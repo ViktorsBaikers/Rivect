@@ -32,6 +32,50 @@ fn scoped_world(tag: &str, config: Option<&str>) -> (World, PathBuf, PathBuf, St
 }
 
 #[test]
+fn typed_errors_preserve_source_chains() {
+    let broker = rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let model_error = broker
+        .prepare("worker", &rivect::config::Config::default(), "")
+        .expect_err("missing model defaults must fail");
+    assert!(
+        matches!(
+            model_error,
+            rivect::model::ModelError::Config(rivect::config::ConfigError {
+                issue: rivect::config::ConfigIssue::Required { ref field },
+                ..
+            }) if field == "models.defaults"
+        ),
+        "{model_error}"
+    );
+    assert!(
+        std::error::Error::source(&model_error)
+            .and_then(|source| source.downcast_ref::<rivect::config::ConfigError>())
+            .is_some(),
+        "model errors must retain the typed configuration source"
+    );
+
+    let world = open_world("typed-error-source", None);
+    let worker_error = rivect::executor::macos::read_once(
+        &world.root.join("missing-scope"),
+        &world.root.join("missing-target"),
+    )
+    .expect_err("missing scope must fail");
+    assert!(
+        matches!(
+            worker_error,
+            rivect::executor::WorkerError::ScopeRootUnavailable { .. }
+        ),
+        "{worker_error}"
+    );
+    assert!(
+        std::error::Error::source(&worker_error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .is_some(),
+        "worker errors must retain the operating-system source"
+    );
+}
+
+#[test]
 fn native_dependency_contract() {
     println!("attempt: {}", rivect::BUILD_ATTEMPT_ID);
     let number = rusqlite::version_number();
@@ -108,7 +152,12 @@ fn boot_confinement_before_dispatch() {
     let denied = rivect::tools::invoke_read(&mut world.runtime, &task, &grant, outside.clone())
         .expect_err("out-of-scope read denied");
     assert!(
-        denied.to_string().contains("outside the admitted scope"),
+        matches!(
+            denied,
+            rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::OutsideScope { ref target }
+            ) if target == &outside
+        ),
         "{denied}"
     );
 
@@ -138,7 +187,12 @@ fn boot_confinement_before_dispatch() {
             .admit(&task, request)
             .expect_err("read-only worker rejects");
         assert!(
-            admitted.to_string().contains("does not admit"),
+            matches!(
+                admitted,
+                rivect::executor::ExecutorError::Policy(
+                    rivect::policy::PolicyError::ClassNotAdmitted { .. }
+                )
+            ),
             "{admitted}"
         );
     }
@@ -245,7 +299,13 @@ fn boot_confinement_before_dispatch() {
     world.runtime.policy.revoke(&grant);
     let revoked = rivect::tools::invoke_read(&mut world.runtime, &task, &grant, file.clone())
         .expect_err("revoked grant denies");
-    assert!(revoked.to_string().contains("revoked"), "{revoked}");
+    assert!(
+        matches!(
+            revoked,
+            rivect::executor::ExecutorError::Policy(rivect::policy::PolicyError::Revoked { .. })
+        ),
+        "{revoked}"
+    );
 
     // Faulted profile: a subscription pin without a live grant gives zero
     // provider and zero tool effects.
@@ -261,8 +321,13 @@ fn boot_confinement_before_dispatch() {
         false,
     );
     assert!(
-        outcome.is_err(),
-        "subscription pin without grant must not dispatch"
+        matches!(
+            outcome,
+            Err(rivect::controller::ControllerError::Policy(
+                rivect::policy::PolicyError::UnknownGrant { .. }
+            ))
+        ),
+        "subscription pin without grant must not dispatch: {outcome:?}"
     );
     assert_eq!(
         faulted
@@ -375,7 +440,7 @@ fn provider_public_ingress() {
     let q = &current["result"]["question"];
     assert_eq!(current["result"]["task_revision"], 2);
     assert_eq!(q["question_revision"], 1);
-    assert_eq!(q["prompt"], "Какую форму использовать?");
+    assert_eq!(q["prompt"], "Which form should we use?");
     assert_eq!(q["options"].as_array().map(Vec::len), Some(5));
     assert_eq!(q["recommended_option_id"], "brief");
     let snapshot = world.dispatch(&json!({
@@ -1024,7 +1089,15 @@ fn revoke_and_cancel_block_dispatch() {
             false,
         )
         .expect_err("revoked scope denies dispatch");
-    assert!(err.to_string().contains("revoked"), "{err}");
+    assert!(
+        matches!(
+            err,
+            rivect::controller::ControllerError::Policy(
+                rivect::policy::PolicyError::Revoked { .. }
+            )
+        ),
+        "{err}"
+    );
     assert_eq!(
         world
             .provider_calls
@@ -1276,7 +1349,15 @@ fn evidence_invalidation_blocks_completion() {
         .store
         .complete_if_eligible(&session, &task)
         .expect_err("completion must be rejected");
-    assert!(err.to_string().contains("unresolved"), "{err}");
+    assert!(
+        matches!(
+            err,
+            rivect::state::StoreError::Conflict(
+                rivect::state::ConflictCause::CompletionOpen { unresolved, .. }
+            ) if unresolved > 0
+        ),
+        "{err}"
+    );
     let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
     assert_ne!(after.lifecycle, Lifecycle::Completed);
     assert!(

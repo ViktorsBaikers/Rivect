@@ -21,35 +21,111 @@ pub enum Stage {
     Resolve,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Parse => "parse",
+            Self::Schema => "schema",
+            Self::Resolve => "resolve",
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigIssue {
+    #[error("invalid TOML: {message}")]
+    Parser { message: String },
+    #[error("config_version must be a non-negative integer")]
+    ConfigVersionNotNonNegativeInteger,
+    #[error("unknown root key {key}")]
+    UnknownRootKey { key: String },
+    #[error("{field} is required")]
+    Required { field: String },
+    #[error("unsupported config_version")]
+    UnsupportedConfigVersion,
+    #[error("at least one connection is required")]
+    MissingConnections,
+    #[error("{kind} connection requires credential_ref")]
+    CredentialRefRequired { kind: ConnKind },
+    #[error("local connection must not carry credentials")]
+    LocalCredentialsForbidden,
+    #[error("unknown group reference: models.groups.{group}")]
+    UnknownGroupReference { group: String },
+    #[error("unknown connection reference: connections.{connection}")]
+    UnknownConnectionReference { connection: String },
+    #[error("conflicting definitions for one purpose")]
+    ConflictingPurposeDefinitions,
+    #[error("{key} must be a table")]
+    ExpectedTable { key: String },
+    #[error("{field} must be a string")]
+    ExpectedString { field: String },
+    #[error("unsupported connection kind {kind}")]
+    UnsupportedConnectionKind { kind: String },
+    #[error("inline credential values are rejected; use credential_ref")]
+    InlineCredential,
+    #[error("unknown key {key}")]
+    UnknownKey { key: String },
+    #[error("group must be a single string reference")]
+    GroupReferenceNotString,
+    #[error("pool must be an array of connection names")]
+    PoolNotArray,
+    #[error("pool entries must be strings")]
+    PoolEntryNotString,
+    #[error("fixed model requires connection")]
+    FixedModelMissingConnection,
+    #[error("fixed model requires model_id")]
+    FixedModelMissingId,
+    #[error("unsupported model mode {mode}")]
+    UnsupportedModelMode { mode: String },
+    #[error("fixed effort requires value")]
+    FixedEffortMissingValue,
+    #[error("unsupported effort value {value}")]
+    UnsupportedEffortValue { value: String },
+    #[error("unsupported effort mode {mode}")]
+    UnsupportedEffortMode { mode: String },
+    #[error("chain must be an array of fixed models")]
+    ChainNotArray,
+    #[error("chain entries must be tables")]
+    ChainEntryNotTable,
+    #[error("fixed chain entry requires connection")]
+    FixedChainEntryMissingConnection,
+    #[error("fixed chain entry requires model_id")]
+    FixedChainEntryMissingModelId,
+    #[error("unsupported fallback mode {mode}")]
+    UnsupportedFallbackMode { mode: String },
+}
+
+#[derive(Debug)]
 pub struct ConfigError {
     pub stage: Stage,
     pub key: Option<String>,
-    pub message: String,
+    pub issue: ConfigIssue,
 }
 
 impl ConfigError {
-    fn parse(message: impl Into<String>) -> Self {
+    fn parse(source: TomlError) -> Self {
         Self {
             stage: Stage::Parse,
             key: None,
-            message: message.into(),
+            issue: ConfigIssue::Parser {
+                message: source.message().to_string(),
+            },
         }
     }
 
-    fn schema(key: impl Into<String>, message: impl Into<String>) -> Self {
+    fn schema(key: impl Into<String>, issue: ConfigIssue) -> Self {
         Self {
             stage: Stage::Schema,
             key: Some(key.into()),
-            message: message.into(),
+            issue,
         }
     }
 
-    fn resolve(key: impl Into<String>, message: impl Into<String>) -> Self {
+    fn resolve(key: impl Into<String>, issue: ConfigIssue) -> Self {
         Self {
             stage: Stage::Resolve,
             key: Some(key.into()),
-            message: message.into(),
+            issue,
         }
     }
 }
@@ -57,9 +133,15 @@ impl ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.key {
-            Some(key) => write!(f, "{:?} {}: {}", self.stage, key, self.message),
-            None => write!(f, "{:?}: {}", self.stage, self.message),
+            Some(key) => write!(f, "{} {key}: {}", self.stage, self.issue),
+            None => write!(f, "{}: {}", self.stage, self.issue),
         }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.issue)
     }
 }
 
@@ -68,6 +150,16 @@ pub enum ConnKind {
     ApiKey,
     Local,
     Subscription,
+}
+
+impl std::fmt::Display for ConnKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ApiKey => "api_key",
+            Self::Local => "local",
+            Self::Subscription => "subscription",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,9 +267,7 @@ impl Config {
     /// Syntax stage only: `toml_edit` rejects malformed TOML and duplicate
     /// keys here. Typed and semantic rejections wait for `validate`.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let doc: DocumentMut = text
-            .parse()
-            .map_err(|err: TomlError| ConfigError::parse(err.message().to_string()))?;
+        let doc: DocumentMut = text.parse().map_err(ConfigError::parse)?;
         Ok(Self {
             raw: Some(doc),
             ..Self::default()
@@ -200,7 +290,7 @@ impl Config {
                     let value = item.as_integer().filter(|v| *v >= 0).ok_or_else(|| {
                         ConfigError::schema(
                             "config_version",
-                            "config_version must be a non-negative integer",
+                            ConfigIssue::ConfigVersionNotNonNegativeInteger,
                         )
                     })?;
                     version = Some(value as u64);
@@ -218,23 +308,31 @@ impl Config {
                 other => {
                     return Err(ConfigError::schema(
                         other,
-                        format!("unknown root key {other}"),
+                        ConfigIssue::UnknownRootKey {
+                            key: other.to_string(),
+                        },
                     ));
                 }
             }
         }
-        let version = version
-            .ok_or_else(|| ConfigError::schema("config_version", "config_version is required"))?;
+        let version = version.ok_or_else(|| {
+            ConfigError::schema(
+                "config_version",
+                ConfigIssue::Required {
+                    field: "config_version".to_string(),
+                },
+            )
+        })?;
         if version != 1 {
             return Err(ConfigError::schema(
                 "config_version",
-                "unsupported config_version",
+                ConfigIssue::UnsupportedConfigVersion,
             ));
         }
         if connections.is_empty() {
             return Err(ConfigError::schema(
                 "connections",
-                "at least one connection is required",
+                ConfigIssue::MissingConnections,
             ));
         }
         for (name, connection) in &connections {
@@ -244,7 +342,9 @@ impl Config {
                     if connection.credential_ref.is_none() {
                         return Err(ConfigError::schema(
                             format!("{key}.credential_ref"),
-                            format!("{:?} connection requires credential_ref", connection.kind),
+                            ConfigIssue::CredentialRefRequired {
+                                kind: connection.kind,
+                            },
                         ));
                     }
                 }
@@ -252,7 +352,7 @@ impl Config {
                     if connection.credential_ref.is_some() {
                         return Err(ConfigError::schema(
                             format!("{key}.credential_ref"),
-                            "local connection must not carry credentials",
+                            ConfigIssue::LocalCredentialsForbidden,
                         ));
                     }
                 }
@@ -261,7 +361,9 @@ impl Config {
         let Some(defaults) = &models.defaults else {
             return Err(ConfigError::schema(
                 "models.defaults",
-                "models.defaults is required",
+                ConfigIssue::Required {
+                    field: "models.defaults".to_string(),
+                },
             ));
         };
         check_model_refs(&connections, &defaults.model, "models.defaults.model")?;
@@ -279,7 +381,9 @@ impl Config {
             {
                 return Err(ConfigError::schema(
                     format!("{key}.group"),
-                    format!("unknown group reference: models.groups.{group}"),
+                    ConfigIssue::UnknownGroupReference {
+                        group: group.clone(),
+                    },
                 ));
             }
             if let Some(model) = &purpose.model {
@@ -290,10 +394,9 @@ impl Config {
                     if !connections.contains_key(&entry.connection) {
                         return Err(ConfigError::schema(
                             format!("{key}.fallback.chain"),
-                            format!(
-                                "unknown connection reference: connections.{}",
-                                entry.connection
-                            ),
+                            ConfigIssue::UnknownConnectionReference {
+                                connection: entry.connection.clone(),
+                            },
                         ));
                     }
                 }
@@ -316,7 +419,12 @@ impl Config {
     /// through to the outer layer.
     pub fn resolve_purpose(&self, purpose: &str) -> Result<ResolvedPurpose, ConfigError> {
         let defaults = self.models.defaults.as_ref().ok_or_else(|| {
-            ConfigError::resolve("models.defaults", "models.defaults is required")
+            ConfigError::resolve(
+                "models.defaults",
+                ConfigIssue::Required {
+                    field: "models.defaults".to_string(),
+                },
+            )
         })?;
         let def = self.models.purposes.get(purpose);
         let (model, model_source) = match def.and_then(|d| d.model.clone()) {
@@ -328,7 +436,9 @@ impl Config {
                     let group_def = self.models.groups.get(&group).ok_or_else(|| {
                         ConfigError::resolve(
                             format!("models.purposes.{purpose}.group"),
-                            format!("unknown group reference: models.groups.{group}"),
+                            ConfigIssue::UnknownGroupReference {
+                                group: group.clone(),
+                            },
                         )
                     })?;
                     (group_def.model.clone(), format!("models.groups.{group}"))
@@ -365,7 +475,7 @@ impl Config {
                 if existing != def {
                     return Err(ConfigError::resolve(
                         format!("models.purposes.{name}"),
-                        "conflicting definitions for one purpose",
+                        ConfigIssue::ConflictingPurposeDefinitions,
                     ));
                 }
             } else {
@@ -377,8 +487,14 @@ impl Config {
 }
 
 fn table_like<'a>(key: &str, item: &'a Item) -> Result<&'a dyn TableLike, ConfigError> {
-    item.as_table_like()
-        .ok_or_else(|| ConfigError::schema(key, format!("{key} must be a table")))
+    item.as_table_like().ok_or_else(|| {
+        ConfigError::schema(
+            key,
+            ConfigIssue::ExpectedTable {
+                key: key.to_string(),
+            },
+        )
+    })
 }
 
 fn string_field(
@@ -392,7 +508,9 @@ fn string_field(
             || {
                 ConfigError::schema(
                     format!("{table_key}.{field}"),
-                    format!("{field} must be a string"),
+                    ConfigIssue::ExpectedString {
+                        field: field.to_string(),
+                    },
                 )
             },
         )?)),
@@ -402,8 +520,14 @@ fn string_field(
 fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
     let table = table_like(name, item)?;
     let key = format!("connections.{name}");
-    let kind_raw = string_field(table, &key, "kind")?
-        .ok_or_else(|| ConfigError::schema(format!("{key}.kind"), "kind is required"))?;
+    let kind_raw = string_field(table, &key, "kind")?.ok_or_else(|| {
+        ConfigError::schema(
+            format!("{key}.kind"),
+            ConfigIssue::Required {
+                field: "kind".to_string(),
+            },
+        )
+    })?;
     let kind = match kind_raw.as_str() {
         "api_key" => ConnKind::ApiKey,
         "local" => ConnKind::Local,
@@ -411,12 +535,20 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
         other => {
             return Err(ConfigError::schema(
                 format!("{key}.kind"),
-                format!("unsupported connection kind {other}"),
+                ConfigIssue::UnsupportedConnectionKind {
+                    kind: other.to_string(),
+                },
             ));
         }
     };
-    let endpoint = string_field(table, &key, "endpoint")?
-        .ok_or_else(|| ConfigError::schema(format!("{key}.endpoint"), "endpoint is required"))?;
+    let endpoint = string_field(table, &key, "endpoint")?.ok_or_else(|| {
+        ConfigError::schema(
+            format!("{key}.endpoint"),
+            ConfigIssue::Required {
+                field: "endpoint".to_string(),
+            },
+        )
+    })?;
     let credential_ref = string_field(table, &key, "credential_ref")?;
     for field in table.iter().map(|(field, _)| field) {
         match field {
@@ -425,13 +557,15 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
                 // Never echo the value: diagnostics stay secret-free.
                 return Err(ConfigError::schema(
                     format!("{key}.{field}"),
-                    "inline credential values are rejected; use credential_ref",
+                    ConfigIssue::InlineCredential,
                 ));
             }
             other => {
                 return Err(ConfigError::schema(
                     format!("{key}.{other}"),
-                    format!("unknown key {other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                    },
                 ));
             }
         }
@@ -453,7 +587,9 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
                     if !matches!(field, "model" | "effort" | "fallback") {
                         return Err(ConfigError::schema(
                             format!("models.defaults.{field}"),
-                            format!("unknown key {field}"),
+                            ConfigIssue::UnknownKey {
+                                key: field.to_string(),
+                            },
                         ));
                     }
                 }
@@ -474,7 +610,9 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
                         if field != "model" {
                             return Err(ConfigError::schema(
                                 format!("models.groups.{name}.{field}"),
-                                format!("unknown key {field}"),
+                                ConfigIssue::UnknownKey {
+                                    key: field.to_string(),
+                                },
                             ));
                         }
                     }
@@ -502,7 +640,7 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
                                     Some(value.as_str().map(str::to_string).ok_or_else(|| {
                                         ConfigError::schema(
                                             format!("{key}.group"),
-                                            "group must be a single string reference",
+                                            ConfigIssue::GroupReferenceNotString,
                                         )
                                     })?);
                             }
@@ -519,7 +657,9 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
                             other => {
                                 return Err(ConfigError::schema(
                                     format!("{key}.{other}"),
-                                    format!("unknown key {other}"),
+                                    ConfigIssue::UnknownKey {
+                                        key: other.to_string(),
+                                    },
                                 ));
                             }
                         }
@@ -530,7 +670,9 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
             other => {
                 return Err(ConfigError::schema(
                     "models",
-                    format!("unknown key {other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                    },
                 ));
             }
         }
@@ -539,19 +681,31 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
 }
 
 fn pick<'a>(table: &'a dyn TableLike, field: &str) -> Result<&'a Item, ConfigError> {
-    table
-        .get(field)
-        .ok_or_else(|| ConfigError::schema(field, format!("{field} is required")))
+    table.get(field).ok_or_else(|| {
+        ConfigError::schema(
+            field,
+            ConfigIssue::Required {
+                field: field.to_string(),
+            },
+        )
+    })
 }
 
 fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
-    let table = item
-        .as_table_like()
-        .ok_or_else(|| ConfigError::schema(key, format!("{key} must be a table")))?;
+    let table = item.as_table_like().ok_or_else(|| {
+        ConfigError::schema(
+            key,
+            ConfigIssue::ExpectedTable {
+                key: key.to_string(),
+            },
+        )
+    })?;
     let Some(mode) = table.get("mode").and_then(Item::as_str) else {
         return Err(ConfigError::schema(
             format!("{key}.mode"),
-            "mode is required",
+            ConfigIssue::Required {
+                field: "mode".to_string(),
+            },
         ));
     };
     match mode {
@@ -561,17 +715,14 @@ fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
                 None => None,
                 Some(value) => {
                     let items = value.as_array().ok_or_else(|| {
-                        ConfigError::schema(
-                            format!("{key}.pool"),
-                            "pool must be an array of connection names",
-                        )
+                        ConfigError::schema(format!("{key}.pool"), ConfigIssue::PoolNotArray)
                     })?;
                     let mut names = Vec::new();
                     for entry in items {
                         names.push(entry.as_str().map(str::to_string).ok_or_else(|| {
                             ConfigError::schema(
                                 format!("{key}.pool"),
-                                "pool entries must be strings",
+                                ConfigIssue::PoolEntryNotString,
                             )
                         })?);
                     }
@@ -587,7 +738,7 @@ fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
                 .ok_or_else(|| {
                     ConfigError::schema(
                         format!("{key}.connection"),
-                        "fixed model requires connection",
+                        ConfigIssue::FixedModelMissingConnection,
                     )
                 })?
                 .to_string();
@@ -595,7 +746,7 @@ fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
                 .get("model_id")
                 .and_then(Item::as_str)
                 .ok_or_else(|| {
-                    ConfigError::schema(format!("{key}.model_id"), "fixed model requires model_id")
+                    ConfigError::schema(format!("{key}.model_id"), ConfigIssue::FixedModelMissingId)
                 })?
                 .to_string();
             Ok(ModelAssign::Fixed(FixedModel {
@@ -605,19 +756,28 @@ fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
         }
         other => Err(ConfigError::schema(
             format!("{key}.mode"),
-            format!("unsupported model mode {other}"),
+            ConfigIssue::UnsupportedModelMode {
+                mode: other.to_string(),
+            },
         )),
     }
 }
 
 fn effort_assign(item: &Item, key: &str) -> Result<EffortAssign, ConfigError> {
-    let table = item
-        .as_table_like()
-        .ok_or_else(|| ConfigError::schema(key, format!("{key} must be a table")))?;
+    let table = item.as_table_like().ok_or_else(|| {
+        ConfigError::schema(
+            key,
+            ConfigIssue::ExpectedTable {
+                key: key.to_string(),
+            },
+        )
+    })?;
     let Some(mode) = table.get("mode").and_then(Item::as_str) else {
         return Err(ConfigError::schema(
             format!("{key}.mode"),
-            "mode is required",
+            ConfigIssue::Required {
+                field: "mode".to_string(),
+            },
         ));
     };
     match mode {
@@ -625,31 +785,42 @@ fn effort_assign(item: &Item, key: &str) -> Result<EffortAssign, ConfigError> {
         "auto" => Ok(EffortAssign::Auto),
         "fixed" => {
             let raw = table.get("value").and_then(Item::as_str).ok_or_else(|| {
-                ConfigError::schema(format!("{key}.value"), "fixed effort requires value")
+                ConfigError::schema(format!("{key}.value"), ConfigIssue::FixedEffortMissingValue)
             })?;
             let value = EffortLevel::parse(raw).ok_or_else(|| {
                 ConfigError::schema(
                     format!("{key}.value"),
-                    format!("unsupported effort value {raw}"),
+                    ConfigIssue::UnsupportedEffortValue {
+                        value: raw.to_string(),
+                    },
                 )
             })?;
             Ok(EffortAssign::Fixed { value })
         }
         other => Err(ConfigError::schema(
             format!("{key}.mode"),
-            format!("unsupported effort mode {other}"),
+            ConfigIssue::UnsupportedEffortMode {
+                mode: other.to_string(),
+            },
         )),
     }
 }
 
 fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError> {
-    let table = item
-        .as_table_like()
-        .ok_or_else(|| ConfigError::schema(key, format!("{key} must be a table")))?;
+    let table = item.as_table_like().ok_or_else(|| {
+        ConfigError::schema(
+            key,
+            ConfigIssue::ExpectedTable {
+                key: key.to_string(),
+            },
+        )
+    })?;
     let Some(mode) = table.get("mode").and_then(Item::as_str) else {
         return Err(ConfigError::schema(
             format!("{key}.mode"),
-            "mode is required",
+            ConfigIssue::Required {
+                field: "mode".to_string(),
+            },
         ));
     };
     match mode {
@@ -658,17 +829,14 @@ fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError
                 None => Vec::new(),
                 Some(value) => {
                     let items = value.as_array().ok_or_else(|| {
-                        ConfigError::schema(
-                            format!("{key}.chain"),
-                            "chain must be an array of fixed models",
-                        )
+                        ConfigError::schema(format!("{key}.chain"), ConfigIssue::ChainNotArray)
                     })?;
                     let mut chain = Vec::new();
                     for entry in items {
                         let inline = entry.as_inline_table().ok_or_else(|| {
                             ConfigError::schema(
                                 format!("{key}.chain"),
-                                "chain entries must be tables",
+                                ConfigIssue::ChainEntryNotTable,
                             )
                         })?;
                         let connection = inline
@@ -677,7 +845,7 @@ fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError
                             .ok_or_else(|| {
                                 ConfigError::schema(
                                     format!("{key}.chain.connection"),
-                                    "fixed chain entry requires connection",
+                                    ConfigIssue::FixedChainEntryMissingConnection,
                                 )
                             })?
                             .to_string();
@@ -687,7 +855,7 @@ fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError
                             .ok_or_else(|| {
                                 ConfigError::schema(
                                     format!("{key}.chain.model_id"),
-                                    "fixed chain entry requires model_id",
+                                    ConfigIssue::FixedChainEntryMissingModelId,
                                 )
                             })?
                             .to_string();
@@ -705,7 +873,9 @@ fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError
         "off" => Ok(FallbackAssign::Off),
         other => Err(ConfigError::schema(
             format!("{key}.mode"),
-            format!("unsupported fallback mode {other}"),
+            ConfigIssue::UnsupportedFallbackMode {
+                mode: other.to_string(),
+            },
         )),
     }
 }
@@ -724,7 +894,9 @@ fn check_model_refs(
         if !connections.contains_key(name) {
             return Err(ConfigError::schema(
                 key,
-                format!("unknown connection reference: connections.{name}"),
+                ConfigIssue::UnknownConnectionReference {
+                    connection: name.to_string(),
+                },
             ));
         }
     }

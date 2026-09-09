@@ -4,7 +4,7 @@
 
 mod support;
 
-use rivect::config::{Config, ConfigError, EffortAssign, ModelAssign, Stage};
+use rivect::config::{Config, ConfigError, ConfigIssue, EffortAssign, ModelAssign, Stage};
 
 fn resolve_or_panic(config: &Config, purpose: &str) -> rivect::config::ResolvedPurpose {
     config
@@ -151,7 +151,7 @@ fn n_model_id() {
     let err = parsed.validate().expect_err("schema must reject");
     expect_stage(&err, Stage::Schema);
     assert!(
-        err.key.clone().unwrap_or_default().contains("model_id"),
+        matches!(err.issue, ConfigIssue::FixedModelMissingId),
         "{err}"
     );
 }
@@ -168,7 +168,7 @@ fn n_effort_value() {
     let err = parsed.validate().expect_err("schema must reject");
     expect_stage(&err, Stage::Schema);
     assert!(
-        err.key.clone().unwrap_or_default().contains("effort"),
+        matches!(err.issue, ConfigIssue::FixedEffortMissingValue),
         "{err}"
     );
 }
@@ -184,7 +184,7 @@ fn n_key() {
     let mut parsed = Config::parse(&text).expect("toml parse must succeed");
     let err = parsed.validate().expect_err("schema must reject");
     expect_stage(&err, Stage::Schema);
-    assert!(err.message.contains("unknown key"), "{err}");
+    assert!(matches!(err.issue, ConfigIssue::UnknownKey { .. }), "{err}");
 }
 
 #[test]
@@ -198,7 +198,10 @@ fn n_fallback() {
     let mut parsed = Config::parse(&text).expect("toml parse must succeed");
     let err = parsed.validate().expect_err("schema must reject");
     expect_stage(&err, Stage::Schema);
-    assert!(err.message.contains("fallback mode"), "{err}");
+    assert!(
+        matches!(err.issue, ConfigIssue::UnsupportedFallbackMode { .. }),
+        "{err}"
+    );
 }
 
 #[test]
@@ -215,7 +218,18 @@ fn n_secret() {
         !err.to_string().contains(support::SECRET_CANARY),
         "diagnostic must never echo the secret: {err}"
     );
-    assert!(err.message.contains("credential"), "{err}");
+    assert!(matches!(err.issue, ConfigIssue::InlineCredential), "{err}");
+}
+
+#[test]
+fn parse_error_does_not_echo_source_text() {
+    let text = format!("api_key = \"{}\" trailing", support::SECRET_CANARY);
+    let err = Config::parse(&text).expect_err("malformed TOML must fail");
+    assert!(matches!(err.issue, ConfigIssue::Parser { .. }), "{err}");
+    assert!(
+        !err.to_string().contains(support::SECRET_CANARY),
+        "parse diagnostic must never echo source text: {err}"
+    );
 }
 
 #[test]
@@ -228,6 +242,7 @@ fn n_duplicate() {
         .clone();
     let err = Config::parse(&text).expect_err("duplicate key is a parser rejection");
     expect_stage(&err, Stage::Parse);
+    assert!(matches!(err.issue, ConfigIssue::Parser { .. }), "{err}");
 }
 
 #[test]
@@ -280,7 +295,13 @@ fn g_unknown() {
         .validate()
         .expect_err("unknown group reference rejected");
     expect_stage(&err, Stage::Schema);
-    assert!(err.message.contains("missing"), "{err}");
+    assert!(
+        matches!(
+            err.issue,
+            ConfigIssue::UnknownGroupReference { ref group } if group == "missing"
+        ),
+        "{err}"
+    );
 }
 
 #[test]
@@ -292,7 +313,10 @@ fn g_array() {
         .validate()
         .expect_err("group array is a schema-stage type rejection");
     expect_stage(&err, Stage::Schema);
-    assert!(err.message.contains("single string reference"), "{err}");
+    assert!(
+        matches!(err.issue, ConfigIssue::GroupReferenceNotString),
+        "{err}"
+    );
 }
 
 #[test]
@@ -307,7 +331,7 @@ fn g_conflict() {
         .expect_err("conflicting definitions rejected");
     expect_stage(&err, Stage::Resolve);
     assert!(
-        err.key.clone().unwrap_or_default().contains("backend_task"),
+        matches!(err.issue, ConfigIssue::ConflictingPurposeDefinitions),
         "{err}"
     );
     // identical replay merges fine and is not a conflict

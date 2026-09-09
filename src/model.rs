@@ -2,7 +2,7 @@
 //! The manifest is frozen at prepare time; later config changes never
 //! rewrite an in-flight request.
 
-use crate::config::{Config, EffortAssign, ModelAssign};
+use crate::config::{Config, ConfigError, EffortAssign, ModelAssign};
 use crate::providers::{self, Provider, ProviderError};
 use sha2::{Digest, Sha256};
 
@@ -17,28 +17,12 @@ pub struct RequestManifest {
     pub epoch_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    CapabilityUnavailable(String),
-    Storage(String),
-}
-
-impl From<ProviderError> for ModelError {
-    fn from(err: ProviderError) -> Self {
-        match err {
-            ProviderError::CapabilityUnavailable(why) => Self::CapabilityUnavailable(why),
-            ProviderError::Transport(why) => Self::Storage(why),
-        }
-    }
-}
-
-impl std::fmt::Display for ModelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CapabilityUnavailable(why) => write!(f, "model capability unavailable: {why}"),
-            Self::Storage(why) => write!(f, "model storage: {why}"),
-        }
-    }
+    #[error("model configuration: {0}")]
+    Config(#[from] ConfigError),
+    #[error("model provider: {0}")]
+    Provider(#[from] ProviderError),
 }
 pub struct Broker {
     provider: Box<dyn Provider>,
@@ -61,9 +45,7 @@ impl Broker {
         config: &Config,
         inputs: &str,
     ) -> Result<RequestManifest, ModelError> {
-        let resolved = config
-            .resolve_purpose(purpose)
-            .map_err(|err| ModelError::CapabilityUnavailable(err.to_string()))?;
+        let resolved = config.resolve_purpose(purpose)?;
         let kind = match &resolved.model {
             ModelAssign::Fixed(fixed) => config.connections.get(&fixed.connection).map(|c| c.kind),
             _ => None,

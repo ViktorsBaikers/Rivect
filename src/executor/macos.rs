@@ -4,7 +4,7 @@
 //! any byte is touched. SLICE-003 extends this same backend.
 
 use sha2::Digest;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 /// The one injected backend seam: everything the executor reads goes
 pub trait ReadWorker: Send {
     fn read_once(
@@ -37,19 +37,22 @@ pub struct ReadObservation {
     pub digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    Denied(String),
-    NotFound(String),
-}
-
-impl std::fmt::Display for WorkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Denied(why) => write!(f, "denied: {why}"),
-            Self::NotFound(what) => write!(f, "not found: {what}"),
-        }
-    }
+    #[error("denied: scope root unavailable: {source}")]
+    ScopeRootUnavailable { source: std::io::Error },
+    #[error("not found: target does not exist: {}", target.display())]
+    TargetMissing { target: PathBuf },
+    #[error("denied: target {} is outside the admitted scope", target.display())]
+    OutsideScope { target: PathBuf },
+    #[error("denied: target metadata unavailable: {source}")]
+    MetadataUnavailable { source: std::io::Error },
+    #[error("denied: target {} is not a regular file", target.display())]
+    NotRegularFile { target: PathBuf },
+    #[error("denied: read failed: {source}")]
+    ReadFailed { source: std::io::Error },
+    #[error("denied: target exceeds the {READ_MAX_BYTES} byte read limit")]
+    TooLarge,
 }
 
 /// One bounded read of an existing regular file inside the canonical scope
@@ -57,30 +60,27 @@ impl std::fmt::Display for WorkerError {
 pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, WorkerError> {
     let scope = scope_root
         .canonicalize()
-        .map_err(|err| WorkerError::Denied(format!("scope root unavailable: {err}")))?;
-    let file = target.canonicalize().map_err(|_| {
-        WorkerError::NotFound(format!("target does not exist: {}", target.display()))
-    })?;
+        .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
+    let file = target
+        .canonicalize()
+        .map_err(|_| WorkerError::TargetMissing {
+            target: target.to_path_buf(),
+        })?;
     if !file.starts_with(&scope) {
-        return Err(WorkerError::Denied(format!(
-            "target {} is outside the admitted scope",
-            target.display()
-        )));
+        return Err(WorkerError::OutsideScope {
+            target: target.to_path_buf(),
+        });
     }
-    let meta = std::fs::metadata(&file)
-        .map_err(|err| WorkerError::Denied(format!("target metadata unavailable: {err}")))?;
+    let meta =
+        std::fs::metadata(&file).map_err(|source| WorkerError::MetadataUnavailable { source })?;
     if !meta.is_file() {
-        return Err(WorkerError::Denied(format!(
-            "target {} is not a regular file",
-            target.display()
-        )));
+        return Err(WorkerError::NotRegularFile {
+            target: target.to_path_buf(),
+        });
     }
-    let bounded =
-        std::fs::read(&file).map_err(|err| WorkerError::Denied(format!("read failed: {err}")))?;
+    let bounded = std::fs::read(&file).map_err(|source| WorkerError::ReadFailed { source })?;
     if bounded.len() > READ_MAX_BYTES {
-        return Err(WorkerError::Denied(format!(
-            "target exceeds the {READ_MAX_BYTES} byte read limit"
-        )));
+        return Err(WorkerError::TooLarge);
     }
     let digest = crate::config::hex(&sha2::Sha256::digest(&bounded));
     Ok(ReadObservation {

@@ -6,8 +6,10 @@
 
 use crate::commands::Runtime;
 use crate::contracts::{AnswerSelection, EffectClass, SessionId, TaskId, TaskSnapshot};
-use crate::executor::{EffectOutcome, EffectRequest};
-use crate::state::StoreError;
+use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
+use crate::model::ModelError;
+use crate::policy::PolicyError;
+use crate::state::{ConflictCause, InvalidCause, StoreError};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +33,20 @@ pub enum StepOutcome {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    #[error(transparent)]
+    Model(#[from] ModelError),
+    #[error(transparent)]
+    Executor(#[from] ExecutorError),
+    #[error("serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
+
 impl Runtime {
     /// One decision step for a task whose pending question has been
     /// answered: the broker dispatches the frozen manifest once, the only
@@ -44,7 +60,7 @@ impl Runtime {
         answer: &AnswerSelection,
         grant_id: &str,
         crash_after_dispatch: bool,
-    ) -> Result<StepOutcome, StoreError> {
+    ) -> Result<StepOutcome, ControllerError> {
         let snapshot = self.owner.store.snapshot(task_id)?;
         if snapshot.lifecycle.is_terminal() {
             return Ok(StepOutcome::NoAction { snapshot });
@@ -61,13 +77,11 @@ impl Runtime {
         }
         // Mutable admission gates before the first provider effect:
         // revocation and task cancellation both deny the dispatch itself.
-        self.policy
-            .admit(grant_id, EffectClass::Read)
-            .map_err(|err| StoreError::Conflict(err.to_string()))?;
+        self.policy.admit(grant_id, EffectClass::Read)?;
         if self.owner.store.task_cancelled(task_id)? {
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(StepOutcome::EffectDenied {
-                reason: "task cancelled".to_string(),
+                reason: crate::executor::TASK_CANCELLED.to_string(),
                 snapshot,
             });
         }
@@ -81,8 +95,7 @@ impl Runtime {
         );
         let manifest = self
             .broker
-            .prepare(&purpose, &self.config_for_broker(), &inputs)
-            .map_err(|err| StoreError::Conflict(err.to_string()))?;
+            .prepare(&purpose, &self.config_for_broker(), &inputs)?;
         let pre = crate::verification::RetainedAttempt {
             attempt_id: manifest.attempt_id.clone(),
             boundary_id: crate::verification::boundary_id(&manifest.attempt_id),
@@ -91,14 +104,9 @@ impl Runtime {
             digest: crate::verification::record_digest(&manifest.attempt_id, "pre"),
             build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
         };
-        self.owner.store.retain(
-            &serde_json::to_string(&pre).unwrap_or_default(),
-            &pre.boundary_id,
-        )?;
-        let reply = self
-            .broker
-            .dispatch(&manifest)
-            .map_err(|err| StoreError::Conflict(err.to_string()))?;
+        let pre_json = serde_json::to_string(&pre)?;
+        self.owner.store.retain(&pre_json, &pre.boundary_id)?;
+        let reply = self.broker.dispatch(&manifest)?;
         self.provider_calls += 1;
         let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
             let snapshot = self.owner.store.snapshot(task_id)?;
@@ -116,16 +124,12 @@ impl Runtime {
             &mut self.owner.store,
             self.read_worker.as_mut(),
         );
-        let admitted = executor
-            .admit(task_id, request)
-            .map_err(|err| StoreError::Conflict(err.to_string()))?;
+        let admitted = executor.admit(task_id, request)?;
         let effect_attempt = admitted.attempt_id.clone();
         if crash_after_dispatch {
             // Process death after the effect committed, before the receipt:
             // exactly one real worker read, no confirmation, no evidence.
-            executor
-                .execute_unconfirmed(&admitted)
-                .map_err(|err| StoreError::Conflict(err.to_string()))?;
+            executor.execute_unconfirmed(&admitted)?;
             self.owner.store.mark_outcome_unknown(task_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(StepOutcome::OutcomeUnknown {
@@ -159,10 +163,10 @@ impl Runtime {
                     digest: crate::verification::record_digest(&manifest.attempt_id, "terminal"),
                     build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
                 };
-                self.owner.store.retain(
-                    &serde_json::to_string(&terminal).unwrap_or_default(),
-                    &terminal.boundary_id,
-                )?;
+                let terminal_json = serde_json::to_string(&terminal)?;
+                self.owner
+                    .store
+                    .retain(&terminal_json, &terminal.boundary_id)?;
                 let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
                 Ok(StepOutcome::Completed { snapshot })
             }
@@ -170,7 +174,7 @@ impl Runtime {
                 let snapshot = self.owner.store.snapshot(task_id)?;
                 Ok(StepOutcome::EffectDenied { reason, snapshot })
             }
-            Err(err) => Err(StoreError::Conflict(err.to_string())),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -191,26 +195,32 @@ impl Runtime {
             .owner
             .store
             .attempt_record(attempt_id)?
-            .ok_or_else(|| StoreError::NotFound(format!("attempt {attempt_id}")))?;
+            .ok_or_else(|| StoreError::missing_attempt(attempt_id))?;
         let (owner_task, state, detail) = record;
         if owner_task != task_id.0 {
-            return Err(StoreError::InvalidInput(format!(
-                "attempt {attempt_id} belongs to task {owner_task}, not {}",
-                task_id.0
-            )));
+            return Err(StoreError::InvalidInput(
+                InvalidCause::AttemptTaskMismatch {
+                    attempt_id: attempt_id.to_string(),
+                    owner_task,
+                    expected: task_id.0.clone(),
+                },
+            ));
         }
         if state != "unknown" {
-            return Err(StoreError::Conflict(format!(
-                "attempt {attempt_id} is {state}, not reconcile-able"
-            )));
+            return Err(StoreError::Conflict(
+                ConflictCause::AttemptNotReconcileable {
+                    attempt_id: attempt_id.to_string(),
+                    state,
+                },
+            ));
         }
         let marker = detail
             .as_deref()
             .and_then(read_performed_digest)
             .ok_or_else(|| {
-                StoreError::InvalidInput(format!(
-                    "attempt {attempt_id} carries no read-performed marker"
-                ))
+                StoreError::InvalidInput(InvalidCause::MissingReadMarker {
+                    attempt_id: attempt_id.to_string(),
+                })
             })?;
         // The marker proves execution; the informational bool can never
         // reject it.

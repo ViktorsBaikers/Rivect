@@ -66,34 +66,21 @@ pub enum EffectOutcome {
     Denied { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
-    Denied(String),
-    Store(StoreError),
+    #[error("effect denied: {0}")]
+    Policy(#[from] PolicyError),
+    #[error("effect denied: {0}")]
+    Worker(#[from] WorkerError),
+    #[error("effect denied: {TASK_CANCELLED}")]
+    Cancelled,
+    #[error("effect denied: {}", readonly_rejection(*class))]
+    Readonly { class: EffectClass },
+    #[error("effect store: {0}")]
+    Store(#[from] StoreError),
 }
 
-impl From<StoreError> for ExecutorError {
-    fn from(err: StoreError) -> Self {
-        Self::Store(err)
-    }
-}
-
-impl From<PolicyError> for ExecutorError {
-    fn from(err: PolicyError) -> Self {
-        match err {
-            PolicyError::Denied(why) => Self::Denied(why),
-        }
-    }
-}
-
-impl std::fmt::Display for ExecutorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Denied(why) => write!(f, "effect denied: {why}"),
-            Self::Store(err) => write!(f, "effect store: {err}"),
-        }
-    }
-}
+pub const TASK_CANCELLED: &str = "task cancelled";
 
 fn readonly_rejection(class: EffectClass) -> String {
     format!(
@@ -167,9 +154,9 @@ impl<'a> Executor<'a> {
         self.policy.admit(&grant_id, EffectClass::Read)?;
         if self.store.task_cancelled(&admitted.task_id)? {
             self.store
-                .attempt_rejected(&admitted.attempt_id, "task cancelled")?;
+                .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
             return Ok(EffectOutcome::Denied {
-                reason: "task cancelled".to_string(),
+                reason: TASK_CANCELLED.to_string(),
             });
         }
         let EffectRequest::Read { path, .. } = &admitted.request else {
@@ -179,7 +166,7 @@ impl<'a> Executor<'a> {
         let observation = self
             .worker
             .read_once(&admitted.scope_root, path)
-            .map_err(|err| ExecutorError::Denied(err.to_string()))?;
+            .map_err(ExecutorError::from)?;
         self.store.set_attempt_state(
             &admitted.attempt_id,
             "confirmed",
@@ -200,9 +187,9 @@ impl<'a> Executor<'a> {
         admitted: &AdmittedEffect,
     ) -> Result<ReadObservation, ExecutorError> {
         if admitted.request.class() != EffectClass::Read {
-            return Err(ExecutorError::Denied(readonly_rejection(
-                admitted.request.class(),
-            )));
+            return Err(ExecutorError::Readonly {
+                class: admitted.request.class(),
+            });
         }
         let grant_id = match &admitted.request {
             EffectRequest::Read { grant_id, .. } => grant_id.clone(),
@@ -211,8 +198,8 @@ impl<'a> Executor<'a> {
         self.policy.admit(&grant_id, EffectClass::Read)?;
         if self.store.task_cancelled(&admitted.task_id)? {
             self.store
-                .attempt_rejected(&admitted.attempt_id, "task cancelled")?;
-            return Err(ExecutorError::Denied("task cancelled".to_string()));
+                .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
+            return Err(ExecutorError::Cancelled);
         }
         let EffectRequest::Read { path, .. } = &admitted.request else {
             unreachable!("read class checked above")
@@ -221,7 +208,7 @@ impl<'a> Executor<'a> {
         let observation = self
             .worker
             .read_once(&admitted.scope_root, path)
-            .map_err(|err| ExecutorError::Denied(err.to_string()))?;
+            .map_err(ExecutorError::from)?;
         self.store.set_attempt_state(
             &admitted.attempt_id,
             "unknown",
