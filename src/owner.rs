@@ -2,32 +2,22 @@
 //! directory before any database writer is opened. The loser attaches; a
 //! second writer is never created.
 
+use crate::config::ConfigError;
 use crate::state::{StoreError, TaskStore};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum OwnerError {
+    #[error("another owner already holds this data root")]
     AlreadyOwned,
-    Io(io::Error),
-}
-
-impl std::fmt::Display for OwnerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyOwned => {
-                write!(f, "another owner already holds this data root")
-            }
-            Self::Io(err) => write!(f, "owner election failed: {err}"),
-        }
-    }
-}
-
-impl From<io::Error> for OwnerError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
+    #[error("owner I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("owner storage failed: {0}")]
+    Store(#[from] StoreError),
+    #[error("owner configuration failed: {0}")]
+    Config(#[from] ConfigError),
 }
 
 pub struct Owner {
@@ -58,10 +48,9 @@ impl Owner {
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::AlreadyOwned),
-            Err(err) => return Err(OwnerError::Io(io::Error::other(err.to_string()))),
+            Err(err) => return Err(OwnerError::Io(io::Error::other(err))),
         }
-        let store = TaskStore::open(&runtime_dir.join("rivect.db"))
-            .map_err(|err| OwnerError::Io(io::Error::other(format!("{err}"))))?;
+        let store = TaskStore::open(&runtime_dir.join("rivect.db"))?;
         Ok(Self {
             _lock: lock,
             store,

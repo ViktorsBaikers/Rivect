@@ -68,14 +68,20 @@ pub struct LocalView {
     pub composer: String,
 }
 
-/// «Начало, без подключения»: ввод и help доступны, логина нет.
+/// Start, no connection: input and help are available; login has not happened.
+pub const STATUS_DISCONNECTED: &str = "Rivect · not connected · /help for help";
+pub const DOCK_EMPTY: &str = "No tasks. Login is a separate explicit action.";
+pub const TRANSCRIPT_INPUT: &str = "Input is available. Enter a task or a clarification.";
+pub const TRANSCRIPT_NO_PROJECT: &str =
+    "No project or index is selected; ordinary replies are not blocked.";
+
 pub fn initial_view() -> LocalView {
     LocalView {
-        status: "Rivect · нет подключения · /help — справка".to_string(),
-        dock: vec!["Задач нет. Login — отдельное явное действие.".to_string()],
+        status: STATUS_DISCONNECTED.to_string(),
+        dock: vec![DOCK_EMPTY.to_string()],
         transcript: vec![
-            "Ввод доступен. Укажите задачу или уточнение.".to_string(),
-            "Проект и индекс не выбраны; обычный ответ не блокируется.".to_string(),
+            TRANSCRIPT_INPUT.to_string(),
+            TRANSCRIPT_NO_PROJECT.to_string(),
         ],
         composer: String::new(),
     }

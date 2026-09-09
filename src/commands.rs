@@ -57,8 +57,7 @@ impl Runtime {
     ) -> Result<Self, OwnerError> {
         let owner = Owner::elect(data_root)?;
         let user_toml = std::fs::read_to_string(data_root.join("config.toml")).ok();
-        let effective = config::resolve_effective(user_toml.as_deref())
-            .map_err(|err| OwnerError::Io(std::io::Error::other(err.to_string())))?;
+        let effective = config::resolve_effective(user_toml.as_deref())?;
         Ok(Self {
             owner,
             policy: Policy::default(),
@@ -123,6 +122,101 @@ const METHODS: &[&str] = &[
     "artifact.read",
 ];
 
+#[derive(Debug, thiserror::Error)]
+enum RequestError {
+    #[error("request exceeds the 1 MiB cap")]
+    RequestTooLarge,
+    #[error("request is not valid JSON")]
+    InvalidJson,
+    #[error("request id is required")]
+    MissingRequestId,
+    #[error("notification ids are not accepted")]
+    NotificationId,
+    #[error("id must be a string of at most 256 bytes or an exact integer")]
+    InvalidRequestId,
+    #[error("jsonrpc must be \"2.0\"")]
+    WrongJsonRpc,
+    #[error("method is required")]
+    MissingMethod,
+    #[error("params must be an object")]
+    ParamsNotObject,
+    #[error("unknown method {method}")]
+    UnknownMethod { method: String },
+    #[error("{field} is required")]
+    Required { field: &'static str },
+    #[error("unsupported schema_version {version}")]
+    UnsupportedVersion { version: u64 },
+    #[error("keys must be a non-empty array")]
+    KeysNotArray,
+    #[error("keys must be non-empty")]
+    EmptyKeys,
+    #[error("keys must be strings")]
+    KeysNotStrings,
+    #[error("duplicate key {key}")]
+    DuplicateKey { key: String },
+    #[error("invalid key {key}")]
+    InvalidKey { key: String },
+    #[error("unknown local command {command}")]
+    UnknownLocalCommand { command: String },
+    #[error("{command} is known but not available in this build")]
+    KnownCommandUnavailable { command: String },
+    #[error("artifact.read is known but not available in this build")]
+    ArtifactReadUnavailable,
+    #[error("unknown command kind {kind}")]
+    UnknownCommandKind { kind: String },
+    #[error("task_id is forbidden on create")]
+    TaskIdForbiddenOnCreate,
+    #[error(
+        "machine answer without an explicit delegation is denied; the pending question is preserved"
+    )]
+    MachineAnswerDenied,
+    #[error("revision fields are required")]
+    MissingRevisionFields,
+    #[error(transparent)]
+    Selection(#[from] SelectionError),
+    #[error("{method} is not available in this build")]
+    MethodUnavailable { method: String },
+}
+
+impl RequestError {
+    fn code(&self) -> ErrorCode {
+        match self {
+            Self::UnknownMethod { .. } => ErrorCode::UnknownMethod,
+            Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
+            Self::KnownCommandUnavailable { .. }
+            | Self::ArtifactReadUnavailable
+            | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
+            Self::MachineAnswerDenied => ErrorCode::Denied,
+            _ => ErrorCode::InvalidInput,
+        }
+    }
+
+    fn rpc_code(&self) -> i64 {
+        match self {
+            Self::InvalidJson => -32700,
+            Self::MissingRequestId
+            | Self::NotificationId
+            | Self::InvalidRequestId
+            | Self::WrongJsonRpc
+            | Self::MissingMethod => -32600,
+            Self::UnknownMethod { .. } => -32601,
+            Self::UnsupportedVersion { .. }
+            | Self::KnownCommandUnavailable { .. }
+            | Self::ArtifactReadUnavailable
+            | Self::MachineAnswerDenied
+            | Self::MethodUnavailable { .. } => -32000,
+            _ => -32602,
+        }
+    }
+
+    fn rpc_message(&self) -> &'static str {
+        match self {
+            Self::InvalidJson => "parse error",
+            _ => self.code().as_str(),
+        }
+    }
+}
+
 pub fn dispatch_runtime_request(
     rt: &mut Runtime,
     ingress: Ingress,
@@ -143,115 +237,68 @@ fn dispatch_inner(
     request: &str,
 ) -> RpcResponse {
     if request.len() > crate::contracts::REQUEST_MAX_BYTES {
-        return envelope_error(
-            Value::Null,
-            ErrorCode::InvalidInput,
-            "-32602",
-            "request exceeds the 1 MiB cap",
-        );
+        return request_error(Value::Null, RequestError::RequestTooLarge);
     }
     let parsed: Value = match serde_json::from_str(request) {
         Ok(value) => value,
-        Err(_) => {
-            return RpcResponse {
-                jsonrpc: "2.0",
-                id: Value::Null,
-                result: None,
-                error: Some(RpcErrorBody {
-                    code: -32700,
-                    message: "parse error".to_string(),
-                    data: WireError::new(ErrorCode::InvalidInput, "request is not valid JSON"),
-                }),
-            };
-        }
+        Err(_) => return request_error(Value::Null, RequestError::InvalidJson),
     };
     let Some(id) = parsed.get("id").cloned() else {
-        return envelope_error(
-            Value::Null,
-            ErrorCode::InvalidInput,
-            "-32600",
-            "request id is required",
-        );
+        return request_error(Value::Null, RequestError::MissingRequestId);
     };
     if id.is_null() {
-        return envelope_error(
-            id,
-            ErrorCode::InvalidInput,
-            "-32600",
-            "notification ids are not accepted",
-        );
+        return request_error(id, RequestError::NotificationId);
     }
     match &id {
         Value::String(s) if s.len() <= 256 => {}
         Value::Number(n) if n.is_i64() => {}
-        _ => {
-            return envelope_error(
-                id,
-                ErrorCode::InvalidInput,
-                "-32600",
-                "id must be a string of at most 256 bytes or an exact integer",
-            );
-        }
+        _ => return request_error(id, RequestError::InvalidRequestId),
     }
     if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return envelope_error(
-            id,
-            ErrorCode::InvalidInput,
-            "-32600",
-            "jsonrpc must be \"2.0\"",
-        );
+        return request_error(id, RequestError::WrongJsonRpc);
     }
     if parsed.get("method").and_then(Value::as_str).is_none() {
-        return envelope_error(id, ErrorCode::InvalidInput, "-32600", "method is required");
+        return request_error(id, RequestError::MissingMethod);
     }
     if parsed.get("params").map(Value::is_object) != Some(true) {
-        return envelope_error(
-            id,
-            ErrorCode::InvalidInput,
-            "-32602",
-            "params must be an object",
-        );
+        return request_error(id, RequestError::ParamsNotObject);
     }
     let method = parsed["method"].as_str().unwrap_or_default().to_string();
     let params = parsed["params"].clone();
     if !METHODS.contains(&method.as_str()) {
-        return envelope_error(
-            id,
-            ErrorCode::UnknownMethod,
-            "-32601",
-            &format!("unknown method {method}"),
-        );
+        return request_error(id, RequestError::UnknownMethod { method });
     }
     let schema = params.get("schema_version").and_then(Value::as_u64);
     match schema {
         None => {
-            return envelope_error(
+            return request_error(
                 id,
-                ErrorCode::InvalidInput,
-                "-32602",
-                "schema_version is required",
+                RequestError::Required {
+                    field: "schema_version",
+                },
             );
         }
         Some(1) => {}
-        Some(other) => {
-            return envelope_error(
-                id,
-                ErrorCode::UnsupportedVersion,
-                "-32000",
-                &format!("unsupported schema_version {other}"),
-            );
+        Some(version) => {
+            return request_error(id, RequestError::UnsupportedVersion { version });
         }
     }
     handle_method(rt, ingress, connection_id, &method, params, id)
 }
 
-fn envelope_error(id: Value, code: ErrorCode, rpc_code: &str, message: &str) -> RpcResponse {
+const RECOVERY_NOT_FOUND: &str = "; read runtime.status to list tasks";
+const RECOVERY_CONFLICT: &str = "; re-read the current snapshot before retrying";
+const RECOVERY_STALE_INTENT: &str = "; read task.snapshot for current revisions";
+const RECOVERY_ALREADY_TERMINAL: &str = "; the historical outcome is preserved";
+const RECOVERY_STORAGE: &str = "; retry after checking local storage";
+
+fn envelope_error(id: Value, code: ErrorCode, rpc_code: i64, message: &str) -> RpcResponse {
     RpcResponse {
         jsonrpc: "2.0",
         id,
         result: None,
         error: Some(RpcErrorBody {
-            code: rpc_code.parse::<i64>().unwrap_or(-32000),
+            code: rpc_code,
             message: code.as_str().to_string(),
             data: WireError {
                 code,
@@ -263,17 +310,31 @@ fn envelope_error(id: Value, code: ErrorCode, rpc_code: &str, message: &str) -> 
     }
 }
 
+fn request_error(id: Value, err: RequestError) -> RpcResponse {
+    let code = err.code();
+    RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(RpcErrorBody {
+            code: err.rpc_code(),
+            message: err.rpc_message().to_string(),
+            data: WireError::new(code, err.to_string()),
+        }),
+    }
+}
+
 fn store_error(id: Value, err: &StoreError) -> RpcResponse {
     let message = err.to_string();
     let recovery = match err {
-        StoreError::NotFound(_) => "; read runtime.status to list tasks",
-        StoreError::Conflict(_) => "; re-read the current snapshot before retrying",
-        StoreError::StaleIntent { .. } => "; read task.snapshot for current revisions",
-        StoreError::AlreadyTerminal => "; the historical outcome is preserved",
+        StoreError::NotFound(_) => RECOVERY_NOT_FOUND,
+        StoreError::Conflict(_) => RECOVERY_CONFLICT,
+        StoreError::StaleIntent { .. } => RECOVERY_STALE_INTENT,
+        StoreError::AlreadyTerminal => RECOVERY_ALREADY_TERMINAL,
         StoreError::InvalidInput(_) => "",
-        StoreError::Storage(_) => "; retry after checking local storage",
+        StoreError::Storage(_) => RECOVERY_STORAGE,
     };
-    envelope_error(id, err.code(), "-32000", &format!("{message}{recovery}"))
+    envelope_error(id, err.code(), -32000, &format!("{message}{recovery}"))
 }
 
 fn handle_method(
@@ -292,11 +353,11 @@ fn handle_method(
                 .unwrap_or_default()
                 .to_string();
             if bootstrap.is_empty() {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "bootstrap_id is required",
+                    RequestError::Required {
+                        field: "bootstrap_id",
+                    },
                 );
             }
             let attach_to = params
@@ -365,45 +426,30 @@ fn handle_method(
                 return missing_session(id);
             };
             let Some(keys) = params.get("keys").and_then(Value::as_array) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "keys must be a non-empty array",
-                );
+                return request_error(id, RequestError::KeysNotArray);
             };
             if keys.is_empty() {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "keys must be non-empty",
-                );
+                return request_error(id, RequestError::EmptyKeys);
             }
             let mut seen = std::collections::BTreeSet::new();
             for key in keys {
                 let Some(key) = key.as_str() else {
-                    return envelope_error(
-                        id,
-                        ErrorCode::InvalidInput,
-                        "-32602",
-                        "keys must be strings",
-                    );
+                    return request_error(id, RequestError::KeysNotStrings);
                 };
                 if !seen.insert(key.to_string()) {
-                    return envelope_error(
+                    return request_error(
                         id,
-                        ErrorCode::InvalidInput,
-                        "-32602",
-                        &format!("duplicate key {key}"),
+                        RequestError::DuplicateKey {
+                            key: key.to_string(),
+                        },
                     );
                 }
                 if key != config::WORKFLOW_KEY {
-                    return envelope_error(
+                    return request_error(
                         id,
-                        ErrorCode::InvalidInput,
-                        "-32602",
-                        &format!("invalid key {key}"),
+                        RequestError::InvalidKey {
+                            key: key.to_string(),
+                        },
                     );
                 }
             }
@@ -420,12 +466,7 @@ fn handle_method(
                 return missing_session(id);
             };
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             match rt.owner.store.snapshot(&task) {
                 Ok(snapshot) => {
@@ -439,12 +480,7 @@ fn handle_method(
                 return missing_session(id);
             };
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             match rt.owner.store.current_question(&task) {
                 Ok(None) => {
@@ -507,19 +543,14 @@ fn handle_method(
                 return missing_session(id);
             };
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             let Some(collection) = params.get("collection").and_then(Value::as_str) else {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "collection is required",
+                    RequestError::Required {
+                        field: "collection",
+                    },
                 );
             };
             let cursor_gen = params
@@ -543,39 +574,34 @@ fn handle_method(
                 .and_then(|c| c.get("kind"))
                 .and_then(Value::as_str)
             else {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "command.kind is required",
+                    RequestError::Required {
+                        field: "command.kind",
+                    },
                 );
             };
             match crate::tools::local_command_kind(kind) {
-                crate::tools::LocalKind::Unknown => envelope_error(
+                crate::tools::LocalKind::Unknown => request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    &format!("unknown local command {kind}"),
+                    RequestError::UnknownLocalCommand {
+                        command: kind.to_string(),
+                    },
                 ),
-                crate::tools::LocalKind::PlannedUnimplemented => envelope_error(
+                crate::tools::LocalKind::PlannedUnimplemented => request_error(
                     id,
-                    ErrorCode::CapabilityUnavailable,
-                    "-32000",
-                    &format!("{kind} is known but not available in this build"),
+                    RequestError::KnownCommandUnavailable {
+                        command: kind.to_string(),
+                    },
                 ),
             }
         }
-        "artifact.read" => envelope_error(
+        "artifact.read" => request_error(id, RequestError::ArtifactReadUnavailable),
+        other => request_error(
             id,
-            ErrorCode::CapabilityUnavailable,
-            "-32000",
-            "artifact.read is known but not available in this build",
-        ),
-        other => envelope_error(
-            id,
-            ErrorCode::UnknownMethod,
-            "-32601",
-            &format!("unknown method {other}"),
+            RequestError::UnknownMethod {
+                method: other.to_string(),
+            },
         ),
     }
 }
@@ -588,11 +614,11 @@ fn session_param(params: &Value) -> Option<SessionId> {
 }
 
 fn missing_session(id: Value) -> RpcResponse {
-    envelope_error(
+    request_error(
         id,
-        ErrorCode::InvalidInput,
-        "-32602",
-        "session_id is required",
+        RequestError::Required {
+            field: "session_id",
+        },
     )
 }
 
@@ -622,11 +648,11 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
         .unwrap_or_default()
         .to_string();
     if command_id.is_empty() {
-        return envelope_error(
+        return request_error(
             id,
-            ErrorCode::InvalidInput,
-            "-32602",
-            "command_id is required",
+            RequestError::Required {
+                field: "command_id",
+            },
         );
     }
     let kind = params
@@ -635,12 +661,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
         .unwrap_or_default()
         .to_string();
     if !crate::contracts::TASK_COMMAND_KINDS.contains(&kind.as_str()) {
-        return envelope_error(
-            id,
-            ErrorCode::InvalidInput,
-            "-32602",
-            &format!("unknown command kind {kind}"),
-        );
+        return request_error(id, RequestError::UnknownCommandKind { kind });
     }
     let principal = match ingress {
         Ingress::TrustedHuman => "local_user",
@@ -649,15 +670,10 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
     match kind.as_str() {
         "create" => {
             if params.get("task_id").is_some() {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is forbidden on create",
-                );
+                return request_error(id, RequestError::TaskIdForbiddenOnCreate);
             }
             let Some(goal) = params.get("goal").and_then(Value::as_str) else {
-                return envelope_error(id, ErrorCode::InvalidInput, "-32602", "goal is required");
+                return request_error(id, RequestError::Required { field: "goal" });
             };
             let contract = params.get("contract").cloned().unwrap_or(Value::Null);
             let criteria = string_array(&contract, "criteria");
@@ -679,20 +695,10 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
             if matches!(ingress, Ingress::Machine) {
                 // Fail closed: an SDK answer never proves human consent, and
                 // the pending question is preserved untouched.
-                return envelope_error(
-                    id,
-                    ErrorCode::Denied,
-                    "-32000",
-                    "machine answer without an explicit delegation is denied; the pending question is preserved",
-                );
+                return request_error(id, RequestError::MachineAnswerDenied);
             }
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             let expected_intent = params
                 .get("expected_intent_revision")
@@ -702,37 +708,25 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 .and_then(Value::as_str)
                 .map(|s| QuestionId(s.to_string()))
             else {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "question_id is required",
+                    RequestError::Required {
+                        field: "question_id",
+                    },
                 );
             };
             let question_revision = params.get("question_revision").and_then(Value::as_u64);
             let (Some(expected_intent), Some(question_revision)) =
                 (expected_intent, question_revision)
             else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "revision fields are required",
-                );
+                return request_error(id, RequestError::MissingRevisionFields);
             };
             let Some(selection_value) = params.get("selection") else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "selection is required",
-                );
+                return request_error(id, RequestError::Required { field: "selection" });
             };
             let selection = match parse_selection(selection_value) {
                 Ok(selection) => selection,
-                Err(message) => {
-                    return envelope_error(id, ErrorCode::InvalidInput, "-32602", &message);
-                }
+                Err(err) => return request_error(id, err.into()),
             };
             let snapshot = match rt.owner.store.snapshot(&task) {
                 Ok(snapshot) => snapshot,
@@ -763,12 +757,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
         }
         "steer" => {
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             let (Some(expected_intent), Some(expected_task)) = (
                 params
@@ -776,19 +765,14 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     .and_then(Value::as_u64),
                 params.get("expected_task_revision").and_then(Value::as_u64),
             ) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "revision fields are required",
-                );
+                return request_error(id, RequestError::MissingRevisionFields);
             };
             let Some(instruction) = params.get("instruction").and_then(Value::as_str) else {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "instruction is required",
+                    RequestError::Required {
+                        field: "instruction",
+                    },
                 );
             };
             match rt.owner.store.steer_task(
@@ -806,22 +790,17 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
         }
         "cancel" => {
             let Some(task) = task_param(&params) else {
-                return envelope_error(
-                    id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "task_id is required",
-                );
+                return request_error(id, RequestError::Required { field: "task_id" });
             };
             let Some(expected_intent) = params
                 .get("expected_intent_revision")
                 .and_then(Value::as_u64)
             else {
-                return envelope_error(
+                return request_error(
                     id,
-                    ErrorCode::InvalidInput,
-                    "-32602",
-                    "expected_intent_revision is required",
+                    RequestError::Required {
+                        field: "expected_intent_revision",
+                    },
                 );
             };
             let reason = params.get("reason").and_then(Value::as_str);
@@ -836,43 +815,55 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 Err(err) => store_error(id, &err),
             }
         }
-        other => envelope_error(
+        other => request_error(
             id,
-            ErrorCode::CapabilityUnavailable,
-            "-32000",
-            &format!("{other} is not available in this build"),
+            RequestError::MethodUnavailable {
+                method: other.to_string(),
+            },
         ),
     }
 }
 
-fn parse_selection(value: &Value) -> std::result::Result<AnswerSelection, String> {
+#[derive(Debug, thiserror::Error)]
+enum SelectionError {
+    #[error("selection cannot carry both option_id and text")]
+    ConflictingFields,
+    #[error("option_id is required")]
+    MissingOptionId,
+    #[error("text is required")]
+    MissingText,
+    #[error("selection.kind must be option or custom")]
+    UnsupportedKind,
+}
+
+fn parse_selection(value: &Value) -> std::result::Result<AnswerSelection, SelectionError> {
     match value.get("kind").and_then(Value::as_str) {
         Some("option") => {
             if value.get("text").is_some() {
-                return Err("selection cannot carry both option_id and text".to_string());
+                return Err(SelectionError::ConflictingFields);
             }
             let option_id = value
                 .get("option_id")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| "option_id is required".to_string())?;
+                .ok_or(SelectionError::MissingOptionId)?;
             Ok(AnswerSelection::Option {
                 option_id: OptionId(option_id.to_string()),
             })
         }
         Some("custom") => {
             if value.get("option_id").is_some() {
-                return Err("selection cannot carry both option_id and text".to_string());
+                return Err(SelectionError::ConflictingFields);
             }
             let text = value
                 .get("text")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "text is required".to_string())?;
+                .ok_or(SelectionError::MissingText)?;
             Ok(AnswerSelection::Custom {
                 text: text.to_string(),
             })
         }
-        _ => Err("selection.kind must be option or custom".to_string()),
+        _ => Err(SelectionError::UnsupportedKind),
     }
 }
 

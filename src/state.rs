@@ -12,29 +12,98 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::path::Path;
-#[derive(Debug, Clone, PartialEq)]
-pub enum StoreError {
-    NotFound(String),
-    Conflict(String),
-    StaleIntent { expected: u64, current: u64 },
-    AlreadyTerminal,
-    InvalidInput(String),
-    Storage(String),
+
+mod sql;
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum Missing {
+    #[error("session {0}")]
+    Session(String),
+    #[error("task {0}")]
+    Task(String),
+    #[error("question {0}")]
+    Question(String),
+    #[error("attempt {0}")]
+    Attempt(String),
+    #[error("evidence {0}")]
+    Evidence(String),
+    #[error("obligation")]
+    Obligation,
 }
 
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound(what) => write!(f, "not found: {what}"),
-            Self::Conflict(why) => write!(f, "conflict: {why}"),
-            Self::StaleIntent { expected, current } => {
-                write!(f, "stale intent: expected {expected}, current {current}")
-            }
-            Self::AlreadyTerminal => write!(f, "already terminal"),
-            Self::InvalidInput(why) => write!(f, "invalid input: {why}"),
-            Self::Storage(why) => write!(f, "storage: {why}"),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ConflictCause {
+    #[error("command {command_id} already recorded with different params")]
+    DuplicateCommand { command_id: String },
+    #[error("cannot publish a question for a {lifecycle} task")]
+    QuestionOnLifecycle { lifecycle: String },
+    #[error("a pending question already exists")]
+    PendingQuestionExists,
+    #[error("question is no longer pending")]
+    QuestionNotPending,
+    #[error("question revision {expected} is not the current revision {current}")]
+    QuestionRevision { expected: u64, current: u64 },
+    #[error("terminal task cannot be reopened")]
+    TerminalCannotReopen,
+    #[error("task revision {expected} is not the current revision {current}")]
+    TaskRevision { expected: u64, current: u64 },
+    #[error("cursor generation {expected} does not match snapshot generation {current}")]
+    CursorGeneration { expected: u64, current: u64 },
+    #[error("task is already terminal")]
+    TaskAlreadyTerminal,
+    #[error(
+        "completion rejected: {unsatisfied} unsatisfied, {unresolved} unresolved, {unknown} unknown"
+    )]
+    CompletionOpen {
+        unsatisfied: u64,
+        unresolved: u64,
+        unknown: u64,
+    },
+    #[error("completion rejected: {stale} stale evidence")]
+    CompletionStale { stale: u64 },
+    #[error("attempt {attempt_id} is {state}, not reconcile-able")]
+    AttemptNotReconcileable { attempt_id: String, state: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum InvalidCause {
+    #[error("goal must be non-empty bounded text")]
+    EmptyGoal,
+    #[error("unknown option {option_id} for question {question_id}")]
+    UnknownOption {
+        option_id: String,
+        question_id: String,
+    },
+    #[error("option {option_id} is disabled: {reason}")]
+    DisabledOption { option_id: String, reason: String },
+    #[error("custom answer must be non-empty")]
+    EmptyCustomAnswer,
+    #[error("unknown collection {0}")]
+    UnknownCollection(String),
+    #[error("attempt {attempt_id} belongs to task {owner_task}, not {expected}")]
+    AttemptTaskMismatch {
+        attempt_id: String,
+        owner_task: String,
+        expected: String,
+    },
+    #[error("attempt {attempt_id} carries no read-performed marker")]
+    MissingReadMarker { attempt_id: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("not found: {0}")]
+    NotFound(#[source] Missing),
+    #[error("conflict: {0}")]
+    Conflict(#[source] ConflictCause),
+    #[error("stale intent: expected {expected}, current {current}")]
+    StaleIntent { expected: u64, current: u64 },
+    #[error("already terminal")]
+    AlreadyTerminal,
+    #[error("invalid input: {0}")]
+    InvalidInput(#[source] InvalidCause),
+    #[error("storage: {0}")]
+    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl StoreError {
@@ -48,12 +117,36 @@ impl StoreError {
             Self::Storage(_) => ErrorCode::StorageUnavailable,
         }
     }
+
+    pub fn missing_session(id: impl Into<String>) -> Self {
+        Self::NotFound(Missing::Session(id.into()))
+    }
+
+    pub fn missing_task(id: impl Into<String>) -> Self {
+        Self::NotFound(Missing::Task(id.into()))
+    }
+
+    pub fn missing_question(id: impl Into<String>) -> Self {
+        Self::NotFound(Missing::Question(id.into()))
+    }
+
+    pub fn missing_attempt(id: impl Into<String>) -> Self {
+        Self::NotFound(Missing::Attempt(id.into()))
+    }
+
+    pub fn missing_evidence(id: impl Into<String>) -> Self {
+        Self::NotFound(Missing::Evidence(id.into()))
+    }
+
+    pub fn missing_obligation() -> Self {
+        Self::NotFound(Missing::Obligation)
+    }
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
-fn storage(err: rusqlite::Error) -> StoreError {
-    StoreError::Storage(err.to_string())
+fn storage(err: impl std::error::Error + Send + Sync + 'static) -> StoreError {
+    StoreError::Storage(Box::new(err))
 }
 
 pub struct TaskStore {
@@ -67,111 +160,7 @@ impl TaskStore {
             .map_err(storage)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(storage)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                session_revision INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS attachments (
-                attachment_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                connection_id TEXT NOT NULL,
-                bootstrap_id TEXT NOT NULL,
-                params_digest TEXT NOT NULL,
-                state TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS bootstrap_receipts (
-                key TEXT PRIMARY KEY,
-                attachment_id TEXT NOT NULL,
-                result_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                intent_revision INTEGER NOT NULL,
-                contract_revision INTEGER NOT NULL,
-                lifecycle TEXT NOT NULL,
-                goal_bytes BLOB NOT NULL,
-                goal_digest TEXT NOT NULL,
-                goal_artifact_id TEXT NOT NULL,
-                event_cursor INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS criteria (
-                criterion_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS task_constraints (
-                task_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                PRIMARY KEY (task_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS obligations (
-                obligation_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                criterion_id TEXT NOT NULL,
-                applicability TEXT NOT NULL,
-                execution TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS evidence (
-                evidence_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                observation TEXT NOT NULL,
-                digest TEXT NOT NULL,
-                validity TEXT NOT NULL,
-                obligation_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS questions (
-                question_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                intent_revision INTEGER NOT NULL,
-                prompt TEXT NOT NULL,
-                body_json TEXT NOT NULL,
-                state TEXT NOT NULL,
-                answer_json TEXT,
-                answered_origin TEXT
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                aggregate_id TEXT NOT NULL,
-                aggregate_revision INTEGER NOT NULL,
-                cursor INTEGER NOT NULL UNIQUE,
-                session_id TEXT NOT NULL,
-                task_id TEXT,
-                event_type TEXT NOT NULL,
-                delta_json TEXT NOT NULL,
-                origin TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_aggregate
-                ON events (aggregate_id, aggregate_revision);
-            CREATE TABLE IF NOT EXISTS command_receipts (
-                command_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                principal TEXT NOT NULL,
-                params_digest TEXT NOT NULL,
-                result_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS attempts (
-                attempt_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                action_id TEXT NOT NULL,
-                effect_class TEXT NOT NULL,
-                describe TEXT NOT NULL,
-                state TEXT NOT NULL,
-                detail TEXT
-            );
-            CREATE TABLE IF NOT EXISTS retained (
-                boundary_id TEXT PRIMARY KEY,
-                record_json TEXT NOT NULL
-            );",
-        )
-        .map_err(storage)?;
+        conn.execute_batch(sql::SCHEMA).map_err(storage)?;
         Ok(Self { conn })
     }
 
@@ -190,16 +179,13 @@ impl TaskStore {
         let key = format!("{connection_id}|{bootstrap_id}");
         let replay = self
             .conn
-            .query_row(
-                "SELECT result_json FROM bootstrap_receipts WHERE key = ?1",
-                params![key],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row(sql::BOOTSTRAP_RECEIPT_BY_KEY, params![key], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()
             .map_err(storage)?;
         if let Some(result_json) = replay {
-            let value: Value = serde_json::from_str(&result_json)
-                .map_err(|err| StoreError::Storage(err.to_string()))?;
+            let value: Value = serde_json::from_str(&result_json).map_err(storage)?;
             let session_id =
                 SessionId(value["session_id"].as_str().unwrap_or_default().to_string());
             let attachment_id = AttachmentId(
@@ -215,14 +201,10 @@ impl TaskStore {
             Some(id) => {
                 let exists: bool = self
                     .conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)",
-                        params![id.0],
-                        |row| row.get(0),
-                    )
+                    .query_row(sql::SESSION_EXISTS, params![id.0], |row| row.get(0))
                     .map_err(storage)?;
                 if !exists {
-                    return Err(StoreError::NotFound(format!("session {}", id.0)));
+                    return Err(StoreError::missing_session(&id.0));
                 }
                 id.clone()
             }
@@ -231,31 +213,30 @@ impl TaskStore {
         let attachment_id = AttachmentId::generate();
         self.conn
             .execute(
-                "INSERT INTO attachments (attachment_id, session_id, connection_id, bootstrap_id, params_digest, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'attached')",
-                params![attachment_id.0, session_id.0, connection_id, bootstrap_id, params_digest],
+                sql::INSERT_ATTACHMENT,
+                params![
+                    attachment_id.0,
+                    session_id.0,
+                    connection_id,
+                    bootstrap_id,
+                    params_digest
+                ],
             )
             .map_err(storage)?;
         let revision: u64 = self
             .conn
-            .query_row(
-                "SELECT COALESCE(MAX(session_revision), 0) + 1 FROM sessions WHERE session_id = ?1",
-                params![session_id.0],
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
-            )
+            .query_row(sql::NEXT_SESSION_REVISION, params![session_id.0], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })
             .map_err(storage)?;
         if attach_to.is_none() {
             self.conn
-                .execute(
-                    "INSERT INTO sessions (session_id, session_revision, created_at)
-                     VALUES (?1, ?2, datetime('now'))",
-                    params![session_id.0, revision as i64],
-                )
+                .execute(sql::INSERT_SESSION, params![session_id.0, revision as i64])
                 .map_err(storage)?;
         } else {
             self.conn
                 .execute(
-                    "UPDATE sessions SET session_revision = ?2 WHERE session_id = ?1",
+                    sql::UPDATE_SESSION_REVISION,
                     params![session_id.0, revision as i64],
                 )
                 .map_err(storage)?;
@@ -265,10 +246,10 @@ impl TaskStore {
             "attachment_id": attachment_id.0,
             "owner_generation": 1u64,
         }))
-        .map_err(|err| StoreError::Storage(err.to_string()))?;
+        .map_err(storage)?;
         self.conn
             .execute(
-                "INSERT INTO bootstrap_receipts (key, attachment_id, result_json) VALUES (?1, ?2, ?3)",
+                sql::INSERT_BOOTSTRAP_RECEIPT,
                 params![key, attachment_id.0, result_json],
             )
             .map_err(storage)?;
@@ -279,11 +260,9 @@ impl TaskStore {
 
     fn next_cursor(tx: &rusqlite::Transaction<'_>) -> Result<u64> {
         let cursor: u64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(cursor), 0) + 1 FROM events",
-                [],
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
-            )
+            .query_row(sql::NEXT_EVENT_CURSOR, [], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })
             .map_err(storage)?;
         Ok(cursor)
     }
@@ -312,8 +291,7 @@ impl TaskStore {
             origin: origin.to_string(),
         };
         tx.execute(
-            "INSERT INTO events (event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            sql::INSERT_EVENT,
             params![
                 event.event_id.0,
                 event.aggregate_id,
@@ -322,7 +300,7 @@ impl TaskStore {
                 event.session_id.0,
                 event.task_id.as_ref().map(|id| id.0.clone()),
                 event.event_type,
-                serde_json::to_string(&event.delta).map_err(|e| StoreError::Storage(e.to_string()))?,
+                serde_json::to_string(&event.delta).map_err(storage)?,
                 event.origin
             ],
         )
@@ -337,17 +315,27 @@ impl TaskStore {
         after: u64,
         limit: u32,
     ) -> Result<Vec<Event>> {
-        let mut sql = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
-             FROM events WHERE session_id = ?1 AND cursor > ?2".to_string();
-        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(session_id.0.clone()), Box::new(after as i64)];
-        if let Some(id) = task_id {
-            sql.push_str(" AND task_id = ?3");
-            args.push(Box::new(id.0.clone()));
-        }
-        sql.push_str(" ORDER BY cursor LIMIT ");
-        sql.push_str(&limit.to_string());
-        let mut stmt = self.conn.prepare(&sql).map_err(storage)?;
+        let (query, args): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(id) = task_id {
+            (
+                sql::EVENTS_AFTER_FOR_TASK,
+                vec![
+                    Box::new(session_id.0.clone()),
+                    Box::new(after as i64),
+                    Box::new(id.0.clone()),
+                    Box::new(limit as i64),
+                ],
+            )
+        } else {
+            (
+                sql::EVENTS_AFTER,
+                vec![
+                    Box::new(session_id.0.clone()),
+                    Box::new(after as i64),
+                    Box::new(limit as i64),
+                ],
+            )
+        };
+        let mut stmt = self.conn.prepare(query).map_err(storage)?;
         let rows = stmt
             .query_map(params_from_iter(args.iter()), |row| {
                 Ok(Event {
@@ -376,11 +364,9 @@ impl TaskStore {
     pub fn receipt(&self, command_id: &str) -> Result<Option<(String, String)>> {
         let row = self
             .conn
-            .query_row(
-                "SELECT params_digest, result_json FROM command_receipts WHERE command_id = ?1",
-                params![command_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row(sql::RECEIPT_BY_COMMAND, params![command_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()
             .map_err(storage)?;
         Ok(row)
@@ -395,14 +381,13 @@ impl TaskStore {
         result: &CommandResult,
     ) -> Result<()> {
         tx.execute(
-            "INSERT INTO command_receipts (command_id, session_id, principal, params_digest, result_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            sql::INSERT_RECEIPT,
             params![
                 command_id,
                 session_id.0,
                 principal,
                 params_digest,
-                serde_json::to_string(result).map_err(|e| StoreError::Storage(e.to_string()))?
+                serde_json::to_string(result).map_err(storage)?
             ],
         )
         .map_err(storage)?;
@@ -421,19 +406,16 @@ impl TaskStore {
     ) -> Result<CommandResult> {
         let (criteria, constraints) = contract;
         if goal.is_empty() || goal.len() > crate::contracts::TEXT_MAX_BYTES {
-            return Err(StoreError::InvalidInput(
-                "goal must be non-empty bounded text".into(),
-            ));
+            return Err(StoreError::InvalidInput(InvalidCause::EmptyGoal));
         }
         let params_digest = format!("create|{principal}|{goal}|{}", criteria.join("\u{1}"));
         if let Some((digest, result_json)) = self.receipt(command_id)? {
             if digest != params_digest {
-                return Err(StoreError::Conflict(format!(
-                    "command {command_id} already recorded with different params"
-                )));
+                return Err(StoreError::Conflict(ConflictCause::DuplicateCommand {
+                    command_id: command_id.to_string(),
+                }));
             }
-            let result: CommandResult = serde_json::from_str(&result_json)
-                .map_err(|e| StoreError::Storage(e.to_string()))?;
+            let result: CommandResult = serde_json::from_str(&result_json).map_err(storage)?;
             return Ok(result);
         }
         let task_id = TaskId::generate();
@@ -441,8 +423,7 @@ impl TaskStore {
         let digest = crate::config::hex(&sha2::Sha256::digest(&goal_bytes));
         let tx = self.conn.transaction().map_err(storage)?;
         tx.execute(
-            "INSERT INTO tasks (task_id, session_id, revision, intent_revision, contract_revision, lifecycle, goal_bytes, goal_digest, goal_artifact_id, event_cursor)
-             VALUES (?1, ?2, 1, 1, 1, 'running', ?3, ?4, ?5, 0)",
+            sql::INSERT_TASK,
             params![
                 task_id.0,
                 session_id.0,
@@ -455,23 +436,20 @@ impl TaskStore {
         for (position, text) in criteria.iter().enumerate() {
             let criterion_id = CriterionId::generate();
             tx.execute(
-                "INSERT INTO criteria (criterion_id, task_id, position, text) VALUES (?1, ?2, ?3, ?4)",
+                sql::INSERT_CRITERION,
                 params![criterion_id.0, task_id.0, position as i64, text],
             )
             .map_err(storage)?;
         }
         for (position, text) in constraints.iter().enumerate() {
             tx.execute(
-                "INSERT INTO task_constraints (task_id, position, text) VALUES (?1, ?2, ?3)",
+                sql::INSERT_CONSTRAINT,
                 params![task_id.0, position as i64, text],
             )
             .map_err(storage)?;
         }
-        tx.execute(
-            "UPDATE tasks SET event_cursor = 1 WHERE task_id = ?1",
-            params![task_id.0],
-        )
-        .map_err(storage)?;
+        tx.execute(sql::TOUCH_EVENT_CURSOR, params![task_id.0])
+            .map_err(storage)?;
         Self::append_event(
             &tx,
             session_id,
@@ -514,46 +492,43 @@ impl TaskStore {
         let tx = self.conn.transaction().map_err(storage)?;
         let (revision, lifecycle): (u64, String) = tx
             .query_row(
-                "SELECT revision, lifecycle FROM tasks WHERE task_id = ?1",
+                sql::TASK_REVISION_LIFECYCLE,
                 params![question.task_id.0],
                 |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
             )
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", question.task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&question.task_id.0))?;
         if lifecycle != "running" {
-            return Err(StoreError::Conflict(format!(
-                "cannot publish a question for a {lifecycle} task"
-            )));
+            return Err(StoreError::Conflict(ConflictCause::QuestionOnLifecycle {
+                lifecycle,
+            }));
         }
         let pending: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM questions WHERE task_id = ?1 AND state = 'pending')",
+                sql::PENDING_QUESTION_EXISTS,
                 params![question.task_id.0],
                 |row| row.get(0),
             )
             .map_err(storage)?;
         if pending {
-            return Err(StoreError::Conflict(
-                "a pending question already exists".into(),
-            ));
+            return Err(StoreError::Conflict(ConflictCause::PendingQuestionExists));
         }
         tx.execute(
-            "INSERT INTO questions (question_id, task_id, revision, intent_revision, prompt, body_json, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            sql::INSERT_QUESTION,
             params![
                 question.question_id.0,
                 question.task_id.0,
                 question.question_revision as i64,
                 question.intent_revision as i64,
                 question.prompt,
-                serde_json::to_string(question).map_err(|e| StoreError::Storage(e.to_string()))?
+                serde_json::to_string(question).map_err(storage)?
             ],
         )
         .map_err(storage)?;
         let new_revision = revision + 1;
         tx.execute(
-            "UPDATE tasks SET revision = ?2, lifecycle = 'waiting', event_cursor = event_cursor + 1 WHERE task_id = ?1",
+            sql::TASK_SET_WAITING,
             params![question.task_id.0, new_revision as i64],
         )
         .map_err(storage)?;
@@ -574,8 +549,7 @@ impl TaskStore {
         let row = self
             .conn
             .query_row(
-                "SELECT body_json, (SELECT revision FROM tasks WHERE task_id = ?2) FROM questions
-                 WHERE task_id = ?2 AND state = 'pending' ORDER BY revision DESC LIMIT 1",
+                sql::CURRENT_QUESTION,
                 params![task_id.0, task_id.0],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -584,8 +558,7 @@ impl TaskStore {
         match row {
             None => Ok(None),
             Some((body, revision)) => {
-                let question: Question =
-                    serde_json::from_str(&body).map_err(|e| StoreError::Storage(e.to_string()))?;
+                let question: Question = serde_json::from_str(&body).map_err(storage)?;
                 Ok(Some((question, revision as u64)))
             }
         }
@@ -602,76 +575,67 @@ impl TaskStore {
     ) -> Result<CommandResult> {
         let tx = self.conn.transaction().map_err(storage)?;
         let (revision, intent_revision, lifecycle): (u64, u64, String) = tx
-            .query_row(
-                "SELECT revision, intent_revision, lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get(2)?,
-                    ))
-                },
-            )
+            .query_row(sql::TASK_REVISIONS, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get(2)?,
+                ))
+            })
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         if Lifecycle::from_db(&lifecycle).is_terminal() {
             return Err(StoreError::AlreadyTerminal);
         }
         let (stored_revision, state, body_json): (u64, String, String) = tx
-            .query_row(
-                "SELECT revision, state, body_json FROM questions WHERE question_id = ?1",
-                params![question_id.0],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
-            )
+            .query_row(sql::QUESTION_BY_ID, params![question_id.0], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+            })
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("question {}", question_id.0)))?;
+            .ok_or_else(|| StoreError::missing_question(&question_id.0))?;
         if state != "pending" {
-            return Err(StoreError::Conflict("question is no longer pending".into()));
+            return Err(StoreError::Conflict(ConflictCause::QuestionNotPending));
         }
         if stored_revision != question_revision {
-            return Err(StoreError::Conflict(format!(
-                "question revision {question_revision} is not the current revision {stored_revision}"
-            )));
+            return Err(StoreError::Conflict(ConflictCause::QuestionRevision {
+                expected: question_revision,
+                current: stored_revision,
+            }));
         }
-        let question: Question =
-            serde_json::from_str(&body_json).map_err(|e| StoreError::Storage(e.to_string()))?;
+        let question: Question = serde_json::from_str(&body_json).map_err(storage)?;
         match selection {
             AnswerSelection::Option { option_id } => {
                 let Some(option) = question.options.iter().find(|o| o.option_id == *option_id)
                 else {
-                    return Err(StoreError::InvalidInput(format!(
-                        "unknown option {} for question {}",
-                        option_id.0, question_id.0
-                    )));
+                    return Err(StoreError::InvalidInput(InvalidCause::UnknownOption {
+                        option_id: option_id.0.clone(),
+                        question_id: question_id.0.clone(),
+                    }));
                 };
                 if let Availability::Disabled { reason } = &option.availability {
-                    return Err(StoreError::InvalidInput(format!(
-                        "option {} is disabled: {reason}",
-                        option_id.0
-                    )));
+                    return Err(StoreError::InvalidInput(InvalidCause::DisabledOption {
+                        option_id: option_id.0.clone(),
+                        reason: reason.clone(),
+                    }));
                 }
             }
             AnswerSelection::Custom { text } => {
                 if text.trim().is_empty() {
-                    return Err(StoreError::InvalidInput(
-                        "custom answer must be non-empty".into(),
-                    ));
+                    return Err(StoreError::InvalidInput(InvalidCause::EmptyCustomAnswer));
                 }
             }
         }
-        let answer_json =
-            serde_json::to_string(selection).map_err(|e| StoreError::Storage(e.to_string()))?;
+        let answer_json = serde_json::to_string(selection).map_err(storage)?;
         tx.execute(
-            "UPDATE questions SET state = 'answered', answer_json = ?2, answered_origin = ?3 WHERE question_id = ?1",
+            sql::ANSWER_QUESTION,
             params![question_id.0, answer_json, author],
         )
         .map_err(storage)?;
         let new_revision = revision + 1;
         tx.execute(
-            "UPDATE tasks SET revision = ?2, lifecycle = 'running', event_cursor = event_cursor + 1 WHERE task_id = ?1",
+            sql::TASK_SET_RUNNING,
             params![task_id.0, new_revision as i64],
         )
         .map_err(storage)?;
@@ -707,24 +671,18 @@ impl TaskStore {
     ) -> Result<CommandResult> {
         let tx = self.conn.transaction().map_err(storage)?;
         let (revision, intent_revision, lifecycle): (u64, u64, String) = tx
-            .query_row(
-                "SELECT revision, intent_revision, lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get(2)?,
-                    ))
-                },
-            )
+            .query_row(sql::TASK_REVISIONS, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get(2)?,
+                ))
+            })
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         if Lifecycle::from_db(&lifecycle).is_terminal() {
-            return Err(StoreError::Conflict(
-                "terminal task cannot be reopened".into(),
-            ));
+            return Err(StoreError::Conflict(ConflictCause::TerminalCannotReopen));
         }
         if intent_revision != expected_intent_revision {
             return Err(StoreError::StaleIntent {
@@ -733,14 +691,15 @@ impl TaskStore {
             });
         }
         if revision != expected_task_revision {
-            return Err(StoreError::Conflict(format!(
-                "task revision {expected_task_revision} is not the current revision {revision}"
-            )));
+            return Err(StoreError::Conflict(ConflictCause::TaskRevision {
+                expected: expected_task_revision,
+                current: revision,
+            }));
         }
         let new_revision = revision + 1;
         let new_intent = intent_revision + 1;
         tx.execute(
-            "UPDATE tasks SET revision = ?2, intent_revision = ?3, event_cursor = event_cursor + 1 WHERE task_id = ?1",
+            sql::UPDATE_INTENT,
             params![task_id.0, new_revision as i64, new_intent as i64],
         )
         .map_err(storage)?;
@@ -777,20 +736,16 @@ impl TaskStore {
     ) -> Result<CommandResult> {
         let tx = self.conn.transaction().map_err(storage)?;
         let (revision, intent_revision, lifecycle): (u64, u64, String) = tx
-            .query_row(
-                "SELECT revision, intent_revision, lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get(2)?,
-                    ))
-                },
-            )
+            .query_row(sql::TASK_REVISIONS, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get(2)?,
+                ))
+            })
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         let terminal = Lifecycle::from_db(&lifecycle).is_terminal();
         if intent_revision != expected_intent_revision {
             return Err(StoreError::StaleIntent {
@@ -812,11 +767,8 @@ impl TaskStore {
                 contract_revision: None,
             });
         }
-        tx.execute(
-            "UPDATE tasks SET revision = ?2, lifecycle = 'cancelled', event_cursor = event_cursor + 1 WHERE task_id = ?1",
-            params![task_id.0, (revision + 1) as i64],
-        )
-        .map_err(storage)?;
+        tx.execute(sql::CANCEL_TASK, params![task_id.0, (revision + 1) as i64])
+            .map_err(storage)?;
         Self::append_event(
             &tx,
             session_id,
@@ -842,53 +794,42 @@ impl TaskStore {
     pub fn task_cancelled(&self, task_id: &TaskId) -> Result<bool> {
         let lifecycle: String = self
             .conn
-            .query_row(
-                "SELECT lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get(0),
-            )
+            .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         Ok(lifecycle == "cancelled")
     }
 
     // ----- snapshots -----
 
     fn snapshot_in_tx(tx: &rusqlite::Transaction<'_>, task_id: &TaskId) -> Result<TaskSnapshot> {
-        let (revision, intent_revision, contract_revision, lifecycle, goal_digest, artifact_id, goal_len, event_cursor): (
-            u64,
-            u64,
-            u64,
-            String,
-            String,
-            String,
-            usize,
-            u64,
-        ) = tx
-            .query_row(
-                "SELECT revision, intent_revision, contract_revision, lifecycle, goal_digest, goal_artifact_id, LENGTH(goal_bytes), event_cursor
-                 FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u64,
-                        row.get::<_, i64>(1)? as u64,
-                        row.get::<_, i64>(2)? as u64,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as u64,
-                    ))
-                },
-            )
+        let (
+            revision,
+            intent_revision,
+            contract_revision,
+            lifecycle,
+            goal_digest,
+            artifact_id,
+            goal_len,
+            event_cursor,
+        ): (u64, u64, u64, String, String, String, usize, u64) = tx
+            .query_row(sql::SNAPSHOT_TASK, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get::<_, i64>(6)? as usize,
+                    row.get::<_, i64>(7)? as u64,
+                ))
+            })
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
-        let mut criteria_stmt = tx
-            .prepare("SELECT criterion_id, text FROM criteria WHERE task_id = ?1 ORDER BY position")
-            .map_err(storage)?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
+        let mut criteria_stmt = tx.prepare(sql::CRITERIA_FOR_TASK).map_err(storage)?;
         let criteria = criteria_stmt
             .query_map(params![task_id.0], |row| {
                 Ok(Criterion {
@@ -899,17 +840,13 @@ impl TaskStore {
             .map_err(storage)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage)?;
-        let mut constraints_stmt = tx
-            .prepare("SELECT text FROM task_constraints WHERE task_id = ?1 ORDER BY position")
-            .map_err(storage)?;
+        let mut constraints_stmt = tx.prepare(sql::CONSTRAINTS_FOR_TASK).map_err(storage)?;
         let constraints = constraints_stmt
             .query_map(params![task_id.0], |row| row.get::<_, String>(0))
             .map_err(storage)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage)?;
-        let mut obligations_stmt = tx
-            .prepare("SELECT obligation_id, criterion_id, applicability, execution FROM obligations WHERE task_id = ?1")
-            .map_err(storage)?;
+        let mut obligations_stmt = tx.prepare(sql::OBLIGATIONS_FOR_TASK).map_err(storage)?;
         let obligations = obligations_stmt
             .query_map(params![task_id.0], |row| {
                 Ok(Obligation {
@@ -932,9 +869,7 @@ impl TaskStore {
             .map_err(storage)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage)?;
-        let mut attempts_stmt = tx
-            .prepare("SELECT attempt_id, action_id, effect_class, state FROM attempts WHERE task_id = ?1")
-            .map_err(storage)?;
+        let mut attempts_stmt = tx.prepare(sql::ATTEMPTS_FOR_TASK).map_err(storage)?;
         let attempts = attempts_stmt
             .query_map(params![task_id.0], |row| {
                 Ok(AttemptRef {
@@ -992,22 +927,15 @@ impl TaskStore {
         task_id: &TaskId,
     ) -> Result<Option<Vec<Blocker>>> {
         let lifecycle: String = tx
-            .query_row(
-                "SELECT lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get(0),
-            )
+            .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
             .map_err(storage)?;
         let mut blockers = Vec::new();
         match lifecycle.as_str() {
             "waiting" => {
                 let pending: Option<(String, u64)> = tx
-                    .query_row(
-                        "SELECT question_id, revision FROM questions WHERE task_id = ?1 AND state = 'pending'
-                         ORDER BY revision DESC LIMIT 1",
-                        params![task_id.0],
-                        |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
-                    )
+                    .query_row(sql::PENDING_QUESTION, params![task_id.0], |row| {
+                        Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+                    })
                     .optional()
                     .map_err(storage)?;
                 if let Some((question_id, revision)) = pending {
@@ -1023,11 +951,9 @@ impl TaskStore {
             }
             "blocked" => {
                 let unresolved: u64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved'",
-                        params![task_id.0],
-                        |row| row.get::<_, i64>(0).map(|v| v as u64),
-                    )
+                    .query_row(sql::UNRESOLVED_OBLIGATIONS, params![task_id.0], |row| {
+                        row.get::<_, i64>(0).map(|v| v as u64)
+                    })
                     .map_err(storage)?;
                 if unresolved > 0 {
                     blockers.push(Blocker {
@@ -1041,11 +967,9 @@ impl TaskStore {
                     });
                 }
                 let unknown: u64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM attempts WHERE task_id = ?1 AND state = 'unknown'",
-                        params![task_id.0],
-                        |row| row.get::<_, i64>(0).map(|v| v as u64),
-                    )
+                    .query_row(sql::UNKNOWN_ATTEMPTS, params![task_id.0], |row| {
+                        row.get::<_, i64>(0).map(|v| v as u64)
+                    })
                     .map_err(storage)?;
                 if unknown > 0 {
                     blockers.push(Blocker {
@@ -1076,12 +1000,7 @@ impl TaskStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Page<crate::contracts::TaskStatus>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT task_id, revision, intent_revision, lifecycle FROM tasks WHERE session_id = ?1 ORDER BY rowid",
-            )
-            .map_err(storage)?;
+        let mut stmt = self.conn.prepare(sql::TASKS_FOR_SESSION).map_err(storage)?;
         let items = stmt
             .query_map(params![session_id.0], |row| {
                 Ok(crate::contracts::TaskStatus {
@@ -1107,10 +1026,10 @@ impl TaskStore {
         if let Some(generation) = cursor_gen
             && generation != snapshot.revision
         {
-            return Err(StoreError::Conflict(format!(
-                "cursor generation {generation} does not match snapshot generation {}",
-                snapshot.revision
-            )));
+            return Err(StoreError::Conflict(ConflictCause::CursorGeneration {
+                expected: generation,
+                current: snapshot.revision,
+            }));
         }
         let generation = snapshot.revision;
         let items: Vec<Value> = match collection {
@@ -1139,8 +1058,8 @@ impl TaskStore {
                 .map(|a| serde_json::to_value(a).unwrap_or(Value::Null))
                 .collect(),
             other => {
-                return Err(StoreError::InvalidInput(format!(
-                    "unknown collection {other}"
+                return Err(StoreError::InvalidInput(InvalidCause::UnknownCollection(
+                    other.to_string(),
                 )));
             }
         };
@@ -1158,8 +1077,7 @@ impl TaskStore {
         let attempt_id = AttemptId::generate().0;
         self.conn
             .execute(
-                "INSERT INTO attempts (attempt_id, task_id, action_id, effect_class, describe, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'planned')",
+                sql::INSERT_ATTEMPT,
                 params![
                     attempt_id,
                     task_id.0,
@@ -1180,13 +1098,10 @@ impl TaskStore {
     ) -> Result<()> {
         let changed = self
             .conn
-            .execute(
-                "UPDATE attempts SET state = ?2, detail = ?3 WHERE attempt_id = ?1",
-                params![attempt_id, state, detail],
-            )
+            .execute(sql::UPDATE_ATTEMPT, params![attempt_id, state, detail])
             .map_err(storage)?;
         if changed == 0 {
-            return Err(StoreError::NotFound(format!("attempt {attempt_id}")));
+            return Err(StoreError::missing_attempt(attempt_id));
         }
         Ok(())
     }
@@ -1194,11 +1109,7 @@ impl TaskStore {
     pub fn attempt_state(&self, attempt_id: &str) -> Result<Option<String>> {
         let state = self
             .conn
-            .query_row(
-                "SELECT state FROM attempts WHERE attempt_id = ?1",
-                params![attempt_id],
-                |row| row.get(0),
-            )
+            .query_row(sql::ATTEMPT_STATE, params![attempt_id], |row| row.get(0))
             .optional()
             .map_err(storage)?;
         Ok(state)
@@ -1212,17 +1123,13 @@ impl TaskStore {
     ) -> Result<Option<(String, String, Option<String>)>> {
         let record = self
             .conn
-            .query_row(
-                "SELECT task_id, state, detail FROM attempts WHERE attempt_id = ?1",
-                params![attempt_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
+            .query_row(sql::ATTEMPT_RECORD, params![attempt_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
             .optional()
             .map_err(storage)?;
         Ok(record)
@@ -1233,12 +1140,9 @@ impl TaskStore {
     pub fn latest_unresolved_attempt(&self, task_id: &TaskId) -> Result<Option<String>> {
         let attempt_id = self
             .conn
-            .query_row(
-                "SELECT attempt_id FROM attempts WHERE task_id = ?1 AND state IN ('running', 'unknown')
-                 ORDER BY rowid DESC LIMIT 1",
-                params![task_id.0],
-                |row| row.get(0),
-            )
+            .query_row(sql::LATEST_UNRESOLVED_ATTEMPT, params![task_id.0], |row| {
+                row.get(0)
+            })
             .optional()
             .map_err(storage)?;
         Ok(attempt_id)
@@ -1263,25 +1167,19 @@ impl TaskStore {
     pub fn goal_bytes(&self, task_id: &TaskId) -> Result<Vec<u8>> {
         let bytes = self
             .conn
-            .query_row(
-                "SELECT goal_bytes FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get(0),
-            )
+            .query_row(sql::GOAL_BYTES, params![task_id.0], |row| row.get(0))
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         Ok(bytes)
     }
 
     pub fn obligations_count(&self, task_id: &TaskId) -> Result<usize> {
         let count = self
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM obligations WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get::<_, i64>(0).map(|v| v as usize),
-            )
+            .query_row(sql::OBLIGATION_COUNT, params![task_id.0], |row| {
+                row.get::<_, i64>(0).map(|v| v as usize)
+            })
             .map_err(storage)?;
         Ok(count)
     }
@@ -1290,12 +1188,12 @@ impl TaskStore {
     pub fn answered_question(&self, task_id: &TaskId) -> Result<Option<(String, String)>> {
         let row = self
             .conn
-            .query_row(
-                "SELECT answer_json, answered_origin FROM questions WHERE task_id = ?1 AND state = 'answered'
-                 ORDER BY rowid DESC LIMIT 1",
-                params![task_id.0],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
+            .query_row(sql::ANSWERED_QUESTION, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
             .optional()
             .map_err(storage)?;
         Ok(row.and_then(|(answer, origin)| Some((answer?, origin?))))
@@ -1312,26 +1210,29 @@ impl TaskStore {
         let obligation_id: String = self
             .conn
             .query_row(
-                "SELECT obligation_id FROM obligations WHERE task_id = ?1 ORDER BY rowid LIMIT 1 OFFSET ?2",
+                sql::OBLIGATION_AT_OFFSET,
                 params![task_id.0, obligation_index as i64],
                 |row| row.get(0),
             )
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound("obligation".into()))?;
+            .ok_or_else(StoreError::missing_obligation)?;
         let evidence_id = EvidenceId::generate().0;
         self.conn
             .execute(
-                "INSERT INTO evidence (evidence_id, task_id, scope, observation, digest, validity, obligation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'current', ?6)",
-                params![evidence_id, task_id.0, scope, observation, digest, obligation_id],
+                sql::INSERT_EVIDENCE,
+                params![
+                    evidence_id,
+                    task_id.0,
+                    scope,
+                    observation,
+                    digest,
+                    obligation_id
+                ],
             )
             .map_err(storage)?;
         self.conn
-            .execute(
-                "UPDATE obligations SET execution = 'satisfied' WHERE obligation_id = ?1",
-                params![obligation_id],
-            )
+            .execute(sql::SATISFY_OBLIGATION, params![obligation_id])
             .map_err(storage)?;
         Ok(evidence_id)
     }
@@ -1339,34 +1240,21 @@ impl TaskStore {
     pub fn invalidate_evidence(&mut self, evidence_id: &str) -> Result<String> {
         let obligation_id: String = self
             .conn
-            .query_row(
-                "UPDATE evidence SET validity = 'stale' WHERE evidence_id = ?1 RETURNING obligation_id",
-                params![evidence_id],
-                |row| row.get(0),
-            )
+            .query_row(sql::STALE_EVIDENCE, params![evidence_id], |row| row.get(0))
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("evidence {evidence_id}")))?;
+            .ok_or_else(|| StoreError::missing_evidence(evidence_id))?;
         self.conn
-            .execute(
-                "UPDATE obligations SET applicability = 'unresolved', execution = 'stale' WHERE obligation_id = ?1",
-                params![obligation_id],
-            )
+            .execute(sql::STALE_OBLIGATION, params![obligation_id])
             .map_err(storage)?;
         let task_id: String = self
             .conn
-            .query_row(
-                "SELECT task_id FROM obligations WHERE obligation_id = ?1",
-                params![obligation_id],
-                |row| row.get(0),
-            )
+            .query_row(sql::TASK_ID_FOR_OBLIGATION, params![obligation_id], |row| {
+                row.get(0)
+            })
             .map_err(storage)?;
         self.conn
-            .execute(
-                "UPDATE tasks SET revision = revision + 1, lifecycle = 'blocked', event_cursor = event_cursor + 1
-                 WHERE task_id = ?1 AND lifecycle != 'cancelled'",
-                params![task_id],
-            )
+            .execute(sql::BLOCK_TASK_NOT_CANCELLED, params![task_id])
             .map_err(storage)?;
         Ok(task_id)
     }
@@ -1374,11 +1262,9 @@ impl TaskStore {
     pub fn evidence_validity(&self, evidence_id: &str) -> Result<Option<String>> {
         let validity = self
             .conn
-            .query_row(
-                "SELECT validity FROM evidence WHERE evidence_id = ?1",
-                params![evidence_id],
-                |row| row.get(0),
-            )
+            .query_row(sql::EVIDENCE_VALIDITY, params![evidence_id], |row| {
+                row.get(0)
+            })
             .optional()
             .map_err(storage)?;
         Ok(validity)
@@ -1388,11 +1274,7 @@ impl TaskStore {
     /// reconciles it; the snapshot carries an outcome_unknown blocker.
     pub fn mark_outcome_unknown(&mut self, task_id: &TaskId) -> Result<()> {
         self.conn
-            .execute(
-                "UPDATE tasks SET revision = revision + 1, lifecycle = 'blocked', event_cursor = event_cursor + 1
-                 WHERE task_id = ?1 AND lifecycle NOT IN ('completed', 'cancelled')",
-                params![task_id.0],
-            )
+            .execute(sql::BLOCK_TASK_OPEN, params![task_id.0])
             .map_err(storage)?;
         Ok(())
     }
@@ -1401,10 +1283,7 @@ impl TaskStore {
     pub fn materialize_obligations(&mut self, task_id: &TaskId) -> Result<()> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT criterion_id FROM criteria WHERE task_id = ?1 AND criterion_id NOT IN
-                 (SELECT criterion_id FROM obligations WHERE task_id = ?1)",
-            )
+            .prepare(sql::MISSING_OBLIGATIONS)
             .map_err(storage)?;
         let missing: Vec<String> = stmt
             .query_map(params![task_id.0], |row| row.get(0))
@@ -1415,8 +1294,7 @@ impl TaskStore {
         for criterion_id in missing {
             self.conn
                 .execute(
-                    "INSERT INTO obligations (obligation_id, task_id, criterion_id, applicability, execution)
-                     VALUES (?1, ?2, ?3, 'required', 'pending')",
+                    sql::INSERT_OBLIGATION,
                     params![EvidenceId::generate().0, task_id.0, criterion_id],
                 )
                 .map_err(storage)?;
@@ -1433,61 +1311,50 @@ impl TaskStore {
     ) -> Result<TaskSnapshot> {
         let tx = self.conn.transaction().map_err(storage)?;
         let lifecycle: String = tx
-            .query_row(
-                "SELECT lifecycle FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get(0),
-            )
+            .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
             .optional()
             .map_err(storage)?
-            .ok_or_else(|| StoreError::NotFound(format!("task {}", task_id.0)))?;
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
         if Lifecycle::from_db(&lifecycle).is_terminal() {
-            return Err(StoreError::Conflict("task is already terminal".into()));
+            return Err(StoreError::Conflict(ConflictCause::TaskAlreadyTerminal));
         }
         let (unsatisfied, unresolved, unknown): (u64, u64, u64) = tx
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND execution != 'satisfied'),
-                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved'),
-                    (SELECT COUNT(*) FROM attempts WHERE task_id = ?1 AND state = 'unknown')",
-                params![task_id.0],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64)),
-            )
+            .query_row(sql::COMPLETION_COUNTS, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
             .map_err(storage)?;
         if unsatisfied > 0 || unresolved > 0 || unknown > 0 {
-            tx.execute(
-                "UPDATE tasks SET lifecycle = 'waiting' WHERE task_id = ?1 AND lifecycle = 'running'",
-                params![task_id.0],
-            )
-            .map_err(storage)?;
+            tx.execute(sql::PAUSE_RUNNING_TASK, params![task_id.0])
+                .map_err(storage)?;
             Self::snapshot_in_tx(&tx, task_id)?;
             tx.commit().map_err(storage)?;
-            return Err(StoreError::Conflict(format!(
-                "completion rejected: {unsatisfied} unsatisfied, {unresolved} unresolved, {unknown} unknown"
-            )));
+            return Err(StoreError::Conflict(ConflictCause::CompletionOpen {
+                unsatisfied,
+                unresolved,
+                unknown,
+            }));
         }
         let stale: u64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM evidence e JOIN obligations o ON o.obligation_id = e.obligation_id
-                 WHERE o.task_id = ?1 AND e.validity = 'stale'",
-                params![task_id.0],
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
-            )
+            .query_row(sql::STALE_EVIDENCE_COUNT, params![task_id.0], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })
             .map_err(storage)?;
         if stale > 0 {
-            return Err(StoreError::Conflict(format!(
-                "completion rejected: {stale} stale evidence"
-            )));
+            return Err(StoreError::Conflict(ConflictCause::CompletionStale {
+                stale,
+            }));
         }
         let revision: u64 = tx
-            .query_row(
-                "SELECT revision FROM tasks WHERE task_id = ?1",
-                params![task_id.0],
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
-            )
+            .query_row(sql::TASK_REVISION, params![task_id.0], |row| {
+                row.get::<_, i64>(0).map(|v| v as u64)
+            })
             .map_err(storage)?;
         tx.execute(
-            "UPDATE tasks SET revision = ?2, lifecycle = 'completed', event_cursor = event_cursor + 1 WHERE task_id = ?1",
+            sql::COMPLETE_TASK,
             params![task_id.0, (revision + 1) as i64],
         )
         .map_err(storage)?;
@@ -1509,10 +1376,7 @@ impl TaskStore {
 
     pub fn retain(&mut self, record_json: &str, boundary_id: &str) -> Result<()> {
         self.conn
-            .execute(
-                "INSERT OR REPLACE INTO retained (boundary_id, record_json) VALUES (?1, ?2)",
-                params![boundary_id, record_json],
-            )
+            .execute(sql::UPSERT_RETAINED, params![boundary_id, record_json])
             .map_err(storage)?;
         Ok(())
     }
@@ -1520,11 +1384,7 @@ impl TaskStore {
     pub fn retained(&self, boundary_id: &str) -> Result<Option<String>> {
         let record = self
             .conn
-            .query_row(
-                "SELECT record_json FROM retained WHERE boundary_id = ?1",
-                params![boundary_id],
-                |row| row.get(0),
-            )
+            .query_row(sql::RETAINED_BY_ID, params![boundary_id], |row| row.get(0))
             .optional()
             .map_err(storage)?;
         Ok(record)
@@ -1548,6 +1408,21 @@ fn goal_artifact_id(task_id: &TaskId) -> String {
     format!("goal-{}", task_id.0)
 }
 
+const ASK_PROMPT: &str = "Which form should we use?";
+const ASK_BRIEF_LABEL: &str = "Brief answer";
+const ASK_BRIEF_CONSEQUENCES: &str = "The essentials without a breakdown.";
+const ASK_STEPS_LABEL: &str = "Step-by-step";
+const ASK_STEPS_CONSEQUENCES: &str = "Sequential steps with an explanation of each.";
+const ASK_WORKED_LABEL: &str = "Worked example";
+const ASK_WORKED_CONSEQUENCES: &str = "A full example from the given conditions to the result.";
+const ASK_COMPARE_LABEL: &str = "Compare options";
+const ASK_COMPARE_CONSEQUENCES: &str = "A table of trade-offs.";
+const ASK_DIAGRAM_LABEL: &str = "Diagram";
+const ASK_DIAGRAM_CONSEQUENCES: &str = "A visual structure diagram.";
+const ASK_DIAGRAM_DISABLED: &str = "no useful diagram for this topic";
+const ASK_RECOMMENDATION: &str =
+    "the request does not need a detailed breakdown; the brief form meets the criterion.";
+
 impl Question {
     pub fn fixture(task_id: &TaskId, intent_revision: u64) -> Self {
         let option = |id: &str, label: &str, consequences: &str, availability: Availability| {
@@ -1563,44 +1438,43 @@ impl Question {
             question_revision: 1,
             task_id: task_id.clone(),
             intent_revision,
-            prompt: "Какую форму использовать?".to_string(),
+            prompt: ASK_PROMPT.to_string(),
             options: vec![
                 option(
                     "brief",
-                    "Краткий ответ",
-                    "Самое существенное без разбора.",
+                    ASK_BRIEF_LABEL,
+                    ASK_BRIEF_CONSEQUENCES,
                     Availability::Enabled,
                 ),
                 option(
                     "steps",
-                    "Пошаговый разбор",
-                    "Последовательные шаги с пояснением каждого.",
+                    ASK_STEPS_LABEL,
+                    ASK_STEPS_CONSEQUENCES,
                     Availability::Enabled,
                 ),
                 option(
                     "worked",
-                    "Разбор на примере",
-                    "Полный пример от условия к результату.",
+                    ASK_WORKED_LABEL,
+                    ASK_WORKED_CONSEQUENCES,
                     Availability::Enabled,
                 ),
                 option(
                     "compare",
-                    "Сравнение вариантов",
-                    "Таблица плюсов и минусов подходов.",
+                    ASK_COMPARE_LABEL,
+                    ASK_COMPARE_CONSEQUENCES,
                     Availability::Enabled,
                 ),
                 option(
                     "diagram",
-                    "Схема",
-                    "Наглядная схема структуры.",
+                    ASK_DIAGRAM_LABEL,
+                    ASK_DIAGRAM_CONSEQUENCES,
                     Availability::Disabled {
-                        reason: "для этой темы нет полезной схемы".to_string(),
+                        reason: ASK_DIAGRAM_DISABLED.to_string(),
                     },
                 ),
             ],
             recommended_option_id: OptionId("brief".to_string()),
-            recommendation_basis:
-                "запрос не требует детального разбора; краткая форма отвечает критерию.".to_string(),
+            recommendation_basis: ASK_RECOMMENDATION.to_string(),
         }
     }
 }

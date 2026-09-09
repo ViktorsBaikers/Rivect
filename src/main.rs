@@ -10,6 +10,24 @@ use std::path::{Path, PathBuf};
 
 const USAGE: &str = "rivect [--tui fullscreen] [--no-mouse] [--headless] [--data-root PATH]";
 
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("unsupported render mode in this build: {mode}")]
+    UnsupportedRenderMode { mode: String },
+    #[error("missing value for --data-root")]
+    MissingDataRoot,
+    #[error("unknown flag {flag}")]
+    UnknownFlag { flag: String },
+    #[error("owner election failed: {0}")]
+    Owner(#[source] rivect::owner::OwnerError),
+    #[error("tui failed: {0}")]
+    Tui(#[source] io::Error),
+    #[error("stdin failed: {0}")]
+    Stdin(#[source] io::Error),
+    #[error("stdout failed: {0}")]
+    Stdout(#[source] io::Error),
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut headless = false;
@@ -21,7 +39,7 @@ fn main() {
             "--tui" => {
                 let mode = iter.next().unwrap_or_default();
                 if mode != "fullscreen" {
-                    eprintln!("unsupported render mode in this build: {mode}");
+                    eprintln!("{}", CliError::UnsupportedRenderMode { mode });
                     std::process::exit(2);
                 }
             }
@@ -29,13 +47,18 @@ fn main() {
             "--headless" => headless = true,
             "--data-root" => {
                 let Some(root) = iter.next() else {
-                    eprintln!("{USAGE}");
+                    eprintln!("{}\n{USAGE}", CliError::MissingDataRoot);
                     std::process::exit(2);
                 };
                 data_root = PathBuf::from(root);
             }
-            other => {
-                eprintln!("unknown flag {other}\n{USAGE}");
+            flag => {
+                eprintln!(
+                    "{}\n{USAGE}",
+                    CliError::UnknownFlag {
+                        flag: flag.to_string(),
+                    }
+                );
                 std::process::exit(2);
             }
         }
@@ -44,8 +67,8 @@ fn main() {
     if !headless && is_tty {
         match rivect::ui::run_tui() {
             Ok(code) => std::process::exit(code),
-            Err(err) => {
-                eprintln!("tui failed: {err}");
+            Err(source) => {
+                eprintln!("{}", CliError::Tui(source));
                 std::process::exit(1);
             }
         }
@@ -66,8 +89,8 @@ fn default_data_root() -> PathBuf {
 fn run_headless(data_root: &Path) -> i32 {
     let mut runtime = match Runtime::open(data_root, Box::new(LoopbackProvider::new())) {
         Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("owner election failed: {err}");
+        Err(source) => {
+            eprintln!("{}", CliError::Owner(source));
             return 1;
         }
     };
@@ -79,8 +102,8 @@ fn run_headless(data_root: &Path) -> i32 {
         match reader.read_line(&mut line) {
             Ok(0) => return 0,
             Ok(_) => {}
-            Err(err) => {
-                eprintln!("stdin failed: {err}");
+            Err(source) => {
+                eprintln!("{}", CliError::Stdin(source));
                 return 1;
             }
         }
@@ -90,10 +113,8 @@ fn run_headless(data_root: &Path) -> i32 {
         }
         let response = dispatch_runtime_request(&mut runtime, Ingress::Machine, "stdio-1", request);
         let mut stdout = io::stdout().lock();
-        if writeln!(stdout, "{response}")
-            .and_then(|_| stdout.flush())
-            .is_err()
-        {
+        if let Err(source) = writeln!(stdout, "{response}").and_then(|_| stdout.flush()) {
+            eprintln!("{}", CliError::Stdout(source));
             return 1;
         }
     }

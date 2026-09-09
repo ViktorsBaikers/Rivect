@@ -13,6 +13,12 @@ pub enum LocalKind {
     Unknown,
 }
 
+const BUSY_READ: &str = "READ";
+const BUSY_UNAVAILABLE: &str = "UNAVAILABLE";
+const READ_FILE_DESCRIPTION: &str = "One admitted file read in the current scope.";
+const PLANNED_COMMAND_DESCRIPTION: &str = "A planned command in this catalog.";
+const UNAVAILABLE_REASON: &str = "known command without a handler in this build";
+
 const PLANNED_LOCAL_KINDS: &[&str] = &[
     "session.new",
     "session.list",
@@ -67,12 +73,16 @@ fn descriptor(
         canonical_id: canonical_id.to_string(),
         aliases: aliases.iter().map(|a| a.to_string()).collect(),
         description: description.to_string(),
-        busy_policy: if available { "READ" } else { "UNAVAILABLE" }.to_string(),
+        busy_policy: if available {
+            BUSY_READ.to_string()
+        } else {
+            BUSY_UNAVAILABLE.to_string()
+        },
         available,
         unavailability_reason: if available {
             None
         } else {
-            Some("known command without a handler in this build".to_string())
+            Some(UNAVAILABLE_REASON.to_string())
         },
     }
 }
@@ -83,16 +93,11 @@ pub fn describe() -> Page<CommandDescriptor> {
     let mut items = vec![descriptor(
         "read_file",
         &["read"],
-        "Одно разрешённое чтение файла в действующей области.",
+        READ_FILE_DESCRIPTION,
         true,
     )];
     for kind in PLANNED_LOCAL_KINDS {
-        items.push(descriptor(
-            kind,
-            &[],
-            "Запланированная команда этого каталога.",
-            false,
-        ));
+        items.push(descriptor(kind, &[], PLANNED_COMMAND_DESCRIPTION, false));
     }
     Page::new(items, 0)
 }

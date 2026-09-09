@@ -13,17 +13,17 @@ pub struct Grant {
     pub revoked: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum PolicyError {
-    Denied(String),
-}
-
-impl std::fmt::Display for PolicyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Denied(why) => write!(f, "denied: {why}"),
-        }
-    }
+    #[error("unknown grant {grant_id}")]
+    UnknownGrant { grant_id: String },
+    #[error("grant {grant_id} revoked")]
+    Revoked { grant_id: String },
+    #[error("grant {grant_id} does not admit {class:?} effects")]
+    ClassNotAdmitted {
+        grant_id: String,
+        class: EffectClass,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -64,14 +64,19 @@ impl Policy {
         let grant = self
             .grants
             .get(grant_id)
-            .ok_or_else(|| PolicyError::Denied(format!("unknown grant {grant_id}")))?;
+            .ok_or_else(|| PolicyError::UnknownGrant {
+                grant_id: grant_id.to_string(),
+            })?;
         if grant.revoked {
-            return Err(PolicyError::Denied(format!("grant {grant_id} revoked")));
+            return Err(PolicyError::Revoked {
+                grant_id: grant_id.to_string(),
+            });
         }
         if !grant.classes.contains(&class) {
-            return Err(PolicyError::Denied(format!(
-                "grant {grant_id} does not admit {class:?} effects"
-            )));
+            return Err(PolicyError::ClassNotAdmitted {
+                grant_id: grant_id.to_string(),
+                class,
+            });
         }
         Ok(grant)
     }

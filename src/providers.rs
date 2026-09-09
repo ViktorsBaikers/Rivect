@@ -17,11 +17,16 @@ pub struct ProviderReply {
     pub tool_calls: Vec<ToolCall>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProviderError {
-    CapabilityUnavailable(String),
-    Transport(String),
+    #[error("provider capability unavailable: model references unknown connection")]
+    UnknownConnection,
+    #[error("provider capability unavailable: {kind} connection requires a separate live grant")]
+    LiveGrantRequired { kind: ConnKind },
 }
+
+const ADMITTED_READ: &str = "performing the admitted read";
+const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision";
 
 pub trait Provider: Send {
     fn name(&self) -> &'static str;
@@ -65,14 +70,14 @@ impl Provider for LoopbackProvider {
             .find_map(|line| line.strip_prefix("read ").map(str::to_string));
         match path {
             Some(path) => Ok(ProviderReply {
-                text: "Выполняю разрешённое чтение.".to_string(),
+                text: ADMITTED_READ.to_string(),
                 tool_calls: vec![ToolCall {
                     tool: "read_file".to_string(),
                     path: Some(path),
                 }],
             }),
             None => Ok(ProviderReply {
-                text: "Нет разрешённого действия; ожидаю решение.".to_string(),
+                text: WAITING_FOR_DECISION.to_string(),
                 tool_calls: Vec::new(),
             }),
         }
@@ -87,12 +92,8 @@ pub fn offline_eligible(
 ) -> Result<(), ProviderError> {
     match (model, connection_kind) {
         (ModelAssign::Fixed(_), Some(ConnKind::Local)) => Ok(()),
-        (ModelAssign::Fixed(_), Some(kind)) => Err(ProviderError::CapabilityUnavailable(format!(
-            "{kind:?} connection requires a separate live grant"
-        ))),
-        (ModelAssign::Fixed(_), None) => Err(ProviderError::CapabilityUnavailable(
-            "model references unknown connection".to_string(),
-        )),
+        (ModelAssign::Fixed(_), Some(kind)) => Err(ProviderError::LiveGrantRequired { kind }),
+        (ModelAssign::Fixed(_), None) => Err(ProviderError::UnknownConnection),
         _ => Ok(()),
     }
 }
