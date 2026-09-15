@@ -5,12 +5,14 @@
 use crate::contracts::{
     AnswerSelection, ArtifactRef, AttachmentId, AttemptId, AttemptRef, AttemptState, Availability,
     Blocker, CommandResult, Criterion, CriterionId, ErrorCode, Event, EventId, EvidenceId,
-    Lifecycle, Obligation, ObligationApplicability, ObligationExecution, OptionId, Page, Question,
-    QuestionId, QuestionOption, ResumeCondition, SessionId, TaskId, TaskSnapshot,
+    KNOWN_READY_OPTION, Lifecycle, Obligation, ObligationApplicability, ObligationExecution,
+    OptionId, Page, Question, QuestionId, QuestionOption, ResumeCondition, SchedulerItem,
+    SessionId, TaskId, TaskSnapshot, TodoItem,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 mod sql;
@@ -39,6 +41,12 @@ pub enum ConflictCause {
     QuestionOnLifecycle { lifecycle: String },
     #[error("a pending question already exists")]
     PendingQuestionExists,
+    #[error("event {event_id} is not present in the owner store")]
+    EventNotFound { event_id: String },
+    #[error("event {event_id} conflicts with the owner store")]
+    EventConflict { event_id: String },
+    #[error("event {event_id} belongs to another session")]
+    EventSessionMismatch { event_id: String },
     #[error("question is no longer pending")]
     QuestionNotPending,
     #[error("question revision {expected} is not the current revision {current}")]
@@ -88,8 +96,11 @@ pub enum InvalidCause {
     },
     #[error("attempt {attempt_id} carries no read-performed marker")]
     MissingReadMarker { attempt_id: String },
+    #[error("page cursor offset is out of range")]
+    CursorOffsetOutOfRange,
+    #[error("event cursor is out of range")]
+    EventCursorOutOfRange,
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("not found: {0}")]
@@ -149,6 +160,27 @@ fn storage(err: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::Storage(Box::new(err))
 }
 
+fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+    Ok(Event {
+        schema_version: 1,
+        event_id: EventId(row.get(0)?),
+        aggregate_id: row.get(1)?,
+        aggregate_revision: row.get::<_, i64>(2)? as u64,
+        cursor: row.get::<_, i64>(3)? as u64,
+        session_id: SessionId(row.get(4)?),
+        task_id: row.get::<_, Option<String>>(5)?.map(TaskId),
+        event_type: row.get(6)?,
+        delta: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(source),
+            )
+        })?,
+        origin: row.get(8)?,
+    })
+}
+
 pub struct TaskStore {
     conn: Connection,
 }
@@ -162,6 +194,44 @@ impl TaskStore {
             .map_err(storage)?;
         conn.execute_batch(sql::SCHEMA).map_err(storage)?;
         Ok(Self { conn })
+    }
+
+    pub fn recover_events(&mut self, session_id: &SessionId, events: &[Event]) -> Result<()> {
+        let tx = self.conn.transaction().map_err(storage)?;
+        let mut applied = BTreeSet::new();
+        for event in events {
+            if event.session_id != *session_id {
+                return Err(StoreError::Conflict(ConflictCause::EventSessionMismatch {
+                    event_id: event.event_id.0.clone(),
+                }));
+            }
+            let canonical = tx
+                .query_row(
+                    sql::EVENT_BY_AGGREGATE_REVISION,
+                    params![event.aggregate_id, event.aggregate_revision as i64],
+                    event_from_row,
+                )
+                .optional()
+                .map_err(storage)?
+                .ok_or_else(|| {
+                    StoreError::Conflict(ConflictCause::EventNotFound {
+                        event_id: event.event_id.0.clone(),
+                    })
+                })?;
+            if canonical != *event {
+                return Err(StoreError::Conflict(ConflictCause::EventConflict {
+                    event_id: event.event_id.0.clone(),
+                }));
+            }
+            if !applied.insert((event.aggregate_id.clone(), event.aggregate_revision)) {
+                continue;
+            }
+            if let Some(task_id) = &event.task_id {
+                tx.execute(sql::REPLAY_TODO_PROJECTION, params![task_id.0])
+                    .map_err(storage)?;
+            }
+        }
+        tx.commit().map_err(storage)
     }
 
     // ----- sessions -----
@@ -315,12 +385,14 @@ impl TaskStore {
         after: u64,
         limit: u32,
     ) -> Result<Vec<Event>> {
+        let after = i64::try_from(after)
+            .map_err(|_conversion| StoreError::InvalidInput(InvalidCause::EventCursorOutOfRange))?;
         let (query, args): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(id) = task_id {
             (
                 sql::EVENTS_AFTER_FOR_TASK,
                 vec![
                     Box::new(session_id.0.clone()),
-                    Box::new(after as i64),
+                    Box::new(after),
                     Box::new(id.0.clone()),
                     Box::new(limit as i64),
                 ],
@@ -330,27 +402,14 @@ impl TaskStore {
                 sql::EVENTS_AFTER,
                 vec![
                     Box::new(session_id.0.clone()),
-                    Box::new(after as i64),
+                    Box::new(after),
                     Box::new(limit as i64),
                 ],
             )
         };
         let mut stmt = self.conn.prepare(query).map_err(storage)?;
         let rows = stmt
-            .query_map(params_from_iter(args.iter()), |row| {
-                Ok(Event {
-                    schema_version: 1,
-                    event_id: EventId(row.get(0)?),
-                    aggregate_id: row.get(1)?,
-                    aggregate_revision: row.get::<_, i64>(2)? as u64,
-                    cursor: row.get::<_, i64>(3)? as u64,
-                    session_id: SessionId(row.get(4)?),
-                    task_id: row.get::<_, Option<String>>(5)?.map(TaskId),
-                    event_type: row.get(6)?,
-                    delta: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or(Value::Null),
-                    origin: row.get(8)?,
-                })
-            })
+            .query_map(params_from_iter(args.iter()), event_from_row)
             .map_err(storage)?;
         let mut out = Vec::new();
         for row in rows {
@@ -408,7 +467,9 @@ impl TaskStore {
         if goal.is_empty() || goal.len() > crate::contracts::TEXT_MAX_BYTES {
             return Err(StoreError::InvalidInput(InvalidCause::EmptyGoal));
         }
-        let params_digest = format!("create|{principal}|{goal}|{}", criteria.join("\u{1}"));
+        let params_digest =
+            serde_json::to_string(&(&session_id.0, principal, goal, criteria, constraints))
+                .map_err(storage)?;
         if let Some((digest, result_json)) = self.receipt(command_id)? {
             if digest != params_digest {
                 return Err(StoreError::Conflict(ConflictCause::DuplicateCommand {
@@ -462,7 +523,7 @@ impl TaskStore {
         let snapshot = Self::snapshot_in_tx(&tx, &task_id)?;
         let result = CommandResult {
             status: "accepted".to_string(),
-            task_id: task_id.clone(),
+            task_id,
             task_revision: snapshot.revision,
             intent_revision: snapshot.intent_revision,
             event_cursor: 1,
@@ -980,6 +1041,13 @@ impl TaskStore {
                         },
                     });
                 }
+                if blockers.is_empty() {
+                    blockers.push(Blocker {
+                        reason: ErrorCode::DependencyBlocked,
+                        owner: "controller".to_string(),
+                        condition: ResumeCondition::NoReadyAction {},
+                    });
+                }
             }
             _ => {}
         }
@@ -996,34 +1064,317 @@ impl TaskStore {
         Ok(snapshot)
     }
 
+    fn batched_blockers(
+        &self,
+        tasks: &[(TaskId, Lifecycle)],
+    ) -> Result<BTreeMap<String, Vec<Blocker>>> {
+        let mut blockers = BTreeMap::<String, Vec<Blocker>>::new();
+        if tasks.is_empty() {
+            return Ok(blockers);
+        }
+        let task_ids: Vec<String> = tasks.iter().map(|(task_id, _)| task_id.0.clone()).collect();
+        let lifecycles: BTreeMap<String, Lifecycle> = tasks
+            .iter()
+            .map(|(task_id, lifecycle)| (task_id.0.clone(), *lifecycle))
+            .collect();
+        let tx = self.conn.unchecked_transaction().map_err(storage)?;
+
+        let pending_sql = sql::pending_questions_for_tasks(task_ids.len());
+        let mut stmt = tx.prepare(&pending_sql).map_err(storage)?;
+        let rows = stmt
+            .query_map(params_from_iter(task_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(storage)?;
+        for row in rows {
+            let (task_id, question_id, revision) = row.map_err(storage)?;
+            if lifecycles.get(&task_id) != Some(&Lifecycle::Waiting) {
+                continue;
+            }
+            blockers.entry(task_id).or_default().push(Blocker {
+                reason: ErrorCode::DependencyBlocked,
+                owner: "state".to_string(),
+                condition: ResumeCondition::Decision {
+                    question_id: QuestionId(question_id),
+                    revision,
+                },
+            });
+        }
+        drop(stmt);
+
+        let unresolved_sql = sql::unresolved_obligations_for_tasks(task_ids.len());
+        let mut stmt = tx.prepare(&unresolved_sql).map_err(storage)?;
+        let rows = stmt
+            .query_map(params_from_iter(task_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(storage)?;
+        for row in rows {
+            let (task_id, unresolved) = row.map_err(storage)?;
+            if lifecycles.get(&task_id) != Some(&Lifecycle::Blocked) {
+                continue;
+            }
+            blockers.entry(task_id).or_default().push(Blocker {
+                reason: ErrorCode::DependencyBlocked,
+                owner: "state".to_string(),
+                condition: ResumeCondition::Dependency {
+                    action_id: crate::contracts::ActionId(format!("obligations:{unresolved}")),
+                },
+            });
+        }
+        drop(stmt);
+
+        let unknown_sql = sql::unknown_attempts_for_tasks(task_ids.len());
+        let mut stmt = tx.prepare(&unknown_sql).map_err(storage)?;
+        let rows = stmt
+            .query_map(params_from_iter(task_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(storage)?;
+        for row in rows {
+            let (task_id, unknown) = row.map_err(storage)?;
+            if lifecycles.get(&task_id) != Some(&Lifecycle::Blocked) {
+                continue;
+            }
+            blockers.entry(task_id).or_default().push(Blocker {
+                reason: ErrorCode::OutcomeUnknown,
+                owner: "executor".to_string(),
+                condition: ResumeCondition::Reconciliation {
+                    action_id: crate::contracts::ActionId(format!("attempts:{unknown}")),
+                },
+            });
+        }
+        drop(stmt);
+
+        for (task_id, lifecycle) in tasks {
+            if *lifecycle == Lifecycle::Blocked {
+                let entry = blockers.entry(task_id.0.clone()).or_default();
+                if entry.is_empty() {
+                    entry.push(Blocker {
+                        reason: ErrorCode::DependencyBlocked,
+                        owner: "controller".to_string(),
+                        condition: ResumeCondition::NoReadyAction {},
+                    });
+                }
+            }
+        }
+        Ok(blockers)
+    }
+
+    fn status_page_context(
+        &self,
+        session_id: &SessionId,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<(u64, u64)> {
+        let generation: u64 = self
+            .conn
+            .query_row(sql::SESSION_GENERATION, params![session_id.0], |row| {
+                row.get::<_, i64>(0).map(|value| value as u64)
+            })
+            .map_err(storage)?;
+        let offset = cursor.map_or(0, |(_, offset)| offset);
+        if let Some((expected, _)) = cursor
+            && expected != generation
+        {
+            return Err(StoreError::Conflict(ConflictCause::CursorGeneration {
+                expected,
+                current: generation,
+            }));
+        }
+        if offset > i64::MAX.unsigned_abs() {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::CursorOffsetOutOfRange,
+            ));
+        }
+        Ok((generation, offset))
+    }
+
+    fn next_page_offset(offset: u64, limit: u32) -> Result<u64> {
+        let next = offset
+            .checked_add(u64::from(limit))
+            .ok_or(StoreError::InvalidInput(
+                InvalidCause::CursorOffsetOutOfRange,
+            ))?;
+        if next > i64::MAX.unsigned_abs() {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::CursorOffsetOutOfRange,
+            ));
+        }
+        Ok(next)
+    }
+
+    fn sql_offset(offset: u64) -> Result<i64> {
+        match i64::try_from(offset) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(StoreError::InvalidInput(
+                InvalidCause::CursorOffsetOutOfRange,
+            )),
+        }
+    }
+
     pub fn task_status_page(
         &self,
         session_id: &SessionId,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
     ) -> Result<Page<crate::contracts::TaskStatus>> {
-        let mut stmt = self.conn.prepare(sql::TASKS_FOR_SESSION).map_err(storage)?;
-        let items = stmt
-            .query_map(params![session_id.0], |row| {
-                Ok(crate::contracts::TaskStatus {
-                    task_id: TaskId(row.get(0)?),
-                    task_revision: row.get::<_, i64>(1)? as u64,
-                    intent_revision: row.get::<_, i64>(2)? as u64,
-                    lifecycle: Lifecycle::from_db(&row.get::<_, String>(3)?),
-                })
-            })
+        let (generation, offset) = self.status_page_context(session_id, cursor)?;
+        let next_offset = Self::next_page_offset(offset, limit)?;
+        let sql_offset = Self::sql_offset(offset)?;
+        let mut stmt = self
+            .conn
+            .prepare(sql::TASKS_FOR_SESSION_PAGE)
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(
+                params![session_id.0, i64::from(limit) + 1, sql_offset],
+                |row| {
+                    Ok((
+                        TaskId(row.get(0)?),
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        Lifecycle::from_db(&row.get::<_, String>(3)?),
+                    ))
+                },
+            )
             .map_err(storage)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage)?;
-        Ok(Page::new(items, 0))
+        drop(stmt);
+        let has_more = rows.len() > limit as usize;
+        let mut rows = rows;
+        rows.truncate(limit as usize);
+        let task_keys: Vec<_> = rows
+            .iter()
+            .map(|(task_id, _, _, lifecycle)| (task_id.clone(), *lifecycle))
+            .collect();
+        let mut blockers = self.batched_blockers(&task_keys)?;
+        let items = rows
+            .into_iter()
+            .map(|(task_id, task_revision, intent_revision, lifecycle)| {
+                Ok(crate::contracts::TaskStatus {
+                    blockers: blockers.remove(&task_id.0),
+                    task_id,
+                    task_revision,
+                    intent_revision,
+                    lifecycle,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut page = Page::new(items, generation);
+        if has_more {
+            page.next_cursor = Some(format!("gen:{generation}:offset:{next_offset}"));
+        }
+        Ok(page)
     }
 
+    fn todo_items(
+        &self,
+        session_id: &SessionId,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<(Vec<TodoItem>, u64, u64, bool)> {
+        let (generation, offset) = self.status_page_context(session_id, cursor)?;
+        let next_offset = Self::next_page_offset(offset, limit)?;
+        let sql_offset = Self::sql_offset(offset)?;
+        let mut stmt = self
+            .conn
+            .prepare(sql::TODO_FOR_SESSION_PAGE)
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(
+                params![session_id.0, i64::from(limit) + 1, sql_offset],
+                |row| {
+                    Ok((
+                        TaskId(row.get(0)?),
+                        row.get::<_, i64>(1)? as u64,
+                        Lifecycle::from_db(&row.get::<_, String>(2)?),
+                    ))
+                },
+            )
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        drop(stmt);
+        let has_more = rows.len() > limit as usize;
+        let mut rows = rows;
+        rows.truncate(limit as usize);
+        let task_keys: Vec<_> = rows
+            .iter()
+            .map(|(task_id, _, lifecycle)| (task_id.clone(), *lifecycle))
+            .collect();
+        let mut blockers = self.batched_blockers(&task_keys)?;
+        let items = rows
+            .into_iter()
+            .map(|(task_id, task_revision, lifecycle)| TodoItem {
+                blockers: blockers.remove(&task_id.0),
+                task_id,
+                task_revision,
+                lifecycle,
+            })
+            .collect();
+        Ok((items, generation, next_offset, has_more))
+    }
+
+    pub fn todo_page(
+        &self,
+        session_id: &SessionId,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<Page<TodoItem>> {
+        let (items, generation, next_offset, has_more) =
+            self.todo_items(session_id, limit, cursor)?;
+        let mut page = Page::new(items, generation);
+        if has_more {
+            page.next_cursor = Some(format!("gen:{generation}:offset:{next_offset}"));
+        }
+        Ok(page)
+    }
+
+    pub fn scheduler_page(
+        &self,
+        session_id: &SessionId,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<Page<SchedulerItem>> {
+        let (todo, generation, next_offset, has_more) =
+            self.todo_items(session_id, limit, cursor)?;
+        let items = todo
+            .into_iter()
+            .map(|item| SchedulerItem {
+                ready: item.lifecycle == Lifecycle::Running && item.blockers.is_none(),
+                task_id: item.task_id,
+                task_revision: item.task_revision,
+                lifecycle: item.lifecycle,
+                blockers: item.blockers,
+            })
+            .collect();
+        let mut page = Page::new(items, generation);
+        if has_more {
+            page.next_cursor = Some(format!("gen:{generation}:offset:{next_offset}"));
+        }
+        Ok(page)
+    }
+
+    /// Paged snapshot collection: the strict cursor `gen:{generation}` /
+    /// `gen:{generation}:offset:{offset}` checks the snapshot revision
+    /// (conflict on mismatch, unchanged behaviour) while `page_size` and
+    /// offset slice the item list. `next_cursor` advances by `page_size`
+    /// while items remain and is absent on the last page; nothing is
+    /// silently discarded.
     pub fn collection(
         &self,
         task_id: &TaskId,
         collection: &str,
-        cursor_gen: Option<u64>,
+        cursor: Option<(u64, u64)>,
+        limit: u32,
     ) -> Result<Page<Value>> {
         let snapshot = self.snapshot(task_id)?;
-        if let Some(generation) = cursor_gen
+        if let Some((generation, _)) = cursor
             && generation != snapshot.revision
         {
             return Err(StoreError::Conflict(ConflictCause::CursorGeneration {
@@ -1063,7 +1414,16 @@ impl TaskStore {
                 )));
             }
         };
-        Ok(Page::new(items, generation))
+        let offset = cursor.map_or(0, |(_, offset)| offset);
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(items.len());
+        let end = start.saturating_add(limit as usize).min(items.len());
+        let mut page = Page::new(items[start..end].to_vec(), generation);
+        if end < items.len() {
+            page.next_cursor = Some(format!("gen:{generation}:offset:{end}"));
+        }
+        Ok(page)
     }
 
     // ----- attempts / effects ledger -----
@@ -1279,6 +1639,13 @@ impl TaskStore {
         Ok(())
     }
 
+    pub fn mark_no_ready(&mut self, task_id: &TaskId) -> Result<()> {
+        self.conn
+            .execute(sql::BLOCK_TASK_OPEN, params![task_id.0])
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// frame_goal contribution: the accepted receipt carries empty
     pub fn materialize_obligations(&mut self, task_id: &TaskId) -> Result<()> {
         let mut stmt = self
@@ -1441,7 +1808,7 @@ impl Question {
             prompt: ASK_PROMPT.to_string(),
             options: vec![
                 option(
-                    "brief",
+                    KNOWN_READY_OPTION,
                     ASK_BRIEF_LABEL,
                     ASK_BRIEF_CONSEQUENCES,
                     Availability::Enabled,
@@ -1473,8 +1840,64 @@ impl Question {
                     },
                 ),
             ],
-            recommended_option_id: OptionId("brief".to_string()),
+            recommended_option_id: OptionId(KNOWN_READY_OPTION.to_string()),
             recommendation_basis: ASK_RECOMMENDATION.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskStore;
+    use crate::contracts::TaskId;
+    use rusqlite::params;
+
+    #[test]
+    fn reopening_store_does_not_rewrite_existing_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("rivect-state-projection-{}", TaskId::generate().0));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("state.db");
+        let task_id = TaskId::generate().0;
+        {
+            let store = TaskStore::open(&path)?;
+            store.conn.execute(
+                "INSERT INTO tasks (task_id, session_id, revision, intent_revision, contract_revision, lifecycle, goal_bytes, goal_digest, goal_artifact_id, event_cursor)
+                 VALUES (?1, ?2, 1, 1, 1, 'running', ?3, ?4, ?5, 0)",
+                params![task_id, "session", vec![b'g'], "digest", "artifact"],
+            )?;
+        }
+        let reopened = TaskStore::open(&path)?;
+        assert_eq!(
+            reopened.conn.total_changes(),
+            0,
+            "opening an in-sync store must not rewrite todo_projection"
+        );
+        let projection_count: i64 = reopened.conn.query_row(
+            "SELECT COUNT(*) FROM todo_projection WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(projection_count, 1);
+        drop(reopened);
+
+        let drifted = TaskStore::open(&path)?;
+        drifted.conn.execute(
+            "DELETE FROM todo_projection WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        drop(drifted);
+        let repaired = TaskStore::open(&path)?;
+        assert_eq!(repaired.conn.total_changes(), 1);
+        let repaired_count: i64 = repaired.conn.query_row(
+            "SELECT COUNT(*) FROM todo_projection WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(repaired_count, 1);
+        drop(repaired);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

@@ -9,11 +9,11 @@ use serde_json::Value;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const TEXT_MAX_BYTES: usize = 65_536;
-pub const LABEL_MAX_BYTES: usize = 256;
 pub const ARRAY_MAX_ITEMS: usize = 200;
 pub const REQUEST_MAX_BYTES: usize = 1 << 20;
 pub const PAGE_DEFAULT: u32 = 20;
 pub const PAGE_MAX: u32 = 200;
+pub const KNOWN_READY_OPTION: &str = "brief";
 
 /// Runtime error codes of the public contract, with JSON-RPC exit semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +245,7 @@ pub enum ResumeCondition {
         question_id: QuestionId,
         revision: u64,
     },
+    NoReadyAction {},
     Dependency {
         action_id: ActionId,
     },
@@ -470,6 +471,27 @@ pub struct TaskStatus {
     pub task_revision: u64,
     pub intent_revision: u64,
     pub lifecycle: Lifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<Vec<Blocker>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TodoItem {
+    pub task_id: TaskId,
+    pub task_revision: u64,
+    pub lifecycle: Lifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<Vec<Blocker>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SchedulerItem {
+    pub task_id: TaskId,
+    pub task_revision: u64,
+    pub lifecycle: Lifecycle,
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<Vec<Blocker>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

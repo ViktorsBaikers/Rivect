@@ -23,6 +23,11 @@ pub const EVENTS_AFTER: &str = "SELECT event_id, aggregate_id, aggregate_revisio
              FROM events WHERE session_id = ?1 AND cursor > ?2 ORDER BY cursor LIMIT ?3";
 pub const EVENTS_AFTER_FOR_TASK: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
              FROM events WHERE session_id = ?1 AND cursor > ?2 AND task_id = ?3 ORDER BY cursor LIMIT ?4";
+pub const EVENT_BY_AGGREGATE_REVISION: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
+             FROM events WHERE aggregate_id = ?1 AND aggregate_revision = ?2";
+pub const REPLAY_TODO_PROJECTION: &str =
+    "INSERT OR REPLACE INTO todo_projection (task_id, revision, lifecycle)
+             SELECT task_id, revision, lifecycle FROM tasks WHERE task_id = ?1";
 pub const RECEIPT_BY_COMMAND: &str =
     "SELECT params_digest, result_json FROM command_receipts WHERE command_id = ?1";
 pub const INSERT_RECEIPT: &str =
@@ -61,8 +66,7 @@ pub const CRITERIA_FOR_TASK: &str =
 pub const CONSTRAINTS_FOR_TASK: &str =
     "SELECT text FROM task_constraints WHERE task_id = ?1 ORDER BY position";
 pub const OBLIGATIONS_FOR_TASK: &str = "SELECT obligation_id, criterion_id, applicability, execution FROM obligations WHERE task_id = ?1";
-pub const ATTEMPTS_FOR_TASK: &str =
-    "SELECT attempt_id, action_id, effect_class, state FROM attempts WHERE task_id = ?1";
+pub const ATTEMPTS_FOR_TASK: &str = "SELECT attempt_id, action_id, effect_class, state FROM attempts WHERE task_id = ?1 ORDER BY rowid";
 pub const PENDING_QUESTION: &str =
     "SELECT question_id, revision FROM questions WHERE task_id = ?1 AND state = 'pending'
                          ORDER BY revision DESC LIMIT 1";
@@ -70,7 +74,43 @@ pub const UNRESOLVED_OBLIGATIONS: &str =
     "SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved'";
 pub const UNKNOWN_ATTEMPTS: &str =
     "SELECT COUNT(*) FROM attempts WHERE task_id = ?1 AND state = 'unknown'";
-pub const TASKS_FOR_SESSION: &str = "SELECT task_id, revision, intent_revision, lifecycle FROM tasks WHERE session_id = ?1 ORDER BY rowid";
+pub const SESSION_GENERATION: &str =
+    "SELECT COALESCE(MAX(revision), 0) FROM tasks WHERE session_id = ?1";
+pub const TASKS_FOR_SESSION_PAGE: &str = "SELECT task_id, revision, intent_revision, lifecycle FROM tasks WHERE session_id = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3";
+pub const TODO_FOR_SESSION_PAGE: &str = "SELECT tp.task_id, tp.revision, tp.lifecycle FROM todo_projection tp JOIN tasks t ON t.task_id = tp.task_id WHERE t.session_id = ?1 ORDER BY t.rowid LIMIT ?2 OFFSET ?3";
+fn task_placeholders(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn pending_questions_for_tasks(count: usize) -> String {
+    format!(
+        "SELECT q.task_id, q.question_id, q.revision FROM questions q
+         WHERE q.task_id IN ({}) AND q.state = 'pending'
+           AND q.rowid = (SELECT latest.rowid FROM questions latest
+                          WHERE latest.task_id = q.task_id AND latest.state = 'pending'
+                          ORDER BY latest.revision DESC LIMIT 1)",
+        task_placeholders(count)
+    )
+}
+
+pub fn unresolved_obligations_for_tasks(count: usize) -> String {
+    format!(
+        "SELECT task_id, COUNT(*) FROM obligations
+         WHERE task_id IN ({}) AND applicability = 'unresolved' GROUP BY task_id",
+        task_placeholders(count)
+    )
+}
+
+pub fn unknown_attempts_for_tasks(count: usize) -> String {
+    format!(
+        "SELECT task_id, COUNT(*) FROM attempts
+         WHERE task_id IN ({}) AND state = 'unknown' GROUP BY task_id",
+        task_placeholders(count)
+    )
+}
 pub const INSERT_ATTEMPT: &str =
     "INSERT INTO attempts (attempt_id, task_id, action_id, effect_class, describe, state)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'planned')";

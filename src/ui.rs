@@ -2,9 +2,13 @@
 //! mouse capture off, terminal restored on exit, cancel and panic. Also owns
 //! the client-side event projection rules.
 
-use crate::contracts::Event;
+use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
+use crate::contracts::{CommandId, Event, TEXT_MAX_BYTES};
+use crate::providers::LoopbackProvider;
 use crossterm::cursor::Show;
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
+use crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -13,22 +17,50 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Constraint;
 use ratatui::widgets::Paragraph;
-use std::io::{self, Stdout};
+use serde_json::{Value, json};
+use std::io::{self, Stdout, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn report_cleanup_error(error: &io::Error) {
+    let message = format!("terminal cleanup failed: {error}\n");
+    let mut stderr = io::stderr().lock();
+    if let Err(write_error) = stderr.write_all(message.as_bytes()) {
+        std::hint::black_box(write_error);
+    }
+}
 
 /// Terminal lifecycle guard. Mouse capture is deliberately never enabled
 /// (D-005 default off so copy-on-select and tmux copy-mode keep working).
 pub struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     previous_hook: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>,
+    restored: bool,
 }
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+            if let Err(cleanup_error) = disable_raw_mode() {
+                report_cleanup_error(&cleanup_error);
+            }
+            return Err(error);
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let mut out = io::stdout();
+                if let Err(cleanup_error) = execute!(out, LeaveAlternateScreen, Show) {
+                    report_cleanup_error(&cleanup_error);
+                }
+                if let Err(cleanup_error) = disable_raw_mode() {
+                    report_cleanup_error(&cleanup_error);
+                }
+                return Err(error);
+            }
+        };
         let original: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> =
             Arc::new(std::panic::take_hook());
         let chained = original.clone();
@@ -36,13 +68,18 @@ impl TerminalGuard {
         // state directly; the guard's own restore stays idempotent.
         std::panic::set_hook(Box::new(move |info| {
             let mut out = io::stdout();
-            let _ = execute!(out, LeaveAlternateScreen, Show);
-            let _ = disable_raw_mode();
+            if let Err(error) = execute!(out, LeaveAlternateScreen, Show) {
+                report_cleanup_error(&error);
+            }
+            if let Err(error) = disable_raw_mode() {
+                report_cleanup_error(&error);
+            }
             chained(info);
         }));
         Ok(Self {
             terminal,
             previous_hook: original,
+            restored: false,
         })
     }
 
@@ -50,13 +87,48 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
+    fn restore_terminal(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        let clear_succeeded = match self.terminal.clear() {
+            Ok(()) => true,
+            Err(error) => {
+                report_cleanup_error(&error);
+                false
+            }
+        };
+        let screen = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let raw_mode = disable_raw_mode();
+        let result = match (screen, raw_mode) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(screen_error), Ok(())) => Err(screen_error),
+            (Ok(()), Err(raw_mode_error)) => Err(raw_mode_error),
+            (Err(screen_error), Err(raw_mode_error)) => {
+                report_cleanup_error(&raw_mode_error);
+                Err(screen_error)
+            }
+        };
+        if result.is_ok() && clear_succeeded {
+            if !std::thread::panicking() {
+                let original = std::mem::replace(&mut self.previous_hook, Arc::new(|_| {}));
+                std::panic::set_hook(Box::new(move |info| original(info)));
+            }
+            self.restored = true;
+        }
+        result
+    }
+
     pub fn restore(mut self) -> io::Result<()> {
-        let _ = self.terminal.clear();
-        execute!(io::stdout(), LeaveAlternateScreen, Show)?;
-        disable_raw_mode()?;
-        let original = std::mem::replace(&mut self.previous_hook, Arc::new(|_| {}));
-        std::panic::set_hook(Box::new(move |info| original(info)));
-        Ok(())
+        self.restore_terminal()
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore_terminal() {
+            report_cleanup_error(&error);
+        }
     }
 }
 
@@ -74,6 +146,10 @@ pub const DOCK_EMPTY: &str = "No tasks. Login is a separate explicit action.";
 pub const TRANSCRIPT_INPUT: &str = "Input is available. Enter a task or a clarification.";
 pub const TRANSCRIPT_NO_PROJECT: &str =
     "No project or index is selected; ordinary replies are not blocked.";
+pub const HELP_TEXT: &str = concat!(
+    "Commands: Enter submits a task; /help shows help; ",
+    "Esc quits; Ctrl-C cancels.",
+);
 
 pub fn initial_view() -> LocalView {
     LocalView {
@@ -108,29 +184,199 @@ pub fn render(
     Ok(())
 }
 
-/// Runs the minimal fullscreen loop. `q`/Esc quits normally (exit 0),
-/// Ctrl-C cancels (exit 130). The guard guarantees terminal restoration on
-/// both paths and on panic.
-pub fn run_tui() -> io::Result<i32> {
+const TUI_CONNECTION: &str = "tui";
+
+fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Value> {
+    let request = serde_json::to_string(&request)
+        .map_err(|source| io::Error::other(format!("tui request encoding failed: {source}")))?;
+    let response =
+        dispatch_runtime_request(runtime, Ingress::TrustedHuman, TUI_CONNECTION, &request);
+    let response: Value = serde_json::from_str(&response)
+        .map_err(|source| io::Error::other(format!("tui response decoding failed: {source}")))?;
+    if let Some(error) = response.get("error") {
+        let message = error
+            .get("data")
+            .and_then(|data| data.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| error.get("message").and_then(Value::as_str))
+            .unwrap_or("request rejected");
+        return Err(io::Error::other(format!("tui request rejected: {message}")));
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| io::Error::other("tui response omitted result"))
+}
+
+struct TuiDispatch {
+    runtime: Runtime,
+    session_id: String,
+}
+
+impl TuiDispatch {
+    fn open(data_root: &Path) -> io::Result<Self> {
+        let mut runtime = Runtime::open(data_root, Box::new(LoopbackProvider::new()))
+            .map_err(|source| io::Error::other(format!("tui runtime open failed: {source}")))?;
+        let result = dispatch_tui_request(
+            &mut runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session.open",
+                "params": {
+                    "schema_version": 1,
+                    "bootstrap_id": format!("tui-{}", CommandId::generate()),
+                }
+            }),
+        )?;
+        let session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("tui session.open omitted session_id"))?;
+        Ok(Self {
+            runtime,
+            session_id,
+        })
+    }
+
+    fn submit(&mut self, goal: &str) -> io::Result<(String, String)> {
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "task.submit",
+                "params": {
+                    "schema_version": 1,
+                    "command_id": CommandId::generate().0,
+                    "session_id": self.session_id,
+                    "kind": "create",
+                    "goal": goal,
+                    "contract": { "criteria": [], "constraints": [] },
+                }
+            }),
+        )?;
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("tui task submission omitted status"))?;
+        if status != "accepted" {
+            return Err(io::Error::other("tui task submission was not accepted"));
+        }
+        let task_id = result
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("tui task submission omitted task_id"))?;
+        Ok((status.to_owned(), task_id.to_owned()))
+    }
+
+    fn status(&mut self) -> io::Result<Value> {
+        // Dock contract: request one PAGE_MAX response; it does not walk cursors.
+        dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "runtime.status",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "page": { "page_size": crate::contracts::PAGE_MAX },
+                }
+            }),
+        )
+    }
+}
+
+fn task_dock(status: &Value) -> Vec<String> {
+    let Some(items) = status
+        .get("todo")
+        .and_then(|todo| todo.get("items"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+    else {
+        return vec![DOCK_EMPTY.to_string()];
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let task_id = item.get("task_id").and_then(Value::as_str)?;
+            let lifecycle = item.get("lifecycle").and_then(Value::as_str)?;
+            let reason = item
+                .get("blockers")
+                .and_then(Value::as_array)
+                .and_then(|blockers| blockers.first())
+                .and_then(|blocker| blocker.get("reason"))
+                .and_then(Value::as_str);
+            Some(match reason {
+                Some(reason) => format!("task {task_id}: {lifecycle} ({reason})"),
+                None => format!("task {task_id}: {lifecycle}"),
+            })
+        })
+        .collect()
+}
+
+const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
+
+fn append_composer_char(view: &mut LocalView, ch: char) {
+    // The typed goal must never exceed what create_task accepts; the wire
+    // frame cap (REQUEST_MAX_BYTES) is far above this, so TEXT_MAX_BYTES is
+    // the binding limit for composed goals.
+    if view.composer.len().saturating_add(ch.len_utf8()) > TEXT_MAX_BYTES {
+        if view.transcript.last().map(String::as_str) != Some(COMPOSER_LIMIT_MESSAGE) {
+            view.transcript.push(COMPOSER_LIMIT_MESSAGE.to_string());
+        }
+        return;
+    }
+    view.composer.push(ch);
+}
+
+/// Runs the minimal fullscreen loop. Esc quits normally, Ctrl-C cancels
+/// (exit 130). The guard guarantees terminal restoration on both paths and on
+/// panic.
+pub fn run_tui(data_root: &Path) -> io::Result<i32> {
     let mut guard = TerminalGuard::enter()?;
     let mut view = initial_view();
+    let mut tui_dispatch = None;
     let mut exit = 0;
     loop {
         render(guard.terminal_mut(), &view)?;
         if poll(Duration::from_millis(250))?
             && let TermEvent::Key(KeyEvent {
-                code, modifiers, ..
+                code,
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
             }) = read()?
         {
             match (code, modifiers) {
-                (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => break,
+                (KeyCode::Esc, _) => break,
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                     exit = 130;
                     break;
                 }
-                (KeyCode::Char(ch), _) => {
-                    view.composer.push(ch);
+                (KeyCode::Enter, _) if !view.composer.is_empty() => {
+                    let input = view.composer.clone();
+                    if input == "/help" {
+                        view.transcript.push(HELP_TEXT.to_string());
+                        view.composer.clear();
+                    } else {
+                        if tui_dispatch.is_none() {
+                            tui_dispatch = Some(TuiDispatch::open(data_root)?);
+                        }
+                        let dispatch = tui_dispatch
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("tui dispatch unavailable"))?;
+                        let (status, task_id) = dispatch.submit(&input)?;
+                        view.dock = task_dock(&dispatch.status()?);
+                        view.transcript
+                            .push(format!("Submitted task: {input} ({status}: {task_id})"));
+                        view.composer.clear();
+                    }
                 }
+                (KeyCode::Enter, _) => {}
+                (KeyCode::Char(ch), _) => append_composer_char(&mut view, ch),
                 (KeyCode::Backspace, _) => {
                     view.composer.pop();
                 }
@@ -155,21 +401,99 @@ pub enum ApplyVerdict {
 #[derive(Debug, Default)]
 pub struct Projection {
     pub last_revision: u64,
+    last_delta: Option<Value>,
 }
 
 impl Projection {
     pub fn new(last_revision: u64) -> Self {
-        Self { last_revision }
+        Self {
+            last_revision,
+            last_delta: None,
+        }
     }
 
     pub fn apply(&mut self, event: &Event) -> ApplyVerdict {
         if event.aggregate_revision <= self.last_revision {
-            return ApplyVerdict::Duplicate;
+            return if self.last_delta.as_ref() == Some(&event.delta) {
+                ApplyVerdict::Duplicate
+            } else {
+                ApplyVerdict::Resync
+            };
         }
         if event.aggregate_revision != self.last_revision + 1 {
             return ApplyVerdict::Resync;
         }
         self.last_revision = event.aggregate_revision;
+        self.last_delta = Some(event.delta.clone());
         ApplyVerdict::Applied
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TuiDispatch, append_composer_char, initial_view, task_dock};
+    use crate::contracts::{PAGE_MAX, TEXT_MAX_BYTES};
+    use serde_json::json;
+    #[test]
+    fn tui_status_requests_page_maximum() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "rivect-ui-page-max-{}",
+            crate::contracts::CommandId::generate()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let mut dispatch = TuiDispatch::open(&root)?;
+        for index in 0..PAGE_MAX {
+            dispatch.submit(&format!("page-max-task-{index}"))?;
+        }
+        let status = dispatch.status()?;
+        let task_count = status
+            .get("tasks")
+            .and_then(|tasks| tasks.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len);
+        assert_eq!(task_count, Some(PAGE_MAX as usize));
+        assert_eq!(task_dock(&status).len(), PAGE_MAX as usize);
+        Ok(())
+    }
+
+    #[test]
+    fn task_dock_renders_blocked_reason() {
+        let dock = task_dock(&json!({
+            "todo": {
+                "items": [{
+                    "task_id": "task-1",
+                    "lifecycle": "blocked",
+                    "blockers": [{ "reason": "outcome_unknown" }]
+                }]
+            }
+        }));
+        assert_eq!(dock, vec!["task task-1: blocked (outcome_unknown)"]);
+    }
+
+    #[test]
+    fn composer_rejects_input_beyond_goal_limit() {
+        let mut view = initial_view();
+        view.composer = "x".repeat(TEXT_MAX_BYTES - 1);
+        append_composer_char(&mut view, 'é');
+        assert_eq!(view.composer.len(), TEXT_MAX_BYTES - 1);
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|line| line.as_str() == super::COMPOSER_LIMIT_MESSAGE)
+                .count(),
+            1
+        );
+        // Exactly TEXT_MAX_BYTES bytes is the submission boundary: accepted.
+        append_composer_char(&mut view, 'x');
+        assert_eq!(view.composer.len(), TEXT_MAX_BYTES);
+        append_composer_char(&mut view, 'y');
+        assert_eq!(view.composer.len(), TEXT_MAX_BYTES);
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|line| line.as_str() == super::COMPOSER_LIMIT_MESSAGE)
+                .count(),
+            1
+        );
     }
 }

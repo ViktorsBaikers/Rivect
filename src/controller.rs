@@ -5,12 +5,13 @@
 //! effect.
 
 use crate::commands::Runtime;
-use crate::contracts::{AnswerSelection, EffectClass, SessionId, TaskId, TaskSnapshot};
+use crate::contracts::{
+    AnswerSelection, EffectClass, KNOWN_READY_OPTION, SessionId, TaskId, TaskSnapshot,
+};
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::ModelError;
 use crate::policy::PolicyError;
 use crate::state::{ConflictCause, InvalidCause, StoreError};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutcome {
@@ -86,49 +87,60 @@ impl Runtime {
             });
         }
         self.owner.store.materialize_obligations(task_id)?;
-        let purpose = self.purpose.clone();
-        let inputs = format!(
-            "goal: {}\nanswer: {}\nread {}",
-            String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
-            answer_text(answer),
-            self.scoped_file.display()
+        let known_ready = matches!(
+            answer,
+            AnswerSelection::Option { option_id }
+                if option_id.0.as_str() == KNOWN_READY_OPTION
         );
-        let manifest = self
-            .broker
-            .prepare(&purpose, &self.config_for_broker(), &inputs)?;
-        let pre = crate::verification::RetainedAttempt {
-            attempt_id: manifest.attempt_id.clone(),
-            boundary_id: crate::verification::boundary_id(&manifest.attempt_id),
-            stage: crate::verification::RetainedStage::PreEffect,
-            cause: "first useful offline dispatch".to_string(),
-            digest: crate::verification::record_digest(&manifest.attempt_id, "pre"),
-            build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+        let (target, retained_attempt_id) = if known_ready {
+            (self.scoped_file.clone(), None)
+        } else {
+            let purpose = self.purpose.clone();
+            let inputs = format!(
+                "goal: {}\nanswer: {}\nread {}",
+                String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
+                answer_text(answer),
+                self.scoped_file.display()
+            );
+            let manifest = self
+                .broker
+                .prepare(&purpose, &self.config_for_broker(), &inputs)?;
+            self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
+            let reply = self.broker.dispatch(&manifest)?;
+            self.provider_calls += 1;
+            let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
+                self.owner.store.mark_no_ready(task_id)?;
+                let snapshot = self.owner.store.snapshot(task_id)?;
+                return Ok(StepOutcome::Waiting { snapshot });
+            };
+            (
+                self.scope_root
+                    .join(call.path.as_deref().unwrap_or_default()),
+                Some(manifest.attempt_id),
+            )
         };
-        let pre_json = serde_json::to_string(&pre)?;
-        self.owner.store.retain(&pre_json, &pre.boundary_id)?;
-        let reply = self.broker.dispatch(&manifest)?;
-        self.provider_calls += 1;
-        let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
-            let snapshot = self.owner.store.snapshot(task_id)?;
-            return Ok(StepOutcome::Waiting { snapshot });
-        };
-        let target: PathBuf = self
-            .scope_root
-            .join(call.path.as_deref().unwrap_or_default());
         let request = EffectRequest::Read {
             grant_id: grant_id.to_string(),
             path: target,
         };
+        let admitted = {
+            let mut executor = crate::executor::Executor::new(
+                &mut self.policy,
+                &mut self.owner.store,
+                self.read_worker.as_mut(),
+            );
+            executor.admit(task_id, request)?
+        };
+        let effect_attempt = admitted.attempt_id.clone();
+        if known_ready {
+            self.retain_pre_effect(&effect_attempt, "known ready admitted read")?;
+        }
         let mut executor = crate::executor::Executor::new(
             &mut self.policy,
             &mut self.owner.store,
             self.read_worker.as_mut(),
         );
-        let admitted = executor.admit(task_id, request)?;
-        let effect_attempt = admitted.attempt_id.clone();
         if crash_after_dispatch {
-            // Process death after the effect committed, before the receipt:
-            // exactly one real worker read, no confirmation, no evidence.
             executor.execute_unconfirmed(&admitted)?;
             self.owner.store.mark_outcome_unknown(task_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
@@ -155,12 +167,15 @@ impl Runtime {
                         &digest,
                     )?;
                 }
+                let terminal_attempt_id =
+                    retained_attempt_id.unwrap_or_else(|| effect_attempt.clone());
+                let terminal_boundary_id = crate::verification::boundary_id(&terminal_attempt_id);
                 let terminal = crate::verification::RetainedAttempt {
-                    attempt_id: manifest.attempt_id.clone(),
-                    boundary_id: pre.boundary_id.clone(),
+                    attempt_id: terminal_attempt_id.clone(),
+                    boundary_id: terminal_boundary_id,
                     stage: crate::verification::RetainedStage::Terminal,
                     cause: observation,
-                    digest: crate::verification::record_digest(&manifest.attempt_id, "terminal"),
+                    digest: crate::verification::record_digest(&terminal_attempt_id, "terminal"),
                     build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
                 };
                 let terminal_json = serde_json::to_string(&terminal)?;
@@ -176,6 +191,20 @@ impl Runtime {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn retain_pre_effect(&mut self, attempt_id: &str, cause: &str) -> Result<(), ControllerError> {
+        let pre = crate::verification::RetainedAttempt {
+            attempt_id: attempt_id.to_string(),
+            boundary_id: crate::verification::boundary_id(attempt_id),
+            stage: crate::verification::RetainedStage::PreEffect,
+            cause: cause.to_string(),
+            digest: crate::verification::record_digest(attempt_id, "pre"),
+            build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+        };
+        let pre_json = serde_json::to_string(&pre)?;
+        self.owner.store.retain(&pre_json, &pre.boundary_id)?;
+        Ok(())
     }
 
     /// Safe reconciliation of an unknown attempt: validates the attempt

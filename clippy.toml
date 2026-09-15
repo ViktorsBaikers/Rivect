@@ -1,0 +1,13 @@
+# Clippy configuration — engineering standards §14.
+# Test code keeps unwrap/expect/dbg/print conveniences; src/ is strict.
+msrv = "1.98.1"
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+# Ratchet thresholds: set just above existing debt so new violations fail the
+# gate while the debt burns down. Lower only when the code improves — never
+# raise to silence a warning.
+cognitive-complexity-threshold = 80
+excessive-nesting-threshold = 9
+future-size-threshold = 16384

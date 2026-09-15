@@ -2,6 +2,16 @@
 //! positives, 6 stage-correct negatives, 6 group controls through the
 //! production `src/config.rs` schema and resolver.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::let_underscore_must_use,
+    let_underscore_drop,
+    clippy::redundant_clone,
+    reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
+)]
+
 mod support;
 
 use rivect::config::{Config, ConfigError, ConfigIssue, EffortAssign, ModelAssign, Stage};

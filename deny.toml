@@ -28,7 +28,19 @@ confidence-threshold = 0.93
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
-deny = []
+# P-001/P-002 (docs/engineering-standards.md §4, §9): owner-local thiserror
+# errors only, rusqlite is the only SQL stack. Mechanical enforcement — these
+# crates can never enter the dependency tree.
+deny = [
+    # anyhow may only arrive via the portable-pty dev-dependency (test PTY
+    # harness); it can never be a direct dep — owner APIs use thiserror enums.
+    { name = "anyhow", wrappers = ["portable-pty"] },
+    { name = "eyre" },
+    { name = "diesel" },
+    { name = "sqlx" },
+    { name = "sea-orm" },
+    { name = "sea-query" },
+]
 skip = []
 skip-tree = []
 
@@ -40,5 +52,9 @@ allow-git = []
 
 [advisories]
 version = 2
+# Scopes: "workspace" denies unmaintained/unsound crates reachable from
+# workspace deps — abandoned or unsound deps surface at admission time.
+unsound = "workspace"
+unmaintained = "workspace"
 yanked = "deny"
 ignore = []

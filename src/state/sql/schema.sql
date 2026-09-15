@@ -28,6 +28,37 @@ CREATE TABLE IF NOT EXISTS tasks (
     goal_artifact_id TEXT NOT NULL,
     event_cursor INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks (session_id);
+-- Covers SESSION_GENERATION's MAX(revision) per session as a covering index;
+-- the page statements keep idx_tasks_session for their rowid-ordered scans.
+CREATE INDEX IF NOT EXISTS idx_tasks_session_revision
+    ON tasks (session_id, revision);
+CREATE TABLE IF NOT EXISTS todo_projection (
+    task_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    lifecycle TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS tasks_todo_projection_insert
+AFTER INSERT ON tasks
+BEGIN
+    INSERT OR REPLACE INTO todo_projection (task_id, revision, lifecycle)
+    VALUES (NEW.task_id, NEW.revision, NEW.lifecycle);
+END;
+CREATE TRIGGER IF NOT EXISTS tasks_todo_projection_update
+AFTER UPDATE OF revision, lifecycle ON tasks
+BEGIN
+    INSERT OR REPLACE INTO todo_projection (task_id, revision, lifecycle)
+    VALUES (NEW.task_id, NEW.revision, NEW.lifecycle);
+END;
+-- Backfill only missing projection rows; task triggers maintain current rows, so
+-- an existing drift is left for explicit recovery instead of rewritten on every open.
+INSERT OR IGNORE INTO todo_projection (task_id, revision, lifecycle)
+SELECT task_id, revision, lifecycle
+FROM tasks
+WHERE NOT EXISTS (
+    SELECT 1 FROM todo_projection
+    WHERE todo_projection.task_id = tasks.task_id
+);
 CREATE TABLE IF NOT EXISTS criteria (
     criterion_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -47,6 +78,8 @@ CREATE TABLE IF NOT EXISTS obligations (
     applicability TEXT NOT NULL,
     execution TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_obligations_task_applicability
+    ON obligations (task_id, applicability);
 CREATE TABLE IF NOT EXISTS evidence (
     evidence_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -67,6 +100,8 @@ CREATE TABLE IF NOT EXISTS questions (
     answer_json TEXT,
     answered_origin TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_questions_task_state_revision
+    ON questions (task_id, state, revision);
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     aggregate_id TEXT NOT NULL,
@@ -96,6 +131,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     state TEXT NOT NULL,
     detail TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_attempts_task_state
+    ON attempts (task_id, state);
 CREATE TABLE IF NOT EXISTS retained (
     boundary_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL

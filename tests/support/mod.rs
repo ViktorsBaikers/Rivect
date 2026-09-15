@@ -3,7 +3,16 @@
 //! examples with their negative mutations and group controls, and the
 //! PTY harness for real-terminal TUI cases. One corpus, both ingresses.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::let_underscore_must_use,
+    let_underscore_drop,
+    clippy::redundant_clone,
+    reason = "shared test corpus: helpers are not all used by every target; test code keeps unwrap/expect/discard conveniences (standards §14)"
+)]
 
 use rivect::commands::{Ingress, Runtime};
 use rivect::contracts::{AnswerSelection, Event, Question, SessionId, TaskId};
@@ -507,12 +516,25 @@ pub fn event_for_test(cursor: u64, aggregate_revision: u64) -> Event {
 // ----- PTY harness (real terminal, real binary) -----
 
 pub struct PtySession {
-    master: std::boxed::Box<dyn std::io::Write + Send>,
-    child: std::boxed::Box<dyn portable_pty::Child + Send>,
+    master: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send>,
     stream: Arc<std::sync::Mutex<Vec<u8>>>,
+    data_root: PathBuf,
 }
 
 pub fn spawn_pty(program: &str, rows: u16, cols: u16) -> PtySession {
+    let data_root = temp_dir("pty-data");
+    spawn_pty_with_args(program, rows, cols, &data_root, &data_root, &[])
+}
+
+pub fn spawn_pty_with_args(
+    program: &str,
+    rows: u16,
+    cols: u16,
+    data_root: &Path,
+    env_root: &Path,
+    args: &[&str],
+) -> PtySession {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -524,7 +546,10 @@ pub fn spawn_pty(program: &str, rows: u16, cols: u16) -> PtySession {
         })
         .expect("openpty");
     let mut command = CommandBuilder::new(program);
-    command.env("RIVECT_DATA_ROOT", temp_dir("pty-data"));
+    command.env("RIVECT_DATA_ROOT", env_root);
+    for arg in args {
+        command.arg(arg);
+    }
     let child = pair.slave.spawn_command(command).expect("spawn");
     let writer = pair.master.take_writer().expect("writer");
     let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -548,10 +573,15 @@ pub fn spawn_pty(program: &str, rows: u16, cols: u16) -> PtySession {
         master: writer,
         child,
         stream,
+        data_root: data_root.to_path_buf(),
     }
 }
 
 impl PtySession {
+    pub fn data_root(&self) -> PathBuf {
+        self.data_root.clone()
+    }
+
     /// Waits until `needle` appears in the collected stream or the deadline
     /// passes; returns whether the needle was seen.
     pub fn wait_for(&mut self, needle: &[u8], timeout: Duration) -> bool {

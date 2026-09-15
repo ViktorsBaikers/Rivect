@@ -15,6 +15,7 @@ use crate::resources::NotificationQueue;
 use crate::state::StoreError;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +57,42 @@ impl Runtime {
         read_worker: Box<dyn crate::executor::ReadWorker>,
     ) -> Result<Self, OwnerError> {
         let owner = Owner::elect(data_root)?;
-        let user_toml = std::fs::read_to_string(data_root.join("config.toml")).ok();
-        let effective = config::resolve_effective(user_toml.as_deref())?;
+        let config_path = data_root.join("config.toml");
+        let user_toml = match std::fs::File::open(&config_path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take((CONFIG_MAX_BYTES as u64) + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|source| OwnerError::ConfigRead {
+                        path: config_path.clone(),
+                        source,
+                    })?;
+                if bytes.len() > CONFIG_MAX_BYTES {
+                    return Err(OwnerError::ConfigTooLarge {
+                        path: config_path,
+                        limit: CONFIG_MAX_BYTES,
+                    });
+                }
+                let text = String::from_utf8(bytes).map_err(|source| OwnerError::ConfigRead {
+                    path: config_path.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+                })?;
+                Some(text)
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(OwnerError::ConfigRead {
+                    path: config_path,
+                    source,
+                });
+            }
+        };
+        let effective = config::resolve_effective(user_toml.as_deref()).map_err(|source| {
+            OwnerError::Config {
+                path: config_path,
+                source,
+            }
+        })?;
         Ok(Self {
             owner,
             policy: Policy::default(),
@@ -80,7 +115,7 @@ impl Runtime {
         self.policy.grant_read(root)
     }
 
-    pub fn config_for_broker(&self) -> crate::config::Config {
+    pub fn config_for_broker(&self) -> config::Config {
         self.effective.parsed.clone().unwrap_or_default()
     }
 
@@ -88,6 +123,8 @@ impl Runtime {
         self.owner.store.goal_bytes(task_id).unwrap_or_default()
     }
 }
+
+const CONFIG_MAX_BYTES: usize = crate::contracts::REQUEST_MAX_BYTES;
 
 #[derive(Debug, Serialize)]
 pub struct StatusResult {
@@ -97,6 +134,8 @@ pub struct StatusResult {
     pub state: String,
     pub workflow: config::ConfigEntry,
     pub tasks: Page<crate::contracts::TaskStatus>,
+    pub todo: Page<crate::contracts::TodoItem>,
+    pub scheduler: Page<crate::contracts::SchedulerItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +177,18 @@ enum RequestError {
     WrongJsonRpc,
     #[error("method is required")]
     MissingMethod,
+    #[error("page must be an object")]
+    InvalidPage,
+    #[error("page_size must be a positive integer")]
+    InvalidPageSize,
+    #[error("response serialization failed")]
+    Serialization,
+    #[error("page cursor must be gen:<generation>:offset:<offset>")]
+    InvalidPageCursor,
+    #[error("page cursor offset is out of range")]
+    PageCursorOffsetOutOfRange,
+    #[error("after_cursor must be a non-negative integer within the SQLite cursor range")]
+    InvalidAfterCursor,
     #[error("params must be an object")]
     ParamsNotObject,
     #[error("unknown method {method}")]
@@ -148,7 +199,13 @@ enum RequestError {
     UnsupportedVersion { version: u64 },
     #[error("keys must be a non-empty array")]
     KeysNotArray,
-    #[error("keys must be non-empty")]
+    #[error("{field} exceeds {max} items")]
+    ArrayTooLarge { field: &'static str, max: usize },
+    #[error("{field} must be an array")]
+    ArrayNotArray { field: &'static str },
+    #[error("{field} items must be strings")]
+    ArrayItemNotString { field: &'static str },
+    #[error("keys must be a non-empty array")]
     EmptyKeys,
     #[error("keys must be strings")]
     KeysNotStrings,
@@ -187,6 +244,7 @@ impl RequestError {
             | Self::ArtifactReadUnavailable
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
             Self::MachineAnswerDenied => ErrorCode::Denied,
+            Self::Serialization => ErrorCode::InternalError,
             _ => ErrorCode::InvalidInput,
         }
     }
@@ -204,7 +262,8 @@ impl RequestError {
             | Self::KnownCommandUnavailable { .. }
             | Self::ArtifactReadUnavailable
             | Self::MachineAnswerDenied
-            | Self::MethodUnavailable { .. } => -32000,
+            | Self::MethodUnavailable { .. }
+            | Self::Serialization => -32000,
             _ => -32602,
         }
     }
@@ -406,20 +465,36 @@ fn handle_method(
             let Some(session) = session_param(&params) else {
                 return missing_session(id);
             };
-            match rt.owner.store.task_status_page(&session) {
-                Ok(tasks) => {
-                    let result = StatusResult {
-                        schema_version: SCHEMA_VERSION,
-                        session_id: session.clone(),
-                        owner_generation: rt.owner.generation,
-                        state: "ready".to_string(),
-                        workflow: rt.effective.workflow_entry.clone(),
-                        tasks,
-                    };
-                    RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
-                }
-                Err(err) => store_error(id, &err),
-            }
+            let (cursor, limit) = match status_page(&params) {
+                Ok(page) => page,
+                Err(err) => return request_error(id, err),
+            };
+            let tasks = match rt.owner.store.task_status_page(&session, limit, cursor) {
+                Ok(tasks) => tasks,
+                Err(err) => return store_error(id, &err),
+            };
+            let todo = match rt.owner.store.todo_page(&session, limit, cursor) {
+                Ok(todo) => todo,
+                Err(err) => return store_error(id, &err),
+            };
+            let scheduler = match rt.owner.store.scheduler_page(&session, limit, cursor) {
+                Ok(scheduler) => scheduler,
+                Err(err) => return store_error(id, &err),
+            };
+            let result = StatusResult {
+                schema_version: SCHEMA_VERSION,
+                session_id: session,
+                owner_generation: rt.owner.generation,
+                state: "ready".to_string(),
+                workflow: rt.effective.workflow_entry.clone(),
+                tasks,
+                todo,
+                scheduler,
+            };
+            let Ok(payload) = serde_json::to_value(&result) else {
+                return request_error(id, RequestError::Serialization);
+            };
+            RpcResponse::ok(id, payload)
         }
         "config.read" => {
             let Some(_session) = session_param(&params) else {
@@ -514,12 +589,15 @@ fn handle_method(
             let Some(session) = session_param(&params) else {
                 return missing_session(id);
             };
-            let after = params
-                .get("after_cursor")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let after = match after_cursor(&params) {
+                Ok(after) => after,
+                Err(err) => return request_error(id, err),
+            };
             let task = task_param(&params);
-            let limit = page_limit(&params);
+            let limit = match page_limit(&params) {
+                Ok(limit) => limit,
+                Err(err) => return request_error(id, err),
+            };
             match rt
                 .owner
                 .store
@@ -553,13 +631,15 @@ fn handle_method(
                     },
                 );
             };
-            let cursor_gen = params
-                .get("page")
-                .and_then(|p| p.get("cursor"))
-                .and_then(Value::as_str)
-                .and_then(|c| c.strip_prefix("gen:"))
-                .and_then(|g| g.parse::<u64>().ok());
-            match rt.owner.store.collection(&task, collection, cursor_gen) {
+            let cursor = match status_cursor(&params) {
+                Ok(cursor) => cursor,
+                Err(err) => return request_error(id, err),
+            };
+            let limit = match page_limit(&params) {
+                Ok(limit) => limit,
+                Err(err) => return request_error(id, err),
+            };
+            match rt.owner.store.collection(&task, collection, cursor, limit) {
                 Ok(page) => RpcResponse::ok(id, serde_json::to_value(&page).unwrap_or(Value::Null)),
                 Err(err) => store_error(id, &err),
             }
@@ -629,13 +709,78 @@ fn task_param(params: &Value) -> Option<TaskId> {
         .map(|s| TaskId(s.to_string()))
 }
 
-fn page_limit(params: &Value) -> u32 {
-    let limit = params
-        .get("page")
-        .and_then(|p| p.get("page_size"))
-        .and_then(Value::as_u64)
-        .unwrap_or(PAGE_DEFAULT as u64) as u32;
-    limit.clamp(1, crate::contracts::PAGE_MAX)
+fn after_cursor(params: &Value) -> Result<u64, RequestError> {
+    let Some(value) = params.get("after_cursor") else {
+        return Ok(0);
+    };
+    let Some(cursor) = value.as_u64() else {
+        return Err(RequestError::InvalidAfterCursor);
+    };
+    i64::try_from(cursor).map_err(|_conversion| RequestError::InvalidAfterCursor)?;
+    Ok(cursor)
+}
+
+fn page_limit(params: &Value) -> Result<u32, RequestError> {
+    let Some(page) = params.get("page") else {
+        return Ok(PAGE_DEFAULT);
+    };
+    let Some(page) = page.as_object() else {
+        return Err(RequestError::InvalidPage);
+    };
+    let Some(page_size) = page.get("page_size") else {
+        return Ok(PAGE_DEFAULT);
+    };
+    let Some(page_size) = page_size.as_u64() else {
+        return Err(RequestError::InvalidPageSize);
+    };
+    if page_size == 0 {
+        return Err(RequestError::InvalidPageSize);
+    }
+    let bounded = page_size.min(u64::from(crate::contracts::PAGE_MAX));
+    match u32::try_from(bounded) {
+        Ok(limit) => Ok(limit),
+        Err(_) => Err(RequestError::InvalidPageSize),
+    }
+}
+
+fn status_page(params: &Value) -> Result<(Option<(u64, u64)>, u32), RequestError> {
+    let limit = page_limit(params)?;
+    let cursor = status_cursor(params)?;
+    Ok((cursor, limit))
+}
+
+fn status_cursor(params: &Value) -> Result<Option<(u64, u64)>, RequestError> {
+    let Some(page) = params.get("page") else {
+        return Ok(None);
+    };
+    let Some(page) = page.as_object() else {
+        return Err(RequestError::InvalidPage);
+    };
+    let Some(cursor) = page.get("cursor") else {
+        return Ok(None);
+    };
+    let Some(cursor) = cursor.as_str() else {
+        return Err(RequestError::InvalidPageCursor);
+    };
+    let Some(cursor) = cursor.strip_prefix("gen:") else {
+        return Err(RequestError::InvalidPageCursor);
+    };
+    let Some((generation, offset)) = cursor.split_once(":offset:") else {
+        let Ok(generation) = cursor.parse::<u64>() else {
+            return Err(RequestError::InvalidPageCursor);
+        };
+        return Ok(Some((generation, 0)));
+    };
+    let Ok(generation) = generation.parse::<u64>() else {
+        return Err(RequestError::InvalidPageCursor);
+    };
+    let Ok(offset) = offset.parse::<u64>() else {
+        return Err(RequestError::InvalidPageCursor);
+    };
+    if offset > i64::MAX.unsigned_abs() {
+        return Err(RequestError::PageCursorOffsetOutOfRange);
+    }
+    Ok(Some((generation, offset)))
 }
 
 fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> RpcResponse {
@@ -676,8 +821,14 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 return request_error(id, RequestError::Required { field: "goal" });
             };
             let contract = params.get("contract").cloned().unwrap_or(Value::Null);
-            let criteria = string_array(&contract, "criteria");
-            let constraints = string_array(&contract, "constraints");
+            let criteria = match string_array(&contract, "criteria") {
+                Ok(criteria) => criteria,
+                Err(err) => return request_error(id, err),
+            };
+            let constraints = match string_array(&contract, "constraints") {
+                Ok(constraints) => constraints,
+                Err(err) => return request_error(id, err),
+            };
             match rt.owner.store.create_task(
                 &session,
                 &command_id,
@@ -830,13 +981,15 @@ enum SelectionError {
     ConflictingFields,
     #[error("option_id is required")]
     MissingOptionId,
-    #[error("text is required")]
+    #[error("custom text exceeds {max} bytes")]
+    TextTooLarge { max: usize },
+    #[error("custom text is required")]
     MissingText,
     #[error("selection.kind must be option or custom")]
     UnsupportedKind,
 }
 
-fn parse_selection(value: &Value) -> std::result::Result<AnswerSelection, SelectionError> {
+fn parse_selection(value: &Value) -> Result<AnswerSelection, SelectionError> {
     match value.get("kind").and_then(Value::as_str) {
         Some("option") => {
             if value.get("text").is_some() {
@@ -859,6 +1012,11 @@ fn parse_selection(value: &Value) -> std::result::Result<AnswerSelection, Select
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or(SelectionError::MissingText)?;
+            if text.len() > crate::contracts::TEXT_MAX_BYTES {
+                return Err(SelectionError::TextTooLarge {
+                    max: crate::contracts::TEXT_MAX_BYTES,
+                });
+            }
             Ok(AnswerSelection::Custom {
                 text: text.to_string(),
             })
@@ -867,16 +1025,25 @@ fn parse_selection(value: &Value) -> std::result::Result<AnswerSelection, Select
     }
 }
 
-fn string_array(contract: &Value, field: &str) -> Vec<String> {
-    contract
-        .get(field)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
+fn string_array(contract: &Value, field: &'static str) -> Result<Vec<String>, RequestError> {
+    let Some(value) = contract.get(field) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(RequestError::ArrayNotArray { field });
+    };
+    if items.len() > crate::contracts::ARRAY_MAX_ITEMS {
+        return Err(RequestError::ArrayTooLarge {
+            field,
+            max: crate::contracts::ARRAY_MAX_ITEMS,
+        });
+    }
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
                 .map(str::to_string)
-                .collect()
+                .ok_or(RequestError::ArrayItemNotString { field })
         })
-        .unwrap_or_default()
+        .collect()
 }

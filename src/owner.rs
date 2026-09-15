@@ -16,8 +16,20 @@ pub enum OwnerError {
     Io(#[from] io::Error),
     #[error("owner storage failed: {0}")]
     Store(#[from] StoreError),
-    #[error("owner configuration failed: {0}")]
-    Config(#[from] ConfigError),
+    #[error("owner configuration failed: {path}: {source}")]
+    Config {
+        path: PathBuf,
+        #[source]
+        source: ConfigError,
+    },
+    #[error("owner configuration exceeds {limit} bytes: {path}")]
+    ConfigTooLarge { path: PathBuf, limit: usize },
+    #[error("owner configuration failed: {path}: read failed: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 pub struct Owner {

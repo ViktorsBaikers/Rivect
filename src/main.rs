@@ -2,10 +2,19 @@
 //! JSON-RPC headless loop otherwise (machine stdout carries only LF-delimited
 //! JSON, diagnostics go to stderr, no ANSI).
 
+// CLI boundary: this crate root owns process exit and stderr diagnostics; the
+// workspace denies these lints everywhere else (docs/engineering-standards.md §8).
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::exit,
+    reason = "CLI boundary owns stderr output and process exit (standards §8)"
+)]
+
 use crossterm::tty::IsTty;
 use rivect::commands::{Ingress, Runtime, dispatch_runtime_request};
 use rivect::providers::LoopbackProvider;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "rivect [--tui fullscreen] [--no-mouse] [--headless] [--data-root PATH]";
@@ -18,7 +27,7 @@ enum CliError {
     MissingDataRoot,
     #[error("unknown flag {flag}")]
     UnknownFlag { flag: String },
-    #[error("owner election failed: {0}")]
+    #[error("runtime open failed: {0}")]
     Owner(#[source] rivect::owner::OwnerError),
     #[error("tui failed: {0}")]
     Tui(#[source] io::Error),
@@ -26,6 +35,8 @@ enum CliError {
     Stdin(#[source] io::Error),
     #[error("stdout failed: {0}")]
     Stdout(#[source] io::Error),
+    #[error("stdin request exceeds {limit} bytes")]
+    RequestTooLarge { limit: usize },
 }
 
 fn main() {
@@ -65,7 +76,7 @@ fn main() {
     }
     let is_tty = io::stdout().is_tty() && io::stdin().is_tty();
     if !headless && is_tty {
-        match rivect::ui::run_tui() {
+        match rivect::ui::run_tui(&data_root) {
             Ok(code) => std::process::exit(code),
             Err(source) => {
                 eprintln!("{}", CliError::Tui(source));
@@ -95,11 +106,17 @@ fn run_headless(data_root: &Path) -> i32 {
         }
     };
     let stdin = io::stdin();
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut reader = stdin.lock();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        let read = {
+            let mut bounded = reader
+                .by_ref()
+                .take((rivect::contracts::REQUEST_MAX_BYTES as u64) + 1);
+            bounded.read_until(b'\n', &mut line)
+        };
+        match read {
             Ok(0) => return 0,
             Ok(_) => {}
             Err(source) => {
@@ -107,7 +124,32 @@ fn run_headless(data_root: &Path) -> i32 {
                 return 1;
             }
         }
-        let request = line.trim_end_matches(['\n', '\r']);
+        let mut frame = line.as_slice();
+        if frame.last() == Some(&b'\n') {
+            frame = &frame[..frame.len() - 1];
+        }
+        if frame.last() == Some(&b'\r') {
+            frame = &frame[..frame.len() - 1];
+        }
+        if frame.len() > rivect::contracts::REQUEST_MAX_BYTES {
+            eprintln!(
+                "{}",
+                CliError::RequestTooLarge {
+                    limit: rivect::contracts::REQUEST_MAX_BYTES,
+                }
+            );
+            return 1;
+        }
+        let request = match std::str::from_utf8(frame) {
+            Ok(request) => request,
+            Err(source) => {
+                eprintln!(
+                    "{}",
+                    CliError::Stdin(io::Error::new(io::ErrorKind::InvalidData, source))
+                );
+                return 1;
+            }
+        };
         if request.is_empty() {
             continue;
         }
@@ -119,5 +161,3 @@ fn run_headless(data_root: &Path) -> i32 {
         }
     }
 }
-
-use std::io;
