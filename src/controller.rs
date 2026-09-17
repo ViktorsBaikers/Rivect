@@ -11,7 +11,22 @@ use crate::contracts::{
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::ModelError;
 use crate::policy::PolicyError;
+use crate::resources::Delivery;
+use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
+
+/// One bounded scheduler pass over the task tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchedulerStep {
+    /// Nothing was admitted: the tree is idle, fully blocked on waiting
+    /// parents, or cancelled.
+    Idle,
+    /// One admitted node ran one decision step to its outcome.
+    Ran {
+        node: NodeId,
+        outcome: Box<StepOutcome>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutcome {
@@ -44,9 +59,15 @@ pub enum ControllerError {
     Model(#[from] ModelError),
     #[error(transparent)]
     Executor(#[from] ExecutorError),
+    #[error(transparent)]
+    Scheduler(#[from] SchedulerError),
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
+
+/// Mirrors the runtime notification queue capacity: one pass drains at
+/// most one full queue, so bounded work never grows with the backlog.
+const SCHEDULER_DRAIN_LIMIT: usize = 8;
 
 impl Runtime {
     /// One decision step for a task whose pending question has been
@@ -303,6 +324,74 @@ impl Runtime {
             )?;
         }
         self.owner.store.complete_if_eligible(session_id, task_id)
+    }
+
+    /// One bounded scheduler pass over the task tree: pending
+    /// notification deliveries drain first — cancellation and other
+    /// signals outrank work — then the next admitted node runs exactly
+    /// one decision step. A parent with unfinished children never
+    /// spends the slot it is about to wait on: it releases the slot
+    /// inside this loop before waiting (PROH-002), and the freed slot
+    /// admits the next ready node in the same pass. Deliveries can only
+    /// ever fail closed: no delivery admits or requeues work by itself,
+    /// so a late callback on a cancelled tree is observed and discarded
+    /// (AC-012). Every step outcome settles the node: a completed run
+    /// completes the node, anything else — denied, no action, unknown,
+    /// or a wait with no runnable children — settles it without holding
+    /// a slot, and a failed decision step settles the node before its
+    /// error propagates. A fresh intent submits a fresh node.
+    pub fn scheduler_step(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<SchedulerStep, ControllerError> {
+        for delivery in self.notifications.drain(SCHEDULER_DRAIN_LIMIT) {
+            match delivery {
+                Delivery::Event(event) => {
+                    self.scheduler.deliver(&event);
+                }
+                // The queue replaced an overflowed backlog with one
+                // marker; admission never depends on delivery history,
+                // so the marker observes the loss without acting on it.
+                Delivery::ResyncMarker => {}
+            }
+        }
+        let node = loop {
+            let Some(node) = self.scheduler.admit_next() else {
+                return Ok(SchedulerStep::Idle);
+            };
+            if matches!(
+                self.scheduler.begin_wait(node)?,
+                WaitTransition::AlreadySatisfied
+            ) {
+                break node;
+            }
+        };
+        let context = self.scheduler.node_context(node)?;
+        let outcome = match self.run_decision_step(
+            session_id,
+            &context.task,
+            &context.answer,
+            &context.grant_id,
+            false,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The node settles before the error propagates: a
+                // failed decision step must release its slot and
+                // reservation, or two of them would stall the tree.
+                self.scheduler.settle(node)?;
+                return Err(error);
+            }
+        };
+        if matches!(outcome, StepOutcome::Completed { .. }) {
+            self.scheduler.complete(node)?;
+        } else {
+            self.scheduler.settle(node)?;
+        }
+        Ok(SchedulerStep::Ran {
+            node,
+            outcome: Box::new(outcome),
+        })
     }
 }
 

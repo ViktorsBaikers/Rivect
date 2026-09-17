@@ -12,6 +12,7 @@ use crate::owner::{Owner, OwnerError};
 use crate::policy::Policy;
 use crate::providers::Provider;
 use crate::resources::NotificationQueue;
+use crate::scheduler::{DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP, Scheduler};
 use crate::state::StoreError;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,6 +31,9 @@ pub struct Runtime {
     pub owner: Owner,
     pub policy: Policy,
     pub broker: Broker,
+    /// The one bounded task-tree scheduler (INV-020): slot release on
+    /// parent wait, strict-FIFO admission, terminal cancellation.
+    pub scheduler: Scheduler,
     pub notifications: NotificationQueue,
     pub effective: EffectiveConfig,
     /// Purpose used by the first-task model loop; resolved through the
@@ -37,6 +41,9 @@ pub struct Runtime {
     pub purpose: String,
     pub scope_root: PathBuf,
     pub scoped_file: PathBuf,
+    /// Grant id matching the scoped read pair; scheduler nodes freeze it
+    /// at answer time and their decision steps re-check it.
+    pub scoped_grant: String,
     /// Publication target of the journaled config carrier (AC-095).
     pub config_path: PathBuf,
     pub provider_calls: u64,
@@ -104,10 +111,12 @@ impl Runtime {
             policy: Policy::default(),
             broker: Broker::new(provider),
             notifications: NotificationQueue::new(8),
+            scheduler: Scheduler::new(DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP),
             effective,
             purpose: String::new(),
             scope_root: PathBuf::new(),
             scoped_file: PathBuf::new(),
+            scoped_grant: String::new(),
             config_path,
             provider_calls: 0,
             read_worker,
@@ -119,7 +128,9 @@ impl Runtime {
     pub fn set_read_scope(&mut self, root: PathBuf, file: PathBuf) -> String {
         self.scope_root = root.clone();
         self.scoped_file = file;
-        self.policy.grant_read(root)
+        let grant = self.policy.grant_read(root);
+        self.scoped_grant = grant.clone();
+        grant
     }
 
     pub fn config_for_broker(&self) -> config::Config {
@@ -1014,6 +1025,17 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 Ok(constraints) => constraints,
                 Err(err) => return request_error(id, err),
             };
+            let parent_task = params
+                .get("parent_task_id")
+                .and_then(Value::as_str)
+                .map(|id| TaskId(id.to_string()));
+            if let Some(parent) = &parent_task {
+                // Fail closed before any row is written: an unknown
+                // parent task must not create an orphan tree linkage.
+                if let Err(err) = rt.owner.store.snapshot(parent) {
+                    return store_error(id, &err);
+                }
+            }
             match rt.owner.store.create_task(
                 &session,
                 &command_id,
@@ -1022,6 +1044,13 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 (&criteria, &constraints),
             ) {
                 Ok(result) => {
+                    // The scheduler owns the tree shape (INV-020):
+                    // parentage recorded at creation links the child's
+                    // runnable node under its parent's when the answer
+                    // freezes.
+                    if let Some(parent) = parent_task {
+                        rt.scheduler.adopt(result.task_id.clone(), parent);
+                    }
                     RpcResponse::ok(id, serde_json::to_value(&result).unwrap_or(Value::Null))
                 }
                 Err(err) => store_error(id, &err),
@@ -1086,7 +1115,23 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 "human",
             ) {
                 Ok(result) => {
-                    RpcResponse::ok(id, serde_json::to_value(&result).unwrap_or(Value::Null))
+                    // The frozen answer builds the task's runnable
+                    // scheduler node through the production path; a
+                    // settled tree grows nothing runnable — the answer
+                    // itself stays durable (INV-021).
+                    match rt.scheduler.submit_answered(
+                        task.clone(),
+                        selection.clone(),
+                        rt.scoped_grant.clone(),
+                    ) {
+                        Ok(_) => RpcResponse::ok(
+                            id,
+                            serde_json::to_value(&result).unwrap_or(Value::Null),
+                        ),
+                        Err(err) => {
+                            envelope_error(id, ErrorCode::InternalError, -32603, &err.to_string())
+                        }
+                    }
                 }
                 Err(err) => store_error(id, &err),
             }
@@ -1146,7 +1191,18 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 .cancel_task(&session, &task, expected_intent, reason)
             {
                 Ok(result) => {
-                    RpcResponse::ok(id, serde_json::to_value(&result).unwrap_or(Value::Null))
+                    // The tree drains with the store cancellation: the
+                    // remaining children of the cancelled task never admit
+                    // or dispatch (AC-012).
+                    match rt.scheduler.cancel_task_tree(&task) {
+                        Ok(_) => RpcResponse::ok(
+                            id,
+                            serde_json::to_value(&result).unwrap_or(Value::Null),
+                        ),
+                        Err(err) => {
+                            envelope_error(id, ErrorCode::InternalError, -32603, &err.to_string())
+                        }
+                    }
                 }
                 Err(err) => store_error(id, &err),
             }
