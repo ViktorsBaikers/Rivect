@@ -37,6 +37,8 @@ pub struct Runtime {
     pub purpose: String,
     pub scope_root: PathBuf,
     pub scoped_file: PathBuf,
+    /// Publication target of the journaled config carrier (AC-095).
+    pub config_path: PathBuf,
     pub provider_calls: u64,
     /// The one injected backend seam; defaults to the real macOS worker.
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
@@ -56,7 +58,11 @@ impl Runtime {
         provider: Box<dyn Provider>,
         read_worker: Box<dyn crate::executor::ReadWorker>,
     ) -> Result<Self, OwnerError> {
-        let owner = Owner::elect(data_root)?;
+        let mut owner = Owner::elect(data_root)?;
+        // Boot recovery: a crash between the managed write and its receipt
+        // leaves one pending row; receipt exactly the writes attributable
+        // to this publisher before any config surface serves (AC-093).
+        config::recover_publications(&mut owner.store)?;
         let config_path = data_root.join("config.toml");
         let user_toml = match std::fs::File::open(&config_path) {
             Ok(file) => {
@@ -89,7 +95,7 @@ impl Runtime {
         };
         let effective = config::resolve_effective(user_toml.as_deref()).map_err(|source| {
             OwnerError::Config {
-                path: config_path,
+                path: config_path.clone(),
                 source,
             }
         })?;
@@ -102,6 +108,7 @@ impl Runtime {
             purpose: String::new(),
             scope_root: PathBuf::new(),
             scoped_file: PathBuf::new(),
+            config_path,
             provider_calls: 0,
             read_worker,
         })
@@ -211,7 +218,7 @@ enum RequestError {
     KeysNotStrings,
     #[error("duplicate key {key}")]
     DuplicateKey { key: String },
-    #[error("invalid key {key}")]
+    #[error("unknown key {key}; known keys: {}", crate::config::WORKFLOW_KEY)]
     InvalidKey { key: String },
     #[error("unknown local command {command}")]
     UnknownLocalCommand { command: String },
@@ -394,6 +401,161 @@ fn store_error(id: Value, err: &StoreError) -> RpcResponse {
         StoreError::Storage(_) => RECOVERY_STORAGE,
     };
     envelope_error(id, err.code(), -32000, &format!("{message}{recovery}"))
+}
+
+/// Snapshot of the retained config view one edit is applied against: the
+/// document plus the entry the read surface serves from it.
+struct RetainedView {
+    parsed: Option<config::Config>,
+    workflow_entry: config::ConfigEntry,
+}
+
+fn retained_view(rt: &Runtime) -> RetainedView {
+    RetainedView {
+        parsed: rt.effective.parsed.clone(),
+        workflow_entry: rt.effective.workflow_entry.clone(),
+    }
+}
+
+/// Applies one typed edit to the retained config document. `Config::set`
+/// and `Config::reset` restore the original document on rejection, so the
+/// retained view always mirrors the last accepted edit; the document is
+/// put back either way — this carrier never owns a second config.
+fn retained_edit(
+    rt: &mut Runtime,
+    apply: impl FnOnce(&mut config::Config) -> Result<config::ConfigEdit, config::ConfigError>,
+) -> Result<config::ConfigEdit, config::ConfigError> {
+    let mut retained = std::mem::take(&mut rt.effective.parsed).unwrap_or_default();
+    let edit = apply(&mut retained);
+    rt.effective.parsed = Some(retained);
+    edit
+}
+
+fn config_error(id: Value, err: &config::ConfigError) -> RpcResponse {
+    envelope_error(id, ErrorCode::InvalidInput, -32602, &err.to_string())
+}
+
+/// Journal owner string for the CLI carrier; the file surface admits with
+/// its own owner spelling through the same singleflight.
+const CONFIG_CARRIER_OWNER: &str = "cli";
+
+/// Admits one accepted edit through the singleflight journal. The read
+/// surface is refreshed first, so the retained doc and its served entry
+/// move together; a rejected admission restores `before` — the command
+/// was never journaled, so no surface may observe its edit.
+fn admit_config_command(
+    rt: &mut Runtime,
+    id: Value,
+    command: &str,
+    key: &str,
+    edit: &config::ConfigEdit,
+    before: RetainedView,
+) -> RpcResponse {
+    rt.effective.refresh_workflow_entry(&edit.digest);
+    let intent = match config::admit_publication(
+        &mut rt.owner.store,
+        CONFIG_CARRIER_OWNER,
+        &rt.config_path,
+        edit,
+    ) {
+        // Fresh admission owns the durable publication: the checked-fd
+        // write lands the bytes against the staged identity, then the
+        // receipt completes the journal row.
+        Ok(config::PublicationAdmission::Staged(intent)) => {
+            match config::publish_intent(&mut rt.owner.store, &intent, &edit.bytes) {
+                Ok(()) => intent,
+                Err(err) => {
+                    // Fail closed: a write that cannot run leaves the row
+                    // pending — the crash-window recovery owns it — and no
+                    // surface serves the edit. A receipt that cannot be
+                    // recorded after the bytes landed keeps the edit
+                    // durable and served; the next boot receipts it.
+                    if !matches!(err, config::PublicationError::Journal(_)) {
+                        rt.effective.parsed = before.parsed;
+                        rt.effective.workflow_entry = before.workflow_entry;
+                    }
+                    return publication_error(id, &err);
+                }
+            }
+        }
+        // A pending row is never answered from the retained document
+        // alone. A foreign winner's write may still be in flight — the
+        // replay observes it — while a row this carrier admitted is
+        // healed: the bytes already hold and take the receipt, or the
+        // retry re-runs the managed write, so no retry reports an edit
+        // that is not on disk.
+        Ok(config::PublicationAdmission::Pending(pending)) => {
+            match config::resolve_pending_publication(
+                &mut rt.owner.store,
+                CONFIG_CARRIER_OWNER,
+                &pending,
+                &edit.bytes,
+            ) {
+                Ok(intent) => intent,
+                Err(err) => {
+                    // The fresh write's fail-closed contract, word for
+                    // word: an unlanded edit is served by no surface,
+                    // while landed bytes keep serving as the receipt
+                    // waits for the next boot.
+                    if !matches!(err, config::PublicationError::Journal(_)) {
+                        rt.effective.parsed = before.parsed;
+                        rt.effective.workflow_entry = before.workflow_entry;
+                    }
+                    return publication_error(id, &err);
+                }
+            }
+        }
+        // A terminal row already proved its bytes hold; the replay
+        // answers the winner's historical outcome.
+        Ok(config::PublicationAdmission::Applied(applied)) => applied,
+        Err(err) => {
+            rt.effective.parsed = before.parsed;
+            rt.effective.workflow_entry = before.workflow_entry;
+            return match err {
+                config::PublicationError::Journal(store) => store_error(id, &store),
+                other => envelope_error(id, ErrorCode::InvalidInput, -32602, &other.to_string()),
+            };
+        }
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": command,
+            "key": key,
+            "digest": edit.digest,
+            "owner": intent.owner,
+            "admission_seq": intent.admission_seq,
+        }),
+    )
+}
+
+/// Wire shape of a publication failure: journal trouble keeps the store's
+/// typed error; the managed write's own failure is an internal effect
+/// failure, never user input.
+fn publication_error(id: Value, err: &config::PublicationError) -> RpcResponse {
+    match err {
+        config::PublicationError::Journal(store) => store_error(id, store),
+        other => envelope_error(id, ErrorCode::InternalError, -32000, &other.to_string()),
+    }
+}
+
+/// Shared tail of the config.set/unset arms: capture the retained view,
+/// apply one typed edit, answer a rejection with the typed ConfigError,
+/// and admit an accepted edit through the singleflight journal.
+fn commit_config_edit(
+    rt: &mut Runtime,
+    id: Value,
+    command: &str,
+    key: &str,
+    apply: impl FnOnce(&mut config::Config) -> Result<config::ConfigEdit, config::ConfigError>,
+) -> RpcResponse {
+    let before = retained_view(rt);
+    let edit = match retained_edit(rt, apply) {
+        Ok(edit) => edit,
+        Err(err) => return config_error(id, &err),
+    };
+    admit_config_command(rt, id, command, key, &edit, before)
 }
 
 fn handle_method(
@@ -662,6 +824,29 @@ fn handle_method(
                 );
             };
             match crate::tools::local_command_kind(kind) {
+                crate::tools::LocalKind::ConfigSet => {
+                    let Some(_session) = session_param(&params) else {
+                        return missing_session(id);
+                    };
+                    let Some(key) = params.get("key").and_then(Value::as_str) else {
+                        return request_error(id, RequestError::Required { field: "key" });
+                    };
+                    let Some(value) = params.get("value") else {
+                        return request_error(id, RequestError::Required { field: "value" });
+                    };
+                    commit_config_edit(rt, id, "config.set", key, |config| {
+                        config.set_wire(key, value)
+                    })
+                }
+                crate::tools::LocalKind::ConfigUnset => {
+                    let Some(_session) = session_param(&params) else {
+                        return missing_session(id);
+                    };
+                    let Some(key) = params.get("key").and_then(Value::as_str) else {
+                        return request_error(id, RequestError::Required { field: "key" });
+                    };
+                    commit_config_edit(rt, id, "config.unset", key, |config| config.reset(key))
+                }
                 crate::tools::LocalKind::Unknown => request_error(
                     id,
                     RequestError::UnknownLocalCommand {

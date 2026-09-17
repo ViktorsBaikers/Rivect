@@ -79,6 +79,27 @@ impl Runtime {
         // Mutable admission gates before the first provider effect:
         // revocation and task cancellation both deny the dispatch itself.
         self.policy.admit(grant_id, EffectClass::Read)?;
+        // Permission-mode consult (DEC-014) on the only permitted action
+        // target: an enrolled deny outranks the fixed interim `manual`
+        // mode (DEC-015), and any verdict that is not a clear allow —
+        // ask included — gates the dispatch read before any provider
+        // effect, mirroring the executor's fail-closed rule.
+        let dispatch_ctx = crate::executor::admission_context(
+            &self.owner.store,
+            EffectClass::Read,
+            &self.scope_root,
+            &self.scoped_file,
+        )?;
+        let dispatch_verdict =
+            self.policy
+                .decide(&self.scoped_file, EffectClass::Read, &dispatch_ctx);
+        if dispatch_verdict != crate::policy::ModeDecision::Allow {
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(StepOutcome::EffectDenied {
+                reason: crate::executor::mode_reason(dispatch_verdict).to_string(),
+                snapshot,
+            });
+        }
         if self.owner.store.task_cancelled(task_id)? {
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(StepOutcome::EffectDenied {

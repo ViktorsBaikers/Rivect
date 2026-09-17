@@ -9,13 +9,20 @@ use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use std::path::PathBuf;
 
 pub enum LocalKind {
+    ConfigSet,
+    ConfigUnset,
     PlannedUnimplemented,
     Unknown,
 }
 
 const BUSY_READ: &str = "READ";
+const BUSY_WRITE: &str = "WRITE";
 const BUSY_UNAVAILABLE: &str = "UNAVAILABLE";
 const READ_FILE_DESCRIPTION: &str = "One admitted file read in the current scope.";
+const CONFIG_SET_DESCRIPTION: &str =
+    "Set one config key through the shared schema and journaled publication.";
+const CONFIG_UNSET_DESCRIPTION: &str =
+    "Remove one config override through the shared schema and journaled publication.";
 const PLANNED_COMMAND_DESCRIPTION: &str = "A planned command in this catalog.";
 const UNAVAILABLE_REASON: &str = "known command without a handler in this build";
 
@@ -46,8 +53,6 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
     "config.search",
     "config.get",
     "config.explain",
-    "config.set",
-    "config.unset",
     "config.validate",
     "config.export",
     "project.init",
@@ -56,10 +61,11 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
 ];
 
 pub fn local_command_kind(kind: &str) -> LocalKind {
-    if PLANNED_LOCAL_KINDS.contains(&kind) {
-        LocalKind::PlannedUnimplemented
-    } else {
-        LocalKind::Unknown
+    match kind {
+        "config.set" => LocalKind::ConfigSet,
+        "config.unset" => LocalKind::ConfigUnset,
+        _ if PLANNED_LOCAL_KINDS.contains(&kind) => LocalKind::PlannedUnimplemented,
+        _ => LocalKind::Unknown,
     }
 }
 
@@ -68,16 +74,13 @@ fn descriptor(
     aliases: &[&str],
     description: &str,
     available: bool,
+    busy_policy: &str,
 ) -> CommandDescriptor {
     CommandDescriptor {
         canonical_id: canonical_id.to_string(),
         aliases: aliases.iter().map(|a| a.to_string()).collect(),
         description: description.to_string(),
-        busy_policy: if available {
-            BUSY_READ.to_string()
-        } else {
-            BUSY_UNAVAILABLE.to_string()
-        },
+        busy_policy: busy_policy.to_string(),
         available,
         unavailability_reason: if available {
             None
@@ -87,17 +90,34 @@ fn descriptor(
     }
 }
 
-/// The initial available prefix plus the planned-but-unbuilt local kinds the
-/// catalog already knows about.
+/// The available prefix, the config carrier commands, and the
+/// planned-but-unbuilt local kinds the catalog already knows about.
 pub fn describe() -> Page<CommandDescriptor> {
-    let mut items = vec![descriptor(
-        "read_file",
-        &["read"],
-        READ_FILE_DESCRIPTION,
-        true,
-    )];
+    let mut items = vec![
+        descriptor(
+            "read_file",
+            &["read"],
+            READ_FILE_DESCRIPTION,
+            true,
+            BUSY_READ,
+        ),
+        descriptor("config.set", &[], CONFIG_SET_DESCRIPTION, true, BUSY_WRITE),
+        descriptor(
+            "config.unset",
+            &[],
+            CONFIG_UNSET_DESCRIPTION,
+            true,
+            BUSY_WRITE,
+        ),
+    ];
     for kind in PLANNED_LOCAL_KINDS {
-        items.push(descriptor(kind, &[], PLANNED_COMMAND_DESCRIPTION, false));
+        items.push(descriptor(
+            kind,
+            &[],
+            PLANNED_COMMAND_DESCRIPTION,
+            false,
+            BUSY_UNAVAILABLE,
+        ));
     }
     Page::new(items, 0)
 }

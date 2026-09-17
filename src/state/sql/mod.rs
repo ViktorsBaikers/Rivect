@@ -25,6 +25,7 @@ pub const EVENTS_AFTER_FOR_TASK: &str = "SELECT event_id, aggregate_id, aggregat
              FROM events WHERE session_id = ?1 AND cursor > ?2 AND task_id = ?3 ORDER BY cursor LIMIT ?4";
 pub const EVENT_BY_AGGREGATE_REVISION: &str = "SELECT event_id, aggregate_id, aggregate_revision, cursor, session_id, task_id, event_type, delta_json, origin
              FROM events WHERE aggregate_id = ?1 AND aggregate_revision = ?2";
+pub const EVENT_COUNT: &str = "SELECT COUNT(*) FROM events";
 pub const REPLAY_TODO_PROJECTION: &str =
     "INSERT OR REPLACE INTO todo_projection (task_id, revision, lifecycle)
              SELECT task_id, revision, lifecycle FROM tasks WHERE task_id = ?1";
@@ -162,3 +163,35 @@ pub const COMPLETION_COUNTS: &str = "SELECT
 pub const UPSERT_RETAINED: &str =
     "INSERT OR REPLACE INTO retained (boundary_id, record_json) VALUES (?1, ?2)";
 pub const RETAINED_BY_ID: &str = "SELECT record_json FROM retained WHERE boundary_id = ?1";
+// The admission counter is scoped to the target, not (owner, target):
+// every intent competing for one target draws from the same sequence, so
+// concurrent intents are totally ordered by admission, never by owner
+// spelling (EDGE-009 — a UUID is not an admission order).
+pub const NEXT_PUBLICATION_SEQ: &str =
+    "SELECT COALESCE(MAX(admission_seq), 0) + 1 FROM config_publications
+                 WHERE target = ?1";
+pub const INSERT_PUBLICATION: &str = "INSERT INTO config_publications (owner, target, admission_seq, intended_digest, base_digest, identity, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')";
+// Selection order: target (the competition scope), then admission_seq
+// (chronology). The journal key stays (owner, target, admission_seq);
+// owner breaks ties only for rows journaled before the per-target
+// counter — its legacy per-(owner, target) sequence could tie across
+// owners. Every row this build writes has a unique (target, admission_seq).
+pub const PENDING_PUBLICATIONS: &str =
+    "SELECT owner, target, admission_seq, intended_digest, base_digest, identity
+                 FROM config_publications WHERE state = 'pending'
+                 ORDER BY target, admission_seq, owner";
+// Terminal rows stay matchable: the singleflight replay of an
+// already-applied intent observes the winner's receipt instead of
+// minting a second journal row.
+pub const APPLIED_PUBLICATIONS: &str =
+    "SELECT owner, target, admission_seq, intended_digest, base_digest, identity
+                 FROM config_publications WHERE state = 'applied'
+                 ORDER BY target, admission_seq, owner";
+pub const COMPLETE_PUBLICATION: &str = "UPDATE config_publications SET state = 'applied'
+                 WHERE owner = ?1 AND target = ?2 AND admission_seq = ?3 AND state = 'pending'";
+pub const INSERT_PREAPPROVAL: &str =
+    "INSERT OR REPLACE INTO preapprovals (scope, granted_by, expires_at)
+                 VALUES (?1, ?2, datetime('now', ?3))";
+pub const PREAPPROVAL_LIVE: &str =
+    "SELECT EXISTS(SELECT 1 FROM preapprovals WHERE scope = ?1 AND expires_at > datetime('now'))";

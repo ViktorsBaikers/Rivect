@@ -137,3 +137,25 @@ CREATE TABLE IF NOT EXISTS retained (
     boundary_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL
 );
+-- Config publication journal: append-only intents, receipted by
+-- the state transition pending -> applied. `identity` is the target's
+-- `dev:ino` at staging: the managed write is in-place, so a surviving
+-- inode attributes intended bytes to our own crashed write; a replaced
+-- inode never does.
+CREATE TABLE IF NOT EXISTS config_publications (
+    owner TEXT NOT NULL,
+    target TEXT NOT NULL,
+    admission_seq INTEGER NOT NULL,
+    intended_digest TEXT NOT NULL,
+    base_digest TEXT,
+    identity TEXT,
+    state TEXT NOT NULL,
+    PRIMARY KEY (owner, target, admission_seq)
+) STRICT;
+-- Limited-grant consents: one live row per scope, renewed by
+-- re-grant; read by the permission-mode decision, written by the panel.
+CREATE TABLE IF NOT EXISTS preapprovals (
+    scope TEXT PRIMARY KEY,
+    granted_by TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+) STRICT;

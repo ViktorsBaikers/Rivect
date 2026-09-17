@@ -71,6 +71,12 @@ pub enum ConflictCause {
     CompletionStale { stale: u64 },
     #[error("attempt {attempt_id} is {state}, not reconcile-able")]
     AttemptNotReconcileable { attempt_id: String, state: String },
+    #[error("publication intent {owner}/{target}#{admission_seq} is not pending")]
+    PublicationNotPending {
+        owner: String,
+        target: String,
+        admission_seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -178,6 +184,45 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             )
         })?,
         origin: row.get(8)?,
+    })
+}
+fn publication_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::config::PublicationIntent> {
+    let identity: Option<String> = row.get(5)?;
+    let publish_identity = identity
+        .map(|raw| parse_publish_identity(&raw))
+        .transpose()?;
+    Ok(crate::config::PublicationIntent {
+        owner: row.get(0)?,
+        target: row.get(1)?,
+        admission_seq: row.get::<_, i64>(2)? as u64,
+        intended_digest: row.get(3)?,
+        base_digest: row.get(4)?,
+        publish_identity,
+    })
+}
+
+/// A malformed `identity` column is a corrupted journal row; reading it
+/// fails instead of guessing an attribution.
+fn parse_publish_identity(raw: &str) -> rusqlite::Result<crate::config::PublishIdentity> {
+    let identity_error = |source: std::io::Error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(source))
+    };
+    let (dev, ino) = raw.split_once(':').ok_or_else(|| {
+        identity_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed publication identity column",
+        ))
+    })?;
+    let hex64 = |digits: &str| {
+        u64::from_str_radix(digits, 16).map_err(|source| {
+            identity_error(std::io::Error::new(std::io::ErrorKind::InvalidData, source))
+        })
+    };
+    Ok(crate::config::PublishIdentity {
+        dev: hex64(dev)?,
+        ino: hex64(ino)?,
     })
 }
 
@@ -416,6 +461,22 @@ impl TaskStore {
             out.push(row.map_err(storage)?);
         }
         Ok(out)
+    }
+
+    /// Total rows in the event outbox, across sessions: the emission
+    /// observable for paths that must stay silent (recovery-only journal
+    /// completion emits no hooks).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the count query fails.
+    pub fn event_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row(sql::EVENT_COUNT, [], |row| row.get(0))
+            .map_err(storage)?;
+        // COUNT(*) is never negative; the fallback only satisfies the
+        // checked-conversion lint on an impossible value.
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     // ----- command dedupe -----
@@ -1755,6 +1816,132 @@ impl TaskStore {
             .optional()
             .map_err(storage)?;
         Ok(record)
+    }
+
+    // ----- config publication journal (config.rs owns the intent) -----
+
+    /// Appends one publication intent and returns its admission sequence.
+    /// The counter is scoped to the target so concurrent intents on one
+    /// target draw from the same sequence: admission order, never owner
+    /// spelling, decides selection later (EDGE-009).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the transaction or either
+    /// statement fails.
+    pub fn append_publication(
+        &mut self,
+        owner: &str,
+        target: &str,
+        intended_digest: &str,
+        base_digest: Option<&str>,
+        identity: Option<crate::config::PublishIdentity>,
+    ) -> Result<u64> {
+        let identity = identity.map(|id| format!("{:x}:{:x}", id.dev, id.ino));
+        let tx = self.conn.transaction().map_err(storage)?;
+        let admission_seq: u64 = tx
+            .query_row(sql::NEXT_PUBLICATION_SEQ, params![target], |row| {
+                row.get::<_, i64>(0).map(|value| value as u64)
+            })
+            .map_err(storage)?;
+        tx.execute(
+            sql::INSERT_PUBLICATION,
+            params![
+                owner,
+                target,
+                admission_seq as i64,
+                intended_digest,
+                base_digest,
+                identity
+            ],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(admission_seq)
+    }
+
+    /// Pending intents in `(target, admission_seq)` order — admission
+    /// order per target. The journal key stays `(owner, target,
+    /// admission_seq)`; owner spelling (a UUID) decides selection only
+    /// for rows journaled before the per-target counter — its legacy
+    /// per-(owner, target) sequence could tie across owners. Every row
+    /// this build writes has a unique `(target, admission_seq)`.
+    pub fn pending_publications(&self) -> Result<Vec<crate::config::PublicationIntent>> {
+        self.publications(sql::PENDING_PUBLICATIONS)
+    }
+
+    /// Applied intents in `(target, admission_seq)` order — the terminal
+    /// results the singleflight replay matches against.
+    pub fn applied_publications(&self) -> Result<Vec<crate::config::PublicationIntent>> {
+        self.publications(sql::APPLIED_PUBLICATIONS)
+    }
+
+    /// Shared body of the two publication reads; only the SQL const
+    /// differs.
+    fn publications(
+        &self,
+        statement: &'static str,
+    ) -> Result<Vec<crate::config::PublicationIntent>> {
+        let mut stmt = self.conn.prepare(statement).map_err(storage)?;
+        let rows = stmt
+            .query_map([], publication_from_row)
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// Records the receipt for one intent; only recovery for a write it
+    /// attributed to itself calls this. A zero-row update means the intent
+    /// left the pending state underneath us (already receipted or gone) —
+    /// that is a typed conflict, never a silent success.
+    pub fn complete_publication(
+        &mut self,
+        owner: &str,
+        target: &str,
+        admission_seq: u64,
+    ) -> Result<()> {
+        let receipted = self
+            .conn
+            .execute(
+                sql::COMPLETE_PUBLICATION,
+                params![owner, target, admission_seq as i64],
+            )
+            .map_err(storage)?;
+        if receipted == 0 {
+            return Err(StoreError::Conflict(ConflictCause::PublicationNotPending {
+                owner: owner.to_string(),
+                target: target.to_string(),
+                admission_seq,
+            }));
+        }
+        Ok(())
+    }
+
+    // ----- preapprovals (the mode decision reads these) -----
+
+    /// Records or renews one limited-grant consent; `ttl_seconds` may be
+    /// negative to register an already-expired row.
+    pub fn record_preapproval(
+        &mut self,
+        scope: &str,
+        granted_by: &str,
+        ttl_seconds: i64,
+    ) -> Result<()> {
+        let modifier = format!("{ttl_seconds:+} seconds");
+        self.conn
+            .execute(
+                sql::INSERT_PREAPPROVAL,
+                params![scope, granted_by, modifier],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Whether a non-expired grant covers `scope`; absent scopes fail closed.
+    pub fn is_preapproved(&self, scope: &str) -> Result<bool> {
+        self.conn
+            .query_row(sql::PREAPPROVAL_LIVE, params![scope], |row| row.get(0))
+            .map_err(storage)
     }
 }
 

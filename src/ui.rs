@@ -3,8 +3,10 @@
 //! the client-side event projection rules.
 
 use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
-use crate::contracts::{CommandId, Event, TEXT_MAX_BYTES};
+use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
+use crate::policy::{ModeDecision, preapproval_scope};
 use crate::providers::LoopbackProvider;
+use crate::state::TaskStore;
 use crossterm::cursor::Show;
 use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
@@ -138,7 +140,189 @@ pub struct LocalView {
     pub dock: Vec<String>,
     pub transcript: Vec<String>,
     pub composer: String,
+    /// Open permission panel (modal). The Ask-verdict producer arrives with
+    /// the mode-selection carrier; while open, keys route to the panel.
+    pub panel: Option<PermissionPanel>,
 }
+
+/// Human actions the permission panel offers (DEC-014 verdict-vs-action
+/// split: the `{allow,ask,deny}` token is the mode verdict, these are the
+/// choices a human makes about it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelAction {
+    AllowOnce,
+    LimitedGrant,
+    Deny,
+}
+
+impl PanelAction {
+    fn label(self) -> String {
+        match self {
+            Self::AllowOnce => "allow once".to_string(),
+            // The label states the TTL the grant records: 600 s is
+            // ten minutes of limited consent, kept inside the 60-column
+            // acceptance geometry.
+            Self::LimitedGrant => {
+                format!(
+                    "allow with limited grant ({} min)",
+                    LIMIT_GRANT_TTL_SECONDS / 60
+                )
+            }
+            Self::Deny => "deny".to_string(),
+        }
+    }
+
+    fn all() -> [Self; 3] {
+        [Self::AllowOnce, Self::LimitedGrant, Self::Deny]
+    }
+}
+
+/// Title of the awaiting-permission state (design-brief §4).
+pub const PANEL_TITLE: &str = "awaiting permission";
+/// Transcript note when the panel resolves without a grant.
+pub const PANEL_DENIED_NOTE: &str = "permission denied; no grant recorded";
+/// Transcript note when the one-shot allow is chosen: it names the chosen
+/// action and the next observable state — the request is consumed by the
+/// choice and no grant outlives it (no consent carrier exists yet; the
+/// consume seam arrives with the mode-selection carrier).
+pub const PANEL_ALLOWED_NOTE: &str = "allowed once; no grant recorded; request consumed";
+/// Transcript note when the limited grant is recorded in the store.
+pub const PANEL_LIMITED_NOTE: &str = "limited grant recorded";
+/// One pinned footer line naming the panel's three key affordances.
+pub const PANEL_FOOTER_HINT: &str = "Tab/arrows move, Enter confirms, Esc denies";
+/// Grantor identity the panel records limited grants under.
+const PANEL_GRANTOR: &str = "human:tui-panel";
+/// Limited grants stay short on purpose; renewing is one explicit action.
+const LIMIT_GRANT_TTL_SECONDS: i64 = 600;
+
+/// The permission panel: one pending effect asking for consent. Focus is
+/// never consent (PRO-002) — the default focus is the non-destructive
+/// action and Enter confirms only what is focused.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionPanel {
+    pub verdict: ModeDecision,
+    pub class: EffectClass,
+    pub initiator: String,
+    pub expiry: String,
+    pub scope: String,
+    focus: PanelAction,
+    /// Vertical scroll offset of the scope body; the header and the
+    /// actions footer never scroll.
+    body_scroll: u16,
+}
+
+impl PermissionPanel {
+    /// Assembles the panel for one pending effect; `class` is the asked
+    /// effect's class and namespaces the limited-grant consent.
+    pub fn new(
+        verdict: ModeDecision,
+        class: EffectClass,
+        initiator: impl Into<String>,
+        expiry: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            verdict,
+            class,
+            initiator: initiator.into(),
+            expiry: expiry.into(),
+            scope: scope.into(),
+            focus: PanelAction::Deny,
+            body_scroll: 0,
+        }
+    }
+
+    /// Cycles focus across the actions; wrapping is intentional so every
+    /// action is reachable with either arrow key.
+    pub fn shift_focus(&mut self, backward: bool) {
+        let actions = PanelAction::all();
+        let index = actions
+            .iter()
+            .position(|action| *action == self.focus)
+            .unwrap_or(actions.len() - 1);
+        let offset = if backward { actions.len() - 1 } else { 1 };
+        self.focus = actions[(index + offset) % actions.len()];
+    }
+
+    /// The action a confirming Enter resolves to.
+    pub fn confirm(&self) -> PanelAction {
+        self.focus
+    }
+
+    /// Panel body; the focused action is bracketed so focus is readable
+    /// without color (standards §7.3: never color alone).
+    pub fn actions_line(&self) -> String {
+        PanelAction::all()
+            .iter()
+            .map(|action| {
+                if *action == self.focus {
+                    format!("[{}]", action.label())
+                } else {
+                    action.label()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Returns focus to the non-destructive action: a failed recording
+    /// must not leave the confirming action under Enter.
+    pub fn focus_deny(&mut self) {
+        self.focus = PanelAction::Deny;
+    }
+
+    /// Scrolls the scope body one line; the header and the actions footer
+    /// stay pinned, so a body longer than its region never hides the
+    /// actions behind the scope.
+    pub fn scroll_body(&mut self, down: bool) {
+        self.body_scroll = if down {
+            self.body_scroll.saturating_add(1)
+        } else {
+            self.body_scroll.saturating_sub(1)
+        };
+    }
+
+    /// Pinned header: the mandatory fields precede the scope so scarce
+    /// rows never hide them (design-brief §4).
+    fn header_text(&self) -> String {
+        format!(
+            "{PANEL_TITLE}\ndecision: {}\neffect: {}\ninitiator: {}\nexpiry: {}",
+            self.verdict.token(),
+            effect_class_label(self.class),
+            self.initiator,
+            self.expiry,
+        )
+    }
+
+    /// Scrollable body: the scope, the only freely wrapping part (the
+    /// request detail carrier arrives with the mode-selection carrier).
+    fn body_text(&self) -> String {
+        format!("scope: {}", self.scope)
+    }
+
+    /// Pinned footer: the actions line, then the one affordance hint.
+    fn footer_text(&self) -> String {
+        format!("{}\n{PANEL_FOOTER_HINT}", self.actions_line())
+    }
+}
+
+/// The six effect classes, spelled for the panel's mandatory
+/// `effect:` header line.
+fn effect_class_label(class: EffectClass) -> &'static str {
+    match class {
+        EffectClass::Read => "read",
+        EffectClass::Write => "write",
+        EffectClass::Exec => "exec",
+        EffectClass::Egress => "egress",
+        EffectClass::Model => "model",
+        EffectClass::Control => "control",
+    }
+}
+
+/// Rows of the pinned panel header (`header_text`).
+const PANEL_HEADER_ROWS: u16 = 5;
+/// Rows of the pinned panel footer (`footer_text`).
+const PANEL_FOOTER_ROWS: u16 = 2;
 
 /// Start, no connection: input and help are available; login has not happened.
 pub const STATUS_DISCONNECTED: &str = "Rivect · not connected · /help for help";
@@ -160,6 +344,7 @@ pub fn initial_view() -> LocalView {
             TRANSCRIPT_NO_PROJECT.to_string(),
         ],
         composer: String::new(),
+        panel: None,
     }
 }
 
@@ -180,6 +365,38 @@ pub fn render(
         frame.render_widget(Paragraph::new(view.transcript.join("\n")), chunks[1]);
         frame.render_widget(Paragraph::new(view.dock.join("\n")), chunks[2]);
         frame.render_widget(Paragraph::new(format!("> {}", view.composer)), chunks[3]);
+        if let Some(panel) = &view.panel {
+            // Modal overlay: capped at the 60-column acceptance geometry,
+            // clamped to the buffer, three regions — pinned header,
+            // scrollable scope body (wrapping, never truncating),
+            // pinned actions footer (design-brief §4).
+            let width = area.width.min(60);
+            let height = area.height.saturating_sub(4).max(6);
+            let panel_area = ratatui::layout::Rect {
+                x: area.width.saturating_sub(width) / 2,
+                y: area.height.saturating_sub(height) / 2,
+                width,
+                height,
+            };
+            frame.render_widget(ratatui::widgets::Clear, panel_area);
+            let block = ratatui::widgets::Block::bordered();
+            let inner = block.inner(panel_area);
+            frame.render_widget(block, panel_area);
+            let regions = ratatui::layout::Layout::vertical([
+                Constraint::Length(PANEL_HEADER_ROWS),
+                Constraint::Min(1),
+                Constraint::Length(PANEL_FOOTER_ROWS),
+            ])
+            .split(inner);
+            frame.render_widget(Paragraph::new(panel.header_text()), regions[0]);
+            frame.render_widget(
+                Paragraph::new(panel.body_text())
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((panel.body_scroll, 0)),
+                regions[1],
+            );
+            frame.render_widget(Paragraph::new(panel.footer_text()), regions[2]);
+        }
     })?;
     Ok(())
 }
@@ -319,6 +536,87 @@ fn task_dock(status: &Value) -> Vec<String> {
 
 const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
 
+/// Handles one key event while the permission panel is open — the one
+/// production handler, shared by the TUI loop and the panel harness, so
+/// the limited-grant recording is exercised on the exact production path.
+/// Returns false when the caller should exit with the cancel code
+/// (Ctrl-C). Enter confirms only the focused action — an unsolicited
+/// Enter resolves to the default deny focus, never a grant (PRO-002);
+/// composer input is suspended while the modal owns the keys.
+///
+/// A limited-grant recording that fails resolves nothing: the panel
+/// stays open, the typed store error is noted in the transcript, and
+/// focus returns to the deny action, so the choice can be retried or
+/// denied, never lost to the failure.
+pub fn handle_panel_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    view: &mut LocalView,
+    store: &mut TaskStore,
+) -> bool {
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
+    match code {
+        KeyCode::Left
+        | KeyCode::BackTab
+        | KeyCode::Right
+        | KeyCode::Tab
+        | KeyCode::Up
+        | KeyCode::Down => {
+            let backward = matches!(code, KeyCode::Left | KeyCode::BackTab | KeyCode::Up);
+            if let Some(panel) = view.panel.as_mut() {
+                panel.shift_focus(backward);
+            }
+        }
+        KeyCode::PageUp | KeyCode::PageDown => {
+            if let Some(panel) = view.panel.as_mut() {
+                panel.scroll_body(code == KeyCode::PageDown);
+            }
+        }
+        KeyCode::Enter => confirm_panel_action(view, store),
+        // Esc cancels the prompt: stopped work stays visible, nothing is
+        // granted (design-brief Pause/cancel state).
+        KeyCode::Esc if view.panel.take().is_some() => {
+            view.transcript.push(PANEL_DENIED_NOTE.to_string());
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Resolves the Enter key. The panel resolves only after its chosen
+/// action succeeded; a failed grant recording puts the panel back
+/// un-resolved, notes the typed store error, and returns focus to the
+/// deny action, so the choice can be retried or denied, never lost to
+/// the failure.
+fn confirm_panel_action(view: &mut LocalView, store: &mut TaskStore) {
+    if let Some(mut panel) = view.panel.take() {
+        match panel.confirm() {
+            PanelAction::Deny => {
+                view.transcript.push(PANEL_DENIED_NOTE.to_string());
+            }
+            PanelAction::AllowOnce => {
+                view.transcript.push(PANEL_ALLOWED_NOTE.to_string());
+            }
+            PanelAction::LimitedGrant => {
+                let scope = preapproval_scope(panel.class, &panel.scope);
+                match store.record_preapproval(&scope, PANEL_GRANTOR, LIMIT_GRANT_TTL_SECONDS) {
+                    Ok(()) => {
+                        view.transcript.push(PANEL_LIMITED_NOTE.to_string());
+                    }
+                    Err(source) => {
+                        panel.focus_deny();
+                        view.panel = Some(panel);
+                        view.transcript
+                            .push(format!("limited grant recording failed: {source}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn append_composer_char(view: &mut LocalView, ch: char) {
     // The typed goal must never exceed what create_task accepts; the wire
     // frame cap (REQUEST_MAX_BYTES) is far above this, so TEXT_MAX_BYTES is
@@ -338,7 +636,7 @@ fn append_composer_char(view: &mut LocalView, ch: char) {
 pub fn run_tui(data_root: &Path) -> io::Result<i32> {
     let mut guard = TerminalGuard::enter()?;
     let mut view = initial_view();
-    let mut tui_dispatch = None;
+    let mut tui_dispatch: Option<TuiDispatch> = None;
     let mut exit = 0;
     loop {
         render(guard.terminal_mut(), &view)?;
@@ -351,10 +649,29 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
             }) = read()?
         {
             match (code, modifiers) {
-                (KeyCode::Esc, _) => break,
+                (KeyCode::Esc, _) if view.panel.is_none() => break,
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                     exit = 130;
                     break;
+                }
+                _ if view.panel.is_some() => {
+                    // The modal owns the keys through the shared production
+                    // handler; the limited-grant action records on the same
+                    // store handle decide reads (DEC-016). Without an open
+                    // dispatch there is no store to grant on, so the
+                    // action fails honestly.
+                    let dispatch = tui_dispatch
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("no open session to grant on"))?;
+                    if !handle_panel_key(
+                        code,
+                        modifiers,
+                        &mut view,
+                        &mut dispatch.runtime.owner.store,
+                    ) {
+                        exit = 130;
+                        break;
+                    }
                 }
                 (KeyCode::Enter, _) if !view.composer.is_empty() => {
                     let input = view.composer.clone();

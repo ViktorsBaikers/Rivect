@@ -4,8 +4,8 @@
 //! any byte is touched. SLICE-003 extends this same backend.
 
 use sha2::Digest;
-use std::fs::Metadata;
-use std::io::Read;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 /// The one injected backend seam: everything the executor reads goes
@@ -15,6 +15,16 @@ pub trait ReadWorker: Send {
         scope_root: &Path,
         target: &Path,
     ) -> Result<ReadObservation, WorkerError>;
+
+    fn write_once(
+        &mut self,
+        _scope_root: &Path,
+        _target: &Path,
+        _expected: FileIdentity,
+        _bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        Err(WorkerError::WriteUnavailable)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,11 +38,37 @@ impl ReadWorker for MacosReadWorker {
     ) -> Result<ReadObservation, WorkerError> {
         read_once(scope_root, target)
     }
+
+    fn write_once(
+        &mut self,
+        scope_root: &Path,
+        target: &Path,
+        expected: FileIdentity,
+        bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        write_once(scope_root, target, expected, bytes)
+    }
 }
 
 pub const BACKEND: &str = "macos";
 
 pub const READ_MAX_BYTES: usize = 1 << 20;
+pub const WRITE_MAX_BYTES: usize = READ_MAX_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
 
 /// macOS `O_NONBLOCK` (Darwin fcntl.h: 0x0004; no libc dependency here).
 /// Opening a FIFO read-only with this flag returns immediately even when no
@@ -63,6 +99,16 @@ pub enum WorkerError {
     TargetChanged { target: PathBuf },
     #[error("denied: read failed: {source}")]
     ReadFailed { source: std::io::Error },
+    #[error("denied: write failed: {source}")]
+    WriteFailed { source: std::io::Error },
+    #[error("denied: managed write failed after mutation: {source}")]
+    WriteMutationFailed { source: std::io::Error },
+    #[error("denied: managed write backend unavailable")]
+    WriteUnavailable,
+    #[error("denied: managed write exceeds the {WRITE_MAX_BYTES} byte limit")]
+    WriteTooLarge,
+    #[error("denied: managed write length conversion failed: {source}")]
+    WriteLengthOverflow { source: std::num::TryFromIntError },
     #[error("denied: target exceeds the {READ_MAX_BYTES} byte read limit")]
     TooLarge,
 }
@@ -74,19 +120,17 @@ fn same_regular_file(expected: &Metadata, opened: &Metadata) -> bool {
         && expected.ino() == opened.ino()
 }
 
-/// One bounded read of an existing regular file inside the canonical scope
-/// root. Symlinks that escape the scope are denied via canonicalisation; the
-/// opened handle is re-checked as a regular file and for dev/ino identity
-/// (fail-closed on swaps), and the FIFO-before-open window is bounded by an
-/// `O_NONBLOCK` open instead of a potentially unbounded blocking `open(2)`.
-pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, WorkerError> {
+fn inspect_regular_target(
+    scope_root: &Path,
+    target: &Path,
+) -> Result<(PathBuf, Metadata), WorkerError> {
     let scope = scope_root
         .canonicalize()
         .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
     let canonical_target = target
         .canonicalize()
         // Every canonicalize failure — missing, permission, symlink loop —
-        // denies the read the same way: the target is unavailable.
+        // denies the effect the same way: the target is unavailable.
         .map_err(|_source| WorkerError::TargetMissing {
             target: target.to_path_buf(),
         })?;
@@ -102,6 +146,24 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
             target: target.to_path_buf(),
         });
     }
+    Ok((canonical_target, canonical_meta))
+}
+
+pub(crate) fn target_identity(
+    scope_root: &Path,
+    target: &Path,
+) -> Result<FileIdentity, WorkerError> {
+    let (_, metadata) = inspect_regular_target(scope_root, target)?;
+    Ok(FileIdentity::from_metadata(&metadata))
+}
+
+/// One bounded read of an existing regular file inside the canonical scope
+/// root. Symlinks that escape the scope are denied via canonicalisation; the
+/// opened handle is re-checked as a regular file and for dev/ino identity
+/// (fail-closed on swaps), and the FIFO-before-open window is bounded by an
+/// `O_NONBLOCK` open instead of a potentially unbounded blocking `open(2)`.
+pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, WorkerError> {
+    let (_, canonical_meta) = inspect_regular_target(scope_root, target)?;
     if canonical_meta.len() > READ_MAX_BYTES as u64 {
         return Err(WorkerError::TooLarge);
     }
@@ -143,6 +205,67 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
         bytes: bounded,
         digest,
     })
+}
+
+pub fn write_once(
+    scope_root: &Path,
+    target: &Path,
+    expected: FileIdentity,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    if bytes.len() > WRITE_MAX_BYTES {
+        return Err(WorkerError::WriteTooLarge);
+    }
+    let (_, canonical_meta) = inspect_regular_target(scope_root, target)?;
+    // The open re-walks the original path. Both the admitted identity and the
+    // canonical-path identity must match the opened handle before any fd
+    // mutation can happen.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NONBLOCK)
+        .open(target)
+        .map_err(|source| WorkerError::WriteFailed { source })?;
+    write_opened_file(target, &canonical_meta, &mut file, expected, bytes)
+}
+
+/// Writes through an already-opened file after checking its current identity.
+pub fn write_once_on_opened_file(
+    scope_root: &Path,
+    target: &Path,
+    file: &mut File,
+    expected: FileIdentity,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    if bytes.len() > WRITE_MAX_BYTES {
+        return Err(WorkerError::WriteTooLarge);
+    }
+    let (_, canonical_meta) = inspect_regular_target(scope_root, target)?;
+    write_opened_file(target, &canonical_meta, file, expected, bytes)
+}
+
+fn write_opened_file(
+    target: &Path,
+    canonical_meta: &Metadata,
+    file: &mut File,
+    expected: FileIdentity,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    let opened_meta = file
+        .metadata()
+        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
+    if !same_regular_file(canonical_meta, &opened_meta)
+        || FileIdentity::from_metadata(&opened_meta) != expected
+    {
+        return Err(WorkerError::TargetChanged {
+            target: target.to_path_buf(),
+        });
+    }
+    let length =
+        u64::try_from(bytes.len()).map_err(|source| WorkerError::WriteLengthOverflow { source })?;
+    file.set_len(length)
+        .map_err(|source| WorkerError::WriteMutationFailed { source })?;
+    file.write_all(bytes)
+        .map_err(|source| WorkerError::WriteMutationFailed { source })
 }
 
 #[cfg(test)]
