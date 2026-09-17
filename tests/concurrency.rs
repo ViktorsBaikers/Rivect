@@ -25,10 +25,13 @@ use rivect::contracts::{AnswerSelection, Event, EventId, Lifecycle, SessionId, T
 use rivect::controller::{
     ControllerError, SchedulerStep, StepOutcome, step_error_observation, step_outcome_observation,
 };
-use rivect::executor::{ExecutorError, ReadWorker, WorkerError};
+use rivect::executor::{
+    EffectOutcome, EffectRequest, Executor, ExecutorError, ReadWorker, WorkerError,
+};
 use rivect::model::{ModelError, RequestManifest};
-use rivect::policy::PolicyError;
+use rivect::policy::{PermissionMode, PolicyError};
 use rivect::providers::{Provider, ProviderError, ProviderReply, ToolCall};
+use rivect::resources::{FlightRole, ReadFlights};
 use rivect::scheduler::{
     CompleteTransition, DeliverVerdict, NodeState, Scheduler, SchedulerError, WaitTransition,
 };
@@ -3095,4 +3098,444 @@ fn spent_only(limit_units: u64, spent: u64) -> BudgetStatus {
         spent,
         reserved: 0,
     }
+}
+
+/// Creates one root task through the real ingress: single-flight cases
+/// need durable tasks so every admitted attempt lands in the ledger.
+fn flight_task(world: &mut World, session: &SessionId, command_id: &str) -> TaskId {
+    let response = world.dispatch(&support::corpus_create(session, command_id));
+    assert!(
+        response
+            .get("result")
+            .and_then(|r| r.get("task_id"))
+            .is_some(),
+        "task create failed: {response}"
+    );
+    TaskId(
+        response["result"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string(),
+    )
+}
+
+/// Admits one read through the single-flight executor seam and reports
+/// the flight role the registry recorded for the fresh attempt.
+fn admit_flight_read(
+    world: &mut World,
+    flights: &mut ReadFlights,
+    task: &TaskId,
+    grant: &str,
+    file: &Path,
+    mode: PermissionMode,
+) -> (rivect::executor::AdmittedEffect, Option<FlightRole>) {
+    let mut executor = Executor::with_flights(
+        &mut world.runtime.policy,
+        &mut world.runtime.owner.store,
+        world.runtime.read_worker.as_mut(),
+        flights,
+    );
+    let admitted = executor
+        .admit(
+            task,
+            EffectRequest::Read {
+                grant_id: grant.to_string(),
+                path: file.to_path_buf(),
+            },
+            mode,
+        )
+        .expect("permitted read admits");
+    let role = flights.role(&admitted.attempt_id);
+    (admitted, role)
+}
+
+/// Executes one admitted read through the single-flight executor seam.
+fn execute_flight_read(
+    world: &mut World,
+    flights: &mut ReadFlights,
+    admitted: &rivect::executor::AdmittedEffect,
+) -> Result<EffectOutcome, ExecutorError> {
+    let mut executor = Executor::with_flights(
+        &mut world.runtime.policy,
+        &mut world.runtime.owner.store,
+        world.runtime.read_worker.as_mut(),
+        flights,
+    );
+    executor.execute(admitted)
+}
+
+/// Two identical permitted reads under one grant merge into one flight:
+/// the first admit leads, the second joins, one physical read charges
+/// the worker, and both attempts settle confirmed with the same digest
+/// (INV-023, AC-060 contribution).
+#[test]
+fn identical_permitted_reads_merge_into_one_physical_charge() {
+    let (mut world, file, grant) = scoped_world("singleflight-merge");
+    let session = world.open_session("bootstrap-singleflight-merge");
+    let task_a = flight_task(&mut world, &session, "cmd-flight-a");
+    let task_b = flight_task(&mut world, &session, "cmd-flight-b");
+    let mut flights = ReadFlights::new();
+
+    let (admitted_a, role_a) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_a,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_b, role_b) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_b,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    assert_eq!(
+        role_a,
+        Some(FlightRole::Leader),
+        "first admit opens the flight"
+    );
+    assert_eq!(
+        role_b,
+        Some(FlightRole::Follower),
+        "identical admit joins it"
+    );
+
+    let outcome_a =
+        execute_flight_read(&mut world, &mut flights, &admitted_a).expect("leader read executes");
+    let outcome_b = execute_flight_read(&mut world, &mut flights, &admitted_b)
+        .expect("follower receives the shared result");
+    let EffectOutcome::Read {
+        bytes: bytes_a,
+        digest: digest_a,
+    } = outcome_a
+    else {
+        panic!("leader outcome is a read");
+    };
+    let EffectOutcome::Read {
+        digest: digest_b, ..
+    } = outcome_b
+    else {
+        panic!("follower outcome is a read");
+    };
+    assert_eq!(bytes_a, b"rivect-concurrency-marker\n");
+    assert_eq!(digest_a, digest_b, "both subscribers observe one read");
+    assert_eq!(world.worker_reads(), 1, "one physical charge");
+
+    for admitted in [&admitted_a, &admitted_b] {
+        let (owner, state, detail) = world
+            .runtime
+            .owner
+            .store
+            .attempt_record(&admitted.attempt_id)
+            .expect("attempt record")
+            .expect("attempt exists");
+        assert_eq!(owner, admitted.task_id.0);
+        assert_eq!(state, "confirmed");
+        let detail = detail.expect("confirmed detail");
+        assert!(
+            detail.contains(&format!("sha256={digest_a}")),
+            "shared digest journalled: {detail}"
+        );
+    }
+}
+
+/// Reads differing in access scope, file snapshot, or permission mode
+/// never merge: each lands its own flight and its own physical read
+/// (INV-023: differing rights/snapshots never merge).
+#[test]
+fn differing_scope_snapshot_or_mode_never_merges_reads() {
+    let (mut world, file, grant) = scoped_world("singleflight-no-merge");
+    let session = world.open_session("bootstrap-singleflight-no-merge");
+    let task_a = flight_task(&mut world, &session, "cmd-no-merge-a");
+    let task_b = flight_task(&mut world, &session, "cmd-no-merge-b");
+    let mut flights = ReadFlights::new();
+
+    // Differing access scope: a wider grant over the same file is a
+    // different right, so it leads its own flight.
+    let wide_grant = world.runtime.policy.grant_read(world.root.clone());
+    let (admitted_a, role_a) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_a,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_b, role_b) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_b,
+        &wide_grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    assert_eq!(role_a, Some(FlightRole::Leader));
+    assert_eq!(
+        role_b,
+        Some(FlightRole::Leader),
+        "a different scope never joins the flight"
+    );
+    execute_flight_read(&mut world, &mut flights, &admitted_a).expect("scoped read executes");
+    execute_flight_read(&mut world, &mut flights, &admitted_b).expect("wide read executes");
+    assert_eq!(world.worker_reads(), 2, "differing rights charge twice");
+
+    // Differing snapshot: a replaced file is a new dev/ino binding.
+    let task_c = flight_task(&mut world, &session, "cmd-no-merge-c");
+    let task_d = flight_task(&mut world, &session, "cmd-no-merge-d");
+    let mut snapshot_flights = ReadFlights::new();
+    let (admitted_c, role_c) = admit_flight_read(
+        &mut world,
+        &mut snapshot_flights,
+        &task_c,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let replacement = world.root.join("scope").join("replacement.txt");
+    std::fs::write(&replacement, "replacement snapshot\n").expect("replacement write");
+    std::fs::rename(&replacement, &file).expect("snapshot swap");
+    let (admitted_d, role_d) = admit_flight_read(
+        &mut world,
+        &mut snapshot_flights,
+        &task_d,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    assert_eq!(role_c, Some(FlightRole::Leader));
+    assert_eq!(
+        role_d,
+        Some(FlightRole::Leader),
+        "a replaced snapshot never joins the flight"
+    );
+    let reads_before = world.worker_reads();
+    execute_flight_read(&mut world, &mut snapshot_flights, &admitted_c)
+        .expect("old snapshot read executes");
+    execute_flight_read(&mut world, &mut snapshot_flights, &admitted_d)
+        .expect("new snapshot read executes");
+    assert_eq!(world.worker_reads(), reads_before + 2);
+
+    // Differing permission mode: both verdicts are permits, but the
+    // rights they were granted under differ, so the reads stay apart.
+    let task_e = flight_task(&mut world, &session, "cmd-no-merge-e");
+    let task_f = flight_task(&mut world, &session, "cmd-no-merge-f");
+    let mut mode_flights = ReadFlights::new();
+    std::fs::write(&file, "mode discriminator\n").expect("stable snapshot for mode pair");
+    let (admitted_e, role_e) = admit_flight_read(
+        &mut world,
+        &mut mode_flights,
+        &task_e,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_f, role_f) = admit_flight_read(
+        &mut world,
+        &mut mode_flights,
+        &task_f,
+        &grant,
+        &file,
+        PermissionMode::ReadOnly,
+    );
+    assert_eq!(role_e, Some(FlightRole::Leader));
+    assert_eq!(
+        role_f,
+        Some(FlightRole::Leader),
+        "a different permission mode never joins the flight"
+    );
+    let reads_before = world.worker_reads();
+    execute_flight_read(&mut world, &mut mode_flights, &admitted_e).expect("manual read executes");
+    execute_flight_read(&mut world, &mut mode_flights, &admitted_f)
+        .expect("read-only read executes");
+    assert_eq!(world.worker_reads(), reads_before + 2);
+}
+
+/// One cancelled subscriber leaves the shared flight running for the
+/// others: the remaining members still receive the one physical read,
+/// and only the cancelled member's attempt settles rejected
+/// (EDGE-008, INV-023).
+#[test]
+fn cancelled_subscriber_leaves_other_flight_members_running() {
+    let (mut world, file, grant) = scoped_world("singleflight-cancel");
+    let session = world.open_session("bootstrap-singleflight-cancel");
+    let task_a = flight_task(&mut world, &session, "cmd-flight-keep-a");
+    let task_b = flight_task(&mut world, &session, "cmd-flight-drop-b");
+    let task_c = flight_task(&mut world, &session, "cmd-flight-keep-c");
+    let mut flights = ReadFlights::new();
+
+    let (admitted_a, _) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_a,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_b, _) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_b,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_c, _) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_c,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+
+    cancel_task_via_ingress(&mut world, &session, &task_b);
+
+    let outcome_a = execute_flight_read(&mut world, &mut flights, &admitted_a)
+        .expect("surviving member still executes");
+    let outcome_c = execute_flight_read(&mut world, &mut flights, &admitted_c)
+        .expect("other surviving member receives the shared result");
+    assert!(matches!(outcome_a, EffectOutcome::Read { .. }));
+    assert!(matches!(outcome_c, EffectOutcome::Read { .. }));
+    assert_eq!(
+        world.worker_reads(),
+        1,
+        "cancel of one subscriber charges once"
+    );
+
+    let outcome_b = execute_flight_read(&mut world, &mut flights, &admitted_b)
+        .expect("cancelled member settles, not errors");
+    assert!(
+        matches!(outcome_b, EffectOutcome::Denied { ref reason } if reason == rivect::executor::TASK_CANCELLED),
+        "cancelled subscriber denies closed: {outcome_b:?}"
+    );
+    let (_, state_b, _) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&admitted_b.attempt_id)
+        .expect("attempt record")
+        .expect("attempt exists");
+    assert_eq!(state_b, "rejected", "only the cancelled member rejects");
+}
+
+/// A deny enrolled after admission denies every flight member at its
+/// own execute-time consult: verdicts stay independent and no physical
+/// read is charged while the verdict denies (INV-023: independent
+/// verdicts never merge).
+#[test]
+fn deny_enrolled_after_admit_denies_each_flight_member_independently() {
+    let (mut world, file, grant) = scoped_world("singleflight-deny-flip");
+    let session = world.open_session("bootstrap-singleflight-deny");
+    let task_a = flight_task(&mut world, &session, "cmd-flight-deny-a");
+    let task_b = flight_task(&mut world, &session, "cmd-flight-deny-b");
+    let mut flights = ReadFlights::new();
+
+    let (admitted_a, _) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_a,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let (admitted_b, _) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_b,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+
+    world
+        .runtime
+        .policy
+        .enroll_deny(&file)
+        .expect("deny enrolls on the target");
+
+    let error_a = execute_flight_read(&mut world, &mut flights, &admitted_a)
+        .expect_err("leader consult denies after the flip");
+    let error_b = execute_flight_read(&mut world, &mut flights, &admitted_b)
+        .expect_err("follower consult denies after the flip");
+    assert!(matches!(error_a, ExecutorError::ModeDenied), "{error_a:?}");
+    assert!(matches!(error_b, ExecutorError::ModeDenied), "{error_b:?}");
+    assert_eq!(
+        world.worker_reads(),
+        0,
+        "a denying verdict never charges a physical read"
+    );
+}
+
+/// Non-read effects never enter or split a read flight: a write admits
+/// between two identical read admits without joining the registry or
+/// disturbing the merge (INV-023: effects never merge).
+#[test]
+fn non_read_effects_never_enter_or_split_a_read_flight() {
+    let (mut world, file, grant) = scoped_world("singleflight-effect-bypass");
+    let session = world.open_session("bootstrap-singleflight-effect");
+    let task_a = flight_task(&mut world, &session, "cmd-flight-read-a");
+    let task_b = flight_task(&mut world, &session, "cmd-flight-read-b");
+    let task_w = flight_task(&mut world, &session, "cmd-flight-write");
+    let write_grant = world.runtime.policy.grant_classes(
+        world.root.join("scope"),
+        vec![rivect::contracts::EffectClass::Write],
+    );
+    let mut flights = ReadFlights::new();
+
+    let (admitted_a, role_a) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_a,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    let admitted_w = {
+        let mut executor = Executor::with_flights(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+            &mut flights,
+        );
+        executor
+            .admit(
+                &task_w,
+                EffectRequest::Write {
+                    grant_id: write_grant,
+                    path: file.clone(),
+                    bytes: b"write beside the flight\n".to_vec(),
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("yolo write admits")
+    };
+    assert!(
+        flights.role(&admitted_w.attempt_id).is_none(),
+        "effects never enter the read flight registry"
+    );
+    let (admitted_b, role_b) = admit_flight_read(
+        &mut world,
+        &mut flights,
+        &task_b,
+        &grant,
+        &file,
+        PermissionMode::Manual,
+    );
+    assert_eq!(role_a, Some(FlightRole::Leader));
+    assert_eq!(
+        role_b,
+        Some(FlightRole::Follower),
+        "the effect neither split nor joined the read flight"
+    );
+
+    execute_flight_read(&mut world, &mut flights, &admitted_a).expect("read a executes");
+    execute_flight_read(&mut world, &mut flights, &admitted_b).expect("read b executes");
+    assert_eq!(
+        world.worker_reads(),
+        1,
+        "only the read flight charges reads"
+    );
 }

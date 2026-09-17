@@ -14,6 +14,7 @@ use crate::contracts::{EffectClass, ErrorCode, TaskId};
 use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, preapproval_scope,
 };
+use crate::resources::{ReadFlightKey, ReadFlights, ReadRights, SnapshotBinding};
 use crate::state::{StoreError, TaskStore};
 use sha2::Digest as _;
 use std::path::{Path, PathBuf};
@@ -187,10 +188,28 @@ fn readonly_rejection(class: EffectClass) -> String {
     )
 }
 
+/// The ledger outcome of one performed read: the effect result and its
+/// confirmation detail share one digest, whichever flight member
+/// journalled it.
+fn read_result(observation: ReadObservation) -> (EffectOutcome, String) {
+    (
+        EffectOutcome::Read {
+            bytes: observation.bytes,
+            digest: observation.digest.clone(),
+        },
+        format!("read-performed sha256={}", observation.digest),
+    )
+}
+
 pub struct Executor<'a> {
     pub policy: &'a mut Policy,
     pub store: &'a mut TaskStore,
     pub worker: &'a mut dyn ReadWorker,
+    /// The single-flight registry for permitted reads (INV-023), when
+    /// the call site runs reads merged. Absent, every admitted read
+    /// executes its own physical charge — the pre-single-flight
+    /// behavior.
+    flights: Option<&'a mut ReadFlights>,
 }
 /// Assembles the DEC-014 decision inputs at an admit call site under the
 /// caller's permission mode (DEC-016); call sites without a Settings
@@ -264,6 +283,26 @@ impl<'a> Executor<'a> {
             policy,
             store,
             worker,
+            flights: None,
+        }
+    }
+
+    /// The single-flight seam: identical permitted reads admitted
+    /// through this executor merge into one physical charge in
+    /// `flights` (INV-023); effects, differing rights, and differing
+    /// snapshots never merge.
+    #[must_use]
+    pub fn with_flights(
+        policy: &'a mut Policy,
+        store: &'a mut TaskStore,
+        worker: &'a mut dyn ReadWorker,
+        flights: &'a mut ReadFlights,
+    ) -> Self {
+        Self {
+            policy,
+            store,
+            worker,
+            flights: Some(flights),
         }
     }
 
@@ -309,6 +348,24 @@ impl<'a> Executor<'a> {
             .plan_attempt(task_id, request.class(), &request.describe())?;
         if decision != ModeDecision::Allow {
             self.reject_mode(&attempt_id, decision)?;
+        }
+        // Single-flight (INV-023): a permitted read joins its identical
+        // open flight, keyed by target, snapshot, scope, and rights. A
+        // target whose snapshot cannot be observed stays unmerged — one
+        // conservative non-merge, never a wrong merge.
+        if let Some(flights) = self.flights.as_deref_mut()
+            && let EffectRequest::Read { path, .. } = &request
+            && let Ok(snapshot) = macos::target_identity(&scope_root, path)
+        {
+            flights.subscribe(
+                ReadFlightKey {
+                    target: path.clone(),
+                    snapshot: SnapshotBinding(snapshot),
+                    scope_root: scope_root.clone(),
+                    rights: ReadRights::new(&grant_id, mode),
+                },
+                &attempt_id,
+            );
         }
         Ok(AdmittedEffect {
             task_id: task_id.clone(),
@@ -516,6 +573,22 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// The shared observation of one read member's flight, when the
+    /// one physical read already happened (INV-023).
+    fn take_shared_observation(&mut self, attempt_id: &str) -> Option<ReadObservation> {
+        self.flights
+            .as_deref_mut()
+            .and_then(|flights| flights.take_shared(attempt_id))
+    }
+
+    /// Leaves the read flight without an observation: a member denied
+    /// or cancelled at execute time no longer claims the shared read;
+    /// the remaining members keep theirs.
+    fn abandon_flight(&mut self, attempt_id: &str) {
+        if let Some(flights) = self.flights.as_deref_mut() {
+            flights.drop_member(attempt_id);
+        }
+    }
     /// Mutable admission immediately before the effect: the grant is
     /// re-checked, cancellation settles the attempt, and the mode verdict
     /// is re-consulted under the admitted mode (an enrolled deny added
@@ -530,31 +603,50 @@ impl<'a> Executor<'a> {
             | EffectRequest::Exec { grant_id, .. }
             | EffectRequest::Egress { grant_id, .. } => grant_id.clone(),
         };
-        self.admit_settled(&admitted.attempt_id, &grant_id, admitted.request.class())?;
+        if let Err(error) =
+            self.admit_settled(&admitted.attempt_id, &grant_id, admitted.request.class())
+        {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
         if self.store.task_cancelled(&admitted.task_id)? {
             self.store
                 .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
+            self.abandon_flight(&admitted.attempt_id);
             return Ok(EffectOutcome::Denied {
                 reason: TASK_CANCELLED.to_string(),
             });
         }
         // Mutable mode consult before the worker runs anything.
         let target = admitted.request.target_path();
-        self.mode_gate(admitted, &target)?;
+        if let Err(error) = self.mode_gate(admitted, &target) {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
+        // Single-flight (INV-023): a read member denied at any
+        // execute-time gate leaves its flight without an observation;
+        // the remaining members keep their own claim on the physical
+        // read, so verdicts and cancels stay per-member.
         self.store.attempt_running(&admitted.attempt_id)?;
         let effect = match &admitted.request {
-            EffectRequest::Read { path, .. } => self
-                .worker
-                .read_once(&admitted.scope_root, path)
-                .map(|observation| {
-                    (
-                        EffectOutcome::Read {
-                            bytes: observation.bytes,
-                            digest: observation.digest.clone(),
-                        },
-                        format!("read-performed sha256={}", observation.digest),
-                    )
-                }),
+            EffectRequest::Read { path, .. } => {
+                // Single-flight (INV-023): a member of a settled flight
+                // takes the shared observation instead of charging its
+                // own physical read; the first member to execute
+                // performs the one read and settles the flight.
+                match self.take_shared_observation(&admitted.attempt_id) {
+                    Some(observation) => Ok(read_result(observation)),
+                    None => self
+                        .worker
+                        .read_once(&admitted.scope_root, path)
+                        .map(|observation| {
+                            if let Some(flights) = self.flights.as_deref_mut() {
+                                flights.settle(&admitted.attempt_id, observation.clone());
+                            }
+                            read_result(observation)
+                        }),
+                }
+            }
             EffectRequest::Write { path, bytes, .. } => admitted
                 .expected_identity
                 // A write without an admit-time binding (a forged
@@ -607,6 +699,7 @@ impl<'a> Executor<'a> {
                 Ok(outcome)
             }
             Err(error) => {
+                self.abandon_flight(&admitted.attempt_id);
                 let detail = error.to_string();
                 match &error {
                     WorkerError::WriteMutationFailed { .. } => {
@@ -636,10 +729,14 @@ impl<'a> Executor<'a> {
             EffectRequest::Read { grant_id, .. } => grant_id.clone(),
             _ => unreachable!("read class checked above"),
         };
-        self.admit_settled(&admitted.attempt_id, &grant_id, EffectClass::Read)?;
+        if let Err(error) = self.admit_settled(&admitted.attempt_id, &grant_id, EffectClass::Read) {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
         if self.store.task_cancelled(&admitted.task_id)? {
             self.store
                 .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
+            self.abandon_flight(&admitted.attempt_id);
             return Err(ExecutorError::Cancelled);
         }
         let EffectRequest::Read { path, .. } = &admitted.request else {
@@ -647,12 +744,28 @@ impl<'a> Executor<'a> {
         };
         // Same mutable mode consult as `execute`: the crash emulation must
         // not read past a verdict that stopped being a clear allow.
-        self.mode_gate(admitted, path)?;
+        if let Err(error) = self.mode_gate(admitted, path) {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
         self.store.attempt_running(&admitted.attempt_id)?;
-        let observation = self
-            .worker
-            .read_once(&admitted.scope_root, path)
-            .map_err(ExecutorError::from)?;
+        // Single-flight (INV-023): the crash emulation keeps one
+        // physical charge — it takes a settled flight's shared
+        // observation, and its own physical read settles the flight for
+        // the remaining members.
+        let observation = match self.take_shared_observation(&admitted.attempt_id) {
+            Some(observation) => observation,
+            None => {
+                let observation = self
+                    .worker
+                    .read_once(&admitted.scope_root, path)
+                    .map_err(ExecutorError::from)?;
+                if let Some(flights) = self.flights.as_deref_mut() {
+                    flights.settle(&admitted.attempt_id, observation.clone());
+                }
+                observation
+            }
+        };
         self.store.set_attempt_state(
             &admitted.attempt_id,
             "unknown",

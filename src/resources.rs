@@ -3,7 +3,10 @@
 //! backlog is replaced by one resync marker.
 
 use crate::contracts::Event;
-use std::collections::VecDeque;
+use crate::executor::{FileIdentity, ReadObservation};
+use crate::policy::PermissionMode;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceHolderStatus {
@@ -72,6 +75,200 @@ impl NotificationQueue {
 
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+}
+
+/// The merge identity of one permitted read (INV-023). The operation
+/// kind is the registry itself: only reads enter it, so effects can
+/// never merge. The remaining components are the significant input
+/// (the target as admitted), the file snapshot binding observed at
+/// admit (the same dev/ino binding the checked-fd write path pins), the
+/// access scope (the grant's scope root), and the rights the read was
+/// permitted under: the grant identity and the caller's permission
+/// mode. Policy generations are projected through those components —
+/// a fresh grant is a fresh id, and any deny or revocation that
+/// changes this read's verdict rejects the next admit instead of
+/// merging with the open flight.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReadFlightKey {
+    pub target: PathBuf,
+    pub snapshot: SnapshotBinding,
+    pub scope_root: PathBuf,
+    pub rights: ReadRights,
+}
+
+/// The file snapshot binding of one admitted read — the same dev/ino
+/// pair the checked-fd write path pins — in the hashable shape the
+/// flight key needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotBinding(pub FileIdentity);
+
+impl std::hash::Hash for SnapshotBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.dev);
+        state.write_u64(self.0.ino);
+    }
+}
+
+/// The rights half of a [`ReadFlightKey`]: grant identity plus the
+/// permission mode id the verdict was consulted under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReadRights {
+    pub grant_id: String,
+    pub mode: &'static str,
+}
+
+impl ReadRights {
+    #[must_use]
+    pub fn new(grant_id: &str, mode: PermissionMode) -> Self {
+        Self {
+            grant_id: grant_id.to_string(),
+            mode: mode.id(),
+        }
+    }
+}
+
+/// One in-flight read: the attempts admitted while the physical read
+/// was still due, and — once the first of them executed — the single
+/// physical observation every remaining member shares.
+#[derive(Debug, Clone, PartialEq)]
+struct Flight {
+    members: Vec<String>,
+    observation: Option<ReadObservation>,
+}
+
+/// Where one admitted read sits in its flight: the first-admitted
+/// member leads; every identical permitted admit that joins the open
+/// flight follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightRole {
+    Leader,
+    Follower,
+}
+
+/// Single-flight registry for identical permitted reads (INV-023,
+/// EDGE-008): identical reads merge into one physical charge, and the
+/// merge key covers target, snapshot, access scope, and rights, so
+/// differing reads never share a flight. A member that never executes
+/// keeps its seat — the registry grows one entry per admitted-but-
+/// unsettled read, never per byte.
+// ponytail: members are pruned only when they execute or leave; if an
+// abandoned-open-flight leak ever matters, retire on task settle.
+#[derive(Debug, Default)]
+pub struct ReadFlights {
+    flights: HashMap<ReadFlightKey, Vec<Flight>>,
+    by_attempt: HashMap<String, ReadFlightKey>,
+}
+
+impl ReadFlights {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one admitted read. An identical open flight — still
+    /// waiting for its physical read — takes the attempt as a follower;
+    /// anything else opens a fresh flight with the attempt as leader.
+    pub fn subscribe(&mut self, key: ReadFlightKey, attempt_id: &str) -> FlightRole {
+        let joins_open = self
+            .flights
+            .get(&key)
+            .is_some_and(|flights| flights.last().is_some_and(|f| f.observation.is_none()));
+        let role = if joins_open {
+            if let Some(flight) = self.flights.get_mut(&key).and_then(|fs| fs.last_mut()) {
+                flight.members.push(attempt_id.to_string());
+            }
+            FlightRole::Follower
+        } else {
+            self.flights.entry(key.clone()).or_default().push(Flight {
+                members: vec![attempt_id.to_string()],
+                observation: None,
+            });
+            FlightRole::Leader
+        };
+        self.by_attempt.insert(attempt_id.to_string(), key);
+        role
+    }
+
+    /// The admission-order seat of one attempt, when it still holds
+    /// flight membership: the first remaining member leads.
+    pub fn role(&self, attempt_id: &str) -> Option<FlightRole> {
+        let key = self.by_attempt.get(attempt_id)?;
+        let flight = self
+            .flights
+            .get(key)?
+            .iter()
+            .find(|flight| flight.members.iter().any(|member| member == attempt_id))?;
+        if flight
+            .members
+            .first()
+            .is_some_and(|leader| leader == attempt_id)
+        {
+            Some(FlightRole::Leader)
+        } else {
+            Some(FlightRole::Follower)
+        }
+    }
+
+    /// Takes the shared observation for one member — the flight's one
+    /// physical read, once it exists — and consumes the membership with
+    /// it. `None` leaves the membership untouched: the flight is still
+    /// open, or the attempt never joined one.
+    pub fn take_shared(&mut self, attempt_id: &str) -> Option<ReadObservation> {
+        let key = self.by_attempt.get(attempt_id)?.clone();
+        let flights = self.flights.get_mut(&key)?;
+        let index = flights
+            .iter()
+            .position(|flight| flight.members.iter().any(|member| member == attempt_id))?;
+        let observation = flights[index].observation.clone()?;
+        flights[index].members.retain(|member| member != attempt_id);
+        if flights[index].members.is_empty() {
+            flights.remove(index);
+        }
+        self.by_attempt.remove(attempt_id);
+        Some(observation)
+    }
+
+    /// Records the one physical observation on the member's flight and
+    /// retires the reader's own membership: the observation now belongs
+    /// to the remaining waiters, and an empty flight is gone.
+    pub fn settle(&mut self, attempt_id: &str, observation: ReadObservation) {
+        let Some(key) = self.by_attempt.get(attempt_id).cloned() else {
+            return;
+        };
+        let Some(flights) = self.flights.get_mut(&key) else {
+            return;
+        };
+        let Some(index) = flights
+            .iter()
+            .position(|flight| flight.members.iter().any(|member| member == attempt_id))
+        else {
+            return;
+        };
+        flights[index].members.retain(|member| member != attempt_id);
+        flights[index].observation = Some(observation);
+        if flights[index].members.is_empty() {
+            flights.remove(index);
+        }
+        self.by_attempt.remove(attempt_id);
+    }
+
+    /// Drops one member without an observation: a cancelled or denied
+    /// member leaves the flight, and the remaining members keep their
+    /// own claim on the physical read. A flight with no members left
+    /// is gone — cancel-all stops the work.
+    pub fn drop_member(&mut self, attempt_id: &str) {
+        let Some(key) = self.by_attempt.get(attempt_id).cloned() else {
+            return;
+        };
+        let Some(flights) = self.flights.get_mut(&key) else {
+            return;
+        };
+        for flight in flights.iter_mut() {
+            flight.members.retain(|member| member != attempt_id);
+        }
+        flights.retain(|flight| !flight.members.is_empty());
+        self.by_attempt.remove(attempt_id);
     }
 }
 
