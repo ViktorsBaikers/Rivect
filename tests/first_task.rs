@@ -62,9 +62,15 @@ impl Provider for NoToolProvider {
 
 #[test]
 fn typed_errors_preserve_source_chains() {
-    let broker = rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let mut broker =
+        rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
     let model_error = broker
-        .prepare("worker", &rivect::config::Config::default(), "")
+        .prepare(
+            "worker",
+            &rivect::config::Config::default(),
+            "/world/typed",
+            "",
+        )
         .expect_err("missing model defaults must fail");
     assert!(
         matches!(
@@ -2679,15 +2685,22 @@ fn request_limits_and_manifest_immutability() {
 
     // In-flight manifest immutability: a pending settings change never
     // rewrites the frozen manifest.
+    let world_id = world.runtime.scope_root.display().to_string();
     let manifest = world
         .runtime
         .broker
         .prepare(
             "backend_task",
             &world.runtime.config_for_broker(),
+            &world_id,
             "goal: probe",
         )
         .expect("manifest prepared");
+    // The manifest is bound to the execution world of its sources and
+    // proofs (AC-013) and carries a context epoch (AC-061 contribution).
+    assert_eq!(manifest.world, world_id);
+    assert!(manifest.epoch_id.starts_with("epoch-"));
+    assert_eq!(manifest.mutation_reason, None);
     let frozen = manifest.clone();
     // The user now switches the config to a subscription pin without grant.
     std::fs::write(
@@ -2703,7 +2716,7 @@ fn request_limits_and_manifest_immutability() {
     let reply = world
         .runtime
         .broker
-        .dispatch(&manifest)
+        .dispatch(&world_id, &manifest)
         .expect("dispatch frozen manifest");
     assert!(!reply.text.is_empty());
     let recorded = world
@@ -2713,12 +2726,23 @@ fn request_limits_and_manifest_immutability() {
         recorded, frozen,
         "provider must receive the exact frozen manifest"
     );
+    // The frozen manifest cannot be replayed from another execution
+    // world, even under the changed config (AC-013).
+    let foreign = world.runtime.broker.dispatch("/world/foreign", &manifest);
+    assert!(
+        matches!(
+            foreign,
+            Err(rivect::model::ModelError::WorldMismatch { .. })
+        ),
+        "a foreign-world dispatch must reject"
+    );
     // A new prepare under the changed config is capability-unavailable.
-    let denied =
-        world
-            .runtime
-            .broker
-            .prepare("main", &world.runtime.config_for_broker(), "goal: probe");
+    let denied = world.runtime.broker.prepare(
+        "main",
+        &world.runtime.config_for_broker(),
+        &world_id,
+        "goal: probe",
+    );
     assert!(
         denied.is_err(),
         "subscription pin without grant must fail eligibility"

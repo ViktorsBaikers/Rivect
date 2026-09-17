@@ -2943,10 +2943,17 @@ fn unknown_sent_cost_is_retained_not_released_as_zero() {
     let mut broker =
         rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
     let manifest = broker
-        .prepare("backend_task", &config, "goal: budget fixture")
+        .prepare(
+            "backend_task",
+            &config,
+            "/world/budget",
+            "goal: budget fixture",
+        )
         .expect("manifest");
     assert!(manifest.cost_bound > 0, "the bound is a finite number");
-    let reply = broker.dispatch(&manifest).expect("offline dispatch");
+    let reply = broker
+        .dispatch("/world/budget", &manifest)
+        .expect("offline dispatch");
     assert!(!reply.text.is_empty(), "the request really was sent");
 
     // The explain's `confirmed` is a stub offline — the loopback

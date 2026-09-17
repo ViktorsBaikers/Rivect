@@ -245,11 +245,15 @@ impl Runtime {
                 answer_text(answer),
                 self.scoped_file.display()
             );
-            let manifest = self
-                .broker
-                .prepare(&purpose, &self.config_for_broker(), &inputs)?;
+            // The manifest freezes the execution world (AC-013): the
+            // scope root the request's sources and proofs live in,
+            // re-checked at dispatch.
+            let world = self.scope_root.display().to_string();
+            let manifest =
+                self.broker
+                    .prepare(&purpose, &self.config_for_broker(), &world, &inputs)?;
             self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
-            let reply = self.broker.dispatch(&manifest)?;
+            let reply = self.broker.dispatch(&world, &manifest)?;
             self.provider_calls += 1;
             let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
                 self.owner.store.mark_no_ready(task_id)?;

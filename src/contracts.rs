@@ -11,6 +11,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const TEXT_MAX_BYTES: usize = 65_536;
 pub const ARRAY_MAX_ITEMS: usize = 200;
 pub const REQUEST_MAX_BYTES: usize = 1 << 20;
+/// Full accounted size one provider request may reach (AC-013): the
+/// transmitted bytes plus the mandatory output reserve. Overflow is a
+/// typed rejection, never a silent drop of mandatory parts.
+pub const MODEL_WIRE_MAX_BYTES: usize = 1 << 20;
 pub const PAGE_DEFAULT: u32 = 20;
 pub const PAGE_MAX: u32 = 200;
 pub const KNOWN_READY_OPTION: &str = "brief";

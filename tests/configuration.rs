@@ -140,7 +140,8 @@ fn four_combination_config() -> String {
 #[test]
 fn four_fixed_auto_combinations_match_on_wire_request_and_explain() {
     let config = Config::parse_validated(&four_combination_config()).expect("valid");
-    let broker = rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let mut broker =
+        rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
     let cases = [
         (
             "fixed_fixed",
@@ -166,7 +167,7 @@ fn four_fixed_auto_combinations_match_on_wire_request_and_explain() {
         assert_eq!(resolved.model_source, format!("models.purposes.{purpose}"));
         assert_eq!(resolved.effort_source, format!("models.purposes.{purpose}"));
         let manifest = broker
-            .prepare(purpose, &config, "goal: fixture")
+            .prepare(purpose, &config, "/world/precedence", "goal: fixture")
             .unwrap_or_else(|err| panic!("{purpose}: {err}"));
         assert_eq!(manifest.model, model, "{purpose}: wire model");
         assert_eq!(manifest.effort, effort, "{purpose}: wire effort");
