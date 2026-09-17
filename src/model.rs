@@ -1,13 +1,17 @@
 //! Model broker: immutable request manifests and owner-brokered dispatch.
 //! The manifest is frozen at prepare time; later config changes never
-//! rewrite an in-flight request.
+//! rewrite an in-flight request. Every physical request passes one
+//! eligibility gate before ranking and one admission re-check before
+//! the send, and is accounted exactly once.
 
-use crate::config::{Config, ConfigError, EffortAssign, EffortLevel, ModelAssign};
+use crate::config::{
+    Config, ConfigError, Connection, EffortAssign, EffortLevel, ModelAssign, PurposeDef,
+};
 use crate::providers::{self, Provider, ProviderError};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestManifest {
     pub attempt_id: String,
     pub purpose: String,
@@ -92,6 +96,94 @@ pub enum ModelError {
     RequestTooLarge { limit: usize, actual: usize },
     #[error("dispatch world mismatch: manifest froze {frozen}, dispatch attempted from {current}")]
     WorldMismatch { frozen: String, current: String },
+    #[error(
+        "no eligible connection for purpose {purpose}: every candidate failed eligibility before ranking"
+    )]
+    NoEligibleCandidate { purpose: String },
+    #[error(
+        "dispatch blocked for attempt {attempt_id}: eligibility snapshot changed since ranking (connection {connection} admitted at version {frozen}, current version {current})"
+    )]
+    EligibilityStale {
+        attempt_id: String,
+        connection: String,
+        frozen: u64,
+        current: u64,
+    },
+    #[error(
+        "dispatch rejected for attempt {attempt_id}: no admission record for the manifest in this broker"
+    )]
+    NoAdmission { attempt_id: String },
+    #[error(
+        "dispatch rejected for attempt {attempt_id}: presented manifest does not match the admitted one"
+    )]
+    AdmissionMismatch { attempt_id: String },
+    #[error("attempt {attempt_id} already accounted: one physical request per attempt id")]
+    AttemptAlreadyAccounted { attempt_id: String },
+}
+
+/// The versioned account-entitlement snapshot a ranking runs under
+/// (AC-044): the connections the account currently holds rights to.
+/// Offline starts unrestricted — no account probe exists yet — and
+/// installing a restricted set bumps the version whenever the content
+/// changes, so a dispatch admitted under an older snapshot is
+/// re-blocked: rights lost between ranking and dispatch never ship a
+/// stale grant, and rights regained demand a fresh ranking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entitlements {
+    version: u64,
+    /// `None` is the unrestricted offline default: every declared
+    /// connection is entitled until an account surface narrows it.
+    rights: Option<BTreeSet<String>>,
+}
+
+impl Entitlements {
+    fn unrestricted() -> Self {
+        Self {
+            version: 0,
+            rights: None,
+        }
+    }
+
+    fn allows(&self, connection: &str) -> bool {
+        self.rights
+            .as_ref()
+            .is_none_or(|set| set.contains(connection))
+    }
+}
+
+/// The admission one physical request was gated through (AC-041):
+/// every broker-prepared manifest carries its purpose, the effective
+/// assignment with its source, the entitlement snapshot version the
+/// ranking ran under, and the frozen manifest itself — dispatch
+/// compares the presented manifest against that copy, so an attempt id
+/// alone never authorizes bytes the ranking never saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRecord {
+    pub purpose: String,
+    /// The effective physical connection: a fixed pin names itself, an
+    /// auto assignment names the ranked pool winner. Offline pools
+    /// carry connections, not model ids — the live endpoint catalogue
+    /// names the model later.
+    pub connection: String,
+    pub model_id: Option<String>,
+    pub model_source: String,
+    pub snapshot_version: u64,
+    /// The manifest frozen at prepare: the dispatch re-check's
+    /// comparison copy.
+    pub manifest: RequestManifest,
+}
+
+/// The single accounting record of one physical request (INV-024):
+/// keyed by the manifest's attempt id and written exactly once, when
+/// the provider send completes. Offline the charge stays at the frozen
+/// bound — see [`SentCostExplain`] for the bound-versus-confirmed
+/// distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountingRecord {
+    pub attempt_id: String,
+    pub purpose: String,
+    pub connection: String,
+    pub cost_bound: u64,
 }
 
 /// The last frozen model-visible prefix digest of one purpose (AC-061
@@ -125,6 +217,18 @@ pub struct Broker {
     /// the model-visible prefix digest decides replay versus a new
     /// epoch. Ordered map — epoch bookkeeping stays deterministic.
     epochs: BTreeMap<String, EpochState>,
+    /// The account-entitlement snapshot every ranking runs under
+    /// (AC-044): versioned, compared again at dispatch.
+    entitlements: Entitlements,
+    /// Admission records keyed by attempt id (AC-041): one entry per
+    /// prepared manifest, the dispatch re-check's source of truth. A
+    /// completed dispatch prunes its entry — the accounting map answers
+    /// replays of a spent attempt — so the map stays bounded by
+    /// in-flight attempts, not lifetime traffic.
+    admissions: BTreeMap<String, AdmissionRecord>,
+    /// The single accounting per physical request (INV-024): one entry
+    /// per completed provider send, keyed by the attempt it charged.
+    accounting: BTreeMap<String, AccountingRecord>,
 }
 
 impl Broker {
@@ -132,6 +236,9 @@ impl Broker {
         Self {
             provider,
             epochs: BTreeMap::new(),
+            entitlements: Entitlements::unrestricted(),
+            admissions: BTreeMap::new(),
+            accounting: BTreeMap::new(),
         }
     }
 
@@ -139,17 +246,66 @@ impl Broker {
         self.provider.name()
     }
 
+    /// Installs the account-entitlement snapshot: the connections the
+    /// account currently holds rights to. A content change bumps the
+    /// version; an identical reinstall does not — the version names
+    /// the snapshot a frozen admission is compared against.
+    pub fn set_account_rights(&mut self, rights: &[String]) {
+        let next: BTreeSet<String> = rights.iter().cloned().collect();
+        if self.entitlements.rights.as_ref() != Some(&next) {
+            self.entitlements.version += 1;
+            self.entitlements.rights = Some(next);
+        }
+    }
+
+    /// The current entitlement-snapshot version (AC-044): the value a
+    /// frozen admission's version must equal for its dispatch to send.
+    #[must_use]
+    pub fn entitlement_version(&self) -> u64 {
+        self.entitlements.version
+    }
+
+    /// The admission one broker-prepared attempt was ranked through
+    /// (AC-041); attempts this broker never ranked have none.
+    #[must_use]
+    pub fn admission(&self, attempt_id: &str) -> Option<&AdmissionRecord> {
+        self.admissions.get(attempt_id)
+    }
+
+    /// The single accounting record of one physical request (INV-024).
+    #[must_use]
+    pub fn accounting_record(&self, attempt_id: &str) -> Option<&AccountingRecord> {
+        self.accounting.get(attempt_id)
+    }
+
+    /// How many physical requests this broker accounted.
+    #[must_use]
+    pub fn accounted_requests(&self) -> usize {
+        self.accounting.len()
+    }
+
+    /// How many attempts this broker currently holds admissions for:
+    /// prepare grows it and a completed dispatch prunes it, so the
+    /// count names in-flight attempts, not lifetime traffic.
+    #[must_use]
+    pub fn admitted_attempts(&self) -> usize {
+        self.admissions.len()
+    }
+
     /// Builds the immutable manifest for one model attempt. Eligibility
-    /// is checked here and again at dispatch. The manifest freezes the
-    /// execution world, the mandatory wire parts and the context epoch;
-    /// a request that does not fit together with its mandatory parts is
-    /// rejected, never truncated.
+    /// runs before ranking here — the catalogue, the offline live-grant
+    /// rule, the account entitlement and the per-purpose `eligible`
+    /// input exclude candidates first — and is re-checked at dispatch.
+    /// The manifest freezes the execution world, the mandatory wire
+    /// parts and the context epoch; a request that does not fit
+    /// together with its mandatory parts is rejected, never truncated.
     ///
     /// # Errors
     ///
     /// Returns [`ModelError::Config`] when the purpose cannot resolve,
-    /// [`ModelError::Provider`] when the assignment is offline
-    /// ineligible, and [`ModelError::RequestTooLarge`] when the
+    /// [`ModelError::Provider`] when a fixed pin is offline ineligible,
+    /// [`ModelError::NoEligibleCandidate`] when no candidate survives
+    /// eligibility, and [`ModelError::RequestTooLarge`] when the
     /// accounted full request exceeds the wire limit.
     pub fn prepare(
         &mut self,
@@ -159,11 +315,14 @@ impl Broker {
         inputs: &str,
     ) -> Result<RequestManifest, ModelError> {
         let resolved = config.resolve_purpose(purpose)?;
-        let kind = match &resolved.model {
-            ModelAssign::Fixed(fixed) => config.connections.get(&fixed.connection).map(|c| c.kind),
-            _ => None,
-        };
-        providers::offline_eligible(&resolved.model, kind)?;
+        let purpose_def = config.models.purposes.get(purpose);
+        let (connection, model_id) = rank_connection(
+            purpose,
+            &resolved.model,
+            purpose_def,
+            &config.connections,
+            &self.entitlements,
+        )?;
         let instructions = MANDATORY_INSTRUCTIONS.to_string();
         let tools: Vec<String> = DECLARED_TOOLS
             .iter()
@@ -186,8 +345,9 @@ impl Broker {
         }
         let (epoch_id, mutation_reason) =
             self.context_epoch(purpose, &resolved.model, &instructions, &tools);
-        Ok(RequestManifest {
-            attempt_id: crate::contracts::AttemptId::generate().0,
+        let attempt_id = crate::contracts::AttemptId::generate().0;
+        let manifest = RequestManifest {
+            attempt_id,
             purpose: purpose.to_string(),
             world: world.to_string(),
             model: resolved.model,
@@ -200,18 +360,44 @@ impl Broker {
             epoch_id,
             mutation_reason,
             cost_bound: sent_cost_bound(inputs),
-        })
+        };
+        self.admissions.insert(
+            manifest.attempt_id.clone(),
+            AdmissionRecord {
+                purpose: purpose.to_string(),
+                connection,
+                model_id,
+                model_source: resolved.model_source,
+                snapshot_version: self.entitlements.version,
+                manifest: manifest.clone(),
+            },
+        );
+        Ok(manifest)
     }
 
     /// Dispatches exactly the frozen manifest bytes to the owner-brokered
-    /// provider. The execution world is re-checked against the frozen one
-    /// before any provider call — a manifest from another world is
-    /// rejected, never re-bound. No worker may call this directly.
+    /// provider. The execution world is re-checked against the frozen
+    /// one, the presented manifest against the frozen copy this broker
+    /// admitted at prepare — an attempt id alone authorizes nothing —
+    /// and the eligibility snapshot against the version frozen at
+    /// ranking: a rights loss between ranking and dispatch re-blocks
+    /// the send, all before any provider call. The physical request is
+    /// accounted exactly once, and the spent admission is pruned so the
+    /// map stays bounded by in-flight attempts. No worker may call
+    /// this directly.
     ///
     /// # Errors
     ///
     /// Returns [`ModelError::WorldMismatch`] when the dispatch world is
-    /// not the world frozen on the manifest, and
+    /// not the world frozen on the manifest,
+    /// [`ModelError::AttemptAlreadyAccounted`] when the attempt already
+    /// spent its one physical request (checked first, so a replayed
+    /// completed attempt reports the spent accounting even after its
+    /// admission was pruned), [`ModelError::NoAdmission`] when this
+    /// broker ranked no manifest with that attempt id,
+    /// [`ModelError::AdmissionMismatch`] when the presented manifest is
+    /// not the one the ranking admitted, [`ModelError::EligibilityStale`]
+    /// when the entitlement snapshot changed since ranking, and
     /// [`ModelError::Provider`] when the provider rejects the request.
     pub fn dispatch(
         &mut self,
@@ -224,7 +410,62 @@ impl Broker {
                 current: world.to_string(),
             });
         }
-        Ok(self.provider.send(manifest)?)
+        // A completed attempt is spent no matter what else moved: the
+        // accounting check precedes every later one, so a replayed
+        // completed attempt reports the spent single accounting — never
+        // a stale snapshot or a missing admission.
+        if self.accounting.contains_key(&manifest.attempt_id) {
+            return Err(ModelError::AttemptAlreadyAccounted {
+                attempt_id: manifest.attempt_id.clone(),
+            });
+        }
+        let (connection, frozen_version) = {
+            let admission = self.admissions.get(&manifest.attempt_id).ok_or_else(|| {
+                ModelError::NoAdmission {
+                    attempt_id: manifest.attempt_id.clone(),
+                }
+            })?;
+            // The attempt id authenticates nothing by itself: only the
+            // frozen manifest this ranking admitted dispatches, so a
+            // forged clone with mutated fields never sends bytes no
+            // ranking saw.
+            if &admission.manifest != manifest {
+                return Err(ModelError::AdmissionMismatch {
+                    attempt_id: manifest.attempt_id.clone(),
+                });
+            }
+            (admission.connection.clone(), admission.snapshot_version)
+        };
+        let current_version = self.entitlements.version;
+        // The re-check re-evaluates against the live snapshot, not a
+        // cached verdict. The version bump on every rights movement is
+        // the primary guard — a same-version rights drift is
+        // unreachable through `set_account_rights` — and the direct
+        // `allows` re-evaluation stays as defense-in-depth against any
+        // future surface that mutates rights without a bump.
+        if current_version != frozen_version || !self.entitlements.allows(&connection) {
+            return Err(ModelError::EligibilityStale {
+                attempt_id: manifest.attempt_id.clone(),
+                connection,
+                frozen: frozen_version,
+                current: current_version,
+            });
+        }
+        let reply = self.provider.send(manifest)?;
+        self.accounting.insert(
+            manifest.attempt_id.clone(),
+            AccountingRecord {
+                attempt_id: manifest.attempt_id.clone(),
+                purpose: manifest.purpose.clone(),
+                connection,
+                cost_bound: manifest.cost_bound,
+            },
+        );
+        // The attempt is spent and its admission is dead weight: prune
+        // it, and a later replay still answers through the accounting
+        // map above.
+        self.admissions.remove(&manifest.attempt_id);
+        Ok(reply)
     }
 
     /// Explains the effort assignment one frozen manifest transmitted:
@@ -279,6 +520,83 @@ impl Broker {
     }
 }
 
+/// Candidate enumeration and offline ranking for one assignment
+/// (AC-044): ineligible candidates are filtered out before ranking —
+/// unknown to the catalogue, not usable without a separate live grant,
+/// outside the account entitlement or the per-purpose `eligible`
+/// input. Offline ranking is pool order, the declared preference:
+/// priced ranking arrives with the live dialects. An assignment with
+/// no surviving candidate fails closed, and a fixed pin keeps the
+/// precise typed rejection vocabulary of
+/// [`providers::offline_eligible`].
+///
+/// # Errors
+///
+/// Returns [`ModelError::Provider`] for an offline-ineligible fixed
+/// pin and [`ModelError::NoEligibleCandidate`] when no candidate
+/// survives the eligibility filter.
+fn rank_connection(
+    purpose: &str,
+    assignment: &ModelAssign,
+    purpose_def: Option<&PurposeDef>,
+    connections: &BTreeMap<String, Connection>,
+    entitlements: &Entitlements,
+) -> Result<(String, Option<String>), ModelError> {
+    match assignment {
+        ModelAssign::Fixed(fixed) => {
+            providers::offline_eligible(
+                assignment,
+                connections.get(&fixed.connection).map(|c| c.kind),
+            )?;
+            if !entitlements.allows(&fixed.connection)
+                || !purpose_entitled(purpose_def, &fixed.connection)
+            {
+                return Err(ModelError::NoEligibleCandidate {
+                    purpose: purpose.to_string(),
+                });
+            }
+            Ok((fixed.connection.clone(), Some(fixed.model_id.clone())))
+        }
+        ModelAssign::Auto { pool } => {
+            // the purpose-level pool is the more specific file-only
+            // surface; the assignment pool is its inline twin
+            let declared = purpose_def
+                .and_then(|def| def.pool.as_deref())
+                .or(pool.as_deref());
+            let candidates: Vec<String> = match declared {
+                Some(pool) => pool.to_vec(),
+                None => connections.keys().cloned().collect(),
+            };
+            candidates
+                .into_iter()
+                .find(|name| {
+                    connections
+                        .get(name)
+                        .is_some_and(|c| providers::offline_usable(Some(c.kind)))
+                        && entitlements.allows(name)
+                        && purpose_entitled(purpose_def, name)
+                })
+                .map(|connection| (connection, None))
+                .ok_or_else(|| ModelError::NoEligibleCandidate {
+                    purpose: purpose.to_string(),
+                })
+        }
+        // an inherit that survived resolution names no connection and
+        // declares no pool: it has no candidate and fails closed
+        ModelAssign::Inherit => Err(ModelError::NoEligibleCandidate {
+            purpose: purpose.to_string(),
+        }),
+    }
+}
+
+/// The per-purpose `eligible` input (DEC-012): `None` restricts
+/// nothing; a declared list admits only its members.
+fn purpose_entitled(purpose_def: Option<&PurposeDef>, connection: &str) -> bool {
+    purpose_def
+        .and_then(|def| def.eligible.as_deref())
+        .is_none_or(|list| list.iter().any(|name| name == connection))
+}
+
 /// The single wire composition shared by freeze and dispatch (AC-013):
 /// the manifest's `wire_bytes` and the prepare-time limit accounting
 /// are the same function, so the sent bytes can never diverge from the
@@ -327,4 +645,46 @@ fn sent_cost_bound(inputs: &str) -> u64 {
     // usize widens to u64 losslessly below 2^64 input bytes; the
     // saturating ceiling is unreachable in practice and stays finite.
     1 + u64::try_from(inputs.len().div_ceil(BUDGET_UNIT_INPUT_BYTES)).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Defense-in-depth probe for the dispatch re-check (AC-044): the
+    /// version bump on every rights movement is the primary guard and a
+    /// same-version rights drift is unreachable through
+    /// [`Broker::set_account_rights`], so this leg holds the private
+    /// snapshot directly and proves the `allows` conjunct still blocks
+    /// the send alone.
+    #[test]
+    fn dispatch_blocks_a_same_version_rights_drift_on_allows_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::parse_validated(
+            "config_version = 1\n\
+             [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+             [models.defaults]\n\
+             model = { mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }\n\
+             effort = { mode = \"auto\" }\n\
+             fallback = { mode = \"auto\" }\n",
+        )?;
+        let mut broker = Broker::new(Box::new(providers::LoopbackProvider::new()));
+        let manifest = broker.prepare("main", &config, "/world/drift", "goal: fixture")?;
+        // rights content changed while the version stayed frozen: only
+        // the direct allows re-evaluation can still block the send
+        broker.entitlements.rights = Some(BTreeSet::from(["reserve".to_string()]));
+        match broker.dispatch("/world/drift", &manifest) {
+            Err(ModelError::EligibilityStale {
+                connection,
+                frozen: 0,
+                current: 0,
+                ..
+            }) => assert_eq!(connection, "local"),
+            Err(other) => return Err(other.into()),
+            Ok(reply) => {
+                return Err(format!("the drifted dispatch must not send: {reply:?}").into());
+            }
+        }
+        Ok(())
+    }
 }

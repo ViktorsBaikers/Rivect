@@ -97,3 +97,12 @@ pub fn offline_eligible(
         _ => Ok(()),
     }
 }
+
+/// Offline kind eligibility as a ranking predicate (AC-044): a
+/// candidate usable without a separate live grant. Ranking filters
+/// candidates with this; [`offline_eligible`] keeps the typed
+/// rejection vocabulary for the single-candidate fixed path.
+#[must_use]
+pub fn offline_usable(connection_kind: Option<ConnKind>) -> bool {
+    matches!(connection_kind, Some(ConnKind::Local))
+}
