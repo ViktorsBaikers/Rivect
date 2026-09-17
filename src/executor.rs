@@ -4,7 +4,7 @@
 
 pub mod macos;
 
-use crate::contracts::{EffectClass, TaskId};
+use crate::contracts::{EffectClass, ErrorCode, TaskId};
 use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, preapproval_scope,
 };
@@ -110,6 +110,29 @@ pub enum ExecutorError {
     Readonly { class: EffectClass },
     #[error("effect store: {0}")]
     Store(#[from] StoreError),
+}
+
+impl ExecutorError {
+    /// Wire code for the failed effect path, mapped at one boundary. A
+    /// sandbox that cannot start or does not enforce is a capability
+    /// failure with a recovery read; every other denial is a denied
+    /// effect, and a store failure keeps its storage code.
+    #[must_use = "the code exists to be carried to the wire; discarding it loses the mapping"]
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Worker(
+                WorkerError::SandboxSpawnFailed { .. } | WorkerError::SandboxUnavailable { .. },
+            ) => ErrorCode::CapabilityUnavailable,
+            Self::Worker(_)
+            | Self::Policy(_)
+            | Self::PolicyDenied
+            | Self::ModeAsk
+            | Self::ModeDenied
+            | Self::Readonly { .. } => ErrorCode::Denied,
+            Self::Cancelled => ErrorCode::Cancelled,
+            Self::Store(_) => ErrorCode::StorageUnavailable,
+        }
+    }
 }
 
 pub const TASK_CANCELLED: &str = "task cancelled";

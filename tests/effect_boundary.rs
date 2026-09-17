@@ -754,6 +754,45 @@ fn managed_write_rejects_oversized_payload_without_touching_target() {
 }
 
 #[test]
+fn publish_intent_rejects_occupant_swap_after_staging() {
+    // The second production write path (config publication) shares the
+    // checked-fd primitive: a staged identity that no longer occupies the
+    // target denies the publication write before any byte lands.
+    let (mut world, _session, _task, file, _grant) = managed_write_fixture("publish-occupant");
+    let staged = std::fs::metadata(&file).expect("inspect staged occupant");
+    let intent = rivect::config::PublicationIntent {
+        owner: "publish-occupant-owner".to_string(),
+        target: file.display().to_string(),
+        admission_seq: 1,
+        intended_digest: String::new(),
+        base_digest: None,
+        publish_identity: Some(rivect::config::PublishIdentity {
+            dev: staged.dev(),
+            ino: staged.ino(),
+        }),
+    };
+    std::fs::remove_file(&file).expect("remove staged occupant");
+    std::fs::write(&file, b"new occupant").expect("replace staged occupant");
+
+    let error = rivect::config::publish_intent(
+        &mut world.runtime.owner.store,
+        &intent,
+        b"publication bytes",
+    )
+    .expect_err("occupant swap must deny the publication write");
+
+    assert!(matches!(
+        error,
+        rivect::config::PublicationError::Write(WorkerError::TargetChanged { target })
+            if target.as_path() == file.as_path()
+    ));
+    assert_eq!(
+        std::fs::read(&file).expect("read new occupant"),
+        b"new occupant"
+    );
+}
+
+#[test]
 fn managed_write_rechecks_revoked_grant_before_writing() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-revoked");
     let admitted = {
