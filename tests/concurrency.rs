@@ -21,7 +21,10 @@
 
 mod support;
 
-use rivect::contracts::{AnswerSelection, Event, EventId, Lifecycle, SessionId, TaskId};
+use rivect::contracts::{
+    AnswerSelection, ErrorCode, Event, EventId, Lifecycle, ObligationApplicability,
+    ObligationExecution, OptionId, SessionId, TaskId,
+};
 use rivect::controller::{
     ControllerError, SchedulerStep, StepOutcome, step_error_observation, step_outcome_observation,
 };
@@ -2257,6 +2260,7 @@ fn every_outcome_and_error_class_maps_to_a_distinct_typed_observation() {
         ControllerError::Serialization(
             serde_json::from_str::<()>("not json").expect_err("serde fails"),
         ),
+        ControllerError::ApplicabilityUnknown,
     ];
     let error_observations: Vec<_> = errors
         .iter()
@@ -2309,6 +2313,7 @@ fn every_outcome_and_error_class_maps_to_a_distinct_typed_observation() {
         "executor error: ",
         "scheduler error: ",
         "serialization error: ",
+        "applicability error: ",
     ]) {
         assert!(
             observation.signature.result.starts_with(prefix),
@@ -2316,6 +2321,78 @@ fn every_outcome_and_error_class_maps_to_a_distinct_typed_observation() {
             observation.signature
         );
     }
+}
+
+/// DEC-068: an applicability evaluation that returns unknown/error
+/// marks the materialized obligation `unresolved` without touching its
+/// execution — the stale-evidence writer (`invalidate_evidence`, proved
+/// by `evidence_invalidation_blocks_completion` in first_task) is a
+/// different leg — and the unchanged `COMPLETION_COUNTS` gate rejects
+/// completion with the unresolved count. The step itself fails through
+/// the production driver, so the supervisor's Err feed observes it.
+#[test]
+fn applicability_evaluation_error_marks_obligation_unresolved_not_stale_and_blocks_completion() {
+    let (mut world, _file, grant) = scoped_world("feed-applicability");
+    let session = world.open_session("bootstrap-feed-applicability");
+    let task = world.create_task(&session, "cmd-feed-applicability");
+    world
+        .runtime
+        .scheduler
+        .submit_answered(
+            task.clone(),
+            AnswerSelection::Option {
+                option_id: OptionId(rivect::controller::APPLICABILITY_UNKNOWN_OPTION.to_string()),
+            },
+            grant.clone(),
+        )
+        .expect("scheduler accepts the node")
+        .expect("task outside cancelled subtrees");
+    let error = world
+        .runtime
+        .scheduler_step(&session)
+        .expect_err("an applicability-evaluation unknown fails the step");
+    assert!(
+        matches!(error, ControllerError::ApplicabilityUnknown),
+        "{error:?}"
+    );
+
+    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    assert_eq!(snapshot.lifecycle, Lifecycle::Blocked);
+    let obligations = &snapshot.obligations.items;
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(
+        obligations[0].applicability,
+        ObligationApplicability::Unresolved
+    );
+    assert_eq!(obligations[0].execution, ObligationExecution::Pending);
+
+    // EDGE-001 through the unchanged completion gate: unresolved
+    // applicability alone — no stale execution — rejects completion.
+    let err = world
+        .runtime
+        .owner
+        .store
+        .complete_if_eligible(&session, &task)
+        .expect_err("unresolved applicability rejects completion");
+    assert!(
+        matches!(
+            &err,
+            StoreError::Conflict(ConflictCause::CompletionOpen { unresolved, .. })
+                if *unresolved > 0
+        ),
+        "{err}"
+    );
+    let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    assert_ne!(after.lifecycle, Lifecycle::Completed);
+    assert!(
+        after
+            .blockers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|b| b.reason == ErrorCode::DependencyBlocked),
+        "blocked must carry the dependency-blocked reason"
+    );
 }
 
 /// A revoked grant fails every decision step at mutable admission; the

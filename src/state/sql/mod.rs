@@ -136,6 +136,12 @@ pub const SATISFY_OBLIGATION: &str =
     "UPDATE obligations SET execution = 'satisfied' WHERE obligation_id = ?1";
 pub const STALE_EVIDENCE: &str =
     "UPDATE evidence SET validity = 'stale' WHERE evidence_id = ?1 RETURNING obligation_id";
+// The DEC-068 unknown/error-applicability write flips applicability
+// alone: STALE_OBLIGATION stays the only writer that touches
+// execution, so an evaluation failure never impersonates stale
+// evidence.
+pub const UNRESOLVED_APPLICABILITY: &str =
+    "UPDATE obligations SET applicability = 'unresolved' WHERE obligation_id = ?1";
 pub const STALE_OBLIGATION: &str = "UPDATE obligations SET applicability = 'unresolved', execution = 'stale' WHERE obligation_id = ?1";
 pub const TASK_ID_FOR_OBLIGATION: &str = "SELECT task_id FROM obligations WHERE obligation_id = ?1";
 pub const BLOCK_TASK_NOT_CANCELLED: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'blocked', event_cursor = event_cursor + 1

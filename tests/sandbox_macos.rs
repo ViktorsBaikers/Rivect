@@ -19,9 +19,11 @@ use rivect::executor::macos::{self, ConfinedOutcome, ReadObservation, SANDBOX_EX
 use rivect::executor::{
     AdmittedEffect, EffectOutcome, EffectRequest, Executor, ExecutorError, ReadWorker,
 };
-use rivect::policy::{AdmissionContext, ModeDecision, PermissionMode, Policy};
+use rivect::policy::{AdmissionContext, ModeDecision, PermissionMode, Policy, preapproval_scope};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -505,6 +507,103 @@ fn matrix_verdict(mode: PermissionMode, class: rivect::contracts::EffectClass) -
     policy.decide(Path::new("/scope/target"), class, &ctx)
 }
 
+/// Local counting oracle around the real Seatbelt worker: support's
+/// default counting worker counts reads only, so the macOS matrix tests
+/// carry their own per-class counters. Every leg counts invocations,
+/// not successes — a denied worker leg still proves the executor
+/// presented the effect to the worker.
+struct CountingSeatbeltWorker {
+    reads: Arc<AtomicU64>,
+    writes: Arc<AtomicU64>,
+    execs: Arc<AtomicU64>,
+    egresses: Arc<AtomicU64>,
+}
+
+impl ReadWorker for CountingSeatbeltWorker {
+    fn read_once(
+        &mut self,
+        scope_root: &Path,
+        target: &Path,
+    ) -> Result<ReadObservation, WorkerError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        macos::MacosReadWorker.read_once(scope_root, target)
+    }
+
+    fn write_once(
+        &mut self,
+        scope_root: &Path,
+        target: &Path,
+        expected: rivect::executor::FileIdentity,
+        bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        macos::MacosReadWorker.write_once(scope_root, target, expected, bytes)
+    }
+
+    fn exec_once(&mut self, scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
+        self.execs.fetch_add(1, Ordering::SeqCst);
+        macos::MacosReadWorker.exec_once(scope_root, program)
+    }
+
+    fn egress_once(&mut self, url: &str) -> Result<(), WorkerError> {
+        self.egresses.fetch_add(1, Ordering::SeqCst);
+        macos::MacosReadWorker.egress_once(url)
+    }
+}
+
+/// Admit leg of one live matrix cell: an Allow expectation must return
+/// the admitted effect; ask and deny expectations must fail closed with
+/// the typed mode error before any worker leg exists.
+fn admit_live_cell(
+    world: &mut support::World,
+    task: &rivect::contracts::TaskId,
+    mode: PermissionMode,
+    request: EffectRequest,
+    expected: ModeDecision,
+) -> Option<AdmittedEffect> {
+    let label = request.describe();
+    let mut executor = Executor::new(
+        &mut world.runtime.policy,
+        &mut world.runtime.owner.store,
+        world.runtime.read_worker.as_mut(),
+    );
+    match executor.admit(task, request, mode) {
+        Ok(admitted) => {
+            assert_eq!(
+                expected,
+                ModeDecision::Allow,
+                "{label}: {mode:?} admitted a cell pinned {expected:?}"
+            );
+            Some(admitted)
+        }
+        Err(error) => {
+            let typed = match expected {
+                ModeDecision::Ask => matches!(error, ExecutorError::ModeAsk),
+                ModeDecision::Deny => matches!(error, ExecutorError::ModeDenied),
+                ModeDecision::Allow => false,
+            };
+            assert!(
+                typed,
+                "{label}: {mode:?} expected {expected:?}, got {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Execute leg of one live matrix cell behind a fresh executor.
+fn execute_live_cell(
+    world: &mut support::World,
+    admitted: &AdmittedEffect,
+) -> Result<EffectOutcome, ExecutorError> {
+    let mut executor = Executor::new(
+        &mut world.runtime.policy,
+        &mut world.runtime.owner.store,
+        world.runtime.read_worker.as_mut(),
+    );
+    executor.execute(admitted)
+}
+
 #[test]
 fn six_permission_modes_gate_the_seatbelt_worker() {
     use rivect::contracts::EffectClass as Class;
@@ -587,80 +686,248 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
         "yolo must not be the default permission mode"
     );
 
-    // Confined-path leg: the pinned verdicts must gate the worker the
-    // executor runs. The mode now rides admit (DEC-016); the macOS
-    // dispatch caller still carries the interim manual default (DEC-015)
-    // until the Settings surface lands, so the executor's live consult
-    // evaluates exactly the manual column above — the pin and the live
-    // consult may not drift apart — and that column's single Allow cell
-    // (read) must cross the real Seatbelt worker.
+    // Live mode-carrying legs (DEC-016; DEC-017 D-003): every mode ×
+    // class pair runs the real admit→execute path with the mode
+    // injected at admit, never admit_managed_write. The executor's own
+    // admission context observes only in-grant-scope and the recorded
+    // preapprovals — every other granting input stays unobserved — so
+    // the live verdicts differ from the all-inputs pin above exactly
+    // there: only preapproved-only (with its recorded consents) and
+    // yolo allow the non-read classes. Allow cells cross the real
+    // Seatbelt worker — the read lands, the write lands, the confined
+    // exec runs a binary copied into the scope (the exec profile's
+    // allowance is the scope subpath), and the egress Allow cell meets
+    // the OS denial the boundary imposes (an egress target admits no
+    // filesystem scope, so it is out of scope by construction); ask
+    // and deny cells fail closed at admit and never invoke the worker.
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("create matrix scope");
     let file = scope.join("target.txt");
-    std::fs::write(&file, b"scoped-by-seatbelt").expect("create matrix target");
-    let grant = world.runtime.set_read_scope(scope, file.clone());
-
-    for class in [Class::Read, Class::Write, Class::Exec, Class::Egress] {
-        let ctx = rivect::executor::admission_context(
-            &world.runtime.owner.store,
-            PermissionMode::Manual,
-            class,
-            file.parent().expect("scope root"),
-            &file,
-        )
-        .expect("executor admission context");
-        assert_eq!(ctx.mode, PermissionMode::Manual);
-        assert_eq!(
-            world.runtime.policy.decide(&file, class, &ctx),
-            matrix_verdict(PermissionMode::Manual, class),
-            "the live mode consult must stay pinned to the manual column for {class:?}"
-        );
-    }
-
-    let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
-        executor
-            .admit(
-                &task,
-                EffectRequest::Read {
-                    grant_id: grant.clone(),
-                    path: file.clone(),
-                },
-                PermissionMode::Manual,
-            )
-            .unwrap_or_else(|error| panic!("manual-mode read admits: {error}"))
-    };
-    let outcome = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
-        executor
-            .execute(&admitted)
-            .unwrap_or_else(|error| panic!("confined read executes: {error}"))
-    };
-    match outcome {
-        EffectOutcome::Read { bytes, digest } => {
-            assert_eq!(bytes, b"scoped-by-seatbelt");
-            assert_eq!(digest, support::sha256_hex(b"scoped-by-seatbelt"));
-        }
-        other => panic!("expected a read outcome, got {other:?}"),
-    }
-    assert_eq!(
-        world.worker_reads(),
-        1,
-        "the manual column's Allow crossed the Seatbelt worker exactly once"
+    let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
+    let reads = Arc::new(AtomicU64::new(0));
+    let writes = Arc::new(AtomicU64::new(0));
+    let execs = Arc::new(AtomicU64::new(0));
+    let egresses = Arc::new(AtomicU64::new(0));
+    world.runtime.read_worker = Box::new(CountingSeatbeltWorker {
+        reads: reads.clone(),
+        writes: writes.clone(),
+        execs: execs.clone(),
+        egresses: egresses.clone(),
+    });
+    // Exec Allow cells run an in-scope copy of a system binary: the
+    // exec profile's allowance is the scope subpath, so a target inside
+    // it is admitted while anything outside is denied (see
+    // denies_exec_outside_scope_at_the_os_boundary).
+    let exec_program = scope.join("true");
+    std::fs::copy("/usr/bin/true", &exec_program).expect("copy in-scope executable");
+    // Seatbelt filters match the exec path's literal spelling, so the
+    // target carries the canonical /private/var form the profile's
+    // canonical scope subpath admits.
+    let exec_program = exec_program
+        .canonicalize()
+        .expect("canonical in-scope executable");
+    let write_grant = world.runtime.policy.grant_classes(
+        file.parent().expect("scope root").to_path_buf(),
+        vec![Class::Write],
     );
+    let exec_grant = world.runtime.policy.grant_classes(scope, vec![Class::Exec]);
+    let egress_url = "https://example.invalid/matrix";
+    let egress_grant = world.runtime.policy.grant_classes(
+        file.parent().expect("scope root").to_path_buf(),
+        vec![Class::Egress],
+    );
+    for (class, target) in [
+        (Class::Read, file.display().to_string()),
+        (Class::Write, file.display().to_string()),
+        (Class::Exec, exec_program.display().to_string()),
+        (Class::Egress, egress_url.to_string()),
+    ] {
+        world
+            .runtime
+            .owner
+            .store
+            .record_preapproval(&preapproval_scope(class, &target), "human:matrix", 600)
+            .expect("record matrix preapproval");
+    }
 
-    let reads_after_live_crossing = world.worker_reads();
+    for (mode, read, write, exec, egress) in [
+        (
+            PermissionMode::Manual,
+            ModeDecision::Allow,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+        ),
+        (
+            PermissionMode::AcceptEdits,
+            ModeDecision::Allow,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+        ),
+        (
+            PermissionMode::ReadOnly,
+            ModeDecision::Allow,
+            ModeDecision::Deny,
+            ModeDecision::Deny,
+            ModeDecision::Deny,
+        ),
+        (
+            PermissionMode::Auto,
+            ModeDecision::Allow,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+            ModeDecision::Ask,
+        ),
+        (
+            PermissionMode::PreapprovedOnly,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+        ),
+        (
+            PermissionMode::Yolo,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
+        ),
+    ] {
+        let payload = format!("landed-under-{}", mode.id());
+        std::fs::write(&file, b"scoped-by-seatbelt").expect("seed matrix target");
+
+        let read_before = reads.load(Ordering::SeqCst);
+        let request = EffectRequest::Read {
+            grant_id: grant.clone(),
+            path: file.clone(),
+        };
+        if let Some(admitted) = admit_live_cell(&mut world, &task, mode, request, read) {
+            let outcome = execute_live_cell(&mut world, &admitted)
+                .unwrap_or_else(|error| panic!("{mode:?} read allow executes: {error}"));
+            match outcome {
+                EffectOutcome::Read { bytes, digest } => {
+                    assert_eq!(bytes, b"scoped-by-seatbelt");
+                    assert_eq!(digest, support::sha256_hex(b"scoped-by-seatbelt"));
+                }
+                other => panic!("{mode:?} read allow outcome: {other:?}"),
+            }
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                read_before + 1,
+                "the {mode:?} read Allow cell crossed the seatbelt worker once"
+            );
+        } else {
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                read_before,
+                "the {mode:?} non-allow read cell never reaches the worker"
+            );
+        }
+
+        let write_before = writes.load(Ordering::SeqCst);
+        let request = EffectRequest::Write {
+            grant_id: write_grant.clone(),
+            path: file.clone(),
+            bytes: payload.clone().into_bytes(),
+        };
+        if let Some(admitted) = admit_live_cell(&mut world, &task, mode, request, write) {
+            let outcome = execute_live_cell(&mut world, &admitted)
+                .unwrap_or_else(|error| panic!("{mode:?} write allow executes: {error}"));
+            match outcome {
+                EffectOutcome::Executed { detail } => {
+                    assert!(
+                        detail.starts_with("write-performed sha256="),
+                        "the write observation names its digest: {detail}"
+                    );
+                }
+                other => panic!("{mode:?} write allow outcome: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read(&file).expect("read the write-allow target"),
+                payload.as_bytes(),
+                "the {mode:?} write Allow cell landed through the confined worker"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                write_before + 1,
+                "the {mode:?} write Allow cell crossed the seatbelt worker once"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(&file).expect("read the non-allow write target"),
+                b"scoped-by-seatbelt",
+                "the {mode:?} non-allow write cell must not touch the target"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                write_before,
+                "the {mode:?} non-allow write cell never reaches the worker"
+            );
+        }
+
+        let exec_before = execs.load(Ordering::SeqCst);
+        let request = EffectRequest::Exec {
+            grant_id: exec_grant.clone(),
+            program: exec_program.clone(),
+        };
+        if let Some(admitted) = admit_live_cell(&mut world, &task, mode, request, exec) {
+            let outcome = execute_live_cell(&mut world, &admitted)
+                .unwrap_or_else(|error| panic!("{mode:?} exec allow executes: {error}"));
+            assert!(
+                matches!(outcome, EffectOutcome::Executed { .. }),
+                "{mode:?} exec allow outcome: {outcome:?}"
+            );
+            assert_eq!(
+                execs.load(Ordering::SeqCst),
+                exec_before + 1,
+                "the {mode:?} exec Allow cell crossed the seatbelt worker once"
+            );
+        } else {
+            assert_eq!(
+                execs.load(Ordering::SeqCst),
+                exec_before,
+                "the {mode:?} non-allow exec cell never reaches the worker"
+            );
+        }
+
+        let egress_before = egresses.load(Ordering::SeqCst);
+        let request = EffectRequest::Egress {
+            grant_id: egress_grant.clone(),
+            url: egress_url.to_string(),
+        };
+        if let Some(admitted) = admit_live_cell(&mut world, &task, mode, request, egress) {
+            let error = execute_live_cell(&mut world, &admitted)
+                .expect_err("the egress Allow cell is os-denied by the boundary, never ambient");
+            assert!(
+                matches!(
+                    error,
+                    ExecutorError::Worker(WorkerError::SandboxDenied { ref target })
+                        if target == &PathBuf::from(egress_url)
+                ),
+                "{mode:?} egress allow denial: {error}"
+            );
+            assert_eq!(
+                egresses.load(Ordering::SeqCst),
+                egress_before + 1,
+                "the {mode:?} egress Allow cell was presented to the seatbelt worker once"
+            );
+        } else {
+            assert_eq!(
+                egresses.load(Ordering::SeqCst),
+                egress_before,
+                "the {mode:?} non-allow egress cell never reaches the worker"
+            );
+        }
+    }
+
+    let reads_after_live_crossing = reads.load(Ordering::SeqCst);
+    let writes_after_live_crossing = writes.load(Ordering::SeqCst);
+    let execs_after_live_crossing = execs.load(Ordering::SeqCst);
+    let egresses_after_live_crossing = egresses.load(Ordering::SeqCst);
     for mode in [
         PermissionMode::Manual,
         PermissionMode::AcceptEdits,
@@ -727,10 +994,21 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
             );
         }
     }
+    assert_eq!(reads.load(Ordering::SeqCst), reads_after_live_crossing);
     assert_eq!(
-        world.worker_reads(),
-        reads_after_live_crossing,
-        "no mode's verdict may execute an effect through the preview seam"
+        writes.load(Ordering::SeqCst),
+        writes_after_live_crossing,
+        "no mode's verdict may execute a write through the preview seam"
+    );
+    assert_eq!(
+        execs.load(Ordering::SeqCst),
+        execs_after_live_crossing,
+        "no mode's verdict may execute an exec through the preview seam"
+    );
+    assert_eq!(
+        egresses.load(Ordering::SeqCst),
+        egresses_after_live_crossing,
+        "no mode's verdict may attempt an egress through the preview seam"
     );
 }
 
@@ -769,6 +1047,95 @@ fn allowed_manual_read_executes_through_the_seatbelt_worker() {
         }
         other => panic!("expected a read outcome, got {other:?}"),
     }
+}
+
+#[test]
+fn allow_mode_write_cells_execute_through_the_seatbelt_worker() {
+    // The matrix's Write Allow cells must hold on the live mode-carrying
+    // path, never through admit_managed_write: for every mode, the write
+    // cell admits with the injected mode and the verdict decides whether
+    // the confined Seatbelt worker runs. The executor context observes
+    // no trusted scope, checkpoint, or budget, so only preapproved-only
+    // (with its recorded consent) and yolo reach a live write; every
+    // other mode fails closed at admit and the worker never runs.
+    use rivect::contracts::EffectClass as Class;
+    for (mode, expected) in [
+        (PermissionMode::Manual, ModeDecision::Ask),
+        (PermissionMode::AcceptEdits, ModeDecision::Ask),
+        (PermissionMode::ReadOnly, ModeDecision::Deny),
+        (PermissionMode::Auto, ModeDecision::Ask),
+        (PermissionMode::PreapprovedOnly, ModeDecision::Allow),
+        (PermissionMode::Yolo, ModeDecision::Allow),
+    ] {
+        let tag = format!("matrix-write-{}", mode.id());
+        let mut world = support::open_world(&tag, None);
+        let session = world.open_session(&format!("{tag}-session"));
+        let task = world.create_task(&session, &format!("{tag}-task"));
+        let scope = world.root.join("scope");
+        std::fs::create_dir_all(&scope).expect("create matrix scope");
+        let file = scope.join("target.txt");
+        std::fs::write(&file, b"scoped-by-seatbelt").expect("create matrix target");
+        let grant = world
+            .runtime
+            .policy
+            .grant_classes(scope, vec![Class::Read, Class::Write]);
+        if mode == PermissionMode::PreapprovedOnly {
+            world
+                .runtime
+                .owner
+                .store
+                .record_preapproval(
+                    &preapproval_scope(Class::Write, &file.display().to_string()),
+                    "human:matrix-write",
+                    600,
+                )
+                .expect("record write preapproval");
+        }
+        let writes = Arc::new(AtomicU64::new(0));
+        world.runtime.read_worker = Box::new(CountingSeatbeltWorker {
+            reads: Arc::new(AtomicU64::new(0)),
+            writes: writes.clone(),
+            execs: Arc::new(AtomicU64::new(0)),
+            egresses: Arc::new(AtomicU64::new(0)),
+        });
+        let payload = format!("landed-under-{tag}");
+        let request = EffectRequest::Write {
+            grant_id: grant,
+            path: file.clone(),
+            bytes: payload.clone().into_bytes(),
+        };
+        if let Some(admitted) = admit_live_cell(&mut world, &task, mode, request, expected) {
+            let outcome = execute_live_cell(&mut world, &admitted)
+                .unwrap_or_else(|error| panic!("{mode:?} confined write executes: {error}"));
+            assert!(
+                matches!(outcome, EffectOutcome::Executed { .. }),
+                "{mode:?} write outcome: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read(&file).expect("read the write target"),
+                payload.as_bytes(),
+                "the {mode:?} Allow cell's write landed through the confined worker"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                1,
+                "the {mode:?} Allow cell crossed the seatbelt worker exactly once"
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(&file).expect("read untouched write target"),
+                b"scoped-by-seatbelt",
+                "the {mode:?} non-allow cell's write must not land"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                0,
+                "the {mode:?} non-allow cell never reaches the worker"
+            );
+        }
+    }
+    // Managed control writes stay policy-gated and mode-free, pinned by
+    // sandbox_worker_reads_scope_and_lands_checked_managed_write.
 }
 
 #[test]

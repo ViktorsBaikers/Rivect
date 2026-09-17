@@ -64,6 +64,8 @@ pub enum ControllerError {
     Scheduler(#[from] SchedulerError),
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("applicability evaluation could not decide the obligations of this step")]
+    ApplicabilityUnknown,
 }
 
 /// Typed settlement of the external-output projection for one decision
@@ -154,6 +156,10 @@ pub fn step_error_observation(
         ControllerError::Executor(source) => format!("executor error: {source}"),
         ControllerError::Scheduler(source) => format!("scheduler error: {source}"),
         ControllerError::Serialization(source) => format!("serialization error: {source}"),
+        ControllerError::ApplicabilityUnknown => {
+            "applicability error: evaluation could not decide the obligations of this step"
+                .to_string()
+        }
     };
     Observation::failure(
         task.clone(),
@@ -167,6 +173,13 @@ pub fn step_error_observation(
 /// Mirrors the runtime notification queue capacity: one pass drains at
 /// most one full queue, so bounded work never grows with the backlog.
 const SCHEDULER_DRAIN_LIMIT: usize = 8;
+
+/// The interim DEC-068 applicability-evaluation sentinel, mirroring
+/// `KNOWN_READY_OPTION`: an answer selecting this option reports the
+/// evaluation of the materialized obligations returned unknown/error.
+/// The step then marks them unresolved (never stale) and fails through
+/// the supervisor's Err feed.
+pub const APPLICABILITY_UNKNOWN_OPTION: &str = "applicability-unknown";
 
 impl Runtime {
     /// One decision step for a task whose pending question has been
@@ -230,6 +243,36 @@ impl Runtime {
             });
         }
         self.owner.store.materialize_obligations(task_id)?;
+        // DEC-068: the step must be able to decide whether every
+        // materialized obligation applies to this dispatch. The frozen
+        // answer is the only applicability input the interim driver
+        // has; the sentinel option reports the evaluation returned
+        // unknown/error. Every obligation is marked unresolved —
+        // execution untouched, so this never impersonates the
+        // stale-evidence leg — and the step fails so `scheduler_step`'s
+        // Err arm feeds the supervisor (INV-020: observation only, the
+        // supervisor never dispatches).
+        if matches!(
+            answer,
+            AnswerSelection::Option { option_id }
+                if option_id.0.as_str() == APPLICABILITY_UNKNOWN_OPTION
+        ) {
+            let obligations: Vec<String> = self
+                .owner
+                .store
+                .snapshot(task_id)?
+                .obligations
+                .items
+                .iter()
+                .map(|obligation| obligation.id.clone())
+                .collect();
+            for obligation_id in obligations {
+                self.owner
+                    .store
+                    .mark_applicability_unresolved(&obligation_id)?;
+            }
+            return Err(ControllerError::ApplicabilityUnknown);
+        }
         let known_ready = matches!(
             answer,
             AnswerSelection::Option { option_id }

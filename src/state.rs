@@ -1739,6 +1739,36 @@ impl TaskStore {
         Ok(task_id)
     }
 
+    /// DEC-068 unknown/error-applicability write: the obligation's
+    /// applicability becomes `unresolved` while its execution stays
+    /// untouched — the stale-evidence leg (`invalidate_evidence`) keeps
+    /// the only `execution='stale'` writer — and the owning task blocks
+    /// unless already cancelled. Returns the owning task id.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::missing_obligation`] when the obligation
+    /// does not exist and [`StoreError::Storage`] when any statement
+    /// fails.
+    pub fn mark_applicability_unresolved(&mut self, obligation_id: &str) -> Result<String> {
+        let changed = self
+            .conn
+            .execute(sql::UNRESOLVED_APPLICABILITY, params![obligation_id])
+            .map_err(storage)?;
+        if changed == 0 {
+            return Err(StoreError::missing_obligation());
+        }
+        let task_id: String = self
+            .conn
+            .query_row(sql::TASK_ID_FOR_OBLIGATION, params![obligation_id], |row| {
+                row.get(0)
+            })
+            .map_err(storage)?;
+        self.conn
+            .execute(sql::BLOCK_TASK_NOT_CANCELLED, params![task_id])
+            .map_err(storage)?;
+        Ok(task_id)
+    }
+
     pub fn evidence_validity(&self, evidence_id: &str) -> Result<Option<String>> {
         let validity = self
             .conn

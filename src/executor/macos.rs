@@ -74,6 +74,14 @@ impl ReadWorker for MacosReadWorker {
     ) -> Result<(), WorkerError> {
         write_once(scope_root, target, expected, bytes)
     }
+
+    fn exec_once(&mut self, scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
+        exec_once(scope_root, program)
+    }
+
+    fn egress_once(&mut self, url: &str) -> Result<(), WorkerError> {
+        egress_once(url)
+    }
 }
 
 pub const BACKEND: &str = "macos";
@@ -600,6 +608,81 @@ fn confined_write_gate(
             target: target.to_path_buf(),
         })
     }
+}
+
+/// One confined process execution inside the granted scope: the
+/// confined run of the program IS the effect — there is no in-process
+/// exec leg, so a program the boundary admits is exactly the effect
+/// that happened. A bare program's own nonzero exit is indistinguishable
+/// from a boundary denial here and denies the effect (the request
+/// carries no arguments, so a well-formed target program exits zero).
+///
+/// # Errors
+/// Returns [`WorkerError::ScopeRootUnavailable`] when the scope root
+/// cannot be canonicalized, [`WorkerError::SandboxSpawnFailed`] when
+/// the sandbox mechanism cannot start, and [`WorkerError::SandboxDenied`]
+/// when the boundary rejects the program.
+pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
+    let profile = exec_profile(scope_root)?;
+    let outcome = run_confined(Path::new(SANDBOX_EXEC), &profile, program, &[])?;
+    if outcome.exit_ok {
+        Ok(())
+    } else {
+        Err(WorkerError::SandboxDenied {
+            target: program.to_path_buf(),
+        })
+    }
+}
+
+/// The egress control leg's helper binary (macOS ships nc).
+const EGRESS_HELPER: &str = "/usr/bin/nc";
+
+/// One egress attempt against the Seatbelt boundary. This backend
+/// grants no egress allowance anywhere, so the confined leg exists to
+/// prove the denial is the OS boundary's, never a stub: the control
+/// target is a listener this worker holds itself — a passthrough
+/// mechanism would connect and is a capability failure, caught before
+/// any externally visible connect. The requested URL never enters a
+/// child argument list; the typed denial names it.
+///
+/// # Errors
+/// Returns [`WorkerError::SandboxUnavailable`] when the control
+/// listener cannot be held or the boundary admits the denied control
+/// connect, [`WorkerError::SandboxSpawnFailed`] when the mechanism
+/// cannot start, and [`WorkerError::SandboxDenied`] naming the
+/// requested URL — the typed form of the OS denial every egress effect
+/// meets here.
+pub fn egress_once(url: &str) -> Result<(), WorkerError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|source| {
+        WorkerError::SandboxUnavailable {
+            reason: format!("egress control listener unavailable: {source}"),
+        }
+    })?;
+    let port = listener
+        .local_addr()
+        .map_err(|source| WorkerError::SandboxUnavailable {
+            reason: format!("egress control listener unavailable: {source}"),
+        })?
+        .port();
+    let control = run_confined(
+        Path::new(SANDBOX_EXEC),
+        &egress_profile(),
+        Path::new(EGRESS_HELPER),
+        &[
+            OsStr::new("-w"),
+            OsStr::new("1"),
+            OsStr::new("127.0.0.1"),
+            OsStr::new(&port.to_string()),
+        ],
+    )?;
+    if control.exit_ok {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: "seatbelt egress boundary admitted the denied control connect".to_string(),
+        });
+    }
+    Err(WorkerError::SandboxDenied {
+        target: PathBuf::from(url),
+    })
 }
 
 /// Proves the Seatbelt read boundary enforces before the first read
