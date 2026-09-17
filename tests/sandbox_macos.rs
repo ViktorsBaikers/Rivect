@@ -24,34 +24,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use support::{TempTree, matrix_verdict};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-struct TempTree {
-    path: PathBuf,
-}
-
-impl TempTree {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "rivect-sandbox-macos-{name}-{}",
-            std::process::id()
-        ));
-        if path.exists() {
-            std::fs::remove_dir_all(&path).expect("remove stale fixture");
-        }
-        std::fs::create_dir_all(&path).expect("create fixture");
-        Self { path }
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            drop(std::fs::remove_dir_all(&self.path));
-        }
-    }
-}
 
 fn sandbox_exec() -> PathBuf {
     PathBuf::from(SANDBOX_EXEC)
@@ -82,10 +58,10 @@ fn sandbox_world(tag: &str) -> (support::World, rivect::contracts::TaskId, PathB
 
 #[test]
 fn denies_read_outside_scope_at_the_os_boundary() {
-    let fixture = TempTree::new("read-escape");
+    let fixture = TempTree::new("sandbox-macos", "read-escape");
     let inside = fixture.path.join("inside.txt");
     std::fs::write(&inside, b"inside-marker").expect("create inside target");
-    let outside_tree = TempTree::new("read-escape-outside");
+    let outside_tree = TempTree::new("sandbox-macos", "read-escape-outside");
     let outside = outside_tree.path.join("secret.txt");
     std::fs::write(&outside, b"secret").expect("create outside target");
     // Seatbelt filters match canonical paths, so the confined legs address
@@ -114,10 +90,10 @@ fn denies_read_outside_scope_at_the_os_boundary() {
 }
 #[test]
 fn denies_write_outside_scope_at_the_os_boundary() {
-    let fixture = TempTree::new("write-escape");
+    let fixture = TempTree::new("sandbox-macos", "write-escape");
     let inside = fixture.path.join("inside.txt");
     std::fs::write(&inside, b"original").expect("create inside target");
-    let outside_tree = TempTree::new("write-escape-outside");
+    let outside_tree = TempTree::new("sandbox-macos", "write-escape-outside");
     let outside = outside_tree.path.join("victim.txt");
     std::fs::write(&outside, b"untouched").expect("create outside target");
     let before = std::fs::metadata(&outside).expect("outside metadata");
@@ -156,7 +132,7 @@ fn denies_write_outside_scope_at_the_os_boundary() {
 
 #[test]
 fn denies_exec_outside_scope_at_the_os_boundary() {
-    let fixture = TempTree::new("exec-escape");
+    let fixture = TempTree::new("sandbox-macos", "exec-escape");
     // In-scope control leg: the same profile must admit executing a
     // binary inside the scope, so the denial below discriminates the
     // scope boundary from an exec broken everywhere.
@@ -254,7 +230,7 @@ fn worker_fails_closed_when_boundary_does_not_enforce() {
     // A mechanism that never denies is not a boundary: the conformance
     // probe must report capability unavailability instead of letting the
     // checked effect run unconfined (PROH-001, EDGE-009).
-    let fixture = TempTree::new("non-enforcing");
+    let fixture = TempTree::new("sandbox-macos", "non-enforcing");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
 
@@ -309,7 +285,7 @@ fn filters_deprecation_stderr_by_exact_prefix() {
 
 #[test]
 fn sandbox_exec_init_failure_maps_to_capability_unavailable() {
-    let fixture = TempTree::new("missing-mechanism");
+    let fixture = TempTree::new("sandbox-macos", "missing-mechanism");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"unchanged").expect("create target");
     let profile = macos::read_profile(&fixture.path).expect("read profile");
@@ -338,7 +314,7 @@ fn worker_probes_conformance_before_first_effect() {
     // confinable: the conformance probe must fail closed with
     // capability_unavailable before any effect byte moves, even though the
     // checked in-process leg would happily write the target.
-    let fixture = TempTree::new("probe-order");
+    let fixture = TempTree::new("sandbox-macos", "probe-order");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
     let mut worker = macos::MacosReadWorker;
@@ -489,22 +465,6 @@ fn mode_gated_write_denies_occupant_swap_between_admit_and_execute() {
         None,
         "the denied write attempt must be settled in the ledger"
     );
-}
-
-/// The DEC-014 matrix verdicts the policy pins for one decision context.
-fn matrix_verdict(mode: PermissionMode, class: rivect::contracts::EffectClass) -> ModeDecision {
-    let policy = Policy::default();
-    let ctx = AdmissionContext {
-        mode,
-        in_grant_scope: true,
-        budget_remaining: true,
-        in_trusted_scope: true,
-        has_checkpoint: true,
-        previously_approved: true,
-        within_declared_bounds: true,
-        dry_run: false,
-    };
-    policy.decide(Path::new("/scope/target"), class, &ctx)
 }
 
 /// Local counting oracle around the real Seatbelt worker: support's
@@ -1223,7 +1183,7 @@ fn passthrough_boundary_performs_no_in_scope_io() {
     // before any confined leg touches the user's target: the denied legs
     // run first on system or worker-owned files, so a passthrough leaves
     // the scope untouched and fails closed as a capability error.
-    let fixture = TempTree::new("passthrough");
+    let fixture = TempTree::new("sandbox-macos", "passthrough");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     let target = scope.join("target.txt");
@@ -1286,7 +1246,7 @@ fn unwritable_scope_is_an_effect_denial_not_a_capability_failure() {
     // A scope this process cannot write (a root-owned grant on a non-root
     // run) is a typed write denial, never a capability failure that
     // re-probes on every spawn forever.
-    let fixture = TempTree::new("unwritable-scope");
+    let fixture = TempTree::new("sandbox-macos", "unwritable-scope");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     {
@@ -1315,7 +1275,7 @@ fn unwritable_scope_is_an_effect_denial_not_a_capability_failure() {
 fn unreadable_target_is_an_effect_denial_not_a_capability_failure() {
     // A target this process cannot read fails the read probe's admitted
     // leg, but that is a typed read denial, never a capability failure.
-    let fixture = TempTree::new("unreadable-target");
+    let fixture = TempTree::new("sandbox-macos", "unreadable-target");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     let target = scope.join("target.txt");
@@ -1346,7 +1306,7 @@ fn confined_child_stdout_is_never_captured() {
     // Gates decide on the exit status alone: a confined read far larger
     // than any sane capture buffer streams to /dev/null, and the outcome
     // type carries no stdout at all.
-    let fixture = TempTree::new("stream-bound");
+    let fixture = TempTree::new("sandbox-macos", "stream-bound");
     let big = fixture.path.join("big.txt");
     {
         use std::io::Write as _;
@@ -1372,7 +1332,7 @@ fn free_write_once_is_confined_for_every_caller() {
     // so confinement must be intrinsic to it: a non-confinable scope fails
     // the probe before any byte moves, exactly as for the executor's
     // managed-write leg.
-    let fixture = TempTree::new("free-write-confined");
+    let fixture = TempTree::new("sandbox-macos", "free-write-confined");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
     let error = macos::write_once(

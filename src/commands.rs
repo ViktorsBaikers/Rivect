@@ -437,6 +437,13 @@ fn retained_view(rt: &Runtime) -> RetainedView {
     }
 }
 
+/// Puts the pre-edit retained view back: the command was never journaled,
+/// so no surface may observe its edit.
+fn restore_retained_view(rt: &mut Runtime, before: &RetainedView) {
+    rt.effective.parsed = before.parsed.clone();
+    rt.effective.workflow_entry = before.workflow_entry.clone();
+}
+
 /// Applies one typed edit to the retained config document. `Config::set`
 /// and `Config::reset` restore the original document on rejection, so the
 /// retained view always mirrors the last accepted edit; the document is
@@ -491,8 +498,7 @@ fn admit_config_command(
                     // recorded after the bytes landed keeps the edit
                     // durable and served; the next boot receipts it.
                     if !matches!(err, config::PublicationError::Journal(_)) {
-                        rt.effective.parsed = before.parsed;
-                        rt.effective.workflow_entry = before.workflow_entry;
+                        restore_retained_view(rt, &before);
                     }
                     return publication_error(id, &err);
                 }
@@ -518,8 +524,7 @@ fn admit_config_command(
                     // while landed bytes keep serving as the receipt
                     // waits for the next boot.
                     if !matches!(err, config::PublicationError::Journal(_)) {
-                        rt.effective.parsed = before.parsed;
-                        rt.effective.workflow_entry = before.workflow_entry;
+                        restore_retained_view(rt, &before);
                     }
                     return publication_error(id, &err);
                 }
@@ -529,8 +534,7 @@ fn admit_config_command(
         // answers the winner's historical outcome.
         Ok(config::PublicationAdmission::Applied(applied)) => applied,
         Err(err) => {
-            rt.effective.parsed = before.parsed;
-            rt.effective.workflow_entry = before.workflow_entry;
+            restore_retained_view(rt, &before);
             return match err {
                 config::PublicationError::Journal(store) => store_error(id, &store),
                 other => envelope_error(id, ErrorCode::InvalidInput, -32602, &other.to_string()),

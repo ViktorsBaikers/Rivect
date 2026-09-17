@@ -243,35 +243,12 @@ impl Runtime {
             });
         }
         self.owner.store.materialize_obligations(task_id)?;
-        // DEC-068: the step must be able to decide whether every
-        // materialized obligation applies to this dispatch. The frozen
-        // answer is the only applicability input the interim driver
-        // has; the sentinel option reports the evaluation returned
-        // unknown/error. Every obligation is marked unresolved —
-        // execution untouched, so this never impersonates the
-        // stale-evidence leg — and the step fails so `scheduler_step`'s
-        // Err arm feeds the supervisor (INV-020: observation only, the
-        // supervisor never dispatches).
         if matches!(
             answer,
             AnswerSelection::Option { option_id }
                 if option_id.0.as_str() == APPLICABILITY_UNKNOWN_OPTION
         ) {
-            let obligations: Vec<String> = self
-                .owner
-                .store
-                .snapshot(task_id)?
-                .obligations
-                .items
-                .iter()
-                .map(|obligation| obligation.id.clone())
-                .collect();
-            for obligation_id in obligations {
-                self.owner
-                    .store
-                    .mark_applicability_unresolved(&obligation_id)?;
-            }
-            return Err(ControllerError::ApplicabilityUnknown);
+            self.fail_applicability(task_id)?;
         }
         let known_ready = matches!(
             answer,
@@ -389,6 +366,31 @@ impl Runtime {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// DEC-068 sentinel tail: the frozen answer is the only applicability
+    /// input the interim driver has; the sentinel option reports the
+    /// evaluation returned unknown/error. Every obligation is marked
+    /// unresolved — execution untouched, so this never impersonates the
+    /// stale-evidence leg — and the step fails so `scheduler_step`'s Err
+    /// arm feeds the supervisor (INV-020: observation only, the
+    /// supervisor never dispatches).
+    fn fail_applicability(&mut self, task_id: &TaskId) -> Result<(), ControllerError> {
+        let obligations: Vec<String> = self
+            .owner
+            .store
+            .snapshot(task_id)?
+            .obligations
+            .items
+            .iter()
+            .map(|obligation| obligation.id.clone())
+            .collect();
+        for obligation_id in obligations {
+            self.owner
+                .store
+                .mark_applicability_unresolved(&obligation_id)?;
+        }
+        Err(ControllerError::ApplicabilityUnknown)
     }
 
     fn retain_pre_effect(&mut self, attempt_id: &str, cause: &str) -> Result<(), ControllerError> {

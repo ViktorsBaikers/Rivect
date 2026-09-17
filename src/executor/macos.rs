@@ -9,6 +9,9 @@
 //! this operation inside the scope, and only then does the checked
 //! in-process leg move bytes — no ambient path.
 
+use super::{
+    denied_write_candidate, drain_retaining_cap, inspect_regular_target, same_regular_file,
+};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -96,7 +99,7 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -168,41 +171,6 @@ pub enum WorkerError {
         "capability unavailable: sandbox {reason}; recovery: fix the environment or run on a capable kernel"
     )]
     SandboxUnavailable { reason: String },
-}
-
-fn same_regular_file(expected: &Metadata, opened: &Metadata) -> bool {
-    expected.is_file()
-        && opened.is_file()
-        && expected.dev() == opened.dev()
-        && expected.ino() == opened.ino()
-}
-fn inspect_regular_target(
-    scope_root: &Path,
-    target: &Path,
-) -> Result<(PathBuf, Metadata), WorkerError> {
-    let scope = scope_root
-        .canonicalize()
-        .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
-    let canonical_target = target
-        .canonicalize()
-        // Every canonicalize failure — missing, permission, symlink loop —
-        // denies the effect the same way: the target is unavailable.
-        .map_err(|_source| WorkerError::TargetMissing {
-            target: target.to_path_buf(),
-        })?;
-    if !canonical_target.starts_with(&scope) {
-        return Err(WorkerError::OutsideScope {
-            target: target.to_path_buf(),
-        });
-    }
-    let canonical_meta = std::fs::metadata(&canonical_target)
-        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
-    if !canonical_meta.is_file() {
-        return Err(WorkerError::NotRegularFile {
-            target: target.to_path_buf(),
-        });
-    }
-    Ok((canonical_target, canonical_meta))
 }
 
 pub(crate) fn target_identity(
@@ -473,11 +441,6 @@ pub struct ConfinedOutcome {
     pub deprecation_notices: String,
 }
 
-/// Upper bound on retained child stderr: plenty for every denial or
-/// diagnostic a gate decides on, while a stderr-spamming child can never
-/// buffer an unbounded stream in this process.
-const STDERR_RETAIN_BYTES: usize = 64 * 1024;
-
 /// Runs one program under the Seatbelt profile. Arguments are passed
 /// separately, the child inherits no environment, and only the exit
 /// status decides success — deprecation stderr never does (EDGE-010).
@@ -526,22 +489,6 @@ pub fn run_confined(
     })
 }
 
-/// Reads one stream to EOF but retains only its first
-/// [`STDERR_RETAIN_BYTES`]: the read loop never stops early, so the
-/// writer can always drain, while this process holds a bounded buffer.
-fn drain_retaining_cap(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut retained = Vec::new();
-    let mut scratch = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut scratch)?;
-        if read == 0 {
-            return Ok(retained);
-        }
-        let room = STDERR_RETAIN_BYTES.saturating_sub(retained.len());
-        retained.extend_from_slice(&scratch[..read.min(room)]);
-    }
-}
-
 /// Splits raw stderr into (retained lines, exact-prefix deprecation
 /// notices). Only a line that starts with the exact prefix is filtered;
 /// a line that merely contains the text stays.
@@ -559,6 +506,30 @@ pub fn split_deprecation_stderr(raw: &str) -> (String, String) {
     (retained.join("\n"), notices.join("\n"))
 }
 
+/// Verdict of one confined gate or effect leg: an admitted run is `Ok`;
+/// a denied run is the typed OS denial naming the target.
+fn expect_admitted(outcome: ConfinedOutcome, target: &Path) -> Result<(), WorkerError> {
+    if outcome.exit_ok {
+        Ok(())
+    } else {
+        Err(WorkerError::SandboxDenied {
+            target: target.to_path_buf(),
+        })
+    }
+}
+
+/// Verdict of one denied probe leg: a run the boundary admitted is a
+/// capability failure; the expected denial is plain `Ok`.
+fn expect_denied(outcome: ConfinedOutcome, reason: &str) -> Result<(), WorkerError> {
+    if outcome.exit_ok {
+        Err(WorkerError::SandboxUnavailable {
+            reason: reason.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// OS-boundary gate for one read effect: the kernel itself must admit a
 /// read of exactly this target before the checked in-process leg runs.
 fn confined_read_gate(
@@ -573,13 +544,7 @@ fn confined_read_gate(
         Path::new("/bin/cat"),
         &[canonical_target.as_os_str()],
     )?;
-    if outcome.exit_ok {
-        Ok(())
-    } else {
-        Err(WorkerError::SandboxDenied {
-            target: canonical_target.to_path_buf(),
-        })
-    }
+    expect_admitted(outcome, canonical_target)
 }
 
 /// OS-boundary gate for one managed write. The confined leg touches the
@@ -601,13 +566,7 @@ fn confined_write_gate(
         Path::new("/usr/bin/touch"),
         &[artifact.as_os_str()],
     )?;
-    if outcome.exit_ok {
-        Ok(())
-    } else {
-        Err(WorkerError::SandboxDenied {
-            target: target.to_path_buf(),
-        })
-    }
+    expect_admitted(outcome, target)
 }
 
 /// One confined process execution inside the granted scope: the
@@ -625,13 +584,7 @@ fn confined_write_gate(
 pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
     let profile = exec_profile(scope_root)?;
     let outcome = run_confined(Path::new(SANDBOX_EXEC), &profile, program, &[])?;
-    if outcome.exit_ok {
-        Ok(())
-    } else {
-        Err(WorkerError::SandboxDenied {
-            target: program.to_path_buf(),
-        })
-    }
+    expect_admitted(outcome, program)
 }
 
 /// The egress control leg's helper binary (macOS ships nc).
@@ -722,26 +675,21 @@ pub fn probe_read_conformance(
     // and the probe fails before any leg touches the user's target. The
     // verdict discriminates only while this process could read the probe
     // target without the boundary at all.
-    match run_confined(
+    let denied = run_confined(
         sandbox_exec,
         &profile,
         Path::new("/bin/cat"),
         &[Path::new(DENIED_PROBE_TARGET).as_os_str()],
-    ) {
-        Ok(outcome) if outcome.exit_ok => {
-            return Err(WorkerError::SandboxUnavailable {
-                reason: "conformance probe: the boundary admitted the denied read leg".to_string(),
-            });
-        }
-        Ok(_) => {
-            if File::open(DENIED_PROBE_TARGET).is_err() {
-                return Err(WorkerError::SandboxUnavailable {
-                    reason: "conformance probe: the denied read target is unreadable, so enforcement cannot be proven"
-                        .to_string(),
-                });
-            }
-        }
-        Err(error) => return Err(error),
+    )?;
+    expect_denied(
+        denied,
+        "conformance probe: the boundary admitted the denied read leg",
+    )?;
+    if File::open(DENIED_PROBE_TARGET).is_err() {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: "conformance probe: the denied read target is unreadable, so enforcement cannot be proven"
+                .to_string(),
+        });
     }
     // Admitted leg on the user's canonical target: a failure distinguishes
     // a target this process cannot read (a typed effect denial) from a
@@ -766,46 +714,6 @@ pub fn probe_read_conformance(
         .unwrap_or_else(PoisonError::into_inner)
         .insert(key);
     Ok(())
-}
-
-/// One write-denial probe target: a path inside a private directory
-/// outside the scope, freshly created 0700 under an unpredictable name
-/// so only this process can populate it. A denied confined write there
-/// names enforcement alone — never filesystem permission, never a
-/// symlink planted in a shared temporary directory. A scope covering
-/// every candidate root has no outside left to deny and is not
-/// confinable.
-fn denied_write_candidate(scope: &Path) -> Result<PathBuf, WorkerError> {
-    for root in [
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/var/tmp"),
-    ] {
-        let Ok(parent) = root.canonicalize() else {
-            continue;
-        };
-        if parent.starts_with(scope) {
-            continue;
-        }
-        let dir = parent.join(format!(
-            "rivect-sandbox-probe-{}-{}",
-            std::process::id(),
-            crate::contracts::TaskId::generate().0
-        ));
-        if std::fs::create_dir(&dir).is_ok() && set_private_mode(&dir) {
-            return Ok(dir.join("deny"));
-        }
-    }
-    Err(WorkerError::SandboxUnavailable {
-        reason: "conformance probe: no securable write-denial probe root outside the scope, so it is not confinable"
-            .to_string(),
-    })
-}
-
-/// Drops group and other access on a freshly created probe directory.
-fn set_private_mode(dir: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok()
 }
 
 /// Proves the Seatbelt write boundary enforces before the first managed
@@ -839,7 +747,10 @@ pub fn probe_write_conformance(
     // deny the write — and a confined write that succeeds means it never
     // denied anything. The stray a passthrough touch created and its
     // directory are removed either way.
-    let candidate = denied_write_candidate(&key.1)?;
+    let candidate = denied_write_candidate(
+        &key.1,
+        "conformance probe: no securable write-denial probe root outside the scope, so it is not confinable",
+    )?;
     let denied = run_confined(
         sandbox_exec,
         &profile,
@@ -850,15 +761,10 @@ pub fn probe_write_conformance(
     if let Some(parent) = candidate.parent() {
         drop(std::fs::remove_dir(parent));
     }
-    match denied {
-        Ok(outcome) if outcome.exit_ok => {
-            return Err(WorkerError::SandboxUnavailable {
-                reason: "conformance probe: the boundary admitted the denied write leg".to_string(),
-            });
-        }
-        Ok(_) => {}
-        Err(error) => return Err(error),
-    }
+    expect_denied(
+        denied?,
+        "conformance probe: the boundary admitted the denied write leg",
+    )?;
     // Admitted leg on an artifact this worker owns inside the scope; the
     // per-effect gates reuse it, so no confined leg ever touches the
     // user's write target. A failure distinguishes a scope this process
@@ -907,7 +813,7 @@ pub fn probe_write_conformance(
 
 #[cfg(test)]
 mod tests {
-    use super::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
+    use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
     use std::io::Read as _;
 
     #[test]

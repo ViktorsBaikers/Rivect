@@ -29,35 +29,10 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use support::{TempTree, matrix_verdict};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-
-struct TempTree {
-    path: PathBuf,
-}
-
-impl TempTree {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "rivect-sandbox-linux-{name}-{}",
-            std::process::id()
-        ));
-        if path.exists() {
-            std::fs::remove_dir_all(&path).expect("remove stale fixture");
-        }
-        std::fs::create_dir_all(&path).expect("create fixture");
-        Self { path }
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            drop(std::fs::remove_dir_all(&self.path));
-        }
-    }
-}
 
 fn launcher() -> SandboxLauncher {
     SandboxLauncher::default()
@@ -69,22 +44,6 @@ fn confined(
     args: &[&std::ffi::OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     linux::run_confined(&launcher(), confinement, program, args)
-}
-
-/// The DEC-014 matrix verdicts the policy pins for one decision context.
-fn matrix_verdict(mode: PermissionMode, class: rivect::contracts::EffectClass) -> ModeDecision {
-    let policy = Policy::default();
-    let ctx = AdmissionContext {
-        mode,
-        in_grant_scope: true,
-        budget_remaining: true,
-        in_trusted_scope: true,
-        has_checkpoint: true,
-        previously_approved: true,
-        within_declared_bounds: true,
-        dry_run: false,
-    };
-    policy.decide(Path::new("/scope/target"), class, &ctx)
 }
 
 /// Local counting oracle around the real Linux worker: support's default
@@ -148,10 +107,10 @@ fn sandbox_world(tag: &str) -> (support::World, rivect::contracts::TaskId, PathB
 
 #[test]
 fn denies_read_outside_scope_at_the_os_boundary() {
-    let fixture = TempTree::new("read-escape");
+    let fixture = TempTree::new("sandbox-linux", "read-escape");
     let inside = fixture.path.join("inside.txt");
     std::fs::write(&inside, b"inside-marker").expect("create inside target");
-    let outside_tree = TempTree::new("read-escape-outside");
+    let outside_tree = TempTree::new("sandbox-linux", "read-escape-outside");
     let outside = outside_tree.path.join("secret.txt");
     std::fs::write(&outside, b"secret").expect("create outside target");
     // Landlock rules anchor at resolved paths, so the confined legs
@@ -189,10 +148,10 @@ fn denies_read_outside_scope_at_the_os_boundary() {
 
 #[test]
 fn denies_write_outside_scope_at_the_os_boundary() {
-    let fixture = TempTree::new("write-escape");
+    let fixture = TempTree::new("sandbox-linux", "write-escape");
     let inside = fixture.path.join("inside.txt");
     std::fs::write(&inside, b"original").expect("create inside target");
-    let outside_tree = TempTree::new("write-escape-outside");
+    let outside_tree = TempTree::new("sandbox-linux", "write-escape-outside");
     let outside = outside_tree.path.join("victim.txt");
     std::fs::write(&outside, b"untouched").expect("create outside target");
     let before = std::fs::metadata(&outside).expect("outside metadata");
@@ -364,7 +323,7 @@ fn worker_fails_closed_when_boundary_does_not_enforce() {
     // checked effect run unconfined (PROH-001, EDGE-009). `/usr/bin/true`
     // consumes every launcher argument and exits 0, so every leg is
     // "admitted".
-    let fixture = TempTree::new("non-enforcing");
+    let fixture = TempTree::new("sandbox-linux", "non-enforcing");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
     let passthrough = SandboxLauncher {
@@ -418,7 +377,7 @@ fn missing_landlock_abi_maps_to_capability_unavailable() {
     // capability_unavailable whose reason names the failed mechanism and
     // the recovery (EDGE-009). A shim reproduces the launcher error a
     // pre-Landlock kernel produces.
-    let fixture = TempTree::new("missing-abi");
+    let fixture = TempTree::new("sandbox-linux", "missing-abi");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     let target = scope.join("target.txt");
@@ -468,7 +427,7 @@ fn missing_userns_maps_to_capability_unavailable() {
     // launcher's own error, and the probe surfaces it as an honest
     // capability_unavailable naming the failed mechanism (EDGE-009). A
     // shim reproduces the error a container without SYS_ADMIN produces.
-    let fixture = TempTree::new("missing-userns");
+    let fixture = TempTree::new("sandbox-linux", "missing-userns");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     let target = scope.join("target.txt");
@@ -507,7 +466,7 @@ fn missing_userns_maps_to_capability_unavailable() {
 
 #[test]
 fn launcher_init_failure_maps_to_capability_unavailable() {
-    let fixture = TempTree::new("missing-mechanism");
+    let fixture = TempTree::new("sandbox-linux", "missing-mechanism");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"unchanged").expect("create target");
     let confinement = linux::read_confinement(&fixture.path).expect("read confinement");
@@ -537,7 +496,7 @@ fn worker_probes_conformance_before_first_effect() {
     // not confinable: the conformance probe must fail closed with
     // capability_unavailable before any effect byte moves, even though
     // the checked in-process leg would happily write the target.
-    let fixture = TempTree::new("probe-order");
+    let fixture = TempTree::new("sandbox-linux", "probe-order");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
     let mut worker = linux::LinuxWorker;
@@ -582,7 +541,7 @@ fn passthrough_boundary_performs_no_in_scope_io() {
     // probe before any confined leg touches the user's target: the denied
     // legs run first on system or worker-owned files, so a passthrough
     // leaves the scope untouched and fails closed as a capability error.
-    let fixture = TempTree::new("passthrough");
+    let fixture = TempTree::new("sandbox-linux", "passthrough");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     let target = scope.join("target.txt");
@@ -719,7 +678,7 @@ fn unwritable_scope_is_an_effect_denial_not_a_capability_failure() {
     // it as the typed WriteFailed effect denial, never a capability
     // failure that re-probes on every spawn forever. Flipping the scope
     // mode flips the verdict, so the leg discriminates (EDGE-009).
-    let fixture = TempTree::new("unwritable-scope");
+    let fixture = TempTree::new("sandbox-linux", "unwritable-scope");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     set_mode(&scope, 0o755);
@@ -785,7 +744,7 @@ fn unreadable_target_is_an_effect_denial_not_a_capability_failure() {
     // it as the typed ReadFailed effect denial, never a capability
     // failure. Flipping the target mode flips the verdict, so the leg
     // discriminates (EDGE-009).
-    let fixture = TempTree::new("unreadable-target");
+    let fixture = TempTree::new("sandbox-linux", "unreadable-target");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     set_mode(&scope, 0o755);
@@ -820,7 +779,7 @@ fn confined_child_stdout_is_never_captured() {
     // Gates decide on the exit status alone: a confined read far larger
     // than any sane capture buffer streams to /dev/null, and the outcome
     // type carries no stdout at all.
-    let fixture = TempTree::new("stream-bound");
+    let fixture = TempTree::new("sandbox-linux", "stream-bound");
     let big = fixture.path.join("big.txt");
     {
         use std::io::Write as _;
@@ -844,7 +803,7 @@ fn confined_child_stdout_is_never_captured() {
 fn free_write_once_is_confined_for_every_caller() {
     // Confinement must be intrinsic to the free write function: a
     // non-confinable scope fails the probe before any byte moves.
-    let fixture = TempTree::new("free-write-confined");
+    let fixture = TempTree::new("sandbox-linux", "free-write-confined");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
     let error = linux::write_once(
@@ -1651,7 +1610,7 @@ fn degraded_environment_fails_closed_naming_the_mechanism() {
     // never an ambient read. The leg runs as a dropped-privilege child
     // because the proof container grants the test process SYS_ADMIN
     // (EDGE-009).
-    let fixture = TempTree::new("degraded-env");
+    let fixture = TempTree::new("sandbox-linux", "degraded-env");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
     set_mode(&scope, 0o755);
@@ -1681,7 +1640,7 @@ fn exec_confinement_denies_unix_socket_connect() {
     // running inside the exec scope reaches host-side unix services
     // outside it — the netns is never the egress carrier for a scoped
     // program, and the exec leg must load the seccomp net-deny.
-    let fixture = TempTree::new("unix-egress");
+    let fixture = TempTree::new("sandbox-linux", "unix-egress");
     let socket_path = fixture.path.join("service.sock");
     // Held binding, no accept: a backlog connect is a real connect, and
     // curl's own --max-time bounds every leg.

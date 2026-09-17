@@ -471,12 +471,7 @@ impl Config {
             ensure_table_like(doc.as_item_mut(), &path, key)
                 .map(|table| set_field(table, field, item))
         });
-        if let Err(error) = edited.and_then(|_| validate_target(self.raw.as_ref(), &target, key)) {
-            self.raw = original;
-            return Err(error);
-        }
-        self.refresh_view_if_valid();
-        Ok(self.finish_edit())
+        self.commit_edit(key, &target, original, edited)
     }
 
     pub fn reset(&mut self, key: &str) -> Result<ConfigEdit, ConfigError> {
@@ -505,7 +500,21 @@ impl Config {
                 table.remove(target_path(&target).1);
             }
         });
-        if let Err(error) = edited.and_then(|_| validate_target(self.raw.as_ref(), &target, key)) {
+        self.commit_edit(key, &target, original, edited)
+    }
+
+    /// Shared edit tail: the edited document must still validate against
+    /// the target — a rejection restores the retained original so no
+    /// surface ever observes the refused edit — then the view refreshes
+    /// from the accepted document and the edit reports.
+    fn commit_edit(
+        &mut self,
+        key: &str,
+        target: &EditTarget,
+        original: Option<DocumentMut>,
+        edited: Result<(), ConfigError>,
+    ) -> Result<ConfigEdit, ConfigError> {
+        if let Err(error) = edited.and_then(|_| validate_target(self.raw.as_ref(), target, key)) {
             self.raw = original;
             return Err(error);
         }
@@ -950,12 +959,17 @@ fn ensure_table_like<'a>(
     })
 }
 
+/// Whether a raw decor suffix carries a comment: an unrendered suffix
+/// counts conservatively — this code cannot prove what the parser kept
+/// there is whitespace.
+fn raw_suffix_is_comment(suffix: &toml_edit::RawString) -> bool {
+    suffix
+        .as_str()
+        .is_none_or(|suffix| !suffix.trim().is_empty())
+}
+
 fn value_has_non_whitespace_suffix(value: &toml_edit::Value) -> bool {
-    value.decor().suffix().is_some_and(|suffix| {
-        suffix
-            .as_str()
-            .is_none_or(|suffix| !suffix.trim().is_empty())
-    })
+    value.decor().suffix().is_some_and(raw_suffix_is_comment)
 }
 
 fn set_trailing_preserving(inline: &mut InlineTable, suffix: toml_edit::RawString) {
@@ -1005,11 +1019,7 @@ fn set_field(table: &mut dyn TableLike, field: &str, item: Item) {
                         .get(key)
                         .and_then(Item::as_value)
                         .and_then(|value| value.decor().suffix())
-                        .filter(|suffix| {
-                            suffix
-                                .as_str()
-                                .is_none_or(|suffix| !suffix.trim().is_empty())
-                        })
+                        .filter(|suffix| raw_suffix_is_comment(suffix))
                         .cloned()
                 })
                 .collect::<Vec<_>>()
@@ -1170,31 +1180,52 @@ fn wire_value(key: &str, value: &Value) -> Result<ConfigValue, ConfigError> {
         (EditTarget::DefaultsFallback | EditTarget::PurposeFallback(_), Value::Object(fields)) => {
             Ok(ConfigValue::Fallback(wire_fallback(fields, key)?))
         }
-        (EditTarget::PurposeEligible(_), Value::Array(items)) => {
-            let mut names = Vec::new();
-            for entry in items {
-                names.push(entry.as_str().map(str::to_string).ok_or_else(|| {
-                    ConfigError::schema(key, ConfigIssue::EligibleEntryNotString)
-                })?);
-            }
-            Ok(ConfigValue::Names(names))
-        }
+        (EditTarget::PurposeEligible(_), Value::Array(items)) => Ok(ConfigValue::Names(
+            wire_name_array(items, key, ConfigIssue::EligibleEntryNotString)?,
+        )),
         _ => Err(type_mismatch(key)),
     }
+}
+
+/// The `mode` discriminant every wire assignment carries; its absence is
+/// the same required-field rejection the TOML surface emits.
+fn wire_mode<'a>(
+    fields: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, ConfigError> {
+    fields.get("mode").and_then(Value::as_str).ok_or_else(|| {
+        ConfigError::schema(
+            format!("{key}.mode"),
+            ConfigIssue::Required {
+                field: "mode".to_string(),
+            },
+        )
+    })
+}
+
+/// Strings of one wire (JSON) array of names, mirroring the rejection
+/// vocabulary `name_array` carries so the CLI and TOML surfaces keep one
+/// schema.
+fn wire_name_array(
+    items: &[Value],
+    key: &str,
+    entry_not_string: ConfigIssue,
+) -> Result<Vec<String>, ConfigError> {
+    let mut names = Vec::new();
+    for entry in items {
+        let Some(name) = entry.as_str() else {
+            return Err(ConfigError::schema(key, entry_not_string));
+        };
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 fn wire_model(
     fields: &serde_json::Map<String, Value>,
     key: &str,
 ) -> Result<ModelAssign, ConfigError> {
-    let Some(mode) = fields.get("mode").and_then(Value::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = wire_mode(fields, key)?;
     match mode {
         "inherit" => Ok(ModelAssign::Inherit),
         "auto" => {
@@ -1204,16 +1235,11 @@ fn wire_model(
                     let items = value.as_array().ok_or_else(|| {
                         ConfigError::schema(format!("{key}.pool"), ConfigIssue::PoolNotArray)
                     })?;
-                    let mut names = Vec::new();
-                    for entry in items {
-                        names.push(entry.as_str().map(str::to_string).ok_or_else(|| {
-                            ConfigError::schema(
-                                format!("{key}.pool"),
-                                ConfigIssue::PoolEntryNotString,
-                            )
-                        })?);
-                    }
-                    Some(names)
+                    Some(wire_name_array(
+                        items,
+                        &format!("{key}.pool"),
+                        ConfigIssue::PoolEntryNotString,
+                    )?)
                 }
             };
             Ok(ModelAssign::Auto { pool })
@@ -1254,14 +1280,7 @@ fn wire_effort(
     fields: &serde_json::Map<String, Value>,
     key: &str,
 ) -> Result<EffortAssign, ConfigError> {
-    let Some(mode) = fields.get("mode").and_then(Value::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = wire_mode(fields, key)?;
     match mode {
         "inherit" => Ok(EffortAssign::Inherit),
         "auto" => Ok(EffortAssign::Auto),
@@ -1292,14 +1311,7 @@ fn wire_fallback(
     fields: &serde_json::Map<String, Value>,
     key: &str,
 ) -> Result<FallbackAssign, ConfigError> {
-    let Some(mode) = fields.get("mode").and_then(Value::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = wire_mode(fields, key)?;
     match mode {
         "auto" => {
             let mut chain = Vec::new();

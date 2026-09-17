@@ -362,6 +362,51 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Fixture directory removed on drop; `prefix` keeps each suite's trees
+/// distinct while the name pins the case.
+pub struct TempTree {
+    pub path: PathBuf,
+}
+
+impl TempTree {
+    pub fn new(prefix: &str, name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("rivect-{prefix}-{name}-{}", std::process::id()));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("remove stale fixture");
+        }
+        std::fs::create_dir_all(&path).expect("create fixture");
+        Self { path }
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            drop(std::fs::remove_dir_all(&self.path));
+        }
+    }
+}
+
+/// The DEC-014 matrix verdicts the policy pins for one decision context.
+pub fn matrix_verdict(
+    mode: rivect::policy::PermissionMode,
+    class: rivect::contracts::EffectClass,
+) -> rivect::policy::ModeDecision {
+    let policy = rivect::policy::Policy::default();
+    let ctx = rivect::policy::AdmissionContext {
+        mode,
+        in_grant_scope: true,
+        budget_remaining: true,
+        in_trusted_scope: true,
+        has_checkpoint: true,
+        previously_approved: true,
+        within_declared_bounds: true,
+        dry_run: false,
+    };
+    policy.decide(Path::new("/scope/target"), class, &ctx)
+}
+
 pub fn open_world(tag: &str, config_toml: Option<&str>) -> World {
     open_world_at(temp_dir(tag), config_toml)
 }

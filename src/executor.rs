@@ -17,6 +17,9 @@ use crate::policy::{
 use crate::resources::{ReadFlightKey, ReadFlights, ReadRights, SnapshotBinding};
 use crate::state::{StoreError, TaskStore};
 use sha2::Digest as _;
+use std::fs::Metadata;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub use macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
@@ -49,6 +52,17 @@ impl EffectRequest {
             Self::Write { .. } => EffectClass::Write,
             Self::Exec { .. } => EffectClass::Exec,
             Self::Egress { .. } => EffectClass::Egress,
+        }
+    }
+
+    /// The grant identity every arm carries: the admission the policy
+    /// checks at plan and again immediately before the effect.
+    pub fn grant_id(&self) -> &str {
+        match self {
+            Self::Read { grant_id, .. }
+            | Self::Write { grant_id, .. }
+            | Self::Exec { grant_id, .. }
+            | Self::Egress { grant_id, .. } => grant_id,
         }
     }
 
@@ -201,6 +215,108 @@ fn read_result(observation: ReadObservation) -> (EffectOutcome, String) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Backend-neutral worker helpers the macOS and Linux backends share:
+// every backend keeps its own confinement mechanism, while the target
+// inspection and probe discipline below are one discipline.
+// ---------------------------------------------------------------------------
+
+fn same_regular_file(expected: &Metadata, opened: &Metadata) -> bool {
+    expected.is_file()
+        && opened.is_file()
+        && expected.dev() == opened.dev()
+        && expected.ino() == opened.ino()
+}
+
+fn inspect_regular_target(
+    scope_root: &Path,
+    target: &Path,
+) -> Result<(PathBuf, Metadata), WorkerError> {
+    let scope = scope_root
+        .canonicalize()
+        .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
+    let canonical_target = target
+        .canonicalize()
+        // Every canonicalize failure — missing, permission, symlink loop —
+        // denies the effect the same way: the target is unavailable.
+        .map_err(|_source| WorkerError::TargetMissing {
+            target: target.to_path_buf(),
+        })?;
+    if !canonical_target.starts_with(&scope) {
+        return Err(WorkerError::OutsideScope {
+            target: target.to_path_buf(),
+        });
+    }
+    let canonical_meta = std::fs::metadata(&canonical_target)
+        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
+    if !canonical_meta.is_file() {
+        return Err(WorkerError::NotRegularFile {
+            target: target.to_path_buf(),
+        });
+    }
+    Ok((canonical_target, canonical_meta))
+}
+
+/// Upper bound on retained child stderr: plenty for every denial or
+/// diagnostic a gate decides on, while a stderr-spamming child can never
+/// buffer an unbounded stream in this process.
+const STDERR_RETAIN_BYTES: usize = 64 * 1024;
+
+/// Reads one stream to EOF but retains only its first
+/// [`STDERR_RETAIN_BYTES`]: the read loop never stops early, so the
+/// writer can always drain, while this process holds a bounded buffer.
+fn drain_retaining_cap(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut scratch = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut scratch)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let room = STDERR_RETAIN_BYTES.saturating_sub(retained.len());
+        retained.extend_from_slice(&scratch[..read.min(room)]);
+    }
+}
+
+/// One write-denial probe target: a path inside a private directory
+/// outside the scope, freshly created 0700 under an unpredictable name
+/// so only this process can populate it. A denied confined write there
+/// names enforcement alone — never filesystem permission, never a
+/// symlink planted in a shared temporary directory. A scope covering
+/// every candidate root has no outside left to deny and is not
+/// confinable.
+fn denied_write_candidate(scope: &Path, unavailable: &str) -> Result<PathBuf, WorkerError> {
+    for root in [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ] {
+        let Ok(parent) = root.canonicalize() else {
+            continue;
+        };
+        if parent.starts_with(scope) {
+            continue;
+        }
+        let dir = parent.join(format!(
+            "rivect-sandbox-probe-{}-{}",
+            std::process::id(),
+            TaskId::generate().0
+        ));
+        if std::fs::create_dir(&dir).is_ok() && set_private_mode(&dir) {
+            return Ok(dir.join("deny"));
+        }
+    }
+    Err(WorkerError::SandboxUnavailable {
+        reason: unavailable.to_string(),
+    })
+}
+
+/// Drops group and other access on a freshly created probe directory.
+fn set_private_mode(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok()
+}
+
 pub struct Executor<'a> {
     pub policy: &'a mut Policy,
     pub store: &'a mut TaskStore,
@@ -318,13 +434,8 @@ impl<'a> Executor<'a> {
         request: EffectRequest,
         mode: PermissionMode,
     ) -> Result<AdmittedEffect, ExecutorError> {
-        let grant_id = match &request {
-            EffectRequest::Read { grant_id, .. }
-            | EffectRequest::Write { grant_id, .. }
-            | EffectRequest::Exec { grant_id, .. }
-            | EffectRequest::Egress { grant_id, .. } => grant_id.clone(),
-        };
-        let grant = self.policy.admit(&grant_id, request.class())?;
+        let grant_id = request.grant_id();
+        let grant = self.policy.admit(grant_id, request.class())?;
         let target = request.target_path();
         let ctx = admission_context(
             self.store,
@@ -362,7 +473,7 @@ impl<'a> Executor<'a> {
                     target: path.clone(),
                     snapshot: SnapshotBinding(snapshot),
                     scope_root: scope_root.clone(),
-                    rights: ReadRights::new(&grant_id, mode),
+                    rights: ReadRights::new(grant_id, mode),
                 },
                 &attempt_id,
             );
@@ -589,6 +700,25 @@ impl<'a> Executor<'a> {
             flights.drop_member(attempt_id);
         }
     }
+    /// One read member's observation (INV-023): the shared observation
+    /// when the flight's single physical read already happened, else
+    /// the one physical read that settles the flight for the remaining
+    /// members.
+    fn read_member(
+        &mut self,
+        admitted: &AdmittedEffect,
+        path: &Path,
+    ) -> Result<ReadObservation, WorkerError> {
+        if let Some(observation) = self.take_shared_observation(&admitted.attempt_id) {
+            return Ok(observation);
+        }
+        let observation = self.worker.read_once(&admitted.scope_root, path)?;
+        if let Some(flights) = self.flights.as_deref_mut() {
+            flights.settle(&admitted.attempt_id, observation.clone());
+        }
+        Ok(observation)
+    }
+
     /// Mutable admission immediately before the effect: the grant is
     /// re-checked, cancellation settles the attempt, and the mode verdict
     /// is re-consulted under the admitted mode (an enrolled deny added
@@ -597,14 +727,9 @@ impl<'a> Executor<'a> {
     /// the OS boundary the worker runs under, never by a pre-worker class
     /// bypass. Ask and deny verdicts fail closed at the gates above.
     pub fn execute(&mut self, admitted: &AdmittedEffect) -> Result<EffectOutcome, ExecutorError> {
-        let grant_id = match &admitted.request {
-            EffectRequest::Read { grant_id, .. }
-            | EffectRequest::Write { grant_id, .. }
-            | EffectRequest::Exec { grant_id, .. }
-            | EffectRequest::Egress { grant_id, .. } => grant_id.clone(),
-        };
+        let grant_id = admitted.request.grant_id();
         if let Err(error) =
-            self.admit_settled(&admitted.attempt_id, &grant_id, admitted.request.class())
+            self.admit_settled(&admitted.attempt_id, grant_id, admitted.request.class())
         {
             self.abandon_flight(&admitted.attempt_id);
             return Err(error);
@@ -634,18 +759,7 @@ impl<'a> Executor<'a> {
                 // takes the shared observation instead of charging its
                 // own physical read; the first member to execute
                 // performs the one read and settles the flight.
-                match self.take_shared_observation(&admitted.attempt_id) {
-                    Some(observation) => Ok(read_result(observation)),
-                    None => self
-                        .worker
-                        .read_once(&admitted.scope_root, path)
-                        .map(|observation| {
-                            if let Some(flights) = self.flights.as_deref_mut() {
-                                flights.settle(&admitted.attempt_id, observation.clone());
-                            }
-                            read_result(observation)
-                        }),
-                }
+                self.read_member(admitted, path).map(read_result)
             }
             EffectRequest::Write { path, bytes, .. } => admitted
                 .expected_identity
@@ -753,19 +867,7 @@ impl<'a> Executor<'a> {
         // physical charge — it takes a settled flight's shared
         // observation, and its own physical read settles the flight for
         // the remaining members.
-        let observation = match self.take_shared_observation(&admitted.attempt_id) {
-            Some(observation) => observation,
-            None => {
-                let observation = self
-                    .worker
-                    .read_once(&admitted.scope_root, path)
-                    .map_err(ExecutorError::from)?;
-                if let Some(flights) = self.flights.as_deref_mut() {
-                    flights.settle(&admitted.attempt_id, observation.clone());
-                }
-                observation
-            }
-        };
+        let observation = self.read_member(admitted, path)?;
         self.store.set_attempt_state(
             &admitted.attempt_id,
             "unknown",
