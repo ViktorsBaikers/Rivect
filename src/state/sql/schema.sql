@@ -137,6 +137,19 @@ CREATE TABLE IF NOT EXISTS retained (
     boundary_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL
 );
+
+-- Supervisor reaction journal (INV-027): one append-only row per
+-- detector firing; the JSON carries the stall cause and the class
+-- limits/cooldown in force when the detector fired. `id` is the
+-- stable append identity — firing order never depends on rowid
+-- spelling.
+CREATE TABLE IF NOT EXISTS supervisor_reactions (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    reaction_json TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_supervisor_reactions_task
+    ON supervisor_reactions (task_id);
 -- Config publication journal: append-only intents, receipted by
 -- the state transition pending -> applied. `identity` is the target's
 -- `dev:ino` at staging: the managed write is in-place, so a surviving

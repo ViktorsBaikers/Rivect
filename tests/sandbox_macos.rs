@@ -420,6 +420,75 @@ fn sandbox_worker_reads_scope_and_lands_checked_managed_write() {
     );
 }
 
+#[test]
+fn mode_gated_write_denies_occupant_swap_between_admit_and_execute() {
+    // INV-029 on the mode-carrying agent write path, never through
+    // admit_managed_write: admit pins the occupant identity under the
+    // caller's mode, so an unlink/recreate swap between admit and execute
+    // denies with the typed TargetChanged error and the swapped file
+    // keeps its bytes.
+    let (mut world, task, file, _grant) = sandbox_world("mode-write-occupant");
+    let scope_root = file.parent().expect("scope root").to_path_buf();
+    let write_grant = world.runtime.policy.grant_classes(
+        scope_root,
+        vec![
+            rivect::contracts::EffectClass::Read,
+            rivect::contracts::EffectClass::Write,
+        ],
+    );
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit(
+                &task,
+                EffectRequest::Write {
+                    grant_id: write_grant,
+                    path: file.clone(),
+                    bytes: b"agent payload".to_vec(),
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("yolo write admission")
+    };
+    std::fs::remove_file(&file).expect("remove admitted occupant");
+    std::fs::write(&file, b"new occupant").expect("replace admitted occupant");
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute(&admitted)
+            .expect_err("an occupant swap must deny the mode-gated write")
+    };
+
+    assert!(matches!(
+        &error,
+        ExecutorError::Worker(WorkerError::TargetChanged { target })
+            if target.as_path() == file.as_path()
+    ));
+    assert_eq!(
+        std::fs::read(&file).expect("read new occupant"),
+        b"new occupant"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .owner
+            .store
+            .latest_unresolved_attempt(&task)
+            .expect("read unresolved mode write attempt"),
+        None,
+        "the denied write attempt must be settled in the ledger"
+    );
+}
+
 /// The DEC-014 matrix verdicts the policy pins for one decision context.
 fn matrix_verdict(mode: PermissionMode, class: rivect::contracts::EffectClass) -> ModeDecision {
     let policy = Policy::default();
@@ -519,14 +588,12 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
     );
 
     // Confined-path leg: the pinned verdicts must gate the worker the
-    // executor runs. The mode carrier is the DEC-015 interim manual
-    // default until the Settings surface lands, so the executor's live
-    // consult evaluates exactly the manual column above — the pin and
-    // the live consult may not drift apart — and that column's single
-    // Allow cell (read) must cross the real Seatbelt worker. Every other
-    // mode reaches the executor only through the preview seam until a
-    // mode carrier exists (follow-up, DEC-015): no mode's verdict may
-    // execute an effect there.
+    // executor runs. The mode now rides admit (DEC-016); the macOS
+    // dispatch caller still carries the interim manual default (DEC-015)
+    // until the Settings surface lands, so the executor's live consult
+    // evaluates exactly the manual column above — the pin and the live
+    // consult may not drift apart — and that column's single Allow cell
+    // (read) must cross the real Seatbelt worker.
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
@@ -539,12 +606,13 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
     for class in [Class::Read, Class::Write, Class::Exec, Class::Egress] {
         let ctx = rivect::executor::admission_context(
             &world.runtime.owner.store,
+            PermissionMode::Manual,
             class,
             file.parent().expect("scope root"),
             &file,
         )
         .expect("executor admission context");
-        assert_eq!(ctx.mode, PermissionMode::default());
+        assert_eq!(ctx.mode, PermissionMode::Manual);
         assert_eq!(
             world.runtime.policy.decide(&file, class, &ctx),
             matrix_verdict(PermissionMode::Manual, class),
@@ -565,6 +633,7 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
                     grant_id: grant.clone(),
                     path: file.clone(),
                 },
+                PermissionMode::Manual,
             )
             .unwrap_or_else(|error| panic!("manual-mode read admits: {error}"))
     };
@@ -681,6 +750,7 @@ fn allowed_manual_read_executes_through_the_seatbelt_worker() {
                     grant_id: grant,
                     path: file,
                 },
+                PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -703,19 +773,43 @@ fn allowed_manual_read_executes_through_the_seatbelt_worker() {
 
 #[test]
 fn non_read_effects_have_no_ambient_path_in_any_mode() {
-    let (mut world, task, file, grant) = sandbox_world("no-ambient-exec");
+    // A forged admission must not bypass the mode gate: with an
+    // all-class grant and the interim manual mode, every non-read cell
+    // of the manual column asks at the execute-time reconsult, the typed
+    // error settles the ledger, and no worker leg runs — there is no
+    // ambient path around the gate.
+    let (mut world, task, file, _grant) = sandbox_world("no-ambient-exec");
+    let scope_root = file.parent().expect("scope root").to_path_buf();
+    // The exec target lives inside the granted scope so the mode gate —
+    // not the scope consult — is the discriminator for the leg.
+    let scoped_exec = scope_root.join("scoped-exec.sh");
+    std::fs::write(&scoped_exec, "#!/bin/sh\nexit 0\n").expect("write scoped exec target");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&scoped_exec, std::fs::Permissions::from_mode(0o755))
+            .expect("make scoped exec target executable");
+    }
+    let all_classes = world.runtime.policy.grant_classes(
+        scope_root.clone(),
+        vec![
+            rivect::contracts::EffectClass::Read,
+            rivect::contracts::EffectClass::Write,
+            rivect::contracts::EffectClass::Exec,
+            rivect::contracts::EffectClass::Egress,
+        ],
+    );
     for request in [
         EffectRequest::Write {
-            grant_id: grant.clone(),
+            grant_id: all_classes.clone(),
             path: file.clone(),
             bytes: b"must not land".to_vec(),
         },
         EffectRequest::Exec {
-            grant_id: grant.clone(),
-            program: PathBuf::from("/bin/sleep"),
+            grant_id: all_classes.clone(),
+            program: scoped_exec,
         },
         EffectRequest::Egress {
-            grant_id: grant,
+            grant_id: all_classes,
             url: "https://example.invalid".to_string(),
         },
     ] {
@@ -730,9 +824,11 @@ fn non_read_effects_have_no_ambient_path_in_any_mode() {
             task_id: task.clone(),
             attempt_id,
             request,
-            scope_root: file.parent().expect("scope root").to_path_buf(),
+            mode: PermissionMode::Manual,
+            expected_identity: None,
+            scope_root: scope_root.clone(),
         };
-        let outcome = {
+        let error = {
             let mut executor = Executor::new(
                 &mut world.runtime.policy,
                 &mut world.runtime.owner.store,
@@ -740,17 +836,12 @@ fn non_read_effects_have_no_ambient_path_in_any_mode() {
             );
             executor
                 .execute(&admitted)
-                .expect("readonly rejection is an outcome")
+                .expect_err("a forged manual-mode non-read effect must ask at the mode gate")
         };
-        match outcome {
-            EffectOutcome::Denied { reason } => {
-                assert!(
-                    reason.contains("no ambient fallback"),
-                    "readonly rejection names the missing fallback: {reason}"
-                );
-            }
-            other => panic!("expected a denied outcome for {class:?}, got {other:?}"),
-        }
+        assert!(
+            matches!(error, ExecutorError::ModeAsk),
+            "{class:?}: {error}"
+        );
     }
     assert_eq!(
         std::fs::read(&file).expect("read untouched target"),

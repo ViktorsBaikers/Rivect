@@ -389,6 +389,31 @@ pub fn open_world_at(root: PathBuf, config_toml: Option<&str>) -> World {
         last_manifest,
     }
 }
+
+/// World with injected provider and read worker: the supervisor
+/// outcome/error feed cases stub one seam at a time while every other
+/// subsystem stays production. Counters stay zero — counting belongs to
+/// [`open_world`].
+pub fn open_world_with(
+    tag: &str,
+    config_toml: Option<&str>,
+    provider: Box<dyn Provider>,
+    worker: Box<dyn rivect::executor::ReadWorker>,
+) -> World {
+    let root = temp_dir(tag);
+    if let Some(text) = config_toml {
+        std::fs::write(root.join("config.toml"), text).expect("config write");
+    }
+    let runtime = Runtime::open_with_worker(&root, provider, worker).expect("owner elected");
+    World {
+        root,
+        runtime,
+        provider_calls: Arc::new(AtomicU64::new(0)),
+        worker_reads: Arc::new(AtomicU64::new(0)),
+        last_read_digest: Arc::new(std::sync::Mutex::new(None)),
+        last_manifest: Arc::new(std::sync::Mutex::new(None)),
+    }
+}
 pub trait IntoRequest {
     fn into_request(self) -> String;
 }

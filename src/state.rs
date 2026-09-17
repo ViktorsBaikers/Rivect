@@ -9,7 +9,7 @@ use crate::contracts::{
     OptionId, Page, Question, QuestionId, QuestionOption, ResumeCondition, SchedulerItem,
     SessionId, TaskId, TaskSnapshot, TodoItem,
 };
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
@@ -166,6 +166,36 @@ fn storage(err: impl std::error::Error + Send + Sync + 'static) -> StoreError {
     StoreError::Storage(Box::new(err))
 }
 
+/// Idempotency step for the reaction journal (DEC-016 schema residual):
+/// `CREATE TABLE IF NOT EXISTS` leaves untouched a database whose
+/// `supervisor_reactions` predates the `id` append identity
+/// (intermediate commit 0131781), so `ORDER BY id` paging would fail.
+/// A current table is left as-is; an id-less one is rebuilt in one
+/// immediate transaction, preserving journal order by rowid.
+fn migrate_supervisor_reactions(conn: &mut Connection) -> Result<()> {
+    let has_id = {
+        let mut stmt = conn
+            .prepare(sql::SUPERVISOR_REACTIONS_COLUMNS)
+            .map_err(storage)?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        columns.iter().any(|name| name == "id")
+    };
+    if has_id {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    tx.execute_batch(sql::MIGRATE_SUPERVISOR_REACTIONS)
+        .map_err(storage)?;
+    tx.commit().map_err(storage)?;
+    Ok(())
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         schema_version: 1,
@@ -232,12 +262,13 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).map_err(storage)?;
+        let mut conn = Connection::open(path).map_err(storage)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(storage)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(storage)?;
         conn.execute_batch(sql::SCHEMA).map_err(storage)?;
+        migrate_supervisor_reactions(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -1816,6 +1847,65 @@ impl TaskStore {
             .optional()
             .map_err(storage)?;
         Ok(record)
+    }
+
+    // ----- supervisor reaction journal (supervisor.rs owns the reaction) -----
+
+    /// Appends one supervisor detector firing to the task's durable
+    /// reaction journal: one row per firing, carrying the stall cause
+    /// and the class limits/cooldown in force (INV-027).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when serialization or the insert
+    /// fails.
+    pub fn record_supervisor_reaction(
+        &mut self,
+        reaction: &crate::supervisor::Reaction,
+    ) -> Result<()> {
+        let reaction_json = serde_json::to_string(reaction).map_err(storage)?;
+        self.conn
+            .execute(
+                sql::INSERT_SUPERVISOR_REACTION,
+                params![reaction.task.0, reaction_json],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Paged retrieval of one task's supervisor reactions, oldest first:
+    /// `limit + 1` rows are fetched so `has_more` never hides a row, and
+    /// a malformed journal row fails instead of guessing a cause.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the query or a reaction row's
+    /// JSON fails to parse.
+    pub fn supervisor_reactions(
+        &self,
+        task_id: &TaskId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<crate::supervisor::Reaction>, bool)> {
+        let mut stmt = self
+            .conn
+            .prepare(sql::SUPERVISOR_REACTIONS_PAGE)
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(
+                params![task_id.0, i64::from(limit) + 1, i64::from(offset)],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        drop(stmt);
+        let has_more = rows.len() > limit as usize;
+        let mut rows = rows;
+        rows.truncate(limit as usize);
+        let reactions = rows
+            .iter()
+            .map(|json| serde_json::from_str(json).map_err(storage))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((reactions, has_more))
     }
 
     // ----- config publication journal (config.rs owns the intent) -----

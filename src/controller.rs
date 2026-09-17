@@ -14,6 +14,7 @@ use crate::policy::PolicyError;
 use crate::resources::Delivery;
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
+use crate::supervisor::{Observation, OperationClass};
 
 /// One bounded scheduler pass over the task tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +66,85 @@ pub enum ControllerError {
     Serialization(#[from] serde_json::Error),
 }
 
+/// One decision step's outcome as the supervisor's typed observation
+/// fingerprint: every `StepOutcome` variant feeds the detectors, each
+/// with its own stable tool/args/result triple, so no outcome class
+/// bypasses the feed (AC-011, DEC-016). The fingerprint's tool is the
+/// only permitted action (`read_file`); the frozen answer names the
+/// inputs, and the result names the variant.
+#[must_use]
+pub fn step_outcome_observation(
+    task: &TaskId,
+    answer: &AnswerSelection,
+    outcome: &StepOutcome,
+) -> Observation {
+    let result = match outcome {
+        StepOutcome::Completed { .. } => "completed".to_string(),
+        StepOutcome::EffectDenied { reason, .. } => reason.clone(),
+        StepOutcome::OutcomeUnknown { attempt_id, .. } => {
+            format!("outcome unknown: {attempt_id}")
+        }
+        StepOutcome::Waiting { .. } => "waiting".to_string(),
+        StepOutcome::NoAction { .. } => "no action".to_string(),
+    };
+    Observation::failure(
+        task.clone(),
+        OperationClass::Read,
+        "read_file",
+        &answer_text(answer),
+        &result,
+    )
+}
+
+/// One failed decision step as the supervisor's typed observation
+/// fingerprint: every `ControllerError` class keeps its own
+/// `decision_step`-tooled fingerprint, so no error class bypasses the
+/// feed and errors never collapse into the effect-denied fingerprint
+/// (AC-011, DEC-016).
+///
+/// # Examples
+///
+/// ```
+/// use rivect::contracts::{AnswerSelection, TaskId};
+/// use rivect::controller::{ControllerError, step_error_observation};
+/// use rivect::scheduler::SchedulerError;
+///
+/// let observation = step_error_observation(
+///     &TaskId("task-loop".to_string()),
+///     &AnswerSelection::Custom {
+///         text: "read /scope/f".to_string(),
+///     },
+///     &ControllerError::Scheduler(SchedulerError::UnknownNode { node: 3 }),
+/// );
+/// assert_eq!(observation.signature.tool, "decision_step");
+/// assert_eq!(
+///     observation.signature.result,
+///     "scheduler error: unknown scheduler node 3"
+/// );
+/// ```
+#[must_use]
+pub fn step_error_observation(
+    task: &TaskId,
+    answer: &AnswerSelection,
+    error: &ControllerError,
+) -> Observation {
+    let result = match error {
+        ControllerError::Store(source) => format!("store error: {source}"),
+        ControllerError::Policy(source) => format!("policy error: {source}"),
+        ControllerError::Model(source) => format!("model error: {source}"),
+        ControllerError::Executor(source) => format!("executor error: {source}"),
+        ControllerError::Scheduler(source) => format!("scheduler error: {source}"),
+        ControllerError::Serialization(source) => format!("serialization error: {source}"),
+    };
+    Observation::failure(
+        task.clone(),
+        OperationClass::Read,
+        "decision_step",
+        &answer_text(answer),
+        &result,
+    )
+}
+
 /// Mirrors the runtime notification queue capacity: one pass drains at
 /// most one full queue, so bounded work never grows with the backlog.
 const SCHEDULER_DRAIN_LIMIT: usize = 8;
@@ -101,12 +181,14 @@ impl Runtime {
         // revocation and task cancellation both deny the dispatch itself.
         self.policy.admit(grant_id, EffectClass::Read)?;
         // Permission-mode consult (DEC-014) on the only permitted action
-        // target: an enrolled deny outranks the fixed interim `manual`
-        // mode (DEC-015), and any verdict that is not a clear allow —
-        // ask included — gates the dispatch read before any provider
-        // effect, mirroring the executor's fail-closed rule.
+        // target. The dispatch carrier is the interim `manual` default
+        // (DEC-015) until the Settings surface lands; an enrolled deny
+        // outranks it, and any verdict that is not a clear allow — ask
+        // included — gates the dispatch read before any provider effect,
+        // mirroring the executor's fail-closed rule.
         let dispatch_ctx = crate::executor::admission_context(
             &self.owner.store,
+            crate::policy::PermissionMode::Manual,
             EffectClass::Read,
             &self.scope_root,
             &self.scoped_file,
@@ -171,7 +253,9 @@ impl Runtime {
                 &mut self.owner.store,
                 self.read_worker.as_mut(),
             );
-            executor.admit(task_id, request)?
+            // Interim manual mode at this boundary (DEC-015) until the
+            // production step driver carries Runtime's mode (DEC-016).
+            executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?
         };
         let effect_attempt = admitted.attempt_id.clone();
         if known_ready {
@@ -230,6 +314,12 @@ impl Runtime {
             Ok(EffectOutcome::Denied { reason }) => {
                 let snapshot = self.owner.store.snapshot(task_id)?;
                 Ok(StepOutcome::EffectDenied { reason, snapshot })
+            }
+            // The dispatch constructs only read requests, so a performed
+            // non-read outcome is structurally unreachable here; the
+            // production step driver (DEC-016) owns that observation map.
+            Ok(EffectOutcome::Executed { .. }) => {
+                unreachable!("internal error: the dispatch only admits reads")
             }
             Err(err) => Err(err.into()),
         }
@@ -380,6 +470,15 @@ impl Runtime {
                 // failed decision step must release its slot and
                 // reservation, or two of them would stall the tree.
                 self.scheduler.settle(node)?;
+                // The failed step feeds the same outcome stream
+                // (AC-011, DEC-016): the error's typed fingerprint
+                // reaches the detectors — an Err never bypasses the
+                // feed — and its reaction lands after the node
+                // settled, like every other observation.
+                let observation = step_error_observation(&context.task, &context.answer, &error);
+                if let Some(reaction) = self.supervisor.observe(&self.scheduler, observation) {
+                    self.owner.store.record_supervisor_reaction(&reaction)?;
+                }
                 return Err(error);
             }
         };
@@ -387,6 +486,19 @@ impl Runtime {
             self.scheduler.complete(node)?;
         } else {
             self.scheduler.settle(node)?;
+        }
+        // The supervisor reads the same outcome stream the scheduler
+        // just settled on (AC-011, DEC-016): every StepOutcome variant
+        // feeds its typed observation fingerprint — the only permitted
+        // action class is the scoped read, and the frozen answer names
+        // the inputs that produced the attempt. The one bounded
+        // reaction goes straight to the durable journal — after the
+        // node settled, so a journal failure can never strand a
+        // running node. The supervisor never dispatches (INV-020):
+        // the mapping is observation-only, never a second planner.
+        let observation = step_outcome_observation(&context.task, &context.answer, &outcome);
+        if let Some(reaction) = self.supervisor.observe(&self.scheduler, observation) {
+            self.owner.store.record_supervisor_reaction(&reaction)?;
         }
         Ok(SchedulerStep::Ran {
             node,

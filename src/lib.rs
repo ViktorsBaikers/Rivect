@@ -12,6 +12,7 @@ pub mod providers;
 pub mod resources;
 pub mod scheduler;
 pub mod state;
+pub mod supervisor;
 pub mod tools;
 pub mod ui;
 pub mod verification;

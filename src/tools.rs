@@ -135,7 +135,9 @@ pub fn invoke_read(
         path,
     };
     let mut executor = Executor::new(&mut rt.policy, &mut rt.owner.store, rt.read_worker.as_mut());
-    let admitted = executor.admit(task_id, request)?;
+    // Interim manual mode at this boundary (DEC-015) until the Settings
+    // mode carrier arrives (DEC-016).
+    let admitted = executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?;
     executor.execute(&admitted)
 }
 

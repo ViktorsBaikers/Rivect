@@ -18,7 +18,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError};
-/// The one injected backend seam: everything the executor reads goes
+/// The one injected backend seam: every effect the executor performs —
+/// read, write, exec, egress — crosses a worker leg, so confinement is
+/// intrinsic to the backend implementations. Legs a backend has not
+/// shipped deny closed with their typed `*Unavailable` variant instead
+/// of silently skipping the boundary.
 pub trait ReadWorker: Send {
     fn read_once(
         &mut self,
@@ -34,6 +38,14 @@ pub trait ReadWorker: Send {
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         Err(WorkerError::WriteUnavailable)
+    }
+
+    fn exec_once(&mut self, _scope_root: &Path, _program: &Path) -> Result<(), WorkerError> {
+        Err(WorkerError::ExecUnavailable)
+    }
+
+    fn egress_once(&mut self, _url: &str) -> Result<(), WorkerError> {
+        Err(WorkerError::EgressUnavailable)
     }
 }
 
@@ -125,6 +137,10 @@ pub enum WorkerError {
     WriteMutationFailed { source: std::io::Error },
     #[error("denied: managed write backend unavailable")]
     WriteUnavailable,
+    #[error("denied: exec backend unavailable")]
+    ExecUnavailable,
+    #[error("denied: egress backend unavailable")]
+    EgressUnavailable,
     #[error("denied: managed write exceeds the {WRITE_MAX_BYTES} byte limit")]
     WriteTooLarge,
     #[error("denied: managed write length conversion failed: {source}")]
@@ -137,8 +153,11 @@ pub enum WorkerError {
         "capability unavailable: seatbelt sandbox-exec could not be started: {source}; recovery: fix the environment or run on a capable kernel"
     )]
     SandboxSpawnFailed { source: std::io::Error },
+    // Mechanism-agnostic prefix: the reason names the failed mechanism
+    // (Seatbelt on macOS, Landlock/seccomp/netns on Linux) — a fixed
+    // "seatbelt" here put the wrong mechanism name on Linux wires.
     #[error(
-        "capability unavailable: seatbelt {reason}; recovery: fix the environment or run on a capable kernel"
+        "capability unavailable: sandbox {reason}; recovery: fix the environment or run on a capable kernel"
     )]
     SandboxUnavailable { reason: String },
 }

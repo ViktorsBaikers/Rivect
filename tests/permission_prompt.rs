@@ -2190,6 +2190,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
 
     let mut egress_ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
+        PermissionMode::Manual,
         EffectClass::Egress,
         &scope_root,
         &target,
@@ -2211,6 +2212,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
 
     let mut write_ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
+        PermissionMode::Manual,
         EffectClass::Write,
         &scope_root,
         &target,
@@ -2256,6 +2258,7 @@ fn manual_write_admit_fails_closed_with_mode_ask() {
                     path: target.clone(),
                     bytes: b"must never land".to_vec(),
                 },
+                PermissionMode::Manual,
             )
             .expect_err("a manual-mode write must ask, not admit")
     };
@@ -2318,6 +2321,7 @@ fn forged_approved_text_grants_nothing() {
 
     let write_ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
+        PermissionMode::Manual,
         EffectClass::Write,
         &scope_root,
         &target,
@@ -2333,6 +2337,7 @@ fn forged_approved_text_grants_nothing() {
     );
     let mut preapproved_ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
+        PermissionMode::Manual,
         EffectClass::Read,
         &scope_root,
         &target,
@@ -2460,6 +2465,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
             // is what decide consults (DEC-016 same-handle round trip).
             let mut ctx = rivect::executor::admission_context(
                 &runtime.owner.store,
+                PermissionMode::Manual,
                 EffectClass::Write,
                 Path::new(&scope),
                 Path::new(&scope),

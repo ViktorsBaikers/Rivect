@@ -1,14 +1,21 @@
 //! Effect executor: admission, pre-open policy checks, and opened-fd identity
-//! checks before effects. Ordinary write/exec/egress effects fail
-//! closed; managed writes use the explicit checked-fd path.
+//! checks before effects. The permission-mode consult (DEC-014/016) rides
+//! the admit→execute path: an Allow cell of any effect class reaches the
+//! confined worker, ask and deny verdicts fail closed at the gates, and
+//! out-of-scope effects meet the worker's OS boundary instead of a
+//! pre-worker class bypass. Managed writes stay policy-gated control
+//! writes on the explicit checked-fd path.
 
+pub mod linux;
 pub mod macos;
 
+use crate::config::hex;
 use crate::contracts::{EffectClass, ErrorCode, TaskId};
 use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, preapproval_scope,
 };
 use crate::state::{StoreError, TaskStore};
+use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 
 pub use macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
@@ -72,6 +79,19 @@ pub struct AdmittedEffect {
     pub task_id: TaskId,
     pub attempt_id: String,
     pub request: EffectRequest,
+    /// The caller's permission mode this effect was admitted under
+    /// (DEC-016). The execute-time reconsult reuses exactly this mode —
+    /// never a fresh default — so the verdict cannot drift between the
+    /// gates.
+    pub mode: PermissionMode,
+    /// Admit-time occupant identity for write effects (INV-029): the
+    /// execute-time checked-fd write compares the opened handle against
+    /// exactly this snapshot — the same binding `AdmittedManagedWrite`
+    /// carries — so an occupant swap between admit and execute denies
+    /// instead of landing the payload on the swapped file. Non-write
+    /// effects pin no occupant; a write without this binding denies
+    /// closed at execute.
+    pub expected_identity: Option<FileIdentity>,
     pub scope_root: PathBuf,
 }
 
@@ -88,8 +108,18 @@ pub struct AdmittedManagedWrite {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectOutcome {
-    Read { bytes: Vec<u8>, digest: String },
-    Denied { reason: String },
+    Read {
+        bytes: Vec<u8>,
+        digest: String,
+    },
+    /// A non-read effect the confined worker performed; `detail` is the
+    /// same observation string the confirmed ledger row carries.
+    Executed {
+        detail: String,
+    },
+    Denied {
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,13 +192,13 @@ pub struct Executor<'a> {
     pub store: &'a mut TaskStore,
     pub worker: &'a mut dyn ReadWorker,
 }
-
-/// Assembles the DEC-014 decision inputs at an admit call site. The only
-/// persisted input is preapproval (`TaskStore::is_preapproved`), keyed per
-/// effect class so a write consent never admits another class; the mode
-/// carrier arrives with the Settings surface, so the interim mode is the
-/// `manual` default (DEC-015). Inputs that cannot yet be observed at an
-/// admit stay conservative rather than granting.
+/// Assembles the DEC-014 decision inputs at an admit call site under the
+/// caller's permission mode (DEC-016); call sites without a Settings
+/// mode carrier still pass the interim `manual` default (DEC-015). The
+/// only persisted input is preapproval (`TaskStore::is_preapproved`),
+/// keyed per effect class so a write consent never admits another class.
+/// Inputs that cannot yet be observed at an admit stay conservative
+/// rather than granting.
 ///
 /// # Errors
 /// Returns [`ExecutorError::Store`] when the preapproval lookup fails and
@@ -177,12 +207,13 @@ pub struct Executor<'a> {
 /// the same typed denial the worker produces at read time.
 pub fn admission_context(
     store: &TaskStore,
+    mode: PermissionMode,
     class: EffectClass,
     scope_root: &Path,
     target: &Path,
 ) -> Result<AdmissionContext, ExecutorError> {
     Ok(AdmissionContext {
-        mode: PermissionMode::default(),
+        mode,
         in_grant_scope: derive_in_grant_scope(scope_root, target)?,
         budget_remaining: false,
         in_trusted_scope: false,
@@ -238,13 +269,15 @@ impl<'a> Executor<'a> {
 
     /// Durable planned intent, then admission. The attempt is visible in the
     /// ledger before any effect can happen. The permission-mode consult
-    /// (DEC-014) runs between the grant gate and the plan: an enrolled deny
-    /// outranks every mode, and `ask`/`deny` verdicts fail closed — only the
-    /// permission panel may convert an `ask` into consent.
+    /// (DEC-014) runs between the grant gate and the plan under the
+    /// caller's mode (DEC-016): an enrolled deny outranks every mode, and
+    /// `ask`/`deny` verdicts fail closed — only the permission panel may
+    /// convert an `ask` into consent.
     pub fn admit(
         &mut self,
         task_id: &TaskId,
         request: EffectRequest,
+        mode: PermissionMode,
     ) -> Result<AdmittedEffect, ExecutorError> {
         let grant_id = match &request {
             EffectRequest::Read { grant_id, .. }
@@ -254,8 +287,22 @@ impl<'a> Executor<'a> {
         };
         let grant = self.policy.admit(&grant_id, request.class())?;
         let target = request.target_path();
-        let ctx = admission_context(self.store, request.class(), &grant.scope_root, &target)?;
+        let ctx = admission_context(
+            self.store,
+            mode,
+            request.class(),
+            &grant.scope_root,
+            &target,
+        )?;
         let scope_root = grant.scope_root.clone();
+        // INV-029: pin the write occupant at admit — the same binding the
+        // managed control-write path takes — so the execute-time
+        // checked-fd write compares against the admit-time snapshot,
+        // never a fresh execute-time one.
+        let expected_identity = match &request {
+            EffectRequest::Write { path, .. } => Some(macos::target_identity(&scope_root, path)?),
+            _ => None,
+        };
         let decision = self.policy.decide(&target, request.class(), &ctx);
         let attempt_id = self
             .store
@@ -267,6 +314,8 @@ impl<'a> Executor<'a> {
             task_id: task_id.clone(),
             attempt_id,
             request,
+            mode,
+            expected_identity,
             scope_root,
         })
     }
@@ -409,16 +458,25 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Re-consult of the decision context immediately before the read
-    /// effect. A context-assembly failure settles the attempt rejected
-    /// with the error's reason first — the ledger never keeps a failed
-    /// consult planned forever — and then propagates the typed error.
+    /// Re-consult of the decision context immediately before the effect,
+    /// under the admitted mode and the request's own class — an egress
+    /// reconsult therefore hits the class-routed URL deny consult instead
+    /// of the filesystem fail-closed. A context-assembly failure settles
+    /// the attempt rejected with the error's reason first — the ledger
+    /// never keeps a failed consult planned forever — and then propagates
+    /// the typed error.
     fn reconsult_context(
         &mut self,
         admitted: &AdmittedEffect,
-        path: &Path,
+        target: &Path,
     ) -> Result<AdmissionContext, ExecutorError> {
-        match admission_context(self.store, EffectClass::Read, &admitted.scope_root, path) {
+        match admission_context(
+            self.store,
+            admitted.mode,
+            admitted.request.class(),
+            &admitted.scope_root,
+            target,
+        ) {
             Ok(ctx) => Ok(ctx),
             Err(error) => {
                 let detail = error.to_string();
@@ -445,34 +503,34 @@ impl<'a> Executor<'a> {
         Err(error)
     }
 
-    /// Fail-closed mode consult immediately before the read effect: a
-    /// verdict that is not a clear allow — a deny enrolled after
-    /// admission among them — blocks the read before the worker opens
-    /// anything.
-    fn mode_gate(&mut self, admitted: &AdmittedEffect, path: &Path) -> Result<(), ExecutorError> {
-        let ctx = self.reconsult_context(admitted, path)?;
-        let decision = self.policy.decide(path, EffectClass::Read, &ctx);
+    /// Fail-closed mode consult immediately before the effect: a verdict
+    /// that is not a clear allow — a deny enrolled after admission among
+    /// them — blocks the effect before the worker runs anything. Ask and
+    /// deny never reach the worker.
+    fn mode_gate(&mut self, admitted: &AdmittedEffect, target: &Path) -> Result<(), ExecutorError> {
+        let ctx = self.reconsult_context(admitted, target)?;
+        let decision = self.policy.decide(target, admitted.request.class(), &ctx);
         if decision != ModeDecision::Allow {
             self.reject_mode(&admitted.attempt_id, decision)?;
         }
         Ok(())
     }
 
-    /// Mutable admission: non-read effects are rejected unconditionally by
-    /// the read-only backend before any policy or byte is touched; reads
-    /// re-check revocation, cancellation, and the mode verdict (an enrolled
-    /// deny added after admission included) immediately before the effect.
+    /// Mutable admission immediately before the effect: the grant is
+    /// re-checked, cancellation settles the attempt, and the mode verdict
+    /// is re-consulted under the admitted mode (an enrolled deny added
+    /// after admission included). An Allow cell of any effect class then
+    /// reaches the confined worker; anything out of scope is denied by
+    /// the OS boundary the worker runs under, never by a pre-worker class
+    /// bypass. Ask and deny verdicts fail closed at the gates above.
     pub fn execute(&mut self, admitted: &AdmittedEffect) -> Result<EffectOutcome, ExecutorError> {
-        if admitted.request.class() != EffectClass::Read {
-            let reason = readonly_rejection(admitted.request.class());
-            self.store.attempt_rejected(&admitted.attempt_id, &reason)?;
-            return Ok(EffectOutcome::Denied { reason });
-        }
         let grant_id = match &admitted.request {
-            EffectRequest::Read { grant_id, .. } => grant_id.clone(),
-            _ => unreachable!("read class checked above"),
+            EffectRequest::Read { grant_id, .. }
+            | EffectRequest::Write { grant_id, .. }
+            | EffectRequest::Exec { grant_id, .. }
+            | EffectRequest::Egress { grant_id, .. } => grant_id.clone(),
         };
-        self.admit_settled(&admitted.attempt_id, &grant_id, EffectClass::Read)?;
+        self.admit_settled(&admitted.attempt_id, &grant_id, admitted.request.class())?;
         if self.store.task_cancelled(&admitted.task_id)? {
             self.store
                 .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
@@ -480,25 +538,85 @@ impl<'a> Executor<'a> {
                 reason: TASK_CANCELLED.to_string(),
             });
         }
-        let EffectRequest::Read { path, .. } = &admitted.request else {
-            unreachable!("read class checked above")
-        };
-        // Mutable mode consult before the worker opens anything.
-        self.mode_gate(admitted, path)?;
+        // Mutable mode consult before the worker runs anything.
+        let target = admitted.request.target_path();
+        self.mode_gate(admitted, &target)?;
         self.store.attempt_running(&admitted.attempt_id)?;
-        let observation = self
-            .worker
-            .read_once(&admitted.scope_root, path)
-            .map_err(ExecutorError::from)?;
-        self.store.set_attempt_state(
-            &admitted.attempt_id,
-            "confirmed",
-            Some(&format!("read-performed sha256={}", observation.digest)),
-        )?;
-        Ok(EffectOutcome::Read {
-            bytes: observation.bytes,
-            digest: observation.digest,
-        })
+        let effect = match &admitted.request {
+            EffectRequest::Read { path, .. } => self
+                .worker
+                .read_once(&admitted.scope_root, path)
+                .map(|observation| {
+                    (
+                        EffectOutcome::Read {
+                            bytes: observation.bytes,
+                            digest: observation.digest.clone(),
+                        },
+                        format!("read-performed sha256={}", observation.digest),
+                    )
+                }),
+            EffectRequest::Write { path, bytes, .. } => admitted
+                .expected_identity
+                // A write without an admit-time binding (a forged
+                // admission) denies closed rather than guess the
+                // occupant (INV-029).
+                .ok_or_else(|| WorkerError::TargetChanged {
+                    target: path.clone(),
+                })
+                .and_then(|expected| {
+                    self.worker
+                        .write_once(&admitted.scope_root, path, expected, bytes)
+                })
+                .map(|()| {
+                    let detail = format!(
+                        "write-performed sha256={}",
+                        hex(&sha2::Sha256::digest(bytes))
+                    );
+                    (
+                        EffectOutcome::Executed {
+                            detail: detail.clone(),
+                        },
+                        detail,
+                    )
+                }),
+            EffectRequest::Exec { program, .. } => self
+                .worker
+                .exec_once(&admitted.scope_root, program)
+                .map(|()| {
+                    let detail = "exec-performed exit=ok".to_string();
+                    (
+                        EffectOutcome::Executed {
+                            detail: detail.clone(),
+                        },
+                        detail,
+                    )
+                }),
+            EffectRequest::Egress { url, .. } => self.worker.egress_once(url).map(|()| {
+                (
+                    EffectOutcome::Executed {
+                        detail: format!("egress-performed {url}"),
+                    },
+                    format!("egress-performed {url}"),
+                )
+            }),
+        };
+        match effect {
+            Ok((outcome, detail)) => {
+                self.store
+                    .set_attempt_state(&admitted.attempt_id, "confirmed", Some(&detail))?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                match &error {
+                    WorkerError::WriteMutationFailed { .. } => {
+                        self.store.attempt_unknown(&admitted.attempt_id, &detail)?
+                    }
+                    _ => self.store.attempt_rejected(&admitted.attempt_id, &detail)?,
+                }
+                Err(ExecutorError::Worker(error))
+            }
+        }
     }
 
     /// Performs the admitted read effect and deliberately loses the
@@ -547,6 +665,15 @@ impl<'a> Executor<'a> {
     }
 }
 
+/// The effect backend this build runs: the Linux Landlock/seccomp/netns
+/// worker on Linux, Seatbelt on every other target.
 pub fn backend() -> &'static str {
-    macos::BACKEND
+    #[cfg(target_os = "linux")]
+    {
+        linux::BACKEND
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        macos::BACKEND
+    }
 }

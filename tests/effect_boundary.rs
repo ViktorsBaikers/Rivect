@@ -52,6 +52,7 @@ fn read_admit_fails_closed_when_deny_covers_target() {
                     grant_id: grant,
                     path: file.clone(),
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect_err("mode consult must deny the covered read")
     };
@@ -161,6 +162,7 @@ fn read_rechecks_mode_verdict_between_admit_and_execute() {
                     grant_id: grant,
                     path: file.clone(),
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -209,6 +211,7 @@ fn execute_settles_rejected_when_context_fails() {
                     grant_id: grant,
                     path: file.clone(),
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -267,6 +270,7 @@ fn execute_unconfirmed_settles_rejected_when_context_fails() {
                     grant_id: grant,
                     path: file.clone(),
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -319,6 +323,7 @@ fn execute_settles_rejected_when_grant_revoked() {
                     grant_id: grant.clone(),
                     path: file,
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -370,6 +375,7 @@ fn execute_unconfirmed_settles_rejected_when_grant_revoked() {
                     grant_id: grant.clone(),
                     path: file,
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
@@ -420,6 +426,7 @@ fn execute_settles_rejected_when_grant_unknown() {
                     grant_id: grant.clone(),
                     path: file,
                 },
+                rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };

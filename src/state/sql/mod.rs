@@ -163,6 +163,29 @@ pub const COMPLETION_COUNTS: &str = "SELECT
 pub const UPSERT_RETAINED: &str =
     "INSERT OR REPLACE INTO retained (boundary_id, record_json) VALUES (?1, ?2)";
 pub const RETAINED_BY_ID: &str = "SELECT record_json FROM retained WHERE boundary_id = ?1";
+pub const INSERT_SUPERVISOR_REACTION: &str =
+    "INSERT INTO supervisor_reactions (task_id, reaction_json) VALUES (?1, ?2)";
+pub const SUPERVISOR_REACTIONS_PAGE: &str = "SELECT reaction_json FROM supervisor_reactions WHERE task_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3";
+// Column census for the reaction journal's idempotency step: a
+// database created before the `id` append identity (intermediate
+// commit 0131781) keeps a two-column table that `ORDER BY id` cannot
+// page.
+pub const SUPERVISOR_REACTIONS_COLUMNS: &str = "PRAGMA table_info(supervisor_reactions)";
+// SQLite cannot ALTER TABLE ... ADD COLUMN a PRIMARY KEY, so the
+// id-less journal is rebuilt in one batch: rows copy in rowid order,
+// the stale table drops, the rebuilt one takes its name, and the task
+// index is recreated with it.
+pub const MIGRATE_SUPERVISOR_REACTIONS: &str = "CREATE TABLE supervisor_reactions_migrated (
+                    id INTEGER PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    reaction_json TEXT NOT NULL
+                ) STRICT;
+                INSERT INTO supervisor_reactions_migrated (task_id, reaction_json)
+                    SELECT task_id, reaction_json FROM supervisor_reactions ORDER BY rowid;
+                DROP TABLE supervisor_reactions;
+                ALTER TABLE supervisor_reactions_migrated RENAME TO supervisor_reactions;
+                CREATE INDEX IF NOT EXISTS idx_supervisor_reactions_task
+                    ON supervisor_reactions (task_id);";
 // The admission counter is scoped to the target, not (owner, target):
 // every intent competing for one target draws from the same sequence, so
 // concurrent intents are totally ordered by admission, never by owner

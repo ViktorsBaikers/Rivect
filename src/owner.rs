@@ -30,6 +30,8 @@ pub enum OwnerError {
         #[source]
         source: io::Error,
     },
+    #[error("supervisor construction failed: {0}")]
+    SupervisorPolicy(#[from] crate::supervisor::SupervisorError),
 }
 
 pub struct Owner {

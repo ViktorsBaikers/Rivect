@@ -451,8 +451,9 @@ fn boot_confinement_before_dispatch() {
         "{denied}"
     );
 
-    // Write, foreign exec and direct egress are structurally rejected by the
-    // read-only worker; there is no ambient fallback.
+    // Write, foreign exec and direct egress are structurally rejected at
+    // the grant gate: the read-only scope grant admits no other class,
+    // long before any mode consult or worker leg.
     for request in [
         EffectRequest::Write {
             grant_id: grant.clone(),
@@ -474,8 +475,8 @@ fn boot_confinement_before_dispatch() {
             world.runtime.read_worker.as_mut(),
         );
         let admitted = executor
-            .admit(&task, request)
-            .expect_err("read-only worker rejects");
+            .admit(&task, request, rivect::policy::PermissionMode::Manual)
+            .expect_err("the read grant rejects non-read classes");
         assert!(
             matches!(
                 admitted,
@@ -486,12 +487,16 @@ fn boot_confinement_before_dispatch() {
             "{admitted}"
         );
     }
-    // Forced-admitted write/exec/egress through Executor::execute: the
-    // read-only backend rejects them unconditionally with zero observable
-    // side effects, verified by file bytes, an exec marker, and a real
-    // local TCP accept oracle showing zero connections.
+    // Forged write/exec/egress admissions that bypass admit must not
+    // bypass the mode gate: with an all-class grant and the interim
+    // manual mode, every non-read cell asks at the execute-time
+    // reconsult, so no worker leg runs — verified by file bytes, an exec
+    // marker, and a real local TCP accept oracle showing zero
+    // connections. There is no ambient path around the gate.
     let exec_marker = world.root.join("exec-marker.out");
-    let exec_script = world.root.join("make_marker.sh");
+    // The exec oracle script lives inside the granted scope so the mode
+    // gate — not the scope consult — is the discriminator for the leg.
+    let exec_script = _scope.join("make_marker.sh");
     std::fs::write(
         &exec_script,
         format!("#!/bin/sh\nprintf x > {}\n", exec_marker.display()),
@@ -510,18 +515,27 @@ fn boot_confinement_before_dispatch() {
     let egress_addr = listener.local_addr().expect("egress oracle addr");
     let scoped_before = std::fs::read(&file).expect("scoped bytes");
     let outside_before = std::fs::read(&outside).expect("outside bytes");
+    let all_classes = world.runtime.policy.grant_classes(
+        _scope.clone(),
+        vec![
+            rivect::contracts::EffectClass::Read,
+            rivect::contracts::EffectClass::Write,
+            rivect::contracts::EffectClass::Exec,
+            rivect::contracts::EffectClass::Egress,
+        ],
+    );
     for request in [
         EffectRequest::Write {
-            grant_id: grant.clone(),
+            grant_id: all_classes.clone(),
             path: file.clone(),
             bytes: b"tampered".to_vec(),
         },
         EffectRequest::Exec {
-            grant_id: grant.clone(),
+            grant_id: all_classes.clone(),
             program: exec_script.clone(),
         },
         EffectRequest::Egress {
-            grant_id: grant.clone(),
+            grant_id: all_classes.clone(),
             url: format!("http://{egress_addr}/probe"),
         },
     ] {
@@ -536,6 +550,8 @@ fn boot_confinement_before_dispatch() {
             task_id: task.clone(),
             attempt_id,
             request,
+            mode: rivect::policy::PermissionMode::Manual,
+            expected_identity: None,
             scope_root: _scope.clone(),
         };
         let mut executor = Executor::new(
@@ -543,15 +559,12 @@ fn boot_confinement_before_dispatch() {
             &mut world.runtime.owner.store,
             world.runtime.read_worker.as_mut(),
         );
-        let denied = executor
+        let error = executor
             .execute(&admitted)
-            .expect("backend denial is an Ok(Denied) outcome, not an error");
-        let rivect::executor::EffectOutcome::Denied { reason } = denied else {
-            panic!("non-read effect must be denied");
-        };
+            .expect_err("a forged manual-mode non-read effect must ask at the mode gate");
         assert!(
-            reason.contains("read-only worker rejects"),
-            "expected the read-only backend rejection, got {reason}"
+            matches!(error, rivect::executor::ExecutorError::ModeAsk),
+            "{error}"
         );
     }
     assert_eq!(

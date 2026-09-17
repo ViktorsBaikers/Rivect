@@ -26,7 +26,12 @@ const OUTPUT_BOUNDARY: &[&str] = &["main.rs"];
 
 /// Files where process spawning may live (standards §10). A `Command` site
 /// anywhere else is a boundary violation until this list is extended on purpose.
-const PROCESS_BOUNDARY: &[&str] = &["executor.rs", "executor/macos.rs", "tools.rs"];
+const PROCESS_BOUNDARY: &[&str] = &[
+    "executor.rs",
+    "executor/linux.rs",
+    "executor/macos.rs",
+    "tools.rs",
+];
 
 /// Panic is a bug, not a control flow (standards §2.2/§4). `unreachable!` with
 /// an invariant message and `assert!`/`debug_assert!` stay allowed on purpose.

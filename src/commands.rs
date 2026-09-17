@@ -14,6 +14,7 @@ use crate::providers::Provider;
 use crate::resources::NotificationQueue;
 use crate::scheduler::{DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP, Scheduler};
 use crate::state::StoreError;
+use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -34,6 +35,10 @@ pub struct Runtime {
     /// The one bounded task-tree scheduler (INV-020): slot release on
     /// parent wait, strict-FIFO admission, terminal cancellation.
     pub scheduler: Scheduler,
+    /// The sterile-retry supervisor (INV-027): reads the scheduler's
+    /// own outcome stream and journals one bounded reaction per
+    /// detector firing; never dispatches.
+    pub supervisor: Supervisor,
     pub notifications: NotificationQueue,
     pub effective: EffectiveConfig,
     /// Purpose used by the first-task model loop; resolved through the
@@ -47,17 +52,20 @@ pub struct Runtime {
     /// Publication target of the journaled config carrier (AC-095).
     pub config_path: PathBuf,
     pub provider_calls: u64,
-    /// The one injected backend seam; defaults to the real macOS worker.
+    /// The one injected backend seam; defaults to the platform worker
+    /// (Linux Landlock/seccomp/netns on Linux, Seatbelt elsewhere).
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
 }
 
 impl Runtime {
     pub fn open(data_root: &Path, provider: Box<dyn Provider>) -> Result<Self, OwnerError> {
-        Self::open_with_worker(
-            data_root,
-            provider,
-            Box::new(crate::executor::macos::MacosReadWorker),
-        )
+        #[cfg(target_os = "linux")]
+        let worker: Box<dyn crate::executor::ReadWorker> =
+            Box::new(crate::executor::linux::LinuxWorker);
+        #[cfg(not(target_os = "linux"))]
+        let worker: Box<dyn crate::executor::ReadWorker> =
+            Box::new(crate::executor::macos::MacosReadWorker);
+        Self::open_with_worker(data_root, provider, worker)
     }
 
     pub fn open_with_worker(
@@ -112,6 +120,7 @@ impl Runtime {
             broker: Broker::new(provider),
             notifications: NotificationQueue::new(8),
             scheduler: Scheduler::new(DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP),
+            supervisor: Supervisor::new(SupervisorPolicy::default())?,
             effective,
             purpose: String::new(),
             scope_root: PathBuf::new(),
