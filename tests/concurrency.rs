@@ -32,7 +32,7 @@ use rivect::providers::{Provider, ProviderError, ProviderReply, ToolCall};
 use rivect::scheduler::{
     CompleteTransition, DeliverVerdict, NodeState, Scheduler, SchedulerError, WaitTransition,
 };
-use rivect::state::{StoreError, TaskStore};
+use rivect::state::{BudgetStatus, ConflictCause, Missing, StoreError, TaskStore};
 use rivect::supervisor::{
     ClassThresholds, FailureSignature, Observation, OperationClass, PolicyFault, Reaction,
     StallCause, Supervisor, SupervisorError, SupervisorPolicy, WATCH_LIMIT,
@@ -2660,4 +2660,432 @@ fn idless_supervisor_reactions_journal_migrates_in_place() {
     let store = TaskStore::open(&path).expect("reopen is a no-op migration");
     let (page, _) = store.supervisor_reactions(&task, 3, 0).expect("full page");
     assert_eq!(page.len(), 3);
+}
+
+// ----- atomic tree budget (INV-022, EDGE-008, AC-059 contribution) -----
+
+/// Two children of one waiting parent compete for the last reserveable
+/// budget at their shared level: the FIFO head admits and holds the only
+/// reservation, the sibling waits in the ready queue, and a direct
+/// over-reserve is a typed denial — never a double-spend.
+#[test]
+fn last_budget_reserve_admits_one_child_and_the_other_waits() {
+    let root = support::temp_dir("budget-last-reserve");
+    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    let mut scheduler = Scheduler::new(4, 16);
+
+    let parent = stub_task("budget-parent");
+    let parent_node = scheduler
+        .submit(
+            None,
+            parent.clone(),
+            answer_custom("plan two children"),
+            "grant".to_string(),
+            1,
+        )
+        .expect("parent submitted");
+    let first = scheduler
+        .submit(
+            Some(parent_node),
+            stub_task("budget-child-a"),
+            answer_custom("read nothing"),
+            "grant".to_string(),
+            3,
+        )
+        .expect("first child submitted");
+    scheduler
+        .submit(
+            Some(parent_node),
+            stub_task("budget-child-b"),
+            answer_custom("read nothing"),
+            "grant".to_string(),
+            3,
+        )
+        .expect("second child submitted");
+    // A dispatch draws from its own scope and every ancestor's: the
+    // children's own levels are generous, the shared parent level fits
+    // the parent plus exactly one child bound.
+    store
+        .open_budget(parent.0.as_str(), 4)
+        .expect("budget scope opens");
+    for task in [stub_task("budget-child-a"), stub_task("budget-child-b")] {
+        store
+            .open_budget(task.0.as_str(), 3)
+            .expect("budget scope opens");
+    }
+    assert_eq!(
+        scheduler.budget_scopes(first).expect("chain resolves"),
+        vec![parent.clone(), stub_task("budget-child-a")],
+        "the applicable levels are the node's own task and every ancestor, root first"
+    );
+
+    let mut reservations = 0usize;
+    let mut admitted = Vec::new();
+    for _ in 0..3 {
+        reservations += 1;
+        let reservation = format!("res-{reservations}");
+        let node = scheduler.admit_next_bounded(|scopes, units| {
+            let levels: Vec<&str> = scopes.iter().map(|task| task.0.as_str()).collect();
+            match store.budget_reserve(&reservation, &levels, u64::from(units)) {
+                Ok(()) => true,
+                // The waiting sibling's denial is the typed budget
+                // conflict at the shared level; any other error is a
+                // bug, not a wait.
+                Err(StoreError::Conflict(ConflictCause::BudgetExhausted { ref scope, .. })) => {
+                    assert_eq!(
+                        scope,
+                        parent.0.as_str(),
+                        "the shared level denies, not the child's own"
+                    );
+                    false
+                }
+                Err(other) => panic!("unexpected reserve outcome: {other}"),
+            }
+        });
+        match node {
+            Some(node) => admitted.push(node),
+            None => break,
+        }
+        if node == Some(parent_node) {
+            // The admitted parent immediately blocks on its children:
+            // slot and units release before the wait (PROHIL-002), so
+            // the caps never mask the budget race.
+            assert!(matches!(
+                scheduler.begin_wait(parent_node),
+                Ok(WaitTransition::Released)
+            ));
+        }
+    }
+
+    assert_eq!(
+        admitted,
+        vec![parent_node, first],
+        "the parent and the FIFO-head child admit; the sibling does not"
+    );
+    assert_eq!(
+        scheduler.state(first).expect("first ran"),
+        NodeState::Running
+    );
+    assert_eq!(
+        scheduler
+            .state(
+                scheduler
+                    .node_of_task(&stub_task("budget-child-b"))
+                    .expect("second node")
+            )
+            .expect("second waits"),
+        NodeState::Ready
+    );
+    // The shared level holds the parent's and exactly one child's live
+    // reservations: no double-spend.
+    assert_eq!(
+        store.budget_status(parent.0.as_str()).expect("status"),
+        BudgetStatus {
+            limit_units: 4,
+            spent: 0,
+            reserved: 4
+        }
+    );
+
+    // Each child's own level shows the race's outcome: the admitted
+    // child's reserve landed, the refused sibling's ledger stayed
+    // untouched — its wait cost nothing at its own scope.
+    assert_eq!(
+        store
+            .budget_status(stub_task("budget-child-a").0.as_str())
+            .expect("admitted child status"),
+        BudgetStatus {
+            limit_units: 3,
+            spent: 0,
+            reserved: 3
+        }
+    );
+    assert_eq!(
+        store
+            .budget_status(stub_task("budget-child-b").0.as_str())
+            .expect("refused child status"),
+        zero_reserved(3)
+    );
+
+    // A direct claim on the exhausted level is a typed denial.
+    let denial = store
+        .budget_reserve("res-direct", &[parent.0.as_str()], 1)
+        .expect_err("no room at the shared level");
+    assert!(
+        matches!(
+            denial,
+            StoreError::Conflict(ConflictCause::BudgetExhausted { ref scope, .. })
+                if scope == parent.0.as_str()
+        ),
+        "wrong denial: {denial}"
+    );
+}
+
+/// A reservation spans every applicable level atomically: a bound that
+/// fits the first level but not a later one rolls the earlier level's
+/// provisional hold back — the denial applies nowhere — and the
+/// invariant `spent + reserved + bound(next) <= limit` holds at each
+/// level after every transition.
+#[test]
+fn budget_reserve_checks_every_applicable_level_atomically() {
+    let root = support::temp_dir("budget-levels");
+    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    store.open_budget("root", 8).expect("root opens");
+    store.open_budget("branch", 4).expect("branch opens");
+
+    // Bound 5 fits the first (root) level but not the later branch
+    // level: the hold the root level already took inside the spanning
+    // transaction must roll back. A fail-fast implementation that only
+    // pre-checked every level would pass too — one that applies each
+    // level's increment as it goes cannot: the root would keep
+    // reserved units for a reservation that never existed.
+    let denied = store
+        .budget_reserve("res-wide", &["root", "branch"], 5)
+        .expect_err("the later branch level cannot fit");
+    assert!(
+        matches!(
+            denied,
+            StoreError::Conflict(ConflictCause::BudgetExhausted { ref scope, .. })
+                if scope == "branch"
+        ),
+        "wrong denial: {denied}"
+    );
+    assert_eq!(store.budget_status("root").expect("root"), zero_reserved(8));
+    assert_eq!(
+        store.budget_status("branch").expect("branch"),
+        zero_reserved(4)
+    );
+    assert!(
+        matches!(
+            store.budget_reservation("res-wide"),
+            Err(StoreError::NotFound(Missing::Reservation(_)))
+        ),
+        "a denied reservation leaves no rows"
+    );
+
+    store
+        .budget_reserve("res-fit", &["root", "branch"], 4)
+        .expect("both levels fit");
+    assert_eq!(
+        store.budget_status("root").expect("root"),
+        BudgetStatus {
+            limit_units: 8,
+            spent: 0,
+            reserved: 4
+        }
+    );
+    assert_eq!(
+        store.budget_status("branch").expect("branch"),
+        BudgetStatus {
+            limit_units: 4,
+            spent: 0,
+            reserved: 4
+        }
+    );
+
+    // A confirmed cost below the bound spends only the confirmed units
+    // at every level, and admission reopens within the invariant.
+    store
+        .budget_charge("res-fit", Some(3))
+        .expect("confirmed charge");
+    for scope in ["root", "branch"] {
+        assert_eq!(
+            store.budget_status(scope).expect("status"),
+            BudgetStatus {
+                limit_units: if scope == "root" { 8 } else { 4 },
+                spent: 3,
+                reserved: 0
+            }
+        );
+    }
+
+    // A confirmed zero is a real confirmation: it spends zero — never
+    // the bound, and never the unknown-cost retention — while the hold
+    // still clears at every level.
+    store
+        .budget_reserve("res-zero", &["root", "branch"], 1)
+        .expect("one unit fits every freed level");
+    store
+        .budget_charge("res-zero", Some(0))
+        .expect("confirmed-zero charge");
+    for scope in ["root", "branch"] {
+        assert_eq!(
+            store.budget_status(scope).expect("status"),
+            BudgetStatus {
+                limit_units: if scope == "root" { 8 } else { 4 },
+                spent: 3,
+                reserved: 0
+            },
+            "a confirmed zero adds no spent units at either level"
+        );
+    }
+    store
+        .budget_reserve("res-next", &["root", "branch"], 1)
+        .expect("the freed levels admit again");
+}
+
+fn zero_reserved(limit_units: u64) -> BudgetStatus {
+    BudgetStatus {
+        limit_units,
+        spent: 0,
+        reserved: 0,
+    }
+}
+
+/// The offline provider reports no usage for a sent request, so the
+/// sent cost stays unknown: the reservation retains the full bound as
+/// spent — never released as zero — and the retention is visible on
+/// the reservation record (INV-022, EDGE-008).
+#[test]
+fn unknown_sent_cost_is_retained_not_released_as_zero() {
+    let config = rivect::config::Config::parse_validated(&support::config_distinct_pools())
+        .expect("config validates");
+    let mut broker =
+        rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("backend_task", &config, "goal: budget fixture")
+        .expect("manifest");
+    assert!(manifest.cost_bound > 0, "the bound is a finite number");
+    let reply = broker.dispatch(&manifest).expect("offline dispatch");
+    assert!(!reply.text.is_empty(), "the request really was sent");
+
+    // The explain's `confirmed` is a stub offline — the loopback
+    // provider reports no usage to read — so only the ledger behavior
+    // below can prove retention; asserting `confirmed == None` here
+    // would just pin the stub. The bound the charge path must retain
+    // is the frozen manifest bound the explain carries.
+    let sent_cost = broker.sent_cost_explain(&manifest);
+    assert_eq!(sent_cost.bound, manifest.cost_bound);
+
+    let root = support::temp_dir("budget-unknown-cost");
+    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    store
+        .open_budget("task-budget", manifest.cost_bound)
+        .expect("budget opens at the bound");
+    store
+        .budget_reserve(&manifest.attempt_id, &["task-budget"], manifest.cost_bound)
+        .expect("reserve the sent request");
+    store
+        .budget_charge(&manifest.attempt_id, sent_cost.confirmed)
+        .expect("unknown charge retains the bound");
+
+    let status = store.budget_status("task-budget").expect("status");
+    assert_eq!(status.reserved, 0, "the reservation resolved");
+    assert_eq!(
+        status.spent, manifest.cost_bound,
+        "an unknown sent cost retains the full bound, never zero"
+    );
+    assert!(
+        status.spent != 0,
+        "retention at the bound is the opposite of a zero release"
+    );
+    assert_eq!(
+        store
+            .budget_reservation(&manifest.attempt_id)
+            .expect("record"),
+        rivect::state::BudgetReservation {
+            state: rivect::state::BudgetReservationState::Charged,
+            bound: manifest.cost_bound,
+            charged: None,
+        }
+    );
+}
+
+/// A reservation is the proof reserve: it stays `reserved` — visibly
+/// neither spent nor released — until one explicit resolution, and it
+/// resolves exactly once. A replayed reservation id is a typed
+/// conflict, so the same units can never be spent twice.
+#[test]
+fn budget_reservation_resolves_exactly_once() {
+    let root = support::temp_dir("budget-once");
+    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    store.open_budget("once", 10).expect("budget opens");
+    store
+        .budget_reserve("res-1", &["once"], 4)
+        .expect("reserve");
+
+    // A scope opens once: a replayed open never re-limits a live ledger.
+    let reopened = store
+        .open_budget("once", 99)
+        .expect_err("scope ids are single-use");
+    assert!(matches!(
+        reopened,
+        StoreError::Conflict(ConflictCause::BudgetScopeExists { .. })
+    ));
+
+    // The proof reserve is held, not silently spent.
+    assert_eq!(
+        store.budget_status("once").expect("held"),
+        BudgetStatus {
+            limit_units: 10,
+            spent: 0,
+            reserved: 4
+        }
+    );
+    assert_eq!(
+        store.budget_reservation("res-1").expect("record"),
+        rivect::state::BudgetReservation {
+            state: rivect::state::BudgetReservationState::Reserved,
+            bound: 4,
+            charged: None,
+        }
+    );
+
+    store.budget_charge("res-1", None).expect("single charge");
+    let replay = store
+        .budget_charge("res-1", None)
+        .expect_err("a charged reservation never resolves again");
+    assert!(matches!(
+        replay,
+        StoreError::Conflict(ConflictCause::ReservationNotReserved { .. })
+    ));
+    let late_release = store
+        .budget_release("res-1")
+        .expect_err("release after charge is a double resolution");
+    assert!(matches!(
+        late_release,
+        StoreError::Conflict(ConflictCause::ReservationNotReserved { .. })
+    ));
+    assert_eq!(
+        store.budget_status("once").expect("unchanged by replays"),
+        BudgetStatus {
+            limit_units: 10,
+            spent: 4,
+            reserved: 0
+        }
+    );
+
+    // A reservation that never sent releases its units untouched.
+    store
+        .budget_reserve("res-2", &["once"], 4)
+        .expect("second reserve");
+    store.budget_release("res-2").expect("release");
+    assert_eq!(
+        store.budget_status("once").expect("released"),
+        spent_only(10, 4)
+    );
+    let charged_after_release = store
+        .budget_charge("res-2", None)
+        .expect_err("a released reservation never charges");
+    assert!(matches!(
+        charged_after_release,
+        StoreError::Conflict(ConflictCause::ReservationNotReserved { .. })
+    ));
+
+    // The reservation id is the replay key: the same id never reserves twice.
+    let replayed_id = store
+        .budget_reserve("res-1", &["once"], 1)
+        .expect_err("reservation ids are single-use");
+    assert!(matches!(
+        replayed_id,
+        StoreError::Conflict(ConflictCause::ReservationAlreadyRecorded { .. })
+    ));
+}
+
+fn spent_only(limit_units: u64, spent: u64) -> BudgetStatus {
+    BudgetStatus {
+        limit_units,
+        spent,
+        reserved: 0,
+    }
 }

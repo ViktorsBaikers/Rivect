@@ -29,6 +29,10 @@ pub enum Missing {
     Attempt(String),
     #[error("evidence {0}")]
     Evidence(String),
+    #[error("budget scope {0}")]
+    BudgetScope(String),
+    #[error("budget reservation {0}")]
+    Reservation(String),
     #[error("obligation")]
     Obligation,
 }
@@ -77,6 +81,25 @@ pub enum ConflictCause {
         target: String,
         admission_seq: u64,
     },
+    #[error("budget scope {scope} is already open")]
+    BudgetScopeExists { scope: String },
+    #[error(
+        "budget scope {scope} exhausted: spent {spent} + reserved {reserved} + bound {bound} exceeds limit {limit}"
+    )]
+    BudgetExhausted {
+        scope: String,
+        spent: u64,
+        reserved: u64,
+        bound: u64,
+        limit: u64,
+    },
+    #[error("budget reservation {reservation_id} is already recorded")]
+    ReservationAlreadyRecorded { reservation_id: String },
+    #[error("budget reservation {reservation_id} is {state}, not reserved")]
+    ReservationNotReserved {
+        reservation_id: String,
+        state: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -106,6 +129,10 @@ pub enum InvalidCause {
     CursorOffsetOutOfRange,
     #[error("event cursor is out of range")]
     EventCursorOutOfRange,
+    #[error("budget units {0} exceed the storable range")]
+    BudgetUnitsOutOfRange(u64),
+    #[error("budget reservation must name at least one scope")]
+    EmptyBudgetScopes,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -127,6 +154,7 @@ impl StoreError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::NotFound(_) => ErrorCode::NotFound,
+            Self::Conflict(ConflictCause::BudgetExhausted { .. }) => ErrorCode::BudgetExhausted,
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::StaleIntent { .. } => ErrorCode::StaleIntent,
             Self::AlreadyTerminal => ErrorCode::AlreadyTerminal,
@@ -2033,6 +2061,308 @@ impl TaskStore {
             .query_row(sql::PREAPPROVAL_LIVE, params![scope], |row| row.get(0))
             .map_err(storage)
     }
+    // ----- budget ledger (INV-022) -----
+
+    /// Opens one budget scope with an immutable limit. A scope opens
+    /// once; a replayed open is a typed conflict, never a silent
+    /// re-limit of a live ledger.
+    pub fn open_budget(&mut self, scope: &str, limit_units: u64) -> Result<()> {
+        let stored_limit = budget_units_i64(limit_units)?;
+        let replayed = self
+            .conn
+            .query_row(sql::BUDGET_SCOPE_ROW, params![scope], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(storage)?;
+        if replayed.is_some() {
+            return Err(StoreError::Conflict(ConflictCause::BudgetScopeExists {
+                scope: scope.to_string(),
+            }));
+        }
+        self.conn
+            .execute(sql::INSERT_BUDGET_SCOPE, params![scope, stored_limit])
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Atomically reserves `bound` units at every applicable scope
+    /// (INV-022): one immediate transaction checks
+    /// `spent + reserved + bound <= limit` at each level and applies
+    /// every increment, or nothing. A level that cannot fit denies the
+    /// whole reservation — a partial multi-level spend cannot exist —
+    /// and the reservation id is single-use, so a replayed reserve can
+    /// never double-spend.
+    pub fn budget_reserve(
+        &mut self,
+        reservation_id: &str,
+        scopes: &[&str],
+        bound: u64,
+    ) -> Result<()> {
+        if scopes.is_empty() {
+            return Err(StoreError::InvalidInput(InvalidCause::EmptyBudgetScopes));
+        }
+        let stored_bound = budget_units_i64(bound)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let replayed: bool = tx
+            .query_row(sql::RESERVATION_EXISTS, params![reservation_id], |row| {
+                row.get(0)
+            })
+            .map_err(storage)?;
+        if replayed {
+            return Err(StoreError::Conflict(
+                ConflictCause::ReservationAlreadyRecorded {
+                    reservation_id: reservation_id.to_string(),
+                },
+            ));
+        }
+        for scope in scopes {
+            // The invariant rides in the WHERE clause: the check and
+            // the increment are one statement, so concurrent children
+            // racing for the last reserveable budget serialize on the
+            // write lock and exactly one wins.
+            let reserved = tx
+                .execute(sql::RESERVE_BUDGET, params![scope, stored_bound])
+                .map_err(storage)?;
+            if reserved == 0 {
+                return Err(Self::reserve_denied(&tx, scope, bound));
+            }
+            tx.execute(
+                sql::INSERT_BUDGET_RESERVATION,
+                params![reservation_id, scope, stored_bound],
+            )
+            .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// Resolves one reservation against the sent request's cost
+    /// (INV-022): a confirmed cost spends the confirmed units, an
+    /// unknown sent cost retains the full bound — never released as
+    /// zero. The reservation is the proof reserve: it converts to
+    /// spent only through this explicit transition, exactly once.
+    pub fn budget_charge(&mut self, reservation_id: &str, confirmed: Option<u64>) -> Result<()> {
+        let stored_confirmed = confirmed.map(budget_units_i64).transpose()?;
+        self.resolve_reservation(reservation_id, "charged", stored_confirmed, false)
+    }
+
+    /// Releases a reservation whose request never sent: the reserved
+    /// units return to every scope untouched and nothing is spent.
+    /// Exactly-once, like the charge.
+    pub fn budget_release(&mut self, reservation_id: &str) -> Result<()> {
+        self.resolve_reservation(reservation_id, "released", None, true)
+    }
+
+    /// One reservation's ledger face: the scope's admission invariant
+    /// is `spent + reserved + bound(next) <= limit`.
+    pub fn budget_status(&self, scope: &str) -> Result<BudgetStatus> {
+        let row = self
+            .conn
+            .query_row(sql::BUDGET_SCOPE_ROW, params![scope], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(storage)?;
+        match row {
+            None => Err(StoreError::NotFound(Missing::BudgetScope(
+                scope.to_string(),
+            ))),
+            Some((limit_units, spent, reserved)) => Ok(BudgetStatus {
+                limit_units: unsigned(limit_units),
+                spent: unsigned(spent),
+                reserved: unsigned(reserved),
+            }),
+        }
+    }
+
+    /// One reservation's resolution record: `charged` is the confirmed
+    /// cost, or `None` when the sent cost stayed unknown and the bound
+    /// was retained.
+    pub fn budget_reservation(&self, reservation_id: &str) -> Result<BudgetReservation> {
+        let row = self
+            .conn
+            .query_row(
+                sql::BUDGET_RESERVATION_ROW,
+                params![reservation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage)?;
+        match row {
+            None => Err(StoreError::NotFound(Missing::Reservation(
+                reservation_id.to_string(),
+            ))),
+            Some((state, bound, charged)) => Ok(BudgetReservation {
+                state: BudgetReservationState::from_db(&state)?,
+                bound: unsigned(bound),
+                charged: charged.map(unsigned),
+            }),
+        }
+    }
+
+    /// Shared body of the two resolutions: load the reservation's
+    /// scope rows, refuse anything not still `reserved` — the
+    /// exactly-once guard against double-spend and silent conversion —
+    /// then apply the scope deltas and the terminal state together.
+    fn resolve_reservation(
+        &mut self,
+        reservation_id: &str,
+        terminal_state: &'static str,
+        confirmed: Option<i64>,
+        release: bool,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let rows = tx
+            .prepare(sql::BUDGET_RESERVATION_SCOPES)
+            .map_err(storage)?
+            .query_map(params![reservation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        if rows.is_empty() {
+            return Err(StoreError::NotFound(Missing::Reservation(
+                reservation_id.to_string(),
+            )));
+        }
+        if let Some((_, _, state)) = rows.iter().find(|(_, _, state)| state != "reserved") {
+            return Err(StoreError::Conflict(
+                ConflictCause::ReservationNotReserved {
+                    reservation_id: reservation_id.to_string(),
+                    state: state.clone(),
+                },
+            ));
+        }
+        for (scope, bound, _) in &rows {
+            if release {
+                tx.execute(sql::RELEASE_BUDGET_SCOPE, params![scope, bound])
+                    .map_err(storage)?;
+            } else {
+                // An unknown sent cost retains the bound: the delta is
+                // the confirmed units, or the bound itself.
+                let delta = confirmed.unwrap_or(*bound);
+                tx.execute(sql::CHARGE_BUDGET_SCOPE, params![scope, delta, bound])
+                    .map_err(storage)?;
+            }
+        }
+        tx.execute(
+            sql::SET_BUDGET_RESERVATION_STATE,
+            params![reservation_id, terminal_state, confirmed],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// Classifies a zero-row reserve: a scope that never opened is a
+    /// missing lookup; an open scope that cannot fit carries its own
+    /// numbers for the typed exhaustion conflict.
+    fn reserve_denied(tx: &rusqlite::Transaction<'_>, scope: &str, bound: u64) -> StoreError {
+        let row = tx
+            .query_row(sql::BUDGET_SCOPE_ROW, params![scope], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional();
+        match row {
+            Ok(None) => StoreError::NotFound(Missing::BudgetScope(scope.to_string())),
+            Ok(Some((limit, spent, reserved))) => {
+                StoreError::Conflict(ConflictCause::BudgetExhausted {
+                    scope: scope.to_string(),
+                    spent: unsigned(spent),
+                    reserved: unsigned(reserved),
+                    bound,
+                    limit: unsigned(limit),
+                })
+            }
+            // The scope row itself failed to read: the storage error
+            // wins over guessing an admission verdict.
+            Err(source) => storage(source),
+        }
+    }
+}
+
+/// One budget scope's ledger face (INV-022): the admission invariant
+/// is `spent + reserved + bound(next) <= limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetStatus {
+    pub limit_units: u64,
+    pub spent: u64,
+    pub reserved: u64,
+}
+
+/// One reservation's resolution: `charged` is the confirmed cost, or
+/// `None` while the reservation is held or was released without a
+/// send — and `None` on a charged row means the sent cost stayed
+/// unknown and the bound was retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetReservation {
+    pub state: BudgetReservationState,
+    pub bound: u64,
+    pub charged: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetReservationState {
+    Reserved,
+    Charged,
+    Released,
+}
+
+impl BudgetReservationState {
+    /// A column value off the recorded set is a corrupted row: the
+    /// read fails instead of guessing a resolution state.
+    fn from_db(raw: &str) -> Result<Self> {
+        match raw {
+            "reserved" => Ok(Self::Reserved),
+            "charged" => Ok(Self::Charged),
+            "released" => Ok(Self::Released),
+            _ => Err(storage(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown budget reservation state {raw:?}"),
+            ))),
+        }
+    }
+}
+
+/// Budget units are u64 in the API and i64 in SQLite; a value past the
+/// storable range is a typed rejection, never a truncating cast.
+fn budget_units_i64(units: u64) -> Result<i64> {
+    match i64::try_from(units) {
+        Ok(stored) => Ok(stored),
+        Err(_) => Err(StoreError::InvalidInput(
+            InvalidCause::BudgetUnitsOutOfRange(units),
+        )),
+    }
+}
+/// Ledger columns are written non-negative; the read widens back.
+fn unsigned(value: i64) -> u64 {
+    value as u64
 }
 
 impl Lifecycle {

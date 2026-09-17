@@ -247,6 +247,22 @@ impl Scheduler {
     /// a running sibling never blocks an unrelated ready branch that
     /// still fits.
     pub fn admit_next(&mut self) -> Option<NodeId> {
+        self.admit_next_bounded(|_, _| true)
+    }
+
+    /// Budget-gated strict-FIFO admission (INV-022): after the slot and
+    /// resource caps, `reserve` must atomically reserve the head's
+    /// dispatch bound at every applicable budget level — the durable
+    /// ledger's own check is `spent + reserved + bound(next) <= limit`.
+    /// A level that cannot fit denies admission, so on the last
+    /// reserveable budget exactly one of two competing children admits
+    /// and the sibling keeps waiting in queue; the caller owns the
+    /// reservation's later charge or release. The budget consult runs
+    /// last: an unfitted node never burns a durable reservation.
+    pub fn admit_next_bounded(
+        &mut self,
+        mut reserve: impl FnMut(&[TaskId], u32) -> bool,
+    ) -> Option<NodeId> {
         let node = *self.ready.front()?;
         let units = self.nodes[node].resource_units;
         if self.running == self.max_slots {
@@ -255,6 +271,9 @@ impl Scheduler {
         // Overflow fails closed: an unrepresentable reservation is a cap.
         let total = self.held_units.checked_add(units)?;
         if total > self.resource_cap {
+            return None;
+        }
+        if !reserve(&self.scope_chain(node), units) {
             return None;
         }
         self.ready.pop_front();
@@ -405,6 +424,16 @@ impl Scheduler {
         self.by_task.get(task).copied()
     }
 
+    /// The budget levels a dispatch by this node draws from: its own
+    /// task and every node-carrying ancestor, root first. The
+    /// scheduler owns tree shape (INV-020); the ledger owns the atomic
+    /// multi-level check, so the two children of one parent compete at
+    /// the shared levels (INV-022).
+    pub fn budget_scopes(&self, node: NodeId) -> Result<Vec<TaskId>, SchedulerError> {
+        self.node_state(node)?;
+        Ok(self.scope_chain(node))
+    }
+
     pub fn running_count(&self) -> usize {
         self.running
     }
@@ -422,6 +451,21 @@ impl Scheduler {
             .get(node)
             .map(|node| node.state)
             .ok_or(SchedulerError::UnknownNode { node })
+    }
+
+    /// Infallible ancestor walk for nodes already known live: the
+    /// chain collects the node's task then each parent's, and reverses
+    /// to root-first order.
+    fn scope_chain(&self, node: NodeId) -> Vec<TaskId> {
+        let mut chain = Vec::new();
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let node_ref = &self.nodes[id];
+            chain.push(node_ref.task.clone());
+            current = node_ref.parent;
+        }
+        chain.reverse();
+        chain
     }
 
     /// One child settled: the parent's unfinished count drops, and a

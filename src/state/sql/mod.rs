@@ -218,3 +218,28 @@ pub const INSERT_PREAPPROVAL: &str =
                  VALUES (?1, ?2, datetime('now', ?3))";
 pub const PREAPPROVAL_LIVE: &str =
     "SELECT EXISTS(SELECT 1 FROM preapprovals WHERE scope = ?1 AND expires_at > datetime('now'))";
+pub const INSERT_BUDGET_SCOPE: &str =
+    "INSERT INTO budget_scopes (scope, limit_units, spent, reserved) VALUES (?1, ?2, 0, 0)";
+pub const BUDGET_SCOPE_ROW: &str =
+    "SELECT limit_units, spent, reserved FROM budget_scopes WHERE scope = ?1";
+// The admission invariant lives in the WHERE clause (INV-022): the
+// check and the increment are one statement, so two children racing
+// for the last reserveable budget serialize on the write lock and
+// exactly one UPDATE matches.
+pub const RESERVE_BUDGET: &str = "UPDATE budget_scopes SET reserved = reserved + ?2
+                 WHERE scope = ?1 AND spent + reserved + ?2 <= limit_units";
+pub const INSERT_BUDGET_RESERVATION: &str =
+    "INSERT INTO budget_reservations (reservation_id, scope, bound, state)
+                 VALUES (?1, ?2, ?3, 'reserved')";
+pub const RESERVATION_EXISTS: &str =
+    "SELECT EXISTS(SELECT 1 FROM budget_reservations WHERE reservation_id = ?1)";
+pub const BUDGET_RESERVATION_SCOPES: &str =
+    "SELECT scope, bound, state FROM budget_reservations WHERE reservation_id = ?1 ORDER BY scope";
+pub const CHARGE_BUDGET_SCOPE: &str =
+    "UPDATE budget_scopes SET spent = spent + ?2, reserved = reserved - ?3 WHERE scope = ?1";
+pub const RELEASE_BUDGET_SCOPE: &str =
+    "UPDATE budget_scopes SET reserved = reserved - ?2 WHERE scope = ?1";
+pub const SET_BUDGET_RESERVATION_STATE: &str =
+    "UPDATE budget_reservations SET state = ?2, charged = ?3 WHERE reservation_id = ?1";
+pub const BUDGET_RESERVATION_ROW: &str =
+    "SELECT state, bound, charged FROM budget_reservations WHERE reservation_id = ?1 LIMIT 1";

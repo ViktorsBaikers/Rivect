@@ -15,6 +15,10 @@ pub struct RequestManifest {
     pub inputs: String,
     pub inputs_digest: String,
     pub epoch_id: String,
+    /// The frozen admission bound of this request (INV-022): the
+    /// `bound(next)` a budget level must fit beside its spent and
+    /// reserved units before the dispatch may send.
+    pub cost_bound: u64,
 }
 
 /// The transmitted/confirmed distinction for one effort assignment
@@ -28,6 +32,18 @@ pub struct RequestManifest {
 pub struct EffortExplain {
     pub transmitted: EffortAssign,
     pub confirmed: Option<EffortLevel>,
+}
+
+/// The bound-versus-confirmed distinction for one sent request
+/// (EDGE-008, INV-022): the frozen manifest carries the admission
+/// bound, and only provider usage data can confirm the units actually
+/// consumed. The offline loopback reports none, so `confirmed` stays
+/// `None` and an unknown sent cost is retained at the bound — never
+/// released as zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentCostExplain {
+    pub bound: u64,
+    pub confirmed: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +91,7 @@ impl Broker {
                 let seed = hex(&Sha256::digest(purpose.as_bytes()));
                 format!("epoch-{}", &seed[..16])
             },
+            cost_bound: sent_cost_bound(inputs),
         })
     }
 
@@ -97,8 +114,32 @@ impl Broker {
             confirmed: None,
         }
     }
+
+    /// Explains the sent cost of one frozen manifest (EDGE-008,
+    /// INV-022): the bound is what admission reserved; the confirmed
+    /// units stay `None` because no offline provider data exists, so
+    /// the charge path retains the bound instead of releasing zero.
+    pub fn sent_cost_explain(&self, manifest: &RequestManifest) -> SentCostExplain {
+        SentCostExplain {
+            bound: manifest.cost_bound,
+            confirmed: None,
+        }
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
     crate::config::hex(bytes)
+}
+
+/// Interim offline cost bound: one unit per slice of transmitted
+/// input plus one for the request itself. Priced bounds arrive with
+/// live provider dialects; until then admission still needs a finite,
+/// deterministic number frozen on the manifest.
+const BUDGET_UNIT_INPUT_BYTES: usize = 4096;
+
+/// The deterministic offline dispatch-cost bound (INV-022).
+fn sent_cost_bound(inputs: &str) -> u64 {
+    // usize widens to u64 losslessly below 2^64 input bytes; the
+    // saturating ceiling is unreachable in practice and stays finite.
+    1 + u64::try_from(inputs.len().div_ceil(BUDGET_UNIT_INPUT_BYTES)).unwrap_or(u64::MAX)
 }

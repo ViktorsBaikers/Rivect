@@ -172,3 +172,25 @@ CREATE TABLE IF NOT EXISTS preapprovals (
     granted_by TEXT NOT NULL,
     expires_at TEXT NOT NULL
 ) STRICT;
+-- Atomic tree budget ledger (INV-022): one row per budget scope.
+CREATE TABLE IF NOT EXISTS budget_scopes (
+    scope TEXT PRIMARY KEY,
+    limit_units INTEGER NOT NULL,
+    spent INTEGER NOT NULL,
+    reserved INTEGER NOT NULL
+) STRICT;
+-- One row per (reservation, scope): a reservation spans every
+-- applicable level atomically and resolves exactly once — charged or
+-- released — so the same units can never be spent twice. `charged`
+-- stays NULL while reserved/released, and NULL on a charged row means
+-- the sent cost stayed unknown and the bound was retained.
+CREATE TABLE IF NOT EXISTS budget_reservations (
+    reservation_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    bound INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    charged INTEGER,
+    PRIMARY KEY (reservation_id, scope)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_budget_reservations_scope
+    ON budget_reservations (scope);
