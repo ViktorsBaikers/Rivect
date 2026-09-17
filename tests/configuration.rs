@@ -104,6 +104,300 @@ fn fixed_model_auto_effort() {
     assert_eq!(resolved.effort_source, "models.purposes.main");
 }
 
+fn fixed(connection: &str, model_id: &str) -> ModelAssign {
+    ModelAssign::Fixed(FixedModel {
+        connection: connection.to_string(),
+        model_id: model_id.to_string(),
+    })
+}
+
+fn four_combination_config() -> String {
+    "config_version = 1\n\
+     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:primary\"\n\
+     [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+     [models.defaults]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"defaults-pin\" }\n\
+     effort = { mode = \"fixed\", value = \"medium\" }\n\
+     fallback = { mode = \"auto\" }\n\
+     [models.purposes.fixed_fixed]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"ff-model\" }\n\
+     effort = { mode = \"fixed\", value = \"high\" }\n\
+     [models.purposes.fixed_auto]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"fa-model\" }\n\
+     effort = { mode = \"auto\" }\n\
+     [models.purposes.auto_fixed]\n\
+     model = { mode = \"auto\", pool = [\"local\"] }\n\
+     effort = { mode = \"fixed\", value = \"low\" }\n\
+     [models.purposes.auto_auto]\n\
+     model = { mode = \"auto\" }\n\
+     effort = { mode = \"auto\" }\n"
+        .to_string()
+}
+
+/// AC-043: the four fixed/auto combinations resolve independently — a
+/// model pin never drags effort and vice versa — and the wire request
+/// the broker freezes carries exactly the explained assignment.
+#[test]
+fn four_fixed_auto_combinations_match_on_wire_request_and_explain() {
+    let config = Config::parse_validated(&four_combination_config()).expect("valid");
+    let broker = rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let cases = [
+        (
+            "fixed_fixed",
+            fixed("local", "ff-model"),
+            EffortAssign::Fixed {
+                value: rivect::config::EffortLevel::High,
+            },
+        ),
+        ("fixed_auto", fixed("local", "fa-model"), EffortAssign::Auto),
+        (
+            "auto_fixed",
+            pool(&["local"]),
+            EffortAssign::Fixed {
+                value: rivect::config::EffortLevel::Low,
+            },
+        ),
+        ("auto_auto", auto_no_pool(), EffortAssign::Auto),
+    ];
+    for (purpose, model, effort) in cases {
+        let resolved = resolve_or_panic(&config, purpose);
+        assert_eq!(resolved.model, model, "{purpose}: explained model");
+        assert_eq!(resolved.effort, effort, "{purpose}: explained effort");
+        assert_eq!(resolved.model_source, format!("models.purposes.{purpose}"));
+        assert_eq!(resolved.effort_source, format!("models.purposes.{purpose}"));
+        let manifest = broker
+            .prepare(purpose, &config, "goal: fixture")
+            .unwrap_or_else(|err| panic!("{purpose}: {err}"));
+        assert_eq!(manifest.model, model, "{purpose}: wire model");
+        assert_eq!(manifest.effort, effort, "{purpose}: wire effort");
+    }
+    // the defaults pin survives for a purpose without its own binding,
+    // while the more specific auto/auto above overrides it — both
+    // directions of the precedence hold
+    let plain = resolve_or_panic(&config, "unbound");
+    assert_eq!(plain.model, fixed("local", "defaults-pin"));
+    assert_eq!(
+        plain.effort,
+        EffortAssign::Fixed {
+            value: rivect::config::EffortLevel::Medium
+        }
+    );
+    assert_eq!(plain.model_source, "models.defaults");
+    assert_eq!(plain.effort_source, "models.defaults");
+}
+
+fn profile_change_config() -> String {
+    "config_version = 1\n\
+     [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+     [models.defaults]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"profile-one\" }\n\
+     effort = { mode = \"fixed\", value = \"medium\" }\n\
+     fallback = { mode = \"auto\" }\n\
+     [models.groups.backend]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"group-one\" }\n\
+     [models.purposes.pinned]\n\
+     group = \"backend\"\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"pinned-model\" }\n\
+     effort = { mode = \"fixed\", value = \"high\" }\n\
+     [models.purposes.backend_task]\n\
+     group = \"backend\"\n"
+        .to_string()
+}
+
+/// AC-047 contribution: changing the profile — the defaults and group
+/// assignments — preserves an explicit purpose pin for both model and
+/// effort, while unpinned purposes follow the change.
+#[test]
+fn profile_change_preserves_pinned_model_and_effort() {
+    let mut config = Config::parse_validated(&profile_change_config()).expect("valid");
+    config
+        .set(
+            "models.defaults.model",
+            ConfigValue::Model(fixed("local", "profile-two")),
+        )
+        .expect("defaults model edit");
+    config
+        .set(
+            "models.defaults.effort",
+            ConfigValue::Effort(EffortAssign::Fixed {
+                value: rivect::config::EffortLevel::Minimal,
+            }),
+        )
+        .expect("defaults effort edit");
+    config
+        .set(
+            "models.groups.backend.model",
+            ConfigValue::Model(fixed("local", "group-two")),
+        )
+        .expect("group model edit");
+
+    let pinned = resolve_or_panic(&config, "pinned");
+    assert_eq!(pinned.model, fixed("local", "pinned-model"));
+    assert_eq!(
+        pinned.effort,
+        EffortAssign::Fixed {
+            value: rivect::config::EffortLevel::High
+        }
+    );
+    assert_eq!(pinned.model_source, "models.purposes.pinned");
+    assert_eq!(pinned.effort_source, "models.purposes.pinned");
+
+    let follower = resolve_or_panic(&config, "backend_task");
+    assert_eq!(follower.model, fixed("local", "group-two"));
+    assert_eq!(follower.model_source, "models.groups.backend");
+
+    let plain = resolve_or_panic(&config, "unbound");
+    assert_eq!(plain.model, fixed("local", "profile-two"));
+    assert_eq!(
+        plain.effort,
+        EffortAssign::Fixed {
+            value: rivect::config::EffortLevel::Minimal
+        }
+    );
+    assert_eq!(plain.model_source, "models.defaults");
+}
+
+fn purpose_pool_config(pool_line: &str, eligible_line: &str) -> String {
+    format!(
+        "{}\n[models.purposes.vision]\n{pool_line}\n{eligible_line}\n",
+        support::base_config()
+    )
+}
+
+/// The new `models.purposes.*` keys parse from the file and carry on
+/// `PurposeDef` (DEC-012); malformed shapes surface the same two-issue
+/// vocabulary the model `pool` field already uses.
+#[test]
+fn purpose_pool_and_eligible_keys_parse_from_the_file() {
+    let config = Config::parse_validated(&purpose_pool_config(
+        "pool = [\"local\", \"primary\"]",
+        "eligible = [\"primary\"]",
+    ))
+    .expect("valid");
+    let def = config.models.purposes.get("vision").expect("vision");
+    assert_eq!(
+        def.pool,
+        Some(vec!["local".to_string(), "primary".to_string()])
+    );
+    assert_eq!(def.eligible, Some(vec!["primary".to_string()]));
+
+    let shapes = [
+        (
+            "pool = \"local\"",
+            "eligible = [\"primary\"]",
+            ConfigIssue::PoolNotArray,
+        ),
+        (
+            "pool = [1]",
+            "eligible = [\"primary\"]",
+            ConfigIssue::PoolEntryNotString,
+        ),
+        (
+            "pool = [\"local\"]",
+            "eligible = \"primary\"",
+            ConfigIssue::EligibleNotArray,
+        ),
+        (
+            "pool = [\"local\"]",
+            "eligible = [1]",
+            ConfigIssue::EligibleEntryNotString,
+        ),
+    ];
+    for (pool_line, eligible_line, issue) in shapes {
+        let err = Config::parse_validated(&purpose_pool_config(pool_line, eligible_line))
+            .expect_err("malformed shape must reject");
+        expect_stage(&err, Stage::Schema);
+        assert!(
+            std::mem::discriminant(&err.issue) == std::mem::discriminant(&issue),
+            "wrong rejection issue: {err}"
+        );
+    }
+}
+
+/// The editability split the schema names: `pool` is file-only — the
+/// `config.set` surface answers the read-only vocabulary — while
+/// `eligible` edits, round-trips through the file schema and resets.
+#[test]
+fn purpose_pool_is_file_only_and_eligible_is_config_set_editable() {
+    let mut config = Config::parse_validated(&purpose_pool_config(
+        "pool = [\"local\"]",
+        "eligible = [\"primary\"]",
+    ))
+    .expect("valid");
+
+    let pool_error = config
+        .set_wire("models.purposes.vision.pool", &json!(["primary"]))
+        .expect_err("pool is file-only");
+    assert!(
+        matches!(
+            &pool_error.issue,
+            ConfigIssue::KeyNotEditable { key } if key == "models.purposes.vision.pool"
+        ),
+        "wrong rejection issue: {pool_error}"
+    );
+
+    let edit = config
+        .set_wire(
+            "models.purposes.vision.eligible",
+            &json!(["primary", "local"]),
+        )
+        .expect("eligible edits through the wire carrier");
+    let edited = Config::parse_validated(String::from_utf8_lossy(&edit.bytes).as_ref())
+        .expect("edited document must validate");
+    assert_eq!(
+        edited
+            .models
+            .purposes
+            .get("vision")
+            .expect("vision")
+            .eligible,
+        Some(vec!["primary".to_string(), "local".to_string()])
+    );
+
+    let entry_error = config
+        .set_wire("models.purposes.vision.eligible", &json!([1]))
+        .expect_err("non-string entries surface the typed issue");
+    assert!(
+        matches!(&entry_error.issue, ConfigIssue::EligibleEntryNotString),
+        "wrong rejection issue: {entry_error}"
+    );
+    let shape_error = config
+        .set_wire("models.purposes.vision.eligible", &json!("primary"))
+        .expect_err("non-array values are a type mismatch");
+    assert!(
+        matches!(
+            &shape_error.issue,
+            ConfigIssue::ValueTypeMismatch { key } if key == "models.purposes.vision.eligible"
+        ),
+        "wrong rejection issue: {shape_error}"
+    );
+
+    // the typed carrier keeps the slot split: names never land elsewhere
+    let slot_error = config
+        .set(
+            "models.defaults.model",
+            ConfigValue::Names(vec!["primary".to_string()]),
+        )
+        .expect_err("names never land on a model slot");
+    assert!(
+        matches!(
+            &slot_error.issue,
+            ConfigIssue::ValueTypeMismatch { key } if key == "models.defaults.model"
+        ),
+        "wrong rejection issue: {slot_error}"
+    );
+
+    let reset = config
+        .reset("models.purposes.vision.eligible")
+        .expect("eligible is an override reset removes");
+    let reset_doc =
+        Config::parse_validated(String::from_utf8_lossy(&reset.bytes).as_ref()).expect("valid");
+    let vision = reset_doc.models.purposes.get("vision").expect("vision");
+    assert_eq!(vision.eligible, None);
+    // the file-only pool survives every edit above untouched
+    assert_eq!(vision.pool, Some(vec!["local".to_string()]));
+}
+
 #[test]
 fn explicit_chain() {
     let config = Config::parse_validated(&support::config_explicit_chain()).expect("valid");
@@ -1890,7 +2184,8 @@ fn cli_edit_walk_answers_every_models_scope_the_file_surface_names() {
         matches!(
             &purpose_error.issue,
             ConfigIssue::UnknownKey { key, known }
-                if key == "bogus" && *known == ["group", "model", "effort", "fallback"]
+                if key == "bogus"
+                    && *known == ["group", "model", "effort", "fallback", "pool", "eligible"]
         ),
         "wrong rejection issue: {purpose_error}"
     );
@@ -1918,7 +2213,7 @@ fn cli_edit_walk_answers_every_models_scope_the_file_surface_names() {
         (
             7331,
             "models.purposes.planner.bogus",
-            "schema models.purposes.planner.bogus: unknown key models.purposes.planner.bogus; known keys: group, model, effort, fallback",
+            "schema models.purposes.planner.bogus: unknown key models.purposes.planner.bogus; known keys: group, model, effort, fallback, pool, eligible",
         ),
         (
             7332,

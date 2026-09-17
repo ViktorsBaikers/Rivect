@@ -2,7 +2,7 @@
 //! The manifest is frozen at prepare time; later config changes never
 //! rewrite an in-flight request.
 
-use crate::config::{Config, ConfigError, EffortAssign, ModelAssign};
+use crate::config::{Config, ConfigError, EffortAssign, EffortLevel, ModelAssign};
 use crate::providers::{self, Provider, ProviderError};
 use sha2::{Digest, Sha256};
 
@@ -15,6 +15,19 @@ pub struct RequestManifest {
     pub inputs: String,
     pub inputs_digest: String,
     pub epoch_id: String,
+}
+
+/// The transmitted/confirmed distinction for one effort assignment
+/// (EDGE-006, AC-043): the frozen wire request carries the resolved
+/// effort verbatim — a value no layer supports is a typed rejection on
+/// both config carriers, never a silent drop — while only provider
+/// data can confirm the level actually applied. The offline loopback
+/// reports none, so `confirmed` stays `None` and a transmitted
+/// assignment is never called confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortExplain {
+    pub transmitted: EffortAssign,
+    pub confirmed: Option<EffortLevel>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +85,17 @@ impl Broker {
         manifest: &RequestManifest,
     ) -> Result<providers::ProviderReply, ModelError> {
         Ok(self.provider.send(manifest)?)
+    }
+
+    /// Explains the effort assignment one frozen manifest transmitted:
+    /// the wire request carries it verbatim, and no provider data exists
+    /// offline to confirm the applied level, so `confirmed` stays `None`
+    /// (transmitted ≠ confirmed, EDGE-006).
+    pub fn effort_explain(&self, manifest: &RequestManifest) -> EffortExplain {
+        EffortExplain {
+            transmitted: manifest.effort.clone(),
+            confirmed: None,
+        }
     }
 }
 

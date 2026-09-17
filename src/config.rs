@@ -82,6 +82,10 @@ pub enum ConfigIssue {
     PoolNotArray,
     #[error("pool entries must be strings")]
     PoolEntryNotString,
+    #[error("eligible must be an array of connection names")]
+    EligibleNotArray,
+    #[error("eligible entries must be strings")]
+    EligibleEntryNotString,
     #[error("fixed model requires connection")]
     FixedModelMissingConnection,
     #[error("fixed model requires model_id")]
@@ -255,6 +259,12 @@ pub struct PurposeDef {
     pub model: Option<ModelAssign>,
     pub effort: Option<EffortAssign>,
     pub fallback: Option<FallbackAssign>,
+    /// File-only auto-selection pool (DEC-012): the `config.set`
+    /// surface answers `KeyNotEditable` for it.
+    pub pool: Option<Vec<String>>,
+    /// Per-purpose eligibility input (DEC-012), editable through
+    /// `config.set`.
+    pub eligible: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -284,6 +294,7 @@ pub enum ConfigValue {
     Model(ModelAssign),
     Effort(EffortAssign),
     Fallback(FallbackAssign),
+    Names(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +453,16 @@ impl Config {
                     return Err(type_mismatch(key));
                 }
                 fallback_item(&fallback)
+            }
+            ConfigValue::Names(names) => {
+                if !matches!(&target, EditTarget::PurposeEligible(_)) {
+                    return Err(type_mismatch(key));
+                }
+                let mut array = Array::new();
+                for name in &names {
+                    array.push(name.clone());
+                }
+                Item::Value(toml_edit::Value::Array(array))
             }
         };
         let (path, field) = target_path(&target);
@@ -694,6 +715,7 @@ enum EditTarget {
     PurposeModel(String),
     PurposeEffort(String),
     PurposeFallback(String),
+    PurposeEligible(String),
 }
 
 impl EditTarget {
@@ -724,6 +746,9 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
         ["models", "purposes", name, "fallback"] => {
             Ok(EditTarget::PurposeFallback(name.to_string()))
         }
+        ["models", "purposes", name, "eligible"] => {
+            Ok(EditTarget::PurposeEligible(name.to_string()))
+        }
         _ => Err(unknown_edit_key(key)),
     }
 }
@@ -737,7 +762,7 @@ const CONNECTION_KEYS: &[&str] = &["kind", "endpoint", "credential_ref"];
 const MODELS_KEYS: &[&str] = &["defaults", "groups", "purposes"];
 const MODEL_SLOT_KEYS: &[&str] = &["model", "effort", "fallback"];
 const GROUP_KEYS: &[&str] = &["model"];
-const PURPOSE_KEYS: &[&str] = &["group", "model", "effort", "fallback"];
+const PURPOSE_KEYS: &[&str] = &["group", "model", "effort", "fallback", "pool", "eligible"];
 const CHAIN_ENTRY_KEYS: &[&str] = &["mode", "connection", "model_id"];
 
 fn unknown_edit_key(key: &str) -> ConfigError {
@@ -790,9 +815,16 @@ fn unknown_edit_key(key: &str) -> ConfigError {
             ["defaults", ..] => unknown_scope_key(key, MODEL_SLOT_KEYS),
             ["groups", _name, "model", ..] => not_editable_key(key),
             ["groups", _name, ..] => unknown_scope_key(key, GROUP_KEYS),
-            ["purposes", _name, "group"] => not_editable_key(key),
+            // `pool` is a file-only field: read-only on the edit surface
+            // through the same precedent `group` set.
+            ["purposes", _name, "group" | "pool"] => not_editable_key(key),
             ["purposes", _name, "fallback", "chain", tail @ ..] => chain_scope(key, tail),
-            ["purposes", _name, "model" | "effort" | "fallback", ..] => not_editable_key(key),
+            [
+                "purposes",
+                _name,
+                "model" | "effort" | "fallback" | "eligible",
+                ..,
+            ] => not_editable_key(key),
             ["purposes", _name, ..] => unknown_scope_key(key, PURPOSE_KEYS),
             _ => unknown_scope_key(key, MODELS_KEYS),
         },
@@ -869,6 +901,7 @@ fn target_path(target: &EditTarget) -> (Vec<&str>, &str) {
         EditTarget::PurposeModel(name) => (vec!["models", "purposes", name], "model"),
         EditTarget::PurposeEffort(name) => (vec!["models", "purposes", name], "effort"),
         EditTarget::PurposeFallback(name) => (vec!["models", "purposes", name], "fallback"),
+        EditTarget::PurposeEligible(name) => (vec!["models", "purposes", name], "eligible"),
     }
 }
 
@@ -1137,6 +1170,15 @@ fn wire_value(key: &str, value: &Value) -> Result<ConfigValue, ConfigError> {
         (EditTarget::DefaultsFallback | EditTarget::PurposeFallback(_), Value::Object(fields)) => {
             Ok(ConfigValue::Fallback(wire_fallback(fields, key)?))
         }
+        (EditTarget::PurposeEligible(_), Value::Array(items)) => {
+            let mut names = Vec::new();
+            for entry in items {
+                names.push(entry.as_str().map(str::to_string).ok_or_else(|| {
+                    ConfigError::schema(key, ConfigIssue::EligibleEntryNotString)
+                })?);
+            }
+            Ok(ConfigValue::Names(names))
+        }
         _ => Err(type_mismatch(key)),
     }
 }
@@ -1378,6 +1420,14 @@ fn validate_target(
             let assignment = fallback_assign(item, key)?;
             validate_fallback_reference(document, &assignment, key)?;
         }
+        EditTarget::PurposeEligible(_) => {
+            name_array(
+                item,
+                key,
+                ConfigIssue::EligibleNotArray,
+                ConfigIssue::EligibleEntryNotString,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1608,6 +1658,22 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
                                 def.fallback =
                                     Some(fallback_assign(value, &format!("{key}.fallback"))?)
                             }
+                            "pool" => {
+                                def.pool = Some(name_array(
+                                    value,
+                                    &format!("{key}.pool"),
+                                    ConfigIssue::PoolNotArray,
+                                    ConfigIssue::PoolEntryNotString,
+                                )?);
+                            }
+                            "eligible" => {
+                                def.eligible = Some(name_array(
+                                    value,
+                                    &format!("{key}.eligible"),
+                                    ConfigIssue::EligibleNotArray,
+                                    ConfigIssue::EligibleEntryNotString,
+                                )?);
+                            }
                             other => {
                                 return Err(ConfigError::schema(
                                     format!("{key}.{other}"),
@@ -1645,6 +1711,28 @@ fn pick<'a>(table: &'a dyn TableLike, field: &str) -> Result<&'a Item, ConfigErr
             },
         )
     })
+}
+
+/// Parses one purpose-level array of connection names (`pool`,
+/// `eligible`), mirroring the two-issue rejection vocabulary the model
+/// `pool` field carries so both surfaces keep one schema.
+fn name_array(
+    value: &Item,
+    key: &str,
+    not_array: ConfigIssue,
+    entry_not_string: ConfigIssue,
+) -> Result<Vec<String>, ConfigError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| ConfigError::schema(key, not_array))?;
+    let mut names = Vec::new();
+    for entry in items {
+        let Some(name) = entry.as_str() else {
+            return Err(ConfigError::schema(key, entry_not_string));
+        };
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
