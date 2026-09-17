@@ -6,6 +6,7 @@ use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
 use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
 use crate::policy::{ModeDecision, preapproval_scope};
 use crate::providers::LoopbackProvider;
+use crate::resources::{OutputStatus, OutputStream};
 use crate::state::TaskStore;
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -16,7 +17,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Constraint;
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
@@ -140,6 +141,14 @@ pub struct LocalView {
     pub dock: Vec<String>,
     pub transcript: Vec<String>,
     pub composer: String,
+    /// Streaming external (worker) output with its typed settlement
+    /// state. Hostile or not, everything shown passed sanitization at
+    /// the stream boundary; the step driver produces the chunks.
+    pub output: OutputStream,
+    /// Vertical scroll offset of the streaming output body; output
+    /// updates never move it, so a reader scrolled into old output
+    /// keeps their place while output updates in place.
+    pub output_scroll: u16,
     /// Open permission panel (modal). The Ask-verdict producer arrives with
     /// the mode-selection carrier; while open, keys route to the panel.
     pub panel: Option<PermissionPanel>,
@@ -335,6 +344,18 @@ pub const HELP_TEXT: &str = concat!(
     "Esc quits; Ctrl-C cancels.",
 );
 
+/// Status line while external output streams (design-brief §4).
+pub const OUTPUT_STATUS_STREAMING: &str = "output · streaming";
+/// Status line when a producer run completed the stream.
+pub const OUTPUT_STATUS_COMPLETE: &str = "output · complete";
+/// Status line prefix when the stream settled partial.
+pub const OUTPUT_STATUS_PARTIAL: &str = "output · partial";
+/// Status line prefix when the stream settled failed.
+pub const OUTPUT_STATUS_ERROR: &str = "output · error";
+/// Appended when retention capacity truncated the stream: the shown
+/// text is the retained head, never the whole output.
+pub const OUTPUT_TRUNCATED_NOTE: &str = "first 64 KiB retained";
+
 pub fn initial_view() -> LocalView {
     LocalView {
         status: STATUS_DISCONNECTED.to_string(),
@@ -344,27 +365,48 @@ pub fn initial_view() -> LocalView {
             TRANSCRIPT_NO_PROJECT.to_string(),
         ],
         composer: String::new(),
+        output: OutputStream::new(),
+        output_scroll: 0,
         panel: None,
     }
 }
 
-pub fn render(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    view: &LocalView,
-) -> io::Result<()> {
+pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Result<(), B::Error> {
     terminal.draw(|frame| {
         let area = frame.area();
-        let chunks = ratatui::layout::Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(view.dock.len().clamp(1, 3) as u16),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        let output_active = view.output.is_active();
+        let mut rows = Vec::with_capacity(6);
+        rows.push(Constraint::Length(1));
+        rows.push(Constraint::Min(1));
+        if output_active {
+            rows.push(Constraint::Length(1));
+            rows.push(Constraint::Min(1));
+        }
+        rows.push(Constraint::Length(view.dock.len().clamp(1, 3) as u16));
+        rows.push(Constraint::Length(1));
+        let chunks = ratatui::layout::Layout::vertical(rows).split(area);
         frame.render_widget(Paragraph::new(view.status.clone()), chunks[0]);
         frame.render_widget(Paragraph::new(view.transcript.join("\n")), chunks[1]);
-        frame.render_widget(Paragraph::new(view.dock.join("\n")), chunks[2]);
-        frame.render_widget(Paragraph::new(format!("> {}", view.composer)), chunks[3]);
+        let mut next = 2;
+        if output_active {
+            frame.render_widget(
+                Paragraph::new(output_status_line(&view.output)),
+                chunks[next],
+            );
+            next += 1;
+            frame.render_widget(
+                Paragraph::new(view.output.text())
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((view.output_scroll, 0)),
+                chunks[next],
+            );
+            next += 1;
+        }
+        frame.render_widget(Paragraph::new(view.dock.join("\n")), chunks[next]);
+        frame.render_widget(
+            Paragraph::new(format!("> {}", view.composer)),
+            chunks[next + 1],
+        );
         if let Some(panel) = &view.panel {
             // Modal overlay: capped at the 60-column acceptance geometry,
             // clamped to the buffer, three regions — pinned header,
@@ -399,6 +441,23 @@ pub fn render(
         }
     })?;
     Ok(())
+}
+
+/// One status line for the streaming output region: the typed state
+/// and, when retention truncated the stream, the honest capacity note —
+/// truncated output is never presented as the whole output.
+fn output_status_line(output: &OutputStream) -> String {
+    let base = match output.status() {
+        OutputStatus::Streaming => OUTPUT_STATUS_STREAMING.to_string(),
+        OutputStatus::Complete => OUTPUT_STATUS_COMPLETE.to_string(),
+        OutputStatus::Partial { cause } => format!("{OUTPUT_STATUS_PARTIAL} — {cause}"),
+        OutputStatus::Failed { cause } => format!("{OUTPUT_STATUS_ERROR} — {cause}"),
+    };
+    if output.head_truncated() {
+        format!("{base} · {OUTPUT_TRUNCATED_NOTE}")
+    } else {
+        base
+    }
 }
 
 const TUI_CONNECTION: &str = "tui";
@@ -672,6 +731,15 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
                         exit = 130;
                         break;
                     }
+                }
+                // Streaming output scroll: the reader keeps their place
+                // while output updates in place (design-brief §3).
+                (KeyCode::PageUp | KeyCode::PageDown, _) if view.output.is_active() => {
+                    view.output_scroll = if code == KeyCode::PageDown {
+                        view.output_scroll.saturating_add(1)
+                    } else {
+                        view.output_scroll.saturating_sub(1)
+                    };
                 }
                 (KeyCode::Enter, _) if !view.composer.is_empty() => {
                     let input = view.composer.clone();

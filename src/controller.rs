@@ -11,7 +11,7 @@ use crate::contracts::{
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::ModelError;
 use crate::policy::PolicyError;
-use crate::resources::Delivery;
+use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
 use crate::supervisor::{Observation, OperationClass};
@@ -64,6 +64,25 @@ pub enum ControllerError {
     Scheduler(#[from] SchedulerError),
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+/// Typed settlement of the external-output projection for one decision
+/// step: a completed run completes the stream, an unknown attempt marks
+/// the already-shown output partial, and a denial fails it with the
+/// typed reason. Waiting and no-action outcomes settle nothing — their
+/// stream keeps streaming until a later outcome settles it.
+#[must_use]
+pub fn output_settlement(outcome: &StepOutcome) -> Option<OutputSettlement> {
+    match outcome {
+        StepOutcome::Completed { .. } => Some(OutputSettlement::Complete),
+        StepOutcome::OutcomeUnknown { attempt_id, .. } => Some(OutputSettlement::Partial {
+            cause: format!("attempt {attempt_id} outcome unknown"),
+        }),
+        StepOutcome::EffectDenied { reason, .. } => Some(OutputSettlement::Failed {
+            cause: reason.clone(),
+        }),
+        StepOutcome::Waiting { .. } | StepOutcome::NoAction { .. } => None,
+    }
 }
 
 /// One decision step's outcome as the supervisor's typed observation
