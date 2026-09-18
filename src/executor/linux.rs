@@ -6,8 +6,9 @@
 //! denied legs run first and touch only system or worker-owned probe
 //! files, so a non-enforcing mechanism is detected before any leg touches
 //! the user's target), then a confined OS leg proves the kernel admits
-//! this operation inside the scope, and only then does the checked
-//! in-process leg move bytes — no ambient path.
+//! this operation inside the scope, then the host opens the target with
+//! `O_NOFOLLOW`, and `helper_confined_read` / `helper_confined_write`
+//! move the payload on the inherited fd — no ambient path.
 //!
 //! The confinement launcher composes three kernel mechanisms without any
 //! `unsafe` in this crate: `unshare(1)` isolates the network namespace,

@@ -2334,7 +2334,7 @@ pub fn publish_intent(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    crate::executor::macos::write_once(
+    crate::executor::write_once(
         &scope_root,
         Path::new(target),
         crate::executor::FileIdentity {

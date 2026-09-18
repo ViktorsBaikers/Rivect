@@ -981,13 +981,18 @@ impl TaskStore {
     }
 
     pub fn task_cancelled(&self, task_id: &TaskId) -> Result<bool> {
+        Ok(self.task_lifecycle(task_id)? == Lifecycle::Cancelled)
+    }
+
+    /// Task lifecycle without loading the full snapshot.
+    pub fn task_lifecycle(&self, task_id: &TaskId) -> Result<Lifecycle> {
         let lifecycle: String = self
             .conn
             .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
             .optional()
             .map_err(storage)?
             .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
-        Ok(lifecycle == "cancelled")
+        Ok(Lifecycle::from_db(&lifecycle))
     }
 
     // ----- snapshots -----
@@ -1725,6 +1730,50 @@ impl TaskStore {
         Ok(evidence_id)
     }
 
+    /// Inserts the same evidence for every obligation of the task and
+    /// satisfies each, in one Immediate transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when any statement fails.
+    pub fn insert_evidence_for_task(
+        &mut self,
+        task_id: &TaskId,
+        scope: &str,
+        observation: &str,
+        digest: &str,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let ids = {
+            let mut stmt = tx.prepare(sql::OBLIGATION_IDS_FOR_TASK).map_err(storage)?;
+            stmt.query_map(params![task_id.0], |row| row.get(0))
+                .map_err(storage)?
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .map_err(storage)?
+        };
+        for obligation_id in ids {
+            let evidence_id = EvidenceId::generate().0;
+            tx.execute(
+                sql::INSERT_EVIDENCE,
+                params![
+                    evidence_id,
+                    task_id.0,
+                    scope,
+                    observation,
+                    digest,
+                    obligation_id
+                ],
+            )
+            .map_err(storage)?;
+            tx.execute(sql::SATISFY_OBLIGATION, params![obligation_id])
+                .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
     pub fn invalidate_evidence(&mut self, evidence_id: &str) -> Result<String> {
         let obligation_id: String = self
             .conn
@@ -1855,7 +1904,6 @@ impl TaskStore {
         if unsatisfied > 0 || unresolved > 0 || unknown > 0 {
             tx.execute(sql::PAUSE_RUNNING_TASK, params![task_id.0])
                 .map_err(storage)?;
-            Self::snapshot_in_tx(&tx, task_id)?;
             tx.commit().map_err(storage)?;
             return Err(StoreError::Conflict(ConflictCause::CompletionOpen {
                 unsatisfied,

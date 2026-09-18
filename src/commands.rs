@@ -1132,6 +1132,12 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     // scheduler node through the production path; a
                     // settled tree grows nothing runnable — the answer
                     // itself stays durable (INV-021).
+                    let serialize_answer = |id: Value| match serde_json::to_value(&result) {
+                        Ok(value) => RpcResponse::ok(id, value),
+                        Err(err) => {
+                            envelope_error(id, ErrorCode::InternalError, -32000, &err.to_string())
+                        }
+                    };
                     match rt.scheduler.submit_answered(
                         task.clone(),
                         selection.clone(),
@@ -1146,15 +1152,9 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                                     &err.to_string(),
                                 );
                             }
-                            RpcResponse::ok(
-                                id,
-                                serde_json::to_value(&result).unwrap_or(Value::Null),
-                            )
+                            serialize_answer(id)
                         }
-                        Ok(None) => RpcResponse::ok(
-                            id,
-                            serde_json::to_value(&result).unwrap_or(Value::Null),
-                        ),
+                        Ok(None) => serialize_answer(id),
                         Err(err) => {
                             let message = err.to_string();
                             envelope_error(

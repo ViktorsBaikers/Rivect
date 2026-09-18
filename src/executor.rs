@@ -12,7 +12,8 @@ pub mod macos;
 use crate::config::hex;
 use crate::contracts::{EffectClass, ErrorCode, TaskId};
 use crate::policy::{
-    AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, preapproval_scope,
+    AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, canonical_egress_target,
+    preapproval_scope,
 };
 use crate::resources::{ReadFlightKey, ReadFlights, ReadRights, SnapshotBinding};
 use crate::state::{StoreError, TaskStore};
@@ -75,7 +76,7 @@ impl EffectRequest {
             Self::Read { path, .. } => format!("read {}", path.display()),
             Self::Write { path, .. } => format!("write {}", path.display()),
             Self::Exec { program, .. } => format!("exec {}", program.display()),
-            Self::Egress { url, .. } => format!("egress {url}"),
+            Self::Egress { url, .. } => format!("egress {}", redact_egress_url(url)),
         }
     }
 
@@ -91,6 +92,12 @@ impl EffectRequest {
             Self::Egress { url, .. } => PathBuf::from(url),
         }
     }
+}
+
+/// Ledger/UI spelling of an egress URL: userinfo and query are stripped so
+/// credentials never persist in `attempts.describe` or confirmed detail.
+fn redact_egress_url(url: &str) -> String {
+    canonical_egress_target(url)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1388,7 +1395,7 @@ impl<'a> Executor<'a> {
             EffectRequest::Egress { url, .. } => self
                 .worker
                 .egress_once(url)
-                .map(|()| executed(format!("egress-performed {url}"))),
+                .map(|()| executed(format!("egress-performed {}", redact_egress_url(url)))),
         };
         match effect {
             Ok((outcome, detail)) => {
@@ -1451,10 +1458,32 @@ pub fn backend() -> &'static str {
     }
 }
 
+/// Platform-routed checked write: Landlock on Linux, Seatbelt otherwise.
+///
+/// Same dispatch as [`backend`] and `Runtime::open`.
+///
+/// # Errors
+/// Returns the platform writer's [`WorkerError`].
+pub fn write_once(
+    scope_root: &Path,
+    target: &Path,
+    expected: FileIdentity,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::write_once(scope_root, target, expected, bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        macos::write_once(scope_root, target, expected, bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ObservedChild, WorkerError, helper_launch_init_failed, helper_probe_verdict,
+        EffectRequest, ObservedChild, WorkerError, helper_launch_init_failed, helper_probe_verdict,
         require_helper_file,
     };
     use std::os::unix::process::ExitStatusExt;
@@ -1565,6 +1594,23 @@ mod tests {
                 Err(WorkerError::SandboxSpawnFailed { .. })
             ),
             "a signal-killed probe child is a capability failure, not a denial"
+        );
+    }
+
+    #[test]
+    fn egress_describe_redacts_userinfo_and_query() {
+        let request = EffectRequest::Egress {
+            grant_id: "grant-1".to_string(),
+            url: "https://user:pass@evil.example/path?token=secret#frag".to_string(),
+        };
+        assert_eq!(request.describe(), "egress https://evil.example/path");
+        let explicit_port = EffectRequest::Egress {
+            grant_id: "grant-1".to_string(),
+            url: "http://user@evil.example:8080/x?token=1".to_string(),
+        };
+        assert_eq!(
+            explicit_port.describe(),
+            "egress http://evil.example:8080/x"
         );
     }
 }

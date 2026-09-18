@@ -256,8 +256,8 @@ impl Runtime {
                 &mut self.owner.store,
                 self.read_worker.as_mut(),
             );
-            // Interim manual mode at this boundary (DEC-015) until the
-            // production step driver carries Runtime's mode (DEC-016).
+            // The production step driver still inlines the interim `manual`
+            // default (DEC-015) until the Settings surface lands.
             executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?
         };
         let effect_attempt = admitted.attempt_id.clone();
@@ -309,8 +309,8 @@ impl Runtime {
         task_id: &TaskId,
         grant_id: &str,
     ) -> Result<Option<StepOutcome>, ControllerError> {
-        let snapshot = self.owner.store.snapshot(task_id)?;
-        if snapshot.lifecycle.is_terminal() {
+        if self.owner.store.task_lifecycle(task_id)?.is_terminal() {
+            let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(Some(StepOutcome::NoAction { snapshot }));
         }
         // No-repeat guard: any unresolved running/unknown attempt of this
@@ -420,16 +420,12 @@ impl Runtime {
             self.scoped_file.display(),
             digest
         );
-        let obligation_count = self.owner.store.obligations_count(task_id)?;
-        for index in 0..obligation_count {
-            self.owner.store.insert_evidence(
-                task_id,
-                index,
-                &format!("task:{}", task_id.0),
-                &observation,
-                digest,
-            )?;
-        }
+        self.owner.store.insert_evidence_for_task(
+            task_id,
+            &format!("task:{}", task_id.0),
+            &observation,
+            digest,
+        )?;
         let terminal_attempt_id = retained_attempt_id.unwrap_or(effect_attempt);
         let terminal_boundary_id = crate::verification::boundary_id(&terminal_attempt_id);
         let terminal = crate::verification::RetainedAttempt {
@@ -551,16 +547,12 @@ impl Runtime {
             "confirmed",
             Some(&format!("read-performed sha256={marker}")),
         )?;
-        let count = self.owner.store.obligations_count(task_id)?;
-        for index in 0..count {
-            self.owner.store.insert_evidence(
-                task_id,
-                index,
-                &format!("task:{}", task_id.0),
-                &format!("reconciled attempt {attempt_id} from sha256={marker}"),
-                &marker,
-            )?;
-        }
+        self.owner.store.insert_evidence_for_task(
+            task_id,
+            &format!("task:{}", task_id.0),
+            &format!("reconciled attempt {attempt_id} from sha256={marker}"),
+            &marker,
+        )?;
         self.owner.store.complete_if_eligible(session_id, task_id)
     }
 

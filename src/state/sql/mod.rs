@@ -130,6 +130,8 @@ pub const ANSWERED_QUESTION: &str =
                  ORDER BY rowid DESC LIMIT 1";
 pub const OBLIGATION_AT_OFFSET: &str =
     "SELECT obligation_id FROM obligations WHERE task_id = ?1 ORDER BY rowid LIMIT 1 OFFSET ?2";
+pub const OBLIGATION_IDS_FOR_TASK: &str =
+    "SELECT obligation_id FROM obligations WHERE task_id = ?1 ORDER BY rowid";
 pub const INSERT_EVIDENCE: &str = "INSERT INTO evidence (evidence_id, task_id, scope, observation, digest, validity, obligation_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'current', ?6)";
 pub const SATISFY_OBLIGATION: &str =

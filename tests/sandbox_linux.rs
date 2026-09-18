@@ -824,6 +824,53 @@ fn free_write_once_is_confined_for_every_caller() {
 }
 
 #[test]
+fn publish_intent_lands_bytes_through_the_linux_writer() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "publish-intent-linux");
+    let target = fixture.path.join("config.toml");
+    let old = support::base_config();
+    std::fs::write(&target, &old).expect("seed target");
+    let write_witness = fixture.path.join("write-witness");
+    let shim = install_helper_io_shim(&fixture.path, &write_witness);
+    rivect_sandbox_helper::override_helper_binary(Some(shim));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            rivect_sandbox_helper::override_helper_binary(None);
+        }
+    }
+    let _reset = Reset;
+
+    let mut store =
+        rivect::state::TaskStore::open(&fixture.path.join("state.db")).expect("open store");
+    let mut config = rivect::config::Config::parse_validated(&old).expect("valid config");
+    let edit = config
+        .set("workflow.enabled", rivect::config::ConfigValue::Bool(false))
+        .expect("workflow edit");
+    let intent = rivect::config::stage_publication(&mut store, "file", &target, &edit)
+        .expect("stage publication intent");
+    rivect::config::publish_intent(&mut store, &intent, &edit.bytes)
+        .expect("linux writer publishes the staged intent");
+    assert_eq!(
+        std::fs::read(&target).expect("published bytes"),
+        edit.bytes,
+        "publication must land through the linux writer"
+    );
+    let recorded = std::fs::read_to_string(&write_witness)
+        .expect("confined write must record payload length; a host write produces no witness");
+    assert_eq!(
+        recorded.trim(),
+        edit.bytes.len().to_string(),
+        "shim write witness must match the payload length"
+    );
+    assert_eq!(
+        store.pending_publications().expect("pending intents").len(),
+        0,
+        "receipt completes the journal row"
+    );
+}
+
+#[test]
 fn sandbox_worker_reads_scope_and_lands_checked_managed_write() {
     let (mut world, task, file, grant) = sandbox_world("worker-happy-path");
     let mut worker = linux::LinuxWorker;
