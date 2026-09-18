@@ -24,7 +24,7 @@ use super::{
     confirm_opened_regular, denied_write_candidate, expect_admitted, expect_denied,
     helper_confined_write, helper_launch_command, helper_launch_init_failed,
     inspect_regular_target, observe_confined_child, probe_read_conformance_legs,
-    read_observation_from, same_regular_file, set_private_mode,
+    read_observation_from, same_regular_file, sandbox_denied, set_private_mode,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -207,9 +207,7 @@ pub fn egress_once(url: &str) -> Result<(), WorkerError> {
             reason: "netns/seccomp egress boundary admitted the denied control connect".to_string(),
         });
     }
-    Err(WorkerError::SandboxDenied {
-        target: PathBuf::from(url),
-    })
+    Err(sandbox_denied(url))
 }
 
 /// Binds the egress control listener on loopback.

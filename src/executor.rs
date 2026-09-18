@@ -95,9 +95,32 @@ impl EffectRequest {
 }
 
 /// Ledger/UI spelling of an egress URL: userinfo and query are stripped so
-/// credentials never persist in `attempts.describe` or confirmed detail.
+/// credentials never persist in `attempts.describe`, confirmed detail,
+/// `attempts.detail`, or `WorkerError` Display.
 fn redact_egress_url(url: &str) -> String {
     canonical_egress_target(url)
+}
+
+/// Describe-path spelling of a sandbox-denied target. UTF-8 URLs follow
+/// [`redact_egress_url`]; non-UTF-8 filesystem paths keep their OsStr.
+pub(crate) fn denied_target_spelling(target: &Path) -> String {
+    target
+        .to_str()
+        .map(redact_egress_url)
+        .unwrap_or_else(|| target.display().to_string())
+}
+
+/// [`WorkerError::SandboxDenied`] with the describe-path spelling, so
+/// userinfo and query never persist in the variant or its Display string
+/// (and therefore never in `attempts.detail`).
+pub(crate) fn sandbox_denied(target: impl AsRef<Path>) -> WorkerError {
+    let target = target.as_ref();
+    WorkerError::SandboxDenied {
+        target: match target.to_str() {
+            Some(raw) => PathBuf::from(redact_egress_url(raw)),
+            None => target.to_path_buf(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -340,9 +363,7 @@ fn expect_admitted(exit_ok: bool, target: &Path) -> Result<(), WorkerError> {
     if exit_ok {
         Ok(())
     } else {
-        Err(WorkerError::SandboxDenied {
-            target: target.to_path_buf(),
-        })
+        Err(sandbox_denied(target))
     }
 }
 
@@ -764,9 +785,7 @@ fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), W
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match helper_exit_code(observed) {
         rivect_sandbox_helper::EXIT_OK => Ok(()),
-        rivect_sandbox_helper::EXIT_DATA_IO => Err(WorkerError::SandboxDenied {
-            target: target.to_path_buf(),
-        }),
+        rivect_sandbox_helper::EXIT_DATA_IO => Err(sandbox_denied(target)),
         _ => Err(WorkerError::SandboxSpawnFailed {
             source: std::io::Error::other(stderr),
         }),
@@ -1484,7 +1503,7 @@ pub fn write_once(
 mod tests {
     use super::{
         EffectRequest, ObservedChild, WorkerError, helper_launch_init_failed, helper_probe_verdict,
-        require_helper_file,
+        require_helper_file, sandbox_denied,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
@@ -1611,6 +1630,64 @@ mod tests {
         assert_eq!(
             explicit_port.describe(),
             "egress http://evil.example:8080/x"
+        );
+    }
+
+    #[test]
+    fn egress_sandbox_denied_mirrors_describe_redaction() {
+        let url = "https://user:pass@evil.example/path?token=secret#frag";
+        let request = EffectRequest::Egress {
+            grant_id: "grant-1".to_string(),
+            url: url.to_string(),
+        };
+        let redacted = request
+            .describe()
+            .strip_prefix("egress ")
+            .expect("describe prefix")
+            .to_string();
+        assert_eq!(redacted, "https://evil.example/path");
+        let error = sandbox_denied(Path::new(url));
+        assert!(
+            matches!(
+                &error,
+                WorkerError::SandboxDenied { target } if target == Path::new(&redacted)
+            ),
+            "SandboxDenied must store the describe-path spelling, got {error:?}"
+        );
+        let display = error.to_string();
+        assert_eq!(
+            display,
+            format!("denied: the seatbelt boundary rejected {redacted}")
+        );
+        assert!(
+            !display.contains("user:pass") && !display.contains("token="),
+            "Display must not carry userinfo or query, got {display}"
+        );
+        let explicit_port = sandbox_denied(Path::new("http://user@evil.example:8080/x?token=1"));
+        assert!(
+            matches!(
+                &explicit_port,
+                WorkerError::SandboxDenied { target }
+                    if target == Path::new("http://evil.example:8080/x")
+            ),
+            "explicit-port deny must mirror describe, got {explicit_port:?}"
+        );
+        assert_eq!(
+            explicit_port.to_string(),
+            "denied: the seatbelt boundary rejected http://evil.example:8080/x"
+        );
+    }
+
+    #[test]
+    fn filesystem_sandbox_denied_keeps_the_path_spelling() {
+        let path = Path::new("/tmp/rivect-probe-target");
+        let error = sandbox_denied(path);
+        assert!(
+            matches!(
+                &error,
+                WorkerError::SandboxDenied { target } if target == path
+            ),
+            "filesystem deny spelling must stay the path, got {error:?}"
         );
     }
 }

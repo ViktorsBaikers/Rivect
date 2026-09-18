@@ -11,10 +11,10 @@
 //! move the payload on the inherited fd — no ambient path.
 
 use super::{
-    confirm_opened_regular, denied_write_candidate, expect_admitted, expect_denied,
-    helper_confined_write, helper_launch_command, helper_launch_init_failed, helper_probe_write,
-    inspect_regular_target, observe_confined_child, probe_read_conformance_legs,
-    read_observation_from, same_regular_file,
+    confirm_opened_regular, denied_target_spelling, denied_write_candidate, expect_admitted,
+    expect_denied, helper_confined_write, helper_launch_command, helper_launch_init_failed,
+    helper_probe_write, inspect_regular_target, observe_confined_child,
+    probe_read_conformance_legs, read_observation_from, same_regular_file, sandbox_denied,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -160,7 +160,10 @@ pub enum WorkerError {
     WriteLengthOverflow { source: std::num::TryFromIntError },
     #[error("denied: target exceeds the {READ_MAX_BYTES} byte read limit")]
     TooLarge,
-    #[error("denied: the seatbelt boundary rejected {}", target.display())]
+    #[error(
+        "denied: the seatbelt boundary rejected {}",
+        denied_target_spelling(target)
+    )]
     SandboxDenied { target: PathBuf },
     #[error(
         "capability unavailable: seatbelt sandbox-exec could not be started: {source}; recovery: fix the environment or run on a capable kernel"
@@ -541,9 +544,7 @@ fn confined_write_gate(
     let result = helper_probe_write("macos", &profile, &artifact);
     drop(std::fs::remove_file(&artifact));
     match result {
-        Err(WorkerError::SandboxDenied { .. }) => Err(WorkerError::SandboxDenied {
-            target: target.to_path_buf(),
-        }),
+        Err(WorkerError::SandboxDenied { .. }) => Err(sandbox_denied(target)),
         other => other,
     }
 }
@@ -635,9 +636,7 @@ pub fn egress_once(url: &str) -> Result<(), WorkerError> {
             reason: "seatbelt egress boundary admitted the denied control connect".to_string(),
         });
     }
-    Err(WorkerError::SandboxDenied {
-        target: PathBuf::from(url),
-    })
+    Err(sandbox_denied(url))
 }
 
 /// Proves the Seatbelt read boundary enforces before the first read
