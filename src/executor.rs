@@ -22,7 +22,7 @@ use std::fs::{File, Metadata};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -194,13 +194,18 @@ pub enum ExecutorError {
 /// The wire code one worker failure carries wherever the family
 /// surfaces — the executor's own effect path and the publication path
 /// share this single map, so the same failure never answers two codes.
-/// A sandbox that cannot start or does not enforce is a capability
-/// failure; every other worker denial is a denied effect.
+/// A sandbox that cannot start or does not enforce — and a confined
+/// run that timed out or died before any verdict — is a capability
+/// failure; a post-mutation write failure keeps the unknown outcome
+/// its ledger settlement already carries; every other worker denial
+/// is a denied effect.
 pub(crate) fn worker_error_code(error: &WorkerError) -> ErrorCode {
     match error {
         WorkerError::SandboxSpawnFailed { .. }
         | WorkerError::SandboxUnavailable { .. }
-        | WorkerError::ConfinedRunTimedOut => ErrorCode::CapabilityUnavailable,
+        | WorkerError::ConfinedRunTimedOut
+        | WorkerError::ConfinedRunKilled { .. } => ErrorCode::CapabilityUnavailable,
+        WorkerError::WriteMutationFailed { .. } => ErrorCode::OutcomeUnknown,
         _ => ErrorCode::Denied,
     }
 }
@@ -208,8 +213,9 @@ pub(crate) fn worker_error_code(error: &WorkerError) -> ErrorCode {
 impl ExecutorError {
     /// Wire code for the failed effect path, mapped at one boundary. A
     /// sandbox that cannot start or does not enforce is a capability
-    /// failure with a recovery read; every other denial is a denied
-    /// effect, and a store failure keeps its storage code.
+    /// failure with a recovery read; a post-mutation write failure
+    /// reports its honest unknown outcome; every other denial is a
+    /// denied effect, and a store failure keeps its storage code.
     #[must_use = "the code exists to be carried to the wire; discarding it loses the mapping"]
     pub fn error_code(&self) -> ErrorCode {
         match self {
@@ -586,8 +592,37 @@ fn write_stdin_nonblocking(
 }
 
 /// Drains a confined child via nonblocking pipes, `yield_now`, and a wall
-/// deadline that kills the child.
+/// deadline that kills the child. Any failure inside the observation
+/// loop — pipe setup, payload write, drains, `try_wait` — kills the
+/// process group and reaps the leader before returning: `Child::drop`
+/// does neither, so an unobserved child must never outlive its failed
+/// observation. The spawn already succeeded, so such a failure is a
+/// mid-run loss reported as [`WorkerError::ConfinedRunKilled`], never
+/// "the launcher could not be started".
 pub(crate) fn observe_confined_child(
+    child: &mut Child,
+    stdin: Option<ChildStdin>,
+    payload: &[u8],
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+) -> Result<ObservedChild, WorkerError> {
+    match observe_confined_child_io(child, stdin, payload, stdout, stderr) {
+        Ok(observed) => Ok(observed),
+        Err(error) => {
+            // A timeout already terminated the child, so a second
+            // terminate is a no-op; every other path needs it.
+            terminate_confined_child(child);
+            Err(match error {
+                WorkerError::SandboxSpawnFailed { source } => {
+                    WorkerError::ConfinedRunKilled { source }
+                }
+                other => other,
+            })
+        }
+    }
+}
+
+fn observe_confined_child_io(
     child: &mut Child,
     mut stdin: Option<ChildStdin>,
     mut payload: &[u8],
@@ -643,6 +678,14 @@ pub(crate) fn observe_confined_child(
                     deadline,
                     child,
                 )?;
+                // A signal ended the run before it produced a verdict:
+                // the spawn already succeeded, so this is a capability
+                // anomaly — never a launch failure the synthesized
+                // exit code used to fabricate, and never an
+                // enforcement denial.
+                if status.code().is_none() {
+                    return Err(confined_run_killed(&status));
+                }
                 return Ok(ObservedChild {
                     status,
                     stdout: stdout_buf,
@@ -724,6 +767,19 @@ fn terminate_confined_child(child: &mut Child) {
     drop(child.wait());
 }
 
+/// A signal ended the confined run before it produced a verdict — the
+/// spawn already succeeded, so this is never "the launcher could not
+/// be started". The signal is the honest cause; a status with neither
+/// an exit code nor a signal keeps its raw debug form.
+fn confined_run_killed(status: &std::process::ExitStatus) -> WorkerError {
+    WorkerError::ConfinedRunKilled {
+        source: std::io::Error::other(match status.signal() {
+            Some(signal) => format!("signal {signal}"),
+            None => format!("{status:?}"),
+        }),
+    }
+}
+
 pub(crate) fn helper_confined_read(
     platform: &str,
     profile: &str,
@@ -790,28 +846,24 @@ pub(crate) fn helper_probe_write(
     helper_probe_verdict(&observed, path)
 }
 
-fn helper_exit_code(observed: &ObservedChild) -> i32 {
-    observed
-        .status
-        .code()
-        .unwrap_or(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
-}
-
 /// Maps a probe-write exit onto the same taxonomy as [`helper_io_bytes`]:
 /// init → [`WorkerError::SandboxUnavailable`], protocol/launch →
 /// [`WorkerError::SandboxSpawnFailed`] (wire `capability_unavailable`),
-/// data I/O → [`WorkerError::SandboxDenied`]. Init/protocol/launch verdicts
-/// require the helper's line-start stderr prefix; a non-helper child cannot
-/// produce them. After that gate, only [`rivect_sandbox_helper::EXIT_OK`]
-/// and [`rivect_sandbox_helper::EXIT_DATA_IO`] are classified here; any
-/// other code — including a synthesized 126 from a signal-killed child —
-/// is a capability failure, never an enforcement denial.
+/// data I/O → [`WorkerError::SandboxDenied`], and a run that died before
+/// producing any exit code → [`WorkerError::ConfinedRunKilled`].
+/// Init/protocol/launch verdicts require the helper's line-start stderr
+/// prefix; a non-helper child cannot produce them. After that gate,
+/// [`rivect_sandbox_helper::EXIT_DATA_IO`] is the only enforcement
+/// denial; any other code is a capability failure.
 fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), WorkerError> {
     if let Some(err) = helper_launch_init_failed(observed) {
         return Err(err);
     }
+    let Some(code) = observed.status.code() else {
+        return Err(confined_run_killed(&observed.status));
+    };
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
-    match helper_exit_code(observed) {
+    match code {
         rivect_sandbox_helper::EXIT_OK => Ok(()),
         rivect_sandbox_helper::EXIT_DATA_IO => Err(sandbox_denied(target)),
         _ => Err(WorkerError::SandboxSpawnFailed {
@@ -827,8 +879,8 @@ fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), W
 /// outcomes — Landlock denying the deny-first control, or a probe shim
 /// naming a missing ABI — never helper init. Discriminate by the helper's
 /// stderr prefix (bytes produced pre-`execv`), not by which call site
-/// opted into classification. Signal-killed children are left to the caller
-/// (timeout already mapped [`WorkerError::ConfinedRunTimedOut`]).
+/// opted into classification. A run that died without an exit code is
+/// the caller's [`WorkerError::ConfinedRunKilled`], not this gate's.
 pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<WorkerError> {
     let stderr = String::from_utf8_lossy(&observed.stderr);
     let from_helper = stderr
@@ -857,7 +909,9 @@ fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, Worke
     if let Some(err) = helper_launch_init_failed(&observed) {
         return Err(err);
     }
-    let code = helper_exit_code(&observed);
+    let Some(code) = observed.status.code() else {
+        return Err(confined_run_killed(&observed.status));
+    };
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match code {
         rivect_sandbox_helper::EXIT_OK => Ok(observed.stdout),
@@ -1360,10 +1414,10 @@ impl<'a> Executor<'a> {
 
     /// Settles the worker failure in the attempt ledger. `mutating`
     /// names whether the effect path could already have changed its
-    /// target: a post-mutation write failure and a timed-out mutating
-    /// effect both record `unknown` — the killed confined child may have
-    /// landed bytes — while a failure on a non-mutating path stays a
-    /// clean rejection.
+    /// target: a post-mutation write failure and a mutating effect
+    /// whose confined run timed out or was killed both record
+    /// `unknown` — the dead child may have landed its change — while a
+    /// failure on a non-mutating path stays a clean rejection.
     fn commit_worker_error(
         &mut self,
         attempt_id: &str,
@@ -1375,7 +1429,9 @@ impl<'a> Executor<'a> {
             WorkerError::WriteMutationFailed { .. } => {
                 self.store.attempt_unknown(attempt_id, &detail)?
             }
-            WorkerError::ConfinedRunTimedOut if mutating => {
+            WorkerError::ConfinedRunTimedOut | WorkerError::ConfinedRunKilled { .. }
+                if mutating =>
+            {
                 self.store.attempt_unknown(attempt_id, &detail)?
             }
             _ => self.store.attempt_rejected(attempt_id, &detail)?,
@@ -1470,12 +1526,15 @@ impl<'a> Executor<'a> {
             }
             Err(error) => {
                 self.abandon_flight(&admitted.attempt_id);
+                // Write is the only effect that declares a mutated
+                // artifact; confined Exec grants no file-write rights
+                // today — revisit if Exec gains write rights.
                 self.commit_worker_error(
                     &admitted.attempt_id,
                     error,
                     matches!(&admitted.request, EffectRequest::Write { .. }),
                 )?;
-                unreachable!("internal error: worker error commit always rejects")
+                unreachable!("internal error: worker error commit always errors")
             }
         }
     }
@@ -1553,11 +1612,12 @@ pub fn write_once(
 mod tests {
     use super::{
         EffectRequest, ObservedChild, WorkerError, helper_io_bytes, helper_launch_init_failed,
-        helper_probe_verdict, require_helper_file, sandbox_denied, spawn_failed,
+        helper_probe_verdict, observe_confined_child, require_helper_file, sandbox_denied,
+        spawn_failed,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
-    use std::process::ExitStatus;
+    use std::process::{ExitStatus, Stdio};
 
     fn exited(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
@@ -1682,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_probe_unprefixed_or_signaled_is_spawn_failed() {
+    fn helper_probe_unprefixed_is_spawn_failed_signaled_is_killed() {
         let target = Path::new("/tmp/rivect-probe-target");
         let unprefixed = ObservedChild {
             status: exited(rivect_sandbox_helper::EXIT_PROTOCOL),
@@ -1701,13 +1761,90 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         };
-        assert!(
-            matches!(
-                helper_probe_verdict(&killed, target),
-                Err(WorkerError::SandboxSpawnFailed { .. })
+        match helper_probe_verdict(&killed, target) {
+            Err(WorkerError::ConfinedRunKilled { source }) => assert!(
+                source.to_string().contains("signal 9"),
+                "a signal-killed probe child names its signal: {source}"
             ),
-            "a signal-killed probe child is a capability failure, not a denial"
-        );
+            other => {
+                unreachable!("a signal-killed probe child is ConfinedRunKilled, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn helper_io_signaled_child_is_confined_run_killed() {
+        for read in [false, true] {
+            let observed = ObservedChild {
+                status: signaled(15),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            match helper_io_bytes(observed, read) {
+                Err(WorkerError::ConfinedRunKilled { source }) => assert!(
+                    source.to_string().contains("signal 15"),
+                    "the killed cause names its signal: {source}"
+                ),
+                other => {
+                    unreachable!("a signaled helper run is ConfinedRunKilled, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observer_reports_signal_death_as_killed_and_reaps() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        match observe_confined_child(&mut child, None, &[], None, None) {
+            Err(WorkerError::ConfinedRunKilled { source }) => assert!(
+                source.to_string().contains("signal"),
+                "the killed cause names its signal: {source}"
+            ),
+            Err(other) => {
+                unreachable!("a signal death is ConfinedRunKilled, got {other:?}")
+            }
+            Ok(_) => unreachable!("a signal death must not yield a verdict"),
+        }
+        // `try_wait` already reaped the leader: a second wait returns
+        // the same signal status, not a zombie.
+        let status = child.wait()?;
+        assert_eq!(status.code(), None, "the reaped status stays signaled");
+        Ok(())
+    }
+
+    #[test]
+    fn observer_kills_and_reaps_on_observation_io_failure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        // A megabyte cannot fit the pipe buffer, so the nonblocking
+        // write loop outlives the exiting child and hits EPIPE — a
+        // mid-run observation loss, never a launch refusal.
+        let payload = vec![b'x'; 1 << 20];
+        match observe_confined_child(&mut child, stdin, &payload, None, None) {
+            Err(WorkerError::ConfinedRunKilled { .. }) => {}
+            Err(other) => {
+                unreachable!("a lost observation is ConfinedRunKilled, got {other:?}")
+            }
+            Ok(_) => unreachable!("a lost observation must not yield a verdict"),
+        }
+        // The wrapper reaped the leader before returning the error.
+        let status = child.wait()?;
+        assert_eq!(status.code(), Some(0), "the reaped status is the exit");
+        Ok(())
     }
 
     #[test]
@@ -1751,7 +1888,7 @@ mod tests {
         let display = error.to_string();
         assert_eq!(
             display,
-            format!("denied: the seatbelt boundary rejected {redacted}")
+            format!("denied: the sandbox boundary rejected {redacted}")
         );
         assert!(
             !display.contains("user:pass") && !display.contains("token="),
@@ -1768,7 +1905,7 @@ mod tests {
         );
         assert_eq!(
             explicit_port.to_string(),
-            "denied: the seatbelt boundary rejected http://evil.example:8080/x"
+            "denied: the sandbox boundary rejected http://evil.example:8080/x"
         );
     }
 

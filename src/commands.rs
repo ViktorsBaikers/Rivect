@@ -17,7 +17,7 @@ use crate::state::StoreError;
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::{Read, Write as _};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,11 @@ pub struct Runtime {
     /// The one injected backend seam; defaults to the platform worker
     /// (Linux Landlock/seccomp/netns on Linux, Seatbelt elsewhere).
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
+    /// Boot-time publication-recovery verdicts a human must resolve:
+    /// collected, sanitized lines with their resolution. Each surface
+    /// reports them its own way — headless stderr, TUI transcript — and
+    /// receipted rows stay silent.
+    pub boot_diagnostics: Vec<String>,
 }
 
 impl Runtime {
@@ -77,14 +82,13 @@ impl Runtime {
         // Boot recovery: a crash between the managed write and its receipt
         // leaves one pending row; receipt exactly the writes attributable
         // to this publisher before any config surface serves (AC-093).
-        // Every verdict a human must resolve surfaces one stderr line —
-        // the receipted rows stay silent.
-        for line in config::recover_publications(&mut owner.store)?
+        // Every verdict a human must resolve is collected into
+        // `boot_diagnostics` — each surface reports the lines its own
+        // way — while the receipted rows stay silent.
+        let boot_diagnostics: Vec<String> = config::recover_publications(&mut owner.store)?
             .iter()
             .filter_map(recovery_diagnostic)
-        {
-            report_boot_diagnostic(&line);
-        }
+            .collect();
         let config_path = data_root.join("config.toml");
         let user_toml = match std::fs::File::open(&config_path) {
             Ok(file) => {
@@ -136,6 +140,7 @@ impl Runtime {
             config_path,
             provider_calls: 0,
             read_worker,
+            boot_diagnostics,
         })
     }
 
@@ -579,10 +584,12 @@ fn publication_error(id: Value, err: &config::PublicationError) -> RpcResponse {
     envelope_error(id, code, rpc_code, &err.to_string())
 }
 
-/// One stderr diagnostic for a recovery verdict a human must resolve:
-/// the verdict token names what the bytes at the target failed to prove.
-/// The healed `ExactlyNew` verdict — our own write receipted by the boot
-/// — stays silent.
+/// One diagnostic line for a recovery verdict a human must resolve:
+/// the verdict token names what the bytes at the target failed to
+/// prove, the sanitized target names where — no control character the
+/// path could carry reaches a terminal — and the resolution names the
+/// retry that settles the row. The healed `ExactlyNew` verdict — our
+/// own write receipted by the boot — stays silent.
 fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String> {
     let verdict = match recovery.verdict {
         config::PublicationVerdict::ExactlyNew => return None,
@@ -594,19 +601,10 @@ fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String>
         config::PublicationVerdict::Unknown => "unknown",
     };
     Some(format!(
-        "publication recovery: {verdict} verdict stays pending at {}",
-        recovery.intent.target
+        "publication recovery: {verdict} verdict stays pending at {}; \
+         resolution: inspect the target, then re-run the configuration edit that owns the pending publication",
+        crate::resources::sanitize_status_cause(&recovery.intent.target)
     ))
-}
-
-/// Boot diagnostics write to stderr through the locked handle, the same
-/// pattern the terminal cleanup path uses: a closed stderr loses the
-/// line, never panics the open.
-fn report_boot_diagnostic(line: &str) {
-    let mut stderr = std::io::stderr().lock();
-    if let Err(error) = stderr.write_all(format!("{line}\n").as_bytes()) {
-        std::hint::black_box(error);
-    }
 }
 
 /// Shared tail of the config.set/unset arms: capture the retained view,
@@ -1450,7 +1448,7 @@ mod tests {
             )),
         );
         let Some(error) = response.error else {
-            return;
+            unreachable!("journal arm must answer an error: {response:?}");
         };
         assert_eq!(error.data.code, ErrorCode::StorageUnavailable);
         assert!(
@@ -1504,6 +1502,10 @@ mod tests {
                 text.contains("/data/config.toml"),
                 "{verdict:?} diagnostic names the target: {text}"
             );
+            assert!(
+                text.contains("resolution:"),
+                "{verdict:?} diagnostic names the resolution: {text}"
+            );
         }
         assert_eq!(
             recovery_diagnostic(&recovery(
@@ -1512,6 +1514,27 @@ mod tests {
             )),
             None,
             "the healed receipted verdict stays silent"
+        );
+    }
+
+    #[test]
+    fn recovery_diagnostic_sanitizes_the_target() {
+        let line = recovery_diagnostic(&recovery(
+            config::PublicationVerdict::Conflicting,
+            "/data/evil\u{7}\u{1b}[2J.toml",
+        ));
+        let Some(text) = line else {
+            unreachable!("an unhealed verdict must surface a diagnostic");
+        };
+        for ch in text.chars() {
+            assert!(
+                !ch.is_control(),
+                "no control character reaches the diagnostic: {text:?}"
+            );
+        }
+        assert!(
+            text.contains("^G"),
+            "the bell survives as visible, inert data: {text}"
         );
     }
 

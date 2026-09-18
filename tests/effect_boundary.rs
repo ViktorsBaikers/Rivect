@@ -542,6 +542,35 @@ impl ReadWorker for ConfinedTimeoutWorker {
     }
 }
 
+/// Every confined leg reports the same verdict as the timeout worker,
+/// except the run died to a signal before producing one: the same
+/// mutating split applies — a read rejects, a write stays unknown.
+struct ConfinedKilledWorker;
+
+impl ReadWorker for ConfinedKilledWorker {
+    fn read_once(
+        &mut self,
+        _scope_root: &Path,
+        _target: &Path,
+    ) -> Result<ReadObservation, WorkerError> {
+        Err(WorkerError::ConfinedRunKilled {
+            source: std::io::Error::other("signal 9"),
+        })
+    }
+
+    fn write_once(
+        &mut self,
+        _scope_root: &Path,
+        _target: &Path,
+        _expected: FileIdentity,
+        _bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        Err(WorkerError::ConfinedRunKilled {
+            source: std::io::Error::other("signal 9"),
+        })
+    }
+}
+
 #[test]
 fn managed_write_rejects_occupant_swap_without_touching_new_file() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-occupant");
@@ -846,6 +875,222 @@ fn read_confined_timeout_settles_rejected() {
     // A timed-out read never mutates its target: the attempt settles as
     // a clean rejection, not unknown.
     assert_eq!(state, "rejected");
+}
+
+#[test]
+fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
+    let (mut world, session, task, file, grant) = managed_write_fixture("write-kill-unknown");
+    world.runtime.read_worker = Box::new(ConfinedKilledWorker);
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit_managed_write(
+                &task,
+                EffectRequest::Write {
+                    grant_id: grant,
+                    path: file,
+                    bytes: b"uncertain bytes".to_vec(),
+                },
+            )
+            .expect("managed write admission")
+    };
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute_managed_write(&admitted)
+            .expect_err("a killed confined run must surface")
+    };
+
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::ConfinedRunKilled { .. })
+        ),
+        "{error}"
+    );
+    // The wire code is a capability failure — the spawn succeeded, so
+    // this is never a launch failure and never an enforcement denial.
+    assert_eq!(
+        error.error_code(),
+        rivect::contracts::ErrorCode::CapabilityUnavailable
+    );
+    let attempt_id = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&task)
+        .expect("read managed write snapshot")
+        .attempts
+        .items
+        .last()
+        .expect("managed write attempt exists")
+        .attempt_id
+        .0
+        .clone();
+    let (_, state, _detail) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&attempt_id)
+        .expect("read attempt")
+        .expect("managed write attempt exists");
+    // The signal-killed confined child may already have landed bytes —
+    // a mutating write settles unknown, never a clean rejection.
+    assert_eq!(state, "unknown");
+
+    let completion = world
+        .runtime
+        .owner
+        .store
+        .complete_if_eligible(&session, &task)
+        .expect_err("an unknown attempt must block task completion");
+    assert!(
+        matches!(
+            completion,
+            StoreError::Conflict(ConflictCause::CompletionOpen { unknown: 1, .. })
+        ),
+        "completion names the blocking unknown attempt: {completion}"
+    );
+}
+
+#[test]
+fn read_confined_kill_settles_rejected() {
+    let (mut world, _session, task, file, grant) = managed_write_fixture("read-kill-rejected");
+    world.runtime.read_worker = Box::new(ConfinedKilledWorker);
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file,
+                },
+                rivect::policy::PermissionMode::Manual,
+            )
+            .expect("manual scoped read admits")
+    };
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute(&admitted)
+            .expect_err("a killed confined run must surface")
+    };
+
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::ConfinedRunKilled { .. })
+        ),
+        "{error}"
+    );
+    let (_, state, _detail) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&admitted.attempt_id)
+        .expect("read attempt")
+        .expect("read attempt exists");
+    // A killed read never mutates its target: the attempt settles as a
+    // clean rejection, not unknown.
+    assert_eq!(state, "rejected");
+}
+
+#[test]
+fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
+    // The generic `admit`+`execute` path derives `mutating` from the
+    // request type, not a hardcoded flag: a Write request whose
+    // confined run dies before a verdict settles unknown, exactly
+    // like the managed write leg.
+    let (mut world, session, task, file, _grant) =
+        managed_write_fixture("generic-write-kill-unknown");
+    world.runtime.read_worker = Box::new(ConfinedKilledWorker);
+    let scope = file.parent().expect("scope").to_path_buf();
+    let write_grant = world
+        .runtime
+        .policy
+        .grant_classes(scope, vec![rivect::contracts::EffectClass::Write]);
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit(
+                &task,
+                EffectRequest::Write {
+                    grant_id: write_grant,
+                    path: file,
+                    bytes: b"uncertain bytes".to_vec(),
+                },
+                rivect::policy::PermissionMode::Yolo,
+            )
+            .expect("generic write admission")
+    };
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute(&admitted)
+            .expect_err("a killed confined run must surface")
+    };
+
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::ConfinedRunKilled { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        error.error_code(),
+        rivect::contracts::ErrorCode::CapabilityUnavailable
+    );
+    let (_, state, _detail) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&admitted.attempt_id)
+        .expect("read attempt")
+        .expect("generic write attempt exists");
+    assert_eq!(state, "unknown");
+
+    let completion = world
+        .runtime
+        .owner
+        .store
+        .complete_if_eligible(&session, &task)
+        .expect_err("an unknown attempt must block task completion");
+    assert!(
+        matches!(
+            completion,
+            StoreError::Conflict(ConflictCause::CompletionOpen { unknown: 1, .. })
+        ),
+        "completion names the blocking unknown attempt: {completion}"
+    );
 }
 
 #[test]
@@ -1789,6 +2034,58 @@ fn out_of_range_output_scroll_still_renders_the_body() {
 }
 
 #[test]
+fn wide_cell_scroll_clamps_to_the_wrapped_bottom() {
+    let mut view = initial_view();
+    // Each line is a word of double-width cells: the renderer wraps it
+    // at cell width — two rows per line, not one row per 46 characters.
+    // A character-count estimate halves the scrollable depth and would
+    // clamp a bottom-seeking offset to the stream's middle.
+    for index in 0..12 {
+        view.output
+            .push_chunk(format!("t{index:02} {}", "あ".repeat(43)).as_bytes());
+        view.output.push_chunk("\n".as_bytes());
+    }
+    view.output_scroll = u16::MAX;
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("t11"),
+        "the clamp must reach the true wrapped bottom: {screen}"
+    );
+    assert!(
+        screen.contains("t09"),
+        "the bottom window starts inside t08's wrapped tail: {screen}"
+    );
+    assert!(
+        !screen.contains("t08"),
+        "the label above the bottom window stays scrolled out: {screen}"
+    );
+}
+
+#[test]
+fn grapheme_cluster_scroll_does_not_overrun_the_content() {
+    let mut view = initial_view();
+    // A combining sequence is one grapheme of one cell: each line is a
+    // single wrapped row, while a character count doubles it — an
+    // over-tall estimate lets the offset skip every real row and blank
+    // the body.
+    for index in 0..12 {
+        view.output
+            .push_chunk(format!("e{index:02} {}", "e\u{301}".repeat(60)).as_bytes());
+        view.output.push_chunk("\n".as_bytes());
+    }
+    view.output_scroll = u16::MAX;
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("e11"),
+        "the bottom row must still render: {screen}"
+    );
+    assert!(
+        screen.contains("e02"),
+        "the clamp stops at the real row count: {screen}"
+    );
+}
+
+#[test]
 fn replaced_output_resets_the_scroll_offset() {
     let mut view = initial_view();
     view.output.push_chunk("old stream\n".as_bytes());
@@ -1907,7 +2204,12 @@ fn unknown_attempt_settles_partial_and_completion_settles_complete() {
     view.output.settle(OutputSettlement::Partial { cause });
     let screen = rendered_text(&view);
     assert!(screen.contains(OUTPUT_STATUS_PARTIAL));
-    assert!(screen.contains("outcome unknown"));
+    // The status line leads with the fixed affordance: the variable
+    // cause is what a narrow width clips, never the hint.
+    assert!(
+        screen.contains(OUTPUT_SCROLL_HINT),
+        "the fixed affordance survives width pressure: {screen}"
+    );
     assert!(!screen.contains(OUTPUT_STATUS_COMPLETE));
     // A settled stream is terminal: late producer chunks cannot extend
     // a partial run into looking more complete than it was.

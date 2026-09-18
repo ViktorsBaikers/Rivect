@@ -105,6 +105,11 @@ fn run_headless(data_root: &Path) -> i32 {
             return 1;
         }
     };
+    // Boot recovery verdicts a human must resolve report on stderr —
+    // machine stdout stays pure JSON.
+    for diagnostic in &runtime.boot_diagnostics {
+        eprintln!("{diagnostic}");
+    }
     let stdin = io::stdin();
     let mut line = Vec::new();
     let mut reader = stdin.lock();

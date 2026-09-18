@@ -322,6 +322,13 @@ fn confined_write() -> Result<(), i32> {
     target.write_all(&payload).map_err(|error| {
         eprintln!("rivect-sandbox-helper: admitted write failed: {error}");
         EXIT_DATA_MUTATED
+    })?;
+    // Durability is the verdict's last leg: the bytes reached the
+    // kernel, but a sync failure leaves the target's durable state
+    // unknown — the same post-mutation code, never a clean rejection.
+    target.sync_all().map_err(|error| {
+        eprintln!("rivect-sandbox-helper: admitted write sync failed: {error}");
+        EXIT_DATA_MUTATED
     })
 }
 

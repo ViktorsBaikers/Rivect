@@ -160,8 +160,12 @@ pub enum WorkerError {
     WriteLengthOverflow { source: std::num::TryFromIntError },
     #[error("denied: target exceeds the {READ_MAX_BYTES} byte read limit")]
     TooLarge,
+    // Mechanism-agnostic wording like `SandboxSpawnFailed` below: the
+    // shared helper path produces this variant on both platforms —
+    // naming one platform's mechanism would put the wrong word on the
+    // other's wires.
     #[error(
-        "denied: the seatbelt boundary rejected {}",
+        "denied: the sandbox boundary rejected {}",
         denied_target_spelling(target)
     )]
     SandboxDenied { target: PathBuf },
@@ -184,6 +188,14 @@ pub enum WorkerError {
         "capability unavailable: confined run exceeded the wall deadline; recovery: fix the environment or run on a capable kernel"
     )]
     ConfinedRunTimedOut,
+    // A confined child that dies to a signal never produced a verdict:
+    // the spawn already succeeded, so "ended before a verdict" never
+    // claims the launcher failed — and never an enforcement denial —
+    // under any platform's mechanism.
+    #[error(
+        "capability unavailable: confined run ended before a verdict: {source}; recovery: fix the environment or run on a capable kernel"
+    )]
+    ConfinedRunKilled { source: std::io::Error },
 }
 
 pub(crate) fn target_identity(

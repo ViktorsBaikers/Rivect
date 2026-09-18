@@ -20,9 +20,13 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::buffer::CellWidth as _;
 use ratatui::layout::Constraint;
+use ratatui::style::Style;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -428,16 +432,21 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         let mut next = 2;
         if output_active {
             frame.render_widget(
-                Paragraph::new(output_status_line(&view.output)),
+                Paragraph::new(output_status_line(&view.output, view.panel.is_some())),
                 chunks[next],
             );
             next += 1;
+            // The measured text is the rendered text: clamping the raw
+            // stream would count control characters the projection
+            // escapes or drops, so the estimate disagrees with the
+            // widget's own rows.
+            let output_text = sanitize_status_cause(view.output.text());
             frame.render_widget(
-                Paragraph::new(sanitize_status_cause(view.output.text()))
+                Paragraph::new(output_text.as_str())
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .scroll((
                         clamp_scroll(
-                            view.output.text(),
+                            &output_text,
                             chunks[next].width,
                             chunks[next].height,
                             view.output_scroll,
@@ -507,10 +516,19 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
     Ok(())
 }
 
-/// One status line for the streaming output region: the typed state
-/// and, when retention truncated the stream, the honest capacity note —
-/// truncated output is never presented as the whole output.
-fn output_status_line(output: &OutputStream) -> String {
+/// One status line for the streaming output region: the fixed scroll
+/// affordance leads, then the typed state and, when retention
+/// truncated the stream, the honest capacity note — truncated output
+/// is never presented as the whole output. The hint leads the variable
+/// tail so a narrow width clips the cause, never the affordance; while
+/// a panel owns PgUp/PgDn the hint drops out entirely rather than lie
+/// about which keys move.
+fn output_status_line(output: &OutputStream, panel_open: bool) -> String {
+    let mut line = if panel_open {
+        String::new()
+    } else {
+        format!("{OUTPUT_SCROLL_HINT} · ")
+    };
     let base = match output.status() {
         OutputStatus::Streaming => OUTPUT_STATUS_STREAMING.to_string(),
         OutputStatus::Complete => OUTPUT_STATUS_COMPLETE.to_string(),
@@ -521,28 +539,117 @@ fn output_status_line(output: &OutputStream) -> String {
             format!("{OUTPUT_STATUS_ERROR}: {}", sanitize_status_cause(cause))
         }
     };
-    let base = if output.head_truncated() {
-        format!("{base} · {OUTPUT_TRUNCATED_NOTE}")
-    } else {
-        base
-    };
-    format!("{base} · {OUTPUT_SCROLL_HINT}")
+    line.push_str(&base);
+    if output.head_truncated() {
+        line.push_str(&format!(" · {OUTPUT_TRUNCATED_NOTE}"));
+    }
+    line
 }
 
 /// Largest offset that can still render rows of `text` inside a
-/// `width`×`height` region: each source line occupies at least one row,
-/// plus one row per `width` columns it wraps across. The estimate
-/// counts characters, never exceeding the rows the renderer produces,
-/// so clamping to it can only under-scroll — an out-of-range offset can
-/// never render an empty body.
+/// `width`×`height` region under `Paragraph`'s `Wrap { trim: false }`.
+/// The row count is the widget's own word-wrap — same graphemes, cell
+/// widths, and break decisions — so the clamp neither strands rows
+/// (a short estimate) nor blanks the body (a tall one).
 fn clamp_scroll(text: &str, width: u16, height: u16, offset: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let rows: usize = text
-        .lines()
-        .map(|line| line.chars().count().max(1).div_ceil(width))
-        .sum();
+    let rows = wrapped_row_count(text, width.max(1));
     let max = rows.saturating_sub(usize::from(height));
     offset.min(u16::try_from(max).unwrap_or(u16::MAX))
+}
+
+/// Rows `text` occupies under `Paragraph::wrap(Wrap { trim: false })`.
+/// ratatui 0.30.2 keeps `WordWrapper` in a crate-private `reflow`
+/// module, so the count ports that algorithm's decisions over the
+/// public primitives the widget itself uses — `Text`'s `str::lines`
+/// split, `Line::styled_graphemes` (the same grapheme segmentation and
+/// the same control-grapheme filtering), `StyledGrapheme::is_whitespace`,
+/// and `CellWidth` — instead of estimating by character count.
+fn wrapped_row_count(text: &str, max_line_width: u16) -> usize {
+    Text::from(text)
+        .iter()
+        .map(|line| wrapped_line_rows(line, max_line_width))
+        .sum()
+}
+
+/// The wrapped rows one input `line` produces: a direct port of
+/// `WordWrapper::process_input` with `trim == false` (the only mode
+/// this file renders), tracking widths and symbol counts in place of
+/// the grapheme buffers — the break decisions depend on nothing else.
+fn wrapped_line_rows(line: &Line<'_>, max_line_width: u16) -> usize {
+    let mut wrapped = 0usize;
+    // The row under construction (upstream's `pending_line`).
+    let mut line_width = 0u16;
+    let mut line_symbols = 0usize;
+    // The pending word (`pending_word`).
+    let mut word_width = 0u16;
+    let mut word_symbols = 0usize;
+    // The pending whitespace (`pending_whitespace`): per-grapheme
+    // widths, because the end-of-line drain consumes them front to back.
+    let mut whitespace_width = 0u16;
+    let mut whitespace: VecDeque<u16> = VecDeque::new();
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let is_whitespace = grapheme.is_whitespace();
+        let symbol_width = grapheme.symbol.cell_width();
+        // Symbols wider than the line limit are dropped entirely.
+        if symbol_width > max_line_width {
+            continue;
+        }
+        let word_found = non_whitespace_previous && is_whitespace;
+        // With `trim == false` the pending word plus its whitespace
+        // overflows an empty line exactly when their widths exceed it.
+        let untrimmed_overflow =
+            line_symbols == 0 && word_width + whitespace_width + symbol_width > max_line_width;
+        if word_found || untrimmed_overflow {
+            // `trim == false`: pending whitespace always lands on the
+            // line, then the word joins it.
+            line_symbols += whitespace.len() + word_symbols;
+            line_width += whitespace_width + word_width;
+            whitespace.clear();
+            whitespace_width = 0;
+            word_symbols = 0;
+            word_width = 0;
+        }
+        // The pending line filled, or the pending word cannot join it.
+        let line_full = line_width >= max_line_width;
+        let pending_word_overflow =
+            symbol_width > 0 && line_width + whitespace_width + word_width >= max_line_width;
+        if line_full || pending_word_overflow {
+            let mut remaining = max_line_width.saturating_sub(line_width);
+            wrapped += 1;
+            line_symbols = 0;
+            line_width = 0;
+            // Whitespace that still fits the ended row stays with it.
+            while let Some(&width) = whitespace.front() {
+                if width > remaining {
+                    break;
+                }
+                whitespace_width -= width;
+                remaining -= width;
+                whitespace.pop_front();
+            }
+            // The separating whitespace ends with the row it broke.
+            if is_whitespace && whitespace.is_empty() {
+                continue;
+            }
+        }
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            whitespace.push_back(symbol_width);
+        } else {
+            word_width += symbol_width;
+            word_symbols += 1;
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+    // Final flush, `trim == false`: pending whitespace always lands.
+    line_symbols += whitespace.len() + word_symbols;
+    if line_symbols > 0 {
+        wrapped += 1;
+    }
+    // An empty input line still renders one row.
+    wrapped.max(1)
 }
 
 const TUI_CONNECTION: &str = "tui";
@@ -791,13 +898,37 @@ fn append_composer_char(view: &mut LocalView, ch: char) {
     view.composer.push(ch);
 }
 
+/// Boot recovery diagnostics join the transcript where the human reads
+/// them — a verdict that must be resolved cannot ride stderr inside the
+/// alternate screen.
+fn surface_boot_diagnostics(view: &mut LocalView, runtime: &Runtime) {
+    view.transcript
+        .extend(runtime.boot_diagnostics.iter().cloned());
+}
+
 /// Runs the minimal fullscreen loop. Esc quits normally, Ctrl-C cancels
 /// (exit 130). The guard guarantees terminal restoration on both paths and on
 /// panic.
 pub fn run_tui(data_root: &Path) -> io::Result<i32> {
     let mut guard = TerminalGuard::enter()?;
     let mut view = initial_view();
-    let mut tui_dispatch: Option<TuiDispatch> = None;
+    // Open the dispatch eagerly so boot recovery verdicts land in the
+    // transcript at startup; a failed open leaves the lazy retry on
+    // first submit, the same arm as before — and the transcript keeps
+    // this first sighting honest instead of swallowing it.
+    let mut tui_dispatch = match TuiDispatch::open(data_root) {
+        Ok(dispatch) => {
+            surface_boot_diagnostics(&mut view, &dispatch.runtime);
+            Some(dispatch)
+        }
+        Err(error) => {
+            view.transcript.push(format!(
+                "session open failed: {}",
+                sanitize_status_cause(&error.to_string())
+            ));
+            None
+        }
+    };
     let mut exit = 0;
     loop {
         render(guard.terminal_mut(), &view)?;
@@ -850,7 +981,9 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
                         view.composer.clear();
                     } else {
                         if tui_dispatch.is_none() {
-                            tui_dispatch = Some(TuiDispatch::open(data_root)?);
+                            let dispatch = TuiDispatch::open(data_root)?;
+                            surface_boot_diagnostics(&mut view, &dispatch.runtime);
+                            tui_dispatch = Some(dispatch);
                         }
                         let dispatch = tui_dispatch
                             .as_mut()
@@ -918,9 +1051,69 @@ impl Projection {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiDispatch, append_composer_char, initial_view, task_dock};
+    use super::{
+        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, append_composer_char,
+        initial_view, output_status_line, surface_boot_diagnostics, task_dock, wrapped_row_count,
+    };
     use crate::contracts::{PAGE_MAX, TEXT_MAX_BYTES};
     use serde_json::json;
+
+    /// Mirrors `commands.rs::tests::BASE_CONFIG`: a publication needs a
+    /// validating base plus one settable key to reach the journal.
+    const BOOT_CONFIG: &str = "config_version = 1\n\
+         [connections.primary]\n\
+         kind = \"api_key\"\n\
+         endpoint = \"https://api.openai.com/v1\"\n\
+         credential_ref = \"keyring:primary\"\n\
+         [models.defaults]\n\
+         model = { mode = \"auto\" }\n\
+         effort = { mode = \"auto\" }\n\
+         fallback = { mode = \"auto\" }\n";
+
+    /// Each expectation names the renderer's own break decisions, not a
+    /// character-count guess: the cases below are exactly where a
+    /// `chars()` estimate diverges from `Wrap { trim: false }`.
+    #[test]
+    fn wrap_count_measures_cells_not_characters() {
+        // Ten double-width graphemes occupy twenty cells: the renderer
+        // breaks the word at cell width, a character count under-reads.
+        assert_eq!(wrapped_row_count("あいうえおかきくけこ", 8), 3);
+        // A combining sequence is one grapheme of one cell, not two
+        // characters: a character count over-reads.
+        assert_eq!(wrapped_row_count("e\u{301}", 1), 1);
+        assert_eq!(wrapped_row_count("e\u{301}".repeat(9).as_str(), 4), 3);
+    }
+
+    #[test]
+    fn wrap_count_wraps_on_word_boundaries() {
+        // A word that does not fit after its predecessor takes its own
+        // row; the separating space ends the row it broke.
+        assert_eq!(wrapped_row_count("aa bb", 4), 2);
+        // A non-breaking space is part of the word — never a break —
+        // so the five-cell word splits at cell width like any lone
+        // word too wide for the row.
+        assert_eq!(wrapped_row_count("ab\u{a0}cd", 4), 2);
+        // A zero-width space IS a break: it ends the word but adds no
+        // width, so both halves rejoin the same row.
+        assert_eq!(wrapped_row_count("ab\u{200b}cd", 4), 1);
+        // A whitespace run cannot break either: eight leading spaces
+        // pack one over-wide row instead of wrapping per cell.
+        assert_eq!(wrapped_row_count("        a", 4), 2);
+        // A lone word longer than the width still breaks at cell width.
+        assert_eq!(wrapped_row_count(&"a".repeat(65), 20), 4);
+    }
+
+    #[test]
+    fn wrap_count_keeps_line_boundaries() {
+        // `str::lines` semantics: a trailing newline adds no row and an
+        // interior empty line renders one; `Text::raw("")` still yields
+        // the one empty `Line` the renderer paints as a blank row.
+        assert_eq!(wrapped_row_count("x\n", 8), 1);
+        assert_eq!(wrapped_row_count("x\n\n", 8), 2);
+        assert_eq!(wrapped_row_count("", 8), 1);
+        assert_eq!(wrapped_row_count("aa bb\ncc", 4), 3);
+    }
+
     #[test]
     fn tui_status_requests_page_maximum() -> Result<(), Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
@@ -982,5 +1175,64 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn status_line_leads_with_the_scroll_hint_and_yields_to_the_panel() {
+        let mut output = OutputStream::new();
+        output.settle(crate::resources::OutputSettlement::Partial {
+            cause: "disk full".to_string(),
+        });
+        let line = output_status_line(&output, false);
+        assert!(
+            matches!(
+                (line.find(OUTPUT_SCROLL_HINT), line.find("disk full")),
+                (Some(hint), Some(cause)) if hint < cause
+            ),
+            "the fixed affordance leads the variable cause: {line}"
+        );
+        let panel_line = output_status_line(&output, true);
+        assert!(
+            !panel_line.contains(OUTPUT_SCROLL_HINT) && panel_line.contains("disk full"),
+            "an open panel owns PgUp/PgDn — the hint drops, the cause stays: {panel_line}"
+        );
+    }
+
+    #[test]
+    fn boot_diagnostics_surface_in_the_transcript() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "rivect-ui-boot-diag-{}",
+            crate::contracts::CommandId::generate()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let target = root.join("config.toml");
+        std::fs::write(&target, BOOT_CONFIG)?;
+        // A pending journal row survives boot as an unresolved verdict, which
+        // the runtime must surface on whichever screen the human is watching.
+        // The owner store lives under `runtime/` — the path `Owner::elect`
+        // opens — so the staged row is visible to `Runtime::open`.
+        let runtime_dir = root.join("runtime");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut store = crate::state::TaskStore::open(&runtime_dir.join("rivect.db"))?;
+        let mut parsed = crate::config::Config::parse_validated(BOOT_CONFIG)?;
+        let edit = parsed.set("workflow.enabled", crate::config::ConfigValue::Bool(false))?;
+        crate::config::stage_publication(&mut store, "cli", &target, &edit)?;
+        drop(store);
+        let runtime = crate::commands::Runtime::open(&root, Box::new(LoopbackProvider::new()))?;
+        assert_eq!(
+            runtime.boot_diagnostics.len(),
+            1,
+            "one unresolved verdict produces one diagnostic line"
+        );
+        let mut view = initial_view();
+        surface_boot_diagnostics(&mut view, &runtime);
+        assert!(
+            view.transcript
+                .iter()
+                .any(|line| line.contains("publication recovery") && line.contains("resolution")),
+            "the verdict and its resolution reach the transcript: {:?}",
+            view.transcript
+        );
+        Ok(())
     }
 }
