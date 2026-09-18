@@ -252,6 +252,7 @@ impl Runtime {
             &self.owner.store,
             crate::policy::PermissionMode::Manual,
             EffectClass::Read,
+            grant_id,
             &self.scope_root,
             &self.scoped_file,
         )?;

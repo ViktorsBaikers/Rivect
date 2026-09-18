@@ -613,20 +613,18 @@ fn helper_exit_code(observed: &ObservedChild) -> i32 {
 /// Maps a probe-write exit onto the same taxonomy as [`helper_io_bytes`]:
 /// init → [`WorkerError::SandboxUnavailable`], protocol/launch →
 /// [`WorkerError::SandboxSpawnFailed`] (wire `capability_unavailable`),
-/// data I/O → [`WorkerError::SandboxDenied`].
+/// data I/O → [`WorkerError::SandboxDenied`]. Init/protocol/launch verdicts
+/// require the helper's line-start stderr prefix; a non-helper child cannot
+/// produce them.
 fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), WorkerError> {
-    let code = helper_exit_code(observed);
-    let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
-    match code {
+    if let Some(err) = helper_launch_init_failed(observed) {
+        return Err(err);
+    }
+    match helper_exit_code(observed) {
         rivect_sandbox_helper::EXIT_OK => Ok(()),
-        rivect_sandbox_helper::EXIT_SANDBOX_INIT => {
-            Err(WorkerError::SandboxUnavailable { reason: stderr })
-        }
-        rivect_sandbox_helper::EXIT_PROTOCOL
-        | rivect_sandbox_helper::EXIT_LAUNCH_EXEC
-        | rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND => Err(WorkerError::SandboxSpawnFailed {
-            source: std::io::Error::other(stderr),
-        }),
+        // Data I/O and any remaining code are enforcement denials. Init,
+        // protocol, and launch already returned above, and only when the
+        // helper prefixed stderr.
         _ => Err(WorkerError::SandboxDenied {
             target: target.to_path_buf(),
         }),
@@ -667,13 +665,13 @@ pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<Work
 }
 
 fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, WorkerError> {
+    if let Some(err) = helper_launch_init_failed(&observed) {
+        return Err(err);
+    }
     let code = helper_exit_code(&observed);
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match code {
         rivect_sandbox_helper::EXIT_OK => Ok(observed.stdout),
-        rivect_sandbox_helper::EXIT_SANDBOX_INIT => {
-            Err(WorkerError::SandboxUnavailable { reason: stderr })
-        }
         rivect_sandbox_helper::EXIT_DATA_IO if read => Err(WorkerError::ReadFailed {
             source: std::io::Error::other(stderr),
         }),
@@ -758,6 +756,7 @@ pub fn admission_context(
     store: &TaskStore,
     mode: PermissionMode,
     class: EffectClass,
+    grant_id: &str,
     scope_root: &Path,
     target: &Path,
 ) -> Result<AdmissionContext, ExecutorError> {
@@ -776,7 +775,7 @@ pub fn admission_context(
     };
     let previously_approved = target
         .to_str()
-        .and_then(|text| preapproval_scope(class, text))
+        .and_then(|text| preapproval_scope(class, grant_id, text))
         .map(|key| store.is_preapproved(&key))
         .transpose()?
         .unwrap_or(false);
@@ -899,6 +898,7 @@ impl<'a> Executor<'a> {
             self.store,
             mode,
             request.class(),
+            grant_id,
             &grant.scope_root,
             &target,
         )?;
@@ -1100,6 +1100,7 @@ impl<'a> Executor<'a> {
             self.store,
             admitted.mode,
             admitted.request.class(),
+            admitted.request.grant_id(),
             &admitted.scope_root,
             target,
         ) {

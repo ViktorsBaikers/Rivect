@@ -765,9 +765,10 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
         file.parent().expect("scope root").to_path_buf(),
         vec![Class::Egress],
     );
-    for (class, target) in [
+    for (class, grant_id, target) in [
         (
             Class::Read,
+            grant.clone(),
             file.canonicalize()
                 .expect("canonical read target")
                 .display()
@@ -775,20 +776,25 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
         ),
         (
             Class::Write,
+            write_grant.clone(),
             file.canonicalize()
                 .expect("canonical write target")
                 .display()
                 .to_string(),
         ),
-        (Class::Exec, exec_program.display().to_string()),
-        (Class::Egress, egress_url.to_string()),
+        (
+            Class::Exec,
+            exec_grant.clone(),
+            exec_program.display().to_string(),
+        ),
+        (Class::Egress, egress_grant.clone(), egress_url.to_string()),
     ] {
         world
             .runtime
             .owner
             .store
             .record_preapproval(
-                &preapproval_scope(class, &target).expect("utf-8 preapproval scope"),
+                &preapproval_scope(class, &grant_id, &target).expect("utf-8 preapproval scope"),
                 "human:matrix",
                 600,
             )
@@ -1130,6 +1136,7 @@ fn allow_mode_write_cells_execute_through_the_seatbelt_worker() {
                 .record_preapproval(
                     &preapproval_scope(
                         Class::Write,
+                        &grant,
                         &file
                             .canonicalize()
                             .expect("canonical write target")
@@ -1582,27 +1589,55 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
     }
     let (mut world, task, file, grant) = sandbox_world("helper-data-plane");
     {
-        let miss = std::process::Command::new(&helper)
-            .arg("not-a-mode")
-            .output()
-            .expect("real helper protocol miss");
-        let stderr = String::from_utf8_lossy(&miss.stderr);
-        assert!(
-            stderr
-                .lines()
-                .any(|line| line.starts_with("rivect-sandbox-helper:")),
-            "the real helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
+        let helper_parent_dir = helper.parent().expect("helper parent dir");
+        // exec_profile alone aborts the Rust helper at stack-guard mmap.
+        // /dev and sysctl-read are the extra allowances the read/write
+        // profiles already carry so the helper can initialize and parse argv.
+        let mut profile = macos::exec_profile(helper_parent_dir).expect("exec profile");
+        profile.push_str("    (allow file-read* (subpath \"/dev\"))\n");
+        profile.push_str("    (allow sysctl-read)\n");
+        let outcome = macos::run_confined(
+            &sandbox_exec(),
+            &profile,
+            &helper,
+            &[std::ffi::OsStr::new("not-a-mode")],
         );
-        assert_eq!(
-            miss.status.code(),
-            Some(rivect_sandbox_helper::EXIT_PROTOCOL)
-        );
+        match outcome {
+            Ok(outcome) => {
+                assert_eq!(
+                    outcome.exit_code,
+                    Some(rivect_sandbox_helper::EXIT_PROTOCOL),
+                    "confined helper protocol miss: {outcome:?}"
+                );
+                assert!(
+                    outcome
+                        .stderr
+                        .lines()
+                        .any(|line| line.starts_with("rivect-sandbox-helper:")),
+                    "the confined helper prefixes protocol misses; a host or shim cannot forge that: {:?}",
+                    outcome.stderr
+                );
+            }
+            Err(WorkerError::SandboxSpawnFailed { source }) => {
+                let stderr = source.to_string();
+                assert!(
+                    stderr
+                        .lines()
+                        .any(|line| line.starts_with("rivect-sandbox-helper:")),
+                    "the confined helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
+                );
+            }
+            other => panic!(
+                "confined helper protocol miss must be EXIT_PROTOCOL or classified spawn-failed, got {other:?}"
+            ),
+        }
         let name = helper
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        assert!(
-            name.contains("rivect-sandbox-helper"),
+        assert_eq!(
+            name,
+            "rivect-sandbox-helper",
             "the confined child must be the helper binary, got {}",
             helper.display()
         );
@@ -1744,6 +1779,10 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         scope.clone(),
         vec![Class::Read, Class::Write, Class::Exec, Class::Egress],
     );
+    let egress_grant = world
+        .runtime
+        .policy
+        .grant_classes(scope.clone(), vec![Class::Egress]);
     let canonical = scope.canonicalize().expect("canonical scope");
     let key = canonical.display().to_string();
     world
@@ -1767,7 +1806,8 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         .owner
         .store
         .record_preapproval(
-            &preapproval_scope(Class::Egress, egress_url).expect("utf-8 egress preapproval"),
+            &preapproval_scope(Class::Egress, &egress_grant, egress_url)
+                .expect("utf-8 egress preapproval"),
             "human:t11-egress",
             600,
         )
@@ -1784,6 +1824,7 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         &world.runtime.owner.store,
         PermissionMode::Auto,
         Class::Write,
+        &grant,
         &scope,
         &file,
     )
@@ -1796,6 +1837,7 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         &world.runtime.owner.store,
         PermissionMode::Auto,
         Class::Egress,
+        &egress_grant,
         &scope,
         Path::new(egress_url),
     )
@@ -1829,10 +1871,6 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         );
     }
     assert_eq!(writes.load(Ordering::SeqCst), 2);
-    let egress_grant = world
-        .runtime
-        .policy
-        .grant_classes(scope, vec![Class::Egress]);
     let admitted = admit_live_cell(
         &mut world,
         &task,

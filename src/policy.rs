@@ -1085,9 +1085,10 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Preapproval rows persist only a scope string, so the effect class is
-/// folded into the key (`"<class>:<scope>"`): a consent recorded for a
-/// write must never admit an exec or egress on the same string.
+/// Preapproval rows persist only a scope string, so the effect class and
+/// grant identity are folded into the key (`"<class>:<grant_id>:<scope>"`):
+/// a consent recorded for a write must never admit an exec or egress on
+/// the same string, and a consent on one grant must never admit another.
 /// Filesystem classes canonicalize the path so `/var` and `/private/var`
 /// (and other alias spellings) share one row; a missing path keeps the
 /// caller spelling. Egress keys canonicalize the URL the same way (WHATWG
@@ -1095,7 +1096,7 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 /// bound, and alias spellings of one URL share one row. Model/control keys
 /// stay as given. Canonical path bytes that are not valid UTF-8 cannot be
 /// keyed without colliding via `display()` — skip preapproval (fail closed).
-pub fn preapproval_scope(class: EffectClass, scope: &str) -> Option<String> {
+pub fn preapproval_scope(class: EffectClass, grant_id: &str, scope: &str) -> Option<String> {
     let scope = match class {
         EffectClass::Read | EffectClass::Write | EffectClass::Exec => {
             match Path::new(scope).canonicalize() {
@@ -1103,13 +1104,18 @@ pub fn preapproval_scope(class: EffectClass, scope: &str) -> Option<String> {
                 Err(_) => scope.to_string(),
             }
         }
-        EffectClass::Egress => {
-            let cleaned = preprocess_egress_target(scope);
-            normalize_egress_url(&cleaned, SchemeKnowledge::Carried).unwrap_or(cleaned)
-        }
+        EffectClass::Egress => canonical_egress_target(scope),
         EffectClass::Model | EffectClass::Control => scope.to_string(),
     };
-    Some(format!("{}:{scope}", class_key(class)))
+    Some(format!("{}:{grant_id}:{scope}", class_key(class)))
+}
+
+/// Canonical egress URL for consent display and preapproval keys: the same
+/// WHATWG preprocess + scheme-carried form [`preapproval_scope`] persists.
+#[must_use]
+pub fn canonical_egress_target(scope: &str) -> String {
+    let cleaned = preprocess_egress_target(scope);
+    normalize_egress_url(&cleaned, SchemeKnowledge::Carried).unwrap_or(cleaned)
 }
 
 fn class_key(class: EffectClass) -> &'static str {

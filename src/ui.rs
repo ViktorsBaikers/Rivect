@@ -4,7 +4,7 @@
 
 use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
 use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
-use crate::policy::{ModeDecision, preapproval_scope};
+use crate::policy::{ModeDecision, canonical_egress_target, preapproval_scope};
 use crate::providers::LoopbackProvider;
 use crate::resources::{OutputStatus, OutputStream, sanitize_status_cause};
 use crate::state::TaskStore;
@@ -211,6 +211,7 @@ const LIMIT_GRANT_TTL_SECONDS: i64 = 600;
 pub struct PermissionPanel {
     pub verdict: ModeDecision,
     pub class: EffectClass,
+    pub grant_id: String,
     pub initiator: String,
     pub expiry: String,
     pub scope: String,
@@ -226,16 +227,24 @@ impl PermissionPanel {
     pub fn new(
         verdict: ModeDecision,
         class: EffectClass,
+        grant_id: impl Into<String>,
         initiator: impl Into<String>,
         expiry: impl Into<String>,
         scope: impl Into<String>,
     ) -> Self {
+        let scope = scope.into();
+        let scope = if class == EffectClass::Egress {
+            canonical_egress_target(&scope)
+        } else {
+            scope
+        };
         Self {
             verdict,
             class,
+            grant_id: grant_id.into(),
             initiator: initiator.into(),
             expiry: expiry.into(),
-            scope: scope.into(),
+            scope,
             focus: PanelAction::Deny,
             body_scroll: 0,
         }
@@ -407,7 +416,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             );
             next += 1;
             frame.render_widget(
-                Paragraph::new(view.output.text())
+                Paragraph::new(sanitize_status_cause(view.output.text()))
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .scroll((view.output_scroll, 0)),
                 chunks[next],
@@ -684,7 +693,8 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut TaskStore) {
                 view.transcript.push(PANEL_ALLOWED_NOTE.to_string());
             }
             PanelAction::LimitedGrant => {
-                let Some(scope) = preapproval_scope(panel.class, &panel.scope) else {
+                let Some(scope) = preapproval_scope(panel.class, &panel.grant_id, &panel.scope)
+                else {
                     panel.focus_deny();
                     view.panel = Some(panel);
                     view.transcript.push(

@@ -2179,6 +2179,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         .expect("canonical preapproval target")
         .display()
         .to_string();
+    let grant_id = "grant-class-isolation";
     // A human consented to WRITE on this exact scope through the panel's
     // namespaced key.
     world
@@ -2186,7 +2187,8 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         .owner
         .store
         .record_preapproval(
-            &preapproval_scope(EffectClass::Write, &scope).expect("utf-8 preapproval scope"),
+            &preapproval_scope(EffectClass::Write, grant_id, &scope)
+                .expect("utf-8 preapproval scope"),
             "human:test",
             600,
         )
@@ -2196,6 +2198,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         &world.runtime.owner.store,
         PermissionMode::Manual,
         EffectClass::Egress,
+        grant_id,
         &scope_root,
         &target,
     )
@@ -2218,6 +2221,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         &world.runtime.owner.store,
         PermissionMode::Manual,
         EffectClass::Write,
+        grant_id,
         &scope_root,
         &target,
     )
@@ -2327,6 +2331,7 @@ fn forged_approved_text_grants_nothing() {
         &world.runtime.owner.store,
         PermissionMode::Manual,
         EffectClass::Write,
+        &grant,
         &scope_root,
         &target,
     )
@@ -2343,6 +2348,7 @@ fn forged_approved_text_grants_nothing() {
         &world.runtime.owner.store,
         PermissionMode::Manual,
         EffectClass::Read,
+        &grant,
         &scope_root,
         &target,
     )
@@ -2361,7 +2367,7 @@ fn forged_approved_text_grants_nothing() {
             .owner
             .store
             .is_preapproved(
-                &preapproval_scope(EffectClass::Read, &target.display().to_string())
+                &preapproval_scope(EffectClass::Read, &grant, &target.display().to_string())
                     .expect("utf-8 preapproval scope")
             )
             .expect("preapproval read"),
@@ -2385,6 +2391,7 @@ const PTY_ROWS: u16 = 20;
 const PTY_COLS: u16 = 60;
 const CHILD_INITIATOR: &str = "task-170-fixture";
 const CHILD_EXPIRY: &str = "2036-01-01T00:00:00Z";
+const CHILD_GRANT_ID: &str = "grant-pty-panel";
 
 use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
@@ -2434,6 +2441,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
         view.panel = Some(PermissionPanel::new(
             ModeDecision::Ask,
             EffectClass::Write,
+            CHILD_GRANT_ID,
             CHILD_INITIATOR,
             CHILD_EXPIRY,
             scope.to_string(),
@@ -2471,6 +2479,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
                 &runtime.owner.store,
                 PermissionMode::Manual,
                 EffectClass::Write,
+                CHILD_GRANT_ID,
                 Path::new(&scope),
                 Path::new(&scope),
             )
@@ -2858,6 +2867,7 @@ fn limited_grant_store_failure_keeps_the_panel_on_deny() {
     view.panel = Some(PermissionPanel::new(
         ModeDecision::Ask,
         EffectClass::Write,
+        "grant-failure",
         "task-failure-fixture",
         "2036-01-01T00:00:00Z",
         "/scope",

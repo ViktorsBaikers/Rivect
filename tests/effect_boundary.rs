@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}\u{2065}\u{0600}\u{0605}\u{06DD}\u{17B4}\u{17B5}";
     assert_eq!(
         rivect::resources::sanitize_status_cause(raw),
         "okhidbiditag"
@@ -1742,6 +1742,7 @@ fn permission_panel_strips_cf_from_rendered_scope_and_initiator() {
     view.panel = Some(PermissionPanel::new(
         rivect::policy::ModeDecision::Ask,
         rivect::contracts::EffectClass::Write,
+        "grant-cf",
         "init\u{206A}iator",
         "exp\u{200B}iry",
         "/tmp/\u{202E}scope",
@@ -1778,16 +1779,18 @@ fn dock_and_composer_strip_cf_on_render() {
 fn preapproval_scope_canonicalizes_egress_urls_like_paths() {
     let mixed = rivect::policy::preapproval_scope(
         rivect::contracts::EffectClass::Egress,
+        "g1",
         "HTTPS://Example.INVALID/matrix",
     )
     .expect("utf-8 egress key");
     let folded = rivect::policy::preapproval_scope(
         rivect::contracts::EffectClass::Egress,
+        "g1",
         "https://example.invalid:443/matrix",
     )
     .expect("utf-8 egress key");
     assert_eq!(mixed, folded);
-    assert_eq!(mixed, "egress:https://example.invalid/matrix");
+    assert_eq!(mixed, "egress:g1:https://example.invalid/matrix");
 }
 
 #[cfg(target_os = "linux")]
@@ -1802,7 +1805,8 @@ fn preapproval_scope_skips_non_utf8_canonical_paths() {
     symlink(&target, &link).expect("utf-8 symlink to non-utf8");
     let link = link.to_str().expect("link name is utf-8");
     assert!(
-        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Read, link).is_none(),
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Read, "g1", link)
+            .is_none(),
         "a non-UTF8 canonical path must skip preapproval rather than collide via display()"
     );
 }
