@@ -350,10 +350,9 @@ fn linux_wrapped_helper() -> Result<Command, WorkerError> {
 ///
 /// # Errors
 /// Returns [`WorkerError::SandboxSpawnFailed`] when the helper binary
-/// cannot be resolved, [`WorkerError::SandboxUnavailable`] when the helper
-/// is not a file or (on Linux) the seccomp net-deny filter cannot be
-/// prepared, and [`WorkerError::WriteFailed`] when that filter file cannot
-/// be written.
+/// cannot be resolved, and [`WorkerError::SandboxUnavailable`] when the
+/// helper is not a file or (on Linux) the seccomp net-deny filter cannot
+/// be prepared.
 pub fn helper_confined_command(
     platform: &str,
     mode: &str,

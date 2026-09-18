@@ -2094,8 +2094,46 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
     let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
     world.runtime.read_worker = Box::new(linux::LinuxWorker);
     {
-        let child = helper_confined_command("linux", "not-a-mode", "")
-            .expect("data-plane confined command")
+        let mut command = helper_confined_command("linux", "not-a-mode", "")
+            .expect("data-plane confined command");
+        // Inner-mode stderr proves `cmd_confined` ran; the wrap argv is
+        // what pins launch/unshare/setpriv in the data-plane command.
+        assert_eq!(
+            command.get_program(),
+            helper.as_os_str(),
+            "data-plane program must be the helper, got {:?}",
+            command.get_program()
+        );
+        let argv: Vec<std::ffi::OsString> = command
+            .get_args()
+            .map(std::ffi::OsStr::to_os_string)
+            .collect();
+        let filter = linux::net_deny_filter_file().expect("seccomp filter file");
+        let wrap = [
+            std::ffi::OsStr::new("launch"),
+            std::ffi::OsStr::new("--"),
+            std::ffi::OsStr::new(UNSHARE),
+            std::ffi::OsStr::new("--net"),
+            std::ffi::OsStr::new("--"),
+            std::ffi::OsStr::new(SETPRIV),
+            std::ffi::OsStr::new("--nnp"),
+            std::ffi::OsStr::new("--seccomp-filter"),
+            filter.as_os_str(),
+            std::ffi::OsStr::new("--"),
+            helper.as_os_str(),
+            std::ffi::OsStr::new("confined"),
+            std::ffi::OsStr::new("linux"),
+            std::ffi::OsStr::new("not-a-mode"),
+        ];
+        assert!(
+            {
+                let mut rest = argv.iter();
+                wrap.iter()
+                    .all(|want| rest.any(|got| got.as_os_str() == *want))
+            },
+            "data-plane argv must wrap launch/unshare/setpriv around confined, got {argv:?}"
+        );
+        let child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

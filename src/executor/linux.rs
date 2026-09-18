@@ -782,9 +782,8 @@ static SECCOMP_FILTER_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 ///
 /// # Errors
 /// Returns [`WorkerError::SandboxUnavailable`] when the filter cannot be
-/// rendered for this architecture or its private directory cannot be
-/// created, and [`WorkerError::WriteFailed`] when the filter file itself
-/// cannot be written.
+/// rendered for this architecture, its private directory cannot be created
+/// or secured, or the filter file cannot be written.
 pub fn net_deny_filter_file() -> Result<PathBuf, WorkerError> {
     let cached = SECCOMP_FILTER_FILE
         .lock()
@@ -799,14 +798,18 @@ pub fn net_deny_filter_file() -> Result<PathBuf, WorkerError> {
         std::process::id(),
         crate::contracts::TaskId::generate().0
     ));
-    std::fs::create_dir(&dir).map_err(|source| WorkerError::WriteFailed { source })?;
+    std::fs::create_dir(&dir).map_err(|source| WorkerError::SandboxUnavailable {
+        reason: format!("linux seccomp: the filter directory cannot be created: {source}"),
+    })?;
     if !set_private_mode(&dir) {
         return Err(WorkerError::SandboxUnavailable {
             reason: "linux seccomp: the filter directory cannot be secured private".to_string(),
         });
     }
     let path = dir.join("net-deny.bpf");
-    std::fs::write(&path, &filter).map_err(|source| WorkerError::WriteFailed { source })?;
+    std::fs::write(&path, &filter).map_err(|source| WorkerError::SandboxUnavailable {
+        reason: format!("linux seccomp: the filter file cannot be written: {source}"),
+    })?;
     SECCOMP_FILTER_FILE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
