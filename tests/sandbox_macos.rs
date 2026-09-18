@@ -1618,6 +1618,14 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
             "the confined helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
         );
         assert!(
+            stderr.contains("confined mode must be read or write"),
+            "the inner confined-mode protocol miss must name the mode: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("launch requires") && !stderr.contains("unknown mode"),
+            "an outer launch-mode protocol miss is not this confined-mode miss: {stderr:?}"
+        );
+        assert!(
             !stderr.contains("exec failed") && !stderr.contains("failed to execute"),
             "a launch-exec failure is 126/127, not a confined protocol miss: {stderr:?}"
         );

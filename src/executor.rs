@@ -347,6 +347,13 @@ fn linux_wrapped_helper() -> Result<Command, WorkerError> {
 /// Data-plane confined helper: Linux is `helper launch -- unshare --net --
 /// setpriv --nnp --seccomp-filter -- helper confined`; macOS is `helper
 /// confined` with in-helper `sandbox_init`.
+///
+/// # Errors
+/// Returns [`WorkerError::SandboxSpawnFailed`] when the helper binary
+/// cannot be resolved, [`WorkerError::SandboxUnavailable`] when the helper
+/// is not a file or (on Linux) the seccomp net-deny filter cannot be
+/// prepared, and [`WorkerError::WriteFailed`] when that filter file cannot
+/// be written.
 pub fn helper_confined_command(
     platform: &str,
     mode: &str,

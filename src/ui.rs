@@ -4,7 +4,9 @@
 
 use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
 use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
-use crate::policy::{ModeDecision, canonical_egress_target, preapproval_scope};
+use crate::policy::{
+    ModeDecision, canonical_egress_target, grant_id_is_key_safe, preapproval_scope,
+};
 use crate::providers::LoopbackProvider;
 use crate::resources::{OutputStatus, OutputStream, sanitize_status_cause};
 use crate::state::TaskStore;
@@ -304,23 +306,19 @@ impl PermissionPanel {
     /// rows never hide them (design-brief §4).
     fn header_text(&self) -> String {
         format!(
-            "{PANEL_TITLE}\ndecision: {}\neffect: {}\ninitiator: {}\nexpiry: {}",
+            "{PANEL_TITLE}\ndecision: {}\neffect: {}\ninitiator: {}\nexpiry: {}\ngrant: {}",
             self.verdict.token(),
             effect_class_label(self.class),
             sanitize_status_cause(&self.initiator),
             sanitize_status_cause(&self.expiry),
+            sanitize_status_cause(&self.grant_id),
         )
     }
 
-    /// Scrollable body: the scope and the grant identity, the freely
-    /// wrapping part (the request detail carrier arrives with the
-    /// mode-selection carrier).
+    /// Scrollable body: the scope, the freely wrapping part (the request
+    /// detail carrier arrives with the mode-selection carrier).
     fn body_text(&self) -> String {
-        format!(
-            "scope: {}\ngrant: {}",
-            sanitize_status_cause(&self.scope),
-            sanitize_status_cause(&self.grant_id),
-        )
+        format!("scope: {}", sanitize_status_cause(&self.scope))
     }
 
     /// Pinned footer: the actions line, then the one affordance hint.
@@ -343,7 +341,7 @@ fn effect_class_label(class: EffectClass) -> &'static str {
 }
 
 /// Rows of the pinned panel header (`header_text`).
-const PANEL_HEADER_ROWS: u16 = 5;
+const PANEL_HEADER_ROWS: u16 = 6;
 /// Rows of the pinned panel footer (`footer_text`).
 const PANEL_FOOTER_ROWS: u16 = 2;
 
@@ -698,6 +696,13 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut TaskStore) {
                 view.transcript.push(PANEL_ALLOWED_NOTE.to_string());
             }
             PanelAction::LimitedGrant => {
+                if !grant_id_is_key_safe(&panel.grant_id) {
+                    panel.focus_deny();
+                    view.panel = Some(panel);
+                    view.transcript
+                        .push("limited grant recording failed: grant id is not valid".to_string());
+                    return;
+                }
                 let Some(scope) = preapproval_scope(panel.class, &panel.grant_id, &panel.scope)
                 else {
                     panel.focus_deny();

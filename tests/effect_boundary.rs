@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}\u{2065}\u{0600}\u{0605}\u{06DD}\u{17B4}\u{17B5}\u{070F}\u{0890}\u{0891}\u{08E2}\u{110BD}\u{1D173}\u{1D17A}";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}\u{2065}\u{0600}\u{0605}\u{06DD}\u{17B4}\u{17B5}\u{070F}\u{0890}\u{0891}\u{08E2}\u{110BD}\u{110CD}\u{13430}\u{1343F}\u{1BCA0}\u{1BCA3}\u{1D173}\u{1D17A}";
     assert_eq!(
         rivect::resources::sanitize_status_cause(raw),
         "okhidbiditag"
@@ -1842,6 +1842,21 @@ fn preapproval_scope_rejects_empty_or_colliding_grant_ids() {
         rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant\na", scope)
             .is_none(),
         "a newline in grant_id must fail closed"
+    );
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant\ra", scope)
+            .is_none(),
+        "a carriage return in grant_id must fail closed"
+    );
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant a", scope)
+            .is_none(),
+        "a space in grant_id must fail closed"
+    );
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant_a", scope)
+            .is_none(),
+        "an underscore in grant_id must fail closed"
     );
 }
 

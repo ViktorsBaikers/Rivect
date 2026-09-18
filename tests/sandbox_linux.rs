@@ -1699,6 +1699,7 @@ fn degraded_environment_fails_closed_naming_the_mechanism() {
     // never an ambient read. The leg runs as a dropped-privilege child
     // because the proof container grants the test process SYS_ADMIN
     // (EDGE-009).
+    ensure_helper();
     let fixture = TempTree::new("sandbox-linux", "degraded-env");
     let scope = fixture.path.join("scope");
     std::fs::create_dir_all(&scope).expect("create scope");
@@ -2116,6 +2117,14 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
             "the confined helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
         );
         assert!(
+            stderr.contains("confined mode must be read or write"),
+            "the inner confined-mode protocol miss must name the mode: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("launch requires") && !stderr.contains("unknown mode"),
+            "an outer launch-mode protocol miss is not this confined-mode miss: {stderr:?}"
+        );
+        assert!(
             !stderr.contains("exec failed") && !stderr.contains("failed to execute"),
             "a launch-exec failure is 126/127, not a confined protocol miss: {stderr:?}"
         );
@@ -2445,11 +2454,12 @@ fn assert_eperm(outcome: &ConfinedOutcome, what: &str) {
     );
     assert!(!outcome.exit_ok, "{what} must fail closed, got {outcome:?}");
     let stderr_lower = outcome.stderr.to_ascii_lowercase();
-    let errno_evidence = outcome.stderr.contains("errno=1");
-    let eperm_evidence = stderr_lower.contains("operation not permitted")
-        && !stderr_lower.contains("setpriv")
-        && !stderr_lower.contains("unshare")
-        && !stderr_lower.contains("sandbox-exec");
+    let from_launcher = stderr_lower.contains("setpriv")
+        || stderr_lower.contains("unshare")
+        || stderr_lower.contains("sandbox-exec");
+    let errno_evidence =
+        outcome.stderr.lines().any(|line| line.trim() == "errno=1") && !from_launcher;
+    let eperm_evidence = stderr_lower.contains("operation not permitted") && !from_launcher;
     assert!(
         errno_evidence || eperm_evidence,
         "{what} must surface EPERM, got {outcome:?}"

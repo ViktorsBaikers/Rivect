@@ -2854,6 +2854,7 @@ fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
     assert!(panel_up.contains("effect: write"));
     assert!(panel_up.contains("initiator: task-170-fixture"));
     assert!(panel_up.contains("expiry: 2036-01-01T00:00:00Z"));
+    assert!(panel_up.contains("grant: grant-pty-panel"));
     // The overflowing body hides its tail at the scroll origin, but the
     // actions and the footer hint never leave the screen. The scope is
     // one long token, so wrap breaks are removed before matching.
@@ -2889,6 +2890,10 @@ fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
     assert!(
         scrolled.contains("awaiting permission") && scrolled.contains("effect: write"),
         "header stays pinned"
+    );
+    assert!(
+        scrolled.contains("grant: grant-pty-panel"),
+        "grant stays pinned in the header"
     );
 
     screen.session.send(b"\x03").expect("send ctrl-c");
@@ -2954,6 +2959,61 @@ fn limited_grant_store_failure_keeps_the_panel_on_deny() {
             .iter()
             .any(|line| line.contains("limited grant recording failed")),
         "the failure is a typed note: {:?}",
+        view.transcript
+    );
+}
+
+/// A limited-grant recording that fails on grant_id charset reports a
+/// grant-id error, not a scope-unicode miss.
+#[test]
+fn limited_grant_invalid_grant_id_keeps_the_panel_on_deny() {
+    let root = support::temp_dir("panel-grant-id-charset");
+    let db = root.join("rivect.db");
+    let mut store = TaskStore::open(&db).expect("open store");
+
+    let mut view = initial_view();
+    view.panel = Some(PermissionPanel::new(
+        ModeDecision::Ask,
+        EffectClass::Write,
+        "grant\rid",
+        "task-failure-fixture",
+        "2036-01-01T00:00:00Z",
+        "/scope",
+    ));
+    assert!(handle_panel_key(
+        KeyCode::Left,
+        KeyModifiers::NONE,
+        &mut view,
+        &mut store
+    ));
+    assert_eq!(
+        view.panel.as_ref().map(PermissionPanel::confirm),
+        Some(PanelAction::LimitedGrant)
+    );
+
+    let keep_running = handle_panel_key(KeyCode::Enter, KeyModifiers::NONE, &mut view, &mut store);
+    assert!(keep_running, "a failed recording must not cancel the TUI");
+    let panel = view
+        .panel
+        .as_ref()
+        .expect("the panel survives the failed recording");
+    assert_eq!(
+        panel.confirm(),
+        PanelAction::Deny,
+        "focus returns to the non-destructive action"
+    );
+    assert!(
+        view.transcript
+            .iter()
+            .any(|line| { line.contains("limited grant recording failed: grant id is not valid") }),
+        "grant_id charset miss is a grant-id error: {:?}",
+        view.transcript
+    );
+    assert!(
+        view.transcript
+            .iter()
+            .all(|line| !line.contains("scope is not valid unicode")),
+        "grant_id charset miss must not be reported as a scope unicode error: {:?}",
         view.transcript
     );
 }
