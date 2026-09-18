@@ -28,7 +28,7 @@ use sha2::Digest;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, PoisonError};
@@ -88,6 +88,12 @@ impl ReadWorker for LinuxWorker {
 /// copy of a harmless binary placed outside any sane grant scope, so a
 /// confined execution of it must be denied before the admitted program
 /// is touched. Existence of a system binary is never the discriminator.
+///
+/// The copy lives under `/tmp/rivect-denied-exec-*`, which is **not**
+/// covered by the exec Landlock execute allowances (loader + grant
+/// scope only). That omission is the deny-first: `setpriv` then
+/// `execve`s the control, Landlock returns EACCES, and `errexec` exits
+/// 126. Do not add a path-beneath execute rule for this directory.
 pub fn denied_exec_control() -> Result<PathBuf, WorkerError> {
     static ARTIFACT: Mutex<Option<PathBuf>> = Mutex::new(None);
     let mut slot = ARTIFACT.lock().unwrap_or_else(PoisonError::into_inner);
@@ -113,6 +119,14 @@ pub fn denied_exec_control() -> Result<PathBuf, WorkerError> {
     };
     std::fs::copy(source, &dest).map_err(|source| WorkerError::SandboxUnavailable {
         reason: format!("denied-exec control copy unavailable: {source}"),
+    })?;
+    // `fs::copy` preserves mode bits on Unix, but umask and a
+    // pre-existing dest can drop `+x`. Landlock EACCES is the
+    // discriminator; a missing execute bit would be a false deny.
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|source| {
+        WorkerError::SandboxUnavailable {
+            reason: format!("denied-exec control execute bit unavailable: {source}"),
+        }
     })?;
     *slot = Some(dest.clone());
     drop(slot);
@@ -578,19 +592,21 @@ fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
         "aarch64" => Some((
             AUDIT_ARCH_AARCH64,
             &[
-                198, 199, 203, 206, 211, // socket socketpair connect sendto sendmsg
+                198, 199, 202, 203, 206, 207, 211,
+                242, // socket accept* connect sendto recvfrom sendmsg accept4
                 243, 269, // recvmmsg sendmmsg
-                97, 117, 270, 271, 280, // unshare ptrace process_vm_* bpf
-                425, 426, 427, 438, // io_uring_* pidfd_getfd
+                97, 117, 268, 270, 271, 280, // unshare ptrace setns process_vm_* bpf
+                425, 426, 427, 434, 435, 438, // io_uring_* pidfd_open clone3 pidfd_getfd
             ],
         )),
         "x86_64" => Some((
             AUDIT_ARCH_X86_64,
             &[
-                41, 53, 42, 44, 46, // socket socketpair connect sendto sendmsg
+                41, 42, 43, 44, 45, 46, 53,
+                288, // socket connect accept sendto recvfrom sendmsg socketpair accept4
                 299, 307, // recvmmsg sendmmsg
-                101, 272, 310, 311, 321, // ptrace unshare process_vm_* bpf
-                425, 426, 427, 438, // io_uring_* pidfd_getfd
+                101, 272, 308, 310, 311, 321, // ptrace unshare setns process_vm_* bpf
+                425, 426, 427, 434, 435, 438, // io_uring_* pidfd_open clone3 pidfd_getfd
             ],
         )),
         _ => None,
@@ -732,7 +748,7 @@ pub fn run_confined(
     if matches!(confinement, Confinement::Egress | Confinement::Exec { .. }) {
         command.arg("--seccomp-filter").arg(net_deny_filter_file()?);
     }
-    command.arg(program).args(args);
+    command.arg("--").arg(program).args(args);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

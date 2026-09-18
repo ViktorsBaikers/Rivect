@@ -15,7 +15,7 @@ use super::{
     same_regular_file,
 };
 use sha2::Digest;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -335,10 +335,11 @@ const DENIED_PROBE_TARGET: &str = "/private/etc/hosts";
 /// on every effect and stays at zero effects.
 static CONFORMANT_READ_SCOPES: Mutex<BTreeSet<(PathBuf, PathBuf)>> = Mutex::new(BTreeSet::new());
 
-/// Write conformance verdicts plus the in-scope probe artifact each later
-/// write gate reuses, under the same caching rules as the read set.
-static CONFORMANT_WRITE_SCOPES: Mutex<BTreeMap<(PathBuf, PathBuf), PathBuf>> =
-    Mutex::new(BTreeMap::new());
+/// Write conformance verdicts already proven this process holds, under
+/// the same caching rules as the read set: the verdict is all a later
+/// gate needs, because every confined write leg runs on its own fresh
+/// probe artifact.
+static CONFORMANT_WRITE_SCOPES: Mutex<BTreeSet<(PathBuf, PathBuf)>> = Mutex::new(BTreeSet::new());
 
 /// Read allowances every confined helper needs before its own scope rules.
 /// dyld's `CacheFinder` stats the root directory itself while hunting the
@@ -383,13 +384,20 @@ fn canonical_scope(scope_root: &Path) -> Result<PathBuf, WorkerError> {
     Ok(canonical)
 }
 
-/// Escapes one canonical path into a Seatbelt string literal.
+/// Escapes one canonical path into a Seatbelt string literal. Control
+/// characters would splice into SBPL, so a scope that contains them is
+/// not confinable.
 fn scheme_literal(canonical: &Path) -> Result<String, WorkerError> {
     let text = canonical
         .to_str()
         .ok_or_else(|| WorkerError::SandboxUnavailable {
             reason: "scope root is not valid unicode".to_string(),
         })?;
+    if text.chars().any(char::is_control) {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: "scope root contains control characters".to_string(),
+        });
+    }
     Ok(format!(
         "\"{}\"",
         text.replace('\\', "\\\\").replace('"', "\\\"")
@@ -476,6 +484,7 @@ pub fn run_confined(
         .arg(sandbox_exec)
         .arg("-p")
         .arg(profile)
+        .arg("--")
         .arg(program)
         .args(args)
         .stdin(Stdio::null())
@@ -555,12 +564,12 @@ fn confined_read_gate(
     expect_admitted(outcome, canonical_target)
 }
 
-/// OS-boundary gate for one managed write. The confined leg touches the
-/// probe artifact [`probe_write_conformance`] owns inside the scope —
-/// never the user's target, so the gate cannot mutate it, truncate it, or
-/// recreate it should it vanish mid-flight; the profile's allowance is
-/// the scope subpath, and proving it on the artifact proves exactly the
-/// admission the checked-fd leg then uses.
+/// OS-boundary gate for one managed write. The confined leg touches a
+/// fresh worker-owned probe artifact inside the scope — never the user's
+/// target, so the gate cannot mutate it, truncate it, or recreate it
+/// should it vanish mid-flight; the profile's allowance is the scope
+/// subpath, and proving it on the artifact proves exactly the admission
+/// the checked-fd leg then uses.
 fn confined_write_gate(
     sandbox_exec: &Path,
     scope_root: &Path,
@@ -569,14 +578,13 @@ fn confined_write_gate(
     probe_write_conformance(sandbox_exec, scope_root)?;
     let profile = write_profile(scope_root)?;
     let artifact = fresh_write_artifact(scope_root)?;
-    let code = helper_probe_write("macos", &profile, &artifact)?;
+    let result = helper_probe_write("macos", &profile, &artifact);
     drop(std::fs::remove_file(&artifact));
-    if code == rivect_sandbox_helper::EXIT_OK {
-        Ok(())
-    } else {
-        Err(WorkerError::SandboxDenied {
+    match result {
+        Err(WorkerError::SandboxDenied { .. }) => Err(WorkerError::SandboxDenied {
             target: target.to_path_buf(),
-        })
+        }),
+        other => other,
     }
 }
 
@@ -751,29 +759,27 @@ pub fn probe_read_conformance(
 }
 
 /// Proves the Seatbelt write boundary enforces before the first managed
-/// write in a scope and returns the in-scope probe artifact later gates
-/// reuse: the kernel must deny a confined write to a file this process
-/// owns outside the scope and admit one to an artifact inside the scope.
-/// The denied leg runs first, so a non-enforcing mechanism is caught
-/// before any in-scope ambient I/O. A scope this process cannot write is
-/// a typed effect denial, never a capability failure.
+/// write in a scope: the kernel must deny a confined write to a file this
+/// process owns outside the scope and admit one to a fresh artifact inside
+/// the scope. The denied leg runs first, so a non-enforcing mechanism is
+/// caught before any in-scope ambient I/O. The admitted artifact is
+/// unlinked after the probe — later gates use their own fresh names. A
+/// scope this process cannot write is a typed effect denial, never a
+/// capability failure.
 ///
 /// # Errors
 /// Returns [`WorkerError::SandboxSpawnFailed`] when the mechanism cannot
 /// start, [`WorkerError::SandboxUnavailable`] when the boundary does not
 /// enforce or the scope is not confinable, and [`WorkerError::WriteFailed`]
 /// when the scope is not writable by this process.
-pub fn probe_write_conformance(
-    sandbox_exec: &Path,
-    scope_root: &Path,
-) -> Result<PathBuf, WorkerError> {
+pub fn probe_write_conformance(sandbox_exec: &Path, scope_root: &Path) -> Result<(), WorkerError> {
     let key = (sandbox_exec.to_path_buf(), canonical_scope(scope_root)?);
-    if let Some(artifact) = CONFORMANT_WRITE_SCOPES
+    if CONFORMANT_WRITE_SCOPES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
+        .contains(&key)
     {
-        return Ok(artifact.clone());
+        return Ok(());
     }
     let profile = write_profile(scope_root)?;
     // Denied leg first: the candidate lives in a private directory this
@@ -799,50 +805,56 @@ pub fn probe_write_conformance(
         denied?,
         "conformance probe: the boundary admitted the denied write leg",
     )?;
-    // Admitted leg on an artifact this worker owns inside the scope; the
-    // per-effect gates reuse it, so no confined leg ever touches the
-    // user's write target. A failure distinguishes a scope this process
-    // cannot write (an effect denial) from a boundary that wrongly denies
-    // in-scope writes (a capability failure).
-    let artifact = key
-        .1
-        .join(format!(".rivect-write-probe-{}", std::process::id()));
-    match run_confined(
+    // Admitted leg on a fresh artifact this worker owns inside the scope;
+    // no confined leg ever touches the user's write target. A failure
+    // distinguishes a scope this process cannot write (an effect denial)
+    // from a boundary that wrongly denies in-scope writes (a capability
+    // failure).
+    let artifact = key.1.join(format!(
+        ".rivect-write-probe-{}-{}",
+        std::process::id(),
+        crate::contracts::TaskId::generate().0
+    ));
+    let admitted = run_confined(
         sandbox_exec,
         &profile,
         Path::new("/usr/bin/touch"),
         &[artifact.as_os_str()],
-    ) {
-        Ok(outcome) if outcome.exit_ok => {}
+    );
+    match admitted {
+        Ok(outcome) if outcome.exit_ok => {
+            drop(std::fs::remove_file(&artifact));
+        }
         Ok(_) => {
             // `O_NOFOLLOW` keeps this writability check from ever opening
             // through a symlink planted on the artifact path — a tampered
             // artifact surfaces as the same typed write denial as a scope
             // this process cannot write.
-            return match std::fs::OpenOptions::new()
+            let fallback = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .custom_flags(O_NOFOLLOW)
-                .open(&artifact)
-            {
-                Ok(_) => {
-                    drop(std::fs::remove_file(&artifact));
-                    Err(WorkerError::SandboxUnavailable {
-                        reason: "conformance probe: the boundary denied the in-scope write leg"
-                            .to_string(),
-                    })
-                }
+                .open(&artifact);
+            drop(std::fs::remove_file(&artifact));
+            return match fallback {
+                Ok(_) => Err(WorkerError::SandboxUnavailable {
+                    reason: "conformance probe: the boundary denied the in-scope write leg"
+                        .to_string(),
+                }),
                 Err(source) => Err(WorkerError::WriteFailed { source }),
             };
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            drop(std::fs::remove_file(&artifact));
+            return Err(error);
+        }
     }
     CONFORMANT_WRITE_SCOPES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, artifact.clone());
-    Ok(artifact)
+        .insert(key);
+    Ok(())
 }
 
 #[cfg(test)]

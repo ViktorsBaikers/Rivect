@@ -1088,7 +1088,17 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 /// Preapproval rows persist only a scope string, so the effect class is
 /// folded into the key (`"<class>:<scope>"`): a consent recorded for a
 /// write must never admit an exec or egress on the same string.
+/// Filesystem classes canonicalize the path so `/var` and `/private/var`
+/// (and other alias spellings) share one row; a missing path keeps the
+/// caller spelling. Egress/model/control keys stay as given.
 pub fn preapproval_scope(class: EffectClass, scope: &str) -> String {
+    let scope = match class {
+        EffectClass::Read | EffectClass::Write | EffectClass::Exec => Path::new(scope)
+            .canonicalize()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| scope.to_string()),
+        EffectClass::Egress | EffectClass::Model | EffectClass::Control => scope.to_string(),
+    };
     format!("{}:{scope}", class_key(class))
 }
 

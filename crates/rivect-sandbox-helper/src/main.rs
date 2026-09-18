@@ -19,7 +19,7 @@
 //!       read stdin -> fd 1 after truncating it (write)
 //!   probe-write <macos|linux> <profile|scope> <path>
 //!       apply the sandbox, then open the probe artifact for write
-//!       (O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW) and write one byte
+//!       (O_WRONLY|O_CREAT|O_EXCL|O_TRUNC|O_NOFOLLOW) and write one byte
 //! ```
 //! Exit verdicts are the crate's `EXIT_*` codes: 0 ok, 10 sandbox init
 //! failure, 20 data I/O failure, 30 protocol error, 126/127 launch exec
@@ -42,6 +42,30 @@ const DATA_MAX_BYTES: usize = 1 << 20;
 
 /// Stdio fd range the inherited data fd lives on (0/1/2).
 const STDIO_TOP_FD: i32 = 2;
+
+/// `open(2)` write-only.
+const O_WRONLY: i32 = 0o1;
+/// `open(2)` create. Darwin and Linux disagree on the bit.
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x0200;
+#[cfg(target_os = "linux")]
+const O_CREAT: i32 = 0o100;
+/// `open(2)` exclusive create.
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 0x0800;
+#[cfg(target_os = "linux")]
+const O_EXCL: i32 = 0o200;
+/// `open(2)` truncate. Darwin and Linux disagree on the bit: the Linux
+/// octal aliases `O_ASYNC|O_CREAT` without `O_TRUNC` on macOS.
+#[cfg(target_os = "macos")]
+const O_TRUNC: i32 = 0x0400;
+#[cfg(target_os = "linux")]
+const O_TRUNC: i32 = 0o1000;
+/// `open(2)` do not follow symlinks.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
 
 // The syscall surface: one module so every `unsafe` block has a named home.
 mod sys {
@@ -66,7 +90,7 @@ mod sys {
         pub fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
         pub fn close(fd: c_int) -> c_int;
         pub fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
-        pub fn open(path: *const c_char, oflag: c_int) -> c_int;
+        pub fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     }
 
@@ -83,32 +107,28 @@ mod sys {
         pub fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
         pub fn close(fd: c_int) -> c_int;
         pub fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
-        pub fn open(path: *const c_char, oflag: c_int) -> c_int;
+        pub fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     }
 }
 
 fn main() -> ExitCode {
-    apply_rlimits();
+    if let Err(code) = apply_rlimits() {
+        return exit(code);
+    }
     // Every mode wastes no time on the parent's file descriptor table: the
     // only fds that exist here are the inherited stdio (0/1/2) — close
     // anything else before any sandbox exists, so a confined program can
-    // never inherit a stray fd (S6).
-    // SAFETY: closing fds above stdio by number is the documented unix
-    // contract; those fds are the parent's strays, never owned handles of
-    // this freshly spawned child.
-    for fd in (STDIO_TOP_FD + 1)..=256 {
-        // SAFETY: closing fds above stdio by number is the documented unix
-        // contract; those fds are the parent's strays, never owned handles
-        // of this freshly spawned child.
-        let _ = unsafe { sys::close(fd) };
-    }
+    // never inherit a stray fd (S6). RLIMIT_NOFILE does not close existing
+    // fds, so the sweep must cover the whole table, not a 256-wide window.
+    close_stray_fds();
 
     let args: Vec<CString> = std::env::args_os()
         .map(|arg| CString::new(arg.into_encoded_bytes()))
         .collect::<Result<_, _>>()
         .unwrap_or_else(|_| {
-            eprintln!("rivect-sandbox-helper: an argument is not valid unicode");
+            eprintln!("rivect-sandbox-helper: an argument contains an interior NUL");
             std::process::exit(EXIT_PROTOCOL);
         });
     let verdict = match args.get(1).map(|arg| arg.as_bytes()) {
@@ -124,6 +144,10 @@ fn main() -> ExitCode {
         Ok(()) => EXIT_OK,
         Err(code) => code,
     };
+    exit(code)
+}
+
+fn exit(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(EXIT_PROTOCOL as u8))
 }
 
@@ -195,7 +219,7 @@ fn cmd_confined(args: &[CString]) -> Result<(), i32> {
 fn apply_sandbox(platform: &[u8], profile: &[u8]) -> Result<(), i32> {
     match platform {
         b"macos" => apply_macos_sandbox(profile),
-        b"linux" => apply_linux_landlock(),
+        b"linux" => apply_linux_landlock(profile),
         _ => {
             eprintln!("rivect-sandbox-helper: confined platform must be macos or linux");
             Err(EXIT_PROTOCOL)
@@ -286,19 +310,18 @@ fn cmd_probe_write(args: &[CString]) -> Result<(), i32> {
 /// Opens the probe artifact for the write boundary and mutates one byte.
 /// The caller (the worker) owns the artifact name — fresh and unpredictable
 /// — so this open can never truncate or follow a file another process
-/// planted; the opened fd is closed before returning.
+/// planted; `O_EXCL` refuses a pre-existing name. The opened fd is closed
+/// before returning.
 fn open_for_write(path: &CString) -> Result<(), i32> {
-    const O_WRONLY: i32 = 0o1;
-    const O_CREAT: i32 = 0o100;
-    const O_TRUNC: i32 = 0o1000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x0100;
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400000;
     // SAFETY: the path is an owned NUL-terminated CString; the flags are the
-    // literal platform open(2) constants; the fd is closed on every path.
+    // literal platform open(2) constants; mode 0o600 applies only because
+    // O_CREAT is set; the fd is closed on every path.
     unsafe {
-        let fd = sys::open(path.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW);
+        let fd = sys::open(
+            path.as_ptr(),
+            O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW,
+            0o600,
+        );
         if fd < 0 {
             eprintln!(
                 "rivect-sandbox-helper: probe-write open denied: {}",
@@ -336,7 +359,7 @@ fn apply_macos_sandbox(profile: &[u8]) -> Result<(), i32> {
     // framework (build.rs).
     unsafe {
         let profile_c = CString::new(profile).map_err(|_nul| {
-            eprintln!("rivect-sandbox-helper: profile is not valid unicode");
+            eprintln!("rivect-sandbox-helper: profile contains an interior NUL");
             EXIT_PROTOCOL
         })?;
         let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
@@ -364,17 +387,22 @@ fn apply_macos_sandbox(_profile: &[u8]) -> Result<(), i32> {
     Err(EXIT_PROTOCOL)
 }
 
-/// Landlock deny-by-default: handles every filesystem access right with zero
-/// rules, so after this call the helper cannot open ANY path — the only I/O
-/// left is the inherited data fd, exactly the admitted operation. The
-/// network namespace is applied by the parent's `unshare --net` wrapper, so
-/// a confined helper has neither a path nor a network escape.
+/// Landlock deny-by-default: handles the ABI-1 filesystem access rights.
+/// With no scope, zero rules mean the helper cannot open ANY path — the
+/// only I/O left is the inherited data fd. With a scope (probe-write), a
+/// path-beneath rule admits create/write inside that directory so the
+/// probe can open its artifact. The network namespace is applied by the
+/// parent's `unshare --net` wrapper, so a confined helper has neither a
+/// path nor a network escape.
 #[cfg(target_os = "linux")]
-fn apply_linux_landlock() -> Result<(), i32> {
+fn apply_linux_landlock(scope: &[u8]) -> Result<(), i32> {
     const PR_SET_NO_NEW_PRIVS: i32 = 38;
-    // Landlock syscall numbers are 444/446 on both aarch64 and x86_64.
+    // Landlock syscall numbers are 444/445/446 on both aarch64 and x86_64.
     const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    const SYS_LANDLOCK_ADD_RULE: i64 = 445;
     const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+    const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 
     const ACCESS_FS_EXECUTE: u64 = 1 << 0;
     const ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
@@ -389,8 +417,9 @@ fn apply_linux_landlock() -> Result<(), i32> {
     const ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
     const ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
     const ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
-    const ACCESS_FS_REFER: u64 = 1 << 13;
-    const ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+    // ABI-1 set only: ACCESS_FS_REFER (ABI 2) and ACCESS_FS_TRUNCATE
+    // (ABI 3) are omitted. Handling TRUNCATE without a grant would deny
+    // ftruncate/set_len on the inherited write fd on ABI3+ kernels.
     const HANDLED_FS: u64 = ACCESS_FS_EXECUTE
         | ACCESS_FS_WRITE_FILE
         | ACCESS_FS_READ_FILE
@@ -403,13 +432,25 @@ fn apply_linux_landlock() -> Result<(), i32> {
         | ACCESS_FS_MAKE_SOCK
         | ACCESS_FS_MAKE_FIFO
         | ACCESS_FS_MAKE_BLOCK
-        | ACCESS_FS_MAKE_SYM
-        | ACCESS_FS_REFER
-        | ACCESS_FS_TRUNCATE;
+        | ACCESS_FS_MAKE_SYM;
 
-    // SAFETY: the attribute is the kernel ABI layout (three u64 words) and
-    // outlives the syscall; the integer constants are the documented
-    // landlock/prctl values shown above.
+    const O_RDONLY: i32 = 0;
+    const O_DIRECTORY: i32 = 0o200_000;
+    const O_CLOEXEC: i32 = 0o2_000_000;
+
+    #[repr(C)]
+    struct LandlockRulesetAttr {
+        handled_access_fs: u64,
+    }
+    #[repr(C)]
+    struct LandlockPathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+
+    // SAFETY: the attribute is the kernel ABI layout and outlives the
+    // syscall; the integer constants are the documented landlock/prctl
+    // values shown above; dirfds opened here are closed on every path.
     unsafe {
         let nnp = sys::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         if nnp != 0 {
@@ -419,18 +460,29 @@ fn apply_linux_landlock() -> Result<(), i32> {
             );
             return Err(EXIT_SANDBOX_INIT);
         }
-        #[repr(C)]
-        struct LandlockRulesetAttr {
-            handled_access_fs: u64,
-            handled_access_net: u64,
-            scoped: u64,
+        // size=0 + VERSION flag is the ABI query, not ruleset creation.
+        let abi = sys::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<LandlockRulesetAttr>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        );
+        if abi < 1 {
+            eprintln!(
+                "rivect-sandbox-helper: landlock ABI probe failed (abi={abi}): {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(EXIT_SANDBOX_INIT);
         }
         let attr = LandlockRulesetAttr {
             handled_access_fs: HANDLED_FS,
-            handled_access_net: 0,
-            scoped: 0,
         };
-        let ruleset = sys::syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const _, 0, 0);
+        let ruleset = sys::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            &attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        );
         if ruleset < 0 {
             eprintln!(
                 "rivect-sandbox-helper: landlock_create_ruleset failed: {}",
@@ -438,21 +490,64 @@ fn apply_linux_landlock() -> Result<(), i32> {
             );
             return Err(EXIT_SANDBOX_INIT);
         }
-        if sys::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0) != 0 {
+        let ruleset_fd = ruleset as i32;
+        if !scope.is_empty() {
+            let scope_c = match CString::new(scope) {
+                Ok(scope_c) => scope_c,
+                Err(_) => {
+                    eprintln!("rivect-sandbox-helper: landlock scope contains an interior NUL");
+                    let _ = sys::close(ruleset_fd);
+                    return Err(EXIT_PROTOCOL);
+                }
+            };
+            let dirfd = sys::open(scope_c.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            if dirfd < 0 {
+                eprintln!(
+                    "rivect-sandbox-helper: landlock scope open failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let _ = sys::close(ruleset_fd);
+                return Err(EXIT_SANDBOX_INIT);
+            }
+            let path_beneath = LandlockPathBeneathAttr {
+                allowed_access: ACCESS_FS_WRITE_FILE
+                    | ACCESS_FS_MAKE_REG
+                    | ACCESS_FS_READ_FILE
+                    | ACCESS_FS_READ_DIR,
+                parent_fd: dirfd,
+            };
+            let added = sys::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &path_beneath as *const LandlockPathBeneathAttr,
+                0u32,
+            );
+            let _ = sys::close(dirfd);
+            if added != 0 {
+                eprintln!(
+                    "rivect-sandbox-helper: landlock_add_rule failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let _ = sys::close(ruleset_fd);
+                return Err(EXIT_SANDBOX_INIT);
+            }
+        }
+        if sys::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0) != 0 {
             eprintln!(
                 "rivect-sandbox-helper: landlock_restrict_self failed: {}",
                 std::io::Error::last_os_error()
             );
-            let _ = sys::close(ruleset as i32);
+            let _ = sys::close(ruleset_fd);
             return Err(EXIT_SANDBOX_INIT);
         }
-        let _ = sys::close(ruleset as i32);
+        let _ = sys::close(ruleset_fd);
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_linux_landlock() -> Result<(), i32> {
+fn apply_linux_landlock(_scope: &[u8]) -> Result<(), i32> {
     eprintln!("rivect-sandbox-helper: the linux confined mode is only built on Linux");
     Err(EXIT_PROTOCOL)
 }
@@ -463,36 +558,108 @@ fn apply_linux_landlock() -> Result<(), i32> {
 
 #[cfg(target_os = "macos")]
 const RLIMITS: &[(i32, u64)] = &[
-    (5, 512 * 1024 * 1024), // RLIMIT_AS
-    (0, 30),                // RLIMIT_CPU seconds
-    (1, 64 * 1024 * 1024),  // RLIMIT_FSIZE
-    (8, 256),               // RLIMIT_NOFILE
+    // Darwin `setrlimit(RLIMIT_AS)` returns EINVAL: the dyld shared
+    // region already exceeds any useful virtual-size cap, so CPU /
+    // FSIZE / NPROC / NOFILE carry the bound.
+    (0, 30),               // RLIMIT_CPU seconds
+    (1, 64 * 1024 * 1024), // RLIMIT_FSIZE
+    (7, 64),               // RLIMIT_NPROC
+    (8, 256),              // RLIMIT_NOFILE
 ];
 #[cfg(target_os = "linux")]
 const RLIMITS: &[(i32, u64)] = &[
     (9, 512 * 1024 * 1024), // RLIMIT_AS
     (0, 30),                // RLIMIT_CPU seconds
     (1, 64 * 1024 * 1024),  // RLIMIT_FSIZE
+    (6, 64),                // RLIMIT_NPROC
     (7, 256),               // RLIMIT_NOFILE
 ];
 
 /// Sets the confined child's resource limits at startup, before any mode
 /// logic: the limits stop a fork bomb, a disk fill, and an fd storm without
-/// ever touching a legitimate program. Hard limits can only tighten, so a
-/// failure to set them is ignored — the parent's wall deadline remains the
-/// backstop.
-fn apply_rlimits() {
+/// ever touching a legitimate program. Hard limits can only tighten; a
+/// failure to set them is a sandbox-init failure (fail closed).
+fn apply_rlimits() -> Result<(), i32> {
     // SAFETY: setrlimit takes the libc rlimit layout (two u64 words) which
     // the repr(C) struct matches; the resource ids are the documented
-    // platform constants; `_` on failure keeps the parent's deadline as the
-    // backstop rather than failing the whole run.
+    // platform constants.
     for &(resource, value) in RLIMITS {
         let limit = sys::Rlimit {
             rlim_cur: value,
             rlim_max: value,
         };
         // SAFETY: setrlimit takes the address of a valid Rlimit for the
-        // named resource; failure keeps the parent's deadline as backstop.
-        let _ = unsafe { sys::setrlimit(resource, &limit) };
+        // named resource; a non-zero return is an init failure.
+        if unsafe { sys::setrlimit(resource, &limit) } != 0 {
+            eprintln!(
+                "rivect-sandbox-helper: setrlimit({resource}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return Err(EXIT_SANDBOX_INIT);
+        }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// fd sweep: close every inherited fd above stdio
+// ---------------------------------------------------------------------------
+
+/// Closes every inherited fd above stdio. Linux prefers `close_range` and
+/// walks `/proc/self/fd` if that syscall is missing; macOS walks `/dev/fd`
+/// and falls back to `F_MAXFD`.
+fn close_stray_fds() {
+    #[cfg(target_os = "linux")]
+    {
+        const SYS_CLOSE_RANGE: i64 = 436;
+        // SAFETY: close_range(3, UINT_MAX, 0) closes every fd above stdio;
+        // a negative return is ENOSYS or a similar miss, and the walk
+        // covers the table instead.
+        let closed = unsafe { sys::syscall(SYS_CLOSE_RANGE, 3i32, u32::MAX, 0u32) };
+        if closed == 0 {
+            return;
+        }
+        walk_fd_dir("/proc/self/fd");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if walk_fd_dir("/dev/fd") {
+            return;
+        }
+        const F_MAXFD: i32 = 51;
+        // SAFETY: F_MAXFD reports the largest open fd in this process;
+        // closing numbers above stdio is the documented unix contract.
+        let max = unsafe { sys::fcntl(0, F_MAXFD) };
+        if max > STDIO_TOP_FD {
+            for fd in (STDIO_TOP_FD + 1)..=max {
+                // SAFETY: those fds are the parent's strays, never owned
+                // handles of this freshly spawned child.
+                let _ = unsafe { sys::close(fd) };
+            }
+        }
+    }
+}
+
+/// Collects numeric fd names from a kernel fd directory, then closes each
+/// fd above stdio. Returns false when the directory cannot be opened.
+fn walk_fd_dir(dir: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let fds: Vec<i32> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+        })
+        .filter(|&fd| fd > STDIO_TOP_FD)
+        .collect();
+    for fd in fds {
+        // SAFETY: those fds are the parent's strays (plus the dirfd of
+        // the walk, which is closed after the names are collected).
+        let _ = unsafe { sys::close(fd) };
+    }
+    true
 }

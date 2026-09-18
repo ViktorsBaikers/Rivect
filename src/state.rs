@@ -2220,9 +2220,9 @@ impl TaskStore {
                 scope.to_string(),
             ))),
             Some((limit_units, spent, reserved)) => Ok(BudgetStatus {
-                limit_units: unsigned(limit_units),
-                spent: unsigned(spent),
-                reserved: unsigned(reserved),
+                limit_units: unsigned(limit_units)?,
+                spent: unsigned(spent)?,
+                reserved: unsigned(reserved)?,
             }),
         }
     }
@@ -2252,8 +2252,8 @@ impl TaskStore {
             ))),
             Some((state, bound, charged)) => Ok(BudgetReservation {
                 state: BudgetReservationState::from_db(&state)?,
-                bound: unsigned(bound),
-                charged: charged.map(unsigned),
+                bound: unsigned(bound)?,
+                charged: charged.map(unsigned).transpose()?,
             }),
         }
     }
@@ -2311,8 +2311,8 @@ impl TaskStore {
                 {
                     return Err(StoreError::InvalidInput(
                         InvalidCause::ConfirmedExceedsBound {
-                            confirmed: unsigned(delta),
-                            bound: unsigned(*bound),
+                            confirmed: unsigned(delta)?,
+                            bound: unsigned(*bound)?,
                         },
                     ));
                 }
@@ -2331,8 +2331,8 @@ impl TaskStore {
                     return Err(StoreError::Conflict(
                         ConflictCause::ChargeReservedBelowBound {
                             scope: scope.clone(),
-                            reserved: unsigned(reserved),
-                            bound: unsigned(*bound),
+                            reserved: unsigned(reserved)?,
+                            bound: unsigned(*bound)?,
                         },
                     ));
                 }
@@ -2363,13 +2363,18 @@ impl TaskStore {
         match row {
             Ok(None) => StoreError::NotFound(Missing::BudgetScope(scope.to_string())),
             Ok(Some((limit, spent, reserved))) => {
-                StoreError::Conflict(ConflictCause::BudgetExhausted {
-                    scope: scope.to_string(),
-                    spent: unsigned(spent),
-                    reserved: unsigned(reserved),
-                    bound,
-                    limit: unsigned(limit),
-                })
+                match (unsigned(spent), unsigned(reserved), unsigned(limit)) {
+                    (Ok(spent), Ok(reserved), Ok(limit)) => {
+                        StoreError::Conflict(ConflictCause::BudgetExhausted {
+                            scope: scope.to_string(),
+                            spent,
+                            reserved,
+                            bound,
+                            limit,
+                        })
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => error,
+                }
             }
             // The scope row itself failed to read: the storage error
             // wins over guessing an admission verdict.
@@ -2431,9 +2436,15 @@ fn budget_units_i64(units: u64) -> Result<i64> {
         )),
     }
 }
-/// Ledger columns are written non-negative; the read widens back.
-fn unsigned(value: i64) -> u64 {
-    value as u64
+/// Ledger columns are written non-negative; a negative value is corrupt
+/// storage, never a wrapping grant of `u64::MAX`.
+fn unsigned(value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_negative| {
+        storage(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("negative ledger column {value}"),
+        ))
+    })
 }
 
 impl Lifecycle {

@@ -94,12 +94,38 @@ pub fn set_nonblocking(fd: impl std::os::fd::AsFd) -> io::Result<()> {
 
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+const SIGKILL: i32 = 9;
 
 #[cfg(target_os = "macos")]
 const O_NONBLOCK: i32 = 0x0004;
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: i32 = 0o4000;
 
+/// Sends `SIGKILL` to the confined child's process group. The host sets
+/// the child as a group leader at spawn (`process_group(0)`), so this
+/// reaps grandchildren that inherited the group — `Child::kill` cannot.
+///
+/// # Errors
+/// Returns the OS error when the pid does not fit `pid_t` or `kill(2)`
+/// fails.
+pub fn kill_process_group(pid: u32) -> io::Result<()> {
+    let pgid = i32::try_from(pid).map_err(|_overflow| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confined child pid does not fit pid_t",
+        )
+    })?;
+    // SAFETY: `pid` is the confined child's process-group leader; a
+    // negative pid is the POSIX process-group form of `kill(2)`.
+    let rc = unsafe { kill(-pgid, SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
 }

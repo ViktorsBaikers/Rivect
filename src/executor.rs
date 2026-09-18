@@ -21,6 +21,7 @@ use std::fs::{File, Metadata};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -295,13 +296,51 @@ pub(crate) struct ObservedChild {
 }
 
 pub(crate) fn helper_path() -> Result<PathBuf, WorkerError> {
-    rivect_sandbox_helper::helper_binary()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })
+    require_helper_file(
+        rivect_sandbox_helper::helper_binary()
+            .map_err(|source| WorkerError::SandboxSpawnFailed { source })?,
+    )
+}
+
+fn require_helper_file(path: PathBuf) -> Result<PathBuf, WorkerError> {
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(WorkerError::SandboxUnavailable {
+            reason: format!("confined helper is not a file: {}", path.display()),
+        })
+    }
+}
+
+fn configure_confined_command(command: &mut Command) {
+    command.process_group(0).env_clear();
 }
 
 pub(crate) fn helper_launch_command() -> Result<Command, WorkerError> {
     let mut command = Command::new(helper_path()?);
-    command.arg("launch").arg("--").env_clear();
+    command.arg("launch").arg("--");
+    configure_confined_command(&mut command);
+    Ok(command)
+}
+
+/// Linux data-plane helper: Landlock is inside the binary; the parent
+/// supplies the same `unshare --net` / `setpriv --nnp --seccomp-filter`
+/// chain `run_confined` uses, with `--` before the helper so a path
+/// named like an option cannot be parsed as a launcher flag.
+#[cfg(target_os = "linux")]
+fn linux_wrapped_helper() -> Result<Command, WorkerError> {
+    let helper = helper_path()?;
+    let mut command = helper_launch_command()?;
+    command
+        .arg(linux::UNSHARE)
+        .arg("--net")
+        .arg("--")
+        .arg(linux::SETPRIV)
+        .arg("--nnp")
+        .arg("--seccomp-filter")
+        .arg(linux::net_deny_filter_file()?)
+        .arg("--")
+        .arg(&helper);
     Ok(command)
 }
 
@@ -310,13 +349,25 @@ pub(crate) fn helper_confined_command(
     mode: &str,
     profile: &str,
 ) -> Result<Command, WorkerError> {
-    let mut command = Command::new(helper_path()?);
-    command.arg("confined").arg(platform).arg(mode);
-    if !profile.is_empty() {
-        command.arg(profile);
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = linux_wrapped_helper()?;
+        command.arg("confined").arg(platform).arg(mode);
+        if !profile.is_empty() {
+            command.arg(profile);
+        }
+        Ok(command)
     }
-    command.env_clear();
-    Ok(command)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = Command::new(helper_path()?);
+        command.arg("confined").arg(platform).arg(mode);
+        if !profile.is_empty() {
+            command.arg(profile);
+        }
+        configure_confined_command(&mut command);
+        Ok(command)
+    }
 }
 
 fn pipe_nonblocking(fd: impl AsFd) -> Result<(), WorkerError> {
@@ -384,15 +435,24 @@ pub(crate) fn observe_confined_child(
         )?;
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The exited child's write ends are closed: every pipe
-                // drains to EOF — a single read would silently truncate
-                // output still buffered past one scratch chunk.
-                drain_pipe_to_eof(&mut stdout, &mut stdout_buf, &mut scratch, READ_MAX_CAP)?;
+                // The exited child's write ends should close: drain to EOF
+                // under the same wall deadline. A grandchild holding the
+                // pipe write end would otherwise loop on WouldBlock forever.
+                drain_pipe_to_eof(
+                    &mut stdout,
+                    &mut stdout_buf,
+                    &mut scratch,
+                    READ_MAX_CAP,
+                    deadline,
+                    child,
+                )?;
                 drain_pipe_to_eof(
                     &mut stderr,
                     &mut stderr_buf,
                     &mut scratch,
                     STDERR_RETAIN_BYTES,
+                    deadline,
+                    child,
                 )?;
                 return Ok(ObservedChild {
                     status,
@@ -402,8 +462,7 @@ pub(crate) fn observe_confined_child(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    drop(child.kill());
-                    drop(child.wait());
+                    terminate_confined_child(child);
                     return Err(WorkerError::ConfinedRunTimedOut);
                 }
                 std::thread::yield_now();
@@ -444,19 +503,35 @@ fn drain_nonblocking_pipe<T: Read>(
     }
 }
 
-/// Post-exit drain: the child's write end is closed, so reads return the
-/// buffered remainder then 0 — never a spurious WouldBlock. Loops until
-/// the pipe hits EOF (`drain_nonblocking_pipe` clears the slot on 0).
+/// Post-exit drain: the child's write end should close, so reads return
+/// the buffered remainder then 0. A grandchild holding the write end
+/// keeps `WouldBlock` forever — the wall deadline kills the process
+/// group and surfaces [`WorkerError::ConfinedRunTimedOut`].
 fn drain_pipe_to_eof<T: Read>(
     pipe: &mut Option<T>,
     retained: &mut Vec<u8>,
     scratch: &mut [u8],
     cap: usize,
+    deadline: Instant,
+    child: &mut Child,
 ) -> Result<(), WorkerError> {
     while pipe.is_some() {
+        if Instant::now() >= deadline {
+            terminate_confined_child(child);
+            return Err(WorkerError::ConfinedRunTimedOut);
+        }
         drain_nonblocking_pipe(pipe, retained, scratch, cap)?;
+        if pipe.is_some() {
+            std::thread::yield_now();
+        }
     }
     Ok(())
+}
+
+fn terminate_confined_child(child: &mut Child) {
+    drop(rivect_sandbox_helper::kill_process_group(child.id()));
+    drop(child.kill());
+    drop(child.wait());
 }
 
 pub(crate) fn helper_confined_read(
@@ -498,21 +573,27 @@ pub(crate) fn helper_probe_write(
     platform: &str,
     profile: &str,
     path: &Path,
-) -> Result<i32, WorkerError> {
-    let mut child = Command::new(helper_path()?)
+) -> Result<(), WorkerError> {
+    #[cfg(target_os = "linux")]
+    let mut command = linux_wrapped_helper()?;
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(helper_path()?);
+    #[cfg(not(target_os = "linux"))]
+    configure_confined_command(&mut command);
+    command
         .arg("probe-write")
         .arg(platform)
         .arg(profile)
         .arg(path)
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
-    Ok(helper_exit_code(&observed))
+    helper_probe_verdict(&observed, path)
 }
 
 fn helper_exit_code(observed: &ObservedChild) -> i32 {
@@ -522,16 +603,55 @@ fn helper_exit_code(observed: &ObservedChild) -> i32 {
         .unwrap_or(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
 }
 
-/// `launch` could not exec the sandbox mechanism: init failure, never an
-/// effect denial. Signal-killed children are left to the caller (timeout
+/// Maps a probe-write exit onto the same taxonomy as [`helper_io_bytes`]:
+/// init → [`WorkerError::SandboxUnavailable`], protocol/launch →
+/// [`WorkerError::SandboxSpawnFailed`] (wire `capability_unavailable`),
+/// data I/O → [`WorkerError::SandboxDenied`].
+fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), WorkerError> {
+    let code = helper_exit_code(observed);
+    let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
+    match code {
+        rivect_sandbox_helper::EXIT_OK => Ok(()),
+        rivect_sandbox_helper::EXIT_SANDBOX_INIT => {
+            Err(WorkerError::SandboxUnavailable { reason: stderr })
+        }
+        rivect_sandbox_helper::EXIT_PROTOCOL
+        | rivect_sandbox_helper::EXIT_LAUNCH_EXEC
+        | rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND => Err(WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other(stderr),
+        }),
+        _ => Err(WorkerError::SandboxDenied {
+            target: target.to_path_buf(),
+        }),
+    }
+}
+
+/// `launch` could not exec the sandbox mechanism: the helper itself
+/// reported init/exec/protocol failure. After a successful helper `exec`,
+/// util-linux `setpriv`/`unshare` reuse 126/127 (`errexec` on EACCES/ENOENT,
+/// `SETPRIV_EXIT_PRIVERR` on Landlock/seccomp apply). Those are confined-run
+/// outcomes — Landlock denying the deny-first control, or a probe shim
+/// naming a missing ABI — never helper init. Discriminate by the helper's
+/// stderr prefix. Signal-killed children are left to the caller (timeout
 /// already mapped [`WorkerError::ConfinedRunTimedOut`]).
 pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<WorkerError> {
+    let stderr = String::from_utf8_lossy(&observed.stderr);
+    let from_helper = stderr.contains("rivect-sandbox-helper:");
     match observed.status.code() {
+        Some(rivect_sandbox_helper::EXIT_SANDBOX_INIT) if from_helper => {
+            Some(WorkerError::SandboxUnavailable {
+                reason: stderr.into_owned(),
+            })
+        }
         Some(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
         | Some(rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND)
-        | Some(rivect_sandbox_helper::EXIT_PROTOCOL) => Some(WorkerError::SandboxSpawnFailed {
-            source: std::io::Error::other(String::from_utf8_lossy(&observed.stderr).into_owned()),
-        }),
+        | Some(rivect_sandbox_helper::EXIT_PROTOCOL)
+            if from_helper =>
+        {
+            Some(WorkerError::SandboxSpawnFailed {
+                source: std::io::Error::other(stderr.into_owned()),
+            })
+        }
         _ => None,
     }
 }
@@ -613,6 +733,12 @@ pub struct Executor<'a> {
 /// Inputs that cannot yet be observed at an admit stay conservative
 /// rather than granting.
 ///
+/// `in_trusted_scope` equals `in_grant_scope` because DEC-014 does not
+/// yet observe a separate trusted-folder signal. AcceptEdits reads are
+/// mode-level (Allow) and the worker still confines the path at execute;
+/// AcceptEdits writes consult `in_trusted_scope` together with a
+/// retained checkpoint keyed as `ret:checkpoint:{canonical_scope}`.
+///
 /// # Errors
 /// Returns [`ExecutorError::Store`] when the preapproval lookup fails and
 /// [`ExecutorError::Worker`] ([`WorkerError::OutsideScope`]) when the
@@ -635,9 +761,13 @@ pub fn admission_context(
         None => false,
     };
     let has_checkpoint = match scope_key.as_deref() {
-        Some(scope) => store.has_retained(scope)?,
+        Some(scope) => store.has_retained(&checkpoint_boundary_id(scope))?,
         None => false,
     };
+    let preapproval_target = target
+        .canonicalize()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| target.display().to_string());
     Ok(AdmissionContext {
         mode,
         in_grant_scope,
@@ -645,16 +775,28 @@ pub fn admission_context(
         in_trusted_scope: in_grant_scope,
         has_checkpoint,
         previously_approved: store
-            .is_preapproved(&preapproval_scope(class, &target.display().to_string()))?,
+            .is_preapproved(&preapproval_scope(class, &preapproval_target))?,
+        // Exec bounds are the grant scope. Egress has no observed bounds
+        // signal yet: a missing signal stays false so Auto cannot
+        // over-grant.
         within_declared_bounds: match class {
             EffectClass::Exec => in_grant_scope,
-            EffectClass::Egress => true,
-            EffectClass::Read | EffectClass::Write | EffectClass::Model | EffectClass::Control => {
-                false
-            }
+            EffectClass::Egress
+            | EffectClass::Read
+            | EffectClass::Write
+            | EffectClass::Model
+            | EffectClass::Control => false,
         },
         dry_run: false,
     })
+}
+
+/// Retain key for a permission checkpoint on one canonical grant scope.
+/// Production attempt evidence uses [`crate::verification::boundary_id`];
+/// this key is the scope-stable id `has_checkpoint` looks up.
+#[must_use]
+pub fn checkpoint_boundary_id(canonical_scope: &str) -> String {
+    format!("ret:checkpoint:{canonical_scope}")
 }
 
 fn budget_has_remaining(store: &TaskStore, scope: &str) -> Result<bool, ExecutorError> {
@@ -1193,5 +1335,57 @@ pub fn backend() -> &'static str {
     #[cfg(not(target_os = "linux"))]
     {
         macos::BACKEND
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObservedChild, WorkerError, helper_launch_init_failed, require_helper_file};
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::PathBuf;
+    use std::process::ExitStatus;
+
+    fn exited(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn a_missing_helper_path_is_sandbox_unavailable() {
+        let result = require_helper_file(PathBuf::from("/no/such/rivect-sandbox-helper"));
+        assert!(
+            matches!(result, Err(WorkerError::SandboxUnavailable { .. })),
+            "missing helper must surface SandboxUnavailable, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn setpriv_exec_denied_is_not_helper_init_failure() {
+        let observed = ObservedChild {
+            status: exited(126),
+            stdout: Vec::new(),
+            stderr:
+                b"setpriv: failed to execute /tmp/rivect-denied-exec/denied-exec: Permission denied"
+                    .to_vec(),
+        };
+        assert!(
+            helper_launch_init_failed(&observed).is_none(),
+            "Landlock-denied setpriv 126 must stay a confined-run outcome"
+        );
+    }
+
+    #[test]
+    fn helper_prefixed_launch_exec_is_init_failure() {
+        let observed = ObservedChild {
+            status: exited(126),
+            stdout: Vec::new(),
+            stderr: b"rivect-sandbox-helper: exec failed: No such file or directory".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_launch_init_failed(&observed),
+                Some(WorkerError::SandboxSpawnFailed { .. })
+            ),
+            "helper-prefixed 126 is launcher init failure"
+        );
     }
 }

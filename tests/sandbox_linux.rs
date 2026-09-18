@@ -214,7 +214,9 @@ fn denies_exec_outside_scope_at_the_os_boundary() {
     // executing a binary created at runtime stays denied under Landlock
     // on this container kernel (overlay-upper files never execute
     // beneath any allowance), so the admitted control leg grants the
-    // binary's own image tree instead of a runtime scope.
+    // binary's own image tree instead of a runtime scope. The denied
+    // control is the worker-owned copy of `true` — never a system
+    // binary such as agetty, whose existence is not the discriminator.
     let scope = Path::new("/usr/bin");
     let confinement = linux::exec_confinement(scope).expect("exec confinement");
     let admitted =
@@ -224,8 +226,8 @@ fn denies_exec_outside_scope_at_the_os_boundary() {
         "an in-scope exec must be admitted under the same confinement: {admitted:?}"
     );
 
-    let denied =
-        confined(&confinement, Path::new("/usr/sbin/agetty"), &[]).expect("confined exec run");
+    let control = linux::denied_exec_control().expect("owned denied-exec control");
+    let denied = confined(&confinement, &control, &[]).expect("confined exec run");
     assert!(
         !denied.exit_ok,
         "an exec outside the scope must be rejected by the OS boundary: {denied:?}"
@@ -1268,21 +1270,23 @@ fn six_permission_modes_gate_the_linux_worker() {
     // Live mode-carrying legs (DEC-016; DEC-018): every mode × class
     // pair runs the real admit→execute path with the mode injected at
     // admit, never admit_managed_write. The executor's own admission
-    // context derives in-grant-scope, exec/egress declared bounds, and
+    // context derives in-grant-scope, exec declared bounds, and
     // recorded preapprovals; budget and checkpoint stay unobserved
-    // unless tests seed them. Auto exec/egress therefore Allow; Auto
-    // write stays Ask without a budget. Allow cells cross the real
+    // unless tests seed them. Auto exec therefore Allows on an in-scope
+    // program; Auto egress Asks because no bounds signal exists yet.
+    // Auto write stays Ask without a budget. Allow cells cross the real
     // Linux worker — the read lands, the write lands, the confined exec
-    // runs, and the egress Allow cell meets the OS denial the boundary
-    // imposes (an egress target admits no filesystem scope, so it is
-    // out of scope by construction); ask and deny cells fail closed at
-    // admit and never invoke the worker.
+    // runs, and an egress Allow cell (preapproved-only / yolo) meets the
+    // OS denial the boundary imposes (an egress target admits no
+    // filesystem scope, so it is out of scope by construction); ask and
+    // deny cells fail closed at admit and never invoke the worker.
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("create matrix scope");
     let file = scope.join("target.txt");
+    std::fs::write(&file, b"scoped-by-landlock").expect("create matrix target");
     let grant = world.runtime.set_read_scope(scope, file.clone());
     let reads = Arc::new(AtomicU64::new(0));
     let writes = Arc::new(AtomicU64::new(0));
@@ -1314,8 +1318,20 @@ fn six_permission_modes_gate_the_linux_worker() {
         vec![Class::Egress],
     );
     for (class, target) in [
-        (Class::Read, file.display().to_string()),
-        (Class::Write, file.display().to_string()),
+        (
+            Class::Read,
+            file.canonicalize()
+                .expect("canonical read target")
+                .display()
+                .to_string(),
+        ),
+        (
+            Class::Write,
+            file.canonicalize()
+                .expect("canonical write target")
+                .display()
+                .to_string(),
+        ),
         (Class::Exec, exec_program.display().to_string()),
         (Class::Egress, egress_url.to_string()),
     ] {
@@ -1354,7 +1370,7 @@ fn six_permission_modes_gate_the_linux_worker() {
             ModeDecision::Allow,
             ModeDecision::Ask,
             ModeDecision::Allow,
-            ModeDecision::Allow,
+            ModeDecision::Ask,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -1799,7 +1815,14 @@ fn allow_mode_write_cells_execute_through_the_linux_worker() {
                 .owner
                 .store
                 .record_preapproval(
-                    &preapproval_scope(Class::Write, &file.display().to_string()),
+                    &preapproval_scope(
+                        Class::Write,
+                        &file
+                            .canonicalize()
+                            .expect("canonical write target")
+                            .display()
+                            .to_string(),
+                    ),
                     "human:matrix-write",
                     600,
                 )
@@ -1939,12 +1962,15 @@ fn run_confined_kills_a_hung_fifo_gate() {
 #[test]
 fn linux_exec_seccomp_denies_io_uring_ptrace_process_vm_pidfd_getfd_unshare_bpf_and_mmsg() {
     let numbers = linux::seccomp_denied_syscalls().expect("native seccomp table");
-    for n in [425u32, 426, 427, 438] {
-        assert!(numbers.contains(&n), "missing io_uring/pidfd_getfd {n}");
+    for n in [425u32, 426, 427, 434, 435, 438] {
+        assert!(
+            numbers.contains(&n),
+            "missing io_uring/pidfd_open/clone3/pidfd_getfd {n}"
+        );
     }
     let extras: &[u32] = match std::env::consts::ARCH {
-        "aarch64" => &[243, 269, 97, 117, 270, 271, 280],
-        "x86_64" => &[299, 307, 101, 272, 310, 311, 321],
+        "aarch64" => &[202, 207, 242, 243, 269, 97, 117, 268, 270, 271, 280],
+        "x86_64" => &[43, 45, 288, 299, 307, 101, 272, 308, 310, 311, 321],
         other => panic!("unexpected arch {other}"),
     };
     for n in extras {
@@ -1970,6 +1996,24 @@ fn landlock_scope_path_with_colon_does_not_break_path_beneath_rule() {
         .nth(2)
         .expect("remainder after two colons");
     assert_eq!(rest, expected, "{rule}");
+}
+
+#[test]
+fn confined_read_under_colon_scope_path_is_admitted() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "colon-scope-run");
+    let scope = fixture.path.join("has:colon");
+    std::fs::create_dir_all(&scope).expect("colon dir");
+    let file = scope.join("inside.txt");
+    std::fs::write(&file, b"colon-scope").expect("seed");
+    let file = file.canonicalize().expect("canon file");
+    let confinement = linux::read_confinement(&scope).expect("confinement");
+    let admitted = confined(&confinement, Path::new("/usr/bin/cat"), &[file.as_os_str()])
+        .expect("confined read under colon scope");
+    assert!(
+        admitted.exit_ok,
+        "colon in a Landlock scope path must not break the confined execute: {admitted:?}"
+    );
 }
 
 #[test]
@@ -2025,7 +2069,10 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
         .runtime
         .owner
         .store
-        .retain("checkpoint", &key)
+        .retain(
+            "checkpoint",
+            &rivect::executor::checkpoint_boundary_id(&key),
+        )
         .expect("retain checkpoint");
     let writes = Arc::new(AtomicU64::new(0));
     world.runtime.read_worker = Box::new(CountingLinuxWorker {

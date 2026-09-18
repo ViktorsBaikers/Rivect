@@ -2174,7 +2174,11 @@ fn preapproval_consent_is_scoped_by_effect_class() {
     let scope_root = world.root.join("scope");
     std::fs::create_dir_all(&scope_root).expect("scope dir");
     let target = fixture_target(&scope_root);
-    let scope = target.display().to_string();
+    let scope = target
+        .canonicalize()
+        .expect("canonical preapproval target")
+        .display()
+        .to_string();
     // A human consented to WRITE on this exact scope through the panel's
     // namespaced key.
     world

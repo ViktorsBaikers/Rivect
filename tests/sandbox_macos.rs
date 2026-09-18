@@ -664,17 +664,18 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
     // Live mode-carrying legs (DEC-016; DEC-017 D-003; DEC-018): every
     // mode × class pair runs the real admit→execute path with the mode
     // injected at admit, never admit_managed_write. The executor's own
-    // admission context now derives in-grant-scope, exec/egress declared
-    // bounds, and recorded preapprovals; budget and checkpoint stay
-    // unobserved unless tests seed them (T11). Auto exec/egress therefore
-    // Allow on an in-scope program / declared egress bound; Auto write
-    // stays Ask without a budget. Allow cells cross the real Seatbelt
-    // worker — the read lands, the write lands, the confined exec runs a
-    // binary copied into the scope (the exec profile's allowance is the
-    // scope subpath), and the egress Allow cell meets the OS denial the
-    // boundary imposes (an egress target admits no filesystem scope, so
-    // it is out of scope by construction); ask and deny cells fail closed
-    // at admit and never invoke the worker.
+    // admission context now derives in-grant-scope, exec declared bounds,
+    // and recorded preapprovals; budget and checkpoint stay unobserved
+    // unless tests seed them (T11). Auto exec therefore Allows on an
+    // in-scope program; Auto egress Asks because no bounds signal exists
+    // yet. Auto write stays Ask without a budget. Allow cells cross the
+    // real Seatbelt worker — the read lands, the write lands, the
+    // confined exec runs a binary copied into the scope (the exec
+    // profile's allowance is the scope subpath), and an egress Allow cell
+    // (preapproved-only / yolo) meets the OS denial the boundary imposes
+    // (an egress target admits no filesystem scope, so it is out of scope
+    // by construction); ask and deny cells fail closed at admit and never
+    // invoke the worker.
     ensure_helper();
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
@@ -682,6 +683,7 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("create matrix scope");
     let file = scope.join("target.txt");
+    std::fs::write(&file, b"scoped-by-seatbelt").expect("create matrix target");
     let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
     let reads = Arc::new(AtomicU64::new(0));
     let writes = Arc::new(AtomicU64::new(0));
@@ -716,8 +718,20 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
         vec![Class::Egress],
     );
     for (class, target) in [
-        (Class::Read, file.display().to_string()),
-        (Class::Write, file.display().to_string()),
+        (
+            Class::Read,
+            file.canonicalize()
+                .expect("canonical read target")
+                .display()
+                .to_string(),
+        ),
+        (
+            Class::Write,
+            file.canonicalize()
+                .expect("canonical write target")
+                .display()
+                .to_string(),
+        ),
         (Class::Exec, exec_program.display().to_string()),
         (Class::Egress, egress_url.to_string()),
     ] {
@@ -756,7 +770,7 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
             ModeDecision::Allow,
             ModeDecision::Ask,
             ModeDecision::Allow,
-            ModeDecision::Allow,
+            ModeDecision::Ask,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -1062,7 +1076,14 @@ fn allow_mode_write_cells_execute_through_the_seatbelt_worker() {
                 .owner
                 .store
                 .record_preapproval(
-                    &preapproval_scope(Class::Write, &file.display().to_string()),
+                    &preapproval_scope(
+                        Class::Write,
+                        &file
+                            .canonicalize()
+                            .expect("canonical write target")
+                            .display()
+                            .to_string(),
+                    ),
                     "human:matrix-write",
                     600,
                 )
@@ -1246,13 +1267,17 @@ fn passthrough_boundary_performs_no_in_scope_io() {
         "the probe must not create in-scope artifacts before proving enforcement: {strays:?}"
     );
 
-    // Control: the real boundary conforms and owns its probe artifact.
-    let artifact = macos::probe_write_conformance(&sandbox_exec(), &scope)
-        .expect("real write boundary conforms");
+    // Control: the real boundary conforms and leaves no leftover probe file.
+    macos::probe_write_conformance(&sandbox_exec(), &scope).expect("real write boundary conforms");
+    let leftovers: Vec<String> = std::fs::read_dir(&scope)
+        .expect("scope readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".rivect-write-probe"))
+        .collect();
     assert!(
-        artifact.is_file(),
-        "the probe owns its in-scope artifact: {}",
-        artifact.display()
+        leftovers.is_empty(),
+        "write conformance must unlink its probe artifact: {leftovers:?}"
     );
     macos::probe_read_conformance(&sandbox_exec(), &scope, &target)
         .expect("real read boundary conforms");
@@ -1534,7 +1559,10 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         .runtime
         .owner
         .store
-        .retain("checkpoint", &key)
+        .retain(
+            "checkpoint",
+            &rivect::executor::checkpoint_boundary_id(&key),
+        )
         .expect("retain checkpoint");
     let writes = Arc::new(AtomicU64::new(0));
     world.runtime.read_worker = Box::new(CountingSeatbeltWorker {

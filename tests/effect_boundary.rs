@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}";
     assert_eq!(rivect::resources::sanitize_status_cause(raw), "okhidbidi");
     let mut stream = OutputStream::new();
     stream.push_chunk("vis\u{200B}ible\u{202A}text".as_bytes());
