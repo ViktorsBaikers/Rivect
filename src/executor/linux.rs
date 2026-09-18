@@ -166,7 +166,7 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
             ),
         });
     }
-    let outcome = run_confined_exec(&launcher, &confinement, program, &[])?;
+    let outcome = run_confined(&launcher, &confinement, program, &[])?;
     expect_admitted(outcome, program)
 }
 
@@ -584,6 +584,7 @@ const CLONE_NEWTIME: u32 = 0x0000_0080;
 const CLONE_NEWNS: u32 = 0x0002_0000;
 const CLONE_NEWCGROUP: u32 = 0x0200_0000;
 const CLONE_NEWUTS: u32 = 0x0400_0000;
+const CLONE_NEWIPC: u32 = 0x0800_0000;
 const CLONE_NEWUSER: u32 = 0x1000_0000;
 const CLONE_NEWPID: u32 = 0x2000_0000;
 const CLONE_NEWNET: u32 = 0x4000_0000;
@@ -591,6 +592,7 @@ const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
     | CLONE_NEWNS
     | CLONE_NEWCGROUP
     | CLONE_NEWUTS
+    | CLONE_NEWIPC
     | CLONE_NEWUSER
     | CLONE_NEWPID
     | CLONE_NEWNET;
@@ -820,17 +822,20 @@ pub fn net_deny_filter_file() -> Result<PathBuf, WorkerError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfinedOutcome {
     pub exit_ok: bool,
+    pub exit_code: Option<i32>,
     pub stderr: String,
 }
 
 /// Runs one program under the confinement: `unshare --net` composes the
 /// network namespace, `setpriv --nnp --landlock-access fs` applies the
-/// ruleset (deny-by-default) with the confinement's allowances, and the
-/// exec and egress legs additionally load the seccomp net-deny filter.
-/// Arguments are passed separately, the child inherits no environment,
-/// and only the exit status decides success. The child's stdout goes to
-/// `/dev/null`; stderr is drained to EOF but only its first 64 KiB are
-/// retained.
+/// ruleset (deny-by-default) with the confinement's allowances, and every
+/// confined leg loads the seccomp net-deny filter. Helper-init
+/// classification still requires the helper prefix (pre-`execv`): a
+/// confined program that prints the prefix spoof as a non-line-start
+/// substring stays a confined-run outcome. Arguments are passed
+/// separately, the child inherits no environment, and only the exit
+/// status decides success. The child's stdout goes to `/dev/null`;
+/// stderr is drained to EOF but only its first 64 KiB are retained.
 ///
 /// # Errors
 /// Returns [`WorkerError::SandboxSpawnFailed`] when the launcher itself
@@ -843,18 +848,6 @@ pub fn run_confined(
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     run_confined_inner(launcher, confinement, program, args)
-}
-
-/// Admitted-exec leg: helper-init classification still requires the helper
-/// prefix (pre-`execv`). A confined program that prints the prefix spoof as
-/// a non-line-start substring stays a confined-run outcome.
-fn run_confined_exec(
-    launcher: &SandboxLauncher,
-    confinement: &Confinement,
-    program: &Path,
-    args: &[&OsStr],
-) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined(launcher, confinement, program, args)
 }
 
 fn run_confined_inner(
@@ -881,14 +874,13 @@ fn run_confined_inner(
             command.arg("--landlock-rule").arg(&rule);
         }
     }
-    // A program that runs inside the scope is untrusted, and pathname
-    // AF_UNIX sockets cross the network namespace: the seccomp net-deny
-    // is loaded wherever a confined program executes — the exec leg and
-    // the egress boundary — so the netns is never the egress carrier
-    // alone.
-    if matches!(confinement, Confinement::Egress | Confinement::Exec { .. }) {
-        command.arg("--seccomp-filter").arg(net_deny_filter_file()?);
-    }
+    // A program that runs inside the scope is untrusted: pathname AF_UNIX
+    // sockets cross the network namespace, and a Write-confined setsid
+    // grandchild leaves the process group and survives killpg. The seccomp
+    // net-deny (setsid/setpgid/clone NEW*) loads on every confined leg —
+    // Read, Write, Exec, and Egress — so the netns is never the egress
+    // carrier alone and killpg cannot be escaped from a write gate.
+    command.arg("--seccomp-filter").arg(net_deny_filter_file()?);
     command.arg("--").arg(program).args(args);
     let mut child = command
         .stdin(Stdio::null())
@@ -903,6 +895,7 @@ fn run_confined_inner(
     }
     Ok(ConfinedOutcome {
         exit_ok: observed.status.success(),
+        exit_code: observed.status.code(),
         stderr: String::from_utf8_lossy(&observed.stderr).into_owned(),
     })
 }
@@ -1205,8 +1198,9 @@ pub fn probe_write_conformance(
 #[cfg(test)]
 mod tests {
     use super::{
-        CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES,
-        landlock_rules, native_net_syscalls, net_deny_filter, sys_clone,
+        CLONE_NEW_NAMESPACE_FLAGS, CLONE_NEWIPC, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
+        Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES, landlock_rules, native_net_syscalls,
+        net_deny_filter, sys_clone,
     };
     use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
     use std::io::Read as _;
@@ -1332,6 +1326,21 @@ mod tests {
             "clone flag check loads seccomp_data.args[0]"
         );
         assert_eq!(
+            insn(clone_check + 2)?,
+            (0x54, 0, 0, CLONE_NEW_NAMESPACE_FLAGS),
+            "clone flags are AND-masked to the NEW* namespace bits"
+        );
+        assert_eq!(
+            insn(clone_check + 3)?,
+            (0x15, 1, 0, 0),
+            "no NEW* bits jump over EPERM to the allow tail"
+        );
+        assert_eq!(
+            insn(clone_check + 4)?,
+            (0x06, 0, 0, 0x0005_0001),
+            "any NEW* bit returns ERRNO|EPERM"
+        );
+        assert_eq!(
             insn(clone_check + 5)?,
             (0x06, 0, 0, 0x7FFF_0000),
             "the tail allows every other syscall"
@@ -1384,6 +1393,11 @@ mod tests {
             verdict(arch, clone, CLONE_NEWPID | 17),
             0x0005_0001,
             "clone(CLONE_NEWPID) is EPERM so a grandchild cannot leave the group"
+        );
+        assert_eq!(
+            verdict(arch, clone, CLONE_NEWIPC | 17),
+            0x0005_0001,
+            "clone(CLONE_NEWIPC) is EPERM so the filter matches its own NEW* mask"
         );
         assert_eq!(
             verdict(arch, clone, CLONE_NEWUSER | CLONE_NEWNS),

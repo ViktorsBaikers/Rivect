@@ -694,9 +694,10 @@ fn close_stray_fds() -> Result<(), i32> {
 /// Collects numeric fd names from a kernel fd directory, then closes each
 /// fd above stdio except the directory fd itself (`closedir` owns that
 /// close). Returns false when the directory cannot be opened, `readdir`
-/// fails (NULL with errno set — not EOF), or `closedir` fails. A vacuous
+/// fails (NULL with errno set — not EOF), `closedir` fails, or a dirent
+/// name is not UTF-8 or not a decimal fd (other than `.`/`..`). A vacuous
 /// walk (open succeeds, readdir errors, we still return true) would leave
-/// inherited fds alive.
+/// inherited fds alive; skipping unparseable names would hide the same.
 fn walk_fd_dir(dir: &str) -> bool {
     let Ok(dir_c) = CString::new(dir) else {
         return false;
@@ -728,14 +729,20 @@ fn walk_fd_dir(dir: &str) -> bool {
                 }
                 break;
             }
-            let Ok(name) = CStr::from_ptr((*entry).d_name.as_ptr()).to_str() else {
-                continue;
+            let name = match CStr::from_ptr((*entry).d_name.as_ptr()).to_str() {
+                Ok(name) => name,
+                Err(_) => {
+                    let _ = sys::closedir(dirp);
+                    return false;
+                }
             };
-            let Ok(fd) = name.parse::<i32>() else {
-                continue;
-            };
-            if fd > STDIO_TOP_FD && fd != dirfd {
-                fds.push(fd);
+            match fd_dirent_close_candidate(name, dirfd) {
+                Ok(Some(fd)) => fds.push(fd),
+                Ok(None) => {}
+                Err(()) => {
+                    let _ = sys::closedir(dirp);
+                    return false;
+                }
             }
         }
         if sys::closedir(dirp) != 0 {
@@ -746,6 +753,17 @@ fn walk_fd_dir(dir: &str) -> bool {
         }
     }
     true
+}
+
+/// `.`/`..` are skipped; a decimal fd name is a close candidate when it is
+/// above stdio and not the walk's dirfd. Any other spelling is a walk
+/// failure — an unparseable name is not silently ignored.
+fn fd_dirent_close_candidate(name: &str, dirfd: i32) -> Result<Option<i32>, ()> {
+    if name == "." || name == ".." {
+        return Ok(None);
+    }
+    let fd = name.parse::<i32>().map_err(|_parse| ())?;
+    Ok((fd > STDIO_TOP_FD && fd != dirfd).then_some(fd))
 }
 
 /// Writes this thread's errno. POSIX `readdir` uses a NULL return with
@@ -808,6 +826,24 @@ mod tests {
         let rejected = path.to_str().is_some_and(|name| !walk_fd_dir(name));
         drop(std::fs::remove_file(&path));
         assert!(rejected, "opendir on a regular file must fail closed");
+    }
+
+    #[test]
+    fn walk_fd_dir_rejects_unparseable_names() {
+        let dir = std::env::temp_dir().join(format!("rivect-fd-walk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create fd-walk dir");
+        std::fs::write(dir.join("not-an-fd"), b"x").expect("plant unparseable name");
+        let rejected = dir.to_str().is_some_and(|name| !walk_fd_dir(name));
+        drop(std::fs::remove_dir_all(&dir));
+        assert!(
+            rejected,
+            "a non-decimal dirent name must fail the walk, not skip"
+        );
+        assert_eq!(fd_dirent_close_candidate(".", 8), Ok(None));
+        assert_eq!(fd_dirent_close_candidate("..", 8), Ok(None));
+        assert_eq!(fd_dirent_close_candidate("9", 8), Ok(Some(9)));
+        assert_eq!(fd_dirent_close_candidate("8", 8), Ok(None));
+        assert_eq!(fd_dirent_close_candidate("not-an-fd", 8), Err(()));
     }
 
     #[test]

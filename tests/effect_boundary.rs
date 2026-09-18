@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}";
     assert_eq!(
         rivect::resources::sanitize_status_cause(raw),
         "okhidbiditag"
@@ -1756,6 +1756,38 @@ fn permission_panel_strips_cf_from_rendered_scope_and_initiator() {
         "/tmp/\u{202E}scope",
         "preapproval key keeps canonical path bytes"
     );
+}
+
+#[test]
+fn dock_and_composer_strip_cf_on_render() {
+    let mut view = initial_view();
+    view.dock = vec!["task t-1: blocked (out\u{200B}come)".to_string()];
+    view.composer = "go\u{202E}al".to_string();
+    let screen = rendered_text(&view);
+    assert!(screen.contains("task t-1: blocked (outcome)"), "{screen}");
+    assert!(screen.contains("> goal"), "{screen}");
+    assert!(!screen.contains('\u{200B}'));
+    assert!(!screen.contains('\u{202E}'));
+    assert_eq!(
+        view.composer, "go\u{202E}al",
+        "composer storage keeps the typed bytes; only the prompt is sanitized"
+    );
+}
+
+#[test]
+fn preapproval_scope_canonicalizes_egress_urls_like_paths() {
+    let mixed = rivect::policy::preapproval_scope(
+        rivect::contracts::EffectClass::Egress,
+        "HTTPS://Example.INVALID/matrix",
+    )
+    .expect("utf-8 egress key");
+    let folded = rivect::policy::preapproval_scope(
+        rivect::contracts::EffectClass::Egress,
+        "https://example.invalid:443/matrix",
+    )
+    .expect("utf-8 egress key");
+    assert_eq!(mixed, folded);
+    assert_eq!(mixed, "egress:https://example.invalid/matrix");
 }
 
 #[cfg(target_os = "linux")]

@@ -774,28 +774,29 @@ pub fn admission_context(
         Some(scope) => store.has_retained(&checkpoint_boundary_id(scope))?,
         None => false,
     };
+    let previously_approved = target
+        .to_str()
+        .and_then(|text| preapproval_scope(class, text))
+        .map(|key| store.is_preapproved(&key))
+        .transpose()?
+        .unwrap_or(false);
     Ok(AdmissionContext {
         mode,
         in_grant_scope,
         budget_remaining,
         in_trusted_scope: in_grant_scope,
         has_checkpoint,
-        previously_approved: target
-            .to_str()
-            .and_then(|text| preapproval_scope(class, text))
-            .map(|key| store.is_preapproved(&key))
-            .transpose()?
-            .unwrap_or(false),
-        // Exec bounds are the grant scope. Egress has no observed bounds
-        // signal yet: a missing signal stays false so Auto cannot
-        // over-grant.
+        previously_approved,
+        // Exec bounds are the grant scope. Egress has no filesystem
+        // scope: a recorded preapproval (canonical URL key) is the
+        // declared bound, so Auto Allow is reachable for a URL that
+        // was previously approved and stays Ask otherwise.
         within_declared_bounds: match class {
             EffectClass::Exec => in_grant_scope,
-            EffectClass::Egress
-            | EffectClass::Read
-            | EffectClass::Write
-            | EffectClass::Model
-            | EffectClass::Control => false,
+            EffectClass::Egress => previously_approved,
+            EffectClass::Read | EffectClass::Write | EffectClass::Model | EffectClass::Control => {
+                false
+            }
         },
         dry_run: false,
     })

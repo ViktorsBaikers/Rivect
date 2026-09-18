@@ -79,9 +79,11 @@ const HELPER_IO_WITNESS: &str = "RIVECT-HELPER-IO-WITNESS";
 /// stdin to stdout and appends [`HELPER_IO_WITNESS`]; `confined write`
 /// tees the payload to the inherited target fd and records its length at
 /// `write_witness`. `launch` execs the remainder so probes still hit the
-/// real Seatbelt binary.
+/// real Seatbelt binary. `probe-write` execs the real helper so write
+/// gates still open(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW).
 fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    let real_helper = rivect_sandbox_helper::helper_binary().expect("real helper for probe-write");
     let shim = dir.join("rivect-shim-helper");
     let payload = dir.join("shim-write-payload");
     let script = format!(
@@ -102,11 +104,12 @@ fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
          exit 0\n\
          fi\n\
          if [ \"$1\" = \"probe-write\" ]; then\n\
-         exit 0\n\
+         exec '{real}' \"$@\"\n\
          fi\n\
          exit 30\n",
         payload = payload.display(),
         witness = write_witness.display(),
+        real = real_helper.display(),
     );
     std::fs::write(&shim, script).expect("write helper I/O shim");
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
@@ -710,12 +713,14 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
     // admission context now derives in-grant-scope, exec declared bounds,
     // and recorded preapprovals; budget and checkpoint stay unobserved
     // unless tests seed them (T11). Auto exec therefore Allows on an
-    // in-scope program; Auto egress Asks because no bounds signal exists
-    // yet. Auto write stays Ask without a budget. Allow cells cross the
+    // in-scope program; Auto egress Allows when the URL was pre-approved
+    // (a recorded approval is the declared bound) and Asks otherwise.
+    // Auto write stays Ask without a budget. Allow cells cross the
     // real Seatbelt worker — the read lands, the write lands, the
     // confined exec runs a binary copied into the scope (the exec
     // profile's allowance is the scope subpath), and an egress Allow cell
-    // (preapproved-only / yolo) meets the OS denial the boundary imposes
+    // (auto-with-preapproval / preapproved-only / yolo) meets the OS
+    // denial the boundary imposes
     // (an egress target admits no filesystem scope, so it is out of scope
     // by construction); ask and deny cells fail closed at admit and never
     // invoke the worker.
@@ -817,7 +822,7 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
             ModeDecision::Allow,
             ModeDecision::Ask,
             ModeDecision::Allow,
-            ModeDecision::Ask,
+            ModeDecision::Allow,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -1532,7 +1537,76 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
             "shim write witness must match the payload length"
         );
     }
+    {
+        let (mut world, task, file, grant) = sandbox_world("helper-missing");
+        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
+            "/no/such/rivect-sandbox-helper",
+        )));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                rivect_sandbox_helper::override_helper_binary(None);
+            }
+        }
+        let _reset = Reset;
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file.clone(),
+                },
+                PermissionMode::Manual,
+            )
+            .expect("admit read");
+        let error = executor
+            .execute(&admitted)
+            .expect_err("a missing helper must fail closed, never host-read");
+        assert!(
+            matches!(
+                error,
+                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
+            ),
+            "missing helper is SandboxUnavailable, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("target survives"),
+            b"scoped-by-seatbelt",
+            "a missing helper must not host-read or mutate the target"
+        );
+    }
     let (mut world, task, file, grant) = sandbox_world("helper-data-plane");
+    {
+        let miss = std::process::Command::new(&helper)
+            .arg("not-a-mode")
+            .output()
+            .expect("real helper protocol miss");
+        let stderr = String::from_utf8_lossy(&miss.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with("rivect-sandbox-helper:")),
+            "the real helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
+        );
+        assert_eq!(
+            miss.status.code(),
+            Some(rivect_sandbox_helper::EXIT_PROTOCOL)
+        );
+        let name = helper
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            name.contains("rivect-sandbox-helper"),
+            "the confined child must be the helper binary, got {}",
+            helper.display()
+        );
+    }
     {
         let mut executor = Executor::new(
             &mut world.runtime.policy,
@@ -1666,10 +1740,10 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
     std::fs::create_dir_all(&scope).expect("scope");
     let file = scope.join("target.txt");
     std::fs::write(&file, b"seed").expect("seed");
-    let grant = world
-        .runtime
-        .policy
-        .grant_classes(scope.clone(), vec![Class::Read, Class::Write, Class::Exec]);
+    let grant = world.runtime.policy.grant_classes(
+        scope.clone(),
+        vec![Class::Read, Class::Write, Class::Exec, Class::Egress],
+    );
     let canonical = scope.canonicalize().expect("canonical scope");
     let key = canonical.display().to_string();
     world
@@ -1687,12 +1761,24 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
             &rivect::executor::checkpoint_boundary_id(&key),
         )
         .expect("retain checkpoint");
+    let egress_url = "https://example.invalid/t11";
+    world
+        .runtime
+        .owner
+        .store
+        .record_preapproval(
+            &preapproval_scope(Class::Egress, egress_url).expect("utf-8 egress preapproval"),
+            "human:t11-egress",
+            600,
+        )
+        .expect("record egress preapproval");
     let writes = Arc::new(AtomicU64::new(0));
+    let egresses = Arc::new(AtomicU64::new(0));
     world.runtime.read_worker = Box::new(CountingSeatbeltWorker {
         reads: Arc::new(AtomicU64::new(0)),
         writes: writes.clone(),
         execs: Arc::new(AtomicU64::new(0)),
-        egresses: Arc::new(AtomicU64::new(0)),
+        egresses: egresses.clone(),
     });
     let ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
@@ -1706,6 +1792,22 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
     assert!(ctx.in_trusted_scope);
     assert!(ctx.has_checkpoint);
     assert!(ctx.in_grant_scope);
+    let egress_ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Auto,
+        Class::Egress,
+        &scope,
+        Path::new(egress_url),
+    )
+    .expect("live egress context");
+    assert!(
+        egress_ctx.previously_approved,
+        "seeded URL preapproval is the declared egress bound"
+    );
+    assert!(
+        egress_ctx.within_declared_bounds,
+        "Auto egress Allow is reachable when the URL was pre-approved"
+    );
     for mode in [PermissionMode::Auto, PermissionMode::AcceptEdits] {
         std::fs::write(&file, b"seed").expect("reseed");
         let admitted = admit_live_cell(
@@ -1727,4 +1829,34 @@ fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_si
         );
     }
     assert_eq!(writes.load(Ordering::SeqCst), 2);
+    let egress_grant = world
+        .runtime
+        .policy
+        .grant_classes(scope, vec![Class::Egress]);
+    let admitted = admit_live_cell(
+        &mut world,
+        &task,
+        PermissionMode::Auto,
+        EffectRequest::Egress {
+            grant_id: egress_grant,
+            url: egress_url.to_string(),
+        },
+        ModeDecision::Allow,
+    )
+    .expect("Auto egress must Allow when the URL was pre-approved");
+    let error = execute_live_cell(&mut world, &admitted)
+        .expect_err("the egress Allow cell is os-denied by the boundary, never ambient");
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::SandboxDenied { ref target })
+                if target == &PathBuf::from(egress_url)
+        ),
+        "Auto egress allow denial: {error}"
+    );
+    assert_eq!(
+        egresses.load(Ordering::SeqCst),
+        1,
+        "Auto egress Allow reached the seatbelt worker once"
+    );
 }

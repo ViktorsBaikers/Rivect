@@ -1090,9 +1090,11 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 /// write must never admit an exec or egress on the same string.
 /// Filesystem classes canonicalize the path so `/var` and `/private/var`
 /// (and other alias spellings) share one row; a missing path keeps the
-/// caller spelling. Egress/model/control keys stay as given.
-/// Canonical path bytes that are not valid UTF-8 cannot be keyed without
-/// colliding via `display()` — skip preapproval (fail closed).
+/// caller spelling. Egress keys canonicalize the URL the same way (WHATWG
+/// preprocess + scheme-carried form): a recorded approval is the declared
+/// bound, and alias spellings of one URL share one row. Model/control keys
+/// stay as given. Canonical path bytes that are not valid UTF-8 cannot be
+/// keyed without colliding via `display()` — skip preapproval (fail closed).
 pub fn preapproval_scope(class: EffectClass, scope: &str) -> Option<String> {
     let scope = match class {
         EffectClass::Read | EffectClass::Write | EffectClass::Exec => {
@@ -1101,7 +1103,11 @@ pub fn preapproval_scope(class: EffectClass, scope: &str) -> Option<String> {
                 Err(_) => scope.to_string(),
             }
         }
-        EffectClass::Egress | EffectClass::Model | EffectClass::Control => scope.to_string(),
+        EffectClass::Egress => {
+            let cleaned = preprocess_egress_target(scope);
+            normalize_egress_url(&cleaned, SchemeKnowledge::Carried).unwrap_or(cleaned)
+        }
+        EffectClass::Model | EffectClass::Control => scope.to_string(),
     };
     Some(format!("{}:{scope}", class_key(class)))
 }

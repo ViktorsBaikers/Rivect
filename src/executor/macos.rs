@@ -457,6 +457,7 @@ pub fn egress_profile() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfinedOutcome {
     pub exit_ok: bool,
+    pub exit_code: Option<i32>,
     pub stderr: String,
     pub deprecation_notices: String,
 }
@@ -481,15 +482,6 @@ pub fn run_confined(
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     run_confined_inner(sandbox_exec, profile, program, args)
-}
-
-fn run_confined_exec(
-    sandbox_exec: &Path,
-    profile: &str,
-    program: &Path,
-    args: &[&OsStr],
-) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined(sandbox_exec, profile, program, args)
 }
 
 fn run_confined_inner(
@@ -522,6 +514,7 @@ fn run_confined_inner(
         split_deprecation_stderr(&String::from_utf8_lossy(&observed.stderr));
     Ok(ConfinedOutcome {
         exit_ok: observed.status.success(),
+        exit_code: observed.status.code(),
         stderr,
         deprecation_notices,
     })
@@ -646,7 +639,7 @@ pub fn exec_once_with(
         denied,
         "seatbelt exec boundary admitted the denied control /usr/bin/true",
     )?;
-    let outcome = run_confined_exec(sandbox_exec, &profile, program, &[])?;
+    let outcome = run_confined(sandbox_exec, &profile, program, &[])?;
     expect_admitted(outcome, program)
 }
 

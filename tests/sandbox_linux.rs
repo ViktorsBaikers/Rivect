@@ -58,9 +58,12 @@ const HELPER_IO_WITNESS: &str = "RIVECT-HELPER-IO-WITNESS";
 /// stdin to stdout and appends [`HELPER_IO_WITNESS`]; `confined write`
 /// tees the payload to the inherited target fd and records its length at
 /// `write_witness`. `launch` execs the remainder so probes still hit the
-/// real Landlock/seccomp chain.
+/// real Landlock/seccomp chain. `probe-write` execs the real helper so
+/// write gates still open(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW) — a stub
+/// `exit 0` would skip that exclusive-create proof.
 fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    let real_helper = rivect_sandbox_helper::helper_binary().expect("real helper for probe-write");
     let shim = dir.join("rivect-shim-helper");
     let payload = dir.join("shim-write-payload");
     let script = format!(
@@ -81,11 +84,12 @@ fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
          exit 0\n\
          fi\n\
          if [ \"$1\" = \"probe-write\" ]; then\n\
-         exit 0\n\
+         exec '{real}' \"$@\"\n\
          fi\n\
          exit 30\n",
         payload = payload.display(),
         witness = write_witness.display(),
+        real = real_helper.display(),
     );
     std::fs::write(&shim, script).expect("write helper I/O shim");
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
@@ -1316,13 +1320,15 @@ fn six_permission_modes_gate_the_linux_worker() {
     // context derives in-grant-scope, exec declared bounds, and
     // recorded preapprovals; budget and checkpoint stay unobserved
     // unless tests seed them. Auto exec therefore Allows on an in-scope
-    // program; Auto egress Asks because no bounds signal exists yet.
+    // program; Auto egress Allows when the URL was pre-approved (a
+    // recorded approval is the declared bound) and Asks otherwise.
     // Auto write stays Ask without a budget. Allow cells cross the real
     // Linux worker — the read lands, the write lands, the confined exec
-    // runs, and an egress Allow cell (preapproved-only / yolo) meets the
-    // OS denial the boundary imposes (an egress target admits no
-    // filesystem scope, so it is out of scope by construction); ask and
-    // deny cells fail closed at admit and never invoke the worker.
+    // runs, and an egress Allow cell (auto-with-preapproval /
+    // preapproved-only / yolo) meets the OS denial the boundary imposes
+    // (an egress target admits no filesystem scope, so it is out of
+    // scope by construction); ask and deny cells fail closed at admit
+    // and never invoke the worker.
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
@@ -1417,7 +1423,7 @@ fn six_permission_modes_gate_the_linux_worker() {
             ModeDecision::Allow,
             ModeDecision::Ask,
             ModeDecision::Allow,
-            ModeDecision::Ask,
+            ModeDecision::Allow,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -2018,6 +2024,57 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
             "shim write witness must match the payload length"
         );
     }
+    {
+        let mut world = support::open_world("helper-missing", None);
+        let session = world.open_session("helper-missing-session");
+        let task = world.create_task(&session, "helper-missing-task");
+        let scope = world.root.join("scope");
+        std::fs::create_dir_all(&scope).expect("scope");
+        let file = scope.join("target.txt");
+        std::fs::write(&file, b"scoped-by-landlock").expect("seed");
+        let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
+        world.runtime.read_worker = Box::new(linux::LinuxWorker);
+        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
+            "/no/such/rivect-sandbox-helper",
+        )));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                rivect_sandbox_helper::override_helper_binary(None);
+            }
+        }
+        let _reset = Reset;
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file.clone(),
+                },
+                PermissionMode::Manual,
+            )
+            .expect("admit read");
+        let error = executor
+            .execute(&admitted)
+            .expect_err("a missing helper must fail closed, never host-read");
+        assert!(
+            matches!(
+                error,
+                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
+            ),
+            "missing helper is SandboxUnavailable, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("target survives"),
+            b"scoped-by-landlock",
+            "a missing helper must not host-read or mutate the target"
+        );
+    }
     let mut world = support::open_world("helper-data-plane", None);
     let session = world.open_session("helper-data-plane-session");
     let task = world.create_task(&session, "helper-data-plane-task");
@@ -2027,6 +2084,32 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
     std::fs::write(&file, b"scoped-by-landlock").expect("seed");
     let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
     world.runtime.read_worker = Box::new(linux::LinuxWorker);
+    {
+        let miss = std::process::Command::new(&helper)
+            .arg("not-a-mode")
+            .output()
+            .expect("real helper protocol miss");
+        let stderr = String::from_utf8_lossy(&miss.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with("rivect-sandbox-helper:")),
+            "the real helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
+        );
+        assert_eq!(
+            miss.status.code(),
+            Some(rivect_sandbox_helper::EXIT_PROTOCOL)
+        );
+        let name = helper
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            name.contains("rivect-sandbox-helper"),
+            "the confined child must be the helper binary, got {}",
+            helper.display()
+        );
+    }
     {
         let mut executor = Executor::new(
             &mut world.runtime.policy,
@@ -2191,10 +2274,10 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
     std::fs::create_dir_all(&scope).expect("scope");
     let file = scope.join("target.txt");
     std::fs::write(&file, b"seed").expect("seed");
-    let grant = world
-        .runtime
-        .policy
-        .grant_classes(scope.clone(), vec![Class::Read, Class::Write]);
+    let grant = world.runtime.policy.grant_classes(
+        scope.clone(),
+        vec![Class::Read, Class::Write, Class::Egress],
+    );
     let canonical = scope.canonicalize().expect("canonical scope");
     let key = canonical.display().to_string();
     world
@@ -2212,12 +2295,24 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
             &rivect::executor::checkpoint_boundary_id(&key),
         )
         .expect("retain checkpoint");
+    let egress_url = "https://example.invalid/t11";
+    world
+        .runtime
+        .owner
+        .store
+        .record_preapproval(
+            &preapproval_scope(Class::Egress, egress_url).expect("utf-8 egress preapproval"),
+            "human:t11-egress",
+            600,
+        )
+        .expect("record egress preapproval");
     let writes = Arc::new(AtomicU64::new(0));
+    let egresses = Arc::new(AtomicU64::new(0));
     world.runtime.read_worker = Box::new(CountingLinuxWorker {
         reads: Arc::new(AtomicU64::new(0)),
         writes: writes.clone(),
         execs: Arc::new(AtomicU64::new(0)),
-        egresses: Arc::new(AtomicU64::new(0)),
+        egresses: egresses.clone(),
     });
     let ctx = rivect::executor::admission_context(
         &world.runtime.owner.store,
@@ -2230,6 +2325,22 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
     assert!(ctx.budget_remaining);
     assert!(ctx.in_trusted_scope);
     assert!(ctx.has_checkpoint);
+    let egress_ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Auto,
+        Class::Egress,
+        &scope,
+        Path::new(egress_url),
+    )
+    .expect("live egress context");
+    assert!(
+        egress_ctx.previously_approved,
+        "seeded URL preapproval is the declared egress bound"
+    );
+    assert!(
+        egress_ctx.within_declared_bounds,
+        "Auto egress Allow is reachable when the URL was pre-approved"
+    );
     for mode in [PermissionMode::Auto, PermissionMode::AcceptEdits] {
         std::fs::write(&file, b"seed").expect("reseed");
         let admitted = admit_live_cell(
@@ -2251,6 +2362,36 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
         );
     }
     assert_eq!(writes.load(Ordering::SeqCst), 2);
+    let egress_grant = world
+        .runtime
+        .policy
+        .grant_classes(scope, vec![Class::Egress]);
+    let admitted = admit_live_cell(
+        &mut world,
+        &task,
+        PermissionMode::Auto,
+        EffectRequest::Egress {
+            grant_id: egress_grant,
+            url: egress_url.to_string(),
+        },
+        ModeDecision::Allow,
+    )
+    .expect("Auto egress must Allow when the URL was pre-approved");
+    let error = execute_live_cell(&mut world, &admitted)
+        .expect_err("the egress Allow cell is os-denied by the boundary, never ambient");
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::SandboxDenied { ref target })
+                if target == &PathBuf::from(egress_url)
+        ),
+        "Auto egress allow denial: {error}"
+    );
+    assert_eq!(
+        egresses.load(Ordering::SeqCst),
+        1,
+        "Auto egress Allow reached the linux worker once"
+    );
 }
 
 #[test]
@@ -2271,6 +2412,27 @@ fn confined_exec_glibc_fork_works_because_clone3_returns_enosys() {
     assert!(
         outcome.exit_ok,
         "glibc fork must work under clone3 ENOSYS: {outcome:?}"
+    );
+}
+
+/// Linux `EPERM` — seccomp `RET_ERRNO|EPERM` and kernel namespace denials
+/// both surface as this errno.
+const EPERM: i32 = 1;
+
+fn assert_eperm(outcome: &ConfinedOutcome, what: &str) {
+    assert!(
+        !outcome.stderr.contains("failed to execute"),
+        "{what} must run under confinement, not be Landlock-denied: {outcome:?}"
+    );
+    assert!(!outcome.exit_ok, "{what} must fail closed, got {outcome:?}");
+    assert!(
+        outcome.exit_code == Some(EPERM)
+            || outcome.stderr.contains("errno=1")
+            || outcome
+                .stderr
+                .to_ascii_lowercase()
+                .contains("operation not permitted"),
+        "{what} must surface EPERM, got {outcome:?}"
     );
 }
 
@@ -2306,13 +2468,17 @@ fn confined_exec_denies_setsid_so_a_forked_grandchild_cannot_escape_killpg() {
         r#"
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 int main(void) {
     pid_t pid = fork();
     if (pid < 0) return 1;
     if (pid == 0) {
-        if (setsid() < 0) _exit(errno);
+        if (setsid() < 0) {
+            dprintf(2, "errno=%d\n", errno);
+            _exit(errno);
+        }
         _exit(0);
     }
     int st = 0;
@@ -2324,14 +2490,50 @@ int main(void) {
     );
     let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
     let outcome = confined(&confinement, &probe, &[]).expect("confined setsid probe");
-    assert!(
-        !outcome.stderr.contains("failed to execute"),
-        "the probe must run under exec confinement, not be Landlock-denied: {outcome:?}"
-    );
-    assert!(
-        !outcome.exit_ok,
-        "setsid after fork must fail closed (EPERM), got {outcome:?}"
-    );
+    assert_eperm(&outcome, "setsid after fork");
+}
+
+#[test]
+fn confined_read_and_write_load_seccomp_so_setsid_is_eperm() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "rw-setsid-eperm");
+    // `setsid -f -w` forks and waits for the child: the child calls
+    // setsid() (EPERM under seccomp) and exits 1, the parent returns that
+    // status — no custom binary needed, and /usr/bin/setsid already sits
+    // inside the read/write legs' system execute allowances.
+    let setsid = if Path::new("/usr/bin/setsid").is_file() {
+        Path::new("/usr/bin/setsid")
+    } else {
+        Path::new("/bin/setsid")
+    };
+    assert!(setsid.is_file(), "need setsid");
+    let true_bin = if Path::new("/usr/bin/true").is_file() {
+        "/usr/bin/true"
+    } else {
+        "/bin/true"
+    };
+    for (name, confinement) in [
+        (
+            "write",
+            linux::write_confinement(&fixture.path).expect("write confinement"),
+        ),
+        (
+            "read",
+            linux::read_confinement(&fixture.path).expect("read confinement"),
+        ),
+    ] {
+        let outcome = confined(
+            &confinement,
+            setsid,
+            &[
+                std::ffi::OsStr::new("-f"),
+                std::ffi::OsStr::new("-w"),
+                std::ffi::OsStr::new(true_bin),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("{name}-confined setsid must run: {error}"));
+        assert_eperm(&outcome, &format!("{name}-confined setsid"));
+    }
 }
 
 #[test]
@@ -2417,11 +2619,36 @@ int main(void) {
         "clone_newpid",
         r#"
 #define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 int main(void) {
     long r = syscall(SYS_clone, 0x20000000 | 17, 0);
-    if (r < 0) return 1;
+    if (r < 0) {
+        dprintf(2, "errno=%d\n", errno);
+        return errno;
+    }
+    if (r == 0) _exit(0);
+    return 0;
+}
+"#,
+    );
+    let newipc = compile_c_probe(
+        &fixture.path,
+        "clone_newipc",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    long r = syscall(SYS_clone, 0x08000000 | 17, 0);
+    if (r < 0) {
+        dprintf(2, "errno=%d\n", errno);
+        return errno;
+    }
     if (r == 0) _exit(0);
     return 0;
 }
@@ -2434,8 +2661,7 @@ int main(void) {
         "plain clone(SIGCHLD) must work: {fork_outcome:?}"
     );
     let newpid_outcome = confined(&confinement, &newpid, &[]).expect("confined clone NEWPID");
-    assert!(
-        !newpid_outcome.exit_ok,
-        "clone(CLONE_NEWPID) must be EPERM: {newpid_outcome:?}"
-    );
+    assert_eperm(&newpid_outcome, "clone(CLONE_NEWPID)");
+    let newipc_outcome = confined(&confinement, &newipc, &[]).expect("confined clone NEWIPC");
+    assert_eperm(&newipc_outcome, "clone(CLONE_NEWIPC)");
 }

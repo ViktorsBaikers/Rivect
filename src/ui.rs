@@ -414,9 +414,18 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             );
             next += 1;
         }
-        frame.render_widget(Paragraph::new(view.dock.join("\n")), chunks[next]);
         frame.render_widget(
-            Paragraph::new(format!("> {}", view.composer)),
+            Paragraph::new(
+                view.dock
+                    .iter()
+                    .map(|line| sanitize_status_cause(line))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            chunks[next],
+        );
+        frame.render_widget(
+            Paragraph::new(format!("> {}", sanitize_status_cause(&view.composer))),
             chunks[next + 1],
         );
         if let Some(panel) = &view.panel {
