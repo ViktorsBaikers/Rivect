@@ -756,13 +756,17 @@ fn walk_fd_dir(dir: &str) -> bool {
 }
 
 /// `.`/`..` are skipped; a decimal fd name is a close candidate when it is
-/// above stdio and not the walk's dirfd. Any other spelling is a walk
-/// failure — an unparseable name is not silently ignored.
+/// above stdio and not the walk's dirfd. Kernel fd names never have leading
+/// zeros, so a multi-digit name that starts with `0` is rejected. Any other
+/// spelling is a walk failure — an unparseable name is not silently ignored.
 fn fd_dirent_close_candidate(name: &str, dirfd: i32) -> Result<Option<i32>, ()> {
     if name == "." || name == ".." {
         return Ok(None);
     }
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if name.len() > 1 && name.starts_with('0') {
         return Err(());
     }
     let fd = name.parse::<i32>().map_err(|_parse| ())?;
@@ -849,6 +853,9 @@ mod tests {
         assert_eq!(fd_dirent_close_candidate("not-an-fd", 8), Err(()));
         assert_eq!(fd_dirent_close_candidate("-1", 8), Err(()));
         assert_eq!(fd_dirent_close_candidate("+3", 8), Err(()));
+        assert_eq!(fd_dirent_close_candidate("0", 8), Ok(None));
+        assert_eq!(fd_dirent_close_candidate("00", 8), Err(()));
+        assert_eq!(fd_dirent_close_candidate("08", 8), Err(()));
     }
 
     #[test]

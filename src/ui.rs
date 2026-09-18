@@ -312,10 +312,15 @@ impl PermissionPanel {
         )
     }
 
-    /// Scrollable body: the scope, the only freely wrapping part (the
-    /// request detail carrier arrives with the mode-selection carrier).
+    /// Scrollable body: the scope and the grant identity, the freely
+    /// wrapping part (the request detail carrier arrives with the
+    /// mode-selection carrier).
     fn body_text(&self) -> String {
-        format!("scope: {}", sanitize_status_cause(&self.scope))
+        format!(
+            "scope: {}\ngrant: {}",
+            sanitize_status_cause(&self.scope),
+            sanitize_status_cause(&self.grant_id),
+        )
     }
 
     /// Pinned footer: the actions line, then the one affordance hint.

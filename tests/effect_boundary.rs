@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}\u{2065}\u{0600}\u{0605}\u{06DD}\u{17B4}\u{17B5}";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}\u{2061}\u{E0020}tag\u{00AD}\u{180B}\u{E0001}\u{FFF9}\u{2065}\u{0600}\u{0605}\u{06DD}\u{17B4}\u{17B5}\u{070F}\u{0890}\u{0891}\u{08E2}\u{110BD}\u{1D173}\u{1D17A}";
     assert_eq!(
         rivect::resources::sanitize_status_cause(raw),
         "okhidbiditag"
@@ -1750,12 +1750,44 @@ fn permission_panel_strips_cf_from_rendered_scope_and_initiator() {
     let screen = rendered_text(&view);
     assert!(screen.contains("initiator: initiator"), "{screen}");
     assert!(screen.contains("scope: /tmp/scope"), "{screen}");
+    assert!(screen.contains("grant: grant-cf"), "{screen}");
     assert!(!screen.contains('\u{206A}'));
     assert!(!screen.contains('\u{202E}'));
     assert_eq!(
         view.panel.as_ref().expect("panel").scope,
         "/tmp/\u{202E}scope",
         "preapproval key keeps canonical path bytes"
+    );
+}
+
+#[test]
+fn permission_panel_displays_canonical_egress_url() {
+    let mut view = initial_view();
+    view.panel = Some(PermissionPanel::new(
+        rivect::policy::ModeDecision::Ask,
+        rivect::contracts::EffectClass::Egress,
+        "grant-egress-display",
+        "task-egress-fixture",
+        "2036-01-01T00:00:00Z",
+        "HTTPS://Example.INVALID:443/Callback?to=alice#frag",
+    ));
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("scope: https://example.invalid/Callback"),
+        "{screen}"
+    );
+    assert!(screen.contains("grant: grant-egress-display"), "{screen}");
+    assert!(
+        !screen.contains("HTTPS://Example.INVALID"),
+        "scheme and host must be lowercased: {screen}"
+    );
+    assert!(
+        !screen.contains(":443"),
+        "default https port must fold: {screen}"
+    );
+    assert!(
+        !screen.contains("to=alice") && !screen.contains("#frag"),
+        "query and fragment must drop: {screen}"
     );
 }
 
@@ -1791,6 +1823,26 @@ fn preapproval_scope_canonicalizes_egress_urls_like_paths() {
     .expect("utf-8 egress key");
     assert_eq!(mixed, folded);
     assert_eq!(mixed, "egress:g1:https://example.invalid/matrix");
+}
+
+#[test]
+fn preapproval_scope_rejects_empty_or_colliding_grant_ids() {
+    let scope = "/tmp/preapproval-grant-charset";
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "", scope)
+            .is_none(),
+        "empty grant_id must fail closed"
+    );
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant:a", scope)
+            .is_none(),
+        "a colon in grant_id would collide key fields"
+    );
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Write, "grant\na", scope)
+            .is_none(),
+        "a newline in grant_id must fail closed"
+    );
 }
 
 #[cfg(target_os = "linux")]

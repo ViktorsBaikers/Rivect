@@ -439,14 +439,8 @@ impl OutputStream {
     }
 }
 
-/// Strips Unicode format controls that reverse or hide status copy:
-/// U+202A–U+202E, U+2066–U+206F, U+200B–U+200F, plus BOM (U+FEFF),
-/// word joiner (U+2060), invisible operators (U+2061–U+2064), invisible
-/// plus (U+2065), Arabic number signs (U+0600–U+0605), Arabic end of ayah
-/// (U+06DD), Khmer inherent vowels (U+17B4–U+17B5), Arabic letter mark
-/// (U+061C), soft hyphen (U+00AD), Mongolian free variation selectors and
-/// vowel separator (U+180B–U+180E), interlinear annotation (U+FFF9–U+FFFB),
-/// and tag characters (U+E0000–U+E007F, including U+E0001).
+/// Strips known spoofing-relevant Unicode format controls that reverse
+/// or hide status copy, then maps remaining controls to caret or U+FFFD.
 pub fn sanitize_status_cause(cause: &str) -> String {
     let mut out = String::with_capacity(cause.len());
     for ch in cause.chars() {
@@ -465,6 +459,8 @@ pub fn sanitize_status_cause(cause: &str) -> String {
     out
 }
 
+/// Known spoofing-relevant Unicode format controls (Cf). This list is
+/// not exhaustive Cf coverage.
 fn is_stripped_format(ch: char) -> bool {
     matches!(
         ch,
@@ -472,11 +468,16 @@ fn is_stripped_format(ch: char) -> bool {
             | '\u{0600}'..='\u{0605}'
             | '\u{061C}'
             | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
             | '\u{17B4}'..='\u{17B5}'
             | '\u{180B}'..='\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
+            | '\u{110BD}'
+            | '\u{1D173}'..='\u{1D17A}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}'

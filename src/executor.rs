@@ -344,7 +344,10 @@ fn linux_wrapped_helper() -> Result<Command, WorkerError> {
     Ok(command)
 }
 
-pub(crate) fn helper_confined_command(
+/// Data-plane confined helper: Linux is `helper launch -- unshare --net --
+/// setpriv --nnp --seccomp-filter -- helper confined`; macOS is `helper
+/// confined` with in-helper `sandbox_init`.
+pub fn helper_confined_command(
     platform: &str,
     mode: &str,
     profile: &str,
@@ -615,18 +618,22 @@ fn helper_exit_code(observed: &ObservedChild) -> i32 {
 /// [`WorkerError::SandboxSpawnFailed`] (wire `capability_unavailable`),
 /// data I/O → [`WorkerError::SandboxDenied`]. Init/protocol/launch verdicts
 /// require the helper's line-start stderr prefix; a non-helper child cannot
-/// produce them.
+/// produce them. After that gate, only [`rivect_sandbox_helper::EXIT_OK`]
+/// and [`rivect_sandbox_helper::EXIT_DATA_IO`] are classified here; any
+/// other code — including a synthesized 126 from a signal-killed child —
+/// is a capability failure, never an enforcement denial.
 fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), WorkerError> {
     if let Some(err) = helper_launch_init_failed(observed) {
         return Err(err);
     }
+    let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match helper_exit_code(observed) {
         rivect_sandbox_helper::EXIT_OK => Ok(()),
-        // Data I/O and any remaining code are enforcement denials. Init,
-        // protocol, and launch already returned above, and only when the
-        // helper prefixed stderr.
-        _ => Err(WorkerError::SandboxDenied {
+        rivect_sandbox_helper::EXIT_DATA_IO => Err(WorkerError::SandboxDenied {
             target: target.to_path_buf(),
+        }),
+        _ => Err(WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other(stderr),
         }),
     }
 }
@@ -1352,13 +1359,20 @@ pub fn backend() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObservedChild, WorkerError, helper_launch_init_failed, require_helper_file};
+    use super::{
+        ObservedChild, WorkerError, helper_launch_init_failed, helper_probe_verdict,
+        require_helper_file,
+    };
     use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::ExitStatus;
 
     fn exited(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
+    }
+
+    fn signaled(signal: i32) -> ExitStatus {
+        ExitStatus::from_raw(signal)
     }
 
     #[test]
@@ -1411,6 +1425,52 @@ mod tests {
         assert!(
             helper_launch_init_failed(&observed).is_none(),
             "a substring that is not a full-line prefix must not spoof helper init"
+        );
+    }
+
+    #[test]
+    fn helper_probe_data_io_is_enforcement_denial() {
+        let target = Path::new("/tmp/rivect-probe-target");
+        let observed = ObservedChild {
+            status: exited(rivect_sandbox_helper::EXIT_DATA_IO),
+            stdout: Vec::new(),
+            stderr: b"rivect-sandbox-helper: probe-write open denied\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_probe_verdict(&observed, target),
+                Err(WorkerError::SandboxDenied { ref target }) if target == Path::new("/tmp/rivect-probe-target")
+            ),
+            "EXIT_DATA_IO is the confined write denial"
+        );
+    }
+
+    #[test]
+    fn helper_probe_unprefixed_or_signaled_is_spawn_failed() {
+        let target = Path::new("/tmp/rivect-probe-target");
+        let unprefixed = ObservedChild {
+            status: exited(rivect_sandbox_helper::EXIT_PROTOCOL),
+            stdout: Vec::new(),
+            stderr: b"not the helper prefix\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_probe_verdict(&unprefixed, target),
+                Err(WorkerError::SandboxSpawnFailed { .. })
+            ),
+            "an unprefixed protocol miss is a capability failure, not a denial"
+        );
+        let killed = ObservedChild {
+            status: signaled(9),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(
+            matches!(
+                helper_probe_verdict(&killed, target),
+                Err(WorkerError::SandboxSpawnFailed { .. })
+            ),
+            "a signal-killed probe child is a capability failure, not a denial"
         );
     }
 }

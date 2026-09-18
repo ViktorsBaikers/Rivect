@@ -18,6 +18,7 @@ use rivect::contracts::ErrorCode;
 use rivect::executor::macos::{self, ConfinedOutcome, ReadObservation, SANDBOX_EXEC, WorkerError};
 use rivect::executor::{
     AdmittedEffect, EffectOutcome, EffectRequest, Executor, ExecutorError, ReadWorker,
+    helper_confined_command,
 };
 use rivect::policy::{AdmissionContext, ModeDecision, PermissionMode, Policy, preapproval_scope};
 use std::net::TcpListener;
@@ -1589,48 +1590,37 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
     }
     let (mut world, task, file, grant) = sandbox_world("helper-data-plane");
     {
-        let helper_parent_dir = helper.parent().expect("helper parent dir");
-        // exec_profile alone aborts the Rust helper at stack-guard mmap.
-        // /dev and sysctl-read are the extra allowances the read/write
-        // profiles already carry so the helper can initialize and parse argv.
-        let mut profile = macos::exec_profile(helper_parent_dir).expect("exec profile");
-        profile.push_str("    (allow file-read* (subpath \"/dev\"))\n");
-        profile.push_str("    (allow sysctl-read)\n");
-        let outcome = macos::run_confined(
-            &sandbox_exec(),
-            &profile,
-            &helper,
-            &[std::ffi::OsStr::new("not-a-mode")],
+        let scope = file.parent().expect("scope");
+        let child = helper_confined_command(
+            "macos",
+            "not-a-mode",
+            &macos::read_profile(scope).expect("read profile"),
+        )
+        .expect("data-plane confined command")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn data-plane confined helper");
+        let output = child
+            .wait_with_output()
+            .expect("wait data-plane confined helper");
+        assert_eq!(
+            output.status.code(),
+            Some(rivect_sandbox_helper::EXIT_PROTOCOL),
+            "confined helper protocol miss: {output:?}"
         );
-        match outcome {
-            Ok(outcome) => {
-                assert_eq!(
-                    outcome.exit_code,
-                    Some(rivect_sandbox_helper::EXIT_PROTOCOL),
-                    "confined helper protocol miss: {outcome:?}"
-                );
-                assert!(
-                    outcome
-                        .stderr
-                        .lines()
-                        .any(|line| line.starts_with("rivect-sandbox-helper:")),
-                    "the confined helper prefixes protocol misses; a host or shim cannot forge that: {:?}",
-                    outcome.stderr
-                );
-            }
-            Err(WorkerError::SandboxSpawnFailed { source }) => {
-                let stderr = source.to_string();
-                assert!(
-                    stderr
-                        .lines()
-                        .any(|line| line.starts_with("rivect-sandbox-helper:")),
-                    "the confined helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
-                );
-            }
-            other => panic!(
-                "confined helper protocol miss must be EXIT_PROTOCOL or classified spawn-failed, got {other:?}"
-            ),
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with("rivect-sandbox-helper:")),
+            "the confined helper prefixes protocol misses; a host or shim cannot forge that: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("exec failed") && !stderr.contains("failed to execute"),
+            "a launch-exec failure is 126/127, not a confined protocol miss: {stderr:?}"
+        );
         let name = helper
             .file_name()
             .and_then(|name| name.to_str())

@@ -2239,6 +2239,60 @@ fn preapproval_consent_is_scoped_by_effect_class() {
 }
 
 #[test]
+fn preapproval_consent_is_scoped_by_grant_id() {
+    let mut world = open_world("preapproval-grants", None);
+    let scope_root = world.root.join("scope");
+    std::fs::create_dir_all(&scope_root).expect("scope dir");
+    let target = fixture_target(&scope_root);
+    let path = target
+        .canonicalize()
+        .expect("canonical preapproval target")
+        .display()
+        .to_string();
+    let grant_a = "grant-a";
+    let grant_b = "grant-b";
+    world
+        .runtime
+        .owner
+        .store
+        .record_preapproval(
+            &preapproval_scope(EffectClass::Write, grant_a, &path)
+                .expect("utf-8 preapproval scope"),
+            "human:test",
+            600,
+        )
+        .expect("record write preapproval under grant A");
+
+    let grant_b_ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Manual,
+        EffectClass::Write,
+        grant_b,
+        &scope_root,
+        &target,
+    )
+    .expect("grant B context");
+    assert!(
+        !grant_b_ctx.previously_approved,
+        "a write consent on grant A must not preapprove grant B on the same class+path"
+    );
+
+    let grant_a_ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Manual,
+        EffectClass::Write,
+        grant_a,
+        &scope_root,
+        &target,
+    )
+    .expect("grant A context");
+    assert!(
+        grant_a_ctx.previously_approved,
+        "grant A must still see its own write preapproval"
+    );
+}
+
+#[test]
 fn manual_write_admit_fails_closed_with_mode_ask() {
     let mut world = open_world("mode-ask-admit", None);
     let session = world.open_session("mode-ask-session");

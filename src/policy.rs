@@ -1096,7 +1096,13 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 /// bound, and alias spellings of one URL share one row. Model/control keys
 /// stay as given. Canonical path bytes that are not valid UTF-8 cannot be
 /// keyed without colliding via `display()` — skip preapproval (fail closed).
+/// `grant_id` must be non-empty and must not contain `:` or `\n` (a colon
+/// would collide key fields). Policy mints `grant-{n}`, so this filter
+/// never triggers in production.
 pub fn preapproval_scope(class: EffectClass, grant_id: &str, scope: &str) -> Option<String> {
+    if grant_id.is_empty() || grant_id.contains(':') || grant_id.contains('\n') {
+        return None;
+    }
     let scope = match class {
         EffectClass::Read | EffectClass::Write | EffectClass::Exec => {
             match Path::new(scope).canonicalize() {
