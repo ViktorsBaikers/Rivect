@@ -1973,3 +1973,97 @@ fn execute_time_cancel_is_cancelled_error_for_every_effect_class() {
         }
     }
 }
+
+/// Execute-entry cancel is proven above: cancel between admit and
+/// execute returns `Err(Cancelled)` for every effect class.
+///
+/// A true mid-I/O `Err(Cancelled)` is not a distinct `execute` stage.
+/// `execute` rechecks cancel once before the worker and does not poll it
+/// during confined I/O, and `ReadWorker::read_once` rejects FIFOs as
+/// non-regular before the confined gate, so an in-flight FIFO cannot be
+/// admitted as a read effect. In-flight kill of a confined child blocked
+/// on I/O is the wall-deadline path (`run_confined_kills_a_hung_fifo_gate`
+/// in the platform sandbox suites): `ConfinedRunTimedOut` after
+/// `terminate_confined_child` SIGKILLs the process group — the child is
+/// dead, not merely denied.
+#[cfg(unix)]
+#[test]
+fn execute_entry_cancel_is_cancelled_in_flight_kill_is_hung_fifo_deadline() {
+    use rivect::policy::PermissionMode;
+    let (mut world, session, task, file, grant) = managed_write_fixture("execute-entry-cancel-pin");
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file,
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("admit")
+    };
+    world
+        .runtime
+        .owner
+        .store
+        .cancel_task(&session, &task, 1, Some("execute-entry pin"))
+        .expect("cancel");
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute(&admitted)
+            .expect_err("execute-entry cancel")
+    };
+    assert!(
+        matches!(error, ExecutorError::Cancelled),
+        "execute-entry cancel must be Cancelled, got {error}"
+    );
+
+    let fixture = TempTree::new("hung-fifo-deadline");
+    let fifo = fixture.path.join("hung.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+    let error = hung_fifo_confined_timeout(&fixture.path, &fifo);
+    assert!(
+        matches!(error, WorkerError::ConfinedRunTimedOut),
+        "in-flight kill is the hung-FIFO deadline, not a mid-I/O Cancelled: {error}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn hung_fifo_confined_timeout(scope: &Path, fifo: &Path) -> WorkerError {
+    use rivect::executor::linux;
+    linux::run_confined(
+        &linux::SandboxLauncher::default(),
+        &linux::read_confinement(scope).expect("read confinement"),
+        Path::new("/bin/cat"),
+        &[fifo.as_os_str()],
+    )
+    .expect_err("a hung fifo must hit the wall deadline")
+}
+
+#[cfg(target_os = "macos")]
+fn hung_fifo_confined_timeout(scope: &Path, fifo: &Path) -> WorkerError {
+    use rivect::executor::macos::{self, SANDBOX_EXEC};
+    let fifo = fifo.canonicalize().expect("canonical fifo");
+    macos::run_confined(
+        Path::new(SANDBOX_EXEC),
+        &macos::read_profile(scope).expect("read profile"),
+        Path::new("/bin/cat"),
+        &[fifo.as_os_str()],
+    )
+    .expect_err("a hung fifo must hit the wall deadline")
+}

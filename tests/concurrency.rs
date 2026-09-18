@@ -3687,36 +3687,68 @@ fn answer_through_dispatch_runtime_request_drives_a_decision_step_without_a_dire
 #[test]
 fn budget_charge_rejects_confirmed_above_bound_and_charge_sql_requires_reserved_ge_bound() {
     let root = support::temp_dir("budget-charge-guards");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
-    store.open_budget("root", 8).expect("root opens");
-    store
-        .budget_reserve("res-over", &["root"], 4)
-        .expect("reserve bound 4");
-    let over = store
-        .budget_charge("res-over", Some(5))
-        .expect_err("confirmed above bound");
+    let path = root.join("state.db");
+    {
+        let mut store = TaskStore::open(&path).expect("store opens");
+        store.open_budget("root", 8).expect("root opens");
+        store
+            .budget_reserve("res-over", &["root"], 4)
+            .expect("reserve bound 4");
+        let over = store
+            .budget_charge("res-over", Some(5))
+            .expect_err("confirmed above bound");
+        assert!(
+            matches!(
+                over,
+                StoreError::InvalidInput(InvalidCause::ConfirmedExceedsBound {
+                    confirmed: 5,
+                    bound: 4
+                })
+            ),
+            "{over}"
+        );
+        store
+            .budget_reserve("res-fit", &["root"], 3)
+            .expect("second reserve");
+        store
+            .budget_charge("res-fit", Some(3))
+            .expect("confirmed at bound spends when reserved covers the bound");
+        assert_eq!(
+            store.budget_status("root").expect("status"),
+            BudgetStatus {
+                limit_units: 8,
+                spent: 3,
+                reserved: 4
+            }
+        );
+    }
+    // CHARGE_BUDGET_SCOPE is `UPDATE ... WHERE reserved >= bound`: a live
+    // reservation whose scope reserved units sit below its bound must
+    // match zero rows and surface ChargeReservedBelowBound, not spend.
+    // The public reserve path always increments reserved by the bound, so
+    // the undercut is a ledger repair — the same shape the SQL CHECK
+    // exists to refuse.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw connection");
+        conn.execute(
+            "UPDATE budget_scopes SET reserved = 1 WHERE scope = ?1",
+            rusqlite::params!["root"],
+        )
+        .expect("undercut reserved below the live reservation bound");
+    }
+    let mut store = TaskStore::open(&path).expect("reopen");
+    let under = store
+        .budget_charge("res-over", Some(1))
+        .expect_err("charge needs reserved >= bound");
     assert!(
         matches!(
-            over,
-            StoreError::InvalidInput(InvalidCause::ConfirmedExceedsBound {
-                confirmed: 5,
-                bound: 4
-            })
+            under,
+            StoreError::Conflict(ConflictCause::ChargeReservedBelowBound {
+                reserved: 1,
+                bound: 4,
+                ref scope
+            }) if scope == "root"
         ),
-        "{over}"
-    );
-    store
-        .budget_reserve("res-fit", &["root"], 3)
-        .expect("second reserve");
-    store
-        .budget_charge("res-fit", Some(3))
-        .expect("confirmed at bound spends when reserved covers the bound");
-    assert_eq!(
-        store.budget_status("root").expect("status"),
-        BudgetStatus {
-            limit_units: 8,
-            spent: 3,
-            reserved: 4
-        }
+        "{under}"
     );
 }

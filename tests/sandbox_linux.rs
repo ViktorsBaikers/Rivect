@@ -2263,6 +2263,36 @@ fn linux_exec_seccomp_denies_io_uring_ptrace_process_vm_pidfd_getfd_unshare_bpf_
     }
 }
 
+/// Table census above pins the denylist numbers. This probe is the OS
+/// enforcement: a confined child that invokes a denied syscall must get
+/// EPERM from the filter, not a table membership check.
+#[test]
+fn confined_exec_denies_unshare_newuser_with_eperm() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "unshare-newuser-eperm");
+    let probe = compile_c_probe(
+        &fixture.path,
+        "newuser_probe",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+    if (unshare(CLONE_NEWUSER) < 0) {
+        dprintf(2, "errno=%d\n", errno);
+        return errno;
+    }
+    return 0;
+}
+"#,
+    );
+    let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
+    let outcome = confined(&confinement, &probe, &[]).expect("confined unshare probe");
+    assert_eperm(&outcome, "unshare(CLONE_NEWUSER)");
+}
+
 #[test]
 fn landlock_scope_path_with_colon_does_not_break_path_beneath_rule() {
     let fixture = TempTree::new("sandbox-linux", "colon-scope");
