@@ -441,8 +441,9 @@ impl OutputStream {
 
 /// Strips Unicode format controls that reverse or hide status copy:
 /// U+202A–U+202E, U+2066–U+206F, U+200B–U+200F, plus BOM (U+FEFF),
-/// word joiner (U+2060), Arabic letter mark (U+061C), and Mongolian
-/// vowel separator (U+180E).
+/// word joiner (U+2060), invisible operators (U+2061–U+2064), Arabic
+/// letter mark (U+061C), Mongolian vowel separator (U+180E), and tag
+/// characters (U+E0020–U+E007F).
 pub fn sanitize_status_cause(cause: &str) -> String {
     let mut out = String::with_capacity(cause.len());
     for ch in cause.chars() {
@@ -468,8 +469,9 @@ fn is_stripped_format(ch: char) -> bool {
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{206F}'
             | '\u{FEFF}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }

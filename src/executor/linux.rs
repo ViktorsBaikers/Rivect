@@ -506,7 +506,10 @@ pub fn landlock_rules(confinement: &Confinement) -> Vec<String> {
                 .collect();
             rules.extend(loader_rules("read-file"));
             rules.extend(loader_rules("execute"));
-            rules.push(scope_rule("execute", scope));
+            // execve requires Landlock read-file as well as execute on
+            // the program; execute-only on the scope cannot load a
+            // binary that lives outside /usr (SYSTEM_READ_RULES).
+            rules.push(scope_rule("execute,read-file", scope));
             rules
         }
         Confinement::Egress => Vec::new(),
@@ -564,6 +567,37 @@ const SECCOMP_RET_ERRNO_ENOSYS: u32 = 0x0005_0026;
 /// `clone3` — same number on x86_64 and aarch64.
 const SYS_CLONE3: u32 = 435;
 
+/// `clone` — architecture-specific; judged by flags, not denied by number,
+/// so glibc `fork` (SIGCHLD) still works after `clone3` returns ENOSYS.
+fn sys_clone() -> Option<u32> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(220),
+        "x86_64" => Some(56),
+        _ => None,
+    }
+}
+
+/// Namespace bits `clone` must not be allowed to set: a NEWPID/NEWUSER
+/// child leaves the host's process group and survives `killpg`. SIGCHLD
+/// and thread flags stay allowed so ordinary `fork` works.
+const CLONE_NEWTIME: u32 = 0x0000_0080;
+const CLONE_NEWNS: u32 = 0x0002_0000;
+const CLONE_NEWCGROUP: u32 = 0x0200_0000;
+const CLONE_NEWUTS: u32 = 0x0400_0000;
+const CLONE_NEWUSER: u32 = 0x1000_0000;
+const CLONE_NEWPID: u32 = 0x2000_0000;
+const CLONE_NEWNET: u32 = 0x4000_0000;
+const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
+    | CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
+
+/// Offset of `seccomp_data.args[0]` (low 32 bits of the first syscall arg).
+const SECCOMP_DATA_ARGS0_OFFSET: u32 = 16;
+
 /// `SECCOMP_RET_ALLOW` — every syscall outside the deny list runs.
 const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
 
@@ -598,30 +632,84 @@ pub fn seccomp_denied_syscalls() -> Option<&'static [u32]> {
 
 fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
     match std::env::consts::ARCH {
-        "aarch64" => Some((
-            AUDIT_ARCH_AARCH64,
-            &[
-                198, 199, 200, 201, 202, 203, 206, 207, 211, 212,
-                242, // socket socketpair bind listen accept connect sendto recvfrom sendmsg recvmsg accept4
-                243, 269, // recvmmsg sendmmsg
-                97, 117, 154, 157, 268, 270, 271,
-                280, // unshare ptrace setpgid setsid setns process_vm_* bpf
-                425, 426, 427, 434, 438,        // io_uring_* pidfd_open pidfd_getfd
-                SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
-            ],
-        )),
-        "x86_64" => Some((
-            AUDIT_ARCH_X86_64,
-            &[
-                41, 42, 43, 44, 45, 46, 47, 49, 50, 53,
-                288, // socket connect accept sendto recvfrom sendmsg recvmsg bind listen socketpair accept4
-                299, 307, // recvmmsg sendmmsg
-                101, 109, 112, 272, 308, 310, 311,
-                321, // ptrace setpgid setsid unshare setns process_vm_* bpf
-                425, 426, 427, 434, 438,        // io_uring_* pidfd_open pidfd_getfd
-                SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
-            ],
-        )),
+        "aarch64" => {
+            const SYS_BIND: u32 = 200;
+            const SYS_LISTEN: u32 = 201;
+            const SYS_RECVMSG: u32 = 212;
+            const SYS_SETPGID: u32 = 154;
+            const SYS_SETSID: u32 = 157;
+            Some((
+                AUDIT_ARCH_AARCH64,
+                &[
+                    198,
+                    199,
+                    SYS_BIND,
+                    SYS_LISTEN,
+                    202,
+                    203,
+                    206,
+                    207,
+                    211,
+                    SYS_RECVMSG,
+                    242, // socket socketpair bind listen accept connect sendto recvfrom sendmsg recvmsg accept4
+                    243,
+                    269, // recvmmsg sendmmsg
+                    97,
+                    117,
+                    SYS_SETPGID,
+                    SYS_SETSID,
+                    268,
+                    270,
+                    271,
+                    280, // unshare ptrace setpgid setsid setns process_vm_* bpf
+                    425,
+                    426,
+                    427,
+                    434,
+                    438,        // io_uring_* pidfd_open pidfd_getfd
+                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
+                ],
+            ))
+        }
+        "x86_64" => {
+            const SYS_BIND: u32 = 49;
+            const SYS_LISTEN: u32 = 50;
+            const SYS_RECVMSG: u32 = 47;
+            const SYS_SETPGID: u32 = 109;
+            const SYS_SETSID: u32 = 112;
+            Some((
+                AUDIT_ARCH_X86_64,
+                &[
+                    41,
+                    42,
+                    43,
+                    44,
+                    45,
+                    46,
+                    SYS_RECVMSG,
+                    SYS_BIND,
+                    SYS_LISTEN,
+                    53,
+                    288, // socket connect accept sendto recvfrom sendmsg recvmsg bind listen socketpair accept4
+                    299,
+                    307, // recvmmsg sendmmsg
+                    101,
+                    SYS_SETPGID,
+                    SYS_SETSID,
+                    272,
+                    308,
+                    310,
+                    311,
+                    321, // ptrace setpgid setsid unshare setns process_vm_* bpf
+                    425,
+                    426,
+                    427,
+                    434,
+                    438,        // io_uring_* pidfd_open pidfd_getfd
+                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
+                ],
+            ))
+        }
         _ => None,
     }
 }
@@ -657,6 +745,20 @@ fn net_deny_filter() -> Result<Vec<u8>, WorkerError> {
         };
         program.push((BPF_RET_K, 0, 0, ret));
     }
+    // SYS_clone stays allowed by number so glibc fork (SIGCHLD) works.
+    // args[0] carrying any CLONE_NEW* namespace bit is EPERM: that child
+    // would leave the process group and survive killpg.
+    let sys_clone = sys_clone().ok_or_else(|| WorkerError::SandboxUnavailable {
+        reason: format!(
+            "linux seccomp: no clone syscall number for architecture {}",
+            std::env::consts::ARCH
+        ),
+    })?;
+    program.push((BPF_JEQ_K, 0, 4, sys_clone));
+    program.push((BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARGS0_OFFSET));
+    program.push((BPF_ALU_AND_K, 0, 0, CLONE_NEW_NAMESPACE_FLAGS));
+    program.push((BPF_JEQ_K, 1, 0, 0));
+    program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM));
     program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW));
     let mut bytes = Vec::with_capacity(program.len() * 8);
     for (code, jt, jf, k) in program {
@@ -740,18 +842,19 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined_inner(launcher, confinement, program, args, true)
+    run_confined_inner(launcher, confinement, program, args)
 }
 
-/// Admitted-exec leg: a confined program that prints the helper prefix
-/// and exits 10/126/127/30 is a confined-run outcome, never helper init.
+/// Admitted-exec leg: helper-init classification still requires the helper
+/// prefix (pre-`execv`). A confined program that prints the prefix spoof as
+/// a non-line-start substring stays a confined-run outcome.
 fn run_confined_exec(
     launcher: &SandboxLauncher,
     confinement: &Confinement,
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined_inner(launcher, confinement, program, args, false)
+    run_confined(launcher, confinement, program, args)
 }
 
 fn run_confined_inner(
@@ -759,7 +862,6 @@ fn run_confined_inner(
     confinement: &Confinement,
     program: &Path,
     args: &[&OsStr],
-    classify_helper_init: bool,
 ) -> Result<ConfinedOutcome, WorkerError> {
     let mut command = helper_launch_command()?;
     command
@@ -796,7 +898,7 @@ fn run_confined_inner(
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
-    if classify_helper_init && let Some(error) = helper_launch_init_failed(&observed) {
+    if let Some(error) = helper_launch_init_failed(&observed) {
         return Err(error);
     }
     Ok(ConfinedOutcome {
@@ -1103,8 +1205,8 @@ pub fn probe_write_conformance(
 #[cfg(test)]
 mod tests {
     use super::{
-        Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES, landlock_rules, native_net_syscalls,
-        net_deny_filter,
+        CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES,
+        landlock_rules, native_net_syscalls, net_deny_filter, sys_clone,
     };
     use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
     use std::io::Read as _;
@@ -1161,8 +1263,8 @@ mod tests {
             native_net_syscalls().ok_or("no syscall table on this architecture")?;
         let filter = net_deny_filter()?;
         // arch load, arch guard, nr load, compat mask, two insns per
-        // denied nr, allow tail.
-        assert_eq!(filter.len(), (4 + 2 * denied.len() + 1) * 8);
+        // denied nr, clone-flag check (5 insns), allow tail.
+        assert_eq!(filter.len(), (4 + 2 * denied.len() + 6) * 8);
         let insn = |index: usize| {
             let base = index * 8;
             let code = u16::from_le_bytes([
@@ -1217,21 +1319,38 @@ mod tests {
                 "clone3 returns ERRNO|ENOSYS; every other denied nr returns ERRNO|EPERM"
             );
         }
+        let clone_check = 4 + denied.len() * 2;
+        let clone = sys_clone().ok_or("no clone syscall on this architecture")?;
         assert_eq!(
-            insn(4 + denied.len() * 2)?,
+            insn(clone_check)?,
+            (0x15, 0, 4, clone),
+            "clone is judged by args[0] rather than denied by number"
+        );
+        assert_eq!(
+            insn(clone_check + 1)?,
+            (0x20, 0, 0, 16),
+            "clone flag check loads seccomp_data.args[0]"
+        );
+        assert_eq!(
+            insn(clone_check + 5)?,
             (0x06, 0, 0, 0x7FFF_0000),
             "the tail allows every other syscall"
         );
 
         // Semantics, not just shape: run the assembled program.
-        let verdict = |arch_word: u32, nr: u32| -> u32 {
+        let verdict = |arch_word: u32, nr: u32, arg0: u32| -> u32 {
             let mut acc = 0u32;
             let mut index = 0usize;
             loop {
                 let (code, jt, jf, k) = insn(index).expect("decoded instruction");
                 match code {
                     0x20 => {
-                        acc = if k == 4 { arch_word } else { nr };
+                        acc = match k {
+                            4 => arch_word,
+                            0 => nr,
+                            16 => arg0,
+                            _ => 0,
+                        };
                         index += 1;
                     }
                     0x15 => index += 1 + usize::from(if acc == k { jt } else { jf }),
@@ -1247,40 +1366,45 @@ mod tests {
             }
         };
         assert_eq!(
-            verdict(arch, denied[0]),
+            verdict(arch, denied[0], 0),
             0x0005_0001,
             "a denied nr returns ERRNO|EPERM"
         );
         assert_eq!(
-            verdict(arch, SYS_CLONE3),
+            verdict(arch, SYS_CLONE3, 0),
             0x0005_0026,
             "clone3 returns ERRNO|ENOSYS so glibc fork falls back to clone"
         );
-        let clone = match std::env::consts::ARCH {
-            "aarch64" => 220,
-            "x86_64" => 56,
-            other => return Err(format!("unexpected arch {other}").into()),
-        };
         assert_eq!(
-            verdict(arch, clone),
+            verdict(arch, clone, 17),
             0x7FFF_0000,
-            "clone itself stays allowed"
+            "clone(SIGCHLD) stays allowed so glibc fork works"
         );
         assert_eq!(
-            verdict(arch, denied[0] | 0x4000_0000),
+            verdict(arch, clone, CLONE_NEWPID | 17),
+            0x0005_0001,
+            "clone(CLONE_NEWPID) is EPERM so a grandchild cannot leave the group"
+        );
+        assert_eq!(
+            verdict(arch, clone, CLONE_NEWUSER | CLONE_NEWNS),
+            0x0005_0001,
+            "clone(CLONE_NEWUSER|CLONE_NEWNS) is EPERM"
+        );
+        assert_eq!(
+            verdict(arch, denied[0] | 0x4000_0000, 0),
             0x0005_0001,
             "a compat-band nr is masked into the deny list"
         );
         let bystander = (0u32..)
-            .find(|candidate| !denied.contains(candidate))
+            .find(|candidate| !denied.contains(candidate) && *candidate != clone)
             .expect("a bystander nr exists");
         assert_eq!(
-            verdict(arch, bystander),
+            verdict(arch, bystander, 0),
             0x7FFF_0000,
             "every other nr is allowed"
         );
         assert_eq!(
-            verdict(arch ^ 1, denied[0]),
+            verdict(arch ^ 1, denied[0], 0),
             0x0005_0001,
             "a foreign architecture fails closed"
         );
@@ -1308,7 +1432,7 @@ mod tests {
         });
         assert_eq!(
             exec.last().map(String::as_str),
-            Some("path-beneath:execute:/scope")
+            Some("path-beneath:execute,read-file:/scope")
         );
         // The exec confinement grants no system-wide execute allowance:
         // only the scope and the loader trees may execute.

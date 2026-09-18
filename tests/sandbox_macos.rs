@@ -71,6 +71,49 @@ fn ensure_helper() {
     });
 }
 
+/// Marker appended by the T9 shim after copying fd0→stdout. A host-side
+/// read of the target never produces this line.
+const HELPER_IO_WITNESS: &str = "RIVECT-HELPER-IO-WITNESS";
+
+/// Test helper that performs confined I/O itself: `confined read` copies
+/// stdin to stdout and appends [`HELPER_IO_WITNESS`]; `confined write`
+/// tees the payload to the inherited target fd and records its length at
+/// `write_witness`. `launch` execs the remainder so probes still hit the
+/// real Seatbelt binary.
+fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = dir.join("rivect-shim-helper");
+    let payload = dir.join("shim-write-payload");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"launch\" ]; then\n\
+         shift\n\
+         [ \"$1\" = \"--\" ] && shift\n\
+         exec \"$@\"\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"read\" ]; then\n\
+         /bin/cat\n\
+         printf '%s\\n' '{HELPER_IO_WITNESS}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"write\" ]; then\n\
+         /usr/bin/tee '{payload}' >/dev/stdout\n\
+         /usr/bin/wc -c < '{payload}' | /usr/bin/tr -d '[:space:]' > '{witness}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"probe-write\" ]; then\n\
+         exit 0\n\
+         fi\n\
+         exit 30\n",
+        payload = payload.display(),
+        witness = write_witness.display(),
+    );
+    std::fs::write(&shim, script).expect("write helper I/O shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper I/O shim");
+    shim
+}
+
 #[test]
 fn denies_read_outside_scope_at_the_os_boundary() {
     let fixture = TempTree::new("sandbox-macos", "read-escape");
@@ -1415,9 +1458,10 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
         helper.display()
     );
     {
-        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
-            "/no/such/rivect-sandbox-helper",
-        )));
+        let (mut world, task, file, grant) = sandbox_world("helper-witness");
+        let write_witness = world.root.join("write-witness");
+        let shim = install_helper_io_shim(&world.root, &write_witness);
+        rivect_sandbox_helper::override_helper_binary(Some(shim));
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -1425,8 +1469,7 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
             }
         }
         let _reset = Reset;
-        let (mut world, task, file, grant) = sandbox_world("helper-witness");
-        let error = {
+        {
             let mut executor = Executor::new(
                 &mut world.runtime.policy,
                 &mut world.runtime.owner.store,
@@ -1442,21 +1485,51 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
                     PermissionMode::Manual,
                 )
                 .expect("admit read");
-            executor
-                .execute(&admitted)
-                .expect_err("missing helper must not host-read")
-        };
-        assert!(
-            matches!(
-                error,
-                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
-            ),
-            "confined read must fail closed at the helper, got {error:?}"
+            match executor.execute(&admitted).expect("shim helper read") {
+                EffectOutcome::Read { bytes, .. } => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        text.contains("scoped-by-seatbelt"),
+                        "shim must still deliver the target bytes, got {text:?}"
+                    );
+                    assert!(
+                        text.contains(HELPER_IO_WITNESS),
+                        "a host read would omit the shim marker: {text:?}"
+                    );
+                }
+                other => panic!("expected a shim helper read, got {other:?}"),
+            }
+        }
+        let write_grant = world.runtime.policy.grant_classes(
+            file.parent().expect("scope").to_path_buf(),
+            vec![rivect::contracts::EffectClass::Write],
         );
+        let payload = b"from-shim";
+        {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            let admitted = executor
+                .admit(
+                    &task,
+                    EffectRequest::Write {
+                        grant_id: write_grant,
+                        path: file,
+                        bytes: payload.to_vec(),
+                    },
+                    PermissionMode::Yolo,
+                )
+                .expect("admit write");
+            executor.execute(&admitted).expect("shim helper write");
+        }
+        let recorded = std::fs::read_to_string(&write_witness)
+            .expect("confined write must record payload length; a host write produces no witness");
         assert_eq!(
-            std::fs::read(&file).expect("host can still read the target"),
-            b"scoped-by-seatbelt",
-            "the discriminator fails only the helper path, not the file"
+            recorded.trim(),
+            payload.len().to_string(),
+            "shim write witness must match the payload length"
         );
     }
     let (mut world, task, file, grant) = sandbox_world("helper-data-plane");

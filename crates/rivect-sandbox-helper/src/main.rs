@@ -86,6 +86,7 @@ mod sys {
         pub fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
         pub fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn __errno_location() -> *mut c_int;
     }
 
     // SAFETY: the declarations mirror the platform libc/kernel ABI; every
@@ -104,6 +105,7 @@ mod sys {
         pub fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
         pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        pub fn __error() -> *mut c_int;
     }
 
     /// glibc/musl `struct dirent` on 64-bit Linux: `d_name` is the last field.
@@ -637,16 +639,18 @@ fn apply_rlimits() -> Result<(), i32> {
 
 /// Closes every inherited fd above stdio. Linux prefers `close_range` and
 /// walks `/proc/self/fd` if that syscall is missing; macOS walks `/dev/fd`
-/// and falls back to `F_MAXFD`. If every method fails, this is a sandbox
-/// init failure — never exec-with-inherited-fds.
+/// and always unions `F_MAXFD` so a partial walk cannot leave strays. If
+/// every method fails, this is a sandbox init failure — never
+/// exec-with-inherited-fds.
 fn close_stray_fds() -> Result<(), i32> {
     #[cfg(target_os = "linux")]
     {
         const SYS_CLOSE_RANGE: i64 = 436;
-        // SAFETY: close_range(3, UINT_MAX, 0) closes every fd above stdio;
-        // a negative return is ENOSYS or a similar miss, and the walk
-        // covers the table instead.
-        let closed = unsafe { sys::syscall(SYS_CLOSE_RANGE, 3u32, u32::MAX, 0u32) };
+        let first = (STDIO_TOP_FD + 1) as u32;
+        // SAFETY: close_range(STDIO_TOP_FD+1, UINT_MAX, 0) closes every fd
+        // above stdio; a negative return is ENOSYS or a similar miss, and
+        // the walk covers the table instead.
+        let closed = unsafe { sys::syscall(SYS_CLOSE_RANGE, first, u32::MAX, 0u32) };
         if closed == 0 {
             return Ok(());
         }
@@ -660,14 +664,16 @@ fn close_stray_fds() -> Result<(), i32> {
     }
     #[cfg(target_os = "macos")]
     {
-        if walk_fd_dir("/dev/fd") {
-            return Ok(());
-        }
+        let walked = walk_fd_dir("/dev/fd");
         const F_MAXFD: i32 = 51;
         // SAFETY: F_MAXFD reports the largest open fd in this process;
-        // closing numbers above stdio is the documented unix contract.
-        let max = unsafe { sys::fcntl(0, F_MAXFD) };
+        // the query fd must be live — stderr (2) is piped by the host,
+        // so it survives even when stdin is the data fd or closed.
+        let max = unsafe { sys::fcntl(2, F_MAXFD) };
         if max < 0 {
+            if walked {
+                return Ok(());
+            }
             eprintln!(
                 "rivect-sandbox-helper: fd sweep failed: /dev/fd walk and F_MAXFD both failed"
             );
@@ -676,7 +682,8 @@ fn close_stray_fds() -> Result<(), i32> {
         if max > STDIO_TOP_FD {
             for fd in (STDIO_TOP_FD + 1)..=max {
                 // SAFETY: those fds are the parent's strays, never owned
-                // handles of this freshly spawned child.
+                // handles of this freshly spawned child. A number the walk
+                // already closed returns EBADF, which is ignored.
                 let _ = unsafe { sys::close(fd) };
             }
         }
@@ -686,7 +693,10 @@ fn close_stray_fds() -> Result<(), i32> {
 
 /// Collects numeric fd names from a kernel fd directory, then closes each
 /// fd above stdio except the directory fd itself (`closedir` owns that
-/// close). Returns false when the directory cannot be opened.
+/// close). Returns false when the directory cannot be opened, `readdir`
+/// fails (NULL with errno set — not EOF), or `closedir` fails. A vacuous
+/// walk (open succeeds, readdir errors, we still return true) would leave
+/// inherited fds alive.
 fn walk_fd_dir(dir: &str) -> bool {
     let Ok(dir_c) = CString::new(dir) else {
         return false;
@@ -695,6 +705,8 @@ fn walk_fd_dir(dir: &str) -> bool {
     // follow the POSIX DIR contract. Names are collected before closedir,
     // the directory fd is excluded from the close list, and closedir
     // closes that fd once — never a double-close of the walk's dirfd.
+    // errno is cleared before each readdir so a NULL return with errno
+    // set is an error, not EOF.
     unsafe {
         let dirp = sys::opendir(dir_c.as_ptr());
         if dirp.is_null() {
@@ -707,8 +719,13 @@ fn walk_fd_dir(dir: &str) -> bool {
         }
         let mut fds = Vec::new();
         loop {
+            set_errno(0);
             let entry = sys::readdir(dirp);
             if entry.is_null() {
+                if get_errno() != 0 {
+                    let _ = sys::closedir(dirp);
+                    return false;
+                }
                 break;
             }
             let Ok(name) = CStr::from_ptr((*entry).d_name.as_ptr()).to_str() else {
@@ -721,12 +738,52 @@ fn walk_fd_dir(dir: &str) -> bool {
                 fds.push(fd);
             }
         }
-        let _ = sys::closedir(dirp);
+        if sys::closedir(dirp) != 0 {
+            return false;
+        }
         for fd in fds {
             let _ = sys::close(fd);
         }
     }
     true
+}
+
+/// Writes this thread's errno. POSIX `readdir` uses a NULL return with
+/// errno unchanged for EOF, so the walk must start each iteration at 0.
+///
+/// # Safety
+/// Caller must invoke from a context that owns this thread's errno word
+/// (the helper's fd-walk, never a concurrent libc call on the same thread).
+unsafe fn set_errno(value: std::os::raw::c_int) {
+    // SAFETY: libc's errno pointer is thread-local; we only store an int.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *sys::__errno_location() = value;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *sys::__error() = value;
+        }
+    }
+}
+
+/// Reads this thread's errno after `readdir`/`closedir`.
+///
+/// # Safety
+/// Same as [`set_errno`]: this thread's errno word only.
+unsafe fn get_errno() -> std::os::raw::c_int {
+    // SAFETY: libc's errno pointer is thread-local; we only load an int.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *sys::__errno_location()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *sys::__error()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -742,6 +799,15 @@ mod tests {
     #[test]
     fn walk_fd_dir_rejects_a_missing_directory() {
         assert!(!walk_fd_dir("/no/such/rivect-fd-dir"));
+    }
+
+    #[test]
+    fn walk_fd_dir_rejects_a_regular_file() {
+        let path = std::env::temp_dir().join(format!("rivect-not-a-dir-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("create non-directory");
+        let rejected = path.to_str().is_some_and(|name| !walk_fd_dir(name));
+        drop(std::fs::remove_file(&path));
+        assert!(rejected, "opendir on a regular file must fail closed");
     }
 
     #[test]

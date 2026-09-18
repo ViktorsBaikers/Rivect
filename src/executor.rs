@@ -435,9 +435,15 @@ pub(crate) fn observe_confined_child(
         )?;
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The exited child's write ends should close: drain to EOF
-                // under the same wall deadline. A grandchild holding the
-                // pipe write end would otherwise loop on WouldBlock forever.
+                // The leader has exited: SIGKILL the process group before
+                // the post-exit drain. A forked grandchild inherits the
+                // piped stderr write end and would otherwise keep
+                // WouldBlock until CONFINED_DEADLINE, which surfaces
+                // ConfinedRunTimedOut instead of success. After killpg,
+                // those write ends close and the drain reaches EOF. The
+                // timeout path still reaps via `terminate_confined_child`
+                // when the leader itself has not exited.
+                drop(rivect_sandbox_helper::kill_process_group(child.id()));
                 drain_pipe_to_eof(
                     &mut stdout,
                     &mut stdout_buf,
@@ -503,10 +509,11 @@ fn drain_nonblocking_pipe<T: Read>(
     }
 }
 
-/// Post-exit drain: the child's write end should close, so reads return
-/// the buffered remainder then 0. A grandchild holding the write end
-/// keeps `WouldBlock` forever — the wall deadline kills the process
-/// group and surfaces [`WorkerError::ConfinedRunTimedOut`].
+/// Post-exit drain: after the leader exits, the caller SIGKILLs the
+/// process group so a grandchild cannot hold the write end. Remaining
+/// bytes then return and the pipe hits EOF. A write end still held
+/// after that kill (outside the group) keeps `WouldBlock` until the
+/// wall deadline, which surfaces [`WorkerError::ConfinedRunTimedOut`].
 fn drain_pipe_to_eof<T: Read>(
     pipe: &mut Option<T>,
     retained: &mut Vec<u8>,
@@ -632,8 +639,9 @@ fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), W
 /// `SETPRIV_EXIT_PRIVERR` on Landlock/seccomp apply). Those are confined-run
 /// outcomes — Landlock denying the deny-first control, or a probe shim
 /// naming a missing ABI — never helper init. Discriminate by the helper's
-/// stderr prefix. Signal-killed children are left to the caller (timeout
-/// already mapped [`WorkerError::ConfinedRunTimedOut`]).
+/// stderr prefix (bytes produced pre-`execv`), not by which call site
+/// opted into classification. Signal-killed children are left to the caller
+/// (timeout already mapped [`WorkerError::ConfinedRunTimedOut`]).
 pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<WorkerError> {
     let stderr = String::from_utf8_lossy(&observed.stderr);
     let from_helper = stderr
@@ -757,7 +765,7 @@ pub fn admission_context(
     let scope_key = scope_root
         .canonicalize()
         .ok()
-        .map(|path| path.display().to_string());
+        .and_then(|path| path.to_str().map(str::to_string));
     let budget_remaining = match scope_key.as_deref() {
         Some(scope) => budget_has_remaining(store, scope)?,
         None => false,

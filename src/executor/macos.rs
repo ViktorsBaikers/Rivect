@@ -480,7 +480,7 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined_inner(sandbox_exec, profile, program, args, true)
+    run_confined_inner(sandbox_exec, profile, program, args)
 }
 
 fn run_confined_exec(
@@ -489,7 +489,7 @@ fn run_confined_exec(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined_inner(sandbox_exec, profile, program, args, false)
+    run_confined(sandbox_exec, profile, program, args)
 }
 
 fn run_confined_inner(
@@ -497,7 +497,6 @@ fn run_confined_inner(
     profile: &str,
     program: &Path,
     args: &[&OsStr],
-    classify_helper_init: bool,
 ) -> Result<ConfinedOutcome, WorkerError> {
     let mut child = helper_launch_command()?
         .arg(sandbox_exec)
@@ -513,7 +512,10 @@ fn run_confined_inner(
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
-    if classify_helper_init && let Some(error) = helper_launch_init_failed(&observed) {
+    // Helper-init classification is the helper prefix (pre-execv), not a
+    // probe-only flag: a confined program that is not the helper stays a
+    // confined-run outcome unless stderr was produced before execv.
+    if let Some(error) = helper_launch_init_failed(&observed) {
         return Err(error);
     }
     let (stderr, deprecation_notices) =

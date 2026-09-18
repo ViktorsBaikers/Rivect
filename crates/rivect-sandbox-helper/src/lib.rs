@@ -15,9 +15,7 @@ thread_local! {
 /// `env::set_var` (unsafe in edition 2024). Pass `None` to restore.
 pub fn override_helper_binary(path: Option<PathBuf>) {
     HELPER_BINARY_OVERRIDE.with(|slot| {
-        if let Ok(mut slot) = slot.try_borrow_mut() {
-            *slot = path;
-        }
+        *slot.borrow_mut() = path;
     });
 }
 

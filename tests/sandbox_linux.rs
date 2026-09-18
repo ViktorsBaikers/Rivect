@@ -50,6 +50,49 @@ fn ensure_helper() {
     });
 }
 
+/// Marker appended by the T9 shim after copying fd0→stdout. A host-side
+/// read of the target never produces this line.
+const HELPER_IO_WITNESS: &str = "RIVECT-HELPER-IO-WITNESS";
+
+/// Test helper that performs confined I/O itself: `confined read` copies
+/// stdin to stdout and appends [`HELPER_IO_WITNESS`]; `confined write`
+/// tees the payload to the inherited target fd and records its length at
+/// `write_witness`. `launch` execs the remainder so probes still hit the
+/// real Landlock/seccomp chain.
+fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = dir.join("rivect-shim-helper");
+    let payload = dir.join("shim-write-payload");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"launch\" ]; then\n\
+         shift\n\
+         [ \"$1\" = \"--\" ] && shift\n\
+         exec \"$@\"\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"read\" ]; then\n\
+         /bin/cat\n\
+         printf '%s\\n' '{HELPER_IO_WITNESS}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"write\" ]; then\n\
+         /usr/bin/tee '{payload}' >/dev/stdout\n\
+         /usr/bin/wc -c < '{payload}' | /usr/bin/tr -d '[:space:]' > '{witness}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"probe-write\" ]; then\n\
+         exit 0\n\
+         fi\n\
+         exit 30\n",
+        payload = payload.display(),
+        witness = write_witness.display(),
+    );
+    std::fs::write(&shim, script).expect("write helper I/O shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper I/O shim");
+    shim
+}
+
 fn confined(
     confinement: &Confinement,
     program: &Path,
@@ -1893,16 +1936,6 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
     let helper = rivect_sandbox_helper::helper_binary().expect("helper binary");
     assert!(helper.is_file(), "{}", helper.display());
     {
-        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
-            "/no/such/rivect-sandbox-helper",
-        )));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                rivect_sandbox_helper::override_helper_binary(None);
-            }
-        }
-        let _reset = Reset;
         let mut world = support::open_world("helper-witness", None);
         let session = world.open_session("helper-witness-session");
         let task = world.create_task(&session, "helper-witness-task");
@@ -1912,7 +1945,17 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
         std::fs::write(&file, b"scoped-by-landlock").expect("seed");
         let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
         world.runtime.read_worker = Box::new(linux::LinuxWorker);
-        let error = {
+        let write_witness = world.root.join("write-witness");
+        let shim = install_helper_io_shim(&world.root, &write_witness);
+        rivect_sandbox_helper::override_helper_binary(Some(shim));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                rivect_sandbox_helper::override_helper_binary(None);
+            }
+        }
+        let _reset = Reset;
+        {
             let mut executor = Executor::new(
                 &mut world.runtime.policy,
                 &mut world.runtime.owner.store,
@@ -1928,21 +1971,51 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
                     PermissionMode::Manual,
                 )
                 .expect("admit read");
-            executor
-                .execute(&admitted)
-                .expect_err("missing helper must not host-read")
-        };
-        assert!(
-            matches!(
-                error,
-                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
-            ),
-            "confined read must fail closed at the helper, got {error:?}"
-        );
+            match executor.execute(&admitted).expect("shim helper read") {
+                EffectOutcome::Read { bytes, .. } => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        text.contains("scoped-by-landlock"),
+                        "shim must still deliver the target bytes, got {text:?}"
+                    );
+                    assert!(
+                        text.contains(HELPER_IO_WITNESS),
+                        "a host read would omit the shim marker: {text:?}"
+                    );
+                }
+                other => panic!("expected a shim helper read, got {other:?}"),
+            }
+        }
+        let write_grant = world
+            .runtime
+            .policy
+            .grant_classes(scope, vec![rivect::contracts::EffectClass::Write]);
+        let payload = b"from-shim";
+        {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            let admitted = executor
+                .admit(
+                    &task,
+                    EffectRequest::Write {
+                        grant_id: write_grant,
+                        path: file,
+                        bytes: payload.to_vec(),
+                    },
+                    PermissionMode::Yolo,
+                )
+                .expect("admit write");
+            executor.execute(&admitted).expect("shim helper write");
+        }
+        let recorded = std::fs::read_to_string(&write_witness)
+            .expect("confined write must record payload length; a host write produces no witness");
         assert_eq!(
-            std::fs::read(&file).expect("host can still read the target"),
-            b"scoped-by-landlock",
-            "the discriminator fails only the helper path, not the file"
+            recorded.trim(),
+            payload.len().to_string(),
+            "shim write witness must match the payload length"
         );
     }
     let mut world = support::open_world("helper-data-plane", None);
@@ -2095,7 +2168,10 @@ fn loader_execute_rules_do_not_grant_execute_on_usr_lib() {
     let fixture = TempTree::new("sandbox-linux", "loader-execute");
     let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
     for rule in linux::landlock_rules(&confinement) {
-        if let Some(path) = rule.strip_prefix("path-beneath:execute:") {
+        if let Some(path) = rule
+            .strip_prefix("path-beneath:execute:")
+            .or_else(|| rule.strip_prefix("path-beneath:execute,read-file:"))
+        {
             assert_ne!(path, "/usr/lib");
             assert_ne!(path, "/lib");
             assert!(!path.ends_with("/usr/lib"), "{rule}");
@@ -2198,28 +2274,168 @@ fn confined_exec_glibc_fork_works_because_clone3_returns_enosys() {
     );
 }
 
+/// Compiles a tiny C probe into `dir` and returns the executable path.
+fn compile_c_probe(dir: &Path, name: &str, source: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let src = dir.join(format!("{name}.c"));
+    std::fs::write(&src, source).expect("write C probe");
+    let bin = dir.join(name);
+    let status = std::process::Command::new("cc")
+        .args(["-O0", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("spawn cc");
+    assert!(status.success(), "cc failed for {name}: {status}");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod C probe");
+    bin
+}
+
 #[test]
 fn confined_exec_denies_setsid_so_a_forked_grandchild_cannot_escape_killpg() {
     ensure_helper();
-    let setsid = Path::new("/usr/bin/setsid");
-    let true_bin = Path::new("/usr/bin/true");
-    assert!(
-        setsid.is_file() && true_bin.is_file(),
-        "need /usr/bin/setsid and /usr/bin/true"
+    let fixture = TempTree::new("sandbox-linux", "setsid-eperm");
+    // Fork first so the caller is not already a process-group leader
+    // (the helper spawned with process_group(0)). The child then calls
+    // setsid(); seccomp must return EPERM. The parent exits with that
+    // errno so the confined outcome is a nonzero status — not a
+    // translated strerror.
+    let probe = compile_c_probe(
+        &fixture.path,
+        "setsid_probe",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    pid_t pid = fork();
+    if (pid < 0) return 1;
+    if (pid == 0) {
+        if (setsid() < 0) _exit(errno);
+        _exit(0);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) return 1;
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    return 1;
+}
+"#,
     );
-    let confinement = linux::exec_confinement(Path::new("/usr/bin")).expect("exec confinement");
+    let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
+    let outcome = confined(&confinement, &probe, &[]).expect("confined setsid probe");
+    assert!(
+        !outcome.stderr.contains("failed to execute"),
+        "the probe must run under exec confinement, not be Landlock-denied: {outcome:?}"
+    );
+    assert!(
+        !outcome.exit_ok,
+        "setsid after fork must fail closed (EPERM), got {outcome:?}"
+    );
+}
+
+#[test]
+fn confined_run_killpg_on_success_reaps_a_forked_grandchild() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "killpg-success");
+    let pidfile = fixture.path.join("grandchild.pid");
+    let sleep = if Path::new("/usr/bin/sleep").is_file() {
+        "/usr/bin/sleep"
+    } else {
+        "/bin/sleep"
+    };
+    assert!(Path::new(sleep).is_file(), "need sleep");
+    let bash = Path::new("/usr/bin/bash");
+    assert!(bash.is_file(), "need /usr/bin/bash");
+    let script = format!("{sleep} 60 &\necho $! > '{}'\n", pidfile.display());
+    let confinement = linux::write_confinement(&fixture.path).expect("write confinement");
     let outcome = confined(
         &confinement,
-        setsid,
-        &[std::ffi::OsStr::new("-f"), true_bin.as_os_str()],
+        bash,
+        &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(&script)],
     )
-    .expect("confined setsid -f");
-    // `setsid -f` forks: the direct child exits 0 while the grandchild —
-    // not a process-group leader — calls setsid() and can only get EPERM
-    // from the seccomp filter. The denial evidence is on stderr.
+    .expect("confined background sleep");
     assert!(
-        outcome.stderr.contains("Operation not permitted")
-            || outcome.stderr.contains("setsid failed"),
-        "setsid/setpgid must be denied so daemonize cannot escape killpg: {outcome:?}"
+        outcome.exit_ok,
+        "the leader must exit successfully so killpg-on-success runs: {outcome:?}"
+    );
+    let pid = std::fs::read_to_string(&pidfile)
+        .expect("grandchild pid")
+        .trim()
+        .parse::<u32>()
+        .expect("pid");
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    // Reaped-by-killpg can linger as a zombie (orphaned, reparented to the
+    // harness, never wait()ed) and the pid can be recycled by a parallel
+    // test's process. Gone, zombie, or a different comm all prove the
+    // SIGKILL landed; only a live `sleep` at that pid is a real escape.
+    let mut gone = !is_live_sleep(&proc);
+    for _ in 0..50 {
+        if gone {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        gone = !is_live_sleep(&proc);
+    }
+    assert!(
+        gone,
+        "killpg after the leader exits must reap grandchild pid {pid}"
+    );
+}
+
+fn is_live_sleep(proc: &Path) -> bool {
+    let Ok(stat) = std::fs::read_to_string(proc.join("stat")) else {
+        return false;
+    };
+    let Some(rest) = stat.rsplit(')').nth(1) else {
+        return false;
+    };
+    rest.trim_start().starts_with('S') && stat.contains("(sleep)")
+}
+
+#[test]
+fn confined_exec_denies_clone_new_namespace_flags_but_allows_plain_fork() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "clone-flags");
+    let fork_ok = compile_c_probe(
+        &fixture.path,
+        "clone_fork",
+        r#"
+#define _GNU_SOURCE
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    long r = syscall(SYS_clone, 17, 0);
+    if (r < 0) return 1;
+    if (r == 0) _exit(0);
+    return 0;
+}
+"#,
+    );
+    let newpid = compile_c_probe(
+        &fixture.path,
+        "clone_newpid",
+        r#"
+#define _GNU_SOURCE
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    long r = syscall(SYS_clone, 0x20000000 | 17, 0);
+    if (r < 0) return 1;
+    if (r == 0) _exit(0);
+    return 0;
+}
+"#,
+    );
+    let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
+    let fork_outcome = confined(&confinement, &fork_ok, &[]).expect("confined clone SIGCHLD");
+    assert!(
+        fork_outcome.exit_ok,
+        "plain clone(SIGCHLD) must work: {fork_outcome:?}"
+    );
+    let newpid_outcome = confined(&confinement, &newpid, &[]).expect("confined clone NEWPID");
+    assert!(
+        !newpid_outcome.exit_ok,
+        "clone(CLONE_NEWPID) must be EPERM: {newpid_outcome:?}"
     );
 }

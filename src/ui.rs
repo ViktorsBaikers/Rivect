@@ -385,8 +385,20 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         rows.push(Constraint::Length(view.dock.len().clamp(1, 3) as u16));
         rows.push(Constraint::Length(1));
         let chunks = ratatui::layout::Layout::vertical(rows).split(area);
-        frame.render_widget(Paragraph::new(view.status.clone()), chunks[0]);
-        frame.render_widget(Paragraph::new(view.transcript.join("\n")), chunks[1]);
+        frame.render_widget(
+            Paragraph::new(sanitize_status_cause(&view.status)),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                view.transcript
+                    .iter()
+                    .map(|line| sanitize_status_cause(line))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            chunks[1],
+        );
         let mut next = 2;
         if output_active {
             frame.render_widget(
@@ -678,8 +690,10 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut TaskStore) {
                     Err(source) => {
                         panel.focus_deny();
                         view.panel = Some(panel);
-                        view.transcript
-                            .push(format!("limited grant recording failed: {source}"));
+                        view.transcript.push(format!(
+                            "limited grant recording failed: {}",
+                            sanitize_status_cause(&source.to_string())
+                        ));
                     }
                 }
             }
