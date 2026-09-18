@@ -10,16 +10,17 @@
 //! in-process leg move bytes — no ambient path.
 
 use super::{
-    denied_write_candidate, drain_retaining_cap, inspect_regular_target, same_regular_file,
+    denied_write_candidate, helper_confined_read, helper_confined_write, helper_launch_command,
+    helper_launch_init_failed, helper_probe_write, inspect_regular_target, observe_confined_child,
+    same_regular_file,
 };
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, PoisonError};
 /// The one injected backend seam: every effect the executor performs —
 /// read, write, exec, egress — crosses a worker leg, so confinement is
@@ -171,6 +172,10 @@ pub enum WorkerError {
         "capability unavailable: sandbox {reason}; recovery: fix the environment or run on a capable kernel"
     )]
     SandboxUnavailable { reason: String },
+    #[error(
+        "capability unavailable: confined run exceeded the wall deadline; recovery: fix the environment or run on a capable kernel"
+    )]
+    ConfinedRunTimedOut,
 }
 
 pub(crate) fn target_identity(
@@ -197,13 +202,9 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
     let sandbox_exec = Path::new(SANDBOX_EXEC);
     probe_read_conformance(sandbox_exec, scope_root, &canonical_target)?;
     confined_read_gate(sandbox_exec, scope_root, &canonical_target)?;
-    // The open re-walks the original path without O_NOFOLLOW: a swap to a
-    // different regular file is caught by the dev/ino identity check below
-    // (fail-closed), and a swap to a FIFO cannot hang this bounded open
-    // (O_NONBLOCK) before the fd-level regular-file check denies it.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(target)
         .map_err(|source| WorkerError::ReadFailed { source })?;
     let opened_meta = file
@@ -214,7 +215,6 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
             target: target.to_path_buf(),
         });
     }
-    // Hardlinks inside the granted scope share dev+inode and remain allowed.
     if !same_regular_file(&canonical_meta, &opened_meta) {
         return Err(WorkerError::TargetChanged {
             target: target.to_path_buf(),
@@ -223,10 +223,8 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
     if opened_meta.len() > READ_MAX_BYTES as u64 {
         return Err(WorkerError::TooLarge);
     }
-    let mut bounded = Vec::with_capacity(opened_meta.len() as usize);
-    file.take((READ_MAX_BYTES as u64) + 1)
-        .read_to_end(&mut bounded)
-        .map_err(|source| WorkerError::ReadFailed { source })?;
+    let profile = read_profile(scope_root)?;
+    let bounded = helper_confined_read("macos", &profile, file)?;
     if bounded.len() > READ_MAX_BYTES {
         return Err(WorkerError::TooLarge);
     }
@@ -255,15 +253,19 @@ pub fn write_once(
     let sandbox_exec = Path::new(SANDBOX_EXEC);
     probe_write_conformance(sandbox_exec, scope_root)?;
     confined_write_gate(sandbox_exec, scope_root, target)?;
-    // The open re-walks the original path. Both the admitted identity and the
-    // canonical-path identity must match the opened handle before any fd
-    // mutation can happen.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(target)
         .map_err(|source| WorkerError::WriteFailed { source })?;
-    write_opened_file(target, &canonical_meta, &mut file, expected, bytes)
+    write_opened_file(
+        scope_root,
+        target,
+        &canonical_meta,
+        &mut file,
+        expected,
+        bytes,
+    )
 }
 
 /// Writes through an already-opened file after checking its current identity.
@@ -278,10 +280,11 @@ pub fn write_once_on_opened_file(
         return Err(WorkerError::WriteTooLarge);
     }
     let (_, canonical_meta) = inspect_regular_target(scope_root, target)?;
-    write_opened_file(target, &canonical_meta, file, expected, bytes)
+    write_opened_file(scope_root, target, &canonical_meta, file, expected, bytes)
 }
 
 fn write_opened_file(
+    scope_root: &Path,
     target: &Path,
     canonical_meta: &Metadata,
     file: &mut File,
@@ -298,12 +301,11 @@ fn write_opened_file(
             target: target.to_path_buf(),
         });
     }
-    let length =
-        u64::try_from(bytes.len()).map_err(|source| WorkerError::WriteLengthOverflow { source })?;
-    file.set_len(length)
-        .map_err(|source| WorkerError::WriteMutationFailed { source })?;
-    file.write_all(bytes)
-        .map_err(|source| WorkerError::WriteMutationFailed { source })
+    let profile = write_profile(scope_root)?;
+    let clone = file
+        .try_clone()
+        .map_err(|source| WorkerError::WriteFailed { source })?;
+    helper_confined_write("macos", &profile, clone, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +356,16 @@ const SYSTEM_READ_RULES: &str = concat!(
     "    (allow file-read* (subpath \"/usr/share\"))\n",
     "    (allow file-read* (subpath \"/System\"))\n",
     "    (allow file-read* (subpath \"/dev\"))\n",
+);
+
+const EXEC_SYSTEM_READ_RULES: &str = concat!(
+    "    (allow file-read* (literal \"/\"))\n",
+    "    (allow file-read* (subpath \"/bin\"))\n",
+    "    (allow file-read* (subpath \"/usr/bin\"))\n",
+    "    (allow file-read* (subpath \"/usr/lib\"))\n",
+    "    (allow file-read* (subpath \"/usr/libexec\"))\n",
+    "    (allow file-read* (subpath \"/usr/share\"))\n",
+    "    (allow file-read* (subpath \"/System\"))\n",
 );
 
 /// Canonicalizes one scope root for a Seatbelt profile. Seatbelt filters
@@ -418,7 +430,7 @@ pub fn write_profile(scope_root: &Path) -> Result<String, WorkerError> {
 pub fn exec_profile(scope_root: &Path) -> Result<String, WorkerError> {
     let scope = scheme_literal(&canonical_scope(scope_root)?)?;
     Ok(format!(
-        "(version 1)\n{SYSTEM_READ_RULES}    (allow process-exec (subpath {scope}))\n"
+        "(version 1)\n{EXEC_SYSTEM_READ_RULES}    (allow process-exec (subpath {scope}))\n"
     ))
 }
 
@@ -460,30 +472,26 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    let mut child = Command::new(sandbox_exec)
+    let mut child = helper_launch_command()?
+        .arg(sandbox_exec)
         .arg("-p")
         .arg(profile)
         .arg(program)
         .args(args)
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
-    // Drain stderr to EOF before waiting: a child holding a full stderr
-    // pipe could otherwise block forever against a wait()ing parent.
-    let raw = match child.stderr.take() {
-        Some(pipe) => drain_retaining_cap(pipe)
-            .map_err(|source| WorkerError::SandboxSpawnFailed { source })?,
-        None => Vec::new(),
-    };
-    let status = child
-        .wait()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
-    let (stderr, deprecation_notices) = split_deprecation_stderr(&String::from_utf8_lossy(&raw));
+    let stderr = child.stderr.take();
+    let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
+    if let Some(error) = helper_launch_init_failed(&observed) {
+        return Err(error);
+    }
+    let (stderr, deprecation_notices) =
+        split_deprecation_stderr(&String::from_utf8_lossy(&observed.stderr));
     Ok(ConfinedOutcome {
-        exit_ok: status.success(),
+        exit_ok: observed.status.success(),
         stderr,
         deprecation_notices,
     })
@@ -558,15 +566,26 @@ fn confined_write_gate(
     scope_root: &Path,
     target: &Path,
 ) -> Result<(), WorkerError> {
-    let artifact = probe_write_conformance(sandbox_exec, scope_root)?;
+    probe_write_conformance(sandbox_exec, scope_root)?;
     let profile = write_profile(scope_root)?;
-    let outcome = run_confined(
-        sandbox_exec,
-        &profile,
-        Path::new("/usr/bin/touch"),
-        &[artifact.as_os_str()],
-    )?;
-    expect_admitted(outcome, target)
+    let artifact = fresh_write_artifact(scope_root)?;
+    let code = helper_probe_write("macos", &profile, &artifact)?;
+    drop(std::fs::remove_file(&artifact));
+    if code == rivect_sandbox_helper::EXIT_OK {
+        Ok(())
+    } else {
+        Err(WorkerError::SandboxDenied {
+            target: target.to_path_buf(),
+        })
+    }
+}
+
+fn fresh_write_artifact(scope_root: &Path) -> Result<PathBuf, WorkerError> {
+    Ok(canonical_scope(scope_root)?.join(format!(
+        ".rivect-write-gate-{}-{}",
+        std::process::id(),
+        crate::contracts::TaskId::generate().0
+    )))
 }
 
 /// One confined process execution inside the granted scope: the
@@ -582,8 +601,23 @@ fn confined_write_gate(
 /// the sandbox mechanism cannot start, and [`WorkerError::SandboxDenied`]
 /// when the boundary rejects the program.
 pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
+    exec_once_with(Path::new(SANDBOX_EXEC), scope_root, program)
+}
+
+/// Same as [`exec_once`] with an injected Seatbelt launcher so a
+/// non-enforcing binary fails closed at the denied control.
+pub fn exec_once_with(
+    sandbox_exec: &Path,
+    scope_root: &Path,
+    program: &Path,
+) -> Result<(), WorkerError> {
     let profile = exec_profile(scope_root)?;
-    let outcome = run_confined(Path::new(SANDBOX_EXEC), &profile, program, &[])?;
+    let denied = run_confined(sandbox_exec, &profile, Path::new("/usr/bin/true"), &[])?;
+    expect_denied(
+        denied,
+        "seatbelt exec boundary admitted the denied control /usr/bin/true",
+    )?;
+    let outcome = run_confined(sandbox_exec, &profile, program, &[])?;
     expect_admitted(outcome, program)
 }
 

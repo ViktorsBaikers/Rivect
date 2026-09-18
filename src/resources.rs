@@ -423,6 +423,9 @@ impl OutputStream {
                 self.truncated = true;
                 break;
             }
+            if is_stripped_format(ch) {
+                continue;
+            }
             if ch == '\n' || !ch.is_control() {
                 self.text.push(ch);
             } else if u32::from(ch) < 0x20 {
@@ -434,4 +437,31 @@ impl OutputStream {
             }
         }
     }
+}
+
+/// Strips Unicode format controls that reverse or hide status copy:
+/// U+202A–U+202E, U+2066–U+2069, U+200B–U+200F.
+pub fn sanitize_status_cause(cause: &str) -> String {
+    let mut out = String::with_capacity(cause.len());
+    for ch in cause.chars() {
+        if is_stripped_format(ch) {
+            continue;
+        }
+        if ch == '\n' || !ch.is_control() {
+            out.push(ch);
+        } else if u32::from(ch) < 0x20 {
+            out.push('^');
+            out.push(char::from_u32(u32::from(ch) + 0x40).unwrap_or('\u{fffd}'));
+        } else {
+            out.push('\u{fffd}');
+        }
+    }
+    out
+}
+
+fn is_stripped_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }

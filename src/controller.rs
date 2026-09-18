@@ -6,7 +6,7 @@
 
 use crate::commands::Runtime;
 use crate::contracts::{
-    AnswerSelection, EffectClass, KNOWN_READY_OPTION, SessionId, TaskId, TaskSnapshot,
+    AnswerSelection, EffectClass, ErrorCode, KNOWN_READY_OPTION, SessionId, TaskId, TaskSnapshot,
 };
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::ModelError;
@@ -66,6 +66,26 @@ pub enum ControllerError {
     Serialization(#[from] serde_json::Error),
     #[error("applicability evaluation could not decide the obligations of this step")]
     ApplicabilityUnknown,
+}
+
+impl ControllerError {
+    #[must_use = "the code exists to be carried to the wire; discarding it loses the mapping"]
+    pub fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Store(error) => error.code(),
+            Self::Policy(_) => ErrorCode::Denied,
+            Self::Model(ModelError::RequestTooLarge { .. }) => ErrorCode::ContextOverflow,
+            Self::Model(ModelError::Config(_) | ModelError::NoEligibleCandidate { .. }) => {
+                ErrorCode::CapabilityUnavailable
+            }
+            Self::Model(_) => ErrorCode::Denied,
+            Self::Executor(error) => error.error_code(),
+            Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,
+            Self::Scheduler(_) => ErrorCode::Conflict,
+            Self::Serialization(_) => ErrorCode::InvalidInput,
+            Self::ApplicabilityUnknown => ErrorCode::OutcomeUnknown,
+        }
+    }
 }
 
 /// Typed settlement of the external-output projection for one decision
@@ -172,7 +192,7 @@ pub fn step_error_observation(
 
 /// Mirrors the runtime notification queue capacity: one pass drains at
 /// most one full queue, so bounded work never grows with the backlog.
-const SCHEDULER_DRAIN_LIMIT: usize = 8;
+pub(crate) const SCHEDULER_DRAIN_LIMIT: usize = 8;
 
 /// The interim DEC-068 applicability-evaluation sentinel, mirroring
 /// `KNOWN_READY_OPTION`: an answer selecting this option reports the
@@ -182,6 +202,16 @@ const SCHEDULER_DRAIN_LIMIT: usize = 8;
 pub const APPLICABILITY_UNKNOWN_OPTION: &str = "applicability-unknown";
 
 impl Runtime {
+    pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
+        for _ in 0..SCHEDULER_DRAIN_LIMIT {
+            match self.scheduler_step(session_id)? {
+                SchedulerStep::Idle => return Ok(()),
+                SchedulerStep::Ran { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     /// One decision step for a task whose pending question has been
     /// answered: the broker dispatches the frozen manifest once, the only
     /// permitted action is a scoped read, evidence and the completion guard

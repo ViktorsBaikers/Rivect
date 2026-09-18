@@ -38,7 +38,7 @@ use rivect::resources::{FlightRole, ReadFlights};
 use rivect::scheduler::{
     CompleteTransition, DeliverVerdict, NodeState, Scheduler, SchedulerError, WaitTransition,
 };
-use rivect::state::{BudgetStatus, ConflictCause, Missing, StoreError, TaskStore};
+use rivect::state::{BudgetStatus, ConflictCause, InvalidCause, Missing, StoreError, TaskStore};
 use rivect::supervisor::{
     ClassThresholds, FailureSignature, Observation, OperationClass, PolicyFault, Reaction,
     StallCause, Supervisor, SupervisorError, SupervisorPolicy, WATCH_LIMIT,
@@ -46,7 +46,7 @@ use rivect::supervisor::{
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use support::{World, answer_custom, corpus_answer_custom, open_world};
+use support::{World, answer_custom, corpus_answer_option, open_world};
 
 fn scoped_world(tag: &str) -> (World, PathBuf, String) {
     scope_world(open_world(tag, Some(&support::config_distinct_pools())))
@@ -125,26 +125,39 @@ fn create_child_task(
     TaskId(result["task_id"].as_str().expect("task id").to_string())
 }
 
-/// Publishes the pending question and answers it through the real
-/// ingress, which also builds the task's runnable scheduler node.
+/// Publishes the pending question and freezes the answer onto a
+/// scheduler node without driving `scheduler_step`: production dispatch
+/// drains the loop (T12); these scheduler proofs still own stepping.
 fn answer_task(
     world: &mut World,
     session: &SessionId,
-    command_id: &str,
+    _command_id: &str,
     task: &TaskId,
     text: &str,
-    id: i64,
+    _id: i64,
 ) {
     let question = world.publish(session, task);
-    let response = world.dispatch(&corpus_answer_custom(
-        session,
-        command_id,
-        task,
-        &question,
-        text,
-        json!(id),
-    ));
-    assert!(response["error"].is_null(), "{response}");
+    let selection = AnswerSelection::Custom {
+        text: text.to_string(),
+    };
+    world
+        .runtime
+        .owner
+        .store
+        .answer_question(
+            session,
+            task,
+            &question.question_id,
+            question.question_revision,
+            &selection,
+            "human",
+        )
+        .expect("answer question");
+    world
+        .runtime
+        .scheduler
+        .submit_answered(task.clone(), selection, world.runtime.scoped_grant.clone())
+        .expect("submit node");
 }
 
 /// Cancels one task through the real ingress: the store cancels the
@@ -3482,11 +3495,11 @@ fn cancelled_subscriber_leaves_other_flight_members_running() {
         "cancel of one subscriber charges once"
     );
 
-    let outcome_b = execute_flight_read(&mut world, &mut flights, &admitted_b)
-        .expect("cancelled member settles, not errors");
+    let error_b = execute_flight_read(&mut world, &mut flights, &admitted_b)
+        .expect_err("cancelled member is Cancelled, not Denied");
     assert!(
-        matches!(outcome_b, EffectOutcome::Denied { ref reason } if reason == rivect::executor::TASK_CANCELLED),
-        "cancelled subscriber denies closed: {outcome_b:?}"
+        matches!(error_b, ExecutorError::Cancelled),
+        "cancelled subscriber errors closed: {error_b}"
     );
     let (_, state_b, _) = world
         .runtime
@@ -3614,5 +3627,96 @@ fn non_read_effects_never_enter_or_split_a_read_flight() {
         world.worker_reads(),
         1,
         "only the read flight charges reads"
+    );
+}
+
+#[test]
+fn answer_through_dispatch_runtime_request_drives_a_decision_step_without_a_direct_scheduler_step_call()
+ {
+    let (mut world, _file, _grant) = scoped_world("dispatch-drain");
+    let session = world.open_session("bootstrap-dispatch-drain");
+    let task = world.create_task(&session, "cmd-drain");
+    let reads_before = world.worker_reads();
+    let question = world.publish(&session, &task);
+    let answer = world.dispatch(&corpus_answer_option(
+        &session,
+        "cmd-drain-answer",
+        &task,
+        &question,
+        "brief",
+        json!(1),
+    ));
+    assert!(answer["error"].is_null(), "{answer}");
+    assert!(
+        world.worker_reads() > reads_before,
+        "dispatch must drive the known-ready read without a direct scheduler_step"
+    );
+    match world
+        .runtime
+        .scheduler_step(&session)
+        .expect("drain already reached idle")
+    {
+        SchedulerStep::Idle => {}
+        other => panic!("expected idle after dispatch drain, got {other:?}"),
+    }
+
+    let skipped = world.create_task(&session, "cmd-cancelled-answer");
+    world
+        .runtime
+        .scheduler
+        .cancel_task_tree(&skipped)
+        .expect("cancel scheduler tree only");
+    let reads_mid = world.worker_reads();
+    let question = world.publish(&session, &skipped);
+    let response = world.dispatch(&corpus_answer_option(
+        &session,
+        "cmd-cancelled-answer-cmd",
+        &skipped,
+        &question,
+        "brief",
+        json!(2),
+    ));
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(
+        world.worker_reads(),
+        reads_mid,
+        "submit_answered Ok(None) must not drive a decision step"
+    );
+}
+
+#[test]
+fn budget_charge_rejects_confirmed_above_bound_and_charge_sql_requires_reserved_ge_bound() {
+    let root = support::temp_dir("budget-charge-guards");
+    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    store.open_budget("root", 8).expect("root opens");
+    store
+        .budget_reserve("res-over", &["root"], 4)
+        .expect("reserve bound 4");
+    let over = store
+        .budget_charge("res-over", Some(5))
+        .expect_err("confirmed above bound");
+    assert!(
+        matches!(
+            over,
+            StoreError::InvalidInput(InvalidCause::ConfirmedExceedsBound {
+                confirmed: 5,
+                bound: 4
+            })
+        ),
+        "{over}"
+    );
+    store
+        .budget_reserve("res-fit", &["root"], 3)
+        .expect("second reserve");
+    store
+        .budget_charge("res-fit", Some(3))
+        .expect("confirmed at bound spends when reserved covers the bound");
+    assert_eq!(
+        store.budget_status("root").expect("status"),
+        BudgetStatus {
+            limit_units: 8,
+            spent: 3,
+            reserved: 4
+        }
     );
 }

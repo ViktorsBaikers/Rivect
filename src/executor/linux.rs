@@ -20,17 +20,17 @@
 
 use super::macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
 use super::{
-    denied_write_candidate, drain_retaining_cap, inspect_regular_target, same_regular_file,
+    denied_write_candidate, helper_confined_read, helper_confined_write, helper_launch_command,
+    helper_launch_init_failed, inspect_regular_target, observe_confined_child, same_regular_file,
     set_private_mode,
 };
 use sha2::Digest;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Mutex, PoisonError};
 
 /// The Landlock/netns launcher, the injected seam the conformance probes
@@ -84,11 +84,40 @@ impl ReadWorker for LinuxWorker {
     }
 }
 
-/// Canonical denied-control target for the exec leg: a system binary no
-/// sane grant scope covers, so a confined execution of it must be denied
-/// before the admitted program is touched. A grant scope that already
-/// covers this path is not confinable and fails the leg closed.
-const DENIED_PROBE_EXEC: &str = "/usr/sbin/agetty";
+/// Canonical denied-control target for the exec leg: a worker-owned
+/// copy of a harmless binary placed outside any sane grant scope, so a
+/// confined execution of it must be denied before the admitted program
+/// is touched. Existence of a system binary is never the discriminator.
+pub fn denied_exec_control() -> Result<PathBuf, WorkerError> {
+    static ARTIFACT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    let mut slot = ARTIFACT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(path) = slot.as_ref()
+        && path.is_file()
+    {
+        return Ok(path.clone());
+    }
+    let dir = std::env::temp_dir().join(format!("rivect-denied-exec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|source| WorkerError::SandboxUnavailable {
+        reason: format!("denied-exec control directory unavailable: {source}"),
+    })?;
+    if !set_private_mode(&dir) {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: "denied-exec control directory is not private".to_string(),
+        });
+    }
+    let dest = dir.join("denied-exec");
+    let source = if Path::new("/usr/bin/true").is_file() {
+        Path::new("/usr/bin/true")
+    } else {
+        Path::new("/bin/true")
+    };
+    std::fs::copy(source, &dest).map_err(|source| WorkerError::SandboxUnavailable {
+        reason: format!("denied-exec control copy unavailable: {source}"),
+    })?;
+    *slot = Some(dest.clone());
+    drop(slot);
+    Ok(dest)
+}
 
 /// The egress control leg's program (bash): its `/dev/tcp` redirection
 /// performs a real connect whose exit status discriminates a held
@@ -113,11 +142,13 @@ const BASH: &str = "/usr/bin/bash";
 pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
     let launcher = SandboxLauncher::default();
     let confinement = exec_confinement(scope_root)?;
-    let control = run_confined(&launcher, &confinement, Path::new(DENIED_PROBE_EXEC), &[])?;
+    let control_path = denied_exec_control()?;
+    let control = run_confined(&launcher, &confinement, &control_path, &[])?;
     if control.exit_ok {
         return Err(WorkerError::SandboxUnavailable {
             reason: format!(
-                "landlock exec boundary admitted the denied control {DENIED_PROBE_EXEC}"
+                "landlock exec boundary admitted the denied control {}",
+                control_path.display()
             ),
         });
     }
@@ -237,13 +268,9 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
     let launcher = SandboxLauncher::default();
     probe_read_conformance(&launcher, scope_root, &canonical_target)?;
     confined_read_gate(&launcher, scope_root, &canonical_target)?;
-    // The open re-walks the original path without O_NOFOLLOW: a swap to a
-    // different regular file is caught by the dev/ino identity check below
-    // (fail-closed), and a swap to a FIFO cannot hang this bounded open
-    // (O_NONBLOCK) before the fd-level regular-file check denies it.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(target)
         .map_err(|source| WorkerError::ReadFailed { source })?;
     let opened_meta = file
@@ -254,7 +281,6 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
             target: target.to_path_buf(),
         });
     }
-    // Hardlinks inside the granted scope share dev+inode and remain allowed.
     if !same_regular_file(&canonical_meta, &opened_meta) {
         return Err(WorkerError::TargetChanged {
             target: target.to_path_buf(),
@@ -263,10 +289,7 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
     if opened_meta.len() > READ_MAX_BYTES as u64 {
         return Err(WorkerError::TooLarge);
     }
-    let mut bounded = Vec::with_capacity(opened_meta.len() as usize);
-    file.take((READ_MAX_BYTES as u64) + 1)
-        .read_to_end(&mut bounded)
-        .map_err(|source| WorkerError::ReadFailed { source })?;
+    let bounded = helper_confined_read("linux", "", file)?;
     if bounded.len() > READ_MAX_BYTES {
         return Err(WorkerError::TooLarge);
     }
@@ -303,12 +326,9 @@ pub fn write_once(
     let launcher = SandboxLauncher::default();
     probe_write_conformance(&launcher, scope_root)?;
     confined_write_gate(&launcher, scope_root, target)?;
-    // The open re-walks the original path. Both the admitted identity and
-    // the canonical-path identity must match the opened handle before any
-    // fd mutation can happen.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(O_NONBLOCK)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(target)
         .map_err(|source| WorkerError::WriteFailed { source })?;
     write_opened_file(target, &canonical_meta, &mut file, expected, bytes)
@@ -334,12 +354,10 @@ fn write_opened_file(
             target: target.to_path_buf(),
         });
     }
-    let length =
-        u64::try_from(bytes.len()).map_err(|source| WorkerError::WriteLengthOverflow { source })?;
-    file.set_len(length)
-        .map_err(|source| WorkerError::WriteMutationFailed { source })?;
-    file.write_all(bytes)
-        .map_err(|source| WorkerError::WriteMutationFailed { source })
+    let clone = file
+        .try_clone()
+        .map_err(|source| WorkerError::WriteFailed { source })?;
+    helper_confined_write("linux", "", clone, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +467,7 @@ pub fn egress_confinement() -> Confinement {
     Confinement::Egress
 }
 
-fn landlock_rules(confinement: &Confinement) -> Vec<String> {
+pub fn landlock_rules(confinement: &Confinement) -> Vec<String> {
     match confinement {
         Confinement::Read { scope } => {
             let mut rules = SYSTEM_EXECUTE_RULES.iter().map(|r| (*r).to_string());
@@ -501,7 +519,13 @@ fn loader_rules(rights: &str) -> Vec<String> {
     LOADER_CANDIDATES
         .iter()
         .filter_map(|candidate| Path::new(candidate).canonicalize().ok())
-        .filter_map(|loader| loader.parent().map(|parent| scope_rule(rights, parent)))
+        .filter_map(|loader| {
+            if rights == "execute" {
+                Some(scope_rule(rights, &loader))
+            } else {
+                loader.parent().map(|parent| scope_rule(rights, parent))
+            }
+        })
         .collect()
 }
 
@@ -545,15 +569,29 @@ const SECCOMP_COMPAT_BAND_MASK: u32 = 0xBFFF_FFFF;
 /// The network syscalls the egress boundary denies, per native
 /// architecture. `None` on any other architecture is an honest
 /// capability failure, never an unfiltered leg.
+pub fn seccomp_denied_syscalls() -> Option<&'static [u32]> {
+    native_net_syscalls().map(|(_, numbers)| numbers)
+}
+
 fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
     match std::env::consts::ARCH {
         "aarch64" => Some((
             AUDIT_ARCH_AARCH64,
-            &[198, 199, 203, 206, 211], // socket socketpair connect sendto sendmsg
+            &[
+                198, 199, 203, 206, 211, // socket socketpair connect sendto sendmsg
+                243, 269, // recvmmsg sendmmsg
+                97, 117, 270, 271, 280, // unshare ptrace process_vm_* bpf
+                425, 426, 427, 438, // io_uring_* pidfd_getfd
+            ],
         )),
         "x86_64" => Some((
             AUDIT_ARCH_X86_64,
-            &[41, 53, 42, 44, 46], // socket socketpair connect sendto sendmsg
+            &[
+                41, 53, 42, 44, 46, // socket socketpair connect sendto sendmsg
+                299, 307, // recvmmsg sendmmsg
+                101, 272, 310, 311, 321, // ptrace unshare process_vm_* bpf
+                425, 426, 427, 438, // io_uring_* pidfd_getfd
+            ],
         )),
         _ => None,
     }
@@ -668,8 +706,9 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    let mut command = Command::new(&launcher.unshare);
+    let mut command = helper_launch_command()?;
     command
+        .arg(&launcher.unshare)
         .arg("--net")
         .arg("--")
         .arg(&launcher.setpriv)
@@ -695,25 +734,19 @@ pub fn run_confined(
     }
     command.arg(program).args(args);
     let mut child = command
-        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
-    // Drain stderr to EOF before waiting: a child holding a full stderr
-    // pipe could otherwise block forever against a wait()ing parent.
-    let raw = match child.stderr.take() {
-        Some(pipe) => drain_retaining_cap(pipe)
-            .map_err(|source| WorkerError::SandboxSpawnFailed { source })?,
-        None => Vec::new(),
-    };
-    let status = child
-        .wait()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+    let stderr = child.stderr.take();
+    let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
+    if let Some(error) = helper_launch_init_failed(&observed) {
+        return Err(error);
+    }
     Ok(ConfinedOutcome {
-        exit_ok: status.success(),
-        stderr: String::from_utf8_lossy(&raw).into_owned(),
+        exit_ok: observed.status.success(),
+        stderr: String::from_utf8_lossy(&observed.stderr).into_owned(),
     })
 }
 

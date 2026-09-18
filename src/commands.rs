@@ -1137,12 +1137,32 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                         selection.clone(),
                         rt.scoped_grant.clone(),
                     ) {
-                        Ok(_) => RpcResponse::ok(
+                        Ok(Some(_)) => {
+                            if let Err(err) = rt.drain_scheduler(&session) {
+                                return envelope_error(
+                                    id,
+                                    err.error_code(),
+                                    -32000,
+                                    &err.to_string(),
+                                );
+                            }
+                            RpcResponse::ok(
+                                id,
+                                serde_json::to_value(&result).unwrap_or(Value::Null),
+                            )
+                        }
+                        Ok(None) => RpcResponse::ok(
                             id,
                             serde_json::to_value(&result).unwrap_or(Value::Null),
                         ),
                         Err(err) => {
-                            envelope_error(id, ErrorCode::InternalError, -32603, &err.to_string())
+                            let message = err.to_string();
+                            envelope_error(
+                                id,
+                                crate::controller::ControllerError::Scheduler(err).error_code(),
+                                -32000,
+                                &message,
+                            )
                         }
                     }
                 }
@@ -1213,7 +1233,13 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                             serde_json::to_value(&result).unwrap_or(Value::Null),
                         ),
                         Err(err) => {
-                            envelope_error(id, ErrorCode::InternalError, -32603, &err.to_string())
+                            let message = err.to_string();
+                            envelope_error(
+                                id,
+                                crate::controller::ControllerError::Scheduler(err).error_code(),
+                                -32000,
+                                &message,
+                            )
                         }
                     }
                 }

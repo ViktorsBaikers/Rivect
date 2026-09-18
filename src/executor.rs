@@ -17,10 +17,13 @@ use crate::policy::{
 use crate::resources::{ReadFlightKey, ReadFlights, ReadRights, SnapshotBinding};
 use crate::state::{StoreError, TaskStore};
 use sha2::Digest as _;
-use std::fs::Metadata;
-use std::io::Read;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub use macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
 
@@ -166,7 +169,9 @@ impl ExecutorError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             Self::Worker(
-                WorkerError::SandboxSpawnFailed { .. } | WorkerError::SandboxUnavailable { .. },
+                WorkerError::SandboxSpawnFailed { .. }
+                | WorkerError::SandboxUnavailable { .. }
+                | WorkerError::ConfinedRunTimedOut,
             ) => ErrorCode::CapabilityUnavailable,
             Self::Worker(_)
             | Self::Policy(_)
@@ -265,6 +270,7 @@ const STDERR_RETAIN_BYTES: usize = 64 * 1024;
 /// Reads one stream to EOF but retains only its first
 /// [`STDERR_RETAIN_BYTES`]: the read loop never stops early, so the
 /// writer can always drain, while this process holds a bounded buffer.
+#[cfg(test)]
 fn drain_retaining_cap(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
     let mut retained = Vec::new();
     let mut scratch = [0u8; 8192];
@@ -275,6 +281,278 @@ fn drain_retaining_cap(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
         }
         let room = STDERR_RETAIN_BYTES.saturating_sub(retained.len());
         retained.extend_from_slice(&scratch[..read.min(room)]);
+    }
+}
+
+/// Wall deadline for one confined child: a hung FIFO or a wedged helper
+/// is killed instead of blocking the executor forever.
+pub(crate) const CONFINED_DEADLINE: Duration = Duration::from_secs(5);
+
+pub(crate) struct ObservedChild {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub(crate) fn helper_path() -> Result<PathBuf, WorkerError> {
+    rivect_sandbox_helper::helper_binary()
+        .map_err(|source| WorkerError::SandboxSpawnFailed { source })
+}
+
+pub(crate) fn helper_launch_command() -> Result<Command, WorkerError> {
+    let mut command = Command::new(helper_path()?);
+    command.arg("launch").arg("--").env_clear();
+    Ok(command)
+}
+
+pub(crate) fn helper_confined_command(
+    platform: &str,
+    mode: &str,
+    profile: &str,
+) -> Result<Command, WorkerError> {
+    let mut command = Command::new(helper_path()?);
+    command.arg("confined").arg(platform).arg(mode);
+    if !profile.is_empty() {
+        command.arg(profile);
+    }
+    command.env_clear();
+    Ok(command)
+}
+
+fn pipe_nonblocking(fd: impl AsFd) -> Result<(), WorkerError> {
+    rivect_sandbox_helper::set_nonblocking(fd)
+        .map_err(|source| WorkerError::SandboxSpawnFailed { source })
+}
+
+fn write_stdin_nonblocking(
+    stdin: &mut Option<ChildStdin>,
+    payload: &mut &[u8],
+) -> Result<(), WorkerError> {
+    let Some(pipe) = stdin.as_mut() else {
+        return Ok(());
+    };
+    if payload.is_empty() {
+        *stdin = None;
+        return Ok(());
+    }
+    match pipe.write(payload) {
+        Ok(0) => Ok(()),
+        Ok(n) => {
+            *payload = &payload[n..];
+            Ok(())
+        }
+        Err(err)
+            if err.kind() == std::io::ErrorKind::WouldBlock
+                || err.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(WorkerError::SandboxSpawnFailed { source }),
+    }
+}
+
+/// Drains a confined child via nonblocking pipes, `yield_now`, and a wall
+/// deadline that kills the child.
+pub(crate) fn observe_confined_child(
+    child: &mut Child,
+    mut stdin: Option<ChildStdin>,
+    mut payload: &[u8],
+    mut stdout: Option<ChildStdout>,
+    mut stderr: Option<ChildStderr>,
+) -> Result<ObservedChild, WorkerError> {
+    if let Some(ref pipe) = stdin {
+        pipe_nonblocking(pipe.as_fd())?;
+    }
+    if let Some(ref pipe) = stdout {
+        pipe_nonblocking(pipe.as_fd())?;
+    }
+    if let Some(ref pipe) = stderr {
+        pipe_nonblocking(pipe.as_fd())?;
+    }
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let mut scratch = [0u8; 8192];
+    let deadline = Instant::now() + CONFINED_DEADLINE;
+    loop {
+        write_stdin_nonblocking(&mut stdin, &mut payload)?;
+        drain_nonblocking_pipe(&mut stdout, &mut stdout_buf, &mut scratch, READ_MAX_CAP)?;
+        drain_nonblocking_pipe(
+            &mut stderr,
+            &mut stderr_buf,
+            &mut scratch,
+            STDERR_RETAIN_BYTES,
+        )?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The exited child's write ends are closed: every pipe
+                // drains to EOF — a single read would silently truncate
+                // output still buffered past one scratch chunk.
+                drain_pipe_to_eof(&mut stdout, &mut stdout_buf, &mut scratch, READ_MAX_CAP)?;
+                drain_pipe_to_eof(
+                    &mut stderr,
+                    &mut stderr_buf,
+                    &mut scratch,
+                    STDERR_RETAIN_BYTES,
+                )?;
+                return Ok(ObservedChild {
+                    status,
+                    stdout: stdout_buf,
+                    stderr: stderr_buf,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    drop(child.kill());
+                    drop(child.wait());
+                    return Err(WorkerError::ConfinedRunTimedOut);
+                }
+                std::thread::yield_now();
+            }
+            Err(source) => return Err(WorkerError::SandboxSpawnFailed { source }),
+        }
+    }
+}
+
+const READ_MAX_CAP: usize = (1 << 20) + 1;
+
+fn drain_nonblocking_pipe<T: Read>(
+    pipe: &mut Option<T>,
+    retained: &mut Vec<u8>,
+    scratch: &mut [u8],
+    cap: usize,
+) -> Result<(), WorkerError> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(());
+    };
+    match reader.read(scratch) {
+        Ok(0) => {
+            *pipe = None;
+            Ok(())
+        }
+        Ok(n) => {
+            let room = cap.saturating_sub(retained.len());
+            retained.extend_from_slice(&scratch[..n.min(room)]);
+            Ok(())
+        }
+        Err(err)
+            if err.kind() == std::io::ErrorKind::WouldBlock
+                || err.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(WorkerError::SandboxSpawnFailed { source }),
+    }
+}
+
+/// Post-exit drain: the child's write end is closed, so reads return the
+/// buffered remainder then 0 — never a spurious WouldBlock. Loops until
+/// the pipe hits EOF (`drain_nonblocking_pipe` clears the slot on 0).
+fn drain_pipe_to_eof<T: Read>(
+    pipe: &mut Option<T>,
+    retained: &mut Vec<u8>,
+    scratch: &mut [u8],
+    cap: usize,
+) -> Result<(), WorkerError> {
+    while pipe.is_some() {
+        drain_nonblocking_pipe(pipe, retained, scratch, cap)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn helper_confined_read(
+    platform: &str,
+    profile: &str,
+    file: File,
+) -> Result<Vec<u8>, WorkerError> {
+    let mut child = helper_confined_command(platform, "read", profile)?
+        .stdin(Stdio::from(file))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let observed = observe_confined_child(&mut child, None, &[], stdout, stderr)?;
+    helper_io_bytes(observed, true)
+}
+
+pub(crate) fn helper_confined_write(
+    platform: &str,
+    profile: &str,
+    file: File,
+    bytes: &[u8],
+) -> Result<(), WorkerError> {
+    let mut child = helper_confined_command(platform, "write", profile)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+    let stdin = child.stdin.take();
+    let stderr = child.stderr.take();
+    let observed = observe_confined_child(&mut child, stdin, bytes, None, stderr)?;
+    helper_io_bytes(observed, false).map(|_| ())
+}
+
+pub(crate) fn helper_probe_write(
+    platform: &str,
+    profile: &str,
+    path: &Path,
+) -> Result<i32, WorkerError> {
+    let mut child = Command::new(helper_path()?)
+        .arg("probe-write")
+        .arg(platform)
+        .arg(profile)
+        .arg(path)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+    let stderr = child.stderr.take();
+    let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
+    Ok(helper_exit_code(&observed))
+}
+
+fn helper_exit_code(observed: &ObservedChild) -> i32 {
+    observed
+        .status
+        .code()
+        .unwrap_or(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
+}
+
+/// `launch` could not exec the sandbox mechanism: init failure, never an
+/// effect denial. Signal-killed children are left to the caller (timeout
+/// already mapped [`WorkerError::ConfinedRunTimedOut`]).
+pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<WorkerError> {
+    match observed.status.code() {
+        Some(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
+        | Some(rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND)
+        | Some(rivect_sandbox_helper::EXIT_PROTOCOL) => Some(WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other(String::from_utf8_lossy(&observed.stderr).into_owned()),
+        }),
+        _ => None,
+    }
+}
+
+fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, WorkerError> {
+    let code = helper_exit_code(&observed);
+    let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
+    match code {
+        rivect_sandbox_helper::EXIT_OK => Ok(observed.stdout),
+        rivect_sandbox_helper::EXIT_SANDBOX_INIT => {
+            Err(WorkerError::SandboxUnavailable { reason: stderr })
+        }
+        rivect_sandbox_helper::EXIT_DATA_IO if read => Err(WorkerError::ReadFailed {
+            source: std::io::Error::other(stderr),
+        }),
+        rivect_sandbox_helper::EXIT_DATA_IO => Err(WorkerError::WriteFailed {
+            source: std::io::Error::other(stderr),
+        }),
+        _ => Err(WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other(stderr),
+        }),
     }
 }
 
@@ -347,17 +625,44 @@ pub fn admission_context(
     scope_root: &Path,
     target: &Path,
 ) -> Result<AdmissionContext, ExecutorError> {
+    let in_grant_scope = derive_in_grant_scope(scope_root, target)?;
+    let scope_key = scope_root
+        .canonicalize()
+        .ok()
+        .map(|path| path.display().to_string());
+    let budget_remaining = match scope_key.as_deref() {
+        Some(scope) => budget_has_remaining(store, scope)?,
+        None => false,
+    };
+    let has_checkpoint = match scope_key.as_deref() {
+        Some(scope) => store.has_retained(scope)?,
+        None => false,
+    };
     Ok(AdmissionContext {
         mode,
-        in_grant_scope: derive_in_grant_scope(scope_root, target)?,
-        budget_remaining: false,
-        in_trusted_scope: false,
-        has_checkpoint: false,
+        in_grant_scope,
+        budget_remaining,
+        in_trusted_scope: in_grant_scope,
+        has_checkpoint,
         previously_approved: store
             .is_preapproved(&preapproval_scope(class, &target.display().to_string()))?,
-        within_declared_bounds: false,
+        within_declared_bounds: match class {
+            EffectClass::Exec => in_grant_scope,
+            EffectClass::Egress => true,
+            EffectClass::Read | EffectClass::Write | EffectClass::Model | EffectClass::Control => {
+                false
+            }
+        },
         dry_run: false,
     })
+}
+
+fn budget_has_remaining(store: &TaskStore, scope: &str) -> Result<bool, ExecutorError> {
+    match store.budget_status(scope) {
+        Ok(status) => Ok(status.spent.saturating_add(status.reserved) < status.limit_units),
+        Err(StoreError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Conservative scope derivation for the decision context: both paths must
@@ -738,9 +1043,7 @@ impl<'a> Executor<'a> {
             self.store
                 .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
             self.abandon_flight(&admitted.attempt_id);
-            return Ok(EffectOutcome::Denied {
-                reason: TASK_CANCELLED.to_string(),
-            });
+            return Err(ExecutorError::Cancelled);
         }
         // Mutable mode consult before the worker runs anything.
         let target = admitted.request.target_path();

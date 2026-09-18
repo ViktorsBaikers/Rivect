@@ -169,6 +169,7 @@ pub const COMPLETION_COUNTS: &str = "SELECT
 pub const UPSERT_RETAINED: &str =
     "INSERT OR REPLACE INTO retained (boundary_id, record_json) VALUES (?1, ?2)";
 pub const RETAINED_BY_ID: &str = "SELECT record_json FROM retained WHERE boundary_id = ?1";
+pub const EXISTS_RETAINED: &str = "SELECT EXISTS(SELECT 1 FROM retained WHERE boundary_id = ?1)";
 pub const INSERT_SUPERVISOR_REACTION: &str =
     "INSERT INTO supervisor_reactions (task_id, reaction_json) VALUES (?1, ?2)";
 pub const SUPERVISOR_REACTIONS_PAGE: &str = "SELECT reaction_json FROM supervisor_reactions WHERE task_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3";
@@ -242,7 +243,8 @@ pub const RESERVATION_EXISTS: &str =
 pub const BUDGET_RESERVATION_SCOPES: &str =
     "SELECT scope, bound, state FROM budget_reservations WHERE reservation_id = ?1 ORDER BY scope";
 pub const CHARGE_BUDGET_SCOPE: &str =
-    "UPDATE budget_scopes SET spent = spent + ?2, reserved = reserved - ?3 WHERE scope = ?1";
+    "UPDATE budget_scopes SET spent = spent + ?2, reserved = reserved - ?3
+                  WHERE scope = ?1 AND reserved >= ?3";
 pub const RELEASE_BUDGET_SCOPE: &str =
     "UPDATE budget_scopes SET reserved = reserved - ?2 WHERE scope = ?1";
 pub const SET_BUDGET_RESERVATION_STATE: &str =

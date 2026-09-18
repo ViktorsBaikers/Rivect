@@ -45,6 +45,38 @@ fn scoped_world(tag: &str, config: Option<&str>) -> (World, PathBuf, PathBuf, St
     (world, scope, file, grant)
 }
 
+/// Freezes an already-published answer onto a scheduler node without
+/// driving `scheduler_step`: production answer ingress drains the loop,
+/// so tests that still own `run_decision_step` build the runnable node
+/// directly.
+fn freeze_answered(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    task: &rivect::contracts::TaskId,
+    question: &rivect::contracts::Question,
+    selection: AnswerSelection,
+) {
+    world
+        .runtime
+        .owner
+        .store
+        .answer_question(
+            session,
+            task,
+            &question.question_id,
+            question.question_revision,
+            &selection,
+            "human",
+        )
+        .expect("answer question");
+    world
+        .runtime
+        .scheduler
+        .submit_answered(task.clone(), selection, world.runtime.scoped_grant.clone())
+        .expect("submit answered node")
+        .expect("answered task is runnable");
+}
+
 struct NoToolProvider;
 
 impl Provider for NoToolProvider {
@@ -653,7 +685,7 @@ fn boot_confinement_before_dispatch() {
 
 #[test]
 fn provider_public_ingress() {
-    let (mut world, _scope, file, grant) =
+    let (mut world, _scope, _file, _grant) =
         scoped_world("public-ingress", Some(&support::config_distinct_pools()));
     let session = world.open_session("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1");
     assert!(!session.0.is_empty());
@@ -769,7 +801,8 @@ fn provider_public_ingress() {
     // The historical create receipt stays at revision 1/running.
     assert_eq!(result["snapshot"]["revision"], 1);
 
-    // Answer via the trusted adapter: applied, one task, not completed.
+    // Answer via the trusted adapter: applied, one task; the production
+    // drain runs the loopback useful path to completion.
     let answer = world.dispatch(&corpus_answer_option(
         &session,
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
@@ -786,9 +819,21 @@ fn provider_public_ingress() {
         status["result"]["tasks"]["items"].as_array().map(Vec::len),
         Some(1)
     );
-    assert_ne!(
+    assert_eq!(
         status["result"]["tasks"]["items"][0]["lifecycle"],
         "completed"
+    );
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "answer drain dispatches the admitted read once"
+    );
+    assert_eq!(
+        world.worker_reads(),
+        1,
+        "answer drain performs one scoped read"
     );
     let (answer_json, author) = world
         .runtime
@@ -800,8 +845,8 @@ fn provider_public_ingress() {
     assert_eq!(author, "human");
     assert!(answer_json.contains("steps"), "{answer_json}");
 
-    // Sequential second answer on the same question: conflict, no second
-    // decision or effect.
+    // Sequential second answer on the completed task: already_terminal,
+    // no second decision or effect.
     let second = world.dispatch(&corpus_answer_option(
         &session,
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6b",
@@ -810,9 +855,17 @@ fn provider_public_ingress() {
         "steps",
         json!(6),
     ));
-    assert_eq!(second["error"]["data"]["code"], "conflict");
+    assert_eq!(second["error"]["data"]["code"], "already_terminal");
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a second answer must not dispatch again"
+    );
 
-    // Steer with the actual current revisions: applied, new intent epoch.
+    // A completed task cannot be steered: terminal cannot reopen, even
+    // when the named intent is stale.
     let stale = world.dispatch(&corpus_steer(
         &session,
         "cmd-steer-stale",
@@ -821,7 +874,7 @@ fn provider_public_ingress() {
         3,
         json!(80),
     ));
-    assert_eq!(stale["error"]["data"]["code"], "stale_intent");
+    assert_eq!(stale["error"]["data"]["code"], "conflict");
     let steer = world.dispatch(&corpus_steer(
         &session,
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa8",
@@ -830,8 +883,7 @@ fn provider_public_ingress() {
         3,
         json!(8),
     ));
-    assert!(steer["error"].is_null(), "{steer}");
-    assert_eq!(steer["result"]["intent_revision"], 2);
+    assert_eq!(steer["error"]["data"]["code"], "conflict");
 
     // Answer origin is visible in the durable event log.
     let events = world
@@ -924,26 +976,21 @@ fn provider_public_ingress() {
         "{custom_json}"
     );
 
-    // The local loopback useful path: one provider call, one scoped read,
-    // evidence and completion, all offline.
-    let outcome = world.runtime.run_decision_step(
-        &session,
-        &fresh_task,
-        &answer_custom(&format!("read {}", file.display())),
-        &grant,
-        false,
-    );
-    match outcome.expect("decision step") {
-        rivect::controller::StepOutcome::Completed { snapshot } => {
-            assert_eq!(snapshot.lifecycle, Lifecycle::Completed);
-        }
-        other => panic!("expected completion, got {other:?}"),
-    }
+    // Custom text still runs the admitted scoped read at drain time; the
+    // exact multi-line bytes stay durable.
+    let custom_snapshot = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&fresh_task)
+        .expect("custom snapshot");
+    assert_eq!(custom_snapshot.lifecycle, Lifecycle::Completed);
     assert_eq!(
         world
             .provider_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2,
+        "each answered task drains exactly one loopback dispatch"
     );
 }
 
@@ -954,15 +1001,15 @@ fn known_ready_action_starts_without_provider_dispatch() {
     let session = world.open_session("bootstrap-known-ready");
     let task = world.create_task(&session, "cmd-known-ready");
     let question = world.publish(&session, &task);
-    let answer = world.dispatch(&corpus_answer_option(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-known-ready-answer",
         &task,
         &question,
-        "brief",
-        json!(40),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+        AnswerSelection::Option {
+            option_id: OptionId("brief".to_string()),
+        },
+    );
     let outcome = world
         .runtime
         .run_decision_step(
@@ -989,15 +1036,15 @@ fn known_ready_action_starts_without_provider_dispatch() {
 
     let planned_task = world.create_task(&session, "cmd-material-plan");
     let planned_question = world.publish(&session, &planned_task);
-    let planned_answer = world.dispatch(&corpus_answer_option(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-material-plan-answer",
         &planned_task,
         &planned_question,
-        "steps",
-        json!(41),
-    ));
-    assert!(planned_answer["error"].is_null(), "{planned_answer}");
+        AnswerSelection::Option {
+            option_id: OptionId("steps".to_string()),
+        },
+    );
     let planned = world
         .runtime
         .run_decision_step(
@@ -1704,15 +1751,13 @@ fn crash_restart_no_repeat_effect() {
             .to_string(),
     );
     let question = world.publish(&session, &task);
-    let answer = world.dispatch(&corpus_answer_custom(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-crash-answer",
         &task,
         &question,
-        &format!("read {}", file.display()),
-        json!(30),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+        answer_custom(&format!("read {}", file.display())),
+    );
 
     // EDGE-003: dispatch happened, the real worker read happened once, the
     // receipt was lost. The old attempt stays unknown and the task blocks.
@@ -2058,15 +2103,13 @@ fn crash_restart_no_repeat_effect() {
     // attempt: exactly one more worker read and one more dispatch.
     let task2 = world.create_task(&session, "cmd-crash-2");
     let question2 = world.publish(&session, &task2);
-    let answer2 = world.dispatch(&corpus_answer_custom(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-crash-answer-2",
         &task2,
         &question2,
-        &format!("read {}", file.display()),
-        json!(31),
-    ));
-    assert!(answer2["error"].is_null(), "{answer2}");
+        answer_custom(&format!("read {}", file.display())),
+    );
     let outcome = world
         .runtime
         .run_decision_step(
@@ -2123,10 +2166,12 @@ fn post_confirmation_duplicate_identity_is_scoped_to_command() {
             false,
         )
         .expect("first confirmation");
-    assert!(matches!(
-        first,
-        rivect::controller::StepOutcome::Completed { .. }
-    ));
+    match first {
+        rivect::controller::StepOutcome::NoAction { snapshot } => {
+            assert_eq!(snapshot.lifecycle, Lifecycle::Completed);
+        }
+        other => panic!("answer drain must have completed the task, got {other:?}"),
+    }
     assert_eq!(world.worker_reads(), 1);
     assert_eq!(
         world
@@ -2173,10 +2218,12 @@ fn post_confirmation_duplicate_identity_is_scoped_to_command() {
             false,
         )
         .expect("second confirmation");
-    assert!(matches!(
-        second,
-        rivect::controller::StepOutcome::Completed { .. }
-    ));
+    match second {
+        rivect::controller::StepOutcome::NoAction { snapshot } => {
+            assert_eq!(snapshot.lifecycle, Lifecycle::Completed);
+        }
+        other => panic!("answer drain must have completed the new task, got {other:?}"),
+    }
     assert_eq!(
         world.worker_reads(),
         2,
@@ -2200,15 +2247,13 @@ fn unknown_without_safe_read_stays_blocked() {
     let session = world.open_session("bootstrap-unknown-no-safe-read");
     let task = world.create_task(&session, "cmd-unknown-no-safe-read");
     let question = world.publish(&session, &task);
-    let answer = world.dispatch(&corpus_answer_custom(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-unknown-no-safe-read-answer",
         &task,
         &question,
-        &format!("read {}", file.display()),
-        json!(73),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+        answer_custom(&format!("read {}", file.display())),
+    );
 
     let unknown = world
         .runtime
@@ -2431,14 +2476,14 @@ fn revoke_and_cancel_block_dispatch() {
     ));
     assert!(answer["error"].is_null(), "{answer}");
 
-    // Cancel blocks the next dispatch before the provider effect.
+    // The answer drain already completed the task, so cancel is already_terminal.
     let cancel = world.dispatch(&json!({
         "jsonrpc": "2.0", "id": 41, "method": "task.submit",
         "params": { "schema_version": 1, "command_id": "cmd-cancel-1", "session_id": session.0,
                     "kind": "cancel", "task_id": task.0, "expected_intent_revision": 1, "reason": "стоп" }
     }));
     assert!(cancel["error"].is_null(), "{cancel}");
-    assert_eq!(cancel["result"]["status"], "applied");
+    assert_eq!(cancel["result"]["status"], "already_terminal");
     let outcome = world
         .runtime
         .run_decision_step(
@@ -2448,8 +2493,51 @@ fn revoke_and_cancel_block_dispatch() {
             &grant,
             false,
         )
-        .expect("cancelled step");
+        .expect("terminal step");
     match outcome {
+        rivect::controller::StepOutcome::NoAction { snapshot } => {
+            assert_eq!(snapshot.lifecycle, Lifecycle::Completed);
+        }
+        other => panic!("drained task must stay terminal, got {other:?}"),
+    }
+    let after_drain_calls = world
+        .provider_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let after_drain_reads = world.worker_reads();
+    assert_eq!(after_drain_calls, 1, "answer drain dispatched once");
+    assert_eq!(
+        after_drain_reads, 1,
+        "answer drain performed one scoped read"
+    );
+
+    // Cancel blocks the next dispatch of a live task before the provider effect.
+    let live = world.create_task(&session, "cmd-cancel-live-task");
+    let live_question = world.publish(&session, &live);
+    freeze_answered(
+        &mut world,
+        &session,
+        &live,
+        &live_question,
+        answer_custom(&format!("read {}", file.display())),
+    );
+    let cancel_live = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 42, "method": "task.submit",
+        "params": { "schema_version": 1, "command_id": "cmd-cancel-live", "session_id": session.0,
+                    "kind": "cancel", "task_id": live.0, "expected_intent_revision": 1, "reason": "стоп" }
+    }));
+    assert!(cancel_live["error"].is_null(), "{cancel_live}");
+    assert_eq!(cancel_live["result"]["status"], "applied");
+    let cancelled = world
+        .runtime
+        .run_decision_step(
+            &session,
+            &live,
+            &answer_custom(&format!("read {}", file.display())),
+            &grant,
+            false,
+        )
+        .expect("cancelled step");
+    match cancelled {
         rivect::controller::StepOutcome::NoAction { snapshot } => {
             assert_eq!(snapshot.lifecycle, Lifecycle::Cancelled);
         }
@@ -2459,21 +2547,20 @@ fn revoke_and_cancel_block_dispatch() {
         world
             .provider_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        0
+        after_drain_calls,
+        "cancel must not dispatch"
     );
 
     // Revoke blocks the next dispatch of a live task.
     let task2 = world.create_task(&session, "cmd-revoke-2");
     let question2 = world.publish(&session, &task2);
-    let answer2 = world.dispatch(&corpus_answer_custom(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-revoke-answer-2",
         &task2,
         &question2,
-        &format!("read {}", file.display()),
-        json!(42),
-    ));
-    assert!(answer2["error"].is_null(), "{answer2}");
+        answer_custom(&format!("read {}", file.display())),
+    );
     world.runtime.policy.revoke(&grant);
     let err = world
         .runtime
@@ -2498,11 +2585,12 @@ fn revoke_and_cancel_block_dispatch() {
         world
             .provider_calls
             .load(std::sync::atomic::Ordering::SeqCst),
-        0
+        after_drain_calls,
+        "revoked scope must not dispatch"
     );
     assert_eq!(
         world.worker_reads(),
-        0,
+        after_drain_reads,
         "revoked scope produces zero worker reads"
     );
 
@@ -2769,15 +2857,13 @@ fn evidence_invalidation_blocks_completion() {
             .to_string(),
     );
     let question = world.publish(&session, &task);
-    let answer = world.dispatch(&corpus_answer_custom(
+    freeze_answered(
+        &mut world,
         &session,
-        "cmd-inv-answer",
         &task,
         &question,
-        &format!("read {}", file.display()),
-        json!(61),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+        answer_custom(&format!("read {}", file.display())),
+    );
     let outcome = world
         .runtime
         .run_decision_step(

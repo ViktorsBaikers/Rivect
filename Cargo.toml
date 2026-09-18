@@ -5,6 +5,23 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = [".", "crates/rivect-sandbox-helper"]
+resolver = "3"
+
+# DEC-009/DEC-018: the confined helper binary (unsafe allowed only in
+# crates/rivect-sandbox-helper) — the workspace forbid/deny lint tables of
+# this package do not reach it. Per-target lint tables are not a cargo
+# feature (cargo rejects `[lints.example.<name>]`); the helper crate owns
+# its own
+# [lints] instead: unsafe_code allow, dead_code warn,
+# unused_qualifications warn, trivial_casts warn,
+# variant_size_differences warn, unwrap_used deny, expect_used deny,
+# panic deny, todo deny, unimplemented deny, dbg_macro deny,
+# mem_forget deny, undocumented_unsafe_blocks deny, map_err_ignore
+# deny, let_underscore_must_use deny, allow_attributes_without_reason
+# warn.
+
 # Engineering standards §14 (docs/engineering-standards.md): denied patterns are
 # enforced here so the gate fails at compile time regardless of which tool or
 # agent produced the code. Local re-allow of these lints is itself caught by
@@ -77,6 +94,7 @@ private_intra_doc_links = "warn"
 [dependencies]
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "std"] }
+rivect-sandbox-helper = { path = "crates/rivect-sandbox-helper", version = "0.1.0" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

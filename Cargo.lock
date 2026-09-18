@@ -817,6 +817,7 @@ dependencies = [
  "focaccia",
  "portable-pty",
  "ratatui",
+ "rivect-sandbox-helper",
  "rusqlite",
  "serde",
  "serde_json",
@@ -827,6 +828,10 @@ dependencies = [
  "uuid",
  "vt100",
 ]
+
+[[package]]
+name = "rivect-sandbox-helper"
+version = "0.1.0"
 
 [[package]]
 name = "rsqlite-vfs"

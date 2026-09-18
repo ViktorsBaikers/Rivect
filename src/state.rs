@@ -100,6 +100,12 @@ pub enum ConflictCause {
         reservation_id: String,
         state: String,
     },
+    #[error("budget scope {scope} reserved {reserved} is below charge bound {bound}")]
+    ChargeReservedBelowBound {
+        scope: String,
+        reserved: u64,
+        bound: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -133,6 +139,8 @@ pub enum InvalidCause {
     BudgetUnitsOutOfRange(u64),
     #[error("budget reservation must name at least one scope")]
     EmptyBudgetScopes,
+    #[error("confirmed cost {confirmed} exceeds reservation bound {bound}")]
+    ConfirmedExceedsBound { confirmed: u64, bound: u64 },
 }
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -1907,6 +1915,12 @@ impl TaskStore {
         Ok(record)
     }
 
+    pub fn has_retained(&self, boundary_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(sql::EXISTS_RETAINED, params![boundary_id], |row| row.get(0))
+            .map_err(storage)
+    }
+
     // ----- supervisor reaction journal (supervisor.rs owns the reaction) -----
 
     /// Appends one supervisor detector firing to the task's durable
@@ -2292,9 +2306,36 @@ impl TaskStore {
             } else {
                 // An unknown sent cost retains the bound: the delta is
                 // the confirmed units, or the bound itself.
+                if let Some(delta) = confirmed
+                    && delta > *bound
+                {
+                    return Err(StoreError::InvalidInput(
+                        InvalidCause::ConfirmedExceedsBound {
+                            confirmed: unsigned(delta),
+                            bound: unsigned(*bound),
+                        },
+                    ));
+                }
                 let delta = confirmed.unwrap_or(*bound);
-                tx.execute(sql::CHARGE_BUDGET_SCOPE, params![scope, delta, bound])
+                let charged = tx
+                    .execute(sql::CHARGE_BUDGET_SCOPE, params![scope, delta, bound])
                     .map_err(storage)?;
+                if charged == 0 {
+                    let reserved = tx
+                        .query_row(sql::BUDGET_SCOPE_ROW, params![scope], |row| {
+                            row.get::<_, i64>(2)
+                        })
+                        .optional()
+                        .map_err(storage)?
+                        .unwrap_or(0);
+                    return Err(StoreError::Conflict(
+                        ConflictCause::ChargeReservedBelowBound {
+                            scope: scope.clone(),
+                            reserved: unsigned(reserved),
+                            bound: unsigned(*bound),
+                        },
+                    ));
+                }
             }
         }
         tx.execute(
@@ -2534,6 +2575,38 @@ mod tests {
         )?;
         assert_eq!(repaired_count, 1);
         drop(repaired);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn charge_sql_requires_reserved_ge_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("rivect-charge-reserved-{}", TaskId::generate().0));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("state.db");
+        let mut store = TaskStore::open(&path)?;
+        store.open_budget("root", 8)?;
+        store.budget_reserve("res", &["root"], 4)?;
+        store.conn.execute(
+            "UPDATE budget_scopes SET reserved = 1 WHERE scope = ?1",
+            params!["root"],
+        )?;
+        let error = store
+            .budget_charge("res", Some(1))
+            .expect_err("reserved below bound");
+        assert!(
+            matches!(
+                error,
+                super::StoreError::Conflict(super::ConflictCause::ChargeReservedBelowBound {
+                    reserved: 1,
+                    bound: 4,
+                    ..
+                })
+            ),
+            "{error}"
+        );
+        drop(store);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

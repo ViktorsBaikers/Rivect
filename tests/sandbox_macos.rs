@@ -23,6 +23,7 @@ use rivect::policy::{AdmissionContext, ModeDecision, PermissionMode, Policy, pre
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use support::{TempTree, matrix_verdict};
 
@@ -30,6 +31,7 @@ use support::{TempTree, matrix_verdict};
 use std::os::unix::fs::MetadataExt;
 
 fn sandbox_exec() -> PathBuf {
+    ensure_helper();
     PathBuf::from(SANDBOX_EXEC)
 }
 
@@ -38,12 +40,14 @@ fn confined(
     program: &Path,
     args: &[&std::ffi::OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
+    ensure_helper();
     macos::run_confined(&sandbox_exec(), profile, program, args)
 }
 
 /// World fixture mirroring the effect-boundary one: a scoped read grant and
 /// the real macOS worker behind the executor.
 fn sandbox_world(tag: &str) -> (support::World, rivect::contracts::TaskId, PathBuf, String) {
+    ensure_helper();
     let mut world = support::open_world(tag, None);
     let session = world.open_session(&format!("{tag}-session"));
     let task = world.create_task(&session, &format!("{tag}-task"));
@@ -54,6 +58,17 @@ fn sandbox_world(tag: &str) -> (support::World, rivect::contracts::TaskId, PathB
     let grant = world.runtime.set_read_scope(scope, file.clone());
     world.runtime.read_worker = Box::new(macos::MacosReadWorker);
     (world, task, file, grant)
+}
+
+fn ensure_helper() {
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "rivect-sandbox-helper"])
+            .status()
+            .expect("spawn helper build");
+        assert!(status.success(), "helper build failed: {status}");
+    });
 }
 
 #[test]
@@ -646,20 +661,21 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
         "yolo must not be the default permission mode"
     );
 
-    // Live mode-carrying legs (DEC-016; DEC-017 D-003): every mode ×
-    // class pair runs the real admit→execute path with the mode
+    // Live mode-carrying legs (DEC-016; DEC-017 D-003; DEC-018): every
+    // mode × class pair runs the real admit→execute path with the mode
     // injected at admit, never admit_managed_write. The executor's own
-    // admission context observes only in-grant-scope and the recorded
-    // preapprovals — every other granting input stays unobserved — so
-    // the live verdicts differ from the all-inputs pin above exactly
-    // there: only preapproved-only (with its recorded consents) and
-    // yolo allow the non-read classes. Allow cells cross the real
-    // Seatbelt worker — the read lands, the write lands, the confined
-    // exec runs a binary copied into the scope (the exec profile's
-    // allowance is the scope subpath), and the egress Allow cell meets
-    // the OS denial the boundary imposes (an egress target admits no
-    // filesystem scope, so it is out of scope by construction); ask
-    // and deny cells fail closed at admit and never invoke the worker.
+    // admission context now derives in-grant-scope, exec/egress declared
+    // bounds, and recorded preapprovals; budget and checkpoint stay
+    // unobserved unless tests seed them (T11). Auto exec/egress therefore
+    // Allow on an in-scope program / declared egress bound; Auto write
+    // stays Ask without a budget. Allow cells cross the real Seatbelt
+    // worker — the read lands, the write lands, the confined exec runs a
+    // binary copied into the scope (the exec profile's allowance is the
+    // scope subpath), and the egress Allow cell meets the OS denial the
+    // boundary imposes (an egress target admits no filesystem scope, so
+    // it is out of scope by construction); ask and deny cells fail closed
+    // at admit and never invoke the worker.
+    ensure_helper();
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
@@ -739,8 +755,8 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
             PermissionMode::Auto,
             ModeDecision::Allow,
             ModeDecision::Ask,
-            ModeDecision::Ask,
-            ModeDecision::Ask,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -1019,6 +1035,7 @@ fn allow_mode_write_cells_execute_through_the_seatbelt_worker() {
     // (with its recorded consent) and yolo reach a live write; every
     // other mode fails closed at admit and the worker never runs.
     use rivect::contracts::EffectClass as Class;
+    ensure_helper();
     for (mode, expected) in [
         (PermissionMode::Manual, ModeDecision::Ask),
         (PermissionMode::AcceptEdits, ModeDecision::Ask),
@@ -1332,6 +1349,7 @@ fn free_write_once_is_confined_for_every_caller() {
     // so confinement must be intrinsic to it: a non-confinable scope fails
     // the probe before any byte moves, exactly as for the executor's
     // managed-write leg.
+    ensure_helper();
     let fixture = TempTree::new("sandbox-macos", "free-write-confined");
     let target = fixture.path.join("target.txt");
     std::fs::write(&target, b"original").expect("create target");
@@ -1355,4 +1373,207 @@ fn free_write_once_is_confined_for_every_caller() {
         b"original",
         "no ambient fallback: the probe failure must precede the write"
     );
+}
+
+#[test]
+fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_process() {
+    ensure_helper();
+    let helper = rivect_sandbox_helper::helper_binary().expect("helper binary");
+    assert!(
+        helper.is_file(),
+        "the confined child must be a built helper, got {}",
+        helper.display()
+    );
+    let (mut world, task, file, grant) = sandbox_world("helper-data-plane");
+    {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file.clone(),
+                },
+                PermissionMode::Manual,
+            )
+            .expect("admit read");
+        match executor.execute(&admitted).expect("helper read") {
+            EffectOutcome::Read { bytes, .. } => assert_eq!(bytes, b"scoped-by-seatbelt"),
+            other => panic!("expected a helper read, got {other:?}"),
+        }
+    }
+    let write_grant = world.runtime.policy.grant_classes(
+        file.parent().expect("scope").to_path_buf(),
+        vec![rivect::contracts::EffectClass::Write],
+    );
+    {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Write {
+                    grant_id: write_grant,
+                    path: file.clone(),
+                    bytes: b"from-helper".to_vec(),
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("admit write");
+        executor.execute(&admitted).expect("helper write");
+    }
+    assert_eq!(
+        std::fs::read(&file).expect("read helper write"),
+        b"from-helper"
+    );
+}
+
+#[test]
+fn run_confined_kills_a_hung_fifo_gate() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-macos", "hung-fifo");
+    let fifo = fixture.path.join("hung.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+    let fifo = fifo.canonicalize().expect("canonical fifo");
+    let profile = macos::read_profile(&fixture.path).expect("read profile");
+    let error = confined(&profile, Path::new("/bin/cat"), &[fifo.as_os_str()])
+        .expect_err("a hung fifo must hit the wall deadline");
+    assert!(matches!(error, WorkerError::ConfinedRunTimedOut), "{error}");
+}
+
+#[test]
+fn macos_write_gate_proves_write_open_on_a_fresh_artifact() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-macos", "fresh-write-gate");
+    let target = fixture.path.join("target.txt");
+    std::fs::write(&target, b"seed").expect("seed target");
+    let meta = std::fs::metadata(&target).expect("meta");
+    macos::write_once(
+        &fixture.path,
+        &target,
+        macos::FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        },
+        b"gate-landed",
+    )
+    .expect("write through fresh gate");
+    assert_eq!(std::fs::read(&target).expect("read"), b"gate-landed");
+    let leftovers: Vec<_> = std::fs::read_dir(&fixture.path)
+        .expect("list")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".rivect-write-gate-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "write gate must use a fresh artifact and remove it: {leftovers:?}"
+    );
+}
+
+#[test]
+fn macos_exec_once_deny_first_probe_fails_closed_when_sandbox_does_not_enforce() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-macos", "exec-deny-first");
+    let program = fixture.path.join("true");
+    std::fs::copy("/usr/bin/true", &program).expect("copy true");
+    let error = macos::exec_once_with(Path::new("/usr/bin/true"), &fixture.path, &program)
+        .expect_err("passthrough sandbox-exec must fail closed");
+    assert!(
+        matches!(error, WorkerError::SandboxUnavailable { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn macos_exec_profile_does_not_allow_dev_read() {
+    let fixture = TempTree::new("sandbox-macos", "exec-no-dev");
+    let profile = macos::exec_profile(&fixture.path).expect("exec profile");
+    assert!(
+        !profile.contains("subpath \"/dev\""),
+        "exec profile must not grant file-read* on /dev: {profile}"
+    );
+}
+
+#[test]
+fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_signals_are_present()
+{
+    ensure_helper();
+    use rivect::contracts::EffectClass as Class;
+    let mut world = support::open_world("live-signals", None);
+    let session = world.open_session("live-signals-session");
+    let task = world.create_task(&session, "live-signals-task");
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope");
+    let file = scope.join("target.txt");
+    std::fs::write(&file, b"seed").expect("seed");
+    let grant = world
+        .runtime
+        .policy
+        .grant_classes(scope.clone(), vec![Class::Read, Class::Write, Class::Exec]);
+    let canonical = scope.canonicalize().expect("canonical scope");
+    let key = canonical.display().to_string();
+    world
+        .runtime
+        .owner
+        .store
+        .open_budget(&key, 8)
+        .expect("open budget");
+    world
+        .runtime
+        .owner
+        .store
+        .retain("checkpoint", &key)
+        .expect("retain checkpoint");
+    let writes = Arc::new(AtomicU64::new(0));
+    world.runtime.read_worker = Box::new(CountingSeatbeltWorker {
+        reads: Arc::new(AtomicU64::new(0)),
+        writes: writes.clone(),
+        execs: Arc::new(AtomicU64::new(0)),
+        egresses: Arc::new(AtomicU64::new(0)),
+    });
+    let ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Auto,
+        Class::Write,
+        &scope,
+        &file,
+    )
+    .expect("live write context");
+    assert!(ctx.budget_remaining);
+    assert!(ctx.in_trusted_scope);
+    assert!(ctx.has_checkpoint);
+    assert!(ctx.in_grant_scope);
+    for mode in [PermissionMode::Auto, PermissionMode::AcceptEdits] {
+        std::fs::write(&file, b"seed").expect("reseed");
+        let admitted = admit_live_cell(
+            &mut world,
+            &task,
+            mode,
+            EffectRequest::Write {
+                grant_id: grant.clone(),
+                path: file.clone(),
+                bytes: format!("live-{mode:?}").into_bytes(),
+            },
+            ModeDecision::Allow,
+        )
+        .unwrap_or_else(|| panic!("{mode:?} write must Allow when signals are seeded"));
+        execute_live_cell(&mut world, &admitted).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert_eq!(
+            std::fs::read(&file).expect("landed"),
+            format!("live-{mode:?}").as_bytes()
+        );
+    }
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
 }

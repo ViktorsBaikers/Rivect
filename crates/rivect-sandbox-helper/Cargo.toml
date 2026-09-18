@@ -1,0 +1,54 @@
+[package]
+name = "rivect-sandbox-helper"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+description = "Confined child that applies the OS sandbox and performs the admitted fd I/O for rivect"
+
+# The helper is the ONE crate where `unsafe` is allowed (DEC-009/DEC-018):
+# sandbox_init/landlock/seccomp/setrlimit are syscall surfaces no safe
+# standard-library API exposes. Every other lint mirrors the workspace
+# discipline so `clippy -D warnings` stays meaningful for this crate too.
+[lints.rust]
+dead_code = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+variant_size_differences = "warn"
+unexpected_cfgs = "warn"
+let_underscore_drop = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# print_stdout/print_stderr are the helper's whole interface: the host
+# captures its stderr and its exit code, so eprintln diagnostics are the
+# protocol, not a boundary violation.
+mem_forget = "deny"
+undocumented_unsafe_blocks = "deny"
+map_err_ignore = "deny"
+let_underscore_must_use = "deny"
+let_underscore_future = "deny"
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+unnecessary_to_owned = "warn"
+inefficient_to_string = "warn"
+checked_conversions = "warn"
+wildcard_imports = "warn"
+excessive_nesting = "warn"
+cognitive_complexity = "warn"
+
+[lib]
+name = "rivect_sandbox_helper"
+
+[[bin]]
+name = "rivect-sandbox-helper"
+path = "src/main.rs"
+
+[build-dependencies]

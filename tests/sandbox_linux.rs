@@ -28,6 +28,7 @@ use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use support::{TempTree, matrix_verdict};
 
@@ -38,11 +39,23 @@ fn launcher() -> SandboxLauncher {
     SandboxLauncher::default()
 }
 
+fn ensure_helper() {
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "rivect-sandbox-helper"])
+            .status()
+            .expect("spawn helper build");
+        assert!(status.success(), "helper build failed: {status}");
+    });
+}
+
 fn confined(
     confinement: &Confinement,
     program: &Path,
     args: &[&std::ffi::OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
+    ensure_helper();
     linux::run_confined(&launcher(), confinement, program, args)
 }
 
@@ -1252,18 +1265,18 @@ fn six_permission_modes_gate_the_linux_worker() {
         "yolo must not be the default permission mode"
     );
 
-    // Live mode-carrying legs (DEC-016): every mode × class pair runs
-    // the real admit→execute path with the mode injected at admit, never
-    // admit_managed_write. The executor's own admission context observes
-    // only in-grant-scope and the recorded preapprovals — every other
-    // granting input stays unobserved — so the live verdicts differ from
-    // the all-inputs pin above exactly there: only preapproved-only
-    // (with its recorded consents) and yolo allow the non-read classes.
-    // Allow cells cross the real Linux worker — the read lands, the
-    // write lands, the confined exec runs, and the egress Allow cell
-    // meets the OS denial the boundary imposes (an egress target admits
-    // no filesystem scope, so it is out of scope by construction); ask
-    // and deny cells fail closed at admit and never invoke the worker.
+    // Live mode-carrying legs (DEC-016; DEC-018): every mode × class
+    // pair runs the real admit→execute path with the mode injected at
+    // admit, never admit_managed_write. The executor's own admission
+    // context derives in-grant-scope, exec/egress declared bounds, and
+    // recorded preapprovals; budget and checkpoint stay unobserved
+    // unless tests seed them. Auto exec/egress therefore Allow; Auto
+    // write stays Ask without a budget. Allow cells cross the real
+    // Linux worker — the read lands, the write lands, the confined exec
+    // runs, and the egress Allow cell meets the OS denial the boundary
+    // imposes (an egress target admits no filesystem scope, so it is
+    // out of scope by construction); ask and deny cells fail closed at
+    // admit and never invoke the worker.
     let mut world = support::open_world("matrix-worker", None);
     let session = world.open_session("matrix-worker-session");
     let task = world.create_task(&session, "matrix-worker-task");
@@ -1340,8 +1353,8 @@ fn six_permission_modes_gate_the_linux_worker() {
             PermissionMode::Auto,
             ModeDecision::Allow,
             ModeDecision::Ask,
-            ModeDecision::Ask,
-            ModeDecision::Ask,
+            ModeDecision::Allow,
+            ModeDecision::Allow,
         ),
         (
             PermissionMode::PreapprovedOnly,
@@ -1844,4 +1857,213 @@ fn allow_mode_write_cells_execute_through_the_linux_worker() {
 fn backend_selects_the_linux_worker_platform() {
     assert_eq!(rivect::executor::backend(), linux::BACKEND);
     assert_eq!(linux::BACKEND, "linux");
+}
+
+#[test]
+fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_process() {
+    ensure_helper();
+    let helper = rivect_sandbox_helper::helper_binary().expect("helper binary");
+    assert!(helper.is_file(), "{}", helper.display());
+    let mut world = support::open_world("helper-data-plane", None);
+    let session = world.open_session("helper-data-plane-session");
+    let task = world.create_task(&session, "helper-data-plane-task");
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope");
+    let file = scope.join("target.txt");
+    std::fs::write(&file, b"scoped-by-landlock").expect("seed");
+    let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
+    world.runtime.read_worker = Box::new(linux::LinuxWorker);
+    {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file.clone(),
+                },
+                PermissionMode::Manual,
+            )
+            .expect("admit read");
+        match executor.execute(&admitted).expect("helper read") {
+            EffectOutcome::Read { bytes, .. } => assert_eq!(bytes, b"scoped-by-landlock"),
+            other => panic!("expected a helper read, got {other:?}"),
+        }
+    }
+    let write_grant = world
+        .runtime
+        .policy
+        .grant_classes(scope, vec![rivect::contracts::EffectClass::Write]);
+    {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        let admitted = executor
+            .admit(
+                &task,
+                EffectRequest::Write {
+                    grant_id: write_grant,
+                    path: file.clone(),
+                    bytes: b"from-helper".to_vec(),
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("admit write");
+        executor.execute(&admitted).expect("helper write");
+    }
+    assert_eq!(std::fs::read(&file).expect("read"), b"from-helper");
+}
+
+#[test]
+fn run_confined_kills_a_hung_fifo_gate() {
+    ensure_helper();
+    let fixture = TempTree::new("sandbox-linux", "hung-fifo");
+    let fifo = fixture.path.join("hung.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+    let confinement = linux::read_confinement(&fixture.path).expect("read confinement");
+    let error = confined(&confinement, Path::new("/bin/cat"), &[fifo.as_os_str()])
+        .expect_err("a hung fifo must hit the wall deadline");
+    assert!(matches!(error, WorkerError::ConfinedRunTimedOut), "{error}");
+}
+
+#[test]
+fn linux_exec_seccomp_denies_io_uring_ptrace_process_vm_pidfd_getfd_unshare_bpf_and_mmsg() {
+    let numbers = linux::seccomp_denied_syscalls().expect("native seccomp table");
+    for n in [425u32, 426, 427, 438] {
+        assert!(numbers.contains(&n), "missing io_uring/pidfd_getfd {n}");
+    }
+    let extras: &[u32] = match std::env::consts::ARCH {
+        "aarch64" => &[243, 269, 97, 117, 270, 271, 280],
+        "x86_64" => &[299, 307, 101, 272, 310, 311, 321],
+        other => panic!("unexpected arch {other}"),
+    };
+    for n in extras {
+        assert!(numbers.contains(n), "missing syscall {n}");
+    }
+}
+
+#[test]
+fn landlock_scope_path_with_colon_does_not_break_path_beneath_rule() {
+    let fixture = TempTree::new("sandbox-linux", "colon-scope");
+    let scope = fixture.path.join("has:colon");
+    std::fs::create_dir_all(&scope).expect("colon dir");
+    let confinement = linux::read_confinement(&scope).expect("confinement");
+    let rules = linux::landlock_rules(&confinement);
+    let canon = scope.canonicalize().expect("canon");
+    let expected = canon.display().to_string();
+    let rule = rules
+        .iter()
+        .find(|r| r.contains(&expected))
+        .expect("scope rule");
+    let rest = rule
+        .splitn(3, ':')
+        .nth(2)
+        .expect("remainder after two colons");
+    assert_eq!(rest, expected, "{rule}");
+}
+
+#[test]
+fn linux_exec_denied_control_is_an_owned_artifact_not_agetty_existence() {
+    let path = linux::denied_exec_control().expect("owned control");
+    assert!(path.is_file(), "{}", path.display());
+    let text = path.to_string_lossy();
+    assert!(
+        text.contains("rivect-denied-exec"),
+        "denied control must be worker-owned, got {text}"
+    );
+    assert!(!text.ends_with("agetty"), "{text}");
+}
+
+#[test]
+fn loader_execute_rules_do_not_grant_execute_on_usr_lib() {
+    let fixture = TempTree::new("sandbox-linux", "loader-execute");
+    let confinement = linux::exec_confinement(&fixture.path).expect("exec confinement");
+    for rule in linux::landlock_rules(&confinement) {
+        if let Some(path) = rule.strip_prefix("path-beneath:execute:") {
+            assert_ne!(path, "/usr/lib");
+            assert_ne!(path, "/lib");
+            assert!(!path.ends_with("/usr/lib"), "{rule}");
+            assert!(!path.ends_with("/lib"), "{rule}");
+        }
+    }
+}
+
+#[test]
+fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signals_are_present() {
+    ensure_helper();
+    use rivect::contracts::EffectClass as Class;
+    let mut world = support::open_world("live-signals", None);
+    let session = world.open_session("live-signals-session");
+    let task = world.create_task(&session, "live-signals-task");
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope");
+    let file = scope.join("target.txt");
+    std::fs::write(&file, b"seed").expect("seed");
+    let grant = world
+        .runtime
+        .policy
+        .grant_classes(scope.clone(), vec![Class::Read, Class::Write]);
+    let canonical = scope.canonicalize().expect("canonical scope");
+    let key = canonical.display().to_string();
+    world
+        .runtime
+        .owner
+        .store
+        .open_budget(&key, 8)
+        .expect("open budget");
+    world
+        .runtime
+        .owner
+        .store
+        .retain("checkpoint", &key)
+        .expect("retain checkpoint");
+    let writes = Arc::new(AtomicU64::new(0));
+    world.runtime.read_worker = Box::new(CountingLinuxWorker {
+        reads: Arc::new(AtomicU64::new(0)),
+        writes: writes.clone(),
+        execs: Arc::new(AtomicU64::new(0)),
+        egresses: Arc::new(AtomicU64::new(0)),
+    });
+    let ctx = rivect::executor::admission_context(
+        &world.runtime.owner.store,
+        PermissionMode::Auto,
+        Class::Write,
+        &scope,
+        &file,
+    )
+    .expect("live write context");
+    assert!(ctx.budget_remaining);
+    assert!(ctx.in_trusted_scope);
+    assert!(ctx.has_checkpoint);
+    for mode in [PermissionMode::Auto, PermissionMode::AcceptEdits] {
+        std::fs::write(&file, b"seed").expect("reseed");
+        let admitted = admit_live_cell(
+            &mut world,
+            &task,
+            mode,
+            EffectRequest::Write {
+                grant_id: grant.clone(),
+                path: file.clone(),
+                bytes: format!("live-{mode:?}").into_bytes(),
+            },
+            ModeDecision::Allow,
+        )
+        .unwrap_or_else(|| panic!("{mode:?} write must Allow when signals are seeded"));
+        execute_live_cell(&mut world, &admitted).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+        assert_eq!(
+            std::fs::read(&file).expect("landed"),
+            format!("live-{mode:?}").as_bytes()
+        );
+    }
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
 }

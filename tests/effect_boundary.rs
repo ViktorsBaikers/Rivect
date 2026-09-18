@@ -13,12 +13,40 @@ use rivect::executor::{
 };
 use rivect::policy::{Policy, PolicyError};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use support::open_world;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
+fn freeze_brief_answer(world: &mut support::World, session: &SessionId, task: &TaskId) {
+    let question = world.publish(session, task);
+    world
+        .runtime
+        .owner
+        .store
+        .answer_question(
+            session,
+            task,
+            &question.question_id,
+            question.question_revision,
+            &rivect::contracts::AnswerSelection::Option {
+                option_id: rivect::contracts::OptionId("brief".to_string()),
+            },
+            "human",
+        )
+        .expect("freeze brief answer");
+}
+
 fn managed_write_fixture(tag: &str) -> (support::World, SessionId, TaskId, PathBuf, String) {
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "rivect-sandbox-helper"])
+            .status()
+            .expect("spawn helper build");
+        assert!(status.success(), "helper build failed: {status}");
+    });
     let mut world = open_world(tag, None);
     let session = world.open_session(&format!("{tag}-session"));
     let task = world.create_task(&session, &format!("{tag}-task"));
@@ -76,16 +104,7 @@ fn read_admit_fails_closed_when_deny_covers_target() {
 #[test]
 fn decision_step_denies_dispatch_when_deny_covers_scoped_file() {
     let (mut world, session, task, file, grant) = managed_write_fixture("mode-deny-decision-step");
-    let question = world.publish(&session, &task);
-    let answer = world.dispatch(&support::corpus_answer_option(
-        &session,
-        "mode-deny-answer",
-        &task,
-        &question,
-        "brief",
-        serde_json::json!(1),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+    freeze_brief_answer(&mut world, &session, &task);
     world
         .runtime
         .policy
@@ -1563,16 +1582,7 @@ fn streaming_updates_preserve_scroll_draft_and_dock() {
 #[test]
 fn typed_error_settlement_marks_the_stream_failed_never_complete() {
     let (mut world, session, task, file, grant) = managed_write_fixture("typed-error-state");
-    let question = world.publish(&session, &task);
-    let answer = world.dispatch(&support::corpus_answer_option(
-        &session,
-        "typed-error-answer",
-        &task,
-        &question,
-        "brief",
-        serde_json::json!(1),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+    freeze_brief_answer(&mut world, &session, &task);
     world
         .runtime
         .policy
@@ -1616,16 +1626,7 @@ fn typed_error_settlement_marks_the_stream_failed_never_complete() {
 #[test]
 fn unknown_attempt_settles_partial_and_completion_settles_complete() {
     let (mut world, session, task, _file, grant) = managed_write_fixture("typed-partial-state");
-    let question = world.publish(&session, &task);
-    let answer = world.dispatch(&support::corpus_answer_option(
-        &session,
-        "typed-partial-answer",
-        &task,
-        &question,
-        "brief",
-        serde_json::json!(1),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+    freeze_brief_answer(&mut world, &session, &task);
     let outcome = world
         .runtime
         .run_decision_step(
@@ -1657,16 +1658,7 @@ fn unknown_attempt_settles_partial_and_completion_settles_complete() {
     assert!(!view.output.text().contains("late bytes"));
 
     let (mut world, session, task, _file, grant) = managed_write_fixture("typed-complete-state");
-    let question = world.publish(&session, &task);
-    let answer = world.dispatch(&support::corpus_answer_option(
-        &session,
-        "typed-complete-answer",
-        &task,
-        &question,
-        "brief",
-        serde_json::json!(1),
-    ));
-    assert!(answer["error"].is_null(), "{answer}");
+    freeze_brief_answer(&mut world, &session, &task);
     let outcome = world
         .runtime
         .run_decision_step(
@@ -1722,4 +1714,117 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
     assert!(screen.contains(&format!(
         "{OUTPUT_STATUS_COMPLETE} · {OUTPUT_TRUNCATED_NOTE}"
     )));
+}
+
+#[test]
+fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i";
+    assert_eq!(rivect::resources::sanitize_status_cause(raw), "okhidbidi");
+    let mut stream = OutputStream::new();
+    stream.push_chunk("vis\u{200B}ible\u{202A}text".as_bytes());
+    assert_eq!(stream.text(), "visibletext");
+    let mut view = initial_view();
+    view.output.settle(OutputSettlement::Failed {
+        cause: "denied\u{200B}\u{202E}secret".to_string(),
+    });
+    let screen = rendered_text(&view);
+    assert!(screen.contains("deniedsecret"), "{screen}");
+    assert!(!screen.contains('\u{200B}'));
+    assert!(!screen.contains('\u{202E}'));
+}
+
+#[test]
+fn status_copy_has_no_em_dash() {
+    assert!(
+        !OUTPUT_STATUS_PARTIAL.contains('\u{2014}'),
+        "{OUTPUT_STATUS_PARTIAL}"
+    );
+    assert!(
+        !OUTPUT_STATUS_ERROR.contains('\u{2014}'),
+        "{OUTPUT_STATUS_ERROR}"
+    );
+    let mut view = initial_view();
+    view.output.settle(OutputSettlement::Partial {
+        cause: "truncated".to_string(),
+    });
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains(&format!("{OUTPUT_STATUS_PARTIAL}: truncated")),
+        "{screen}"
+    );
+    assert!(!screen.contains('\u{2014}'));
+}
+
+#[test]
+fn execute_time_cancel_is_cancelled_error_for_every_effect_class() {
+    use rivect::contracts::EffectClass as Class;
+    use rivect::policy::PermissionMode;
+    for class in [Class::Read, Class::Write, Class::Exec, Class::Egress] {
+        let tag = format!("execute-cancel-{}", format!("{class:?}").to_lowercase());
+        let (mut world, session, task, file, grant) = managed_write_fixture(&tag);
+        let scope = file.parent().expect("scope").to_path_buf();
+        let request = match class {
+            Class::Read => EffectRequest::Read {
+                grant_id: grant,
+                path: file.clone(),
+            },
+            Class::Write => EffectRequest::Write {
+                grant_id: world
+                    .runtime
+                    .policy
+                    .grant_classes(scope.clone(), vec![Class::Write]),
+                path: file.clone(),
+                bytes: b"must not land".to_vec(),
+            },
+            Class::Exec => {
+                let program = scope.join("true");
+                std::fs::copy("/usr/bin/true", &program).expect("copy true");
+                EffectRequest::Exec {
+                    grant_id: world.runtime.policy.grant_classes(scope, vec![Class::Exec]),
+                    program,
+                }
+            }
+            Class::Egress => EffectRequest::Egress {
+                grant_id: world
+                    .runtime
+                    .policy
+                    .grant_classes(scope, vec![Class::Egress]),
+                url: "https://example.invalid/cancel".to_string(),
+            },
+            Class::Model | Class::Control => continue,
+        };
+        let admitted = {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            executor
+                .admit(&task, request, PermissionMode::Yolo)
+                .unwrap_or_else(|error| panic!("{class:?} admit: {error}"))
+        };
+        world
+            .runtime
+            .owner
+            .store
+            .cancel_task(&session, &task, 1, Some("cancel before execute"))
+            .expect("cancel");
+        let error = {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            executor
+                .execute(&admitted)
+                .expect_err("execute-time cancel")
+        };
+        assert!(
+            matches!(error, ExecutorError::Cancelled),
+            "{class:?} must be Cancelled, got {error}"
+        );
+        if class == Class::Write {
+            assert_eq!(std::fs::read(&file).expect("untouched"), b"original");
+        }
+    }
 }

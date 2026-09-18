@@ -6,7 +6,7 @@ use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
 use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
 use crate::policy::{ModeDecision, preapproval_scope};
 use crate::providers::LoopbackProvider;
-use crate::resources::{OutputStatus, OutputStream};
+use crate::resources::{OutputStatus, OutputStream, sanitize_status_cause};
 use crate::state::TaskStore;
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -450,8 +450,12 @@ fn output_status_line(output: &OutputStream) -> String {
     let base = match output.status() {
         OutputStatus::Streaming => OUTPUT_STATUS_STREAMING.to_string(),
         OutputStatus::Complete => OUTPUT_STATUS_COMPLETE.to_string(),
-        OutputStatus::Partial { cause } => format!("{OUTPUT_STATUS_PARTIAL} — {cause}"),
-        OutputStatus::Failed { cause } => format!("{OUTPUT_STATUS_ERROR} — {cause}"),
+        OutputStatus::Partial { cause } => {
+            format!("{OUTPUT_STATUS_PARTIAL}: {}", sanitize_status_cause(cause))
+        }
+        OutputStatus::Failed { cause } => {
+            format!("{OUTPUT_STATUS_ERROR}: {}", sanitize_status_cause(cause))
+        }
     };
     if output.head_truncated() {
         format!("{base} · {OUTPUT_TRUNCATED_NOTE}")
