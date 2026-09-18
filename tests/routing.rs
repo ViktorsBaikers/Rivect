@@ -32,26 +32,13 @@ use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
 use std::sync::{Arc, Mutex};
 
-fn local_fixed_config(effort_toml: &str) -> String {
-    format!(
-        "config_version = 1\n\
-         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
-         [models.defaults]\n\
-         model = {{ mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }}\n\
-         effort = {effort_toml}\n\
-         fallback = {{ mode = \"auto\" }}\n"
-    )
-}
-
-/// Same local-connection fixture with a switchable model id, for the
-/// context-epoch and pending-config legs.
-fn local_model_config(model_id: &str) -> String {
+fn local_config(model_id: &str, effort_toml: &str) -> String {
     format!(
         "config_version = 1\n\
          [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
          [models.defaults]\n\
          model = {{ mode = \"fixed\", connection = \"local\", model_id = \"{model_id}\" }}\n\
-         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         effort = {effort_toml}\n\
          fallback = {{ mode = \"auto\" }}\n"
     )
 }
@@ -97,7 +84,8 @@ fn wire_prefix(wire: &str) -> &str {
 fn unsupported_effort_surfaces_on_both_carriers_never_drops() {
     // file carrier: the unsupported value is a typed schema rejection,
     // never a coercion or a silent drop
-    let file_error = Config::parse_validated(&local_fixed_config(
+    let file_error = Config::parse_validated(&local_config(
+        "fixture-model",
         "{ mode = \"fixed\", value = \"ultra\" }",
     ))
     .expect_err("the file surface must reject the unsupported effort value");
@@ -111,8 +99,8 @@ fn unsupported_effort_surfaces_on_both_carriers_never_drops() {
     );
 
     // config.set carrier: the same rejection vocabulary
-    let mut config =
-        Config::parse_validated(&local_fixed_config("{ mode = \"auto\" }")).expect("valid");
+    let mut config = Config::parse_validated(&local_config("fixture-model", "{ mode = \"auto\" }"))
+        .expect("valid");
     let wire_error = config
         .set_wire(
             "models.defaults.effort",
@@ -142,7 +130,8 @@ fn transmitted_effort_is_never_confirmed_without_provider_data() {
     // transmitted assignment must never surface as confirmed.
 
     // fixed leg: the resolved level rides the wire request verbatim
-    let config = Config::parse_validated(&local_fixed_config(
+    let config = Config::parse_validated(&local_config(
+        "fixture-model",
         "{ mode = \"fixed\", value = \"high\" }",
     ))
     .expect("valid");
@@ -176,7 +165,8 @@ fn transmitted_effort_is_never_confirmed_without_provider_data() {
     );
 
     // auto leg: same round-trip discipline for the unresolved level
-    let auto = Config::parse_validated(&local_fixed_config("{ mode = \"auto\" }")).expect("valid");
+    let auto = Config::parse_validated(&local_config("fixture-model", "{ mode = \"auto\" }"))
+        .expect("valid");
     let manifest = broker
         .prepare("main", &auto, "/world/fixture", "goal: fixture")
         .expect("manifest");
@@ -196,7 +186,11 @@ fn transmitted_effort_is_never_confirmed_without_provider_data() {
 
 #[test]
 fn wire_request_is_the_frozen_manifest_and_overflow_rejects() {
-    let config = Config::parse_validated(&local_model_config("fixture-model")).expect("valid");
+    let config = Config::parse_validated(&local_config(
+        "fixture-model",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
     let (mut broker, sent) = recording_broker();
     let manifest = broker
         .prepare(
@@ -248,7 +242,11 @@ fn wire_request_is_the_frozen_manifest_and_overflow_rejects() {
 
 #[test]
 fn dispatch_rejects_a_foreign_execution_world() {
-    let config = Config::parse_validated(&local_model_config("fixture-model")).expect("valid");
+    let config = Config::parse_validated(&local_config(
+        "fixture-model",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
     let (mut broker, sent) = recording_broker();
     let manifest = broker
         .prepare("main", &config, "/world/alpha", "goal: fixture")
@@ -276,8 +274,16 @@ fn dispatch_rejects_a_foreign_execution_world() {
 
 #[test]
 fn epoch_replays_bytewise_and_opens_on_model_switch() {
-    let first_config = Config::parse_validated(&local_model_config("model-a")).expect("valid");
-    let switched_config = Config::parse_validated(&local_model_config("model-b")).expect("valid");
+    let first_config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let switched_config = Config::parse_validated(&local_config(
+        "model-b",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
     let (mut broker, _sent) = recording_broker();
 
     // input-only change: theme/counter churn never rewrites the
@@ -318,8 +324,16 @@ fn epoch_replays_bytewise_and_opens_on_model_switch() {
 
 #[test]
 fn pending_config_and_draft_never_rewrite_the_in_flight_request() {
-    let first_config = Config::parse_validated(&local_model_config("model-a")).expect("valid");
-    let pending_config = Config::parse_validated(&local_model_config("model-b")).expect("valid");
+    let first_config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let pending_config = Config::parse_validated(&local_config(
+        "model-b",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
     let (mut broker, sent) = recording_broker();
     let draft_v1 = "goal: fixture\nanswer: draft v1";
     let manifest = broker

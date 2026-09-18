@@ -20,11 +20,11 @@
 
 use super::macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
 use super::{
-    denied_write_candidate, helper_confined_read, helper_confined_write, helper_launch_command,
-    helper_launch_init_failed, inspect_regular_target, observe_confined_child, same_regular_file,
-    set_private_mode,
+    confirm_opened_regular, denied_write_candidate, expect_admitted, expect_denied,
+    helper_confined_write, helper_launch_command, helper_launch_init_failed,
+    inspect_regular_target, observe_confined_child, probe_read_conformance_legs,
+    read_observation_from, same_regular_file, set_private_mode,
 };
-use sha2::Digest;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
@@ -167,7 +167,7 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
         });
     }
     let outcome = run_confined(&launcher, &confinement, program, &[])?;
-    expect_admitted(outcome, program)
+    expect_admitted(outcome.exit_ok, program)
 }
 
 /// One egress attempt against the netns/seccomp boundary. This backend
@@ -287,31 +287,8 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(target)
         .map_err(|source| WorkerError::ReadFailed { source })?;
-    let opened_meta = file
-        .metadata()
-        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
-    if !opened_meta.is_file() {
-        return Err(WorkerError::NotRegularFile {
-            target: target.to_path_buf(),
-        });
-    }
-    if !same_regular_file(&canonical_meta, &opened_meta) {
-        return Err(WorkerError::TargetChanged {
-            target: target.to_path_buf(),
-        });
-    }
-    if opened_meta.len() > READ_MAX_BYTES as u64 {
-        return Err(WorkerError::TooLarge);
-    }
-    let bounded = helper_confined_read("linux", "", file)?;
-    if bounded.len() > READ_MAX_BYTES {
-        return Err(WorkerError::TooLarge);
-    }
-    let digest = crate::config::hex(&sha2::Sha256::digest(&bounded));
-    Ok(ReadObservation {
-        bytes: bounded,
-        digest,
-    })
+    confirm_opened_regular(target, &canonical_meta, &file)?;
+    read_observation_from("linux", "", file)
 }
 
 /// One checked-fd managed write of an existing regular file inside the
@@ -423,15 +400,10 @@ pub enum Confinement {
 /// resolved directories, so a symlinked spelling would deny the very
 /// scope the grant admits.
 fn canonical_scope(scope_root: &Path) -> Result<PathBuf, WorkerError> {
-    let canonical = scope_root
-        .canonicalize()
-        .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
-    if canonical.to_str().is_none() {
-        return Err(WorkerError::SandboxUnavailable {
-            reason: "linux landlock: scope root is not valid unicode".to_string(),
-        });
-    }
-    Ok(canonical)
+    super::canonical_scope(
+        scope_root,
+        "linux landlock: scope root is not valid unicode",
+    )
 }
 
 fn scope_rule(rights: &str, scope: &Path) -> String {
@@ -484,9 +456,11 @@ pub fn egress_confinement() -> Confinement {
 pub fn landlock_rules(confinement: &Confinement) -> Vec<String> {
     match confinement {
         Confinement::Read { scope } => {
-            let mut rules = SYSTEM_EXECUTE_RULES.iter().map(|r| (*r).to_string());
-            let mut all: Vec<String> = SYSTEM_READ_RULES.iter().map(|r| (*r).to_string()).collect();
-            all.extend(&mut rules);
+            let mut all: Vec<String> = SYSTEM_READ_RULES
+                .iter()
+                .chain(SYSTEM_EXECUTE_RULES)
+                .map(|r| (*r).to_string())
+                .collect();
             all.push(scope_rule("read-file", scope));
             all
         }
@@ -916,30 +890,6 @@ fn stderr_excerpt(stderr: &str) -> String {
         .collect()
 }
 
-/// Verdict of one confined gate or effect leg: an admitted run is `Ok`;
-/// a denied run is the typed OS denial naming the target.
-fn expect_admitted(outcome: ConfinedOutcome, target: &Path) -> Result<(), WorkerError> {
-    if outcome.exit_ok {
-        Ok(())
-    } else {
-        Err(WorkerError::SandboxDenied {
-            target: target.to_path_buf(),
-        })
-    }
-}
-
-/// Verdict of one denied probe leg: a run the boundary admitted is a
-/// capability failure; the expected denial is plain `Ok`.
-fn expect_denied(outcome: ConfinedOutcome, reason: &str) -> Result<(), WorkerError> {
-    if outcome.exit_ok {
-        Err(WorkerError::SandboxUnavailable {
-            reason: reason.to_string(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
 // ----- conformance probes and gates --------------------------------------
 
 /// Read conformance verdicts already proven this process holds, keyed by
@@ -984,7 +934,7 @@ fn confined_read_gate(
         Path::new(CAT),
         &[canonical_target.as_os_str()],
     )?;
-    expect_admitted(outcome, canonical_target)
+    expect_admitted(outcome.exit_ok, canonical_target)
 }
 
 /// OS-boundary gate for one managed write. The confined leg proves the
@@ -1011,7 +961,7 @@ fn confined_write_gate(
         &[artifact.as_os_str()],
     )?;
     drop(std::fs::remove_file(&artifact));
-    expect_admitted(outcome, target)
+    expect_admitted(outcome.exit_ok, target)
 }
 
 /// Proves the Landlock read boundary enforces before the first read
@@ -1042,54 +992,24 @@ pub fn probe_read_conformance(
     {
         return Ok(());
     }
-    let canonical_target = target
-        .canonicalize()
-        .map_err(|_source| WorkerError::TargetMissing {
-            target: target.to_path_buf(),
-        })?;
     let confinement = read_confinement(scope_root)?;
-    // Denied leg first: on a non-enforcing mechanism this read succeeds
-    // and the probe fails before any leg touches the user's target. The
-    // verdict discriminates only while this process could read the probe
-    // target without the boundary at all.
-    let denied = run_confined(
-        launcher,
-        &confinement,
-        Path::new(CAT),
-        &[Path::new(DENIED_PROBE_TARGET).as_os_str()],
-    )?;
-    expect_denied(
-        denied,
+    probe_read_conformance_legs(
+        target,
+        DENIED_PROBE_TARGET,
         "linux landlock conformance probe: the boundary admitted the denied read leg",
+        "linux landlock conformance probe: the denied read target is unreadable, so enforcement cannot be proven",
+        |path| {
+            let outcome =
+                run_confined(launcher, &confinement, Path::new(CAT), &[path.as_os_str()])?;
+            Ok((outcome.exit_ok, outcome.stderr))
+        },
+        |stderr| {
+            format!(
+                "linux landlock conformance probe: the boundary denied the in-scope read leg: {}",
+                stderr_excerpt(stderr)
+            )
+        },
     )?;
-    if File::open(DENIED_PROBE_TARGET).is_err() {
-        return Err(WorkerError::SandboxUnavailable {
-            reason: "linux landlock conformance probe: the denied read target is unreadable, so enforcement cannot be proven"
-                .to_string(),
-        });
-    }
-    // Admitted leg on the user's canonical target: a failure distinguishes
-    // a target this process cannot read (a typed effect denial) from a
-    // boundary that wrongly denies in-scope reads — a capability failure
-    // whose reason carries the launcher's own mechanism name.
-    match run_confined(
-        launcher,
-        &confinement,
-        Path::new(CAT),
-        &[canonical_target.as_os_str()],
-    ) {
-        Ok(outcome) if outcome.exit_ok => {}
-        Ok(outcome) => {
-            File::open(&canonical_target).map_err(|source| WorkerError::ReadFailed { source })?;
-            return Err(WorkerError::SandboxUnavailable {
-                reason: format!(
-                    "linux landlock conformance probe: the boundary denied the in-scope read leg: {}",
-                    stderr_excerpt(&outcome.stderr)
-                ),
-            });
-        }
-        Err(error) => return Err(error),
-    }
     CONFORMANT_READ_SCOPES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1148,7 +1068,7 @@ pub fn probe_write_conformance(
         drop(std::fs::remove_dir(parent));
     }
     expect_denied(
-        denied?,
+        denied?.exit_ok,
         "linux landlock conformance probe: the boundary admitted the denied write leg",
     )?;
     // Admitted leg on a fresh artifact this worker owns inside the

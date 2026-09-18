@@ -548,9 +548,7 @@ fn rank_connection(
                 assignment,
                 connections.get(&fixed.connection).map(|c| c.kind),
             )?;
-            if !entitlements.allows(&fixed.connection)
-                || !purpose_entitled(purpose_def, &fixed.connection)
-            {
+            if !entitled(entitlements, purpose_def, &fixed.connection) {
                 return Err(ModelError::NoEligibleCandidate {
                     purpose: purpose.to_string(),
                 });
@@ -573,8 +571,7 @@ fn rank_connection(
                     connections
                         .get(name)
                         .is_some_and(|c| providers::offline_usable(Some(c.kind)))
-                        && entitlements.allows(name)
-                        && purpose_entitled(purpose_def, name)
+                        && entitled(entitlements, purpose_def, name)
                 })
                 .map(|connection| (connection, None))
                 .ok_or_else(|| ModelError::NoEligibleCandidate {
@@ -587,6 +584,15 @@ fn rank_connection(
             purpose: purpose.to_string(),
         }),
     }
+}
+
+/// Account entitlement and the per-purpose `eligible` input together.
+fn entitled(
+    entitlements: &Entitlements,
+    purpose_def: Option<&PurposeDef>,
+    connection: &str,
+) -> bool {
+    entitlements.allows(connection) && purpose_entitled(purpose_def, connection)
 }
 
 /// The per-purpose `eligible` input (DEC-012): `None` restricts

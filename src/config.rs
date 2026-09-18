@@ -1747,6 +1747,17 @@ fn name_array(
     Ok(names)
 }
 
+fn toml_mode<'a>(table: &'a dyn TableLike, key: &str) -> Result<&'a str, ConfigError> {
+    table.get("mode").and_then(Item::as_str).ok_or_else(|| {
+        ConfigError::schema(
+            format!("{key}.mode"),
+            ConfigIssue::Required {
+                field: "mode".to_string(),
+            },
+        )
+    })
+}
+
 fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
     let table = item.as_table_like().ok_or_else(|| {
         ConfigError::schema(
@@ -1756,34 +1767,18 @@ fn model_assign(item: &Item, key: &str) -> Result<ModelAssign, ConfigError> {
             },
         )
     })?;
-    let Some(mode) = table.get("mode").and_then(Item::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = toml_mode(table, key)?;
     match mode {
         "inherit" => Ok(ModelAssign::Inherit),
         "auto" => {
             let pool = match table.get("pool") {
                 None => None,
-                Some(value) => {
-                    let items = value.as_array().ok_or_else(|| {
-                        ConfigError::schema(format!("{key}.pool"), ConfigIssue::PoolNotArray)
-                    })?;
-                    let mut names = Vec::new();
-                    for entry in items {
-                        names.push(entry.as_str().map(str::to_string).ok_or_else(|| {
-                            ConfigError::schema(
-                                format!("{key}.pool"),
-                                ConfigIssue::PoolEntryNotString,
-                            )
-                        })?);
-                    }
-                    Some(names)
-                }
+                Some(value) => Some(name_array(
+                    value,
+                    &format!("{key}.pool"),
+                    ConfigIssue::PoolNotArray,
+                    ConfigIssue::PoolEntryNotString,
+                )?),
             };
             Ok(ModelAssign::Auto { pool })
         }
@@ -1828,14 +1823,7 @@ fn effort_assign(item: &Item, key: &str) -> Result<EffortAssign, ConfigError> {
             },
         )
     })?;
-    let Some(mode) = table.get("mode").and_then(Item::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = toml_mode(table, key)?;
     match mode {
         "inherit" => Ok(EffortAssign::Inherit),
         "auto" => Ok(EffortAssign::Auto),
@@ -1871,14 +1859,7 @@ fn fallback_assign(item: &Item, key: &str) -> Result<FallbackAssign, ConfigError
             },
         )
     })?;
-    let Some(mode) = table.get("mode").and_then(Item::as_str) else {
-        return Err(ConfigError::schema(
-            format!("{key}.mode"),
-            ConfigIssue::Required {
-                field: "mode".to_string(),
-            },
-        ));
-    };
+    let mode = toml_mode(table, key)?;
     match mode {
         "auto" => {
             let chain = match table.get("chain") {

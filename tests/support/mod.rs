@@ -21,8 +21,8 @@ use rivect::providers::{Provider, ProviderReply};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 pub const CONNECTION_ID: &str = "test-conn-1";
@@ -709,4 +709,82 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 pub fn path_str(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+pub fn ensure_helper() {
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "-p", "rivect-sandbox-helper"])
+            .status()
+            .expect("spawn helper build");
+        assert!(status.success(), "helper build failed: {status}");
+    });
+}
+
+/// Marker appended by the T9 shim after copying fd0→stdout. A host-side
+/// read of the target never produces this line.
+pub const HELPER_IO_WITNESS: &str = "RIVECT-HELPER-IO-WITNESS";
+
+/// Test helper that performs confined I/O itself: `confined read` copies
+/// stdin to stdout and appends [`HELPER_IO_WITNESS`]; `confined write`
+/// tees the payload to the inherited target fd and records its length at
+/// `write_witness`. `launch` execs the remainder so probes still hit the
+/// real OS boundary. `probe-write` execs the real helper so write gates
+/// still open(O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW).
+pub fn install_helper_io_shim(dir: &Path, write_witness: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real_helper = rivect_sandbox_helper::helper_binary().expect("real helper for probe-write");
+    let shim = dir.join("rivect-shim-helper");
+    let payload = dir.join("shim-write-payload");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"launch\" ]; then\n\
+         shift\n\
+         [ \"$1\" = \"--\" ] && shift\n\
+         exec \"$@\"\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"read\" ]; then\n\
+         /bin/cat\n\
+         printf '%s\\n' '{HELPER_IO_WITNESS}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"confined\" ] && [ \"$3\" = \"write\" ]; then\n\
+         /usr/bin/tee '{payload}' >/dev/stdout\n\
+         /usr/bin/wc -c < '{payload}' | /usr/bin/tr -d '[:space:]' > '{witness}'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"probe-write\" ]; then\n\
+         exec '{real}' \"$@\"\n\
+         fi\n\
+         exit 30\n",
+        payload = payload.display(),
+        witness = write_witness.display(),
+        real = real_helper.display(),
+    );
+    std::fs::write(&shim, script).expect("write helper I/O shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper I/O shim");
+    shim
+}
+
+/// World fixture mirroring the effect-boundary one: a scoped read grant
+/// and the supplied worker behind the executor. The marker is the
+/// platform-specific scoped-file contents.
+pub fn sandbox_world(
+    tag: &str,
+    marker: &[u8],
+    worker: impl rivect::executor::ReadWorker + 'static,
+) -> (World, TaskId, PathBuf, String) {
+    ensure_helper();
+    let mut world = open_world(tag, None);
+    let session = world.open_session(&format!("{tag}-session"));
+    let task = world.create_task(&session, &format!("{tag}-task"));
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("create sandbox scope");
+    let file = scope.join("target.txt");
+    std::fs::write(&file, marker).expect("create sandbox target");
+    let grant = world.runtime.set_read_scope(scope, file.clone());
+    world.runtime.read_worker = Box::new(worker);
+    (world, task, file, grant)
 }

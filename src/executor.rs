@@ -221,6 +221,15 @@ fn read_result(observation: ReadObservation) -> (EffectOutcome, String) {
     )
 }
 
+fn executed(detail: String) -> (EffectOutcome, String) {
+    (
+        EffectOutcome::Executed {
+            detail: detail.clone(),
+        },
+        detail,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Backend-neutral worker helpers the macOS and Linux backends share:
 // every backend keeps its own confinement mechanism, while the target
@@ -261,6 +270,119 @@ fn inspect_regular_target(
         });
     }
     Ok((canonical_target, canonical_meta))
+}
+
+/// Post-open occupant check shared by both backends' read legs: the
+/// opened handle must still be a regular file, still the canonical
+/// identity, and still under the read cap. The `is_file` check stays
+/// ahead of [`same_regular_file`] so a swapped non-file is
+/// [`WorkerError::NotRegularFile`], not [`WorkerError::TargetChanged`].
+fn confirm_opened_regular(
+    target: &Path,
+    canonical_meta: &Metadata,
+    file: &File,
+) -> Result<(), WorkerError> {
+    let opened_meta = file
+        .metadata()
+        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
+    if !opened_meta.is_file() {
+        return Err(WorkerError::NotRegularFile {
+            target: target.to_path_buf(),
+        });
+    }
+    if !same_regular_file(canonical_meta, &opened_meta) {
+        return Err(WorkerError::TargetChanged {
+            target: target.to_path_buf(),
+        });
+    }
+    if opened_meta.len() > macos::READ_MAX_BYTES as u64 {
+        return Err(WorkerError::TooLarge);
+    }
+    Ok(())
+}
+
+fn read_observation_from(
+    platform: &str,
+    profile: &str,
+    file: File,
+) -> Result<ReadObservation, WorkerError> {
+    let bounded = helper_confined_read(platform, profile, file)?;
+    if bounded.len() > macos::READ_MAX_BYTES {
+        return Err(WorkerError::TooLarge);
+    }
+    let digest = hex(&sha2::Sha256::digest(&bounded));
+    Ok(ReadObservation {
+        bytes: bounded,
+        digest,
+    })
+}
+
+fn canonical_scope(scope_root: &Path, unicode_reason: &str) -> Result<PathBuf, WorkerError> {
+    let canonical = scope_root
+        .canonicalize()
+        .map_err(|source| WorkerError::ScopeRootUnavailable { source })?;
+    if canonical.to_str().is_none() {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: unicode_reason.to_string(),
+        });
+    }
+    Ok(canonical)
+}
+
+fn expect_admitted(exit_ok: bool, target: &Path) -> Result<(), WorkerError> {
+    if exit_ok {
+        Ok(())
+    } else {
+        Err(WorkerError::SandboxDenied {
+            target: target.to_path_buf(),
+        })
+    }
+}
+
+fn expect_denied(exit_ok: bool, reason: &str) -> Result<(), WorkerError> {
+    if exit_ok {
+        Err(WorkerError::SandboxUnavailable {
+            reason: reason.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Denied-first / admitted-leg / fail-closed flow both backends share.
+/// The caller owns cache lookup and insert; failed probes must not be
+/// cached. `admitted_fail_reason` receives the confined stderr so Linux
+/// can embed an excerpt while macOS keeps a fixed string.
+fn probe_read_conformance_legs(
+    target: &Path,
+    denied_target: &str,
+    denied_admitted_reason: &str,
+    denied_unreadable_reason: &str,
+    mut run: impl FnMut(&Path) -> Result<(bool, String), WorkerError>,
+    admitted_fail_reason: impl FnOnce(&str) -> String,
+) -> Result<(), WorkerError> {
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|_source| WorkerError::TargetMissing {
+            target: target.to_path_buf(),
+        })?;
+    let (denied_ok, _) = run(Path::new(denied_target))?;
+    expect_denied(denied_ok, denied_admitted_reason)?;
+    if File::open(denied_target).is_err() {
+        return Err(WorkerError::SandboxUnavailable {
+            reason: denied_unreadable_reason.to_string(),
+        });
+    }
+    match run(&canonical_target) {
+        Ok((true, _)) => Ok(()),
+        Ok((false, stderr)) => {
+            File::open(&canonical_target).map_err(|source| WorkerError::ReadFailed { source })?;
+            Err(WorkerError::SandboxUnavailable {
+                reason: admitted_fail_reason(&stderr),
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Upper bound on retained child stderr: plenty for every denial or
@@ -1060,14 +1182,7 @@ impl<'a> Executor<'a> {
         ) {
             Ok(()) => {}
             Err(error) => {
-                let detail = error.to_string();
-                match &error {
-                    WorkerError::WriteMutationFailed { .. } => {
-                        self.store.attempt_unknown(&admitted.attempt_id, &detail)?
-                    }
-                    _ => self.store.attempt_rejected(&admitted.attempt_id, &detail)?,
-                }
-                return Err(ExecutorError::Worker(error));
+                return self.commit_worker_error(&admitted.attempt_id, error);
             }
         }
         self.store.attempt_confirmed(&admitted.attempt_id)?;
@@ -1133,13 +1248,13 @@ impl<'a> Executor<'a> {
         attempt_id: &str,
         decision: ModeDecision,
     ) -> Result<(), ExecutorError> {
-        let error = match decision {
-            ModeDecision::Ask => ExecutorError::ModeAsk,
-            ModeDecision::Deny => ExecutorError::ModeDenied,
-            ModeDecision::Allow => unreachable!("internal error: allow is not a rejection"),
+        let reason = mode_reason(decision);
+        let error = if matches!(decision, ModeDecision::Ask) {
+            ExecutorError::ModeAsk
+        } else {
+            ExecutorError::ModeDenied
         };
-        self.store
-            .attempt_rejected(attempt_id, mode_reason(decision))?;
+        self.store.attempt_rejected(attempt_id, reason)?;
         Err(error)
     }
 
@@ -1154,6 +1269,46 @@ impl<'a> Executor<'a> {
             self.reject_mode(&admitted.attempt_id, decision)?;
         }
         Ok(())
+    }
+
+    /// Shared execute-time gates for an admitted effect: grant re-check,
+    /// cancel, mode consult, then running. Gate failures leave the flight
+    /// without an observation so remaining members keep their own claim.
+    fn execute_gates(&mut self, admitted: &AdmittedEffect) -> Result<(), ExecutorError> {
+        let grant_id = admitted.request.grant_id();
+        let class = admitted.request.class();
+        let target = admitted.request.target_path();
+        if let Err(error) = self.admit_settled(&admitted.attempt_id, grant_id, class) {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
+        if self.store.task_cancelled(&admitted.task_id)? {
+            self.store
+                .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(ExecutorError::Cancelled);
+        }
+        if let Err(error) = self.mode_gate(admitted, &target) {
+            self.abandon_flight(&admitted.attempt_id);
+            return Err(error);
+        }
+        self.store.attempt_running(&admitted.attempt_id)?;
+        Ok(())
+    }
+
+    fn commit_worker_error(
+        &mut self,
+        attempt_id: &str,
+        error: WorkerError,
+    ) -> Result<(), ExecutorError> {
+        let detail = error.to_string();
+        match &error {
+            WorkerError::WriteMutationFailed { .. } => {
+                self.store.attempt_unknown(attempt_id, &detail)?
+            }
+            _ => self.store.attempt_rejected(attempt_id, &detail)?,
+        }
+        Err(ExecutorError::Worker(error))
     }
 
     /// The shared observation of one read member's flight, when the
@@ -1199,30 +1354,7 @@ impl<'a> Executor<'a> {
     /// the OS boundary the worker runs under, never by a pre-worker class
     /// bypass. Ask and deny verdicts fail closed at the gates above.
     pub fn execute(&mut self, admitted: &AdmittedEffect) -> Result<EffectOutcome, ExecutorError> {
-        let grant_id = admitted.request.grant_id();
-        if let Err(error) =
-            self.admit_settled(&admitted.attempt_id, grant_id, admitted.request.class())
-        {
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(error);
-        }
-        if self.store.task_cancelled(&admitted.task_id)? {
-            self.store
-                .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(ExecutorError::Cancelled);
-        }
-        // Mutable mode consult before the worker runs anything.
-        let target = admitted.request.target_path();
-        if let Err(error) = self.mode_gate(admitted, &target) {
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(error);
-        }
-        // Single-flight (INV-023): a read member denied at any
-        // execute-time gate leaves its flight without an observation;
-        // the remaining members keep their own claim on the physical
-        // read, so verdicts and cancels stay per-member.
-        self.store.attempt_running(&admitted.attempt_id)?;
+        self.execute_gates(admitted)?;
         let effect = match &admitted.request {
             EffectRequest::Read { path, .. } => {
                 // Single-flight (INV-023): a member of a settled flight
@@ -1244,37 +1376,19 @@ impl<'a> Executor<'a> {
                         .write_once(&admitted.scope_root, path, expected, bytes)
                 })
                 .map(|()| {
-                    let detail = format!(
+                    executed(format!(
                         "write-performed sha256={}",
                         hex(&sha2::Sha256::digest(bytes))
-                    );
-                    (
-                        EffectOutcome::Executed {
-                            detail: detail.clone(),
-                        },
-                        detail,
-                    )
+                    ))
                 }),
             EffectRequest::Exec { program, .. } => self
                 .worker
                 .exec_once(&admitted.scope_root, program)
-                .map(|()| {
-                    let detail = "exec-performed exit=ok".to_string();
-                    (
-                        EffectOutcome::Executed {
-                            detail: detail.clone(),
-                        },
-                        detail,
-                    )
-                }),
-            EffectRequest::Egress { url, .. } => self.worker.egress_once(url).map(|()| {
-                (
-                    EffectOutcome::Executed {
-                        detail: format!("egress-performed {url}"),
-                    },
-                    format!("egress-performed {url}"),
-                )
-            }),
+                .map(|()| executed("exec-performed exit=ok".to_string())),
+            EffectRequest::Egress { url, .. } => self
+                .worker
+                .egress_once(url)
+                .map(|()| executed(format!("egress-performed {url}"))),
         };
         match effect {
             Ok((outcome, detail)) => {
@@ -1284,14 +1398,8 @@ impl<'a> Executor<'a> {
             }
             Err(error) => {
                 self.abandon_flight(&admitted.attempt_id);
-                let detail = error.to_string();
-                match &error {
-                    WorkerError::WriteMutationFailed { .. } => {
-                        self.store.attempt_unknown(&admitted.attempt_id, &detail)?
-                    }
-                    _ => self.store.attempt_rejected(&admitted.attempt_id, &detail)?,
-                }
-                Err(ExecutorError::Worker(error))
+                self.commit_worker_error(&admitted.attempt_id, error)?;
+                unreachable!("internal error: worker error commit always rejects")
             }
         }
     }
@@ -1309,30 +1417,10 @@ impl<'a> Executor<'a> {
                 class: admitted.request.class(),
             });
         }
-        let grant_id = match &admitted.request {
-            EffectRequest::Read { grant_id, .. } => grant_id.clone(),
-            _ => unreachable!("read class checked above"),
-        };
-        if let Err(error) = self.admit_settled(&admitted.attempt_id, &grant_id, EffectClass::Read) {
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(error);
-        }
-        if self.store.task_cancelled(&admitted.task_id)? {
-            self.store
-                .attempt_rejected(&admitted.attempt_id, TASK_CANCELLED)?;
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(ExecutorError::Cancelled);
-        }
+        self.execute_gates(admitted)?;
         let EffectRequest::Read { path, .. } = &admitted.request else {
-            unreachable!("read class checked above")
+            unreachable!("internal error: read class checked above")
         };
-        // Same mutable mode consult as `execute`: the crash emulation must
-        // not read past a verdict that stopped being a clear allow.
-        if let Err(error) = self.mode_gate(admitted, path) {
-            self.abandon_flight(&admitted.attempt_id);
-            return Err(error);
-        }
-        self.store.attempt_running(&admitted.attempt_id)?;
         // Single-flight (INV-023): the crash emulation keeps one
         // physical charge — it takes a settled flight's shared
         // observation, and its own physical read settles the flight for

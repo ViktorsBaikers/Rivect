@@ -100,15 +100,8 @@ pub struct ReadFlightKey {
 /// The file snapshot binding of one admitted read — the same dev/ino
 /// pair the checked-fd write path pins — in the hashable shape the
 /// flight key needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SnapshotBinding(pub FileIdentity);
-
-impl std::hash::Hash for SnapshotBinding {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.0.dev);
-        state.write_u64(self.0.ino);
-    }
-}
 
 /// The rights half of a [`ReadFlightKey`]: grant identity plus the
 /// permission mode id the verdict was consulted under.
@@ -152,8 +145,8 @@ pub enum FlightRole {
 /// differing reads never share a flight. A member that never executes
 /// keeps its seat — the registry grows one entry per admitted-but-
 /// unsettled read, never per byte.
-// ponytail: members are pruned only when they execute or leave; if an
-// abandoned-open-flight leak ever matters, retire on task settle.
+// Members retire only on execute or leave; abandoned open flights keep
+// their seat until then.
 #[derive(Debug, Default)]
 pub struct ReadFlights {
     flights: HashMap<ReadFlightKey, Vec<Flight>>,
@@ -170,14 +163,13 @@ impl ReadFlights {
     /// waiting for its physical read — takes the attempt as a follower;
     /// anything else opens a fresh flight with the attempt as leader.
     pub fn subscribe(&mut self, key: ReadFlightKey, attempt_id: &str) -> FlightRole {
-        let joins_open = self
+        let role = if let Some(flight) = self
             .flights
-            .get(&key)
-            .is_some_and(|flights| flights.last().is_some_and(|f| f.observation.is_none()));
-        let role = if joins_open {
-            if let Some(flight) = self.flights.get_mut(&key).and_then(|fs| fs.last_mut()) {
-                flight.members.push(attempt_id.to_string());
-            }
+            .get_mut(&key)
+            .and_then(|flights| flights.last_mut())
+            .filter(|flight| flight.observation.is_none())
+        {
+            flight.members.push(attempt_id.to_string());
             FlightRole::Follower
         } else {
             self.flights.entry(key.clone()).or_default().push(Flight {
@@ -215,16 +207,15 @@ impl ReadFlights {
     /// it. `None` leaves the membership untouched: the flight is still
     /// open, or the attempt never joined one.
     pub fn take_shared(&mut self, attempt_id: &str) -> Option<ReadObservation> {
-        let key = self.by_attempt.get(attempt_id)?.clone();
-        let flights = self.flights.get_mut(&key)?;
-        let index = flights
-            .iter()
-            .position(|flight| flight.members.iter().any(|member| member == attempt_id))?;
-        let observation = flights[index].observation.clone()?;
-        flights[index].members.retain(|member| member != attempt_id);
-        if flights[index].members.is_empty() {
-            flights.remove(index);
-        }
+        let observation = {
+            let (flights, index) = self.flight_index_mut(attempt_id)?;
+            let observation = flights[index].observation.clone()?;
+            flights[index].members.retain(|member| member != attempt_id);
+            if flights[index].members.is_empty() {
+                flights.remove(index);
+            }
+            observation
+        };
         self.by_attempt.remove(attempt_id);
         Some(observation)
     }
@@ -233,24 +224,26 @@ impl ReadFlights {
     /// retires the reader's own membership: the observation now belongs
     /// to the remaining waiters, and an empty flight is gone.
     pub fn settle(&mut self, attempt_id: &str, observation: ReadObservation) {
-        let Some(key) = self.by_attempt.get(attempt_id).cloned() else {
-            return;
-        };
-        let Some(flights) = self.flights.get_mut(&key) else {
-            return;
-        };
-        let Some(index) = flights
-            .iter()
-            .position(|flight| flight.members.iter().any(|member| member == attempt_id))
-        else {
-            return;
-        };
-        flights[index].members.retain(|member| member != attempt_id);
-        flights[index].observation = Some(observation);
-        if flights[index].members.is_empty() {
-            flights.remove(index);
+        {
+            let Some((flights, index)) = self.flight_index_mut(attempt_id) else {
+                return;
+            };
+            flights[index].members.retain(|member| member != attempt_id);
+            flights[index].observation = Some(observation);
+            if flights[index].members.is_empty() {
+                flights.remove(index);
+            }
         }
         self.by_attempt.remove(attempt_id);
+    }
+
+    fn flight_index_mut(&mut self, attempt_id: &str) -> Option<(&mut Vec<Flight>, usize)> {
+        let key = self.by_attempt.get(attempt_id)?;
+        let flights = self.flights.get_mut(key)?;
+        let index = flights
+            .iter()
+            .position(|flight| flight.members.iter().any(|member| member == attempt_id))?;
+        Some((flights, index))
     }
 
     /// Drops one member without an observation: a cancelled or denied
@@ -423,18 +416,7 @@ impl OutputStream {
                 self.truncated = true;
                 break;
             }
-            if is_stripped_format(ch) {
-                continue;
-            }
-            if ch == '\n' || !ch.is_control() {
-                self.text.push(ch);
-            } else if u32::from(ch) < 0x20 {
-                self.text.push('^');
-                self.text
-                    .push(char::from_u32(u32::from(ch) + 0x40).unwrap_or('\u{fffd}'));
-            } else {
-                self.text.push('\u{fffd}');
-            }
+            push_sanitized(&mut self.text, ch);
         }
     }
 }
@@ -444,19 +426,23 @@ impl OutputStream {
 pub fn sanitize_status_cause(cause: &str) -> String {
     let mut out = String::with_capacity(cause.len());
     for ch in cause.chars() {
-        if is_stripped_format(ch) {
-            continue;
-        }
-        if ch == '\n' || !ch.is_control() {
-            out.push(ch);
-        } else if u32::from(ch) < 0x20 {
-            out.push('^');
-            out.push(char::from_u32(u32::from(ch) + 0x40).unwrap_or('\u{fffd}'));
-        } else {
-            out.push('\u{fffd}');
-        }
+        push_sanitized(&mut out, ch);
     }
     out
+}
+
+fn push_sanitized(out: &mut String, ch: char) {
+    if is_stripped_format(ch) {
+        return;
+    }
+    if ch == '\n' || !ch.is_control() {
+        out.push(ch);
+    } else if u32::from(ch) < 0x20 {
+        out.push('^');
+        out.push(char::from_u32(u32::from(ch) + 0x40).unwrap_or('\u{fffd}'));
+    } else {
+        out.push('\u{fffd}');
+    }
 }
 
 /// Known spoofing-relevant Unicode format controls (Cf). This list is

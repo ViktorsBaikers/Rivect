@@ -15,6 +15,7 @@ use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
 use crate::supervisor::{Observation, OperationClass};
+use std::path::PathBuf;
 
 /// One bounded scheduler pass over the task tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -225,55 +226,9 @@ impl Runtime {
         grant_id: &str,
         crash_after_dispatch: bool,
     ) -> Result<StepOutcome, ControllerError> {
-        let snapshot = self.owner.store.snapshot(task_id)?;
-        if snapshot.lifecycle.is_terminal() {
-            return Ok(StepOutcome::NoAction { snapshot });
+        if let Some(gated) = self.gate_decision_dispatch(task_id, grant_id)? {
+            return Ok(gated);
         }
-        // No-repeat guard: any unresolved running/unknown attempt of this
-        // task blocks the next decision before a single provider call or
-        // worker effect; the caller reconciles or starts a new task.
-        if let Some(unresolved) = self.owner.store.latest_unresolved_attempt(task_id)? {
-            let snapshot = self.owner.store.snapshot(task_id)?;
-            return Ok(StepOutcome::OutcomeUnknown {
-                attempt_id: unresolved,
-                snapshot,
-            });
-        }
-        // Mutable admission gates before the first provider effect:
-        // revocation and task cancellation both deny the dispatch itself.
-        self.policy.admit(grant_id, EffectClass::Read)?;
-        // Permission-mode consult (DEC-014) on the only permitted action
-        // target. The dispatch carrier is the interim `manual` default
-        // (DEC-015) until the Settings surface lands; an enrolled deny
-        // outranks it, and any verdict that is not a clear allow — ask
-        // included — gates the dispatch read before any provider effect,
-        // mirroring the executor's fail-closed rule.
-        let dispatch_ctx = crate::executor::admission_context(
-            &self.owner.store,
-            crate::policy::PermissionMode::Manual,
-            EffectClass::Read,
-            grant_id,
-            &self.scope_root,
-            &self.scoped_file,
-        )?;
-        let dispatch_verdict =
-            self.policy
-                .decide(&self.scoped_file, EffectClass::Read, &dispatch_ctx);
-        if dispatch_verdict != crate::policy::ModeDecision::Allow {
-            let snapshot = self.owner.store.snapshot(task_id)?;
-            return Ok(StepOutcome::EffectDenied {
-                reason: crate::executor::mode_reason(dispatch_verdict).to_string(),
-                snapshot,
-            });
-        }
-        if self.owner.store.task_cancelled(task_id)? {
-            let snapshot = self.owner.store.snapshot(task_id)?;
-            return Ok(StepOutcome::EffectDenied {
-                reason: crate::executor::TASK_CANCELLED.to_string(),
-                snapshot,
-            });
-        }
-        self.owner.store.materialize_obligations(task_id)?;
         if matches!(
             answer,
             AnswerSelection::Option { option_id }
@@ -286,37 +241,11 @@ impl Runtime {
             AnswerSelection::Option { option_id }
                 if option_id.0.as_str() == KNOWN_READY_OPTION
         );
-        let (target, retained_attempt_id) = if known_ready {
-            (self.scoped_file.clone(), None)
-        } else {
-            let purpose = self.purpose.clone();
-            let inputs = format!(
-                "goal: {}\nanswer: {}\nread {}",
-                String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
-                answer_text(answer),
-                self.scoped_file.display()
-            );
-            // The manifest freezes the execution world (AC-013): the
-            // scope root the request's sources and proofs live in,
-            // re-checked at dispatch.
-            let world = self.scope_root.display().to_string();
-            let manifest =
-                self.broker
-                    .prepare(&purpose, &self.config_for_broker(), &world, &inputs)?;
-            self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
-            let reply = self.broker.dispatch(&world, &manifest)?;
-            self.provider_calls += 1;
-            let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
-                self.owner.store.mark_no_ready(task_id)?;
-                let snapshot = self.owner.store.snapshot(task_id)?;
-                return Ok(StepOutcome::Waiting { snapshot });
+        let (target, retained_attempt_id) =
+            match self.resolve_read_target(task_id, answer, known_ready)? {
+                Ok(pair) => pair,
+                Err(waiting) => return Ok(waiting),
             };
-            (
-                self.scope_root
-                    .join(call.path.as_deref().unwrap_or_default()),
-                Some(manifest.attempt_id),
-            )
-        };
         let request = EffectRequest::Read {
             grant_id: grant_id.to_string(),
             path: target,
@@ -350,41 +279,14 @@ impl Runtime {
             });
         }
         match executor.execute(&admitted) {
-            Ok(EffectOutcome::Read { bytes, digest }) => {
-                let observation = format!(
-                    "read {} bytes from {}; sha256={}",
-                    bytes.len(),
-                    self.scoped_file.display(),
-                    digest
-                );
-                let obligation_count = self.owner.store.obligations_count(task_id)?;
-                for index in 0..obligation_count {
-                    self.owner.store.insert_evidence(
-                        task_id,
-                        index,
-                        &format!("task:{}", task_id.0),
-                        &observation,
-                        &digest,
-                    )?;
-                }
-                let terminal_attempt_id =
-                    retained_attempt_id.unwrap_or_else(|| effect_attempt.clone());
-                let terminal_boundary_id = crate::verification::boundary_id(&terminal_attempt_id);
-                let terminal = crate::verification::RetainedAttempt {
-                    attempt_id: terminal_attempt_id.clone(),
-                    boundary_id: terminal_boundary_id,
-                    stage: crate::verification::RetainedStage::Terminal,
-                    cause: observation,
-                    digest: crate::verification::record_digest(&terminal_attempt_id, "terminal"),
-                    build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
-                };
-                let terminal_json = serde_json::to_string(&terminal)?;
-                self.owner
-                    .store
-                    .retain(&terminal_json, &terminal.boundary_id)?;
-                let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
-                Ok(StepOutcome::Completed { snapshot })
-            }
+            Ok(EffectOutcome::Read { bytes, digest }) => self.complete_read_with_evidence(
+                session_id,
+                task_id,
+                &bytes,
+                &digest,
+                retained_attempt_id,
+                effect_attempt,
+            ),
             Ok(EffectOutcome::Denied { reason }) => {
                 let snapshot = self.owner.store.snapshot(task_id)?;
                 Ok(StepOutcome::EffectDenied { reason, snapshot })
@@ -397,6 +299,153 @@ impl Runtime {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// No-repeat, mutable admission, permission-mode, and cancel gates
+    /// that must hold before any provider call or worker effect. A
+    /// `Some` outcome is the step's answer; `None` continues the dispatch.
+    fn gate_decision_dispatch(
+        &mut self,
+        task_id: &TaskId,
+        grant_id: &str,
+    ) -> Result<Option<StepOutcome>, ControllerError> {
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        if snapshot.lifecycle.is_terminal() {
+            return Ok(Some(StepOutcome::NoAction { snapshot }));
+        }
+        // No-repeat guard: any unresolved running/unknown attempt of this
+        // task blocks the next decision before a single provider call or
+        // worker effect; the caller reconciles or starts a new task.
+        if let Some(unresolved) = self.owner.store.latest_unresolved_attempt(task_id)? {
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(Some(StepOutcome::OutcomeUnknown {
+                attempt_id: unresolved,
+                snapshot,
+            }));
+        }
+        // Mutable admission gates before the first provider effect:
+        // revocation and task cancellation both deny the dispatch itself.
+        self.policy.admit(grant_id, EffectClass::Read)?;
+        // Permission-mode consult (DEC-014) on the only permitted action
+        // target. The dispatch carrier is the interim `manual` default
+        // (DEC-015) until the Settings surface lands; an enrolled deny
+        // outranks it, and any verdict that is not a clear allow — ask
+        // included — gates the dispatch read before any provider effect,
+        // mirroring the executor's fail-closed rule.
+        let dispatch_ctx = crate::executor::admission_context(
+            &self.owner.store,
+            crate::policy::PermissionMode::Manual,
+            EffectClass::Read,
+            grant_id,
+            &self.scope_root,
+            &self.scoped_file,
+        )?;
+        let dispatch_verdict =
+            self.policy
+                .decide(&self.scoped_file, EffectClass::Read, &dispatch_ctx);
+        if dispatch_verdict != crate::policy::ModeDecision::Allow {
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(Some(StepOutcome::EffectDenied {
+                reason: crate::executor::mode_reason(dispatch_verdict).to_string(),
+                snapshot,
+            }));
+        }
+        if self.owner.store.task_cancelled(task_id)? {
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(Some(StepOutcome::EffectDenied {
+                reason: crate::executor::TASK_CANCELLED.to_string(),
+                snapshot,
+            }));
+        }
+        self.owner.store.materialize_obligations(task_id)?;
+        Ok(None)
+    }
+
+    /// Resolves the scoped read target: known-ready uses the fixture file;
+    /// otherwise the broker names it. `Err(Waiting)` is a step outcome,
+    /// not a controller failure.
+    fn resolve_read_target(
+        &mut self,
+        task_id: &TaskId,
+        answer: &AnswerSelection,
+        known_ready: bool,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        if known_ready {
+            return Ok(Ok((self.scoped_file.clone(), None)));
+        }
+        let purpose = self.purpose.clone();
+        let inputs = format!(
+            "goal: {}\nanswer: {}\nread {}",
+            String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
+            answer_text(answer),
+            self.scoped_file.display()
+        );
+        // The manifest freezes the execution world (AC-013): the
+        // scope root the request's sources and proofs live in,
+        // re-checked at dispatch.
+        let world = self.scope_root.display().to_string();
+        let manifest = self
+            .broker
+            .prepare(&purpose, &self.config_for_broker(), &world, &inputs)?;
+        self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
+        let reply = self.broker.dispatch(&world, &manifest)?;
+        self.provider_calls += 1;
+        let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
+            self.owner.store.mark_no_ready(task_id)?;
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(Err(StepOutcome::Waiting { snapshot }));
+        };
+        Ok(Ok((
+            self.scope_root
+                .join(call.path.as_deref().unwrap_or_default()),
+            Some(manifest.attempt_id),
+        )))
+    }
+
+    /// Evidence and the completion guard for a confirmed scoped read.
+    /// The observation names `scoped_file`, the dispatch's permitted
+    /// action, not the worker target the grant already bound.
+    fn complete_read_with_evidence(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        bytes: &[u8],
+        digest: &str,
+        retained_attempt_id: Option<String>,
+        effect_attempt: String,
+    ) -> Result<StepOutcome, ControllerError> {
+        let observation = format!(
+            "read {} bytes from {}; sha256={}",
+            bytes.len(),
+            self.scoped_file.display(),
+            digest
+        );
+        let obligation_count = self.owner.store.obligations_count(task_id)?;
+        for index in 0..obligation_count {
+            self.owner.store.insert_evidence(
+                task_id,
+                index,
+                &format!("task:{}", task_id.0),
+                &observation,
+                digest,
+            )?;
+        }
+        let terminal_attempt_id = retained_attempt_id.unwrap_or(effect_attempt);
+        let terminal_boundary_id = crate::verification::boundary_id(&terminal_attempt_id);
+        let terminal = crate::verification::RetainedAttempt {
+            attempt_id: terminal_attempt_id.clone(),
+            boundary_id: terminal_boundary_id,
+            stage: crate::verification::RetainedStage::Terminal,
+            cause: observation,
+            digest: crate::verification::record_digest(&terminal_attempt_id, "terminal"),
+            build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+        };
+        let terminal_json = serde_json::to_string(&terminal)?;
+        self.owner
+            .store
+            .retain(&terminal_json, &terminal.boundary_id)?;
+        let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
+        Ok(StepOutcome::Completed { snapshot })
     }
 
     /// DEC-068 sentinel tail: the frozen answer is the only applicability
