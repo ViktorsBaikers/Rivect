@@ -165,8 +165,12 @@ pub enum WorkerError {
         denied_target_spelling(target)
     )]
     SandboxDenied { target: PathBuf },
+    // Mechanism-agnostic wording like `SandboxUnavailable` below: this
+    // variant is produced by the shared helper path on both platforms —
+    // naming "seatbelt" would put the wrong mechanism on Linux wires.
+    // The source names the attempted spawn.
     #[error(
-        "capability unavailable: seatbelt sandbox-exec could not be started: {source}; recovery: fix the environment or run on a capable kernel"
+        "capability unavailable: the sandbox launcher could not be started: {source}; recovery: fix the environment or run on a capable kernel"
     )]
     SandboxSpawnFailed { source: std::io::Error },
     // Mechanism-agnostic prefix: the reason names the failed mechanism
@@ -463,7 +467,8 @@ fn run_confined_inner(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    let mut child = helper_launch_command()?
+    let mut command = helper_launch_command()?;
+    command
         .arg(sandbox_exec)
         .arg("-p")
         .arg(profile)
@@ -472,9 +477,10 @@ fn run_confined_inner(
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+        .map_err(|source| crate::executor::spawn_failed(&command, source))?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
     // Helper-init classification is the helper prefix (pre-execv), not a
@@ -791,8 +797,26 @@ pub fn probe_write_conformance(sandbox_exec: &Path, scope_root: &Path) -> Result
 
 #[cfg(test)]
 mod tests {
-    use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
+    use crate::executor::{
+        STDERR_RETAIN_BYTES, WorkerError, drain_retaining_cap, same_regular_file,
+    };
     use std::io::Read as _;
+
+    #[test]
+    fn spawn_failed_display_names_the_sandbox_attempt_not_one_mechanism() {
+        let error = WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other("spawn of confined helper failed"),
+        };
+        let display = error.to_string();
+        assert!(
+            !display.contains("seatbelt") && !display.contains("sandbox-exec"),
+            "the shared variant must not name one platform's mechanism: {display}"
+        );
+        assert!(
+            display.contains("sandbox") && display.contains("spawn of confined helper failed"),
+            "the display names the sandbox attempt and its cause: {display}"
+        );
+    }
 
     #[test]
     fn target_identity_requires_same_regular_file() -> Result<(), Box<dyn std::error::Error>> {

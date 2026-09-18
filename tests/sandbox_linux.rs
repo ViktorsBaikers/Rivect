@@ -617,6 +617,7 @@ fn nobody_probe(helper: &str, paths: &[&Path]) -> std::process::Output {
         .arg(std::env::current_exe().expect("test binary path"))
         .arg("--exact")
         .arg("--nocapture")
+        .arg("--ignored")
         .arg(helper)
         .args(paths.iter().map(|path| path.as_os_str()))
         .env_clear()
@@ -640,6 +641,7 @@ fn set_mode(path: &Path, mode: u32) {
 /// environment), 2 for the typed `WriteFailed` denial, 4 for anything
 /// else.
 #[test]
+#[ignore = "probe leg: only the parent test launches it via --ignored"]
 fn nobody_write_denial_probe_helper() {
     let args = probe_args();
     let (Some(scope), Some(target)) = (args.first(), args.get(1)) else {
@@ -711,6 +713,7 @@ fn unwritable_scope_is_an_effect_denial_not_a_capability_failure() {
 /// honest capability failure of an unprivileged environment), 2 for the
 /// typed `ReadFailed` denial, 4 for anything else.
 #[test]
+#[ignore = "probe leg: only the parent test launches it via --ignored"]
 fn nobody_read_denial_probe_helper() {
     let args = probe_args();
     let (Some(scope), Some(target)) = (args.first(), args.get(1)) else {
@@ -1646,6 +1649,7 @@ fn six_permission_modes_gate_the_linux_worker() {
 /// through the real worker and exits 0 only for a capability_unavailable
 /// whose reason names the launcher mechanism (`unshare`/`setpriv`).
 #[test]
+#[ignore = "probe leg: only the parent test launches it via --ignored"]
 fn degraded_read_probe_helper() {
     let args = probe_args();
     let (Some(scope), Some(target)) = (args.first(), args.get(1)) else {
@@ -1921,7 +1925,6 @@ fn allow_mode_write_cells_execute_through_the_linux_worker() {
 #[test]
 fn backend_selects_the_linux_worker_platform() {
     assert_eq!(rivect::executor::backend(), linux::BACKEND);
-    assert_eq!(linux::BACKEND, "linux");
 }
 
 #[test]

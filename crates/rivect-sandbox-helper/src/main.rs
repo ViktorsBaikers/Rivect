@@ -22,9 +22,11 @@
 //!       (O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW) and write one byte
 //! ```
 //! Exit verdicts are the crate's `EXIT_*` codes: 0 ok, 10 sandbox init
-//! failure, 20 data I/O failure, 30 protocol error, 126/127 launch exec
-//! failure — the host maps them to the worker's typed errors. Diagnostics
-//! go to stderr (fd 2), which is the only stream the host captures.
+//! failure, 20 data I/O failure before any mutation, 21 data failure
+//! after the write truncated its target, 30 protocol error, 126/127
+//! launch exec failure — the host maps them to the worker's typed
+//! errors. Diagnostics go to stderr (fd 2), which is the only stream the
+//! host captures.
 
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
@@ -32,8 +34,8 @@ use std::os::fd::FromRawFd as _;
 use std::process::ExitCode;
 
 use rivect_sandbox_helper::{
-    EXIT_DATA_IO, EXIT_LAUNCH_EXEC, EXIT_LAUNCH_NOT_FOUND, EXIT_OK, EXIT_PROTOCOL,
-    EXIT_SANDBOX_INIT,
+    EXIT_DATA_IO, EXIT_DATA_MUTATED, EXIT_LAUNCH_EXEC, EXIT_LAUNCH_NOT_FOUND, EXIT_OK,
+    EXIT_PROTOCOL, EXIT_SANDBOX_INIT,
 };
 
 /// Data-plane byte budget, mirroring the executor's read cap: a confined
@@ -210,7 +212,10 @@ fn cmd_launch(args: &[CString]) -> Result<(), i32> {
     };
     if attempted == -1 {
         let error = std::io::Error::last_os_error();
-        eprintln!("rivect-sandbox-helper: exec failed: {error}");
+        eprintln!(
+            "rivect-sandbox-helper: exec failed for {}: {error}",
+            program.to_string_lossy()
+        );
         return Err(if error.kind() == std::io::ErrorKind::NotFound {
             EXIT_LAUNCH_NOT_FOUND
         } else {
@@ -311,9 +316,12 @@ fn confined_write() -> Result<(), i32> {
         eprintln!("rivect-sandbox-helper: admitted truncate failed: {error}");
         EXIT_DATA_IO
     })?;
+    // The truncate already landed: every failure past this point leaves
+    // the target mutated, so the host must read the outcome as unknown,
+    // never as a clean rejection.
     target.write_all(&payload).map_err(|error| {
         eprintln!("rivect-sandbox-helper: admitted write failed: {error}");
-        EXIT_DATA_IO
+        EXIT_DATA_MUTATED
     })
 }
 

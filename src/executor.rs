@@ -191,6 +191,20 @@ pub enum ExecutorError {
     Store(#[from] StoreError),
 }
 
+/// The wire code one worker failure carries wherever the family
+/// surfaces — the executor's own effect path and the publication path
+/// share this single map, so the same failure never answers two codes.
+/// A sandbox that cannot start or does not enforce is a capability
+/// failure; every other worker denial is a denied effect.
+pub(crate) fn worker_error_code(error: &WorkerError) -> ErrorCode {
+    match error {
+        WorkerError::SandboxSpawnFailed { .. }
+        | WorkerError::SandboxUnavailable { .. }
+        | WorkerError::ConfinedRunTimedOut => ErrorCode::CapabilityUnavailable,
+        _ => ErrorCode::Denied,
+    }
+}
+
 impl ExecutorError {
     /// Wire code for the failed effect path, mapped at one boundary. A
     /// sandbox that cannot start or does not enforce is a capability
@@ -199,13 +213,8 @@ impl ExecutorError {
     #[must_use = "the code exists to be carried to the wire; discarding it loses the mapping"]
     pub fn error_code(&self) -> ErrorCode {
         match self {
-            Self::Worker(
-                WorkerError::SandboxSpawnFailed { .. }
-                | WorkerError::SandboxUnavailable { .. }
-                | WorkerError::ConfinedRunTimedOut,
-            ) => ErrorCode::CapabilityUnavailable,
-            Self::Worker(_)
-            | Self::Policy(_)
+            Self::Worker(worker) => worker_error_code(worker),
+            Self::Policy(_)
             | Self::PolicyDenied
             | Self::ModeAsk
             | Self::ModeDenied
@@ -529,6 +538,21 @@ pub fn helper_confined_command(
     }
 }
 
+/// A `Command::spawn` refusal names the attempted program in its
+/// diagnostic: the bare OS error ("no such file") says nothing about
+/// which sandbox launcher could not start.
+fn spawn_failed(command: &Command, source: std::io::Error) -> WorkerError {
+    WorkerError::SandboxSpawnFailed {
+        source: std::io::Error::new(
+            source.kind(),
+            format!(
+                "spawn of {} failed: {source}",
+                command.get_program().to_string_lossy()
+            ),
+        ),
+    }
+}
+
 fn pipe_nonblocking(fd: impl AsFd) -> Result<(), WorkerError> {
     rivect_sandbox_helper::set_nonblocking(fd)
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })
@@ -705,12 +729,14 @@ pub(crate) fn helper_confined_read(
     profile: &str,
     file: File,
 ) -> Result<Vec<u8>, WorkerError> {
-    let mut child = helper_confined_command(platform, "read", profile)?
+    let mut command = helper_confined_command(platform, "read", profile)?;
+    command
         .stdin(Stdio::from(file))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+        .map_err(|source| spawn_failed(&command, source))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], stdout, stderr)?;
@@ -723,12 +749,14 @@ pub(crate) fn helper_confined_write(
     file: File,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
-    let mut child = helper_confined_command(platform, "write", profile)?
+    let mut command = helper_confined_command(platform, "write", profile)?;
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file))
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+        .map_err(|source| spawn_failed(&command, source))?;
     let stdin = child.stdin.take();
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, stdin, bytes, None, stderr)?;
@@ -756,7 +784,7 @@ pub(crate) fn helper_probe_write(
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
+        .map_err(|source| spawn_failed(&command, source))?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
     helper_probe_verdict(&observed, path)
@@ -833,6 +861,12 @@ fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, Worke
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match code {
         rivect_sandbox_helper::EXIT_OK => Ok(observed.stdout),
+        // The confined write reported a failure after its truncate
+        // landed: the target may be mutated, so the outcome is unknown —
+        // never a clean rejection.
+        rivect_sandbox_helper::EXIT_DATA_MUTATED => Err(WorkerError::WriteMutationFailed {
+            source: std::io::Error::other(stderr),
+        }),
         rivect_sandbox_helper::EXIT_DATA_IO if read => Err(WorkerError::ReadFailed {
             source: std::io::Error::other(stderr),
         }),
@@ -1208,7 +1242,9 @@ impl<'a> Executor<'a> {
         ) {
             Ok(()) => {}
             Err(error) => {
-                return self.commit_worker_error(&admitted.attempt_id, error);
+                // A managed write mutates its target: any worker failure
+                // here settles against a possibly-changed file.
+                return self.commit_worker_error(&admitted.attempt_id, error, true);
             }
         }
         self.store.attempt_confirmed(&admitted.attempt_id)?;
@@ -1322,14 +1358,24 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// Settles the worker failure in the attempt ledger. `mutating`
+    /// names whether the effect path could already have changed its
+    /// target: a post-mutation write failure and a timed-out mutating
+    /// effect both record `unknown` — the killed confined child may have
+    /// landed bytes — while a failure on a non-mutating path stays a
+    /// clean rejection.
     fn commit_worker_error(
         &mut self,
         attempt_id: &str,
         error: WorkerError,
+        mutating: bool,
     ) -> Result<(), ExecutorError> {
         let detail = error.to_string();
         match &error {
             WorkerError::WriteMutationFailed { .. } => {
+                self.store.attempt_unknown(attempt_id, &detail)?
+            }
+            WorkerError::ConfinedRunTimedOut if mutating => {
                 self.store.attempt_unknown(attempt_id, &detail)?
             }
             _ => self.store.attempt_rejected(attempt_id, &detail)?,
@@ -1424,7 +1470,11 @@ impl<'a> Executor<'a> {
             }
             Err(error) => {
                 self.abandon_flight(&admitted.attempt_id);
-                self.commit_worker_error(&admitted.attempt_id, error)?;
+                self.commit_worker_error(
+                    &admitted.attempt_id,
+                    error,
+                    matches!(&admitted.request, EffectRequest::Write { .. }),
+                )?;
                 unreachable!("internal error: worker error commit always rejects")
             }
         }
@@ -1502,8 +1552,8 @@ pub fn write_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectRequest, ObservedChild, WorkerError, helper_launch_init_failed, helper_probe_verdict,
-        require_helper_file, sandbox_denied,
+        EffectRequest, ObservedChild, WorkerError, helper_io_bytes, helper_launch_init_failed,
+        helper_probe_verdict, require_helper_file, sandbox_denied, spawn_failed,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
@@ -1584,6 +1634,50 @@ mod tests {
                 Err(WorkerError::SandboxDenied { ref target }) if target == Path::new("/tmp/rivect-probe-target")
             ),
             "EXIT_DATA_IO is the confined write denial"
+        );
+    }
+
+    #[test]
+    fn helper_write_post_mutation_exit_is_mutation_failed() {
+        let observed = ObservedChild {
+            status: exited(rivect_sandbox_helper::EXIT_DATA_MUTATED),
+            stdout: Vec::new(),
+            stderr: b"rivect-sandbox-helper: admitted write failed: disk full\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_io_bytes(observed, false),
+                Err(WorkerError::WriteMutationFailed { .. })
+            ),
+            "EXIT_DATA_MUTATED is the post-mutation write failure"
+        );
+        let pre_mutation = ObservedChild {
+            status: exited(rivect_sandbox_helper::EXIT_DATA_IO),
+            stdout: Vec::new(),
+            stderr: b"rivect-sandbox-helper: admitted truncate failed: io error\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_io_bytes(pre_mutation, false),
+                Err(WorkerError::WriteFailed { .. })
+            ),
+            "EXIT_DATA_IO on the write path stays the pre-mutation failure"
+        );
+    }
+
+    #[test]
+    fn spawn_refusal_names_the_attempted_program() {
+        let mut command = std::process::Command::new("/no/such/rivect-sandbox-helper");
+        command.arg("confined");
+        let error = spawn_failed(&command, std::io::Error::last_os_error());
+        let display = error.to_string();
+        assert!(
+            display.contains("/no/such/rivect-sandbox-helper"),
+            "a spawn refusal names the attempted launcher: {display}"
+        );
+        assert!(
+            !display.contains("seatbelt") && !display.contains("sandbox-exec"),
+            "the shared variant names no single mechanism: {display}"
         );
     }
 

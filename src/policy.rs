@@ -117,7 +117,7 @@ pub enum PolicyError {
     UnknownGrant { grant_id: String },
     #[error("grant {grant_id} revoked")]
     Revoked { grant_id: String },
-    #[error("grant {grant_id} does not admit {class:?} effects")]
+    #[error("grant {grant_id} does not admit {} effects", class_key(*class))]
     ClassNotAdmitted {
         grant_id: String,
         class: EffectClass,

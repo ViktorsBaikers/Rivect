@@ -3015,3 +3015,120 @@ fn cli_config_set_without_a_retained_document_is_a_typed_rejection() {
         "a rejected edit never journals an intent"
     );
 }
+
+// ----- publication failure wire codes (AC-093/AC-095) -----
+// Every `PublicationError` variant the admit path can raise keeps its own
+// wire code — a missing target is `not_found`, a broken write surfaces the
+// executor's `denied` — instead of collapsing into `internal_error`. The
+// variant the CLI carrier can stage but never trigger through one dispatch
+// (`TargetNotUtf8` — the data root is always UTF-8 — and the `Journal`
+// arm's own storage faults) stays pinned by the unit tests beside
+// `publication_error`.
+
+#[test]
+fn cli_config_set_maps_staging_failures_to_their_wire_codes() {
+    // An absent target is `not_found`: the managed write cannot create
+    // it, and no generic fault should answer for it.
+    let (mut world, session) = carrier_world("wire-absent");
+    std::fs::remove_file(world.root.join("config.toml")).expect("remove the target");
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7317, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "workflow.enabled", "value": false }
+    }));
+    assert_eq!(
+        response["error"]["data"]["code"], "not_found",
+        "an absent publication target is not_found: {response}"
+    );
+
+    // A non-regular target is `storage_unavailable`: staging opens it,
+    // observes it cannot carry bytes, and refuses.
+    let (mut world, session) = carrier_world("wire-nonregular");
+    let target = world.root.join("config.toml");
+    std::fs::remove_file(&target).expect("remove the target");
+    std::fs::create_dir(&target).expect("a directory occupies the target path");
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7318, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "workflow.enabled", "value": false }
+    }));
+    assert_eq!(
+        response["error"]["data"]["code"], "storage_unavailable",
+        "a non-regular publication target is storage_unavailable: {response}"
+    );
+}
+
+#[test]
+fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
+    // A pending own-carrier row replays through `resolve_pending_publication`
+    // — the same fail-closed publication_error arm as the fresh write.
+    let (mut world, session) = carrier_world("wire-write-denied");
+    let target = world.root.join("config.toml");
+    let mut file_config = Config::parse_validated(&support::base_config()).expect("valid config");
+    let edit = file_config
+        .set("workflow.enabled", ConfigValue::Bool(false))
+        .expect("typed edit");
+    stage_publication(&mut world.runtime.owner.store, "cli", &target, &edit)
+        .expect("stage the carrier's own intent");
+    // The managed write must fail: a read-only target refuses the
+    // checked-fd write with `denied`, the executor's own wire code.
+    let mut permissions = std::fs::metadata(&target)
+        .expect("target metadata")
+        .permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&target, permissions).expect("read-only target");
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7319, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "workflow.enabled", "value": false }
+    }));
+    assert_eq!(
+        response["error"]["data"]["code"], "denied",
+        "a refused managed write surfaces the executor's denied code: {response}"
+    );
+    assert_eq!(
+        pending_intents(&mut world.runtime.owner.store),
+        1,
+        "the unlanded write leaves its intent pending for recovery"
+    );
+    let mut permissions = std::fs::metadata(&target)
+        .expect("target metadata")
+        .permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&target, permissions).expect("restore target permissions");
+
+    // A staged row that carries no publish identity — only an older
+    // journal produces one — cannot run its write at all.
+    let (mut world, session) = carrier_world("wire-identity");
+    let target = world.root.join("config.toml");
+    world
+        .runtime
+        .owner
+        .store
+        .append_publication(
+            "cli",
+            target.to_str().expect("utf-8 target"),
+            &edit.digest,
+            None,
+            None,
+        )
+        .expect("journal an identity-less intent");
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7320, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "workflow.enabled", "value": false }
+    }));
+    assert_eq!(
+        response["error"]["data"]["code"], "internal_error",
+        "a staged row without publish identity is internal_error: {response}"
+    );
+    assert_eq!(
+        pending_intents(&mut world.runtime.owner.store),
+        1,
+        "the row the write never ran for stays pending"
+    );
+}

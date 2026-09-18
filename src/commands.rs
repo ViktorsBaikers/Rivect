@@ -17,7 +17,7 @@ use crate::state::StoreError;
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +77,14 @@ impl Runtime {
         // Boot recovery: a crash between the managed write and its receipt
         // leaves one pending row; receipt exactly the writes attributable
         // to this publisher before any config surface serves (AC-093).
-        config::recover_publications(&mut owner.store)?;
+        // Every verdict a human must resolve surfaces one stderr line —
+        // the receipted rows stay silent.
+        for line in config::recover_publications(&mut owner.store)?
+            .iter()
+            .filter_map(recovery_diagnostic)
+        {
+            report_boot_diagnostic(&line);
+        }
         let config_path = data_root.join("config.toml");
         let user_toml = match std::fs::File::open(&config_path) {
             Ok(file) => {
@@ -535,10 +542,7 @@ fn admit_config_command(
         Ok(config::PublicationAdmission::Applied(applied)) => applied,
         Err(err) => {
             restore_retained_view(rt, &before);
-            return match err {
-                config::PublicationError::Journal(store) => store_error(id, &store),
-                other => envelope_error(id, ErrorCode::InvalidInput, -32602, &other.to_string()),
-            };
+            return publication_error(id, &err);
         }
     };
     RpcResponse::ok(
@@ -554,13 +558,54 @@ fn admit_config_command(
     )
 }
 
-/// Wire shape of a publication failure: journal trouble keeps the store's
-/// typed error; the managed write's own failure is an internal effect
-/// failure, never user input.
+/// Wire shape of a publication failure, one code per variant wherever
+/// the family surfaces (P-001): journal trouble keeps the store's typed
+/// error and its recovery text; the managed write's own failure takes
+/// the same code the executor assigns that worker error — a sandbox
+/// that cannot start is a capability failure, a denied write a denial —
+/// and the target variants split caller-input codes from backend ones
+/// instead of collapsing into `internal_error`.
 fn publication_error(id: Value, err: &config::PublicationError) -> RpcResponse {
-    match err {
-        config::PublicationError::Journal(store) => store_error(id, store),
-        other => envelope_error(id, ErrorCode::InternalError, -32000, &other.to_string()),
+    let (code, rpc_code) = match err {
+        config::PublicationError::Journal(store) => return store_error(id, store),
+        config::PublicationError::Write(worker) => {
+            (crate::executor::worker_error_code(worker), -32000)
+        }
+        config::PublicationError::TargetAbsent(_) => (ErrorCode::NotFound, -32000),
+        config::PublicationError::TargetNotUtf8 => (ErrorCode::InvalidInput, -32602),
+        config::PublicationError::Target(_) => (ErrorCode::StorageUnavailable, -32000),
+        config::PublicationError::IdentityMissing => (ErrorCode::InternalError, -32000),
+    };
+    envelope_error(id, code, rpc_code, &err.to_string())
+}
+
+/// One stderr diagnostic for a recovery verdict a human must resolve:
+/// the verdict token names what the bytes at the target failed to prove.
+/// The healed `ExactlyNew` verdict — our own write receipted by the boot
+/// — stays silent.
+fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String> {
+    let verdict = match recovery.verdict {
+        config::PublicationVerdict::ExactlyNew => return None,
+        config::PublicationVerdict::Old => "old",
+        config::PublicationVerdict::ByteIdenticalThird => "byte_identical_third",
+        config::PublicationVerdict::Conflicting => "conflicting",
+        config::PublicationVerdict::TornOrUnparseable => "torn_or_unparseable",
+        config::PublicationVerdict::Absent => "absent",
+        config::PublicationVerdict::Unknown => "unknown",
+    };
+    Some(format!(
+        "publication recovery: {verdict} verdict stays pending at {}",
+        recovery.intent.target
+    ))
+}
+
+/// Boot diagnostics write to stderr through the locked handle, the same
+/// pattern the terminal cleanup path uses: a closed stderr loses the
+/// line, never panics the open.
+fn report_boot_diagnostic(line: &str) {
+    let mut stderr = std::io::stderr().lock();
+    if let Err(error) = stderr.write_all(format!("{line}\n").as_bytes()) {
+        std::hint::black_box(error);
     }
 }
 
@@ -1326,4 +1371,185 @@ fn string_array(contract: &Value, field: &'static str) -> Result<Vec<String>, Re
                 .ok_or(RequestError::ArrayItemNotString { field })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{publication_error, recovery_diagnostic};
+    use crate::config::{self, ConfigValue};
+    use crate::contracts::ErrorCode;
+    use crate::executor::WorkerError;
+    use crate::state::{StoreError, TaskStore};
+    use serde_json::Value;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    const BASE_CONFIG: &str = "config_version = 1\n\
+         [connections.primary]\n\
+         kind = \"api_key\"\n\
+         endpoint = \"https://api.openai.com/v1\"\n\
+         credential_ref = \"keyring:primary\"\n\
+         [models.defaults]\n\
+         model = { mode = \"auto\" }\n\
+         effort = { mode = \"auto\" }\n\
+         fallback = { mode = \"auto\" }\n";
+
+    fn wire_code(err: &config::PublicationError) -> Option<ErrorCode> {
+        publication_error(Value::from(1), err)
+            .error
+            .map(|error| error.data.code)
+    }
+
+    #[test]
+    fn publication_error_maps_each_variant_to_its_own_wire_code() {
+        assert_eq!(
+            wire_code(&config::PublicationError::TargetAbsent(
+                "/data/config.toml".to_string()
+            )),
+            Some(ErrorCode::NotFound),
+            "an absent publication target is not_found, not a generic fault"
+        );
+        assert_eq!(
+            wire_code(&config::PublicationError::TargetNotUtf8),
+            Some(ErrorCode::InvalidInput)
+        );
+        assert_eq!(
+            wire_code(&config::PublicationError::Target(std::io::Error::other(
+                "permission denied"
+            ))),
+            Some(ErrorCode::StorageUnavailable)
+        );
+        assert_eq!(
+            wire_code(&config::PublicationError::IdentityMissing),
+            Some(ErrorCode::InternalError)
+        );
+        assert_eq!(
+            wire_code(&config::PublicationError::Write(
+                WorkerError::SandboxSpawnFailed {
+                    source: std::io::Error::other("spawn failed")
+                }
+            )),
+            Some(ErrorCode::CapabilityUnavailable),
+            "a sandbox that cannot start is a capability failure, not internal"
+        );
+        assert_eq!(
+            wire_code(&config::PublicationError::Write(WorkerError::WriteFailed {
+                source: std::io::Error::other("denied")
+            })),
+            Some(ErrorCode::Denied),
+            "a denied managed write surfaces the executor's denied code"
+        );
+    }
+
+    #[test]
+    fn publication_journal_error_keeps_the_store_code_and_recovery_text() {
+        let response = publication_error(
+            Value::from(1),
+            &config::PublicationError::Journal(StoreError::Storage(
+                std::io::Error::other("disk full").into(),
+            )),
+        );
+        let Some(error) = response.error else {
+            return;
+        };
+        assert_eq!(error.data.code, ErrorCode::StorageUnavailable);
+        assert!(
+            error
+                .data
+                .message
+                .contains("retry after checking local storage"),
+            "the journal arm keeps the store recovery text: {error:?}"
+        );
+    }
+
+    fn recovery(verdict: config::PublicationVerdict, target: &str) -> config::PublicationRecovery {
+        config::PublicationRecovery {
+            intent: config::PublicationIntent {
+                owner: "cli".to_string(),
+                target: target.to_string(),
+                admission_seq: 1,
+                intended_digest: "digest".to_string(),
+                base_digest: None,
+                publish_identity: None,
+            },
+            verdict,
+        }
+    }
+
+    #[test]
+    fn recovery_diagnostic_names_verdict_and_target_only_when_unhealed() {
+        for (verdict, token) in [
+            (config::PublicationVerdict::Old, "old"),
+            (
+                config::PublicationVerdict::ByteIdenticalThird,
+                "byte_identical_third",
+            ),
+            (config::PublicationVerdict::Conflicting, "conflicting"),
+            (
+                config::PublicationVerdict::TornOrUnparseable,
+                "torn_or_unparseable",
+            ),
+            (config::PublicationVerdict::Absent, "absent"),
+            (config::PublicationVerdict::Unknown, "unknown"),
+        ] {
+            let line = recovery_diagnostic(&recovery(verdict, "/data/config.toml"));
+            let Some(text) = line else {
+                unreachable!("{verdict:?} must surface a diagnostic");
+            };
+            assert!(
+                text.contains(token),
+                "{verdict:?} diagnostic names the verdict: {text}"
+            );
+            assert!(
+                text.contains("/data/config.toml"),
+                "{verdict:?} diagnostic names the target: {text}"
+            );
+        }
+        assert_eq!(
+            recovery_diagnostic(&recovery(
+                config::PublicationVerdict::ExactlyNew,
+                "/data/config.toml"
+            )),
+            None,
+            "the healed receipted verdict stays silent"
+        );
+    }
+
+    #[test]
+    fn recovery_diagnostics_compose_over_a_seeded_journal() -> TestResult {
+        let root =
+            std::env::temp_dir().join(format!("rivect-recovery-diag-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&root));
+        std::fs::create_dir_all(&root)?;
+        let target = root.join("config.toml");
+        std::fs::write(&target, BASE_CONFIG)?;
+        let mut store = TaskStore::open(&root.join("state.db"))?;
+        let mut parsed = config::Config::parse_validated(BASE_CONFIG)?;
+        let edit = parsed.set("workflow.enabled", ConfigValue::Bool(false))?;
+        config::stage_publication(&mut store, "cli", &target, &edit)?;
+
+        // The crash window before the write: base bytes still hold, the
+        // verdict is Old and surfaces exactly one diagnostic line.
+        let lines: Vec<String> = config::recover_publications(&mut store)?
+            .iter()
+            .filter_map(recovery_diagnostic)
+            .collect();
+        assert_eq!(lines.len(), 1, "one unresolved verdict, one line");
+        assert!(lines[0].contains("old"));
+        assert!(lines[0].contains(&*target.to_string_lossy()));
+
+        // The healed crash window — intended bytes under the staged
+        // inode — receipts and emits nothing.
+        std::fs::write(&target, &edit.bytes)?;
+        let silent: Vec<String> = config::recover_publications(&mut store)?
+            .iter()
+            .filter_map(recovery_diagnostic)
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "the receipted verdict emits no diagnostic: {silent:?}"
+        );
+        drop(std::fs::remove_dir_all(&root));
+        Ok(())
+    }
 }

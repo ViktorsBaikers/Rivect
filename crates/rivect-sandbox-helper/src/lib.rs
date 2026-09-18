@@ -26,6 +26,10 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_SANDBOX_INIT: i32 = 10;
 /// The data-plane fd I/O failed inside the confined child.
 pub const EXIT_DATA_IO: i32 = 20;
+/// The confined write failed after the target was already truncated: the
+/// bytes on disk are neither the old nor the intended content, so the
+/// host must classify the attempt unknown, never rejected.
+pub const EXIT_DATA_MUTATED: i32 = 21;
 /// The helper was invoked with an invalid mode/argument contract.
 pub const EXIT_PROTOCOL: i32 = 30;
 /// `launch` could not execute the target program for a reason other than a
@@ -38,7 +42,7 @@ pub const EXIT_LAUNCH_NOT_FOUND: i32 = 127;
 /// Cargo sets `CARGO_BIN_EXE_rivect_sandbox_helper` for this crate's binary
 /// in test builds; a `RIVECT_SANDBOX_HELPER` override pins an explicit
 /// install; and the production layout expects the helper installed beside
-/// the rivect executable (or two levels up from a `deps/` test harness).
+/// the rivect executable (or one level up from a `deps/` test harness).
 ///
 /// # Errors
 /// Returns an `io::Error` naming the resolution rule when no candidate
@@ -76,15 +80,9 @@ pub fn helper_binary() -> io::Result<PathBuf> {
     if deps_beside.is_file() {
         return Ok(deps_beside);
     }
-    // The helper builds as this package's example during `cargo test`:
-    // `target/debug/examples/rivect-sandbox-helper`.
-    let examples = up.join("examples").join("rivect-sandbox-helper");
-    if examples.is_file() {
-        return Ok(examples);
-    }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "rivect-sandbox-helper binary not found beside the rivect executable (or in deps/ or examples/ next to a test harness); install it beside the binary or set RIVECT_SANDBOX_HELPER",
+        "rivect-sandbox-helper binary not found beside the rivect executable (or one level up from a deps/ test harness); install it beside the binary or set RIVECT_SANDBOX_HELPER",
     ))
 }
 

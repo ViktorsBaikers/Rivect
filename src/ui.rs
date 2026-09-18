@@ -156,6 +156,16 @@ pub struct LocalView {
     pub panel: Option<PermissionPanel>,
 }
 
+impl LocalView {
+    /// Replaces the streaming output with a new stream: the new stream
+    /// starts at its top, so the previous stream's scroll offset must
+    /// not carry into content it never described.
+    pub fn replace_output(&mut self, output: OutputStream) {
+        self.output = output;
+        self.output_scroll = 0;
+    }
+}
+
 /// Human actions the permission panel offers (DEC-014 verdict-vs-action
 /// split: the `{allow,ask,deny}` token is the mode verdict, these are the
 /// choices a human makes about it).
@@ -199,8 +209,9 @@ pub const PANEL_DENIED_NOTE: &str = "permission denied; no grant recorded";
 pub const PANEL_ALLOWED_NOTE: &str = "allowed once; no grant recorded; request consumed";
 /// Transcript note when the limited grant is recorded in the store.
 pub const PANEL_LIMITED_NOTE: &str = "limited grant recorded";
-/// One pinned footer line naming the panel's three key affordances.
-pub const PANEL_FOOTER_HINT: &str = "Tab/arrows move, Enter confirms, Esc denies";
+/// One pinned footer line naming the panel's key affordances, sized to
+/// fit the narrowest panel body (58 columns inside the border).
+pub const PANEL_FOOTER_HINT: &str = "arrows move, PgUp/PgDn scroll, Enter confirms, Esc denies";
 /// Grantor identity the panel records limited grants under.
 const PANEL_GRANTOR: &str = "human:tui-panel";
 /// Limited grants stay short on purpose; renewing is one explicit action.
@@ -367,6 +378,9 @@ pub const OUTPUT_STATUS_ERROR: &str = "output · error";
 /// Appended when retention capacity truncated the stream: the shown
 /// text is the retained head, never the whole output.
 pub const OUTPUT_TRUNCATED_NOTE: &str = "first 64 KiB retained";
+/// Scroll affordance on the output status line: PageUp/PageDown move
+/// the output body while it is active.
+pub const OUTPUT_SCROLL_HINT: &str = "PgUp/PgDn scroll";
 
 pub fn initial_view() -> LocalView {
     LocalView {
@@ -421,7 +435,15 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             frame.render_widget(
                 Paragraph::new(sanitize_status_cause(view.output.text()))
                     .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((view.output_scroll, 0)),
+                    .scroll((
+                        clamp_scroll(
+                            view.output.text(),
+                            chunks[next].width,
+                            chunks[next].height,
+                            view.output_scroll,
+                        ),
+                        0,
+                    )),
                 chunks[next],
             );
             next += 1;
@@ -464,10 +486,19 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             ])
             .split(inner);
             frame.render_widget(Paragraph::new(panel.header_text()), regions[0]);
+            let body = panel.body_text();
             frame.render_widget(
-                Paragraph::new(panel.body_text())
+                Paragraph::new(body.as_str())
                     .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((panel.body_scroll, 0)),
+                    .scroll((
+                        clamp_scroll(
+                            &body,
+                            regions[1].width,
+                            regions[1].height,
+                            panel.body_scroll,
+                        ),
+                        0,
+                    )),
                 regions[1],
             );
             frame.render_widget(Paragraph::new(panel.footer_text()), regions[2]);
@@ -490,11 +521,28 @@ fn output_status_line(output: &OutputStream) -> String {
             format!("{OUTPUT_STATUS_ERROR}: {}", sanitize_status_cause(cause))
         }
     };
-    if output.head_truncated() {
+    let base = if output.head_truncated() {
         format!("{base} · {OUTPUT_TRUNCATED_NOTE}")
     } else {
         base
-    }
+    };
+    format!("{base} · {OUTPUT_SCROLL_HINT}")
+}
+
+/// Largest offset that can still render rows of `text` inside a
+/// `width`×`height` region: each source line occupies at least one row,
+/// plus one row per `width` columns it wraps across. The estimate
+/// counts characters, never exceeding the rows the renderer produces,
+/// so clamping to it can only under-scroll — an out-of-range offset can
+/// never render an empty body.
+fn clamp_scroll(text: &str, width: u16, height: u16, offset: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows: usize = text
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum();
+    let max = rows.saturating_sub(usize::from(height));
+    offset.min(u16::try_from(max).unwrap_or(u16::MAX))
 }
 
 const TUI_CONNECTION: &str = "tui";

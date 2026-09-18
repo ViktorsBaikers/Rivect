@@ -1,11 +1,11 @@
-//! Minimal read-only tool surface (DXV-1 initial prefix): the typed
-//! `read_file` tool routed through executor admission, plus the local
-//! command kinds known to the catalog. Known-but-unbuilt capabilities are
-//! reported unavailable, never as fake success.
+//! Typed tool surface: the `read_file` tool routed through executor
+//! admission, the journaled `config.set`/`config.unset` carrier commands,
+//! and the local command kinds known to the catalog. Known-but-unbuilt
+//! capabilities are reported unavailable, never as fake success.
 
 use crate::commands::Runtime;
 use crate::contracts::{CommandDescriptor, Page, TaskId};
-use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
+use crate::executor::{EffectOutcome, EffectRequest, Executor, ExecutorError};
 use std::path::PathBuf;
 
 pub enum LocalKind {
@@ -140,5 +140,3 @@ pub fn invoke_read(
     let admitted = executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?;
     executor.execute(&admitted)
 }
-
-use crate::executor::Executor;

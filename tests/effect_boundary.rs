@@ -12,6 +12,7 @@ use rivect::executor::{
     EffectRequest, Executor, ExecutorError, ReadObservation, ReadWorker, WorkerError,
 };
 use rivect::policy::{Policy, PolicyError};
+use rivect::state::{ConflictCause, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use support::open_world;
@@ -516,6 +517,31 @@ impl ReadWorker for PostMutationFailureWorker {
     }
 }
 
+/// Every confined leg reports the same verdict: the helper hit its
+/// deadline, was killed, and may already have acted — a read leaves the
+/// attempt rejected, a write leaves it unknown.
+struct ConfinedTimeoutWorker;
+
+impl ReadWorker for ConfinedTimeoutWorker {
+    fn read_once(
+        &mut self,
+        _scope_root: &Path,
+        _target: &Path,
+    ) -> Result<ReadObservation, WorkerError> {
+        Err(WorkerError::ConfinedRunTimedOut)
+    }
+
+    fn write_once(
+        &mut self,
+        _scope_root: &Path,
+        _target: &Path,
+        _expected: FileIdentity,
+        _bytes: &[u8],
+    ) -> Result<(), WorkerError> {
+        Err(WorkerError::ConfinedRunTimedOut)
+    }
+}
+
 #[test]
 fn managed_write_rejects_occupant_swap_without_touching_new_file() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-occupant");
@@ -610,7 +636,7 @@ fn managed_write_writes_exact_bytes_on_checked_fd() {
 
 #[test]
 fn managed_write_records_unknown_after_post_mutation_failure() {
-    let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-unknown");
+    let (mut world, session, task, file, grant) = managed_write_fixture("managed-write-unknown");
     world.runtime.read_worker = Box::new(PostMutationFailureWorker);
     let admitted = {
         let mut executor = Executor::new(
@@ -673,6 +699,153 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
         "unknown attempt should retain mutation detail"
     );
     assert_eq!(std::fs::read(&file).expect("read mutated target"), b"");
+
+    // The mutation-unknown attempt holds completion open: no surface
+    // may settle the task while the target's bytes stay unattributed.
+    let completion = world
+        .runtime
+        .owner
+        .store
+        .complete_if_eligible(&session, &task)
+        .expect_err("an unknown attempt must block task completion");
+    assert!(
+        matches!(
+            completion,
+            StoreError::Conflict(ConflictCause::CompletionOpen { unknown: 1, .. })
+        ),
+        "completion names the blocking unknown attempt: {completion}"
+    );
+}
+
+#[test]
+fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
+    let (mut world, session, task, file, grant) = managed_write_fixture("write-timeout-unknown");
+    world.runtime.read_worker = Box::new(ConfinedTimeoutWorker);
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit_managed_write(
+                &task,
+                EffectRequest::Write {
+                    grant_id: grant,
+                    path: file,
+                    bytes: b"uncertain bytes".to_vec(),
+                },
+            )
+            .expect("managed write admission")
+    };
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute_managed_write(&admitted)
+            .expect_err("confined timeout must surface")
+    };
+
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::ConfinedRunTimedOut)
+        ),
+        "{error}"
+    );
+    let attempt_id = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&task)
+        .expect("read managed write snapshot")
+        .attempts
+        .items
+        .last()
+        .expect("managed write attempt exists")
+        .attempt_id
+        .0
+        .clone();
+    let (_, state, _detail) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&attempt_id)
+        .expect("read attempt")
+        .expect("managed write attempt exists");
+    // The killed confined child may already have landed bytes — a
+    // timed-out write settles unknown, never a clean rejection.
+    assert_eq!(state, "unknown");
+
+    let completion = world
+        .runtime
+        .owner
+        .store
+        .complete_if_eligible(&session, &task)
+        .expect_err("an unknown attempt must block task completion");
+    assert!(
+        matches!(
+            completion,
+            StoreError::Conflict(ConflictCause::CompletionOpen { unknown: 1, .. })
+        ),
+        "completion names the blocking unknown attempt: {completion}"
+    );
+}
+
+#[test]
+fn read_confined_timeout_settles_rejected() {
+    let (mut world, _session, task, file, grant) = managed_write_fixture("read-timeout-rejected");
+    world.runtime.read_worker = Box::new(ConfinedTimeoutWorker);
+    let admitted = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .admit(
+                &task,
+                EffectRequest::Read {
+                    grant_id: grant,
+                    path: file,
+                },
+                rivect::policy::PermissionMode::Manual,
+            )
+            .expect("manual scoped read admits")
+    };
+
+    let error = {
+        let mut executor = Executor::new(
+            &mut world.runtime.policy,
+            &mut world.runtime.owner.store,
+            world.runtime.read_worker.as_mut(),
+        );
+        executor
+            .execute(&admitted)
+            .expect_err("confined timeout must surface")
+    };
+
+    assert!(
+        matches!(
+            error,
+            ExecutorError::Worker(WorkerError::ConfinedRunTimedOut)
+        ),
+        "{error}"
+    );
+    let (_, state, _detail) = world
+        .runtime
+        .owner
+        .store
+        .attempt_record(&admitted.attempt_id)
+        .expect("read attempt")
+        .expect("read attempt exists");
+    // A timed-out read never mutates its target: the attempt settles as
+    // a clean rejection, not unknown.
+    assert_eq!(state, "rejected");
 }
 
 #[test]
@@ -1369,8 +1542,9 @@ use ratatui::backend::TestBackend;
 use rivect::controller::output_settlement;
 use rivect::resources::{OutputSettlement, OutputStatus, OutputStream};
 use rivect::ui::{
-    OUTPUT_STATUS_COMPLETE, OUTPUT_STATUS_ERROR, OUTPUT_STATUS_PARTIAL, OUTPUT_STATUS_STREAMING,
-    OUTPUT_TRUNCATED_NOTE, PermissionPanel, initial_view, render,
+    OUTPUT_SCROLL_HINT, OUTPUT_STATUS_COMPLETE, OUTPUT_STATUS_ERROR, OUTPUT_STATUS_PARTIAL,
+    OUTPUT_STATUS_STREAMING, OUTPUT_TRUNCATED_NOTE, PANEL_FOOTER_HINT, PermissionPanel,
+    initial_view, render,
 };
 
 /// Renders one view onto an 80×24 test buffer and joins the cell
@@ -1577,6 +1751,89 @@ fn streaming_updates_preserve_scroll_draft_and_dock() {
     assert!(screen.contains("task t2: blocked (mode ask)"));
     assert!(screen.contains(OUTPUT_STATUS_STREAMING));
     assert!(!screen.contains(OUTPUT_STATUS_COMPLETE));
+}
+
+#[test]
+fn scroll_affordances_are_visible_on_both_scrollable_surfaces() {
+    // The panel footer names paging inside its 58-column body.
+    assert!(
+        PANEL_FOOTER_HINT.contains("PgUp/PgDn"),
+        "the footer hint must advertise paging: {PANEL_FOOTER_HINT}"
+    );
+    assert!(
+        PANEL_FOOTER_HINT.len() <= 58,
+        "the hint fits the narrowest panel body: {PANEL_FOOTER_HINT}"
+    );
+    // The streaming output's status line carries the same affordance.
+    let mut view = initial_view();
+    view.output.push_chunk("scrolled output\n".as_bytes());
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains(OUTPUT_SCROLL_HINT),
+        "the output status line advertises paging: {screen}"
+    );
+}
+
+#[test]
+fn out_of_range_output_scroll_still_renders_the_body() {
+    let mut view = initial_view();
+    view.output.push_chunk("only output line\n".as_bytes());
+    // An offset far past the content — left behind by a taller stream —
+    // must clamp to the content bounds instead of rendering nothing.
+    view.output_scroll = u16::MAX;
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("only output line"),
+        "an out-of-range offset must not render an empty body: {screen}"
+    );
+}
+
+#[test]
+fn replaced_output_resets_the_scroll_offset() {
+    let mut view = initial_view();
+    view.output.push_chunk("old stream\n".as_bytes());
+    view.output_scroll = 7;
+    let mut next = OutputStream::new();
+    next.push_chunk("fresh stream head\n".as_bytes());
+    view.replace_output(next);
+    assert_eq!(view.output_scroll, 0, "a replaced stream starts at its top");
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("fresh stream head"),
+        "the new stream renders from its head: {screen}"
+    );
+    assert!(
+        !screen.contains("old stream"),
+        "the replaced stream is gone: {screen}"
+    );
+}
+
+#[test]
+fn out_of_range_panel_body_scroll_still_renders_the_scope() {
+    let mut view = initial_view();
+    let mut panel = PermissionPanel::new(
+        rivect::policy::ModeDecision::Ask,
+        rivect::contracts::EffectClass::Write,
+        "grant-scroll-clamp",
+        "task-scroll-fixture",
+        "2036-01-01T00:00:00Z",
+        "/visible-scope",
+    );
+    // Fifty PageDowns on a one-row body leave an offset far past the
+    // content; the render must clamp it rather than blank the scope.
+    for _ in 0..50 {
+        panel.scroll_body(true);
+    }
+    view.panel = Some(panel);
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("scope: /visible-scope"),
+        "an out-of-range offset must not hide the scope body: {screen}"
+    );
+    assert!(
+        screen.contains(PANEL_FOOTER_HINT),
+        "the footer stays pinned: {screen}"
+    );
 }
 
 #[test]
