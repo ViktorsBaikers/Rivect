@@ -298,15 +298,15 @@ impl PermissionPanel {
             "{PANEL_TITLE}\ndecision: {}\neffect: {}\ninitiator: {}\nexpiry: {}",
             self.verdict.token(),
             effect_class_label(self.class),
-            self.initiator,
-            self.expiry,
+            sanitize_status_cause(&self.initiator),
+            sanitize_status_cause(&self.expiry),
         )
     }
 
     /// Scrollable body: the scope, the only freely wrapping part (the
     /// request detail carrier arrives with the mode-selection carrier).
     fn body_text(&self) -> String {
-        format!("scope: {}", self.scope)
+        format!("scope: {}", sanitize_status_cause(&self.scope))
     }
 
     /// Pinned footer: the actions line, then the one affordance hint.
@@ -663,7 +663,14 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut TaskStore) {
                 view.transcript.push(PANEL_ALLOWED_NOTE.to_string());
             }
             PanelAction::LimitedGrant => {
-                let scope = preapproval_scope(panel.class, &panel.scope);
+                let Some(scope) = preapproval_scope(panel.class, &panel.scope) else {
+                    panel.focus_deny();
+                    view.panel = Some(panel);
+                    view.transcript.push(
+                        "limited grant recording failed: scope is not valid unicode".to_string(),
+                    );
+                    return;
+                };
                 match store.record_preapproval(&scope, PANEL_GRANTOR, LIMIT_GRANT_TTL_SECONDS) {
                     Ok(()) => {
                         view.transcript.push(PANEL_LIMITED_NOTE.to_string());

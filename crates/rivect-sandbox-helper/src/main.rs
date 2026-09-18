@@ -19,14 +19,14 @@
 //!       read stdin -> fd 1 after truncating it (write)
 //!   probe-write <macos|linux> <profile|scope> <path>
 //!       apply the sandbox, then open the probe artifact for write
-//!       (O_WRONLY|O_CREAT|O_EXCL|O_TRUNC|O_NOFOLLOW) and write one byte
+//!       (O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW) and write one byte
 //! ```
 //! Exit verdicts are the crate's `EXIT_*` codes: 0 ok, 10 sandbox init
 //! failure, 20 data I/O failure, 30 protocol error, 126/127 launch exec
 //! failure — the host maps them to the worker's typed errors. Diagnostics
 //! go to stderr (fd 2), which is the only stream the host captures.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd as _;
 use std::process::ExitCode;
@@ -55,12 +55,6 @@ const O_CREAT: i32 = 0o100;
 const O_EXCL: i32 = 0x0800;
 #[cfg(target_os = "linux")]
 const O_EXCL: i32 = 0o200;
-/// `open(2)` truncate. Darwin and Linux disagree on the bit: the Linux
-/// octal aliases `O_ASYNC|O_CREAT` without `O_TRUNC` on macOS.
-#[cfg(target_os = "macos")]
-const O_TRUNC: i32 = 0x0400;
-#[cfg(target_os = "linux")]
-const O_TRUNC: i32 = 0o1000;
 /// `open(2)` do not follow symlinks.
 #[cfg(target_os = "macos")]
 const O_NOFOLLOW: i32 = 0x0100;
@@ -111,6 +105,38 @@ mod sys {
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
         pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     }
+
+    /// glibc/musl `struct dirent` on 64-bit Linux: `d_name` is the last field.
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    pub struct Dirent {
+        pub d_ino: u64,
+        pub d_off: i64,
+        pub d_reclen: u16,
+        pub d_type: u8,
+        pub d_name: [c_char; 256],
+    }
+
+    /// Darwin `struct dirent`: `d_name` is the last field.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub struct Dirent {
+        pub d_ino: u64,
+        pub d_seekoff: u64,
+        pub d_reclen: u16,
+        pub d_namlen: u16,
+        pub d_type: u8,
+        pub d_name: [c_char; 1024],
+    }
+
+    // SAFETY: POSIX directory iteration; `Dirent::d_name` is a
+    // NUL-terminated C string at the documented offset on each platform.
+    unsafe extern "C" {
+        pub fn opendir(name: *const c_char) -> *mut c_void;
+        pub fn readdir(dirp: *mut c_void) -> *mut Dirent;
+        pub fn closedir(dirp: *mut c_void) -> c_int;
+        pub fn dirfd(dirp: *mut c_void) -> c_int;
+    }
 }
 
 fn main() -> ExitCode {
@@ -122,7 +148,9 @@ fn main() -> ExitCode {
     // anything else before any sandbox exists, so a confined program can
     // never inherit a stray fd (S6). RLIMIT_NOFILE does not close existing
     // fds, so the sweep must cover the whole table, not a 256-wide window.
-    close_stray_fds();
+    if let Err(code) = close_stray_fds() {
+        return exit(code);
+    }
 
     let args: Vec<CString> = std::env::args_os()
         .map(|arg| CString::new(arg.into_encoded_bytes()))
@@ -319,7 +347,7 @@ fn open_for_write(path: &CString) -> Result<(), i32> {
     unsafe {
         let fd = sys::open(
             path.as_ptr(),
-            O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
             0o600,
         );
         if fd < 0 {
@@ -368,9 +396,7 @@ fn apply_macos_sandbox(profile: &[u8]) -> Result<(), i32> {
             let message = if errorbuf.is_null() {
                 "sandbox_init failed".to_string()
             } else {
-                let message = std::ffi::CStr::from_ptr(errorbuf)
-                    .to_string_lossy()
-                    .into_owned();
+                let message = CStr::from_ptr(errorbuf).to_string_lossy().into_owned();
                 sys::sandbox_free_error(errorbuf);
                 message
             };
@@ -434,9 +460,9 @@ fn apply_linux_landlock(scope: &[u8]) -> Result<(), i32> {
         | ACCESS_FS_MAKE_BLOCK
         | ACCESS_FS_MAKE_SYM;
 
-    const O_RDONLY: i32 = 0;
     const O_DIRECTORY: i32 = 0o200_000;
     const O_CLOEXEC: i32 = 0o2_000_000;
+    const O_PATH: i32 = 0o10_000_000;
 
     #[repr(C)]
     struct LandlockRulesetAttr {
@@ -500,7 +526,11 @@ fn apply_linux_landlock(scope: &[u8]) -> Result<(), i32> {
                     return Err(EXIT_PROTOCOL);
                 }
             };
-            let dirfd = sys::open(scope_c.as_ptr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            let dirfd = sys::open(
+                scope_c.as_ptr(),
+                O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                0,
+            );
             if dirfd < 0 {
                 eprintln!(
                     "rivect-sandbox-helper: landlock scope open failed: {}",
@@ -607,29 +637,42 @@ fn apply_rlimits() -> Result<(), i32> {
 
 /// Closes every inherited fd above stdio. Linux prefers `close_range` and
 /// walks `/proc/self/fd` if that syscall is missing; macOS walks `/dev/fd`
-/// and falls back to `F_MAXFD`.
-fn close_stray_fds() {
+/// and falls back to `F_MAXFD`. If every method fails, this is a sandbox
+/// init failure — never exec-with-inherited-fds.
+fn close_stray_fds() -> Result<(), i32> {
     #[cfg(target_os = "linux")]
     {
         const SYS_CLOSE_RANGE: i64 = 436;
         // SAFETY: close_range(3, UINT_MAX, 0) closes every fd above stdio;
         // a negative return is ENOSYS or a similar miss, and the walk
         // covers the table instead.
-        let closed = unsafe { sys::syscall(SYS_CLOSE_RANGE, 3i32, u32::MAX, 0u32) };
+        let closed = unsafe { sys::syscall(SYS_CLOSE_RANGE, 3u32, u32::MAX, 0u32) };
         if closed == 0 {
-            return;
+            return Ok(());
         }
-        walk_fd_dir("/proc/self/fd");
+        if walk_fd_dir("/proc/self/fd") {
+            return Ok(());
+        }
+        eprintln!(
+            "rivect-sandbox-helper: fd sweep failed: close_range and /proc/self/fd walk both failed"
+        );
+        return Err(EXIT_SANDBOX_INIT);
     }
     #[cfg(target_os = "macos")]
     {
         if walk_fd_dir("/dev/fd") {
-            return;
+            return Ok(());
         }
         const F_MAXFD: i32 = 51;
         // SAFETY: F_MAXFD reports the largest open fd in this process;
         // closing numbers above stdio is the documented unix contract.
         let max = unsafe { sys::fcntl(0, F_MAXFD) };
+        if max < 0 {
+            eprintln!(
+                "rivect-sandbox-helper: fd sweep failed: /dev/fd walk and F_MAXFD both failed"
+            );
+            return Err(EXIT_SANDBOX_INIT);
+        }
         if max > STDIO_TOP_FD {
             for fd in (STDIO_TOP_FD + 1)..=max {
                 // SAFETY: those fds are the parent's strays, never owned
@@ -637,29 +680,85 @@ fn close_stray_fds() {
                 let _ = unsafe { sys::close(fd) };
             }
         }
+        Ok(())
     }
 }
 
 /// Collects numeric fd names from a kernel fd directory, then closes each
-/// fd above stdio. Returns false when the directory cannot be opened.
+/// fd above stdio except the directory fd itself (`closedir` owns that
+/// close). Returns false when the directory cannot be opened.
 fn walk_fd_dir(dir: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(dir_c) = CString::new(dir) else {
         return false;
     };
-    let fds: Vec<i32> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok())
-        })
-        .filter(|&fd| fd > STDIO_TOP_FD)
-        .collect();
-    for fd in fds {
-        // SAFETY: those fds are the parent's strays (plus the dirfd of
-        // the walk, which is closed after the names are collected).
-        let _ = unsafe { sys::close(fd) };
+    // SAFETY: `dir_c` is a valid CString; opendir/readdir/dirfd/closedir
+    // follow the POSIX DIR contract. Names are collected before closedir,
+    // the directory fd is excluded from the close list, and closedir
+    // closes that fd once — never a double-close of the walk's dirfd.
+    unsafe {
+        let dirp = sys::opendir(dir_c.as_ptr());
+        if dirp.is_null() {
+            return false;
+        }
+        let dirfd = sys::dirfd(dirp);
+        if dirfd < 0 {
+            let _ = sys::closedir(dirp);
+            return false;
+        }
+        let mut fds = Vec::new();
+        loop {
+            let entry = sys::readdir(dirp);
+            if entry.is_null() {
+                break;
+            }
+            let Ok(name) = CStr::from_ptr((*entry).d_name.as_ptr()).to_str() else {
+                continue;
+            };
+            let Ok(fd) = name.parse::<i32>() else {
+                continue;
+            };
+            if fd > STDIO_TOP_FD && fd != dirfd {
+                fds.push(fd);
+            }
+        }
+        let _ = sys::closedir(dirp);
+        for fd in fds {
+            let _ = sys::close(fd);
+        }
     }
     true
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "helper unit tests assert setup and outcomes"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_fd_dir_rejects_a_missing_directory() {
+        assert!(!walk_fd_dir("/no/such/rivect-fd-dir"));
+    }
+
+    #[test]
+    fn walk_fd_dir_closes_strays_without_double_closing_its_dirfd() {
+        use std::os::fd::IntoRawFd;
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let raw = file.into_raw_fd();
+        assert!(raw > STDIO_TOP_FD);
+        let dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        assert!(walk_fd_dir(dir), "fd directory walk must succeed");
+        // SAFETY: `raw` was closed by the walk; a second close is EBADF,
+        // proving the dirfd was not recycled onto this number.
+        let rc = unsafe { sys::close(raw) };
+        assert_eq!(rc, -1, "the stray fd must already be closed");
+    }
 }

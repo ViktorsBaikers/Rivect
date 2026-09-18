@@ -636,7 +636,9 @@ fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), W
 /// already mapped [`WorkerError::ConfinedRunTimedOut`]).
 pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<WorkerError> {
     let stderr = String::from_utf8_lossy(&observed.stderr);
-    let from_helper = stderr.contains("rivect-sandbox-helper:");
+    let from_helper = stderr
+        .lines()
+        .any(|line| line.starts_with("rivect-sandbox-helper:"));
     match observed.status.code() {
         Some(rivect_sandbox_helper::EXIT_SANDBOX_INIT) if from_helper => {
             Some(WorkerError::SandboxUnavailable {
@@ -764,18 +766,18 @@ pub fn admission_context(
         Some(scope) => store.has_retained(&checkpoint_boundary_id(scope))?,
         None => false,
     };
-    let preapproval_target = target
-        .canonicalize()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| target.display().to_string());
     Ok(AdmissionContext {
         mode,
         in_grant_scope,
         budget_remaining,
         in_trusted_scope: in_grant_scope,
         has_checkpoint,
-        previously_approved: store
-            .is_preapproved(&preapproval_scope(class, &preapproval_target))?,
+        previously_approved: target
+            .to_str()
+            .and_then(|text| preapproval_scope(class, text))
+            .map(|key| store.is_preapproved(&key))
+            .transpose()?
+            .unwrap_or(false),
         // Exec bounds are the grant scope. Egress has no observed bounds
         // signal yet: a missing signal stays false so Auto cannot
         // over-grant.
@@ -1386,6 +1388,19 @@ mod tests {
                 Some(WorkerError::SandboxSpawnFailed { .. })
             ),
             "helper-prefixed 126 is launcher init failure"
+        );
+    }
+
+    #[test]
+    fn helper_prefix_must_be_a_full_line() {
+        let observed = ObservedChild {
+            status: exited(10),
+            stdout: Vec::new(),
+            stderr: b"confined-program said rivect-sandbox-helper: spoof\n".to_vec(),
+        };
+        assert!(
+            helper_launch_init_failed(&observed).is_none(),
+            "a substring that is not a full-line prefix must not spoof helper init"
         );
     }
 }

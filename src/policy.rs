@@ -1091,15 +1091,19 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 /// Filesystem classes canonicalize the path so `/var` and `/private/var`
 /// (and other alias spellings) share one row; a missing path keeps the
 /// caller spelling. Egress/model/control keys stay as given.
-pub fn preapproval_scope(class: EffectClass, scope: &str) -> String {
+/// Canonical path bytes that are not valid UTF-8 cannot be keyed without
+/// colliding via `display()` — skip preapproval (fail closed).
+pub fn preapproval_scope(class: EffectClass, scope: &str) -> Option<String> {
     let scope = match class {
-        EffectClass::Read | EffectClass::Write | EffectClass::Exec => Path::new(scope)
-            .canonicalize()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| scope.to_string()),
+        EffectClass::Read | EffectClass::Write | EffectClass::Exec => {
+            match Path::new(scope).canonicalize() {
+                Ok(path) => path.to_str()?.to_string(),
+                Err(_) => scope.to_string(),
+            }
+        }
         EffectClass::Egress | EffectClass::Model | EffectClass::Control => scope.to_string(),
     };
-    format!("{}:{scope}", class_key(class))
+    Some(format!("{}:{scope}", class_key(class)))
 }
 
 fn class_key(class: EffectClass) -> &'static str {

@@ -3,8 +3,23 @@
 //! dependencies — the unsafe syscall surface lives in the binary, this lib
 //! holds only what the host process needs to spawn it.
 
+use std::cell::RefCell;
 use std::io;
 use std::path::PathBuf;
+
+thread_local! {
+    static HELPER_BINARY_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Overrides helper resolution for this thread. Tests use this instead of
+/// `env::set_var` (unsafe in edition 2024). Pass `None` to restore.
+pub fn override_helper_binary(path: Option<PathBuf>) {
+    HELPER_BINARY_OVERRIDE.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = path;
+        }
+    });
+}
 
 /// The confined run succeeded.
 pub const EXIT_OK: i32 = 0;
@@ -32,6 +47,11 @@ pub const EXIT_LAUNCH_NOT_FOUND: i32 = 127;
 /// exists — the executor surfaces that as the mechanism being unavailable,
 /// never as an ambient in-process fallback.
 pub fn helper_binary() -> io::Result<PathBuf> {
+    if let Some(path) =
+        HELPER_BINARY_OVERRIDE.with(|slot| slot.try_borrow().ok().and_then(|guard| guard.clone()))
+    {
+        return Ok(path);
+    }
     if let Some(path) = std::env::var_os("RIVECT_SANDBOX_HELPER") {
         return Ok(PathBuf::from(path));
     }

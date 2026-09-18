@@ -1370,7 +1370,7 @@ use rivect::controller::output_settlement;
 use rivect::resources::{OutputSettlement, OutputStatus, OutputStream};
 use rivect::ui::{
     OUTPUT_STATUS_COMPLETE, OUTPUT_STATUS_ERROR, OUTPUT_STATUS_PARTIAL, OUTPUT_STATUS_STREAMING,
-    OUTPUT_TRUNCATED_NOTE, initial_view, render,
+    OUTPUT_TRUNCATED_NOTE, PermissionPanel, initial_view, render,
 };
 
 /// Renders one view onto an 80×24 test buffer and joins the cell
@@ -1718,7 +1718,7 @@ fn long_output_marks_retained_head_instead_of_presenting_whole() {
 
 #[test]
 fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
-    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}";
+    let raw = "ok\u{200B}hid\u{202E}bid\u{2066}i\u{FEFF}\u{2060}\u{061C}\u{180E}\u{206A}";
     assert_eq!(rivect::resources::sanitize_status_cause(raw), "okhidbidi");
     let mut stream = OutputStream::new();
     stream.push_chunk("vis\u{200B}ible\u{202A}text".as_bytes());
@@ -1731,6 +1731,45 @@ fn sanitizer_strips_cf_and_bidi_and_status_cause_is_sanitized() {
     assert!(screen.contains("deniedsecret"), "{screen}");
     assert!(!screen.contains('\u{200B}'));
     assert!(!screen.contains('\u{202E}'));
+}
+
+#[test]
+fn permission_panel_strips_cf_from_rendered_scope_and_initiator() {
+    let mut view = initial_view();
+    view.panel = Some(PermissionPanel::new(
+        rivect::policy::ModeDecision::Ask,
+        rivect::contracts::EffectClass::Write,
+        "init\u{206A}iator",
+        "exp\u{200B}iry",
+        "/tmp/\u{202E}scope",
+    ));
+    let screen = rendered_text(&view);
+    assert!(screen.contains("initiator: initiator"), "{screen}");
+    assert!(screen.contains("scope: /tmp/scope"), "{screen}");
+    assert!(!screen.contains('\u{206A}'));
+    assert!(!screen.contains('\u{202E}'));
+    assert_eq!(
+        view.panel.as_ref().expect("panel").scope,
+        "/tmp/\u{202E}scope",
+        "preapproval key keeps canonical path bytes"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preapproval_scope_skips_non_utf8_canonical_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = TempTree::new("preapproval-non-utf8");
+    let target = fixture.path.join(OsStr::from_bytes(b"not-\xff-utf8"));
+    std::fs::create_dir_all(&target).expect("non-utf8 dir");
+    let link = fixture.path.join("link");
+    symlink(&target, &link).expect("utf-8 symlink to non-utf8");
+    let link = link.to_str().expect("link name is utf-8");
+    assert!(
+        rivect::policy::preapproval_scope(rivect::contracts::EffectClass::Read, link).is_none(),
+        "a non-UTF8 canonical path must skip preapproval rather than collide via display()"
+    );
 }
 
 #[test]

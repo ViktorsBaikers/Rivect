@@ -166,7 +166,7 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
             ),
         });
     }
-    let outcome = run_confined(&launcher, &confinement, program, &[])?;
+    let outcome = run_confined_exec(&launcher, &confinement, program, &[])?;
     expect_admitted(outcome, program)
 }
 
@@ -556,6 +556,14 @@ const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 /// `EPERM` from the confined program, never as a signal.
 const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001;
 
+/// `SECCOMP_RET_ERRNO | ENOSYS` — glibc tries `clone3` first and falls
+/// back to `clone` only on ENOSYS. EPERM would break fork in confined
+/// exec; the deny targets confused-deputy (`clone3` as a helper), not spawn.
+const SECCOMP_RET_ERRNO_ENOSYS: u32 = 0x0005_0026;
+
+/// `clone3` — same number on x86_64 and aarch64.
+const SYS_CLONE3: u32 = 435;
+
 /// `SECCOMP_RET_ALLOW` — every syscall outside the deny list runs.
 const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
 
@@ -563,7 +571,8 @@ const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
 /// filter loads the architecture word and jumps straight to a deny
 /// verdict for any other architecture (an unjudged architecture fails
 /// closed), loads the syscall number, masks the x32/ILP32 compat band
-/// bit, and returns `ERRNO|EPERM` for exactly the denied numbers,
+/// bit, and returns `ERRNO|EPERM` for the denied numbers except `clone3`
+/// (which returns `ERRNO|ENOSYS` so glibc fork falls back to `clone`),
 /// `ALLOW` for everything else — so the launcher's own `execve` of the
 /// confined program is never blocked, and neither are the Landlock
 /// syscalls `setpriv` itself already applied.
@@ -592,21 +601,25 @@ fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
         "aarch64" => Some((
             AUDIT_ARCH_AARCH64,
             &[
-                198, 199, 202, 203, 206, 207, 211,
-                242, // socket accept* connect sendto recvfrom sendmsg accept4
+                198, 199, 200, 201, 202, 203, 206, 207, 211, 212,
+                242, // socket socketpair bind listen accept connect sendto recvfrom sendmsg recvmsg accept4
                 243, 269, // recvmmsg sendmmsg
-                97, 117, 268, 270, 271, 280, // unshare ptrace setns process_vm_* bpf
-                425, 426, 427, 434, 435, 438, // io_uring_* pidfd_open clone3 pidfd_getfd
+                97, 117, 154, 157, 268, 270, 271,
+                280, // unshare ptrace setpgid setsid setns process_vm_* bpf
+                425, 426, 427, 434, 438,        // io_uring_* pidfd_open pidfd_getfd
+                SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
             ],
         )),
         "x86_64" => Some((
             AUDIT_ARCH_X86_64,
             &[
-                41, 42, 43, 44, 45, 46, 53,
-                288, // socket connect accept sendto recvfrom sendmsg socketpair accept4
+                41, 42, 43, 44, 45, 46, 47, 49, 50, 53,
+                288, // socket connect accept sendto recvfrom sendmsg recvmsg bind listen socketpair accept4
                 299, 307, // recvmmsg sendmmsg
-                101, 272, 308, 310, 311, 321, // ptrace unshare setns process_vm_* bpf
-                425, 426, 427, 434, 435, 438, // io_uring_* pidfd_open clone3 pidfd_getfd
+                101, 109, 112, 272, 308, 310, 311,
+                321, // ptrace setpgid setsid unshare setns process_vm_* bpf
+                425, 426, 427, 434, 438,        // io_uring_* pidfd_open pidfd_getfd
+                SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
             ],
         )),
         _ => None,
@@ -637,7 +650,12 @@ fn net_deny_filter() -> Result<Vec<u8>, WorkerError> {
     ];
     for &nr in denied {
         program.push((BPF_JEQ_K, 0, 1, nr));
-        program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM));
+        let ret = if nr == SYS_CLONE3 {
+            SECCOMP_RET_ERRNO_ENOSYS
+        } else {
+            SECCOMP_RET_ERRNO_EPERM
+        };
+        program.push((BPF_RET_K, 0, 0, ret));
     }
     program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW));
     let mut bytes = Vec::with_capacity(program.len() * 8);
@@ -722,6 +740,27 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
+    run_confined_inner(launcher, confinement, program, args, true)
+}
+
+/// Admitted-exec leg: a confined program that prints the helper prefix
+/// and exits 10/126/127/30 is a confined-run outcome, never helper init.
+fn run_confined_exec(
+    launcher: &SandboxLauncher,
+    confinement: &Confinement,
+    program: &Path,
+    args: &[&OsStr],
+) -> Result<ConfinedOutcome, WorkerError> {
+    run_confined_inner(launcher, confinement, program, args, false)
+}
+
+fn run_confined_inner(
+    launcher: &SandboxLauncher,
+    confinement: &Confinement,
+    program: &Path,
+    args: &[&OsStr],
+    classify_helper_init: bool,
+) -> Result<ConfinedOutcome, WorkerError> {
     let mut command = helper_launch_command()?;
     command
         .arg(&launcher.unshare)
@@ -757,7 +796,7 @@ pub fn run_confined(
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
-    if let Some(error) = helper_launch_init_failed(&observed) {
+    if classify_helper_init && let Some(error) = helper_launch_init_failed(&observed) {
         return Err(error);
     }
     Ok(ConfinedOutcome {
@@ -1064,7 +1103,8 @@ pub fn probe_write_conformance(
 #[cfg(test)]
 mod tests {
     use super::{
-        Confinement, SYSTEM_EXECUTE_RULES, landlock_rules, native_net_syscalls, net_deny_filter,
+        Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES, landlock_rules, native_net_syscalls,
+        net_deny_filter,
     };
     use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
     use std::io::Read as _;
@@ -1166,10 +1206,15 @@ mod tests {
         );
         for (position, &nr) in denied.iter().enumerate() {
             assert_eq!(insn(4 + position * 2)?, (0x15, 0, 1, nr));
+            let ret = if nr == SYS_CLONE3 {
+                0x0005_0026
+            } else {
+                0x0005_0001
+            };
             assert_eq!(
                 insn(5 + position * 2)?,
-                (0x06, 0, 0, 0x0005_0001),
-                "each denied nr returns ERRNO|EPERM"
+                (0x06, 0, 0, ret),
+                "clone3 returns ERRNO|ENOSYS; every other denied nr returns ERRNO|EPERM"
             );
         }
         assert_eq!(
@@ -1205,6 +1250,21 @@ mod tests {
             verdict(arch, denied[0]),
             0x0005_0001,
             "a denied nr returns ERRNO|EPERM"
+        );
+        assert_eq!(
+            verdict(arch, SYS_CLONE3),
+            0x0005_0026,
+            "clone3 returns ERRNO|ENOSYS so glibc fork falls back to clone"
+        );
+        let clone = match std::env::consts::ARCH {
+            "aarch64" => 220,
+            "x86_64" => 56,
+            other => return Err(format!("unexpected arch {other}").into()),
+        };
+        assert_eq!(
+            verdict(arch, clone),
+            0x7FFF_0000,
+            "clone itself stays allowed"
         );
         assert_eq!(
             verdict(arch, denied[0] | 0x4000_0000),

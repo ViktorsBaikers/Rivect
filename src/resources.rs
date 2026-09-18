@@ -440,7 +440,7 @@ impl OutputStream {
 }
 
 /// Strips Unicode format controls that reverse or hide status copy:
-/// U+202A–U+202E, U+2066–U+2069, U+200B–U+200F, plus BOM (U+FEFF),
+/// U+202A–U+202E, U+2066–U+206F, U+200B–U+200F, plus BOM (U+FEFF),
 /// word joiner (U+2060), Arabic letter mark (U+061C), and Mongolian
 /// vowel separator (U+180E).
 pub fn sanitize_status_cause(cause: &str) -> String {
@@ -469,7 +469,7 @@ fn is_stripped_format(ch: char) -> bool {
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
             | '\u{FEFF}'
     )
 }

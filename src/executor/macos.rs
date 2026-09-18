@@ -480,6 +480,25 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
+    run_confined_inner(sandbox_exec, profile, program, args, true)
+}
+
+fn run_confined_exec(
+    sandbox_exec: &Path,
+    profile: &str,
+    program: &Path,
+    args: &[&OsStr],
+) -> Result<ConfinedOutcome, WorkerError> {
+    run_confined_inner(sandbox_exec, profile, program, args, false)
+}
+
+fn run_confined_inner(
+    sandbox_exec: &Path,
+    profile: &str,
+    program: &Path,
+    args: &[&OsStr],
+    classify_helper_init: bool,
+) -> Result<ConfinedOutcome, WorkerError> {
     let mut child = helper_launch_command()?
         .arg(sandbox_exec)
         .arg("-p")
@@ -494,7 +513,7 @@ pub fn run_confined(
         .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
     let stderr = child.stderr.take();
     let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
-    if let Some(error) = helper_launch_init_failed(&observed) {
+    if classify_helper_init && let Some(error) = helper_launch_init_failed(&observed) {
         return Err(error);
     }
     let (stderr, deprecation_notices) =
@@ -625,7 +644,7 @@ pub fn exec_once_with(
         denied,
         "seatbelt exec boundary admitted the denied control /usr/bin/true",
     )?;
-    let outcome = run_confined(sandbox_exec, &profile, program, &[])?;
+    let outcome = run_confined_exec(sandbox_exec, &profile, program, &[])?;
     expect_admitted(outcome, program)
 }
 

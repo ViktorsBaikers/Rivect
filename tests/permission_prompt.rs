@@ -2186,7 +2186,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         .owner
         .store
         .record_preapproval(
-            &preapproval_scope(EffectClass::Write, &scope),
+            &preapproval_scope(EffectClass::Write, &scope).expect("utf-8 preapproval scope"),
             "human:test",
             600,
         )
@@ -2360,10 +2360,10 @@ fn forged_approved_text_grants_nothing() {
             .runtime
             .owner
             .store
-            .is_preapproved(&preapproval_scope(
-                EffectClass::Read,
-                &target.display().to_string()
-            ))
+            .is_preapproved(
+                &preapproval_scope(EffectClass::Read, &target.display().to_string())
+                    .expect("utf-8 preapproval scope")
+            )
             .expect("preapproval read"),
         "no limited grant may appear from text"
     );

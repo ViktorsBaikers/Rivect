@@ -739,7 +739,11 @@ fn six_permission_modes_gate_the_seatbelt_worker() {
             .runtime
             .owner
             .store
-            .record_preapproval(&preapproval_scope(class, &target), "human:matrix", 600)
+            .record_preapproval(
+                &preapproval_scope(class, &target).expect("utf-8 preapproval scope"),
+                "human:matrix",
+                600,
+            )
             .expect("record matrix preapproval");
     }
 
@@ -1083,7 +1087,8 @@ fn allow_mode_write_cells_execute_through_the_seatbelt_worker() {
                             .expect("canonical write target")
                             .display()
                             .to_string(),
-                    ),
+                    )
+                    .expect("utf-8 preapproval scope"),
                     "human:matrix-write",
                     600,
                 )
@@ -1409,6 +1414,51 @@ fn admitted_read_and_write_execute_inside_the_seatbelt_helper_not_the_host_proce
         "the confined child must be a built helper, got {}",
         helper.display()
     );
+    {
+        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
+            "/no/such/rivect-sandbox-helper",
+        )));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                rivect_sandbox_helper::override_helper_binary(None);
+            }
+        }
+        let _reset = Reset;
+        let (mut world, task, file, grant) = sandbox_world("helper-witness");
+        let error = {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            let admitted = executor
+                .admit(
+                    &task,
+                    EffectRequest::Read {
+                        grant_id: grant,
+                        path: file.clone(),
+                    },
+                    PermissionMode::Manual,
+                )
+                .expect("admit read");
+            executor
+                .execute(&admitted)
+                .expect_err("missing helper must not host-read")
+        };
+        assert!(
+            matches!(
+                error,
+                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
+            ),
+            "confined read must fail closed at the helper, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("host can still read the target"),
+            b"scoped-by-seatbelt",
+            "the discriminator fails only the helper path, not the file"
+        );
+    }
     let (mut world, task, file, grant) = sandbox_world("helper-data-plane");
     {
         let mut executor = Executor::new(

@@ -1339,7 +1339,11 @@ fn six_permission_modes_gate_the_linux_worker() {
             .runtime
             .owner
             .store
-            .record_preapproval(&preapproval_scope(class, &target), "human:matrix", 600)
+            .record_preapproval(
+                &preapproval_scope(class, &target).expect("utf-8 preapproval scope"),
+                "human:matrix",
+                600,
+            )
             .expect("record matrix preapproval");
     }
 
@@ -1822,7 +1826,8 @@ fn allow_mode_write_cells_execute_through_the_linux_worker() {
                             .expect("canonical write target")
                             .display()
                             .to_string(),
-                    ),
+                    )
+                    .expect("utf-8 preapproval scope"),
                     "human:matrix-write",
                     600,
                 )
@@ -1887,6 +1892,59 @@ fn admitted_read_and_write_execute_inside_the_landlock_helper_not_the_host_proce
     ensure_helper();
     let helper = rivect_sandbox_helper::helper_binary().expect("helper binary");
     assert!(helper.is_file(), "{}", helper.display());
+    {
+        rivect_sandbox_helper::override_helper_binary(Some(PathBuf::from(
+            "/no/such/rivect-sandbox-helper",
+        )));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                rivect_sandbox_helper::override_helper_binary(None);
+            }
+        }
+        let _reset = Reset;
+        let mut world = support::open_world("helper-witness", None);
+        let session = world.open_session("helper-witness-session");
+        let task = world.create_task(&session, "helper-witness-task");
+        let scope = world.root.join("scope");
+        std::fs::create_dir_all(&scope).expect("scope");
+        let file = scope.join("target.txt");
+        std::fs::write(&file, b"scoped-by-landlock").expect("seed");
+        let grant = world.runtime.set_read_scope(scope.clone(), file.clone());
+        world.runtime.read_worker = Box::new(linux::LinuxWorker);
+        let error = {
+            let mut executor = Executor::new(
+                &mut world.runtime.policy,
+                &mut world.runtime.owner.store,
+                world.runtime.read_worker.as_mut(),
+            );
+            let admitted = executor
+                .admit(
+                    &task,
+                    EffectRequest::Read {
+                        grant_id: grant,
+                        path: file.clone(),
+                    },
+                    PermissionMode::Manual,
+                )
+                .expect("admit read");
+            executor
+                .execute(&admitted)
+                .expect_err("missing helper must not host-read")
+        };
+        assert!(
+            matches!(
+                error,
+                ExecutorError::Worker(WorkerError::SandboxUnavailable { .. })
+            ),
+            "confined read must fail closed at the helper, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("host can still read the target"),
+            b"scoped-by-landlock",
+            "the discriminator fails only the helper path, not the file"
+        );
+    }
     let mut world = support::open_world("helper-data-plane", None);
     let session = world.open_session("helper-data-plane-session");
     let task = world.create_task(&session, "helper-data-plane-task");
@@ -1969,8 +2027,12 @@ fn linux_exec_seccomp_denies_io_uring_ptrace_process_vm_pidfd_getfd_unshare_bpf_
         );
     }
     let extras: &[u32] = match std::env::consts::ARCH {
-        "aarch64" => &[202, 207, 242, 243, 269, 97, 117, 268, 270, 271, 280],
-        "x86_64" => &[43, 45, 288, 299, 307, 101, 272, 308, 310, 311, 321],
+        "aarch64" => &[
+            200, 201, 202, 207, 212, 242, 243, 269, 97, 117, 154, 157, 268, 270, 271, 280,
+        ],
+        "x86_64" => &[
+            43, 45, 47, 49, 50, 288, 299, 307, 101, 109, 112, 272, 308, 310, 311, 321,
+        ],
         other => panic!("unexpected arch {other}"),
     };
     for n in extras {
@@ -2113,4 +2175,51 @@ fn live_admission_context_allow_cells_reach_the_linux_worker_when_granting_signa
         );
     }
     assert_eq!(writes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn confined_exec_glibc_fork_works_because_clone3_returns_enosys() {
+    ensure_helper();
+    let bash = Path::new("/usr/bin/bash");
+    assert!(bash.is_file(), "need /usr/bin/bash");
+    let confinement = linux::exec_confinement(Path::new("/usr/bin")).expect("exec confinement");
+    let outcome = confined(
+        &confinement,
+        bash,
+        &[
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new("echo ok | /usr/bin/cat"),
+        ],
+    )
+    .expect("confined bash pipeline");
+    assert!(
+        outcome.exit_ok,
+        "glibc fork must work under clone3 ENOSYS: {outcome:?}"
+    );
+}
+
+#[test]
+fn confined_exec_denies_setsid_so_a_forked_grandchild_cannot_escape_killpg() {
+    ensure_helper();
+    let setsid = Path::new("/usr/bin/setsid");
+    let true_bin = Path::new("/usr/bin/true");
+    assert!(
+        setsid.is_file() && true_bin.is_file(),
+        "need /usr/bin/setsid and /usr/bin/true"
+    );
+    let confinement = linux::exec_confinement(Path::new("/usr/bin")).expect("exec confinement");
+    let outcome = confined(
+        &confinement,
+        setsid,
+        &[std::ffi::OsStr::new("-f"), true_bin.as_os_str()],
+    )
+    .expect("confined setsid -f");
+    // `setsid -f` forks: the direct child exits 0 while the grandchild —
+    // not a process-group leader — calls setsid() and can only get EPERM
+    // from the seccomp filter. The denial evidence is on stderr.
+    assert!(
+        outcome.stderr.contains("Operation not permitted")
+            || outcome.stderr.contains("setsid failed"),
+        "setsid/setpgid must be denied so daemonize cannot escape killpg: {outcome:?}"
+    );
 }
