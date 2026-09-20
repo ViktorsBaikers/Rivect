@@ -16,7 +16,13 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlErr
 
 pub const WORKFLOW_KEY: &str = "workflow.enabled";
 
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+/// The keys `config.read` serves, named once for the read surface's
+/// unknown-key hint (DEC-013): the workflow flag plus the additive
+/// profile keys. Name-bearing keys print their pattern form — a
+/// connection or profile name is never itself a known key.
+pub const READ_KEY_HINT: &str = "workflow.enabled, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
+
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Optional per-connection region and credential profile:\n# [connections.<id>]\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.<name>]\n# credential_ref = \"keyring:rivect/default\"\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -116,6 +122,12 @@ pub enum ConfigIssue {
     NoRetainedDocument,
     #[error("value type does not match {key}")]
     ValueTypeMismatch { key: String },
+    #[error(
+        "{key} carries raw secret material; a scoped secret reference (store:scope) is required"
+    )]
+    SecretRefExpected { key: String },
+    #[error("unknown profile reference: profiles.{profile}")]
+    UnknownProfileReference { profile: String },
 }
 
 #[derive(Debug)]
@@ -189,6 +201,20 @@ impl std::fmt::Display for ConnKind {
 pub struct Connection {
     pub kind: ConnKind,
     pub endpoint: String,
+    pub credential_ref: Option<String>,
+    /// Optional deployment region (DEC-013): provider dialects resolve
+    /// its wire meaning; the schema carries it opaque.
+    pub region: Option<String>,
+    /// The credential profile this connection binds (AC-047): names a
+    /// `[profiles.<name>]` entry — never a secret itself.
+    pub profile: Option<String>,
+}
+
+/// One credential profile (DEC-013): the `credential_ref` is a scoped
+/// secret reference (`store:scope`), never the secret itself — raw
+/// material is refused at both carriers.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Profile {
     pub credential_ref: Option<String>,
 }
 
@@ -284,6 +310,10 @@ pub struct Config {
     pub version: u64,
     pub workflow: Workflow,
     pub connections: BTreeMap<String, Connection>,
+    /// Declared credential profiles (DEC-013): `connections.<id>.profile`
+    /// references must resolve here — a dangling profile is the same
+    /// schema violation a dangling connection reference is.
+    pub profiles: BTreeMap<String, Profile>,
     pub models: Models,
     raw: Option<DocumentMut>,
 }
@@ -295,6 +325,8 @@ pub enum ConfigValue {
     Effort(EffortAssign),
     Fallback(FallbackAssign),
     Names(Vec<String>),
+    /// A plain string value — the additive profile keys' carrier.
+    Text(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,10 +363,11 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return Ok(());
         };
-        let (version, workflow, connections, models) = validated_document(doc)?;
+        let (version, workflow, connections, profiles, models) = validated_document(doc)?;
         self.version = version;
         self.workflow = workflow;
         self.connections = connections;
+        self.profiles = profiles;
         self.models = models;
         Ok(())
     }
@@ -464,6 +497,17 @@ impl Config {
                 }
                 Item::Value(toml_edit::Value::Array(array))
             }
+            ConfigValue::Text(text) => {
+                if !matches!(
+                    &target,
+                    EditTarget::ConnectionRegion(_)
+                        | EditTarget::ConnectionProfile(_)
+                        | EditTarget::ProfileCredentialRef(_)
+                ) {
+                    return Err(type_mismatch(key));
+                }
+                toml_edit::value(text.as_str())
+            }
         };
         let (path, field) = target_path(&target);
         let original = self.raw.clone();
@@ -532,7 +576,7 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return;
         };
-        let Ok((version, workflow, connections, models)) = validated_document(doc) else {
+        let Ok((version, workflow, connections, profiles, models)) = validated_document(doc) else {
             // Targeted edits intentionally remain usable while another path
             // still carries a rejected value; that value is never rewritten.
             return;
@@ -540,6 +584,7 @@ impl Config {
         self.version = version;
         self.workflow = workflow;
         self.connections = connections;
+        self.profiles = profiles;
         self.models = models;
     }
 
@@ -562,14 +607,101 @@ impl Config {
     pub fn set_wire(&mut self, key: &str, value: &Value) -> Result<ConfigEdit, ConfigError> {
         self.set(key, wire_value(key, value)?)
     }
+
+    /// The served value of one readable key on this document (DEC-014):
+    /// `Some` for an in-domain key — null when the field carries no
+    /// value — `None` outside the read domain, where the surface answers
+    /// with the unknown-key hint instead. The domain check is the same
+    /// [`is_readable_key`] the wire surface gates on, so a rejected key
+    /// can never read as an empty-name null here.
+    pub fn read_value(&self, key: &str) -> Option<Value> {
+        if !is_readable_key(key) {
+            return None;
+        }
+        let segments: Vec<&str> = key.split('.').collect();
+        match segments.as_slice() {
+            ["connections", name, "region"] => Some(
+                self.connections
+                    .get(*name)
+                    .and_then(|connection| connection.region.clone())
+                    .map_or(Value::Null, Value::String),
+            ),
+            ["connections", name, "profile"] => Some(
+                self.connections
+                    .get(*name)
+                    .and_then(|connection| connection.profile.clone())
+                    .map_or(Value::Null, Value::String),
+            ),
+            ["profiles", name, "credential_ref"] => Some(
+                self.profiles
+                    .get(*name)
+                    .and_then(|profile| profile.credential_ref.clone())
+                    .map_or(Value::Null, Value::String),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The byte digest of the retained document — the revision a read
+    /// entry names as its source, matching the digest an admitted edit
+    /// reports for the same document state.
+    pub fn revision(&self) -> String {
+        self.finish_edit().digest
+    }
 }
 
-fn validated_document(
-    doc: &DocumentMut,
-) -> Result<(u64, Workflow, BTreeMap<String, Connection>, Models), ConfigError> {
+/// Whether `config.read` serves this key (DEC-014): the workflow flag
+/// plus the additive profile keys. The shape domain is closed — a name
+/// segment is never itself a known key, and an empty segment reads as
+/// unknown.
+pub fn is_readable_key(key: &str) -> bool {
+    if key == WORKFLOW_KEY {
+        return true;
+    }
+    let segments: Vec<&str> = key.split('.').collect();
+    match segments.as_slice() {
+        ["connections", name, "region" | "profile"] => !name.is_empty(),
+        ["profiles", name, "credential_ref"] => !name.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `raw` spells a scoped secret reference (`store:scope`): the
+/// store segment is an identifier, the scope is non-empty and carries
+/// no whitespace. Anything else — including secret-looking material —
+/// is refused (DEC-013).
+fn scoped_secret_ref(raw: &str) -> bool {
+    let Some((store, scope)) = raw.split_once(':') else {
+        return false;
+    };
+    !store.is_empty()
+        && store
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && store
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        && !scope.is_empty()
+        && !scope.chars().any(char::is_whitespace)
+}
+
+/// The typed view `validated_document` extracts from the raw TOML:
+/// version, workflow table, connections, credential profiles and the
+/// models section, all schema-checked.
+type ParsedDocument = (
+    u64,
+    Workflow,
+    BTreeMap<String, Connection>,
+    BTreeMap<String, Profile>,
+    Models,
+);
+
+fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
     let mut version = None;
     let mut workflow = Workflow::default();
     let mut connections = BTreeMap::new();
+    let mut profiles = BTreeMap::new();
     let mut models = Models::default();
     for (key, item) in doc.iter() {
         match key {
@@ -613,6 +745,49 @@ fn validated_document(
                 let table = table_like(key, item)?;
                 for (name, entry) in table.iter() {
                     connections.insert(name.to_string(), connection(name, entry)?);
+                }
+            }
+            "profiles" => {
+                let table = table_like(key, item)?;
+                for (name, entry) in table.iter() {
+                    let profile_table = table_like(name, entry)?;
+                    let profile_key = format!("profiles.{name}");
+                    let mut credential_ref = None;
+                    for (field, value) in profile_table.iter() {
+                        match field {
+                            "credential_ref" => {
+                                let raw = value.as_str().ok_or_else(|| {
+                                    ConfigError::schema(
+                                        format!("{profile_key}.credential_ref"),
+                                        ConfigIssue::ExpectedString {
+                                            field: "credential_ref".to_string(),
+                                        },
+                                    )
+                                })?;
+                                if !scoped_secret_ref(raw) {
+                                    // Never echo the value: diagnostics
+                                    // stay secret-free.
+                                    return Err(ConfigError::schema(
+                                        format!("{profile_key}.credential_ref"),
+                                        ConfigIssue::SecretRefExpected {
+                                            key: format!("{profile_key}.credential_ref"),
+                                        },
+                                    ));
+                                }
+                                credential_ref = Some(raw.to_string());
+                            }
+                            other => {
+                                return Err(ConfigError::schema(
+                                    format!("{profile_key}.{other}"),
+                                    ConfigIssue::UnknownKey {
+                                        key: other.to_string(),
+                                        known: PROFILE_KEYS,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    profiles.insert(name.to_string(), Profile { credential_ref });
                 }
             }
             "models" => {
@@ -670,6 +845,31 @@ fn validated_document(
                 }
             }
         }
+        // A present reference must be a scoped secret reference —
+        // the same shape profiles enforce. Never echo the value:
+        // diagnostics stay secret-free.
+        if let Some(credential_ref) = &connection.credential_ref
+            && !scoped_secret_ref(credential_ref)
+        {
+            return Err(ConfigError::schema(
+                format!("{key}.credential_ref"),
+                ConfigIssue::SecretRefExpected {
+                    key: format!("{key}.credential_ref"),
+                },
+            ));
+        }
+        // A profile binding must name a declared profile — the same
+        // referential discipline connection references already carry.
+        if let Some(profile) = &connection.profile
+            && !profiles.contains_key(profile)
+        {
+            return Err(ConfigError::schema(
+                format!("{key}.profile"),
+                ConfigIssue::UnknownProfileReference {
+                    profile: profile.clone(),
+                },
+            ));
+        }
     }
     let Some(defaults) = &models.defaults else {
         return Err(ConfigError::schema(
@@ -711,7 +911,7 @@ fn validated_document(
             check_chain_refs(&connections, fallback, &format!("{key}.fallback.chain"))?;
         }
     }
-    Ok((version, workflow, connections, models))
+    Ok((version, workflow, connections, profiles, models))
 }
 
 #[derive(Debug)]
@@ -725,6 +925,9 @@ enum EditTarget {
     PurposeEffort(String),
     PurposeFallback(String),
     PurposeEligible(String),
+    ConnectionRegion(String),
+    ConnectionProfile(String),
+    ProfileCredentialRef(String),
 }
 
 impl EditTarget {
@@ -758,6 +961,15 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
         ["models", "purposes", name, "eligible"] => {
             Ok(EditTarget::PurposeEligible(name.to_string()))
         }
+        // The additive profile keys (DEC-013): connection `region` and
+        // `profile` plus the credential profiles' `credential_ref` are
+        // the only editable connection/profile fields — `kind`,
+        // `endpoint` and `credential_ref` stay non-editable.
+        ["connections", name, "region"] => Ok(EditTarget::ConnectionRegion(name.to_string())),
+        ["connections", name, "profile"] => Ok(EditTarget::ConnectionProfile(name.to_string())),
+        ["profiles", name, "credential_ref"] => {
+            Ok(EditTarget::ProfileCredentialRef(name.to_string()))
+        }
         _ => Err(unknown_edit_key(key)),
     }
 }
@@ -767,7 +979,8 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
 /// one key earns one hint on both carriers (DEC-017) — never a second,
 /// divergent schema.
 const WORKFLOW_KEYS: &[&str] = &["enabled"];
-const CONNECTION_KEYS: &[&str] = &["kind", "endpoint", "credential_ref"];
+const CONNECTION_KEYS: &[&str] = &["kind", "endpoint", "credential_ref", "region", "profile"];
+const PROFILE_KEYS: &[&str] = &["credential_ref"];
 const MODELS_KEYS: &[&str] = &["defaults", "groups", "purposes"];
 const MODEL_SLOT_KEYS: &[&str] = &["model", "effort", "fallback"];
 const GROUP_KEYS: &[&str] = &["model"];
@@ -813,6 +1026,11 @@ fn unknown_edit_key(key: &str) -> ConfigError {
             [] | [_] => not_editable_key(key),
             [_, field] if CONNECTION_KEYS.contains(field) => not_editable_key(key),
             _ => unknown_scope_key(key, CONNECTION_KEYS),
+        },
+        "profiles" => match rest {
+            [] | [_] => not_editable_key(key),
+            [_, field] if PROFILE_KEYS.contains(field) => not_editable_key(key),
+            _ => unknown_scope_key(key, PROFILE_KEYS),
         },
         "models" => match rest {
             [] => not_editable_key(key),
@@ -911,6 +1129,9 @@ fn target_path(target: &EditTarget) -> (Vec<&str>, &str) {
         EditTarget::PurposeEffort(name) => (vec!["models", "purposes", name], "effort"),
         EditTarget::PurposeFallback(name) => (vec!["models", "purposes", name], "fallback"),
         EditTarget::PurposeEligible(name) => (vec!["models", "purposes", name], "eligible"),
+        EditTarget::ConnectionRegion(name) => (vec!["connections", name], "region"),
+        EditTarget::ConnectionProfile(name) => (vec!["connections", name], "profile"),
+        EditTarget::ProfileCredentialRef(name) => (vec!["profiles", name], "credential_ref"),
     }
 }
 
@@ -1183,6 +1404,12 @@ fn wire_value(key: &str, value: &Value) -> Result<ConfigValue, ConfigError> {
         (EditTarget::PurposeEligible(_), Value::Array(items)) => Ok(ConfigValue::Names(
             wire_name_array(items, key, ConfigIssue::EligibleEntryNotString)?,
         )),
+        (
+            EditTarget::ConnectionRegion(_)
+            | EditTarget::ConnectionProfile(_)
+            | EditTarget::ProfileCredentialRef(_),
+            Value::String(text),
+        ) => Ok(ConfigValue::Text(text.clone())),
         _ => Err(type_mismatch(key)),
     }
 }
@@ -1440,6 +1667,61 @@ fn validate_target(
                 ConfigIssue::EligibleEntryNotString,
             )?;
         }
+        EditTarget::ConnectionRegion(_) => {
+            if item.as_str().is_none() {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::ExpectedString {
+                        field: "region".to_string(),
+                    },
+                ));
+            }
+        }
+        EditTarget::ConnectionProfile(_) => {
+            let Some(raw) = item.as_str() else {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::ExpectedString {
+                        field: "profile".to_string(),
+                    },
+                ));
+            };
+            // The profile binding must resolve against the declared
+            // profiles — the same discipline the file surface enforces
+            // at parse.
+            let declared = document
+                .as_item()
+                .get("profiles")
+                .and_then(|item| item.as_table_like())
+                .is_some_and(|profiles| profiles.get(raw).is_some());
+            if !declared {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::UnknownProfileReference {
+                        profile: raw.to_string(),
+                    },
+                ));
+            }
+        }
+        EditTarget::ProfileCredentialRef(_) => {
+            let Some(raw) = item.as_str() else {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::ExpectedString {
+                        field: "credential_ref".to_string(),
+                    },
+                ));
+            };
+            if !scoped_secret_ref(raw) {
+                // Never echo the value: diagnostics stay secret-free.
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::SecretRefExpected {
+                        key: key.to_string(),
+                    },
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1563,9 +1845,11 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
         )
     })?;
     let credential_ref = string_field(table, &key, "credential_ref")?;
+    let region = string_field(table, &key, "region")?;
+    let profile = string_field(table, &key, "profile")?;
     for field in table.iter().map(|(field, _)| field) {
         match field {
-            "kind" | "endpoint" | "credential_ref" => {}
+            "kind" | "endpoint" | "credential_ref" | "region" | "profile" => {}
             "api_key" | "secret" | "token" | "password" => {
                 // Never echo the value: diagnostics stay secret-free.
                 return Err(ConfigError::schema(
@@ -1588,6 +1872,8 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
         kind,
         endpoint,
         credential_ref,
+        region,
+        profile,
     })
 }
 
@@ -2077,6 +2363,12 @@ fn user_workflow_entry(value: bool, revision: &str) -> ConfigEntry {
     }
 }
 
+/// The digest of the shipped defaults — the revision a shipped-sourced
+/// read entry names.
+pub fn shipped_revision() -> String {
+    hex(&Sha256::digest(SHIPPED_DEFAULTS_TOML.as_bytes()))
+}
+
 fn shipped_workflow_entry() -> ConfigEntry {
     ConfigEntry {
         key: WORKFLOW_KEY.to_string(),
@@ -2085,7 +2377,7 @@ fn shipped_workflow_entry() -> ConfigEntry {
         },
         source: ConfigSource {
             kind: "shipped".to_string(),
-            revision: hex(&Sha256::digest(SHIPPED_DEFAULTS_TOML.as_bytes())),
+            revision: shipped_revision(),
             target: None,
         },
     }

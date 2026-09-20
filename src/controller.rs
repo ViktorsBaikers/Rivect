@@ -4,12 +4,13 @@
 //! revocation/cancellation block the next dispatch before any provider
 //! effect.
 
-use crate::commands::Runtime;
+use crate::commands::{PausedAttempt, Runtime};
 use crate::contracts::{
-    AnswerSelection, EffectClass, ErrorCode, KNOWN_READY_OPTION, SessionId, TaskId, TaskSnapshot,
+    AnswerSelection, Availability, EffectClass, ErrorCode, KNOWN_READY_OPTION, OptionId, Question,
+    QuestionId, QuestionOption, SessionId, TaskId, TaskSnapshot,
 };
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
-use crate::model::ModelError;
+use crate::model::{ModelError, PendingFallback, RequestManifest};
 use crate::policy::PolicyError;
 use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
@@ -76,9 +77,16 @@ impl ControllerError {
             Self::Store(error) => error.code(),
             Self::Policy(_) => ErrorCode::Denied,
             Self::Model(ModelError::RequestTooLarge { .. }) => ErrorCode::ContextOverflow,
-            Self::Model(ModelError::Config(_) | ModelError::NoEligibleCandidate { .. }) => {
-                ErrorCode::CapabilityUnavailable
-            }
+            Self::Model(
+                ModelError::Config(_)
+                | ModelError::NoEligibleCandidate { .. }
+                | ModelError::ManualChoiceRejected { .. },
+            ) => ErrorCode::CapabilityUnavailable,
+            // The pending choice is normally bridged into a Waiting
+            // outcome; when it propagates — no candidates left, no
+            // publishable question — the honest class is a blocked
+            // decision dependency, never a denial.
+            Self::Model(ModelError::ManualFallbackPending { .. }) => ErrorCode::DependencyBlocked,
             Self::Model(_) => ErrorCode::Denied,
             Self::Executor(error) => error.error_code(),
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,
@@ -242,7 +250,7 @@ impl Runtime {
                 if option_id.0.as_str() == KNOWN_READY_OPTION
         );
         let (target, retained_attempt_id) =
-            match self.resolve_read_target(task_id, answer, known_ready)? {
+            match self.resolve_read_target(session_id, task_id, answer, known_ready)? {
                 Ok(pair) => pair,
                 Err(waiting) => return Ok(waiting),
             };
@@ -362,16 +370,48 @@ impl Runtime {
     }
 
     /// Resolves the scoped read target: known-ready uses the fixture file;
-    /// otherwise the broker names it. `Err(Waiting)` is a step outcome,
-    /// not a controller failure.
+    /// otherwise the broker names it — through a fresh prepare/dispatch,
+    /// or through the manual-fallback candidate a pending answer named.
+    /// `Err(Waiting)` is a step outcome, not a controller failure.
     fn resolve_read_target(
         &mut self,
+        session_id: &SessionId,
         task_id: &TaskId,
         answer: &AnswerSelection,
         known_ready: bool,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
         if known_ready {
             return Ok(Ok((self.scoped_file.clone(), None)));
+        }
+        // The manifest freezes the execution world (AC-013): the
+        // scope root the request's sources and proofs live in,
+        // re-checked at dispatch.
+        let world = self.scope_root.display().to_string();
+        // A manual-fallback answer naming a served candidate dispatches
+        // the paused attempt's frozen manifest through the picked
+        // connection — the broker re-runs the current eligibility check
+        // before the send, so a candidate that lost eligibility between
+        // the question and the answer is refused typed, never sent.
+        let chosen = match answer {
+            AnswerSelection::Option { option_id } => self
+                .paused_attempts
+                .get(&task_id.0)
+                .filter(|paused| {
+                    paused
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.candidates.contains(&option_id.0))
+                })
+                .map(|paused| (paused.manifest.attempt_id.clone(), option_id.0.clone())),
+            AnswerSelection::Custom { .. } => None,
+        };
+        if let Some((attempt_id, connection)) = chosen {
+            let reply = self
+                .broker
+                .dispatch_fallback_choice(&world, &attempt_id, &connection)?;
+            self.provider_calls += 1;
+            self.paused_attempts.remove(&task_id.0);
+            return self.read_target_from_reply(task_id, reply, Some(attempt_id));
         }
         let purpose = self.purpose.clone();
         let inputs = format!(
@@ -380,16 +420,123 @@ impl Runtime {
             answer_text(answer),
             self.scoped_file.display()
         );
-        // The manifest freezes the execution world (AC-013): the
-        // scope root the request's sources and proofs live in,
-        // re-checked at dispatch.
-        let world = self.scope_root.display().to_string();
         let manifest = self
             .broker
             .prepare(&purpose, &self.config_for_broker(), &world, &inputs)?;
         self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
-        let reply = self.broker.dispatch(&world, &manifest)?;
-        self.provider_calls += 1;
+        match self.broker.dispatch(&world, &manifest) {
+            Ok(reply) => {
+                self.provider_calls += 1;
+                // The send landed: any attempt this task was paused on
+                // is superseded — tombstone it so a late retry of its
+                // frozen manifest is refused, not resurrected.
+                if let Some(previous) = self.paused_attempts.remove(&task_id.0) {
+                    self.broker.cancel_attempt(&previous.manifest.attempt_id);
+                }
+                self.read_target_from_reply(task_id, reply, Some(manifest.attempt_id))
+            }
+            Err(ModelError::ManualFallbackPending { .. }) => {
+                self.pause_on_fallback_choice(session_id, task_id, manifest)
+            }
+            Err(source) => {
+                // Every dispatch error leaves the primary's admission
+                // live — the task pauses on a still-retryable attempt.
+                self.record_pause(task_id, manifest, None);
+                Err(source.into())
+            }
+        }
+    }
+
+    /// Remembers the broker attempt this task is paused on so a later
+    /// cancel tombstones it (EDGE-004); a superseded earlier pause dies
+    /// with its replacement — its frozen manifest never replays.
+    fn record_pause(
+        &mut self,
+        task_id: &TaskId,
+        manifest: RequestManifest,
+        choice: Option<PendingFallback>,
+    ) {
+        if let Some(previous) = self
+            .paused_attempts
+            .insert(task_id.0.clone(), PausedAttempt { manifest, choice })
+        {
+            self.broker.cancel_attempt(&previous.manifest.attempt_id);
+        }
+    }
+
+    /// The manual-fallback bridge (AC-045, DEC-014): the broker recorded
+    /// the pending choice on the failed attempt; this consumes it into a
+    /// `question.current` publication — one atomic store write that serves
+    /// the candidates and moves the task to waiting — and remembers the
+    /// attempt so the answered candidate dispatches and a cancel still
+    /// tombstones it.
+    fn pause_on_fallback_choice(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        manifest: RequestManifest,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        let Some(choice) = self.broker.pending_choice(&manifest.attempt_id).cloned() else {
+            // dispatch reported the pending state, so the record must
+            // exist — a missing one is a broker invariant violation,
+            // not a recoverable pause. Tombstone the still-live
+            // admission in place so it can never be resurrected.
+            self.broker.cancel_attempt(&manifest.attempt_id);
+            return Err(ControllerError::Model(ModelError::NoPendingChoice {
+                attempt_id: manifest.attempt_id.clone(),
+            }));
+        };
+        let Some(recommended) = choice.candidates.first() else {
+            // No surviving candidate means there is no choice to serve:
+            // an empty question would wait forever, so the step fails
+            // typed instead. The admission stays live and retryable —
+            // record the pause so a cancel still tombstones it.
+            self.record_pause(task_id, manifest, None);
+            return Err(ControllerError::Model(ModelError::NoEligibleCandidate {
+                purpose: choice.purpose,
+            }));
+        };
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        let question = Question {
+            question_id: QuestionId::generate(),
+            question_revision: 1,
+            task_id: task_id.clone(),
+            intent_revision: snapshot.intent_revision,
+            prompt: "the pinned dispatch failed; choose the fallback connection".to_string(),
+            options: choice
+                .candidates
+                .iter()
+                .map(|connection| QuestionOption {
+                    option_id: OptionId(connection.clone()),
+                    label: connection.clone(),
+                    consequences: format!("dispatch the frozen request through {connection}"),
+                    availability: Availability::Enabled,
+                })
+                .collect(),
+            recommended_option_id: OptionId(recommended.clone()),
+            recommendation_basis: "candidates passing the current eligibility check".to_string(),
+        };
+        // One atomic write: the question lands and the task moves to
+        // waiting — on a store error nothing is published, the broker's
+        // pending record stays, and the next failed dispatch serves it
+        // again.
+        self.owner.store.publish_question(session_id, &question)?;
+        self.broker.take_pending_choice(&manifest.attempt_id);
+        self.record_pause(task_id, manifest, Some(choice));
+        Ok(Err(StepOutcome::Waiting {
+            snapshot: self.owner.store.snapshot(task_id)?,
+        }))
+    }
+
+    /// The read target a dispatch reply names: the only permitted action
+    /// is the scoped `read_file` call; a reply without one leaves the
+    /// task waiting on its intent.
+    fn read_target_from_reply(
+        &mut self,
+        task_id: &TaskId,
+        reply: crate::providers::ProviderReply,
+        retained_attempt_id: Option<String>,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
         let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
             self.owner.store.mark_no_ready(task_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
@@ -398,7 +545,7 @@ impl Runtime {
         Ok(Ok((
             self.scope_root
                 .join(call.path.as_deref().unwrap_or_default()),
-            Some(manifest.attempt_id),
+            retained_attempt_id,
         )))
     }
 

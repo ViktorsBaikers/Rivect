@@ -13,6 +13,13 @@
 //! carries purpose, effective assignment/source, admission and exactly
 //! one accounting record per physical request through the real offline
 //! loopback (EDGE-005, PROH-003, AC-041/044).
+//! SLICE-014 legs — `FallbackAssign::{Auto,Manual,Off}` carry runtime
+//! semantics on the one broker: the auto chain walks only candidates
+//! passing the current eligibility check, manual records a pending
+//! choice that rides the existing question protocol, off never
+//! substitutes, a confirmed effect is never replayed, adapter retries
+//! spend the shared outer cap, and a cancelled attempt is never
+//! resurrected by a retry or a late callback (AC-045/045b, EDGE-004).
 
 #![allow(
     clippy::unwrap_used,
@@ -27,10 +34,15 @@
 use rivect::config::{
     Config, ConfigIssue, ConnKind, EffortAssign, EffortLevel, FixedModel, ModelAssign, Stage,
 };
-use rivect::contracts::MODEL_WIRE_MAX_BYTES;
-use rivect::model::{Broker, ModelError, RequestManifest};
+use rivect::contracts::{MODEL_WIRE_MAX_BYTES, Question};
+use rivect::model::{Broker, CandidateRejection, ModelError, RejectionCause, RequestManifest};
 use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
+use serde_json::json;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod support;
 
 fn local_config(model_id: &str, effort_toml: &str) -> String {
     format!(
@@ -49,6 +61,17 @@ fn local_config(model_id: &str, effort_toml: &str) -> String {
 struct RecordingProvider {
     inner: LoopbackProvider,
     sent: Arc<Mutex<Vec<RequestManifest>>>,
+    script: Arc<Mutex<VecDeque<Respond>>>,
+    inner_attempts: Arc<AtomicU64>,
+    inner_retries: u32,
+}
+
+/// One scripted send outcome. The adapter's own retries run inside the
+/// one physical send — an inner cost the request's shared outer cap
+/// already pays for — so they are observable but never a second send.
+enum Respond {
+    Delegate,
+    Fail(ProviderError),
 }
 
 impl Provider for RecordingProvider {
@@ -57,21 +80,70 @@ impl Provider for RecordingProvider {
     }
 
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        for _ in 0..self.inner_retries {
+            self.inner_attempts.fetch_add(1, Ordering::SeqCst);
+        }
         self.sent
             .lock()
             .expect("wire log lock")
             .push(manifest.clone());
-        self.inner.send(manifest)
+        let respond = self
+            .script
+            .lock()
+            .expect("script lock")
+            .pop_front()
+            .unwrap_or(Respond::Delegate);
+        match respond {
+            Respond::Fail(error) => Err(error),
+            Respond::Delegate => self.inner.send(manifest),
+        }
     }
 }
 
 fn recording_broker() -> (Broker, Arc<Mutex<Vec<RequestManifest>>>) {
+    let (broker, sent, _) = scripted_broker(Vec::new(), 0);
+    (broker, sent)
+}
+
+fn scripted_broker(
+    script: Vec<Respond>,
+    inner_retries: u32,
+) -> (Broker, Arc<Mutex<Vec<RequestManifest>>>, Arc<AtomicU64>) {
     let sent = Arc::new(Mutex::new(Vec::new()));
+    let inner_attempts = Arc::new(AtomicU64::new(0));
     let provider = RecordingProvider {
         inner: LoopbackProvider::new(),
         sent: sent.clone(),
+        script: Arc::new(Mutex::new(script.into())),
+        inner_attempts: inner_attempts.clone(),
+        inner_retries,
     };
-    (Broker::new(Box::new(provider)), sent)
+    (Broker::new(Box::new(provider)), sent, inner_attempts)
+}
+
+/// Fallback corpus: six connections so the auto chain can express an
+/// egress-denied candidate (`web`), an account-denied one (`denied`), a
+/// purpose-shadowed one (`shadowed`), a removed one (`gone`), and the
+/// admitted reserve. `purpose_toml` carries the relay purpose's
+/// `fallback`/`eligible` lines.
+fn fallback_config(purpose_toml: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
+         [connections.web]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"keyring:web\"\n\
+         [connections.denied]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11436\"\n\
+         [connections.shadowed]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11437\"\n\
+         [connections.gone]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11438\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n\
+         [models.purposes.relay]\n\
+         model = {{ mode = \"fixed\", connection = \"local\", model_id = \"primary-pin\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         {purpose_toml}"
+    )
 }
 
 /// Everything the provider sees before the inputs separator: the
@@ -740,4 +812,1302 @@ fn every_purpose_carries_admission_and_single_accounting() {
         "nine purposes plus one pending manifest — the forged and duplicate replays added none"
     );
     assert_eq!(broker.accounted_requests(), expected.len() + 1);
+}
+
+// --- SLICE-014 legs ---------------------------------------------------
+
+/// AC-045: `mode = "auto"` walks only chain entries passing the CURRENT
+/// eligibility check — a candidate that fails it never receives the
+/// request — and the admitted reserve's physical send freezes the
+/// primary's task data byte-for-byte under its own attempt id, model
+/// pin and shared reservation.
+#[test]
+fn fallback_auto_walks_only_admitted_chain_entries_preserving_primary_pins_and_spend() {
+    let config = Config::parse_validated(&fallback_config(
+        "fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"web\", model_id = \"web-model\" }, \
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/fallback", "goal: relay")
+        .expect("manifest");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "local" && fixed.model_id == "primary-pin"),
+        "the primary pin is the fixed purpose assignment"
+    );
+
+    let reply = broker
+        .dispatch("/world/fallback", &manifest)
+        .expect("the admitted reserve answers the fallback");
+    assert!(!reply.text.is_empty());
+
+    let reserve_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(
+            sent.len(),
+            2,
+            "the egress-ineligible chain head never received a send"
+        );
+        let (primary, reserve) = (&sent[0], &sent[1]);
+        assert_eq!(
+            primary, &manifest,
+            "the primary send is exactly the frozen manifest"
+        );
+        // pins and spend preserved: the fallback request carries the
+        // primary's task data byte-for-byte under its own attempt id
+        // and its own fixed model
+        assert_ne!(reserve.attempt_id, primary.attempt_id);
+        assert_eq!(
+            reserve.model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "reserve-model".to_string(),
+            })
+        );
+        assert_eq!(reserve.purpose, primary.purpose);
+        assert_eq!(reserve.world, primary.world);
+        assert_eq!(reserve.effort, primary.effort);
+        assert_eq!(reserve.instructions, primary.instructions);
+        assert_eq!(reserve.tools, primary.tools);
+        assert_eq!(reserve.output_reserve, primary.output_reserve);
+        assert_eq!(reserve.inputs, primary.inputs);
+        assert_eq!(reserve.inputs_digest, primary.inputs_digest);
+        assert_eq!(reserve.cost_bound, primary.cost_bound);
+        assert_eq!(
+            reserve.mutation_reason.as_deref(),
+            Some("model switch"),
+            "a model change opens the new epoch — never a silent rewrite"
+        );
+        let attempt = reserve.attempt_id.clone();
+        drop(sent);
+        attempt
+    };
+    // accounting: exactly one charged physical request, naming the
+    // reserve; the failed primary send spent nothing
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&reserve_attempt)
+        .expect("the reserve send is accounted");
+    assert_eq!(record.connection, "reserve");
+    assert_eq!(record.cost_bound, manifest.cost_bound);
+    assert!(
+        broker.accounting_record(&manifest.attempt_id).is_none(),
+        "a failed primary send spends nothing"
+    );
+    // both admissions are spent: neither can replay
+    assert!(broker.admission(&manifest.attempt_id).is_none());
+    assert!(broker.admission(&reserve_attempt).is_none());
+}
+
+/// AC-045/DEC-014: `mode = "manual"` rides the production question
+/// path — the runtime consumes the broker's pending choice into a
+/// served `question.current`, the task waits on it, and no substitute
+/// dispatches on its own. The answered candidate then sends the frozen
+/// manifest's task data through the picked connection under the
+/// substitute's own attempt id, and the paused primary's admission is
+/// spent with it.
+#[test]
+fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-fallback",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(rivect::executor::macos::MacosReadWorker),
+    );
+    // the same scoped world the first-task loop drives
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-boot");
+    let task = world.create_task(&session, "manual-choice");
+    let question = world.publish(&session, &task);
+    // the fixture answer runs the step: the primary send fails, the
+    // manual fallback publishes its own question, the task waits
+    let answered = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "manual-first",
+        &task,
+        &question,
+        "steps",
+        json!(4101),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+
+    // the pending choice rides question.current itself — the test never
+    // publishes it by hand
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4102),
+    ));
+    let served = current["result"]["question"].clone();
+    assert_eq!(served["task_id"].as_str(), Some(task.0.as_str()));
+    let option_ids: Vec<&str> = served["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .filter_map(|option| option["option_id"].as_str())
+        .collect();
+    assert_eq!(
+        option_ids,
+        ["denied", "gone", "reserve", "shadowed"],
+        "eligible candidates minus the failed primary"
+    );
+    let served_question: Question = serde_json::from_value(served).expect("served question parses");
+
+    // a repeated read serves the same pending question — reading never
+    // consumes or mutates the pause
+    let reread = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4104),
+    ));
+    assert_eq!(
+        reread["result"]["question"]["question_id"].as_str(),
+        Some(served_question.question_id.0.as_str()),
+        "the pending question is stable across reads: {reread}"
+    );
+
+    // no substitute dispatched while the choice was pending: one send,
+    // nothing accounted, the failed attempt stays admitted
+    let paused_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(sent.len(), 1, "manual never dispatches a substitute");
+        sent[0].attempt_id.clone()
+    };
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the failed attempt stays admitted while the choice is pending"
+    );
+
+    // the answered candidate dispatches the frozen manifest's task data
+    // through the picked connection under the substitute's own attempt id
+    let picked = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "manual-pick",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4103),
+    ));
+    assert!(
+        picked.get("error").is_none(),
+        "the pick commits and the step completes: {picked}"
+    );
+    let substitute_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(sent.len(), 2, "the picked candidate sends once");
+        let substitute = &sent[1];
+        assert_ne!(
+            substitute.attempt_id, paused_attempt,
+            "the substitute carries its own attempt id"
+        );
+        assert_eq!(
+            substitute.model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "primary-pin".to_string(),
+            }),
+            "the pinned model survives the substitution on the picked connection"
+        );
+        assert_eq!(
+            substitute.inputs, sent[0].inputs,
+            "the frozen task data crosses byte-for-byte"
+        );
+        substitute.attempt_id.clone()
+    };
+    // exactly one physical request accounted, naming the picked
+    // connection — the failed primary send spent nothing and neither
+    // attempt id can replay
+    assert_eq!(world.runtime.broker.accounted_requests(), 1);
+    let record = world
+        .runtime
+        .broker
+        .accounting_record(&substitute_attempt)
+        .expect("the substitute send is accounted");
+    assert_eq!(record.connection, "reserve");
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the paused admission is spent with the substitute"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the answered pause is consumed"
+    );
+
+    // a replayed answer is refused typed — the completed task is
+    // terminal, the spent question never dispatches a second
+    // substitute, and nothing accounts twice
+    let replay = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "manual-replay",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4105),
+    ));
+    assert_eq!(
+        replay["error"]["data"]["code"].as_str(),
+        Some("already_terminal"),
+        "the replayed answer is refused typed: {replay}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        2,
+        "the replay added no send"
+    );
+    assert_eq!(world.runtime.broker.accounted_requests(), 1);
+}
+
+/// AC-045b: a manual pick is re-checked against the CURRENT eligibility
+/// state — a candidate that lost its account rights between the question
+/// and the answer is refused typed and never receives the send; the
+/// paused attempt stays admitted so a cancel still tombstones it.
+#[test]
+fn fallback_manual_choice_recheck_blocks_a_candidate_that_lost_eligibility() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-stale-pick",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(rivect::executor::macos::MacosReadWorker),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-stale-boot");
+    let task = world.create_task(&session, "manual-stale-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "stale-first",
+        &task,
+        &question,
+        "steps",
+        json!(4201),
+    ));
+    assert!(answered.get("error").is_none());
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4202),
+    ));
+    let served_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the pending choice question");
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+
+    // `reserve` loses its account rights after the question is served —
+    // the answer still names it, and the dispatch-time re-check refuses
+    // the pick typed: the send never happens
+    world.runtime.broker.set_account_rights(&[
+        "local".to_string(),
+        "denied".to_string(),
+        "gone".to_string(),
+        "shadowed".to_string(),
+        "web".to_string(),
+    ]);
+    let picked = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "stale-pick",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4203),
+    ));
+    assert_eq!(
+        picked["error"]["data"]["code"].as_str(),
+        Some("capability_unavailable"),
+        "the rejected pick is a typed capability refusal: {picked}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the ineligible pick never received a send"
+    );
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the paused attempt stays admitted after the refused pick"
+    );
+
+    // and the surviving pause still tombstones on cancel
+    let intent_revision = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&task)
+        .expect("snapshot")
+        .intent_revision;
+    let cancelled = world.dispatch(
+        &json!({
+            "jsonrpc": "2.0", "id": 4204, "method": "task.submit",
+            "params": {
+                "schema_version": 1, "command_id": "stale-cancel",
+                "session_id": session.0, "kind": "cancel", "task_id": task.0,
+                "expected_intent_revision": intent_revision
+            }
+        })
+        .to_string(),
+    );
+    assert!(
+        cancelled.get("error").is_none(),
+        "cancel commits: {cancelled}"
+    );
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the cancel tombstoned the paused attempt"
+    );
+}
+
+/// EDGE-004 through the production path: a task cancelled while waiting
+/// on a manual-fallback choice tombstones its broker attempt — a late
+/// dispatch of the frozen manifest is refused, never resurrected — and
+/// a task with no outstanding attempt cancels without a tombstone.
+#[test]
+fn task_cancel_tombstones_the_paused_broker_attempt() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-cancel",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(rivect::executor::macos::MacosReadWorker),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-cancel-boot");
+    let task = world.create_task(&session, "manual-cancel-choice");
+    let question = world.publish(&session, &task);
+    world.dispatch(&support::corpus_answer_option(
+        &session,
+        "cancel-first",
+        &task,
+        &question,
+        "steps",
+        json!(4301),
+    ));
+    let manifest = sent.lock().expect("wire log lock")[0].clone();
+    assert!(
+        world
+            .runtime
+            .broker
+            .admission(&manifest.attempt_id)
+            .is_some(),
+        "the choice-pending attempt is still admitted"
+    );
+
+    let intent_revision = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&task)
+        .expect("snapshot")
+        .intent_revision;
+    let cancelled = world.dispatch(
+        &json!({
+            "jsonrpc": "2.0", "id": 4302, "method": "task.submit",
+            "params": {
+                "schema_version": 1, "command_id": "cancel-waiting",
+                "session_id": session.0, "kind": "cancel", "task_id": task.0,
+                "expected_intent_revision": intent_revision
+            }
+        })
+        .to_string(),
+    );
+    assert!(
+        cancelled.get("error").is_none(),
+        "cancel commits: {cancelled}"
+    );
+    assert!(
+        world
+            .runtime
+            .broker
+            .admission(&manifest.attempt_id)
+            .is_none(),
+        "the cancelled task's broker attempt is tombstoned"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause record is consumed with the tombstone"
+    );
+    let late = world
+        .runtime
+        .broker
+        .dispatch(&manifest.world.clone(), &manifest)
+        .expect_err("a late dispatch of the cancelled attempt is refused");
+    assert!(
+        matches!(&late, ModelError::AttemptCancelled { attempt_id }
+            if attempt_id == &manifest.attempt_id),
+        "wrong rejection: {late}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the cancelled attempt never dispatched again"
+    );
+
+    // a task that never ran a dispatch holds no pause record: cancel
+    // commits without tombstoning anything
+    let idle_task = world.create_task(&session, "cancel-idle");
+    let idle_revision = world
+        .runtime
+        .owner
+        .store
+        .snapshot(&idle_task)
+        .expect("snapshot")
+        .intent_revision;
+    let idle = world.dispatch(
+        &json!({
+            "jsonrpc": "2.0", "id": 4303, "method": "task.submit",
+            "params": {
+                "schema_version": 1, "command_id": "cancel-idle",
+                "session_id": session.0, "kind": "cancel", "task_id": idle_task.0,
+                "expected_intent_revision": idle_revision
+            }
+        })
+        .to_string(),
+    );
+    assert!(
+        idle.get("error").is_none(),
+        "a task with no outstanding attempt cancels clean: {idle}"
+    );
+}
+
+/// AC-045: `mode = "off"` never substitutes — the provider's own error
+/// surfaces typed, the task stays paused on its admission, and an
+/// operator retry of the same frozen manifest resumes the intent.
+#[test]
+fn fallback_off_never_substitutes_and_leaves_the_task_paused() {
+    let config =
+        Config::parse_validated(&fallback_config("fallback = { mode = \"off\" }")).expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/off", "goal: off")
+        .expect("manifest");
+    let error = broker
+        .dispatch("/world/off", &manifest)
+        .expect_err("off never substitutes");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::UnknownConnection)
+        ),
+        "off reports the provider's own error: {error}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "no substitute was sent"
+    );
+    assert!(broker.pending_choice(&manifest.attempt_id).is_none());
+    assert_eq!(broker.accounted_requests(), 0, "nothing spent");
+    assert!(
+        broker.admission(&manifest.attempt_id).is_some(),
+        "the task stays paused on its admission — the intent survives for a retry"
+    );
+
+    // the paused attempt retries the same frozen manifest
+    let reply = broker
+        .dispatch("/world/off", &manifest)
+        .expect("the paused attempt retries the same manifest");
+    assert!(!reply.text.is_empty());
+    assert_eq!(sent.lock().expect("wire log lock").len(), 2);
+    assert_eq!(broker.accounted_requests(), 1);
+}
+
+/// AC-045b: every rejection cause is honored at send time — a candidate
+/// that fails the current eligibility check never receives the request,
+/// even when it passed at prepare. The check reads the broker's CURRENT
+/// view: a connection removed after prepare rejects as unknown.
+#[test]
+fn fallback_candidate_failing_eligibility_or_egress_never_receives_the_request() {
+    let mut config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\", \"denied\", \"web\", \"gone\", \"vanishing\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"gone\", model_id = \"gone-model\" }, \
+             { mode = \"fixed\", connection = \"web\", model_id = \"web-model\" }, \
+             { mode = \"fixed\", connection = \"denied\", model_id = \"denied-model\" }, \
+             { mode = \"fixed\", connection = \"shadowed\", model_id = \"shadowed-model\" }, \
+             { mode = \"fixed\", connection = \"vanishing\", model_id = \"vanishing-model\" }, \
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }\n\
+         [connections.vanishing]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11439\"",
+    ))
+    .expect("valid");
+    // `gone` was declared so the chain validates, but the retained
+    // config never admitted it — the current check rejects it
+    config.connections.remove("gone");
+
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    // account rights deny `denied`; every other declared connection is
+    // entitled
+    broker.set_account_rights(&[
+        "local".to_string(),
+        "reserve".to_string(),
+        "web".to_string(),
+        "gone".to_string(),
+        "shadowed".to_string(),
+        "vanishing".to_string(),
+    ]);
+    let manifest = broker
+        .prepare("relay", &config, "/world/eligible", "goal: eligibility")
+        .expect("manifest");
+    // the current check is live: `vanishing` passes at prepare, then
+    // the config edit removes it before dispatch
+    let mut edited = config.clone();
+    edited.connections.remove("vanishing");
+    broker.set_config(&edited);
+
+    broker
+        .dispatch("/world/eligible", &manifest)
+        .expect("the admitted reserve answers after every rejection");
+
+    let sent = sent.lock().expect("wire log lock");
+    assert_eq!(
+        sent.len(),
+        2,
+        "only the primary and the admitted reserve were sent"
+    );
+    assert_eq!(sent[0], manifest);
+    assert_eq!(
+        sent[1].model,
+        ModelAssign::Fixed(FixedModel {
+            connection: "reserve".to_string(),
+            model_id: "reserve-model".to_string(),
+        }),
+        "every ineligible candidate was skipped without a send"
+    );
+}
+
+/// EDGE-004 + AC-045: an adapter's inner retries ride inside the one
+/// physical send — the shared outer cap is spent once — and a cancelled
+/// attempt is never resurrected by a retry or a late callback.
+#[test]
+fn adapter_inner_retries_spend_the_shared_outer_cap_and_never_resurrect_a_cancelled_attempt() {
+    let config = Config::parse_validated(&fallback_config(
+        "fallback = { mode = \"auto\", chain = [] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, inner_attempts) = scripted_broker(vec![Respond::Delegate], 3);
+    let manifest = broker
+        .prepare("relay", &config, "/world/retry", "goal: shared cap")
+        .expect("manifest");
+    broker
+        .dispatch("/world/retry", &manifest)
+        .expect("dispatch");
+    assert_eq!(
+        inner_attempts.load(Ordering::SeqCst),
+        3,
+        "the adapter's three inner tries rode inside one physical send"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "inner retries never mint a second physical send"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the shared outer cap is spent once, not once per inner try"
+    );
+
+    // a cancelled attempt is never resurrected by a late callback
+    let doomed = broker
+        .prepare("relay", &config, "/world/retry", "goal: cancelled")
+        .expect("manifest");
+    assert!(broker.cancel_attempt(&doomed.attempt_id));
+    let late = broker
+        .dispatch("/world/retry", &doomed)
+        .expect_err("a cancelled attempt never re-dispatches");
+    assert!(
+        matches!(&late, ModelError::AttemptCancelled { attempt_id }
+            if attempt_id == &doomed.attempt_id),
+        "wrong rejection: {late}"
+    );
+    let again = broker
+        .dispatch("/world/retry", &doomed)
+        .expect_err("the cancellation stays authoritative");
+    assert!(
+        matches!(&again, ModelError::AttemptCancelled { .. }),
+        "wrong rejection: {again}"
+    );
+    assert_eq!(sent.lock().expect("wire log lock").len(), 1);
+    assert_eq!(
+        inner_attempts.load(Ordering::SeqCst),
+        3,
+        "the cancelled callback ran no inner retries"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+}
+
+/// EDGE-004: cancellation is authoritative before any send, clears a
+/// pending manual choice, and stays distinct from a spent attempt.
+#[test]
+fn cancel_then_late_provider_callback_produces_no_new_dispatch_or_effect() {
+    let config = Config::parse_validated(&fallback_config("fallback = { mode = \"manual\" }"))
+        .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+
+    // cancel before any send: the admission dies, nothing dispatches
+    let manifest = broker
+        .prepare("relay", &config, "/world/cancel", "goal: pre-send cancel")
+        .expect("manifest");
+    assert!(broker.cancel_attempt(&manifest.attempt_id));
+    let late = broker
+        .dispatch("/world/cancel", &manifest)
+        .expect_err("a cancelled attempt never dispatches");
+    assert!(
+        matches!(&late, ModelError::AttemptCancelled { attempt_id }
+            if attempt_id == &manifest.attempt_id),
+        "wrong rejection: {late}"
+    );
+    assert!(sent.lock().expect("wire log lock").is_empty());
+    assert_eq!(broker.accounted_requests(), 0);
+    assert!(broker.admission(&manifest.attempt_id).is_none());
+
+    // a failed manual attempt records a pending choice; cancelling the
+    // attempt clears it — a late human answer never dispatches
+    let manual = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/cancel",
+            "goal: pending choice cancel",
+        )
+        .expect("manifest");
+    let pending_error = broker
+        .dispatch("/world/cancel", &manual)
+        .expect_err("manual records the choice");
+    assert!(matches!(
+        &pending_error,
+        ModelError::ManualFallbackPending { .. }
+    ));
+    assert!(broker.pending_choice(&manual.attempt_id).is_some());
+    assert!(broker.cancel_attempt(&manual.attempt_id));
+    assert!(
+        broker.pending_choice(&manual.attempt_id).is_none(),
+        "the pending choice dies with its attempt"
+    );
+    assert_eq!(sent.lock().expect("wire log lock").len(), 1);
+
+    // a completed attempt answers spent, never cancelled
+    let done = broker
+        .prepare("relay", &config, "/world/cancel", "goal: done")
+        .expect("manifest");
+    broker.dispatch("/world/cancel", &done).expect("dispatch");
+    assert!(
+        !broker.cancel_attempt(&done.attempt_id),
+        "a spent attempt is not cancelled"
+    );
+    let replay = broker
+        .dispatch("/world/cancel", &done)
+        .expect_err("the spent attempt reports spent, not cancelled");
+    assert!(
+        matches!(&replay, ModelError::AttemptAlreadyAccounted { attempt_id }
+            if attempt_id == &done.attempt_id),
+        "wrong rejection: {replay}"
+    );
+}
+
+/// AC-045: an auto chain whose every entry fails pauses honestly — the
+/// typed rejection names each skipped candidate with its cause, in chain
+/// order: catalogue removal, the offline live-grant rule, the account
+/// entitlement, the per-purpose eligible list, and a candidate that
+/// passed the re-check but failed its own send. The intent stays
+/// admitted for a retry, and nothing was spent on the rejected entries.
+#[test]
+fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_preserved() {
+    let mut config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"gone\", \"web\", \"denied\", \"reserve\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"gone\", model_id = \"gone-model\" }, \
+             { mode = \"fixed\", connection = \"web\", model_id = \"web-model\" }, \
+             { mode = \"fixed\", connection = \"denied\", model_id = \"denied-model\" }, \
+             { mode = \"fixed\", connection = \"shadowed\", model_id = \"shadowed-model\" }, \
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    // `gone` was declared so the chain validates, then removed — the
+    // current check reports it unknown
+    config.connections.remove("gone");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    // every declared connection holds rights except `denied`
+    broker.set_account_rights(&[
+        "local".to_string(),
+        "gone".to_string(),
+        "web".to_string(),
+        "shadowed".to_string(),
+        "reserve".to_string(),
+    ]);
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/exhausted",
+            "goal: exhausted chain",
+        )
+        .expect("manifest");
+    let error = broker
+        .dispatch("/world/exhausted", &manifest)
+        .expect_err("the exhausted chain pauses instead of dispatching");
+    // the rejection vector is exact: every skipped entry in chain order
+    // with its typed cause — only `reserve` ever reached a send
+    assert!(
+        matches!(&error, ModelError::FallbackExhausted {
+            attempt_id, purpose, rejected, attempted, ..
+        } if attempt_id == &manifest.attempt_id
+            && purpose == "relay"
+            && attempted == &vec!["reserve".to_string()]
+            && rejected == &vec![
+                CandidateRejection {
+                    connection: "gone".to_string(),
+                    cause: RejectionCause::UnknownConnection,
+                },
+                CandidateRejection {
+                    connection: "web".to_string(),
+                    cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
+                },
+                CandidateRejection {
+                    connection: "denied".to_string(),
+                    cause: RejectionCause::NotEntitled,
+                },
+                CandidateRejection {
+                    connection: "shadowed".to_string(),
+                    cause: RejectionCause::NotPurposeEligible,
+                },
+                CandidateRejection {
+                    connection: "reserve".to_string(),
+                    cause: RejectionCause::SendFailed(ProviderError::UnknownConnection),
+                },
+            ]),
+        "wrong rejection: {error}"
+    );
+    // the typed provider cause stays on the error chain
+    let source =
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<ProviderError>());
+    assert!(
+        matches!(source, Some(ProviderError::UnknownConnection)),
+        "the primary provider error stays typed on the error chain"
+    );
+
+    // intent, effects and budget preserved: the paused attempt stays
+    // admitted, only the attempted reserve ever sent — and failed —
+    // nothing is accounted
+    assert!(broker.admission(&manifest.attempt_id).is_some());
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        2,
+        "the primary and the one admitted substitute — nothing else sent"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    assert!(broker.pending_choice(&manifest.attempt_id).is_none());
+
+    // an operator retry resumes the same frozen intent
+    broker
+        .dispatch("/world/exhausted", &manifest)
+        .expect("the paused attempt retries the same manifest");
+    assert_eq!(sent.lock().expect("wire log lock").len(), 3);
+    assert_eq!(broker.accounted_requests(), 1);
+}
+
+/// AC-045: a candidate that passes the re-check but fails its own send
+/// is recorded `SendFailed` and the walk continues in chain order — the
+/// later admitted entry answers, the skipped entry never received a
+/// send, and every admission returns to the baseline count.
+#[test]
+fn send_failure_walks_the_admitted_chain_in_order() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\", \"denied\", \"shadowed\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"denied\", model_id = \"denied-model\" }, \
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }, \
+             { mode = \"fixed\", connection = \"shadowed\", model_id = \"shadowed-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            // the primary send fails, then reserve's admitted substitute
+            // fails its own send — the walk continues to shadowed
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    // `denied` holds no account rights: the walk skips it before any send
+    broker.set_account_rights(&[
+        "local".to_string(),
+        "reserve".to_string(),
+        "shadowed".to_string(),
+    ]);
+    let manifest = broker
+        .prepare("relay", &config, "/world/walk", "goal: walk")
+        .expect("manifest");
+    assert_eq!(broker.admitted_attempts(), 1, "the prepare admits one");
+    let reply = broker
+        .dispatch("/world/walk", &manifest)
+        .expect("the walk answers through shadowed");
+    assert!(!reply.text.is_empty());
+
+    let shadowed_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(
+            sent.len(),
+            3,
+            "primary, reserve substitute, shadowed substitute — denied never sent"
+        );
+        assert_eq!(&sent[0], &manifest);
+        assert_eq!(
+            sent[1].model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "reserve-model".to_string(),
+            })
+        );
+        assert_eq!(
+            sent[2].model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "shadowed".to_string(),
+                model_id: "shadowed-model".to_string(),
+            })
+        );
+        assert_eq!(sent[1].inputs, sent[0].inputs);
+        assert_eq!(sent[2].inputs, sent[0].inputs);
+        assert_ne!(sent[1].attempt_id, sent[0].attempt_id);
+        assert_ne!(sent[2].attempt_id, sent[1].attempt_id);
+        sent[2].attempt_id.clone()
+    };
+    assert_eq!(broker.accounted_requests(), 1);
+    assert_eq!(
+        broker
+            .accounting_record(&shadowed_attempt)
+            .expect("the shadowed send is accounted")
+            .connection,
+        "shadowed"
+    );
+    assert_eq!(
+        broker.admitted_attempts(),
+        0,
+        "every admission returns to baseline — the failed substitute left none"
+    );
+}
+
+/// AC-061 adjacency: a failed send never mints an epoch — the
+/// substitute's provisional mint rolls back, so a re-prepare of the same
+/// prefix replays the epoch instead of reporting a phantom model switch.
+#[test]
+fn failed_send_leaves_no_phantom_epoch() {
+    let config = Config::parse_validated(&fallback_config(
+        "fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, _sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection),
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/epoch", "goal: epoch")
+        .expect("manifest");
+    let error = broker
+        .dispatch("/world/epoch", &manifest)
+        .expect_err("the single-entry chain exhausts");
+    assert!(
+        matches!(&error, ModelError::FallbackExhausted {
+            rejected, attempted, ..
+        } if attempted == &vec!["reserve".to_string()]
+            && rejected == &vec![CandidateRejection {
+                connection: "reserve".to_string(),
+                cause: RejectionCause::SendFailed(ProviderError::UnknownConnection),
+            }]),
+        "wrong rejection: {error}"
+    );
+
+    // the failed substitute's provisional epoch mint rolled back: a
+    // re-prepare of the same prefix replays the epoch bytewise — no
+    // phantom "model switch" is reported for a send that never landed
+    let replay = broker
+        .prepare("relay", &config, "/world/epoch", "goal: epoch")
+        .expect("re-prepare");
+    assert!(
+        replay.mutation_reason.is_none(),
+        "no phantom mutation: {:?}",
+        replay.mutation_reason
+    );
+    assert_eq!(
+        replay.epoch_id, manifest.epoch_id,
+        "the epoch replays bytewise for the unchanged prefix"
+    );
+    assert!(
+        broker.admission(&manifest.attempt_id).is_some(),
+        "the failed primary stays admitted for a retry"
+    );
+    assert_eq!(
+        broker.admitted_attempts(),
+        2,
+        "primary and replay prepare — the dead substitute left none"
+    );
+}
+
+/// AC-045/AC-061 through the manual path: the broker-side pause pin —
+/// not the frozen `Manual` flag alone — gates a substitute dispatch,
+/// the pick is confined to the candidates the recorded pause served,
+/// and a substitute whose send fails rolls its provisional epoch mint
+/// back exactly like the auto walk's: the re-prepare replays the epoch,
+/// the dead substitute leaves no admission, and the paused primary
+/// stays admitted for the retry that still lands.
+#[test]
+fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
+    let config = Config::parse_validated(&fallback_config("fallback = { mode = \"manual\" }"))
+        .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            // the primary send fails into the pause, the picked
+            // substitute's own send fails, the retried pick lands
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/manual-epoch", "goal: epoch")
+        .expect("manifest");
+
+    // the pause pin is the gate: a Manual admission that never paused
+    // refuses the substitute dispatch typed — the flag alone authorizes
+    // nothing
+    let premature = broker
+        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .expect_err("an un-paused Manual admission has no substitute path");
+    assert!(
+        matches!(&premature, ModelError::NoPendingChoice { .. }),
+        "wrong rejection: {premature}"
+    );
+
+    let error = broker
+        .dispatch("/world/manual-epoch", &manifest)
+        .expect_err("manual records the pending choice");
+    assert!(matches!(&error, ModelError::ManualFallbackPending { .. }));
+    // the publish path consumes the pending choice — the surviving pin
+    // is what still authorizes the human's pick afterwards
+    let pending = broker
+        .take_pending_choice(&manifest.attempt_id)
+        .expect("the recorded pending choice");
+    assert!(pending.candidates.contains(&"reserve".to_string()));
+
+    // the pick is confined to the served set: the just-failed primary
+    // is never on it, even while it still passes the live check
+    let off_menu = broker
+        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "local")
+        .expect_err("the failed primary was never served");
+    assert!(
+        matches!(
+            &off_menu,
+            ModelError::ManualChoiceRejected {
+                cause: RejectionCause::NotOffered,
+                ..
+            }
+        ),
+        "wrong rejection: {off_menu}"
+    );
+
+    let picked = broker
+        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .expect_err("the substitute's send fails");
+    assert!(
+        matches!(
+            &picked,
+            ModelError::Provider(ProviderError::UnknownConnection)
+        ),
+        "wrong rejection: {picked}"
+    );
+    assert_eq!(sent.lock().expect("wire log lock").len(), 2);
+
+    // the failed substitute's provisional epoch mint rolled back: a
+    // re-prepare of the same prefix replays the epoch bytewise — no
+    // phantom "model switch" is reported for a send that never landed
+    let replay = broker
+        .prepare("relay", &config, "/world/manual-epoch", "goal: epoch")
+        .expect("re-prepare")
+        .clone();
+    assert!(
+        replay.mutation_reason.is_none(),
+        "no phantom mutation: {:?}",
+        replay.mutation_reason
+    );
+    assert_eq!(
+        replay.epoch_id, manifest.epoch_id,
+        "the epoch replays bytewise for the unchanged prefix"
+    );
+    assert!(
+        broker.admission(&manifest.attempt_id).is_some(),
+        "the paused primary stays admitted for a retry"
+    );
+    assert_eq!(
+        broker.admitted_attempts(),
+        2,
+        "primary and replay prepare — the dead substitute left none"
+    );
+
+    // the pause survives a failed substitute: the re-pick lands, the
+    // consumed pause clears exactly once, and a later answer is refused
+    // typed — the spent primary's id never replays either
+    broker
+        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .expect("the retried pick dispatches the substitute");
+    let refused = broker
+        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .expect_err("the consumed pause refuses a second substitute");
+    assert!(
+        matches!(&refused, ModelError::NoAdmission { .. }),
+        "wrong rejection: {refused}"
+    );
+}
+
+/// AC-045b: the dispatch-time re-check view refreshes only on a
+/// successful prepare — a prepare that fails purpose resolution must not
+/// steer the retained view with its caller-supplied config.
+#[test]
+fn a_failed_prepare_never_rewrites_the_dispatch_recheck_view() {
+    let config = Config::parse_validated(&fallback_config("fallback = { mode = \"manual\" }"))
+        .expect("valid");
+    let (mut broker, _sent, _inner) =
+        scripted_broker(vec![Respond::Fail(ProviderError::UnknownConnection)], 0);
+    let manifest = broker
+        .prepare("relay", &config, "/world/view", "goal: view")
+        .expect("manifest");
+    // a prepare whose purpose cannot resolve fails — the retained view
+    // must stay the one this successful prepare observed, not the empty
+    // caller config the failure carried
+    let failed = broker.prepare("relay", &Config::default(), "/world/view", "goal: x");
+    assert!(
+        matches!(failed, Err(ModelError::Config(_))),
+        "a purpose with no defaults fails typed: {failed:?}"
+    );
+    let error = broker
+        .dispatch("/world/view", &manifest)
+        .expect_err("manual pauses on the failed send");
+    assert!(matches!(&error, ModelError::ManualFallbackPending { .. }));
+    let pending = broker
+        .take_pending_choice(&manifest.attempt_id)
+        .expect("the pending choice");
+    assert_eq!(
+        pending.candidates,
+        vec![
+            "denied".to_string(),
+            "gone".to_string(),
+            "reserve".to_string(),
+            "shadowed".to_string(),
+        ],
+        "the retained view still names the real catalogue — the failed \
+         prepare's empty config never reached it"
+    );
+}
+
+/// A broken stream after a confirmed tool effect never replays that
+/// effect: the spent attempt rejects the re-send outright, and the
+/// fallback continuation is a real loopback answer under the
+/// substitute's own attempt — the same frozen inputs re-request the
+/// read legitimately while neither spent attempt id can dispatch again.
+#[test]
+fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
+    let config = Config::parse_validated(&fallback_config(
+        "fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            // attempt A confirms its tool effect through the loopback
+            Respond::Delegate,
+            // attempt B's stream breaks on the primary send
+            Respond::Fail(ProviderError::UnknownConnection),
+            // the reserve continues the broken stream through the real
+            // loopback — nothing about the reply is preconstructed
+            Respond::Delegate,
+        ],
+        0,
+    );
+    let first = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/stream",
+            "goal: fixture\nread /scope/allowed.txt",
+        )
+        .expect("manifest A");
+    let confirmed = broker
+        .dispatch("/world/stream", &first)
+        .expect("the first dispatch confirms its tool effect");
+    assert_eq!(
+        confirmed.tool_calls.len(),
+        1,
+        "the admitted read effect ran"
+    );
+
+    // the stream's re-send of the spent attempt is the replay surface:
+    // it can never re-run the confirmed effect
+    let replay = broker
+        .dispatch("/world/stream", &first)
+        .expect_err("a spent attempt never replays");
+    assert!(
+        matches!(&replay, ModelError::AttemptAlreadyAccounted { attempt_id }
+            if attempt_id == &first.attempt_id),
+        "wrong rejection: {replay}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the replay added no send"
+    );
+
+    // the broken follow-on request falls back — the continuation runs
+    // the real provider seam: the substitute inherits the frozen inputs
+    // byte-for-byte, so the loopback re-derives the read request under
+    // the substitute's OWN attempt — a new decision, not a replay of
+    // attempt A's confirmed send
+    let follow = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/stream",
+            "goal: fixture\nread /scope/allowed.txt",
+        )
+        .expect("manifest B");
+    let continued = broker
+        .dispatch("/world/stream", &follow)
+        .expect("the reserve continues the broken stream");
+    assert_eq!(
+        continued.tool_calls.len(),
+        1,
+        "the continuation re-requests the read under its own attempt"
+    );
+    let substitute_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(
+            sent.len(),
+            3,
+            "the primary of A, the broken primary of B, the reserve substitute"
+        );
+        assert_eq!(&sent[0], &first);
+        assert_eq!(&sent[1], &follow);
+        assert_ne!(sent[2].attempt_id, sent[0].attempt_id);
+        assert_ne!(sent[2].attempt_id, sent[1].attempt_id);
+        assert_eq!(
+            sent[2].inputs, sent[1].inputs,
+            "the substitute carries the frozen task data byte-for-byte"
+        );
+        assert_eq!(
+            sent[2].model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "reserve-model".to_string(),
+            })
+        );
+        sent[2].attempt_id.clone()
+    };
+    assert_eq!(
+        broker.accounted_requests(),
+        2,
+        "attempt A and the reserve substitute — the failed send spent nothing"
+    );
+    assert_eq!(
+        broker
+            .accounting_record(&substitute_attempt)
+            .expect("the substitute send is accounted")
+            .connection,
+        "reserve"
+    );
+    // the continuation's attempt is spent too: replaying it is refused
+    // like every spent attempt — no id ever replays its accounting
+    let substitute_manifest = sent.lock().expect("wire log lock")[2].clone();
+    let again = broker
+        .dispatch("/world/stream", &substitute_manifest)
+        .expect_err("the spent substitute never replays either");
+    assert!(
+        matches!(&again, ModelError::AttemptAlreadyAccounted { attempt_id }
+            if attempt_id == &substitute_attempt),
+        "wrong rejection: {again}"
+    );
 }

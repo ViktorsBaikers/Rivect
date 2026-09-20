@@ -7,7 +7,7 @@ use crate::contracts::{
     AnswerSelection, ErrorCode, OptionId, PAGE_DEFAULT, Page, QuestionId, QuestionResult,
     RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId, TaskId, WireError,
 };
-use crate::model::Broker;
+use crate::model::{Broker, PendingFallback, RequestManifest};
 use crate::owner::{Owner, OwnerError};
 use crate::policy::Policy;
 use crate::providers::Provider;
@@ -17,6 +17,7 @@ use crate::state::StoreError;
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,22 @@ pub struct Runtime {
     /// reports them its own way — headless stderr, TUI transcript — and
     /// receipted rows stay silent.
     pub boot_diagnostics: Vec<String>,
+    /// Tasks paused on a manual-fallback choice (AC-045): the broker
+    /// attempt stays admitted while the served question waits for its
+    /// answer — cancellation tombstones the attempt through this map,
+    /// and the answered candidate dispatches from its frozen manifest.
+    pub paused_attempts: BTreeMap<String, PausedAttempt>,
+}
+
+/// The broker-side pause state of one task waiting on a manual
+/// fallback answer: the frozen manifest whose dispatch paused, plus
+/// the pending choice already consumed for publication — kept so a
+/// later answer can name only a served candidate and a cancel can
+/// still tombstone the attempt.
+#[derive(Debug)]
+pub struct PausedAttempt {
+    pub manifest: RequestManifest,
+    pub choice: Option<PendingFallback>,
 }
 
 impl Runtime {
@@ -140,7 +157,7 @@ impl Runtime {
         })?;
         let supervisor = Supervisor::new(SupervisorPolicy::default())
             .map_err(|source| fail_open(source.into()))?;
-        Ok(Self {
+        let mut runtime = Self {
             owner,
             policy: Policy::default(),
             broker: Broker::new(provider),
@@ -156,7 +173,13 @@ impl Runtime {
             provider_calls: 0,
             read_worker,
             boot_diagnostics,
-        })
+            paused_attempts: BTreeMap::new(),
+        };
+        // The broker's candidate re-check view tracks the effective
+        // config from boot (AC-045b); every admitted config edit
+        // re-pushes it through the same seam.
+        runtime.broker.set_config(&runtime.config_for_broker());
+        Ok(runtime)
     }
 
     /// Grants the single scoped read used by the first-task loop and records
@@ -227,9 +250,45 @@ pub struct StatusResult {
     pub owner_generation: u64,
     pub state: String,
     pub workflow: config::ConfigEntry,
+    /// The pending/active credential-profile pair (AC-047): `active` is
+    /// the profile the latest admitted manifest froze at prepare;
+    /// `pending` is the profile the next dispatch on that connection
+    /// binds under the current config — they diverge only while an
+    /// accepted profile edit waits for the next request.
+    pub profile: ProfileStatus,
     pub tasks: Page<crate::contracts::TaskStatus>,
     pub todo: Page<crate::contracts::TodoItem>,
     pub scheduler: Page<crate::contracts::SchedulerItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileStatus {
+    pub pending: Option<String>,
+    pub active: Option<String>,
+}
+
+/// The pending/active profile pair for the status surface (AC-047):
+/// `active` names the profile the latest admitted manifest froze;
+/// `pending` names the profile the next dispatch on that connection
+/// binds under the current config. With no bound connection both are
+/// absent.
+fn profile_status(rt: &Runtime) -> ProfileStatus {
+    let Some(bound) = rt.broker.bound_profile() else {
+        return ProfileStatus {
+            pending: None,
+            active: None,
+        };
+    };
+    let pending = rt
+        .effective
+        .parsed
+        .as_ref()
+        .and_then(|config| config.connections.get(&bound.connection))
+        .and_then(|connection| connection.profile.clone());
+    ProfileStatus {
+        pending,
+        active: bound.profile,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -305,7 +364,7 @@ enum RequestError {
     KeysNotStrings,
     #[error("duplicate key {key}")]
     DuplicateKey { key: String },
-    #[error("unknown key {key}; known keys: {}", crate::config::WORKFLOW_KEY)]
+    #[error("unknown key {key}; known keys: {}", crate::config::READ_KEY_HINT)]
     InvalidKey { key: String },
     #[error("unknown local command {command}")]
     UnknownLocalCommand { command: String },
@@ -605,6 +664,11 @@ fn admit_config_command(
             return publication_error(id, &err);
         }
     };
+    // The edit is durable and served: the broker's candidate re-check
+    // view moves with the retained document (AC-045b) so the next
+    // dispatch — or an in-flight fallback walk — checks against it.
+    let applied = rt.config_for_broker();
+    rt.broker.set_config(&applied);
     RpcResponse::ok(
         id,
         json!({
@@ -786,6 +850,7 @@ fn handle_method(
                 owner_generation: rt.owner.generation,
                 state: "ready".to_string(),
                 workflow: rt.effective.workflow_entry.clone(),
+                profile: profile_status(rt),
                 tasks,
                 todo,
                 scheduler,
@@ -806,6 +871,7 @@ fn handle_method(
                 return request_error(id, RequestError::EmptyKeys);
             }
             let mut seen = std::collections::BTreeSet::new();
+            let mut validated: Vec<&str> = Vec::with_capacity(keys.len());
             for key in keys {
                 let Some(key) = key.as_str() else {
                     return request_error(id, RequestError::KeysNotStrings);
@@ -818,7 +884,7 @@ fn handle_method(
                         },
                     );
                 }
-                if key != config::WORKFLOW_KEY {
+                if !config::is_readable_key(key) {
                     return request_error(
                         id,
                         RequestError::InvalidKey {
@@ -826,11 +892,47 @@ fn handle_method(
                         },
                     );
                 }
+                validated.push(key);
+            }
+            // One entry per requested key, in request order: the
+            // workflow flag keeps its established entry; the additive
+            // profile keys read from the retained document — an absent
+            // field serves null rather than disappearing. `parsed` is
+            // `None` exactly when no user config file exists, and the
+            // shipped defaults answer those reads.
+            let view = rt.config_for_broker();
+            let revision = rt
+                .effective
+                .parsed
+                .as_ref()
+                .map_or_else(config::shipped_revision, config::Config::revision);
+            let source_kind = if rt.effective.parsed.is_some() {
+                "user"
+            } else {
+                "shipped"
+            };
+            let mut entries = Vec::with_capacity(validated.len());
+            for key in validated {
+                if key == config::WORKFLOW_KEY {
+                    entries.push(rt.effective.workflow_entry.clone());
+                    continue;
+                }
+                entries.push(config::ConfigEntry {
+                    key: key.to_string(),
+                    effective: config::ConfigViewValue::Visible {
+                        value: view.read_value(key).unwrap_or(Value::Null),
+                    },
+                    source: config::ConfigSource {
+                        kind: source_kind.to_string(),
+                        revision: revision.clone(),
+                        target: None,
+                    },
+                });
             }
             let result = ConfigReadResult {
                 schema_version: SCHEMA_VERSION,
                 source_digest: rt.effective.sources_digest.clone(),
-                entries: Page::new(vec![rt.effective.workflow_entry.clone()], 0),
+                entries: Page::new(entries, 0),
             };
             RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
         }
@@ -1267,7 +1369,17 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                             }
                             serialize_answer(id)
                         }
-                        Ok(None) => serialize_answer(id),
+                        Ok(None) => {
+                            // A task in a cancelled subtree (or under
+                            // a settled parent) never runs again, so
+                            // its paused attempt can never dispatch —
+                            // tombstone the still-live admission here,
+                            // the last point an answer can reach it.
+                            if let Some(paused) = rt.paused_attempts.remove(&task.0) {
+                                rt.broker.cancel_attempt(&paused.manifest.attempt_id);
+                            }
+                            serialize_answer(id)
+                        }
                         Err(err) => {
                             let message = err.to_string();
                             envelope_error(
@@ -1341,10 +1453,21 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     // remaining children of the cancelled task never admit
                     // or dispatch (AC-012).
                     match rt.scheduler.cancel_task_tree(&task) {
-                        Ok(_) => RpcResponse::ok(
-                            id,
-                            serde_json::to_value(&result).unwrap_or(Value::Null),
-                        ),
+                        Ok(_) => {
+                            // A task paused on a manual-fallback choice
+                            // still holds a live broker admission:
+                            // tombstone it so a late retry or provider
+                            // callback never resurrects the cancelled
+                            // attempt (EDGE-004). No entry means no
+                            // outstanding attempt — nothing to tombstone.
+                            if let Some(paused) = rt.paused_attempts.remove(&task.0) {
+                                rt.broker.cancel_attempt(&paused.manifest.attempt_id);
+                            }
+                            RpcResponse::ok(
+                                id,
+                                serde_json::to_value(&result).unwrap_or(Value::Null),
+                            )
+                        }
                         Err(err) => {
                             let message = err.to_string();
                             envelope_error(

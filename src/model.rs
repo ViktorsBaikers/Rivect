@@ -5,7 +5,8 @@
 //! the send, and is accounted exactly once.
 
 use crate::config::{
-    Config, ConfigError, Connection, EffortAssign, EffortLevel, ModelAssign, PurposeDef,
+    Config, ConfigError, ConnKind, Connection, EffortAssign, EffortLevel, FallbackAssign,
+    FixedModel, ModelAssign, PurposeDef,
 };
 use crate::providers::{self, Provider, ProviderError};
 use sha2::{Digest, Sha256};
@@ -119,6 +120,100 @@ pub enum ModelError {
     AdmissionMismatch { attempt_id: String },
     #[error("attempt {attempt_id} already accounted: one physical request per attempt id")]
     AttemptAlreadyAccounted { attempt_id: String },
+    #[error(
+        "attempt {attempt_id} was cancelled; a late retry or provider callback never resurrects it"
+    )]
+    AttemptCancelled { attempt_id: String },
+    // These two Displays carry the purpose but never the attempt id:
+    // a retried step mints a fresh attempt each time, and the
+    // supervisor's exact-repeat fingerprint needs equivalent failures
+    // to read identically.
+    #[error("manual fallback for purpose {purpose} awaits the pending choice on question.current")]
+    ManualFallbackPending { attempt_id: String, purpose: String },
+    #[error("no pending manual fallback choice is recorded for this attempt")]
+    NoPendingChoice { attempt_id: String },
+    #[error("manual fallback choice {connection} rejected: {cause}")]
+    ManualChoiceRejected {
+        attempt_id: String,
+        connection: String,
+        cause: RejectionCause,
+    },
+    #[error("fallback for purpose {purpose} exhausted: {source}")]
+    FallbackExhausted {
+        attempt_id: String,
+        purpose: String,
+        /// Every chain entry the walk skipped or saw fail, in order.
+        rejected: Vec<CandidateRejection>,
+        /// The chain connections that actually received a send.
+        attempted: Vec<String>,
+        #[source]
+        source: ProviderError,
+    },
+}
+
+/// Why one fallback candidate was refused at send time (AC-045b): the
+/// dispatch-time re-check runs the same catalogue, egress, entitlement
+/// and purpose-eligibility gates the ranking ran at prepare, a
+/// candidate failing any of them never receives the request, and a
+/// manual pick is additionally confined to the candidates the recorded
+/// pause served.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RejectionCause {
+    UnknownConnection,
+    LiveGrantRequired {
+        kind: ConnKind,
+    },
+    NotEntitled,
+    NotPurposeEligible,
+    /// The pick was never among the candidates the recorded pause
+    /// served — the broker never widens the question's offer.
+    NotOffered,
+    /// The candidate passed the re-check but its own send failed.
+    SendFailed(ProviderError),
+}
+
+impl std::fmt::Display for RejectionCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownConnection => f.write_str("connection no longer declared"),
+            Self::LiveGrantRequired { kind } => {
+                write!(f, "{kind} connection requires a separate live grant")
+            }
+            Self::NotEntitled => f.write_str("outside the account entitlement"),
+            Self::NotPurposeEligible => f.write_str("outside the purpose's eligible list"),
+            Self::NotOffered => f.write_str("not among the candidates the pending choice served"),
+            Self::SendFailed(source) => write!(f, "send failed: {source}"),
+        }
+    }
+}
+
+/// One skipped fallback chain entry with its typed cause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateRejection {
+    pub connection: String,
+    pub cause: RejectionCause,
+}
+
+/// A recorded manual-fallback choice (AC-045, DEC-014): the failed
+/// attempt stays admitted while the choice is pending — the existing
+/// question.current protocol carries it to the human — and the broker
+/// never dispatches a substitute on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFallback {
+    pub attempt_id: String,
+    pub purpose: String,
+    /// The connections passing the current eligibility check, sorted.
+    pub candidates: Vec<String>,
+}
+
+/// The credential profile the latest prepared manifest froze on its
+/// bound connection (AC-047): the `active` half of the status surface's
+/// pending/active pair — `pending` is the profile the next dispatch on
+/// that connection binds under the current config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileBinding {
+    pub connection: String,
+    pub profile: Option<String>,
 }
 
 /// The versioned account-entitlement snapshot a ranking runs under
@@ -171,6 +266,13 @@ pub struct AdmissionRecord {
     /// The manifest frozen at prepare: the dispatch re-check's
     /// comparison copy.
     pub manifest: RequestManifest,
+    /// The resolved fallback assignment for this attempt (AC-045):
+    /// frozen at admission — a later config edit never rewrites the
+    /// chain an in-flight dispatch walks.
+    pub fallback: FallbackAssign,
+    /// Where the fallback assignment resolved from, for the child
+    /// admission's source label.
+    pub fallback_source: String,
 }
 
 /// The single accounting record of one physical request (INV-024):
@@ -189,6 +291,7 @@ pub struct AccountingRecord {
 /// The last frozen model-visible prefix digest of one purpose (AC-061
 /// contribution): an unchanged digest replays the epoch, a changed one
 /// opens a new epoch with the recorded reason.
+#[derive(Clone)]
 struct EpochState {
     prefix_digest: String,
 }
@@ -229,6 +332,30 @@ pub struct Broker {
     /// The single accounting per physical request (INV-024): one entry
     /// per completed provider send, keyed by the attempt it charged.
     accounting: BTreeMap<String, AccountingRecord>,
+    /// The connection catalogue the dispatch-time candidate re-check
+    /// reads (AC-045b): refreshed from the latest observed config, so a
+    /// candidate removed after admission fails the current check.
+    view_connections: BTreeMap<String, Connection>,
+    /// The purpose definitions the re-check's `eligible` input reads.
+    view_purposes: BTreeMap<String, PurposeDef>,
+    /// Cancelled-attempt tombstones (EDGE-004): a late retry or provider
+    /// callback against a cancelled attempt never sends. Bounded by
+    /// lifetime cancelled attempts, like the accounting map is by
+    /// lifetime completed sends.
+    cancelled: BTreeSet<String>,
+    /// Pending manual-fallback choices keyed by the failed attempt id
+    /// (AC-045): the dispatch that records one never substitutes.
+    pending: BTreeMap<String, PendingFallback>,
+    /// Attempts currently paused on a manual-fallback choice, keyed by
+    /// the failed attempt id (AC-045): the broker-side proof a pause
+    /// happened. `pending` drains when the choice is published, so the
+    /// admission's frozen `Manual` flag alone can never authorize a
+    /// substitute dispatch — only an attempt this map still pins may
+    /// answer, and the value is the candidate set the pause served.
+    /// Dies with the admission: spent, substituted or cancelled.
+    paused: BTreeMap<String, BTreeSet<String>>,
+    /// The profile the latest prepared manifest bound (AC-047).
+    bound_profile: Option<ProfileBinding>,
 }
 
 impl Broker {
@@ -239,11 +366,73 @@ impl Broker {
             entitlements: Entitlements::unrestricted(),
             admissions: BTreeMap::new(),
             accounting: BTreeMap::new(),
+            view_connections: BTreeMap::new(),
+            view_purposes: BTreeMap::new(),
+            cancelled: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            paused: BTreeMap::new(),
+            bound_profile: None,
         }
     }
 
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
+    }
+
+    /// Refreshes the candidate view the dispatch-time re-check reads
+    /// (AC-045b): pushed on boot and on every admitted config edit, and
+    /// re-observed on every successful prepare — the fallback walk
+    /// always checks against the current view, never a prepare-time
+    /// snapshot, and a rejected prepare never steers it.
+    pub fn set_config(&mut self, config: &Config) {
+        self.observe_config(config);
+    }
+
+    fn observe_config(&mut self, config: &Config) {
+        self.view_connections = config.connections.clone();
+        self.view_purposes = config.models.purposes.clone();
+    }
+
+    /// The pending manual-fallback choice recorded for one attempt
+    /// (AC-045); `None` when the attempt never produced one.
+    #[must_use]
+    pub fn pending_choice(&self, attempt_id: &str) -> Option<&PendingFallback> {
+        self.pending.get(attempt_id)
+    }
+
+    /// Consumes the pending choice: the caller that publishes it through
+    /// question.current owns the pause from here — a repeated read never
+    /// re-serves a consumed choice. The pause pin survives the drain:
+    /// it is the gate a substitute dispatch must satisfy, cleared only
+    /// when the pause itself resolves.
+    pub fn take_pending_choice(&mut self, attempt_id: &str) -> Option<PendingFallback> {
+        self.pending.remove(attempt_id)
+    }
+
+    /// Cancels one admitted attempt (EDGE-004): the admission, any
+    /// pending choice and the pause pin die and the attempt is
+    /// tombstoned, so a late provider callback or retry is rejected
+    /// rather than resurrected.
+    /// Returns `false` for an attempt this broker never admitted or
+    /// already accounted — a spent attempt reports spent, not cancelled.
+    pub fn cancel_attempt(&mut self, attempt_id: &str) -> bool {
+        if self.accounting.contains_key(attempt_id) {
+            return false;
+        }
+        if self.admissions.remove(attempt_id).is_none() {
+            return false;
+        }
+        self.pending.remove(attempt_id);
+        self.paused.remove(attempt_id);
+        self.cancelled.insert(attempt_id.to_string());
+        true
+    }
+
+    /// The credential profile the latest prepared manifest bound
+    /// (AC-047): `active` on the status surface.
+    #[must_use]
+    pub fn bound_profile(&self) -> Option<ProfileBinding> {
+        self.bound_profile.clone()
     }
 
     /// Installs the account-entitlement snapshot: the connections the
@@ -361,17 +550,37 @@ impl Broker {
             mutation_reason,
             cost_bound: sent_cost_bound(inputs),
         };
+        // The re-check view tracks the config this prepare ran under —
+        // the walk at dispatch time never reads a staler document. The
+        // observe rides only a prepare that reached the admission: a
+        // purpose resolution, ranking or size rejection above must not
+        // steer the re-check with its caller-supplied config.
+        self.observe_config(config);
         self.admissions.insert(
             manifest.attempt_id.clone(),
             AdmissionRecord {
                 purpose: purpose.to_string(),
-                connection,
+                connection: connection.clone(),
                 model_id,
                 model_source: resolved.model_source,
                 snapshot_version: self.entitlements.version,
                 manifest: manifest.clone(),
+                fallback: resolved.fallback,
+                fallback_source: resolved.fallback_source,
             },
         );
+        // The credential profile the admission binds (AC-047): frozen on
+        // the broker so the status surface can name it `active` — and
+        // only once the admission stands, so a rejected prepare never
+        // moves the pending/active pair.
+        let profile = config
+            .connections
+            .get(&connection)
+            .and_then(|entry| entry.profile.clone());
+        self.bound_profile = Some(ProfileBinding {
+            connection,
+            profile,
+        });
         Ok(manifest)
     }
 
@@ -393,11 +602,16 @@ impl Broker {
     /// [`ModelError::AttemptAlreadyAccounted`] when the attempt already
     /// spent its one physical request (checked first, so a replayed
     /// completed attempt reports the spent accounting even after its
-    /// admission was pruned), [`ModelError::NoAdmission`] when this
-    /// broker ranked no manifest with that attempt id,
+    /// admission was pruned), [`ModelError::AttemptCancelled`] when the
+    /// attempt was tombstoned by a cancel, [`ModelError::NoAdmission`]
+    /// when this broker ranked no manifest with that attempt id,
     /// [`ModelError::AdmissionMismatch`] when the presented manifest is
     /// not the one the ranking admitted, [`ModelError::EligibilityStale`]
-    /// when the entitlement snapshot changed since ranking, and
+    /// when the entitlement snapshot changed since ranking,
+    /// [`ModelError::ManualFallbackPending`] when the frozen fallback is
+    /// `manual` and the send failed — the pending choice rides
+    /// question.current — [`ModelError::FallbackExhausted`] when the
+    /// auto chain ran out with every entry rejected or failed, and
     /// [`ModelError::Provider`] when the provider rejects the request.
     pub fn dispatch(
         &mut self,
@@ -419,7 +633,15 @@ impl Broker {
                 attempt_id: manifest.attempt_id.clone(),
             });
         }
-        let (connection, frozen_version) = {
+        // Cancellation is authoritative (EDGE-004): a tombstoned attempt
+        // is rejected before any other check can resurrect it — a late
+        // provider callback never produces a new dispatch or effect.
+        if self.cancelled.contains(&manifest.attempt_id) {
+            return Err(ModelError::AttemptCancelled {
+                attempt_id: manifest.attempt_id.clone(),
+            });
+        }
+        let admission = {
             let admission = self.admissions.get(&manifest.attempt_id).ok_or_else(|| {
                 ModelError::NoAdmission {
                     attempt_id: manifest.attempt_id.clone(),
@@ -434,7 +656,7 @@ impl Broker {
                     attempt_id: manifest.attempt_id.clone(),
                 });
             }
-            (admission.connection.clone(), admission.snapshot_version)
+            admission.clone()
         };
         let current_version = self.entitlements.version;
         // The re-check re-evaluates against the live snapshot, not a
@@ -443,21 +665,39 @@ impl Broker {
         // unreachable through `set_account_rights` — and the direct
         // `allows` re-evaluation stays as defense-in-depth against any
         // future surface that mutates rights without a bump.
-        if current_version != frozen_version || !self.entitlements.allows(&connection) {
+        if current_version != admission.snapshot_version
+            || !self.entitlements.allows(&admission.connection)
+        {
             return Err(ModelError::EligibilityStale {
                 attempt_id: manifest.attempt_id.clone(),
-                connection,
-                frozen: frozen_version,
+                connection: admission.connection.clone(),
+                frozen: admission.snapshot_version,
                 current: current_version,
             });
         }
+        match self.complete_send(manifest, &admission.connection) {
+            Ok(reply) => Ok(reply),
+            Err(source) => self.fallback_or_fail(manifest, &admission, source),
+        }
+    }
+
+    /// Sends one frozen manifest and charges its shared reservation
+    /// once: admission for the send happened immediately above the call
+    /// site — the presented-manifest re-check for the primary, the chain
+    /// re-check for a fallback candidate. On success the spent admission
+    /// and any stale pending choice die with the send.
+    fn complete_send(
+        &mut self,
+        manifest: &RequestManifest,
+        connection: &str,
+    ) -> Result<providers::ProviderReply, ProviderError> {
         let reply = self.provider.send(manifest)?;
         self.accounting.insert(
             manifest.attempt_id.clone(),
             AccountingRecord {
                 attempt_id: manifest.attempt_id.clone(),
                 purpose: manifest.purpose.clone(),
-                connection,
+                connection: connection.to_string(),
                 cost_bound: manifest.cost_bound,
             },
         );
@@ -465,7 +705,315 @@ impl Broker {
         // it, and a later replay still answers through the accounting
         // map above.
         self.admissions.remove(&manifest.attempt_id);
+        self.pending.remove(&manifest.attempt_id);
+        self.paused.remove(&manifest.attempt_id);
         Ok(reply)
+    }
+
+    /// Dispatches the manual-fallback candidate the human picked
+    /// through question.current (AC-045): the paused attempt's
+    /// admission is still live, so its frozen manifest supplies the
+    /// task data byte-for-byte while the picked connection mints the
+    /// substitute's own attempt id and sends under the same admission
+    /// gates — the pick re-runs the CURRENT eligibility check, so a
+    /// candidate that lost catalogue presence, offline usability,
+    /// entitlement or purpose eligibility between the question and the
+    /// answer never receives the send. One physical request, one
+    /// accounting; the paused primary's admission is spent with the
+    /// substitute so neither id can replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::NoAdmission`] when this broker holds no
+    /// live admission for the attempt — [`ModelError::AttemptCancelled`]
+    /// for a tombstoned one and [`ModelError::AttemptAlreadyAccounted`]
+    /// for a spent one — [`ModelError::NoPendingChoice`] when the
+    /// attempt is not pinned as paused on a manual fallback (the pin is
+    /// set when the failed dispatch records the pending choice and the
+    /// frozen `Manual` flag alone never substitutes for it),
+    /// [`ModelError::WorldMismatch`] when the dispatch world is not the
+    /// frozen one, [`ModelError::ManualChoiceRejected`] when the picked
+    /// connection was not among the candidates the pause served or fails
+    /// the current eligibility check, and [`ModelError::Provider`] when
+    /// the substitute's send fails — the paused attempt stays admitted
+    /// for a retry.
+    pub fn dispatch_fallback_choice(
+        &mut self,
+        world: &str,
+        attempt_id: &str,
+        connection: &str,
+    ) -> Result<providers::ProviderReply, ModelError> {
+        let admission = self.admissions.get(attempt_id).cloned().ok_or_else(|| {
+            if self.cancelled.contains(attempt_id) {
+                ModelError::AttemptCancelled {
+                    attempt_id: attempt_id.to_string(),
+                }
+            } else if self.accounting.contains_key(attempt_id) {
+                ModelError::AttemptAlreadyAccounted {
+                    attempt_id: attempt_id.to_string(),
+                }
+            } else {
+                ModelError::NoAdmission {
+                    attempt_id: attempt_id.to_string(),
+                }
+            }
+        })?;
+        // The pause pin is the gate, not the frozen `Manual` flag: it
+        // exists only because a failed dispatch recorded the pending
+        // choice, and it survives the publish-time `pending` drain —
+        // an un-paused Manual admission reads NoPendingChoice.
+        let Some(served) = self.paused.get(attempt_id) else {
+            return Err(ModelError::NoPendingChoice {
+                attempt_id: attempt_id.to_string(),
+            });
+        };
+        let manifest = &admission.manifest;
+        if manifest.world != world {
+            return Err(ModelError::WorldMismatch {
+                frozen: manifest.world.clone(),
+                current: world.to_string(),
+            });
+        }
+        // The pick is confined to the candidates the pause served — the
+        // failed primary is never among them — before the current
+        // eligibility re-check runs.
+        if !served.contains(connection) {
+            return Err(ModelError::ManualChoiceRejected {
+                attempt_id: attempt_id.to_string(),
+                connection: connection.to_string(),
+                cause: RejectionCause::NotOffered,
+            });
+        }
+        if let Some(cause) = self.candidate_rejection(&admission.purpose, connection) {
+            return Err(ModelError::ManualChoiceRejected {
+                attempt_id: attempt_id.to_string(),
+                connection: connection.to_string(),
+                cause,
+            });
+        }
+        // A fixed model pin survives the substitution on the picked
+        // connection; an auto ranking narrows to a pool of one — the
+        // human's pick IS the ranked pool.
+        let model = match &manifest.model {
+            ModelAssign::Fixed(fixed) => ModelAssign::Fixed(FixedModel {
+                connection: connection.to_string(),
+                model_id: fixed.model_id.clone(),
+            }),
+            _ => ModelAssign::Auto {
+                pool: Some(vec![connection.to_string()]),
+            },
+        };
+        let (substitute, displaced) = self.mint_substitute(&admission, model, connection, "manual");
+        match self.complete_send(&substitute, connection) {
+            Ok(reply) => {
+                // The substitute answered the intent: the paused
+                // primary's admission is spent with it, so neither id
+                // can replay — and its pending record dies with it.
+                self.admissions.remove(attempt_id);
+                self.pending.remove(attempt_id);
+                self.paused.remove(attempt_id);
+                Ok(reply)
+            }
+            Err(source) => {
+                self.admissions.remove(&substitute.attempt_id);
+                self.restore_epoch(&admission.purpose, displaced);
+                Err(ModelError::Provider(source))
+            }
+        }
+    }
+
+    /// The resolved `FallbackAssign` frozen on the failed attempt's
+    /// admission decides the pause shape (AC-045): `off` reports the
+    /// provider's own error unchanged, `manual` records the pending
+    /// choice and reports it without dispatching a substitute, `auto`
+    /// walks the chain — every entry is re-checked against the CURRENT
+    /// catalogue, egress, entitlement and purpose-eligibility gates, so
+    /// a candidate failing the check never receives the request. An
+    /// admitted entry mints one fallback manifest carrying the failed
+    /// attempt's frozen task data byte-for-byte under its own attempt
+    /// id, the chain entry's fixed model and the same cost bound — one
+    /// reservation, one accounting, no second-order fallback.
+    fn fallback_or_fail(
+        &mut self,
+        manifest: &RequestManifest,
+        admission: &AdmissionRecord,
+        source: ProviderError,
+    ) -> Result<providers::ProviderReply, ModelError> {
+        match &admission.fallback {
+            FallbackAssign::Off => Err(ModelError::Provider(source)),
+            FallbackAssign::Manual => {
+                let mut candidates = self.eligible_candidates(&admission.purpose);
+                // The failed primary never re-enters its own choice
+                // list — it already produced this failure.
+                candidates.retain(|name| name != &admission.connection);
+                let pending = PendingFallback {
+                    attempt_id: manifest.attempt_id.clone(),
+                    purpose: admission.purpose.clone(),
+                    candidates,
+                };
+                // The pause pin outlives the pending record's
+                // publish-time drain: it is the broker-side proof a
+                // substitute dispatch must satisfy, and its set is the
+                // only candidate list the pick may choose from.
+                self.paused.insert(
+                    manifest.attempt_id.clone(),
+                    pending.candidates.iter().cloned().collect(),
+                );
+                self.pending.insert(manifest.attempt_id.clone(), pending);
+                Err(ModelError::ManualFallbackPending {
+                    attempt_id: manifest.attempt_id.clone(),
+                    purpose: admission.purpose.clone(),
+                })
+            }
+            FallbackAssign::Auto { chain } => {
+                let mut rejected = Vec::new();
+                let mut attempted = Vec::new();
+                for entry in chain {
+                    if let Some(cause) =
+                        self.candidate_rejection(&admission.purpose, &entry.connection)
+                    {
+                        rejected.push(CandidateRejection {
+                            connection: entry.connection.clone(),
+                            cause,
+                        });
+                        continue;
+                    }
+                    let model = ModelAssign::Fixed(FixedModel {
+                        connection: entry.connection.clone(),
+                        model_id: entry.model_id.clone(),
+                    });
+                    let (fallback_manifest, displaced) =
+                        self.mint_substitute(admission, model, &entry.connection, "fallback");
+                    attempted.push(entry.connection.clone());
+                    match self.complete_send(&fallback_manifest, &entry.connection) {
+                        Ok(reply) => {
+                            // The substitute answered the intent: the
+                            // failed primary's admission is spent with
+                            // it, so neither id can replay.
+                            self.admissions.remove(&manifest.attempt_id);
+                            return Ok(reply);
+                        }
+                        Err(send_error) => {
+                            // The minted manifest never leaves this
+                            // scope, so its unspent admission is dead
+                            // weight — prune it, and roll the
+                            // provisional epoch mint back to the entry
+                            // the failed send displaced.
+                            self.admissions.remove(&fallback_manifest.attempt_id);
+                            self.restore_epoch(&admission.purpose, displaced);
+                            rejected.push(CandidateRejection {
+                                connection: entry.connection.clone(),
+                                cause: RejectionCause::SendFailed(send_error),
+                            });
+                        }
+                    }
+                }
+                Err(ModelError::FallbackExhausted {
+                    attempt_id: manifest.attempt_id.clone(),
+                    purpose: admission.purpose.clone(),
+                    rejected,
+                    attempted,
+                    source,
+                })
+            }
+        }
+    }
+
+    /// Mints one substitute manifest and admission for a failed or
+    /// paused attempt: the frozen manifest supplies the task data
+    /// byte-for-byte, the substitute sends under its own fresh attempt
+    /// id on the picked connection, and `leg` names the fallback leg on
+    /// the child admission's source label. The epoch mint is
+    /// provisional until the send lands — the returned displaced entry
+    /// is what [`Broker::restore_epoch`] rolls back on a failed send,
+    /// so the walk never leaves a phantom model-switch epoch behind a
+    /// request that went nowhere.
+    fn mint_substitute(
+        &mut self,
+        admission: &AdmissionRecord,
+        model: ModelAssign,
+        connection: &str,
+        leg: &str,
+    ) -> (RequestManifest, Option<EpochState>) {
+        let displaced = self.epochs.get(&admission.purpose).cloned();
+        let (epoch_id, mutation_reason) = self.context_epoch(
+            &admission.purpose,
+            &model,
+            &admission.manifest.instructions,
+            &admission.manifest.tools,
+        );
+        let model_id = match &model {
+            ModelAssign::Fixed(fixed) => Some(fixed.model_id.clone()),
+            _ => None,
+        };
+        let substitute = RequestManifest {
+            attempt_id: crate::contracts::AttemptId::generate().0,
+            model,
+            epoch_id,
+            mutation_reason,
+            ..admission.manifest.clone()
+        };
+        self.admissions.insert(
+            substitute.attempt_id.clone(),
+            AdmissionRecord {
+                purpose: admission.purpose.clone(),
+                connection: connection.to_string(),
+                model_id,
+                model_source: format!("{}.{leg}", admission.fallback_source),
+                snapshot_version: self.entitlements.version,
+                manifest: substitute.clone(),
+                // A substitute send never spawns its own fallback.
+                fallback: FallbackAssign::Off,
+                fallback_source: admission.fallback_source.clone(),
+            },
+        );
+        (substitute, displaced)
+    }
+
+    /// Rolls a provisional epoch mint back after a substitute's send
+    /// failed: the entry the mint displaced — or its absence — is
+    /// restored so the failed send leaves no phantom epoch behind.
+    fn restore_epoch(&mut self, purpose: &str, displaced: Option<EpochState>) {
+        match displaced {
+            Some(previous) => {
+                self.epochs.insert(purpose.to_string(), previous);
+            }
+            None => {
+                self.epochs.remove(purpose);
+            }
+        }
+    }
+
+    /// The dispatch-time candidate check (AC-045b): the same gates the
+    /// ranking ran at prepare — catalogue presence, the offline
+    /// live-grant rule, the account entitlement, the per-purpose
+    /// `eligible` input — evaluated against the broker's CURRENT config
+    /// view. A candidate failing any gate returns its typed cause and
+    /// never receives the request.
+    fn candidate_rejection(&self, purpose: &str, connection: &str) -> Option<RejectionCause> {
+        let Some(entry) = self.view_connections.get(connection) else {
+            return Some(RejectionCause::UnknownConnection);
+        };
+        if !providers::offline_usable(Some(entry.kind)) {
+            return Some(RejectionCause::LiveGrantRequired { kind: entry.kind });
+        }
+        if !self.entitlements.allows(connection) {
+            return Some(RejectionCause::NotEntitled);
+        }
+        if !purpose_entitled(self.view_purposes.get(purpose), connection) {
+            return Some(RejectionCause::NotPurposeEligible);
+        }
+        None
+    }
+
+    /// The connections currently eligible for one purpose — the
+    /// candidate list a manual fallback choice offers (AC-045).
+    fn eligible_candidates(&self, purpose: &str) -> Vec<String> {
+        self.view_connections
+            .keys()
+            .filter(|name| self.candidate_rejection(purpose, name).is_none())
+            .cloned()
+            .collect()
     }
 
     /// Explains the effort assignment one frozen manifest transmitted:

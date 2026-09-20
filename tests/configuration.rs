@@ -15,8 +15,8 @@
 mod support;
 
 use rivect::config::{
-    Config, ConfigEdit, ConfigError, ConfigIssue, ConfigValue, EffortAssign, FallbackAssign,
-    FixedModel, ModelAssign, Stage,
+    Config, ConfigEdit, ConfigError, ConfigIssue, ConfigValue, ConnKind, EffortAssign,
+    FallbackAssign, FixedModel, ModelAssign, Stage,
 };
 
 fn resolve_or_panic(config: &Config, purpose: &str) -> rivect::config::ResolvedPurpose {
@@ -44,7 +44,7 @@ fn all_roles_auto() {
     let config = Config::parse_validated(&support::config_all_roles_auto()).expect("valid");
     assert_eq!(config.version, 1);
     let primary = config.connections.get("primary").expect("primary");
-    assert_eq!(primary.kind, rivect::config::ConnKind::ApiKey);
+    assert_eq!(primary.kind, ConnKind::ApiKey);
     assert_eq!(primary.credential_ref.as_deref(), Some("keyring:primary"));
     let resolved = resolve_or_panic(&config, "worker");
     assert_eq!(resolved.model, auto_no_pool());
@@ -421,7 +421,7 @@ fn manual_subscription() {
         .connections
         .get("subscription")
         .expect("subscription");
-    assert_eq!(subscription.kind, rivect::config::ConnKind::Subscription);
+    assert_eq!(subscription.kind, ConnKind::Subscription);
     let resolved = resolve_or_panic(&config, "main");
     assert!(
         matches!(&resolved.model, ModelAssign::Fixed(fixed) if fixed.connection == "subscription")
@@ -1776,7 +1776,7 @@ fn config_read_unknown_key_names_its_accepted_domain() {
 
     assert_eq!(
         response["error"]["data"]["message"],
-        "unknown key bogus; known keys: workflow.enabled"
+        "unknown key bogus; known keys: workflow.enabled, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
     );
 }
 
@@ -2082,7 +2082,8 @@ fn cli_unknown_edit_key_names_the_scope_the_file_surface_names() {
         matches!(
             &file_error.issue,
             ConfigIssue::UnknownKey { key, known }
-                if key == "bogus" && *known == ["kind", "endpoint", "credential_ref"]
+                if key == "bogus"
+                    && *known == ["kind", "endpoint", "credential_ref", "region", "profile"]
         ),
         "wrong rejection issue: {file_error}"
     );
@@ -2097,7 +2098,7 @@ fn cli_unknown_edit_key_names_the_scope_the_file_surface_names() {
     }));
     assert_eq!(
         response["error"]["data"]["message"],
-        "schema connections.primary.bogus: unknown key connections.primary.bogus; known keys: kind, endpoint, credential_ref",
+        "schema connections.primary.bogus: unknown key connections.primary.bogus; known keys: kind, endpoint, credential_ref, region, profile",
         "the CLI hint must walk the schema, not re-declare it: {response}"
     );
 }
@@ -3130,5 +3131,463 @@ fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
         pending_intents(&mut world.runtime.owner.store),
         1,
         "the row the write never ran for stays pending"
+    );
+}
+
+// ----- SLICE-014 legs --------------------------------------------------
+
+/// AC-047 corpus: a profiled connection plus two declared credential
+/// profiles — the switch surface `config.set connections.local.profile`
+/// moves the pending binding between them, while the purpose pins stay
+/// fixed and workflow stays off.
+fn profiled_config() -> String {
+    "config_version = 1\n\
+     [workflow]\nenabled = false\n\
+     [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\nprofile = \"p1\"\n\
+     [profiles.p1]\ncredential_ref = \"keyring:rivect/p1\"\n\
+     [profiles.p2]\ncredential_ref = \"keyring:rivect/p2\"\n\
+     [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n\
+     [models.purposes.main]\n\
+     model = { mode = \"fixed\", connection = \"local\", model_id = \"pinned-model\" }\n\
+     effort = { mode = \"fixed\", value = \"high\" }\n"
+        .to_string()
+}
+
+/// AC-047: a profile switch through the existing config.set carrier
+/// preserves the pinned model/effort, the manual permission grants, the
+/// workflow-off state, and the already-frozen in-flight manifest.
+#[test]
+fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_off() {
+    let mut world = support::open_world("profile-switch", Some(&profiled_config()));
+    let session = world.open_session("profile-boot");
+    // a manual permission the switch must preserve
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let scoped_file = scope.join("allowed.txt");
+    std::fs::write(&scoped_file, "marker\n").expect("scope file");
+    let grant = world.runtime.set_read_scope(scope, scoped_file);
+    let before = world
+        .runtime
+        .config_for_broker()
+        .resolve_purpose("main")
+        .expect("resolve");
+
+    // bind p1: the prepared manifest freezes the in-use connection's
+    // profile at admission
+    let config = world.runtime.config_for_broker();
+    let manifest = world
+        .runtime
+        .broker
+        .prepare("main", &config, "/world/profile", "goal: pinned")
+        .expect("manifest");
+    world
+        .runtime
+        .broker
+        .dispatch("/world/profile", &manifest)
+        .expect("dispatch binds the profile");
+    let bound = world
+        .runtime
+        .broker
+        .bound_profile()
+        .expect("a bound profile");
+    assert_eq!(bound.connection, "local");
+    assert_eq!(bound.profile.as_deref(), Some("p1"));
+
+    // the profile switch rides the existing config.set carrier
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 9001, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.local.profile", "value": "p2" }
+    }));
+    assert!(
+        response["error"].is_null(),
+        "the typed edit is admitted: {response}"
+    );
+
+    let after = world
+        .runtime
+        .config_for_broker()
+        .resolve_purpose("main")
+        .expect("resolve");
+    assert_eq!(
+        after.model, before.model,
+        "the pinned model survives the profile switch"
+    );
+    assert_eq!(after.effort, before.effort, "the pinned effort survives");
+    assert_eq!(after.fallback, before.fallback);
+    // workflow-off state is untouched by the profile edit
+    assert_eq!(
+        world
+            .runtime
+            .effective
+            .parsed
+            .as_ref()
+            .expect("parsed")
+            .workflow
+            .enabled,
+        Some(false)
+    );
+    // the manual permission survives untouched
+    assert!(
+        world.runtime.policy.grant(&grant).is_some(),
+        "the scoped grant survives the switch"
+    );
+    // the in-flight manifest was never rewritten: the wire record is
+    // exactly what prepare froze
+    assert_eq!(world.last_manifest().as_ref(), Some(&manifest));
+}
+
+/// AC-047: the existing runtime.status surface carries the pending and
+/// active profile pair — they diverge while an accepted edit waits for
+/// the next request and converge once it binds.
+#[test]
+fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface() {
+    let mut world = support::open_world("profile-status", Some(&profiled_config()));
+    let session = world.open_session("status-boot");
+
+    // before any dispatch: no binding exists
+    let status = world.dispatch(&support::corpus_status(&session));
+    assert_eq!(status["result"]["profile"]["active"], json!(null));
+    assert_eq!(status["result"]["profile"]["pending"], json!(null));
+
+    // bind p1 by an actual dispatch
+    let config = world.runtime.config_for_broker();
+    let manifest = world
+        .runtime
+        .broker
+        .prepare("main", &config, "/world/status", "goal: status")
+        .expect("manifest");
+    world
+        .runtime
+        .broker
+        .dispatch("/world/status", &manifest)
+        .expect("dispatch");
+    let status = world.dispatch(&support::corpus_status(&session));
+    assert_eq!(status["result"]["profile"]["active"], json!("p1"));
+    assert_eq!(
+        status["result"]["profile"]["pending"],
+        json!("p1"),
+        "no edit is pending before the switch"
+    );
+
+    // the switch is admitted: pending diverges from active until the
+    // next request binds it
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 9002, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.local.profile", "value": "p2" }
+    }));
+    assert!(response["error"].is_null(), "{response}");
+    let status = world.dispatch(&support::corpus_status(&session));
+    assert_eq!(
+        status["result"]["profile"]["active"],
+        json!("p1"),
+        "the bound manifest still names p1"
+    );
+    assert_eq!(
+        status["result"]["profile"]["pending"],
+        json!("p2"),
+        "the accepted edit is pending"
+    );
+
+    // the next request binds p2; the surfaces converge again
+    let config = world.runtime.config_for_broker();
+    let next = world
+        .runtime
+        .broker
+        .prepare("main", &config, "/world/status", "goal: status")
+        .expect("manifest");
+    world
+        .runtime
+        .broker
+        .dispatch("/world/status", &next)
+        .expect("dispatch");
+    let status = world.dispatch(&support::corpus_status(&session));
+    assert_eq!(status["result"]["profile"]["active"], json!("p2"));
+    assert_eq!(status["result"]["profile"]["pending"], json!("p2"));
+}
+
+/// AC-047: a profile change never replaces draft or task state — the
+/// task snapshot, the pending question, and the in-flight manifest all
+/// survive the edit byte-for-byte.
+#[test]
+fn profile_change_does_not_replace_draft_or_task_state() {
+    let mut world = support::open_world("profile-draft", Some(&profiled_config()));
+    let session = world.open_session("draft-boot");
+    let task = world.create_task(&session, "draft-task");
+
+    // a pending decision — the draft state — plus an in-flight manifest
+    let published = world.publish(&session, &task);
+    let manifest = {
+        let config = world.runtime.config_for_broker();
+        world
+            .runtime
+            .broker
+            .prepare("main", &config, "/world/draft", "goal: draft")
+            .expect("manifest")
+    };
+    // snapshot after the draft exists: the edit — not the publish —
+    // is what must leave the record untouched
+    let before = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 9003, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.local.profile", "value": "p2" }
+    }));
+    assert!(response["error"].is_null(), "{response}");
+
+    let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    assert_eq!(after.task_id, before.task_id);
+    assert_eq!(
+        after.revision, before.revision,
+        "the task record is untouched"
+    );
+    assert_eq!(after.intent_revision, before.intent_revision);
+    assert_eq!(after.lifecycle, before.lifecycle);
+    let (served, _) = world
+        .runtime
+        .owner
+        .store
+        .current_question(&task)
+        .expect("question")
+        .expect("pending");
+    assert_eq!(
+        served.question_id, published.question_id,
+        "the pending decision is preserved"
+    );
+    // the frozen manifest still dispatches its own bytes — the edit
+    // never reached back into an in-flight request
+    world
+        .runtime
+        .broker
+        .dispatch("/world/draft", &manifest)
+        .expect("dispatch");
+    assert_eq!(world.last_manifest().as_ref(), Some(&manifest));
+}
+
+/// DEC-013/AC-047: the additive connection `region`/`profile` keys and
+/// the `profiles.<name>.credential_ref` table parse under the same
+/// strict schema, reject unknown keys with their own csv, and refuse
+/// raw secret material on both carriers — never a silent coercion.
+#[test]
+fn new_connection_and_profile_keys_are_additive_and_strict_validated() {
+    let config = Config::parse_validated(&profiled_config()).expect("the additive keys parse");
+    let local = config.connections.get("local").expect("local");
+    assert_eq!(local.profile.as_deref(), Some("p1"));
+    assert_eq!(local.region, None);
+    assert_eq!(
+        config
+            .profiles
+            .get("p1")
+            .and_then(|profile| profile.credential_ref.as_deref()),
+        Some("keyring:rivect/p1")
+    );
+
+    // strict validation holds on the new key domain: an unknown
+    // profiles field names its own csv
+    let bogus = profiled_config().replace("credential_ref = \"keyring:rivect/p1\"", "bogus = 1");
+    let file_error = Config::parse_validated(&bogus).expect_err("unknown profiles key");
+    assert!(
+        matches!(&file_error.issue, ConfigIssue::UnknownKey { key, .. } if key == "bogus"),
+        "wrong rejection: {file_error}"
+    );
+    // a raw secret is refused before any surface can observe it
+    let secret = profiled_config().replace("keyring:rivect/p1", support::SECRET_CANARY);
+    let secret_error =
+        Config::parse_validated(&secret).expect_err("a raw secret is not a SecretRef");
+    assert!(
+        matches!(&secret_error.issue, ConfigIssue::SecretRefExpected { .. }),
+        "wrong rejection: {secret_error}"
+    );
+    // a dangling profile reference is the same typed discipline the
+    // connection references already enforce
+    let dangling = profiled_config().replace("profile = \"p1\"", "profile = \"ghost\"");
+    let dangling_error = Config::parse_validated(&dangling).expect_err("dangling profile ref");
+    assert!(
+        matches!(&dangling_error.issue, ConfigIssue::UnknownProfileReference { profile } if profile == "ghost"),
+        "wrong rejection: {dangling_error}"
+    );
+
+    // a connection credential_ref carries the same scoped-secret shape
+    // as a profile ref — a bare token is refused before any surface can
+    // observe it, and the diagnostic names the key, never the value
+    let unscoped = profiled_config().replace(
+        "kind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\nprofile = \"p1\"",
+        "kind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"not a scoped ref\"",
+    );
+    let unscoped_error = Config::parse_validated(&unscoped).expect_err("unscoped connection ref");
+    assert!(
+        matches!(&unscoped_error.issue, ConfigIssue::SecretRefExpected { key } if key == "connections.local.credential_ref"),
+        "wrong rejection: {unscoped_error}"
+    );
+    assert!(
+        !format!("{unscoped_error}").contains("not a scoped ref"),
+        "the diagnostic never echoes the refused value"
+    );
+    // a local connection carries no credentials at all — even a
+    // well-formed ref is refused
+    let local_ref = profiled_config().replace(
+        "profile = \"p1\"",
+        "credential_ref = \"keyring:rivect/local\"",
+    );
+    let local_error = Config::parse_validated(&local_ref).expect_err("local credential ref");
+    assert!(
+        matches!(&local_error.issue, ConfigIssue::LocalCredentialsForbidden),
+        "wrong rejection: {local_error}"
+    );
+    // and an api_key connection cannot omit its ref
+    let missing_ref = profiled_config().replace(
+        "kind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\nprofile = \"p1\"",
+        "kind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"",
+    );
+    let missing_error = Config::parse_validated(&missing_ref).expect_err("api_key needs a ref");
+    assert!(
+        matches!(&missing_error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+        "wrong rejection: {missing_error}"
+    );
+
+    // set/unset/read on the new keys run the same typed path
+    let mut config = Config::parse_validated(&profiled_config()).expect("valid");
+    config
+        .set(
+            "connections.local.profile",
+            ConfigValue::Text("p2".to_string()),
+        )
+        .expect("typed edit");
+    assert_eq!(config.connections["local"].profile.as_deref(), Some("p2"));
+    config
+        .reset("connections.local.profile")
+        .expect("override removes");
+    assert_eq!(config.connections["local"].profile, None);
+    config
+        .set(
+            "connections.local.region",
+            ConfigValue::Text("eu-west-1".to_string()),
+        )
+        .expect("region edit");
+    assert_eq!(
+        config.connections["local"].region.as_deref(),
+        Some("eu-west-1")
+    );
+    config
+        .set(
+            "profiles.p3.credential_ref",
+            ConfigValue::Text("keyring:rivect/p3".to_string()),
+        )
+        .expect("a new profile is additive");
+    assert_eq!(
+        config.profiles["p3"].credential_ref.as_deref(),
+        Some("keyring:rivect/p3")
+    );
+    // read domain: the new keys answer, unknowns stay out
+    assert_eq!(
+        config.read_value("connections.local.region"),
+        Some(json!("eu-west-1"))
+    );
+    assert_eq!(
+        config.read_value("connections.local.profile"),
+        Some(json!(null))
+    );
+    assert_eq!(
+        config.read_value("profiles.p3.credential_ref"),
+        Some(json!("keyring:rivect/p3"))
+    );
+    assert_eq!(config.read_value("bogus.key"), None);
+
+    // the wire surface speaks the same schema
+    config
+        .set_wire("connections.local.profile", &json!("p1"))
+        .expect("wire edit");
+    let wire_error = config
+        .set_wire("profiles.p3.credential_ref", &json!(support::SECRET_CANARY))
+        .expect_err("a wire secret is refused");
+    assert!(
+        matches!(&wire_error.issue, ConfigIssue::SecretRefExpected { .. }),
+        "{wire_error}"
+    );
+    assert_eq!(
+        config.profiles["p3"].credential_ref.as_deref(),
+        Some("keyring:rivect/p3"),
+        "the refused write left nothing"
+    );
+    // the shipped defaults document the complete commented profile
+    // block — the connection header, region, profile binding, profile
+    // table, and its scoped credential_ref — and nothing ships live
+    let shipped = rivect::config::SHIPPED_DEFAULTS_TOML;
+    assert!(
+        shipped.contains(
+            "# [connections.<id>]\n\
+             # region = \"us-east-1\"\n\
+             # profile = \"default\"\n\
+             # [profiles.<name>]\n\
+             # credential_ref = \"keyring:rivect/default\"\n"
+        ),
+        "the complete commented profile block ships verbatim"
+    );
+    for line in shipped.lines() {
+        let trimmed = line.trim_start();
+        let profile_key = ["region", "profile", "credential_ref"]
+            .iter()
+            .any(|key| trimmed.starts_with(key));
+        assert!(
+            !(profile_key && !trimmed.starts_with('#')),
+            "a profile key shipped live: {line}"
+        );
+    }
+}
+
+/// DEC-014: `config.read` serves the additive profile keys over the wire —
+/// one entry per requested key in request order, each carrying the
+/// retained document's source attribution, and the revision an accepted
+/// edit reported is the revision the entries name.
+#[test]
+fn config_read_serves_the_profile_keys_with_source_attribution() {
+    let mut world = support::open_world("read-profile-keys", Some(&profiled_config()));
+    let session = world.open_session("read-profile-boot");
+
+    // set a region first so the served value is observable, not null
+    let set = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7330, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.local.region", "value": "eu-west-1" }
+    }));
+    assert!(set["error"].is_null(), "{set}");
+
+    let read = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7331, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "keys": ["connections.local.region", "profiles.p1.credential_ref"] }
+    }));
+    assert!(read["error"].is_null(), "{read}");
+    let items = read["result"]["entries"]["items"]
+        .as_array()
+        .expect("one entry per key");
+    assert_eq!(items.len(), 2, "{read}");
+
+    let region = &items[0];
+    assert_eq!(region["key"], "connections.local.region", "{region}");
+    assert_eq!(region["effective"]["value"], json!("eu-west-1"), "{region}");
+    assert_eq!(region["source"]["kind"], "user", "{region}");
+    assert_eq!(
+        region["source"]["revision"], set["result"]["digest"],
+        "the entry names the retained document's revision: {region}"
+    );
+
+    let profile = &items[1];
+    assert_eq!(profile["key"], "profiles.p1.credential_ref", "{profile}");
+    assert_eq!(
+        profile["effective"]["value"],
+        json!("keyring:rivect/p1"),
+        "{profile}"
+    );
+    assert_eq!(profile["source"]["kind"], "user", "{profile}");
+    assert_eq!(
+        profile["source"]["revision"], set["result"]["digest"],
+        "{profile}"
     );
 }

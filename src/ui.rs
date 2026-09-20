@@ -833,31 +833,54 @@ impl TuiDispatch {
 }
 
 fn task_dock(status: &Value) -> Vec<String> {
-    let Some(items) = status
+    let mut lines: Vec<String> = status
         .get("todo")
         .and_then(|todo| todo.get("items"))
         .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-    else {
-        return vec![DOCK_EMPTY.to_string()];
-    };
-    items
-        .iter()
-        .filter_map(|item| {
-            let task_id = item.get("task_id").and_then(Value::as_str)?;
-            let lifecycle = item.get("lifecycle").and_then(Value::as_str)?;
-            let reason = item
-                .get("blockers")
-                .and_then(Value::as_array)
-                .and_then(|blockers| blockers.first())
-                .and_then(|blocker| blocker.get("reason"))
-                .and_then(Value::as_str);
-            Some(match reason {
-                Some(reason) => format!("task {task_id}: {lifecycle} ({reason})"),
-                None => format!("task {task_id}: {lifecycle}"),
-            })
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let task_id = item.get("task_id").and_then(Value::as_str)?;
+                    let lifecycle = item.get("lifecycle").and_then(Value::as_str)?;
+                    let reason = item
+                        .get("blockers")
+                        .and_then(Value::as_array)
+                        .and_then(|blockers| blockers.first())
+                        .and_then(|blocker| blocker.get("reason"))
+                        .and_then(Value::as_str);
+                    Some(match reason {
+                        Some(reason) => format!("task {task_id}: {lifecycle} ({reason})"),
+                        None => format!("task {task_id}: {lifecycle}"),
+                    })
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+    // The pending/active profile pair rides the same status payload
+    // (AC-047): a switch waiting for the next request shows beside the
+    // active binding, a converged pair names the bound profile once.
+    if let Some(profile) = status.get("profile") {
+        let pending = profile.get("pending").and_then(Value::as_str);
+        let active = profile.get("active").and_then(Value::as_str);
+        match (pending, active) {
+            (Some(pending), Some(active)) if pending != active => {
+                lines.push(format!("profile: {active} active → {pending} pending"));
+            }
+            (Some(pending), Some(_)) => lines.push(format!("profile: {pending}")),
+            // A pending profile with no active binding still shows —
+            // tagged, so it never reads as the bound one.
+            (Some(pending), None) => {
+                lines.push(format!("profile: {pending} pending"));
+            }
+            (None, Some(active)) => lines.push(format!("profile: {active}")),
+            (None, None) => {}
+        }
+    }
+    if lines.is_empty() {
+        return vec![DOCK_EMPTY.to_string()];
+    }
+    lines
 }
 
 const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
@@ -1155,7 +1178,7 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError,
+        DOCK_EMPTY, LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError,
         append_composer_char, initial_view, note_open_failure, output_status_line,
         surface_boot_diagnostics, task_dock, wrapped_row_count,
     };
@@ -1252,6 +1275,41 @@ mod tests {
             }
         }));
         assert_eq!(dock, vec!["task task-1: blocked (outcome_unknown)"]);
+    }
+
+    #[test]
+    fn task_dock_marks_a_pending_profile_switch_beside_the_active_binding() {
+        let dock = task_dock(&json!({
+            "todo": { "items": [] },
+            "profile": { "pending": "p2", "active": "p1" }
+        }));
+        assert_eq!(dock, vec!["profile: p1 active → p2 pending"]);
+
+        let converged = task_dock(&json!({
+            "todo": { "items": [] },
+            "profile": { "pending": "p1", "active": "p1" }
+        }));
+        assert_eq!(converged, vec!["profile: p1"]);
+
+        // a pending profile with no active binding yet still shows —
+        // tagged so it never reads as the bound one
+        let pending_only = task_dock(&json!({
+            "todo": { "items": [] },
+            "profile": { "pending": "p2", "active": null }
+        }));
+        assert_eq!(pending_only, vec!["profile: p2 pending"]);
+
+        let active_only = task_dock(&json!({
+            "todo": { "items": [] },
+            "profile": { "pending": null, "active": "p1" }
+        }));
+        assert_eq!(active_only, vec!["profile: p1"]);
+
+        let silent = task_dock(&json!({
+            "todo": { "items": [] },
+            "profile": { "pending": null, "active": null }
+        }));
+        assert_eq!(silent, vec![DOCK_EMPTY]);
     }
 
     #[test]
