@@ -3595,6 +3595,56 @@ fn tui_failed_open_reports_verdict_before_alternate_screen() {
 }
 
 #[test]
+fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
+    let data_root = support::temp_dir("pty-lazy-open-verdict");
+    stage_pending_verdict_then_broken_config(&data_root);
+    let mut pty = spawn_pty_with_args(&rivect_binary(), 24, 80, &data_root, &data_root, &[]);
+    // The degraded session leaves the dispatch slot empty, so a submitted
+    // task drives the lazy-retry open: it fails the same way and its
+    // propagated error is the only channel left once the guard restores
+    // the primary screen.
+    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10));
+    assert!(
+        visible.contains("session open failed"),
+        "the degraded session records the eager open failure: {visible:?}"
+    );
+    pty.send(b"retry the open\r");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)),
+        Some(1),
+        "the failed lazy retry must propagate out of the loop"
+    );
+    // The drain thread keeps appending past the observed exit, so the
+    // post-restore slice is polled to a deadline rather than read once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut stream = pty.collected();
+    loop {
+        let tail = support::find_subsequence(&stream, b"\x1b[?1049l")
+            .map(|leave| &stream[leave + b"\x1b[?1049l".len()..]);
+        if tail
+            .is_some_and(|tail| support::find_subsequence(tail, b"publication recovery").is_some())
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        stream = pty.collected();
+    }
+    let leave = support::find_subsequence(&stream, b"\x1b[?1049l");
+    assert!(
+        leave.is_some(),
+        "the propagated error must leave the alternate screen: {:?}",
+        String::from_utf8_lossy(&stream)
+    );
+    let restored = &stream[leave.expect("leave offset") + b"\x1b[?1049l".len()..];
+    assert!(
+        support::find_subsequence(restored, b"publication recovery").is_some(),
+        "the carried verdict must reach the restored primary screen: {:?}",
+        String::from_utf8_lossy(restored)
+    );
+}
+
+#[test]
 #[ignore = "live consumptive path: requires a fresh root grant per test-plan; stays NOT_RUN without it"]
 fn live_first_useful_provider_task() {
     let grant = std::env::var("RIVECT_LIVE_GRANT").expect(
