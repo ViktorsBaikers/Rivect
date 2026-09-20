@@ -147,7 +147,7 @@ pub enum ModelError {
         /// The chain connections that actually received a send.
         attempted: Vec<String>,
         #[source]
-        source: ProviderError,
+        source: Box<ProviderError>,
     },
 }
 
@@ -157,6 +157,8 @@ pub enum ModelError {
 /// candidate failing any of them never receives the request, and a
 /// manual pick is additionally confined to the candidates the recorded
 /// pause served.
+/// `SendFailed` carries `ProviderError` inline so a send failure keeps
+/// its typed cause; the sibling variants stay tag-sized.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RejectionCause {
     UnknownConnection,
@@ -913,7 +915,7 @@ impl Broker {
                     purpose: admission.purpose.clone(),
                     rejected,
                     attempted,
-                    source,
+                    source: Box::new(source),
                 })
             }
         }

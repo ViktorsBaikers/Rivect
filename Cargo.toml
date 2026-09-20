@@ -104,6 +104,19 @@ thiserror = "2.0.20"
 uuid = { version = "1.26.0", features = ["v4"] }
 unicode-normalization = "0.1.25"
 focaccia = "2.1.0"
+# SRC-010: scoped credential profiles on native secret stores — keyring-core
+# supplies the Entry/CredentialStore seam; the platform store crates are the
+# explicit backends (no `keyring` wrapper crate per its own guidance).
+keyring-core = "1.0.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `keychain` feature = the legacy-file keychain store (SRC-010 records the
+# feature name); the crate ships no default features.
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Exactly one rt/crypto feature is required; SRC-010 pins rt-tokio-crypto-rust.
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
 portable-pty = "0.9.0"

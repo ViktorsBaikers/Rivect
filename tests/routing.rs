@@ -1659,11 +1659,16 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
             ]),
         "wrong rejection: {error}"
     );
-    // the typed provider cause stays on the error chain
-    let source =
-        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<ProviderError>());
+    // the typed provider cause stays on the error chain — the variant
+    // heap-boxes the source so `ModelError` stays small, so the chain node
+    // is `Box<ProviderError>` whose payload is still the typed error
+    let source = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<Box<ProviderError>>());
     assert!(
-        matches!(source, Some(ProviderError::UnknownConnection)),
+        matches!(
+            source.map(|boxed| &**boxed),
+            Some(ProviderError::UnknownConnection)
+        ),
         "the primary provider error stays typed on the error chain"
     );
 
