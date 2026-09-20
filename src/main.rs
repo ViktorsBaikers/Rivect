@@ -88,6 +88,16 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Boot diagnostics write to stderr through the locked handle, the same
+/// pattern the terminal cleanup path uses: a closed stderr loses the
+/// line, never panics the open.
+fn report_boot_diagnostic(line: &str) {
+    let mut stderr = io::stderr().lock();
+    if let Err(error) = stderr.write_all(format!("{line}\n").as_bytes()) {
+        std::hint::black_box(error);
+    }
+}
+
 fn default_data_root() -> PathBuf {
     std::env::var_os("RIVECT_DATA_ROOT")
         .map(PathBuf::from)
@@ -108,7 +118,7 @@ fn run_headless(data_root: &Path) -> i32 {
     // Boot recovery verdicts a human must resolve report on stderr —
     // machine stdout stays pure JSON.
     for diagnostic in &runtime.boot_diagnostics {
-        eprintln!("{diagnostic}");
+        report_boot_diagnostic(diagnostic);
     }
     let stdin = io::stdin();
     let mut line = Vec::new();

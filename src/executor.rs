@@ -609,9 +609,20 @@ pub(crate) fn observe_confined_child(
     match observe_confined_child_io(child, stdin, payload, stdout, stderr) {
         Ok(observed) => Ok(observed),
         Err(error) => {
-            // A timeout already terminated the child, so a second
-            // terminate is a no-op; every other path needs it.
-            terminate_confined_child(child);
+            // The terminal verdicts self-terminate inside the io loop:
+            // the timeout arms already ran terminate_confined_child,
+            // and a killed run only reports after the post-exit group
+            // kill and the leader's reap. killpg keys on the leader pid;
+            // once it is reaped and freed it can be recycled as another
+            // process group leader, so a second killpg could signal an
+            // unrelated group. Every other path still needs the
+            // terminate.
+            if !matches!(
+                error,
+                WorkerError::ConfinedRunTimedOut | WorkerError::ConfinedRunKilled { .. }
+            ) {
+                terminate_confined_child(child);
+            }
             Err(match error {
                 WorkerError::SandboxSpawnFailed { source } => {
                     WorkerError::ConfinedRunKilled { source }
@@ -780,6 +791,13 @@ fn confined_run_killed(status: &std::process::ExitStatus) -> WorkerError {
     }
 }
 
+/// The child's exit code, or the killed verdict when a signal ended the
+/// run before any code — one classification the helper verdict paths
+/// share.
+fn helper_exit_code(status: &std::process::ExitStatus) -> Result<i32, WorkerError> {
+    status.code().ok_or_else(|| confined_run_killed(status))
+}
+
 pub(crate) fn helper_confined_read(
     platform: &str,
     profile: &str,
@@ -859,9 +877,7 @@ fn helper_probe_verdict(observed: &ObservedChild, target: &Path) -> Result<(), W
     if let Some(err) = helper_launch_init_failed(observed) {
         return Err(err);
     }
-    let Some(code) = observed.status.code() else {
-        return Err(confined_run_killed(&observed.status));
-    };
+    let code = helper_exit_code(&observed.status)?;
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match code {
         rivect_sandbox_helper::EXIT_OK => Ok(()),
@@ -886,15 +902,18 @@ pub(crate) fn helper_launch_init_failed(observed: &ObservedChild) -> Option<Work
     let from_helper = stderr
         .lines()
         .any(|line| line.starts_with("rivect-sandbox-helper:"));
-    match observed.status.code() {
-        Some(rivect_sandbox_helper::EXIT_SANDBOX_INIT) if from_helper => {
+    let Ok(code) = helper_exit_code(&observed.status) else {
+        return None;
+    };
+    match code {
+        rivect_sandbox_helper::EXIT_SANDBOX_INIT if from_helper => {
             Some(WorkerError::SandboxUnavailable {
                 reason: stderr.into_owned(),
             })
         }
-        Some(rivect_sandbox_helper::EXIT_LAUNCH_EXEC)
-        | Some(rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND)
-        | Some(rivect_sandbox_helper::EXIT_PROTOCOL)
+        rivect_sandbox_helper::EXIT_LAUNCH_EXEC
+        | rivect_sandbox_helper::EXIT_LAUNCH_NOT_FOUND
+        | rivect_sandbox_helper::EXIT_PROTOCOL
             if from_helper =>
         {
             Some(WorkerError::SandboxSpawnFailed {
@@ -909,9 +928,7 @@ fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, Worke
     if let Some(err) = helper_launch_init_failed(&observed) {
         return Err(err);
     }
-    let Some(code) = observed.status.code() else {
-        return Err(confined_run_killed(&observed.status));
-    };
+    let code = helper_exit_code(&observed.status)?;
     let stderr = String::from_utf8_lossy(&observed.stderr).into_owned();
     match code {
         rivect_sandbox_helper::EXIT_OK => Ok(observed.stdout),
@@ -927,7 +944,14 @@ fn helper_io_bytes(observed: ObservedChild, read: bool) -> Result<Vec<u8>, Worke
         rivect_sandbox_helper::EXIT_DATA_IO => Err(WorkerError::WriteFailed {
             source: std::io::Error::other(stderr),
         }),
-        _ => Err(WorkerError::SandboxSpawnFailed {
+        _ if read => Err(WorkerError::SandboxSpawnFailed {
+            source: std::io::Error::other(stderr),
+        }),
+        // An unlisted code on the write leg cannot prove the target is
+        // unmutated — the confined writer may have truncated it and
+        // then died — so it takes the same never-a-clean-rejection
+        // outcome as EXIT_DATA_MUTATED.
+        _ => Err(WorkerError::WriteMutationFailed {
             source: std::io::Error::other(stderr),
         }),
     }
@@ -1722,6 +1746,38 @@ mod tests {
                 Err(WorkerError::WriteFailed { .. })
             ),
             "EXIT_DATA_IO on the write path stays the pre-mutation failure"
+        );
+    }
+
+    #[test]
+    fn helper_write_unlisted_exit_is_mutation_failed() {
+        // An exit code the contract does not bless cannot prove the
+        // write never mutated its target, so the write leg reports the
+        // honest unknown outcome while the read leg stays a capability
+        // failure.
+        let observed = ObservedChild {
+            status: exited(42),
+            stdout: Vec::new(),
+            stderr: b"confined writer died oddly\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_io_bytes(observed, false),
+                Err(WorkerError::WriteMutationFailed { .. })
+            ),
+            "an unlisted write exit is WriteMutationFailed, never a clean rejection"
+        );
+        let observed = ObservedChild {
+            status: exited(42),
+            stdout: Vec::new(),
+            stderr: b"confined reader died oddly\n".to_vec(),
+        };
+        assert!(
+            matches!(
+                helper_io_bytes(observed, true),
+                Err(WorkerError::SandboxSpawnFailed { .. })
+            ),
+            "an unlisted read exit stays a capability failure"
         );
     }
 

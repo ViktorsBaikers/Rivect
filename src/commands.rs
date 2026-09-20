@@ -17,7 +17,7 @@ use crate::state::StoreError;
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,49 +89,61 @@ impl Runtime {
             .iter()
             .filter_map(recovery_diagnostic)
             .collect();
+        // A failed open hands no runtime to any surface, so the
+        // collected verdicts still reach stderr before the error does.
+        let fail_open = |error: OwnerError| -> OwnerError {
+            report_boot_diagnostics(&boot_diagnostics);
+            error
+        };
         let config_path = data_root.join("config.toml");
         let user_toml = match std::fs::File::open(&config_path) {
             Ok(file) => {
                 let mut bytes = Vec::new();
                 file.take((CONFIG_MAX_BYTES as u64) + 1)
                     .read_to_end(&mut bytes)
-                    .map_err(|source| OwnerError::ConfigRead {
-                        path: config_path.clone(),
-                        source,
+                    .map_err(|source| {
+                        fail_open(OwnerError::ConfigRead {
+                            path: config_path.clone(),
+                            source,
+                        })
                     })?;
                 if bytes.len() > CONFIG_MAX_BYTES {
-                    return Err(OwnerError::ConfigTooLarge {
+                    return Err(fail_open(OwnerError::ConfigTooLarge {
                         path: config_path,
                         limit: CONFIG_MAX_BYTES,
-                    });
+                    }));
                 }
-                let text = String::from_utf8(bytes).map_err(|source| OwnerError::ConfigRead {
-                    path: config_path.clone(),
-                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+                let text = String::from_utf8(bytes).map_err(|source| {
+                    fail_open(OwnerError::ConfigRead {
+                        path: config_path.clone(),
+                        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+                    })
                 })?;
                 Some(text)
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
             Err(source) => {
-                return Err(OwnerError::ConfigRead {
+                return Err(fail_open(OwnerError::ConfigRead {
                     path: config_path,
                     source,
-                });
+                }));
             }
         };
         let effective = config::resolve_effective(user_toml.as_deref()).map_err(|source| {
-            OwnerError::Config {
+            fail_open(OwnerError::Config {
                 path: config_path.clone(),
                 source,
-            }
+            })
         })?;
+        let supervisor = Supervisor::new(SupervisorPolicy::default())
+            .map_err(|source| fail_open(source.into()))?;
         Ok(Self {
             owner,
             policy: Policy::default(),
             broker: Broker::new(provider),
             notifications: NotificationQueue::new(8),
             scheduler: Scheduler::new(DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP),
-            supervisor: Supervisor::new(SupervisorPolicy::default())?,
+            supervisor,
             effective,
             purpose: String::new(),
             scope_root: PathBuf::new(),
@@ -584,12 +596,27 @@ fn publication_error(id: Value, err: &config::PublicationError) -> RpcResponse {
     envelope_error(id, code, rpc_code, &err.to_string())
 }
 
+/// Boot diagnostics write to stderr through the locked handle, the same
+/// pattern the terminal cleanup path uses: a closed stderr loses the
+/// line, never panics the open. Reached when an open fails after the
+/// verdicts were collected — a caller that never receives the runtime
+/// never sees the diagnostics field.
+pub(crate) fn report_boot_diagnostics(lines: &[String]) {
+    let mut stderr = std::io::stderr().lock();
+    for line in lines {
+        if let Err(error) = stderr.write_all(format!("{line}\n").as_bytes()) {
+            std::hint::black_box(error);
+        }
+    }
+}
+
 /// One diagnostic line for a recovery verdict a human must resolve:
 /// the verdict token names what the bytes at the target failed to
-/// prove, the sanitized target names where — no control character the
-/// path could carry reaches a terminal — and the resolution names the
-/// retry that settles the row. The healed `ExactlyNew` verdict — our
-/// own write receipted by the boot — stays silent.
+/// prove, the sanitized target names where — every control character
+/// arrives as inert text and a newline as ␤, so one verdict stays one
+/// line — and the resolution names the retry that settles the row. The
+/// healed `ExactlyNew` verdict — our own write receipted by the boot —
+/// stays silent.
 fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String> {
     let verdict = match recovery.verdict {
         config::PublicationVerdict::ExactlyNew => return None,
@@ -603,7 +630,7 @@ fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String>
     Some(format!(
         "publication recovery: {verdict} verdict stays pending at {}; \
          resolution: inspect the target, then re-run the configuration edit that owns the pending publication",
-        crate::resources::sanitize_status_cause(&recovery.intent.target)
+        crate::resources::sanitize_status_cause(&recovery.intent.target).replace('\n', "␤")
     ))
 }
 
@@ -1437,6 +1464,15 @@ mod tests {
             Some(ErrorCode::Denied),
             "a denied managed write surfaces the executor's denied code"
         );
+        assert_eq!(
+            wire_code(&config::PublicationError::Write(
+                WorkerError::WriteMutationFailed {
+                    source: std::io::Error::other("mutated then lost")
+                }
+            )),
+            Some(ErrorCode::OutcomeUnknown),
+            "a post-mutation write failure reports the unknown outcome"
+        );
     }
 
     #[test]
@@ -1521,7 +1557,7 @@ mod tests {
     fn recovery_diagnostic_sanitizes_the_target() {
         let line = recovery_diagnostic(&recovery(
             config::PublicationVerdict::Conflicting,
-            "/data/evil\u{7}\u{1b}[2J.toml",
+            "/data/evil\u{7}\u{1b}[2J\n.toml",
         ));
         let Some(text) = line else {
             unreachable!("an unhealed verdict must surface a diagnostic");
@@ -1535,6 +1571,10 @@ mod tests {
         assert!(
             text.contains("^G"),
             "the bell survives as visible, inert data: {text}"
+        );
+        assert!(
+            text.contains('␤'),
+            "a newline in the target survives as one inert glyph — the diagnostic stays one line: {text}"
         );
     }
 

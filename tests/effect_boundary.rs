@@ -700,6 +700,10 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
         error,
         ExecutorError::Worker(WorkerError::WriteMutationFailed { .. })
     ));
+    assert_eq!(
+        error.error_code(),
+        rivect::contracts::ErrorCode::OutcomeUnknown
+    );
     let attempt_id = world
         .runtime
         .owner
@@ -1074,7 +1078,7 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
         .owner
         .store
         .attempt_record(&admitted.attempt_id)
-        .expect("read attempt")
+        .expect("write attempt")
         .expect("generic write attempt exists");
     assert_eq!(state, "unknown");
 
@@ -1966,14 +1970,14 @@ fn streaming_updates_preserve_scroll_draft_and_dock() {
     // Four PageDown presses on the active stream leave output_scroll at
     // 4 — the same state run_tui's PageUp/PageDown arm produces — so the
     // four head lines are scrolled out of view.
-    view.output_scroll = 4;
+    view.output_scroll.set(4);
     for batch in 1..40 {
         view.output
             .push_chunk(format!("stream batch {batch}\n").as_bytes());
     }
     // Output updates in place; the reader's scroll, the draft and the
     // task dock all survive the update (design-brief §3).
-    assert_eq!(view.output_scroll, 4);
+    assert_eq!(view.output_scroll.get(), 4);
     assert_eq!(view.composer, "draft in progress");
     assert_eq!(
         view.dock,
@@ -2025,7 +2029,7 @@ fn out_of_range_output_scroll_still_renders_the_body() {
     view.output.push_chunk("only output line\n".as_bytes());
     // An offset far past the content — left behind by a taller stream —
     // must clamp to the content bounds instead of rendering nothing.
-    view.output_scroll = u16::MAX;
+    view.output_scroll.set(u16::MAX);
     let screen = rendered_text(&view);
     assert!(
         screen.contains("only output line"),
@@ -2045,7 +2049,7 @@ fn wide_cell_scroll_clamps_to_the_wrapped_bottom() {
             .push_chunk(format!("t{index:02} {}", "あ".repeat(43)).as_bytes());
         view.output.push_chunk("\n".as_bytes());
     }
-    view.output_scroll = u16::MAX;
+    view.output_scroll.set(u16::MAX);
     let screen = rendered_text(&view);
     assert!(
         screen.contains("t11"),
@@ -2073,7 +2077,7 @@ fn grapheme_cluster_scroll_does_not_overrun_the_content() {
             .push_chunk(format!("e{index:02} {}", "e\u{301}".repeat(60)).as_bytes());
         view.output.push_chunk("\n".as_bytes());
     }
-    view.output_scroll = u16::MAX;
+    view.output_scroll.set(u16::MAX);
     let screen = rendered_text(&view);
     assert!(
         screen.contains("e11"),
@@ -2089,11 +2093,15 @@ fn grapheme_cluster_scroll_does_not_overrun_the_content() {
 fn replaced_output_resets_the_scroll_offset() {
     let mut view = initial_view();
     view.output.push_chunk("old stream\n".as_bytes());
-    view.output_scroll = 7;
+    view.output_scroll.set(7);
     let mut next = OutputStream::new();
     next.push_chunk("fresh stream head\n".as_bytes());
     view.replace_output(next);
-    assert_eq!(view.output_scroll, 0, "a replaced stream starts at its top");
+    assert_eq!(
+        view.output_scroll.get(),
+        0,
+        "a replaced stream starts at its top"
+    );
     let screen = rendered_text(&view);
     assert!(
         screen.contains("fresh stream head"),
@@ -2130,6 +2138,62 @@ fn out_of_range_panel_body_scroll_still_renders_the_scope() {
     assert!(
         screen.contains(PANEL_FOOTER_HINT),
         "the footer stays pinned: {screen}"
+    );
+}
+
+#[test]
+fn stored_output_scroll_clamps_back_to_the_rendered_bound() {
+    let mut view = initial_view();
+    for index in 0..60 {
+        view.output
+            .push_chunk(format!("row {index:02}\n").as_bytes());
+    }
+    // A PageDown run past the content bottom leaves the stored offset
+    // out of range; the render clamps the stored offset to the wrapped
+    // bound, so one PageUp visibly moves instead of first walking off
+    // the accumulated overshoot.
+    view.output_scroll.set(u16::MAX);
+    let bottom = rendered_text(&view);
+    assert!(
+        view.output_scroll.get() < u16::MAX && view.output_scroll.get() > 0,
+        "the render clamps the stored offset to the real bound: {}",
+        view.output_scroll.get()
+    );
+    view.output_scroll.update(|offset| offset.saturating_sub(1));
+    let raised = rendered_text(&view);
+    assert_ne!(
+        bottom, raised,
+        "one PageUp after an overshoot visibly moves"
+    );
+}
+
+#[test]
+fn stored_panel_body_scroll_clamps_back_to_the_rendered_bound() {
+    let mut view = initial_view();
+    let scope = (0..40)
+        .map(|index| format!("line-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut panel = PermissionPanel::new(
+        rivect::policy::ModeDecision::Ask,
+        rivect::contracts::EffectClass::Write,
+        "grant-scroll-bound",
+        "task-scroll-fixture",
+        "2036-01-01T00:00:00Z",
+        scope,
+    );
+    for _ in 0..50 {
+        panel.scroll_body(true);
+    }
+    view.panel = Some(panel);
+    let bottom = rendered_text(&view);
+    // The stored body offset is clamped by the render: one PageUp
+    // visibly moves instead of walking off the overshoot.
+    view.panel.as_mut().expect("panel open").scroll_body(false);
+    let raised = rendered_text(&view);
+    assert_ne!(
+        bottom, raised,
+        "one PageUp after an overshoot visibly moves"
     );
 }
 

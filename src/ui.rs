@@ -2,7 +2,7 @@
 //! mouse capture off, terminal restored on exit, cancel and panic. Also owns
 //! the client-side event projection rules.
 
-use crate::commands::{Ingress, Runtime, dispatch_runtime_request};
+use crate::commands::{Ingress, Runtime, dispatch_runtime_request, report_boot_diagnostics};
 use crate::contracts::{CommandId, EffectClass, Event, TEXT_MAX_BYTES};
 use crate::policy::{
     ModeDecision, canonical_egress_target, grant_id_is_key_safe, preapproval_scope,
@@ -26,6 +26,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
 use std::path::Path;
@@ -153,8 +154,11 @@ pub struct LocalView {
     pub output: OutputStream,
     /// Vertical scroll offset of the streaming output body; output
     /// updates never move it, so a reader scrolled into old output
-    /// keeps their place while output updates in place.
-    pub output_scroll: u16,
+    /// keeps their place while output updates in place. `render` clamps
+    /// the stored offset to the wrapped bound each frame — it holds a
+    /// shared borrow of the view, so the write-back goes through `Cell`
+    /// — and a PageDown overshoot can never swallow the next PageUp.
+    pub output_scroll: Cell<u16>,
     /// Open permission panel (modal). The Ask-verdict producer arrives with
     /// the mode-selection carrier; while open, keys route to the panel.
     pub panel: Option<PermissionPanel>,
@@ -166,7 +170,7 @@ impl LocalView {
     /// not carry into content it never described.
     pub fn replace_output(&mut self, output: OutputStream) {
         self.output = output;
-        self.output_scroll = 0;
+        self.output_scroll.set(0);
     }
 }
 
@@ -234,8 +238,10 @@ pub struct PermissionPanel {
     pub scope: String,
     focus: PanelAction,
     /// Vertical scroll offset of the scope body; the header and the
-    /// actions footer never scroll.
-    body_scroll: u16,
+    /// actions footer never scroll. `render` clamps the stored offset
+    /// to the wrapped bound each frame, through `Cell` like
+    /// [`LocalView::output_scroll`].
+    body_scroll: Cell<u16>,
 }
 
 impl PermissionPanel {
@@ -263,7 +269,7 @@ impl PermissionPanel {
             expiry: expiry.into(),
             scope,
             focus: PanelAction::Deny,
-            body_scroll: 0,
+            body_scroll: Cell::new(0),
         }
     }
 
@@ -310,11 +316,13 @@ impl PermissionPanel {
     /// stay pinned, so a body longer than its region never hides the
     /// actions behind the scope.
     pub fn scroll_body(&mut self, down: bool) {
-        self.body_scroll = if down {
-            self.body_scroll.saturating_add(1)
-        } else {
-            self.body_scroll.saturating_sub(1)
-        };
+        self.body_scroll.update(|offset| {
+            if down {
+                offset.saturating_add(1)
+            } else {
+                offset.saturating_sub(1)
+            }
+        });
     }
 
     /// Pinned header: the mandatory fields precede the scope so scarce
@@ -396,7 +404,7 @@ pub fn initial_view() -> LocalView {
         ],
         composer: String::new(),
         output: OutputStream::new(),
-        output_scroll: 0,
+        output_scroll: Cell::new(0),
         panel: None,
     }
 }
@@ -441,18 +449,22 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             // escapes or drops, so the estimate disagrees with the
             // widget's own rows.
             let output_text = sanitize_status_cause(view.output.text());
+            // The render owns the region's width and height, so it owns
+            // the bound: the stored offset is clamped back each frame
+            // and can never run past the content (the overshoot a
+            // PageDown run would otherwise leave swallows the next
+            // PageUp whole).
+            let scroll = clamp_scroll(
+                &output_text,
+                chunks[next].width,
+                chunks[next].height,
+                view.output_scroll.get(),
+            );
+            view.output_scroll.set(scroll);
             frame.render_widget(
                 Paragraph::new(output_text.as_str())
                     .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((
-                        clamp_scroll(
-                            &output_text,
-                            chunks[next].width,
-                            chunks[next].height,
-                            view.output_scroll,
-                        ),
-                        0,
-                    )),
+                    .scroll((scroll, 0)),
                 chunks[next],
             );
             next += 1;
@@ -496,18 +508,17 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             .split(inner);
             frame.render_widget(Paragraph::new(panel.header_text()), regions[0]);
             let body = panel.body_text();
+            let body_scroll = clamp_scroll(
+                &body,
+                regions[1].width,
+                regions[1].height,
+                panel.body_scroll.get(),
+            );
+            panel.body_scroll.set(body_scroll);
             frame.render_widget(
                 Paragraph::new(body.as_str())
                     .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((
-                        clamp_scroll(
-                            &body,
-                            regions[1].width,
-                            regions[1].height,
-                            panel.body_scroll,
-                        ),
-                        0,
-                    )),
+                    .scroll((body_scroll, 0)),
                 regions[1],
             );
             frame.render_widget(Paragraph::new(panel.footer_text()), regions[2]);
@@ -552,6 +563,11 @@ fn output_status_line(output: &OutputStream, panel_open: bool) -> String {
 /// widths, and break decisions — so the clamp neither strands rows
 /// (a short estimate) nor blanks the body (a tall one).
 fn clamp_scroll(text: &str, width: u16, height: u16, offset: u16) -> u16 {
+    // An unscrolled body needs no wrap pass: the clamp can only answer
+    // zero, so skip the per-frame row count on the common path.
+    if offset == 0 {
+        return 0;
+    }
     let rows = wrapped_row_count(text, width.max(1));
     let max = rows.saturating_sub(usize::from(height));
     offset.min(u16::try_from(max).unwrap_or(u16::MAX))
@@ -685,7 +701,7 @@ impl TuiDispatch {
     fn open(data_root: &Path) -> io::Result<Self> {
         let mut runtime = Runtime::open(data_root, Box::new(LoopbackProvider::new()))
             .map_err(|source| io::Error::other(format!("tui runtime open failed: {source}")))?;
-        let result = dispatch_tui_request(
+        let result = match dispatch_tui_request(
             &mut runtime,
             json!({
                 "jsonrpc": "2.0",
@@ -696,7 +712,17 @@ impl TuiDispatch {
                     "bootstrap_id": format!("tui-{}", CommandId::generate()),
                 }
             }),
-        )?;
+        ) {
+            Ok(result) => result,
+            // The runtime is discarded on this path; emit its boot
+            // diagnostics the same best-effort way `Runtime::open` does
+            // on failure, so a verdict a human must resolve is not lost
+            // with the dropped state.
+            Err(error) => {
+                report_boot_diagnostics(&runtime.boot_diagnostics);
+                return Err(error);
+            }
+        };
         let session_id = result
             .get("session_id")
             .and_then(Value::as_str)
@@ -902,8 +928,7 @@ fn append_composer_char(view: &mut LocalView, ch: char) {
 /// them — a verdict that must be resolved cannot ride stderr inside the
 /// alternate screen.
 fn surface_boot_diagnostics(view: &mut LocalView, runtime: &Runtime) {
-    view.transcript
-        .extend(runtime.boot_diagnostics.iter().cloned());
+    view.transcript.extend_from_slice(&runtime.boot_diagnostics);
 }
 
 /// Runs the minimal fullscreen loop. Esc quits normally, Ctrl-C cancels
@@ -968,11 +993,13 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
                 // Streaming output scroll: the reader keeps their place
                 // while output updates in place (design-brief §3).
                 (KeyCode::PageUp | KeyCode::PageDown, _) if view.output.is_active() => {
-                    view.output_scroll = if code == KeyCode::PageDown {
-                        view.output_scroll.saturating_add(1)
-                    } else {
-                        view.output_scroll.saturating_sub(1)
-                    };
+                    view.output_scroll.update(|offset| {
+                        if code == KeyCode::PageDown {
+                            offset.saturating_add(1)
+                        } else {
+                            offset.saturating_sub(1)
+                        }
+                    });
                 }
                 (KeyCode::Enter, _) if !view.composer.is_empty() => {
                     let input = view.composer.clone();
