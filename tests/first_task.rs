@@ -3574,6 +3574,10 @@ fn tui_failed_open_reports_verdict_before_alternate_screen() {
         visible.contains("session open failed"),
         "the transcript records the open failure inside the session: {visible:?}"
     );
+    assert!(
+        visible.contains("publication recovery"),
+        "the carried verdict reaches the transcript inside the session: {visible:?}"
+    );
     let stream = pty.collected();
     let verdict = support::find_subsequence(&stream, b"publication recovery");
     let entered = support::find_subsequence(&stream, b"\x1b[?1049h");

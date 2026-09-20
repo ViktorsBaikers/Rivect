@@ -726,13 +726,16 @@ struct TuiDispatch {
 
 impl TuiDispatch {
     fn open(data_root: &Path) -> Result<Self, TuiOpenError> {
-        // `Runtime::open` already emitted the verdicts it collected to
-        // stderr before failing, so its error carries no diagnostics.
+        // `Runtime::open` already emitted the collected verdicts to
+        // stderr inside the failed open — emitting here would double the
+        // channel — and also carries them on its error, so this arm fills
+        // the same transcript/error channels the sibling arms do for a
+        // discarded runtime.
         let mut runtime =
-            Runtime::open(data_root, Box::new(LoopbackProvider::new())).map_err(|source| {
+            Runtime::open(data_root, Box::new(LoopbackProvider::new())).map_err(|carrier| {
                 TuiOpenError {
-                    error: io::Error::other(format!("tui runtime open failed: {source}")),
-                    boot_diagnostics: Vec::new(),
+                    error: io::Error::other(format!("tui runtime open failed: {carrier}")),
+                    boot_diagnostics: carrier.diagnostics().to_vec(),
                 }
             })?;
         let result = match dispatch_tui_request(
@@ -1007,7 +1010,19 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
             None
         }
     };
-    let mut guard = TerminalGuard::enter()?;
+    let mut guard = match TerminalGuard::enter() {
+        Ok(guard) => guard,
+        // The alternate screen never took the terminal, so stderr is
+        // still the live channel here: a successfully opened runtime's
+        // unresolved verdicts are emitted before the propagating error
+        // drops it.
+        Err(source) => {
+            if let Some(dispatch) = &tui_dispatch {
+                report_boot_diagnostics(&dispatch.runtime.boot_diagnostics);
+            }
+            return Err(source);
+        }
+    };
     let mut exit = 0;
     loop {
         render(guard.terminal_mut(), &view)?;
@@ -1287,19 +1302,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn boot_diagnostics_surface_in_the_transcript() -> Result<(), Box<dyn std::error::Error>> {
+    /// Stages one pending publication row under a fresh temp root, then
+    /// opens the runtime that must collect its unresolved verdict at
+    /// boot. A pending journal row survives boot as an unresolved
+    /// verdict, which the runtime must surface on whichever screen the
+    /// human is watching; the owner store lives under `runtime/` — the
+    /// path `Owner::elect` opens — so the staged row is visible to
+    /// `Runtime::open`.
+    fn staged_verdict_runtime(
+        tag: &str,
+    ) -> Result<crate::commands::Runtime, Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
-            "rivect-ui-boot-diag-{}",
+            "rivect-ui-{tag}-{}",
             crate::contracts::CommandId::generate()
         ));
         std::fs::create_dir_all(&root)?;
         let target = root.join("config.toml");
         std::fs::write(&target, BOOT_CONFIG)?;
-        // A pending journal row survives boot as an unresolved verdict, which
-        // the runtime must surface on whichever screen the human is watching.
-        // The owner store lives under `runtime/` — the path `Owner::elect`
-        // opens — so the staged row is visible to `Runtime::open`.
         let runtime_dir = root.join("runtime");
         std::fs::create_dir_all(&runtime_dir)?;
         let mut store = crate::state::TaskStore::open(&runtime_dir.join("rivect.db"))?;
@@ -1307,7 +1326,15 @@ mod tests {
         let edit = parsed.set("workflow.enabled", crate::config::ConfigValue::Bool(false))?;
         crate::config::stage_publication(&mut store, "cli", &target, &edit)?;
         drop(store);
-        let runtime = crate::commands::Runtime::open(&root, Box::new(LoopbackProvider::new()))?;
+        Ok(crate::commands::Runtime::open(
+            &root,
+            Box::new(LoopbackProvider::new()),
+        )?)
+    }
+
+    #[test]
+    fn boot_diagnostics_surface_in_the_transcript() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = staged_verdict_runtime("boot-diag")?;
         assert_eq!(
             runtime.boot_diagnostics.len(),
             1,
@@ -1328,23 +1355,7 @@ mod tests {
     #[test]
     fn failed_open_drains_carried_verdicts_into_the_transcript()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = std::env::temp_dir().join(format!(
-            "rivect-ui-open-drain-{}",
-            crate::contracts::CommandId::generate()
-        ));
-        std::fs::create_dir_all(&root)?;
-        let target = root.join("config.toml");
-        std::fs::write(&target, BOOT_CONFIG)?;
-        // Same staged pending row as the boot-diagnostics pin: one
-        // unresolved verdict the runtime collects at open.
-        let runtime_dir = root.join("runtime");
-        std::fs::create_dir_all(&runtime_dir)?;
-        let mut store = crate::state::TaskStore::open(&runtime_dir.join("rivect.db"))?;
-        let mut parsed = crate::config::Config::parse_validated(BOOT_CONFIG)?;
-        let edit = parsed.set("workflow.enabled", crate::config::ConfigValue::Bool(false))?;
-        crate::config::stage_publication(&mut store, "cli", &target, &edit)?;
-        drop(store);
-        let runtime = crate::commands::Runtime::open(&root, Box::new(LoopbackProvider::new()))?;
+        let runtime = staged_verdict_runtime("open-drain")?;
         assert_eq!(runtime.boot_diagnostics.len(), 1);
         // The failed-open arm owes the operator the dropped runtime's
         // verdicts on the transcript surface, ahead of its own error line.

@@ -754,7 +754,8 @@ fn drain_nonblocking_pipe<T: Read>(
 /// group already killed, so a re-fired killpg would key on a freed pid
 /// — and a mid-drain loss reports the same [`WorkerError::ConfinedRunKilled`]
 /// the outer remap would produce, never a `SandboxSpawnFailed` that
-/// escapes the terminate skip.
+/// escapes the terminate skip. The remap below owns that guarantee, not
+/// the helper's current body: only terminal variants leave this loop.
 fn drain_pipe_to_eof<T: Read>(
     pipe: &mut Option<T>,
     retained: &mut Vec<u8>,
@@ -768,7 +769,15 @@ fn drain_pipe_to_eof<T: Read>(
         }
         drain_nonblocking_pipe(pipe, retained, scratch, cap).map_err(|error| match error {
             WorkerError::SandboxSpawnFailed { source } => WorkerError::ConfinedRunKilled { source },
-            other => other,
+            // Only a terminal verdict may escape a post-reap drain — any
+            // other variant re-arms `terminate_confined_child` on the
+            // freed leader pgid — so a non-terminal failure folds into
+            // the same killed verdict a mid-drain loss reports.
+            terminal @ (WorkerError::ConfinedRunTimedOut
+            | WorkerError::ConfinedRunKilled { .. }) => terminal,
+            other => WorkerError::ConfinedRunKilled {
+                source: std::io::Error::other(other.to_string()),
+            },
         })?;
         if pipe.is_some() {
             std::thread::yield_now();
@@ -1640,13 +1649,14 @@ pub fn write_once(
 #[cfg(test)]
 mod tests {
     use super::{
-        EffectRequest, ObservedChild, WorkerError, helper_io_bytes, helper_launch_init_failed,
-        helper_probe_verdict, observe_confined_child, require_helper_file, sandbox_denied,
-        spawn_failed,
+        CONFINED_DEADLINE, EffectRequest, ObservedChild, WorkerError, drain_pipe_to_eof,
+        helper_io_bytes, helper_launch_init_failed, helper_probe_verdict, observe_confined_child,
+        require_helper_file, sandbox_denied, spawn_failed,
     };
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{ExitStatus, Stdio};
+    use std::time::Instant;
 
     fn exited(code: i32) -> ExitStatus {
         ExitStatus::from_raw(code << 8)
@@ -1906,6 +1916,68 @@ mod tests {
         let status = child.wait()?;
         assert_eq!(status.code(), Some(0), "the reaped status is the exit");
         Ok(())
+    }
+
+    /// A pipe read that always fails: the post-reap drain must report
+    /// the loss as the killed run it is — never `SandboxSpawnFailed`,
+    /// which would escape the terminate skip and re-fire killpg on the
+    /// freed leader pgid.
+    struct FailingRead;
+
+    impl std::io::Read for FailingRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("pipe read failed"))
+        }
+    }
+
+    /// A pipe whose write end never closes: reads `WouldBlock` forever,
+    /// so only the wall deadline ends the drain.
+    struct PendingRead;
+
+    impl std::io::Read for PendingRead {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    #[test]
+    fn post_reap_drain_read_failure_is_confined_run_killed() {
+        let mut pipe = Some(FailingRead);
+        let result = drain_pipe_to_eof(
+            &mut pipe,
+            &mut Vec::new(),
+            &mut [0u8; 64],
+            64,
+            Instant::now() + CONFINED_DEADLINE,
+        );
+        match result {
+            Err(WorkerError::ConfinedRunKilled { source }) => {
+                // The verbatim source — not the folded display text —
+                // proves the dedicated `SandboxSpawnFailed` arm ran.
+                assert_eq!(source.to_string(), "pipe read failed");
+            }
+            other => {
+                unreachable!("a mid-drain loss after the reap is ConfinedRunKilled, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn post_reap_drain_held_open_past_deadline_is_timed_out() {
+        let mut pipe = Some(PendingRead);
+        // The already-elapsed deadline fires on the first loop check —
+        // the stub read under it would never produce EOF.
+        let result = drain_pipe_to_eof(
+            &mut pipe,
+            &mut Vec::new(),
+            &mut [0u8; 64],
+            64,
+            Instant::now(),
+        );
+        assert!(
+            matches!(result, Err(WorkerError::ConfinedRunTimedOut)),
+            "a write end held past the deadline is ConfinedRunTimedOut, got {result:?}"
+        );
     }
 
     #[test]

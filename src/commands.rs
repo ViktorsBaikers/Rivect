@@ -63,7 +63,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn open(data_root: &Path, provider: Box<dyn Provider>) -> Result<Self, OwnerError> {
+    pub fn open(data_root: &Path, provider: Box<dyn Provider>) -> Result<Self, OpenError> {
         #[cfg(target_os = "linux")]
         let worker: Box<dyn crate::executor::ReadWorker> =
             Box::new(crate::executor::linux::LinuxWorker);
@@ -77,7 +77,7 @@ impl Runtime {
         data_root: &Path,
         provider: Box<dyn Provider>,
         read_worker: Box<dyn crate::executor::ReadWorker>,
-    ) -> Result<Self, OwnerError> {
+    ) -> Result<Self, OpenError> {
         let mut owner = Owner::elect(data_root)?;
         // Boot recovery: a crash between the managed write and its receipt
         // leaves one pending row; receipt exactly the writes attributable
@@ -85,15 +85,18 @@ impl Runtime {
         // Every verdict a human must resolve is collected into
         // `boot_diagnostics` — each surface reports the lines its own
         // way — while the receipted rows stay silent.
-        let boot_diagnostics: Vec<String> = config::recover_publications(&mut owner.store)?
+        let boot_diagnostics: Vec<String> = config::recover_publications(&mut owner.store)
+            .map_err(OwnerError::from)?
             .iter()
             .filter_map(recovery_diagnostic)
             .collect();
         // A failed open hands no runtime to any surface, so the
-        // collected verdicts still reach stderr before the error does.
-        let fail_open = |error: OwnerError| -> OwnerError {
+        // collected verdicts still reach stderr before the error does —
+        // and ride the error itself, so a caller whose stderr is a dead
+        // channel can still hand them to a live one.
+        let fail_open = |error: OwnerError| -> OpenError {
             report_boot_diagnostics(&boot_diagnostics);
-            error
+            OpenError::new(error, boot_diagnostics.clone())
         };
         let config_path = data_root.join("config.toml");
         let user_toml = match std::fs::File::open(&config_path) {
@@ -172,6 +175,46 @@ impl Runtime {
 
     pub fn goal_bytes(&self, task_id: &TaskId) -> Vec<u8> {
         self.owner.store.goal_bytes(task_id).unwrap_or_default()
+    }
+}
+
+/// A failed [`Runtime::open`] still owes the operator the boot verdicts
+/// collected before the failure — a failed open hands no runtime to any
+/// surface, so they ride the error. Each surface routes them to the
+/// channel it owns: the transcript while the TUI holds the terminal, the
+/// propagated error text after the guard restores it. `Display` forwards
+/// the underlying failure; the verdicts are a separate channel, not
+/// error prose.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub struct OpenError {
+    cause: OwnerError,
+    diagnostics: Vec<String>,
+}
+
+impl OpenError {
+    fn new(cause: OwnerError, diagnostics: Vec<String>) -> Self {
+        Self { cause, diagnostics }
+    }
+
+    /// The boot verdicts collected before the failure — already
+    /// sanitized one-line strings like [`Runtime::boot_diagnostics`].
+    /// Empty when the failure preceded collection.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// The underlying open failure, for callers owning an
+    /// [`OwnerError`]-typed surface.
+    pub fn into_source(self) -> OwnerError {
+        self.cause
+    }
+}
+
+impl From<OwnerError> for OpenError {
+    /// A failure before verdict collection has nothing to carry.
+    fn from(source: OwnerError) -> Self {
+        Self::new(source, Vec::new())
     }
 }
 
@@ -600,7 +643,7 @@ fn publication_error(id: Value, err: &config::PublicationError) -> RpcResponse {
 /// pattern the terminal cleanup path uses: a closed stderr loses the
 /// line, never panics the open. Reached when an open fails after the
 /// verdicts were collected — a caller that never receives the runtime
-/// never sees the diagnostics field.
+/// finds them on [`OpenError`] instead.
 pub(crate) fn report_boot_diagnostics(lines: &[String]) {
     let mut stderr = std::io::stderr().lock();
     for line in lines {

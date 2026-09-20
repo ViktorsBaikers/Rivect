@@ -110,8 +110,12 @@ fn default_data_root() -> PathBuf {
 fn run_headless(data_root: &Path) -> i32 {
     let mut runtime = match Runtime::open(data_root, Box::new(LoopbackProvider::new())) {
         Ok(runtime) => runtime,
-        Err(source) => {
-            eprintln!("{}", CliError::Owner(source));
+        // The failed open already emitted the collected verdicts to
+        // stderr and carries them for surfaces that need their own
+        // channel — headless stderr is that channel, so only the source
+        // failure joins the error line.
+        Err(carrier) => {
+            eprintln!("{}", CliError::Owner(carrier.into_source()));
             return 1;
         }
     };
