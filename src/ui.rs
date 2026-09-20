@@ -692,15 +692,49 @@ fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Val
         .ok_or_else(|| io::Error::other("tui response omitted result"))
 }
 
+/// A failed open still owes the operator the boot verdicts the dropped
+/// runtime collected: they ride the error so the caller surfaces them on
+/// a channel that is actually visible — the transcript while the
+/// alternate screen owns the terminal, the propagated error text after
+/// the guard restores it.
+struct TuiOpenError {
+    error: io::Error,
+    boot_diagnostics: Vec<String>,
+}
+
+impl TuiOpenError {
+    /// The propagated error is the only channel left once the guard
+    /// restores the screen, so the carried verdicts fold into its text —
+    /// each already sanitized to a single line at the recovery boundary.
+    fn into_io_error(self) -> io::Error {
+        if self.boot_diagnostics.is_empty() {
+            return self.error;
+        }
+        let mut text = self.error.to_string();
+        for line in &self.boot_diagnostics {
+            text.push('\n');
+            text.push_str(line);
+        }
+        io::Error::other(text)
+    }
+}
+
 struct TuiDispatch {
     runtime: Runtime,
     session_id: String,
 }
 
 impl TuiDispatch {
-    fn open(data_root: &Path) -> io::Result<Self> {
-        let mut runtime = Runtime::open(data_root, Box::new(LoopbackProvider::new()))
-            .map_err(|source| io::Error::other(format!("tui runtime open failed: {source}")))?;
+    fn open(data_root: &Path) -> Result<Self, TuiOpenError> {
+        // `Runtime::open` already emitted the verdicts it collected to
+        // stderr before failing, so its error carries no diagnostics.
+        let mut runtime =
+            Runtime::open(data_root, Box::new(LoopbackProvider::new())).map_err(|source| {
+                TuiOpenError {
+                    error: io::Error::other(format!("tui runtime open failed: {source}")),
+                    boot_diagnostics: Vec::new(),
+                }
+            })?;
         let result = match dispatch_tui_request(
             &mut runtime,
             json!({
@@ -716,18 +750,30 @@ impl TuiDispatch {
             Ok(result) => result,
             // The runtime is discarded on this path; emit its boot
             // diagnostics the same best-effort way `Runtime::open` does
-            // on failure, so a verdict a human must resolve is not lost
-            // with the dropped state.
+            // on failure, and carry them on the error too — whether
+            // stderr is visible depends on the alternate screen, which
+            // only the caller knows.
             Err(error) => {
                 report_boot_diagnostics(&runtime.boot_diagnostics);
-                return Err(error);
+                return Err(TuiOpenError {
+                    error,
+                    boot_diagnostics: std::mem::take(&mut runtime.boot_diagnostics),
+                });
             }
         };
-        let session_id = result
+        let Some(session_id) = result
             .get("session_id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| io::Error::other("tui session.open omitted session_id"))?;
+        else {
+            // Same obligation as the dispatch arm: the dropped runtime
+            // must not take its unresolved verdicts with it.
+            report_boot_diagnostics(&runtime.boot_diagnostics);
+            return Err(TuiOpenError {
+                error: io::Error::other("tui session.open omitted session_id"),
+                boot_diagnostics: std::mem::take(&mut runtime.boot_diagnostics),
+            });
+        };
         Ok(Self {
             runtime,
             session_id,
@@ -931,29 +977,37 @@ fn surface_boot_diagnostics(view: &mut LocalView, runtime: &Runtime) {
     view.transcript.extend_from_slice(&runtime.boot_diagnostics);
 }
 
+/// A failed open's carried verdicts join the transcript ahead of the
+/// error line itself: the operator reads what must be resolved on the
+/// same surface the TUI keeps painting.
+fn note_open_failure(view: &mut LocalView, failure: &TuiOpenError) {
+    view.transcript.extend_from_slice(&failure.boot_diagnostics);
+    view.transcript.push(format!(
+        "session open failed: {}",
+        sanitize_status_cause(&failure.error.to_string())
+    ));
+}
+
 /// Runs the minimal fullscreen loop. Esc quits normally, Ctrl-C cancels
 /// (exit 130). The guard guarantees terminal restoration on both paths and on
 /// panic.
 pub fn run_tui(data_root: &Path) -> io::Result<i32> {
-    let mut guard = TerminalGuard::enter()?;
     let mut view = initial_view();
-    // Open the dispatch eagerly so boot recovery verdicts land in the
-    // transcript at startup; a failed open leaves the lazy retry on
-    // first submit, the same arm as before — and the transcript keeps
-    // this first sighting honest instead of swallowing it.
+    // The eager open completes before the alternate screen: open does no
+    // tty I/O, so a failed open's stderr verdicts stay on the primary
+    // screen — and the transcript records them for the operator who
+    // watches the degraded session that follows.
     let mut tui_dispatch = match TuiDispatch::open(data_root) {
         Ok(dispatch) => {
             surface_boot_diagnostics(&mut view, &dispatch.runtime);
             Some(dispatch)
         }
-        Err(error) => {
-            view.transcript.push(format!(
-                "session open failed: {}",
-                sanitize_status_cause(&error.to_string())
-            ));
+        Err(failure) => {
+            note_open_failure(&mut view, &failure);
             None
         }
     };
+    let mut guard = TerminalGuard::enter()?;
     let mut exit = 0;
     loop {
         render(guard.terminal_mut(), &view)?;
@@ -1008,7 +1062,14 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
                         view.composer.clear();
                     } else {
                         if tui_dispatch.is_none() {
-                            let dispatch = TuiDispatch::open(data_root)?;
+                            let dispatch = match TuiDispatch::open(data_root) {
+                                Ok(dispatch) => dispatch,
+                                // The alternate screen owns the terminal,
+                                // so stderr is a dead channel: the carried
+                                // verdicts fold into the propagated error
+                                // and print after the guard restores.
+                                Err(failure) => return Err(failure.into_io_error()),
+                            };
                             surface_boot_diagnostics(&mut view, &dispatch.runtime);
                             tui_dispatch = Some(dispatch);
                         }
@@ -1079,8 +1140,9 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, append_composer_char,
-        initial_view, output_status_line, surface_boot_diagnostics, task_dock, wrapped_row_count,
+        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError,
+        append_composer_char, initial_view, note_open_failure, output_status_line,
+        surface_boot_diagnostics, task_dock, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, TEXT_MAX_BYTES};
     use serde_json::json;
@@ -1148,7 +1210,7 @@ mod tests {
             crate::contracts::CommandId::generate()
         ));
         std::fs::create_dir_all(&root)?;
-        let mut dispatch = TuiDispatch::open(&root)?;
+        let mut dispatch = TuiDispatch::open(&root).map_err(TuiOpenError::into_io_error)?;
         for index in 0..PAGE_MAX {
             dispatch.submit(&format!("page-max-task-{index}"))?;
         }
@@ -1259,6 +1321,58 @@ mod tests {
                 .any(|line| line.contains("publication recovery") && line.contains("resolution")),
             "the verdict and its resolution reach the transcript: {:?}",
             view.transcript
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_open_drains_carried_verdicts_into_the_transcript()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "rivect-ui-open-drain-{}",
+            crate::contracts::CommandId::generate()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let target = root.join("config.toml");
+        std::fs::write(&target, BOOT_CONFIG)?;
+        // Same staged pending row as the boot-diagnostics pin: one
+        // unresolved verdict the runtime collects at open.
+        let runtime_dir = root.join("runtime");
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut store = crate::state::TaskStore::open(&runtime_dir.join("rivect.db"))?;
+        let mut parsed = crate::config::Config::parse_validated(BOOT_CONFIG)?;
+        let edit = parsed.set("workflow.enabled", crate::config::ConfigValue::Bool(false))?;
+        crate::config::stage_publication(&mut store, "cli", &target, &edit)?;
+        drop(store);
+        let runtime = crate::commands::Runtime::open(&root, Box::new(LoopbackProvider::new()))?;
+        assert_eq!(runtime.boot_diagnostics.len(), 1);
+        // The failed-open arm owes the operator the dropped runtime's
+        // verdicts on the transcript surface, ahead of its own error line.
+        let failure = TuiOpenError {
+            error: std::io::Error::other("tui runtime open failed: staged"),
+            boot_diagnostics: runtime.boot_diagnostics,
+        };
+        let mut view = initial_view();
+        note_open_failure(&mut view, &failure);
+        let verdict = view
+            .transcript
+            .iter()
+            .position(|line| line.contains("publication recovery") && line.contains("resolution"));
+        let error_line = view
+            .transcript
+            .iter()
+            .position(|line| line.contains("session open failed"));
+        assert!(
+            matches!((verdict, error_line), (Some(v), Some(e)) if v < e),
+            "the carried verdict lands ahead of the error line: {:?}",
+            view.transcript
+        );
+        // And the propagated form keeps the lines for the post-restore
+        // stderr print.
+        let text = failure.into_io_error().to_string();
+        assert!(
+            text.contains("publication recovery") && text.contains("tui runtime open failed"),
+            "the propagated error still carries the verdict: {text}"
         );
         Ok(())
     }

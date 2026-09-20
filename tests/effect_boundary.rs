@@ -808,7 +808,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
         .owner
         .store
         .attempt_record(&attempt_id)
-        .expect("read attempt")
+        .expect("write attempt")
         .expect("managed write attempt exists");
     // The killed confined child may already have landed bytes — a
     // timed-out write settles unknown, never a clean rejection.
@@ -945,7 +945,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
         .owner
         .store
         .attempt_record(&attempt_id)
-        .expect("read attempt")
+        .expect("write attempt")
         .expect("managed write attempt exists");
     // The signal-killed confined child may already have landed bytes —
     // a mutating write settles unknown, never a clean rejection.

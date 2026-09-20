@@ -609,14 +609,15 @@ pub(crate) fn observe_confined_child(
     match observe_confined_child_io(child, stdin, payload, stdout, stderr) {
         Ok(observed) => Ok(observed),
         Err(error) => {
-            // The terminal verdicts self-terminate inside the io loop:
-            // the timeout arms already ran terminate_confined_child,
-            // and a killed run only reports after the post-exit group
-            // kill and the leader's reap. killpg keys on the leader pid;
-            // once it is reaped and freed it can be recycled as another
-            // process group leader, so a second killpg could signal an
-            // unrelated group. Every other path still needs the
-            // terminate.
+            // Terminal verdicts are exactly the paths that no longer
+            // need terminate: the pre-exit timeout arm already ran
+            // terminate_confined_child, and post-reap outcomes — a
+            // killed run, a timed-out or failed post-exit drain — only
+            // exist after the leader was reaped and its process group
+            // killed. killpg keys on the leader pid; once it is reaped
+            // and freed it can be recycled as another process group
+            // leader, so a second killpg could signal an unrelated
+            // group. Every pre-reap failure still needs the terminate.
             if !matches!(
                 error,
                 WorkerError::ConfinedRunTimedOut | WorkerError::ConfinedRunKilled { .. }
@@ -679,7 +680,6 @@ fn observe_confined_child_io(
                     &mut scratch,
                     READ_MAX_CAP,
                     deadline,
-                    child,
                 )?;
                 drain_pipe_to_eof(
                     &mut stderr,
@@ -687,7 +687,6 @@ fn observe_confined_child_io(
                     &mut scratch,
                     STDERR_RETAIN_BYTES,
                     deadline,
-                    child,
                 )?;
                 // A signal ended the run before it produced a verdict:
                 // the spawn already succeeded, so this is a capability
@@ -751,20 +750,26 @@ fn drain_nonblocking_pipe<T: Read>(
 /// bytes then return and the pipe hits EOF. A write end still held
 /// after that kill (outside the group) keeps `WouldBlock` until the
 /// wall deadline, which surfaces [`WorkerError::ConfinedRunTimedOut`].
+/// Nothing here terminates again: the leader is already reaped and its
+/// group already killed, so a re-fired killpg would key on a freed pid
+/// — and a mid-drain loss reports the same [`WorkerError::ConfinedRunKilled`]
+/// the outer remap would produce, never a `SandboxSpawnFailed` that
+/// escapes the terminate skip.
 fn drain_pipe_to_eof<T: Read>(
     pipe: &mut Option<T>,
     retained: &mut Vec<u8>,
     scratch: &mut [u8],
     cap: usize,
     deadline: Instant,
-    child: &mut Child,
 ) -> Result<(), WorkerError> {
     while pipe.is_some() {
         if Instant::now() >= deadline {
-            terminate_confined_child(child);
             return Err(WorkerError::ConfinedRunTimedOut);
         }
-        drain_nonblocking_pipe(pipe, retained, scratch, cap)?;
+        drain_nonblocking_pipe(pipe, retained, scratch, cap).map_err(|error| match error {
+            WorkerError::SandboxSpawnFailed { source } => WorkerError::ConfinedRunKilled { source },
+            other => other,
+        })?;
         if pipe.is_some() {
             std::thread::yield_now();
         }

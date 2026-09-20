@@ -26,12 +26,12 @@ use rivect::ui::{ApplyVerdict, Projection};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use support::{
     World, answer_custom, corpus_answer_custom, corpus_answer_option, corpus_config_read,
     corpus_create, corpus_question_current, corpus_status, corpus_steer, open_world, rivect_binary,
-    spawn_pty,
+    spawn_pty, spawn_pty_with_args,
 };
 
 fn scoped_world(tag: &str, config: Option<&str>) -> (World, PathBuf, PathBuf, String) {
@@ -3185,7 +3185,7 @@ fn tui_data_root_flag_overrides_environment() {
     let flag_root = support::temp_dir("tui-flag-root");
     let env_root = support::temp_dir("tui-env-root");
     let flag_text = flag_root.to_string_lossy().to_string();
-    let mut pty = support::spawn_pty_with_args(
+    let mut pty = spawn_pty_with_args(
         &rivect_binary(),
         24,
         80,
@@ -3212,7 +3212,7 @@ fn tui_data_root_flag_overrides_environment() {
     );
 
     let env_only_root = support::temp_dir("tui-env-only-root");
-    let mut env_only = support::spawn_pty_with_args(
+    let mut env_only = spawn_pty_with_args(
         &rivect_binary(),
         24,
         80,
@@ -3513,6 +3513,80 @@ fn headless_classifies_oversized_non_utf8_frame_as_limit() {
     assert!(
         !stderr.contains("stdin failed"),
         "oversized non-utf8 input must not be classified as stdin failure: {stderr:?}"
+    );
+}
+
+/// Stages one pending publication row under `root`'s owner store, then
+/// breaks the config so `Runtime::open` collects the verdict and fails:
+/// the failed-open drain must still hand the line to an operator-visible
+/// channel on every surface.
+fn stage_pending_verdict_then_broken_config(root: &Path) {
+    let target = root.join("config.toml");
+    std::fs::write(&target, support::base_config()).expect("seed config");
+    // The owner store lives under `runtime/` — the path `Owner::elect`
+    // opens — so the staged row is visible to `Runtime::open`.
+    let runtime_dir = root.join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    let mut store =
+        rivect::state::TaskStore::open(&runtime_dir.join("rivect.db")).expect("open store");
+    let mut parsed =
+        rivect::config::Config::parse_validated(&support::base_config()).expect("valid config");
+    let edit = parsed
+        .set("workflow.enabled", rivect::config::ConfigValue::Bool(false))
+        .expect("workflow edit");
+    rivect::config::stage_publication(&mut store, "cli", &target, &edit)
+        .expect("stage publication intent");
+    drop(store);
+    std::fs::write(&target, b"[workflow\n").expect("malformed config");
+}
+
+#[test]
+fn headless_failed_open_reports_verdict_before_error() {
+    let data_root = support::temp_dir("headless-open-verdict");
+    stage_pending_verdict_then_broken_config(&data_root);
+    let output = std::process::Command::new(rivect_binary())
+        .arg("--headless")
+        .arg("--data-root")
+        .arg(&data_root)
+        .env_clear()
+        .output()
+        .expect("run headless");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let verdict = stderr.find("publication recovery");
+    let failure = stderr.find("runtime open failed");
+    assert!(
+        matches!((verdict, failure), (Some(v), Some(f)) if v < f),
+        "the pending verdict must reach stderr ahead of the open error: {stderr}"
+    );
+}
+
+#[test]
+fn tui_failed_open_reports_verdict_before_alternate_screen() {
+    let data_root = support::temp_dir("pty-open-verdict");
+    stage_pending_verdict_then_broken_config(&data_root);
+    let mut pty = spawn_pty_with_args(&rivect_binary(), 24, 80, &data_root, &data_root, &[]);
+    // The degraded session still enters the alternate screen and renders
+    // the open failure on its transcript — asserted on the reconstructed
+    // screen, since the renderer emits positioned words, not raw lines.
+    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10));
+    assert!(
+        visible.contains("session open failed"),
+        "the transcript records the open failure inside the session: {visible:?}"
+    );
+    let stream = pty.collected();
+    let verdict = support::find_subsequence(&stream, b"publication recovery");
+    let entered = support::find_subsequence(&stream, b"\x1b[?1049h");
+    assert!(
+        matches!((verdict, entered), (Some(v), Some(e)) if v < e),
+        "the pending verdict must reach the terminal before the alternate screen takes it: {:?}",
+        String::from_utf8_lossy(&stream)
+    );
+    pty.send(&[0x1b]);
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)),
+        Some(0),
+        "Esc leaves the degraded session normally"
     );
 }
 
