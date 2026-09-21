@@ -1,13 +1,15 @@
-//! The `custom-chat-completions` and `aiand` connections' adapter —
-//! the OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
-//! HZN-008 class S and class A). Dialect selection keys on the
-//! literal connection id, never an auth label, an endpoint shape or
-//! a catalogue answer: every compatible host a deployment wires
-//! under `custom-chat-completions` shares the one recorded generic
-//! contract, while `aiand` carries its own recorded predicates —
-//! the `/v1` base normalization and the org-scoped catalogue
-//! transform — resolved per literal id by the contract table, never
-//! inherited across ids. The adapter authors no
+//! The `custom-chat-completions`, `aiand` and `aimlapi` connections'
+//! adapter — the OpenAI-compatible Chat Completions dialect
+//! (DEC-007/DEC-025, HZN-008 class S and class A). Dialect selection
+//! keys on the literal connection id, never an auth label, an
+//! endpoint shape or a catalogue answer: every compatible host a
+//! deployment wires under `custom-chat-completions` shares the one
+//! recorded generic contract, while `aiand` and `aimlapi` carry their
+//! own recorded predicates — the `/v1` base normalization and the
+//! org-scoped catalogue transform on `aiand`, the default-host
+//! endpoint rule and the chat-id catalogue filter on `aimlapi` —
+//! resolved per literal id by the contract table, never inherited
+//! across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -101,10 +103,38 @@ const AIAND_MODELS: &[&str] = &[
 /// endpoint resolves to under the recorded base normalization.
 const AIAND_DEFAULT_BASE_URL: &str = "https://api.aiand.com/v1";
 
+/// The recorded default API root of an `aimlapi` connection
+/// (`aimlApiModelManagerOptions`'s `defaultBaseUrl`): the host the
+/// recorded `config?.baseUrl ?? defaultBaseUrl` fallback resolves.
+/// Our schema's `endpoint` field is required, so its empty string is
+/// the upstream absent-override case.
+const AIMLAPI_DEFAULT_BASE_URL: &str = "https://api.aimlapi.com/v1";
+
+/// The recorded endpoint rule a literal id binds (HZN-008): the
+/// dialect is shared across connection ids — how a configured
+/// endpoint becomes the API root is not.
+enum EndpointRule {
+    /// The configured origin is the API base verbatim, trailing
+    /// slashes trimmed (`custom-chat-completions` binds egress to the
+    /// configured origin and records no fixed host).
+    Verbatim,
+    /// `aiand`'s `normalizeAiandBaseUrl`: a bare configured base gains
+    /// the `/v1` tail, an empty one resolves the recorded default
+    /// host.
+    NormalizedV1Root,
+    /// `aimlapi`'s `config?.baseUrl ?? defaultBaseUrl` under the
+    /// discovery client's `normalizeBaseUrl` — the configured base
+    /// trimmed, a single trailing slash stripped — with the required
+    /// field's empty string standing for the absent override the
+    /// `??` fallback covers: the recorded default host.
+    ConfiguredElseDefault,
+}
+
 /// The recorded per-entry transform a `data[]` listing runs
-/// (HZN-008): the generic class carries model ids only, while
+/// (HZN-008): the generic class carries model ids only,
 /// `aiand`'s org-scoped listing applies the recorded
-/// capability/effort/currency map (`mapAiandModel`).
+/// capability/effort/currency map (`mapAiandModel`), and `aimlapi`'s
+/// applies the recorded chat-id filter to a defaults-only surface.
 enum EntryRule {
     /// Every non-empty `id` verbatim — the generic class records no
     /// per-model metadata surface.
@@ -114,6 +144,14 @@ enum EntryRule {
     /// onto the effort ladder, and the org's billing currency decides
     /// whether the stated per-1M-token price lands.
     Aiand,
+    /// The `aimlapi` transform: the id must pass the recorded chat-id
+    /// filter (`isLikelyAimlApiChatModelId` — the provider's
+    /// `exclude-models` roster drops the media and embedding SKUs the
+    /// chat surface cannot serve); an admitted id lands the defaults
+    /// surface alone — `mapWithBundledReference` hydrates a listing
+    /// entry only through a bundled reference index this adapter does
+    /// not carry, so the listing states the id alone.
+    Aimlapi,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -124,14 +162,9 @@ struct SourceContract {
     /// The recorded static-seed model ids merging into the listing as
     /// the offer floor — empty where the class records no seed.
     seed: &'static [&'static str],
-    /// `true` — the configured endpoint normalizes onto the recorded
-    /// `/v1` API root (`aiand`'s `normalizeAiandBaseUrl`: a bare
-    /// configured base gains the `/v1` tail, an empty one resolves to
-    /// the recorded default host); `false` — the configured origin is
-    /// the API base verbatim, trailing slashes trimmed
-    /// (`custom-chat-completions` binds egress to the configured
-    /// origin and records no fixed host).
-    normalized_v1_root: bool,
+    /// The recorded endpoint rule the configured `endpoint` resolves
+    /// under.
+    endpoint: EndpointRule,
     /// The recorded per-entry transform over `data[]` entries.
     entries: EntryRule,
 }
@@ -146,13 +179,22 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
     match connection {
         "custom-chat-completions" => Some(SourceContract {
             seed: &[],
-            normalized_v1_root: false,
+            endpoint: EndpointRule::Verbatim,
             entries: EntryRule::IdsOnly,
         }),
         "aiand" => Some(SourceContract {
             seed: AIAND_MODELS,
-            normalized_v1_root: true,
+            endpoint: EndpointRule::NormalizedV1Root,
             entries: EntryRule::Aiand,
+        }),
+        // `aimlApiModelManagerOptions`: no static seed, the
+        // configured-or-default host rule and the chat-id listing
+        // filter — the account's shared balance is an account-level
+        // fact the recorded contract gives no wire surface.
+        "aimlapi" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::ConfiguredElseDefault,
+            entries: EntryRule::Aimlapi,
         }),
         _ => None,
     }
@@ -162,20 +204,33 @@ impl SourceContract {
     /// The connection's API root under the recorded endpoint rule:
     /// egress stays bound to the configured endpoint — the `aiand`
     /// normalization only supplies the `/v1` tail a configured base
-    /// lacks, and the recorded default host for an empty one.
+    /// lacks, and each recorded default host covers an empty one.
     fn endpoint(&self, configured: &str) -> String {
-        if !self.normalized_v1_root {
-            return configured.trim_end_matches('/').to_string();
-        }
-        let trimmed = configured.trim();
-        if trimmed.is_empty() {
-            return AIAND_DEFAULT_BASE_URL.to_string();
-        }
-        let base = trimmed.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            base.to_string()
-        } else {
-            format!("{base}/v1")
+        match self.endpoint {
+            EndpointRule::Verbatim => configured.trim_end_matches('/').to_string(),
+            EndpointRule::NormalizedV1Root => {
+                let trimmed = configured.trim();
+                if trimmed.is_empty() {
+                    return AIAND_DEFAULT_BASE_URL.to_string();
+                }
+                let base = trimmed.trim_end_matches('/');
+                if base.ends_with("/v1") {
+                    base.to_string()
+                } else {
+                    format!("{base}/v1")
+                }
+            }
+            EndpointRule::ConfiguredElseDefault => {
+                // `normalizeBaseUrl`: the configured base trimmed, one
+                // trailing slash stripped — never a `/v1` append; the
+                // empty string is the upstream absent-override case
+                // the recorded `?? defaultBaseUrl` covers.
+                let trimmed = configured.trim();
+                if trimmed.is_empty() {
+                    return AIMLAPI_DEFAULT_BASE_URL.to_string();
+                }
+                trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
+            }
         }
     }
 }
@@ -473,19 +528,27 @@ impl ChatCompletionsProvider {
 
     /// One `data[]` entry under the literal id's recorded transform —
     /// `None` when the entry names no usable id: an empty or absent
-    /// id can never name a model.
+    /// id can never name a model, and an `aimlapi` id the recorded
+    /// `exclude-models` roster names is filtered before offer.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         let id = entry
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())?;
-        Some(match self.contract.entries {
-            EntryRule::IdsOnly => CatalogModel {
+        match self.contract.entries {
+            EntryRule::IdsOnly => Some(CatalogModel {
                 id: id.to_string(),
                 ..CatalogModel::default()
-            },
-            EntryRule::Aiand => aiand_entry(id, entry),
-        })
+            }),
+            EntryRule::Aiand => Some(aiand_entry(id, entry)),
+            // `filterModel` runs on the mapped model's id — verbatim
+            // `entry.id` here, the mapped id `mapWithBundledReference`
+            // keeps — so the recorded filter applies to the listed id.
+            EntryRule::Aimlapi => is_likely_aimlapi_chat_id(id).then(|| CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+        }
     }
 
     /// Reads the credential material for this send — the only place
@@ -1213,6 +1276,55 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
         context_window: positive_count(entry.get("context_window")),
         price: aiand_price(entry),
     }
+}
+
+/// The recorded `aimlapi` exclusion tokens (`rules/runtime/
+/// behavior.kdl`, `exclude-models provider="aimlapi"`): an id whose
+/// lowercase alphanumeric runs name one is a media/embedding SKU the
+/// chat surface cannot serve. The match runs on bounded `[^a-z0-9]+`
+/// segments, not plain substrings — a `...-video-...` segment drops
+/// while `video` inside `videoservice` survives.
+const AIMLAPI_EXCLUDED_TOKENS: &[&str] = &[
+    "audio",
+    "embed",
+    "embedding",
+    "embeddings",
+    "i2i",
+    "i2v",
+    "image",
+    "speech",
+    "t2i",
+    "t2v",
+    "tts",
+    "video",
+];
+
+/// The recorded `aimlapi` exclusion substrings (same rule): media
+/// family names matched inside the lowercase id.
+const AIMLAPI_EXCLUDED_SUBSTRINGS: &[&str] = &[
+    "dall-e", "dalle", "flux", "imagen", "sora", "veo", "whisper",
+];
+
+/// The recorded `aimlapi` chat-id filter
+/// (`isLikelyAimlApiChatModelId` → `isExcludedModel`, openai-compat.ts
+/// §6.4): the id is trimmed and lowered, then dropped when the
+/// `exclude-models` rule matches — a substring hit, or a `token` hit
+/// against the id's alphanumeric runs (`matchesList` splits
+/// `[^a-z0-9]+`). Every other non-empty listed id is offered.
+fn is_likely_aimlapi_chat_id(id: &str) -> bool {
+    let normalized = id.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if AIMLAPI_EXCLUDED_SUBSTRINGS
+        .iter()
+        .any(|sub| normalized.contains(sub))
+    {
+        return false;
+    }
+    !normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| AIMLAPI_EXCLUDED_TOKENS.contains(&part))
 }
 
 impl std::fmt::Debug for ChatCompletionsProvider {

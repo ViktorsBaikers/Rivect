@@ -1,18 +1,19 @@
-//! Provider proof legs for three literal connection ids whose source
+//! Provider proof legs for four literal connection ids whose source
 //! classes resolve through this offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
-//! custom-chat-completions, abliteration, aiand): the configured
-//! literal `custom-chat-completions` connection returns a verified
-//! model outcome through the standard Broker against the
+//! custom-chat-completions, abliteration, aiand, aimlapi): the
+//! configured literal `custom-chat-completions` connection returns a
+//! verified model outcome through the standard Broker against the
 //! source-derived `chat/completions` peer, `abliteration` does the
 //! same through the shared SLICE-016 Responses adapter, and `aiand`
-//! through the shared Chat Completions adapter — no copied codec —
-//! as localhost wiremock fixtures, no OMP, no user adapter, no real
-//! host. The shared SSE parser's WHATWG §9.2.5–9.2.6 conformance is
-//! pinned in provider_openai.rs; this file pins the Chat Completions
-//! dialect surface plus the abliteration and aiand per-connection
-//! predicates on top of it. TP-PROVIDER-INSTALLED::<id> stays
-//! NOT_RUN — the ignored named cases carry that status explicitly.
+//! and `aimlapi` through the shared Chat Completions adapter — no
+//! copied codec — as localhost wiremock fixtures, no OMP, no user
+//! adapter, no real host. The shared SSE parser's WHATWG
+//! §9.2.5–9.2.6 conformance is pinned in provider_openai.rs; this file
+//! pins the Chat Completions dialect surface plus the abliteration,
+//! aiand and aimlapi per-connection predicates on top of it.
+//! TP-PROVIDER-INSTALLED::<id> stays NOT_RUN — the ignored named cases
+//! carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -4746,3 +4747,810 @@ async fn aiand_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::aiand = NOT_RUN"]
 fn provider_installed_aiand() {}
+
+// ----- aimlapi ---------------------------------------------------------------
+//
+// The `aimlapi` connection's proof legs (HZN-008 class A): the shared
+// Chat Completions adapter serves the literal id — no copied codec —
+// under the connection's own recorded predicates
+// (`aimlApiModelManagerOptions`, openai-compat.ts §6.4). The
+// configured endpoint is the API base verbatim under the recorded
+// `normalizeBaseUrl` — trimmed, a single trailing slash stripped —
+// and an empty one resolves the recorded default
+// `api.aimlapi.com/v1`, the `config?.baseUrl ?? defaultBaseUrl` absent
+// case our required `endpoint` field expresses as the empty string.
+// The `/models` listing is authoritative (`dynamicModelsAuthoritative`)
+// and passes the recorded chat-id filter
+// (`isLikelyAimlApiChatModelId` — the provider's `exclude-models`
+// roster drops the media/embedding SKUs the chat surface cannot
+// serve); an admitted id lands the defaults surface alone, since
+// `mapWithBundledReference` reads listing fields only through a
+// bundled reference index this adapter does not carry. All keys share
+// one account balance per the recorded contract — an account-level
+// fact with no listing field and no balance endpoint, so the adapter
+// never reads one and never spends a second egress leg on it.
+
+/// The scoped credential ref the `aimlapi` connection binds.
+const AIMLAPI_REF: &str = "keyring:rivect-test/aimlapi";
+
+/// The pinned model id the fixed-pin `aimlapi` legs carry — the
+/// recorded `defaultModel` of the catalogue descriptors.
+const AIMLAPI_MODEL: &str = "gpt-5.5-2026-04-23";
+
+/// One configured `aimlapi` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim — the recorded
+/// `api.aimlapi.com/v1` carries its `/v1` segment the same way.
+fn aimlapi_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.aimlapi]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{AIMLAPI_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"aimlapi\", model_id = \"{AIMLAPI_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn aimlapi_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIMLAPI_REF, SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "aimlapi".to_string(), store.clone())
+        .expect("the shared adapter builds for the aimlapi id");
+    (provider, store)
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the `aimlapi` pin.
+fn prepared_aimlapi(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+    let (provider, _store) = aimlapi_provider(config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the aimlapi pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+// ----- TP-PROVIDER-WIRE::aimlapi --------------------------------------------
+
+/// A configured `aimlapi` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — pinned model, system+user messages,
+/// `stream` with `stream_options.include_usage`, the declared tool
+/// surface as function tools and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn aimlapi_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: prove the wire");
+
+    let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SECRET),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(AIMLAPI_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["tools"],
+        json!([{
+            "type": "function",
+            "function": {"name": "read_file", "description": "", "parameters": {"type": "object"}},
+        }]),
+        "the declared tool surface maps to function tools verbatim"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "aimlapi");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/aimlapi", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds no
+/// adapter — a Chat-Completions-classed id is reserved for its own
+/// named contract arm — `dialect_for` reserving `aimlapi` means the
+/// id is never fixture-served even when it declares `local` kind, and
+/// a manifest pinning a different connection id is refused at send.
+#[test]
+fn aimlapi_dialect_is_keyed_on_the_literal_connection_id() {
+    let config = Config::parse_validated(&aimlapi_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "aimlapi-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `aimlapi` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.aimlapi]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"aimlapi\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("aimlapi").expect("declared");
+    assert!(
+        !loopback.serves("aimlapi", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send
+    let (provider, _store) = aimlapi_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{AIMLAPI_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/aimlapi", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::aimlapi -----------------------------------------
+
+/// `GET /models` is the authoritative listing for `aimlapi`
+/// (`dynamicModelsAuthoritative`, no recorded static seed): the
+/// configured endpoint is the API base verbatim under the recorded
+/// `normalizeBaseUrl` — never normalized onto a `/v1` root the way
+/// `aiand`'s arm records — and every listed entry passes the recorded
+/// chat-id filter before offer. `isLikelyAimlApiChatModelId`
+/// normalizes (trim, lowercase), rejects empty, and drops the ids the
+/// provider's `exclude-models` roster names — token matches on
+/// `[^a-z0-9]+` segments, substring matches — while an admitted id
+/// lands the defaults surface alone: `mapWithBundledReference` reads
+/// the entry's name/limits only through a bundled reference index
+/// this adapter does not carry, so neither a stated price nor the
+/// account's shared balance — an account-level fact the listing never
+/// carries — lands as a field.
+#[tokio::test]
+async fn aimlapi_models_listing_filters_chat_models_and_shares_account_balance() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // chat ids — admitted, offered verbatim
+            json!({"id": AIMLAPI_MODEL}),
+            json!({"id": "openai/gpt-5.5-mini"}),
+            // token-roster exclusions: the media/embedding SKUs the
+            // chat surface cannot serve — `audio`, `embed`,
+            // `embedding`, `embeddings`, `i2i`, `i2v`, `image`,
+            // `speech`, `t2i`, `t2v`, `tts`, `video` as whole
+            // `[^a-z0-9]+` segments — one id pins each member
+            json!({"id": "openai/tts-1"}),
+            json!({"id": "x/speech-1"}),
+            json!({"id": "openai/text-embedding-3-large"}),
+            json!({"id": "x/embed-1"}),
+            json!({"id": "x/embeddings-1"}),
+            json!({"id": "stabilityai/sdxl-t2i"}),
+            json!({"id": "x/i2i"}),
+            json!({"id": "aiml/video-kling-i2v"}),
+            json!({"id": "x/t2v"}),
+            json!({"id": "assemblyai/audio-sense"}),
+            json!({"id": "google/image-gen-4"}),
+            // substring-roster exclusions: `dall-e`, `dalle`, `flux`,
+            // `imagen`, `sora`, `veo`, `whisper` anywhere in the id
+            json!({"id": "openai/dall-e-3"}),
+            json!({"id": "x/dalle-mini"}),
+            json!({"id": "black-forest-labs/flux-1.1-pro"}),
+            json!({"id": "google/imagen-4"}),
+            json!({"id": "openai/sora-2"}),
+            json!({"id": "google/veo-3"}),
+            json!({"id": "openai/whisper-1"}),
+            // the roster's bounded tokens keep chat ids from
+            // false-matching on plain substrings: `embedded` is not the
+            // `embed`/`embedding` token and no substring covers it
+            json!({"id": "vendor/embedded-chat-7b"}),
+            // normalization is recorded inside the predicate: a
+            // spaced, uppercased media id still fails the filter
+            json!({"id": "  OpenAI/WHISPER-2  "}),
+            // the shared account balance is an account-level fact the
+            // listing never carries: fields naming a balance, a
+            // currency, per-model prices or limits are not a surface
+            // this dialect reads — none of them lands
+            json!({
+                "id": "priced-chat",
+                "balance": "12.50",
+                "currency": "usd",
+                "input_per_1m": "1",
+                "output_per_1m": "2",
+                "context_length": 262144,
+            }),
+            // a raw-empty id drops upstream in `catalog_entry`'s
+            // `!id.is_empty()`; a whitespace-only id survives that
+            // check and the predicate's trim-to-empty arm drops it —
+            // neither, nor an entry with no id, reaches the pool
+            json!({"id": ""}),
+            json!({"id": "   "}),
+            json!({"owned_by": "nobody"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = aimlapi_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the filtered listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec![
+            AIMLAPI_MODEL,
+            "openai/gpt-5.5-mini",
+            "priced-chat",
+            "vendor/embedded-chat-7b",
+        ],
+        "the authoritative listing filters to chat ids, sorted"
+    );
+    // every admitted id lands the defaults surface — price stays
+    // `Unknown`, no field the listing stated is adopted: the shared
+    // account balance has no landing spot and is never invented
+    for id in [
+        AIMLAPI_MODEL,
+        "openai/gpt-5.5-mini",
+        "priced-chat",
+        "vendor/embedded-chat-7b",
+    ] {
+        assert_eq!(
+            models.iter().find(|model| model.id == id),
+            Some(&CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+            "{id}: the listing states the id alone — balance and metadata stay unread"
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — no balance endpoint is consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+
+    // the configured endpoint is verbatim, never normalized onto a
+    // `/v1` root the way `aiand`'s recorded rule does: a bare origin
+    // serves its listing at `/models`, and a single trailing slash is
+    // the recorded strip
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"object": "list", "data": [{"id": "plain-chat"}]})),
+        )
+        .mount(&server)
+        .await;
+    let bare = Config::parse_validated(&aimlapi_config(&server.uri())).expect("valid");
+    let (provider, _store) = aimlapi_provider(&bare);
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        model_ids(&catalog.expect("the bare-origin listing answers")),
+        vec!["plain-chat"]
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests[0].url.path(),
+        "/models",
+        "the aimlapi arm hits the configured origin verbatim"
+    );
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "trailing-chat"})]).await;
+    let slashed =
+        Config::parse_validated(&aimlapi_config(&format!("{}/v1/", server.uri()))).expect("valid");
+    let (provider, _store) = aimlapi_provider(&slashed);
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        model_ids(&catalog.expect("the slashed-origin listing answers")),
+        vec!["trailing-chat"]
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/models",
+        "one trailing slash is stripped — the recorded normalizeBaseUrl"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default host —
+/// the `config?.baseUrl ?? defaultBaseUrl` absent arm, which our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded `normalizeBaseUrl`
+/// trim. Offline pin: the adapter's `Debug` surface reports the
+/// resolved endpoint, so the arm is proved without one byte toward
+/// `api.aimlapi.com` — the host the bearer credential would egress to.
+#[test]
+fn aimlapi_empty_endpoint_resolves_the_recorded_default_host() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&aimlapi_config(endpoint)).expect("an empty endpoint is valid");
+        let (provider, _store) = aimlapi_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.aimlapi.com/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default host: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+// ----- TP-PROVIDER-AUTH::aimlapi --------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `aimlapi`: a configured region — the recorded contract names none —
+/// the profile-bound ref whose scope disagrees with the binding, an
+/// absent credential and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn aimlapi_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server)).replace(
+        "kind = \"api_key\"",
+        "kind = \"api_key\"\nregion = \"eu-1\"",
+    ))
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "aimlapi".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "aimlapi");
+    assert_eq!(region, "eu-1");
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aimlapi]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"aimlapi\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "aimlapi".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "aimlapi".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIMLAPI_REF, SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "aimlapi".to_string(), store).expect("builds");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, reason } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "aimlapi");
+    assert!(
+        reason.contains("401"),
+        "the status code is the context: {reason}"
+    );
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIMLAPI_REF, SECRET)],
+    ));
+    let provider =
+        provider_result(config.clone(), "aimlapi".to_string(), store).expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(SECRET),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: debug surfaces");
+    assert!(
+        !format!("{manifest:?}").contains(SECRET),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(SECRET),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(SECRET),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-aimlapi",
+        Some(&aimlapi_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(SECRET),
+        "runtime Debug never carries credential material"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::aimlapi ----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling material at the scope
+/// admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn aimlapi_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "aimlapi".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(AIMLAPI_REF, SECRET.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The auto-pick catalogue leg rides the filtered catalogue: the
+/// dispatch narrows the pool to the `aimlapi` winner and the shared
+/// adapter resolves the deterministic sorted-first id of the filtered
+/// listing as the wire model — a listing whose every id the roster
+/// excludes names no model, and the send denies unpinned rather than
+/// offering a non-chat id.
+#[tokio::test]
+async fn aimlapi_auto_pick_resolves_through_the_filtered_catalog() {
+    let server = MockServer::start().await;
+    // a rostered id sorts ahead of the admitted id yet never enters
+    // the pick — the filtered listing alone names the wire model, so
+    // the leg proves filter-before-pick rather than ordering luck
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "0-media/whisper-1"}),
+            json!({"id": "a-listed-chat-model"}),
+        ],
+    )
+    .await;
+    mount_chat(&server, completed_stream("auto pick", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aimlapi]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{AIMLAPI_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_aimlapi(&auto, "/world/aimlapi", "goal: auto pick");
+    let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
+    outcome.expect("the auto send resolves through the catalogue");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    let send = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("the send crossed the wire");
+    let body: Value = serde_json::from_slice(&send.body).expect("json body");
+    assert_eq!(
+        body["model"], "a-listed-chat-model",
+        "the sorted-first filtered id rides the wire"
+    );
+
+    // a listing whose every id is rostered names no model — the send
+    // denies unpinned, and the chat endpoint is never reached
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "openai/whisper-1"})]).await;
+    mount_chat(&server, completed_stream("unreachable", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aimlapi]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{AIMLAPI_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_aimlapi(&auto, "/world/aimlapi", "goal: empty pick");
+    let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnpinnedModel { .. }))
+        ),
+        "a fully filtered listing denies unpinned: {outcome:?}"
+    );
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/v1/chat/completions"),
+        "no send crosses the wire without a model the filter admitted"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `aimlapi`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside
+/// this run, and INSTALLED reports NOT_RUN — an omitted leg fails the
+/// suite rather than silently absenting.
+#[tokio::test]
+async fn aimlapi_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": AIMLAPI_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the filtered authoritative listing answers through the
+    // credential seam — no seed merges, the listed id is the offer.
+    let (provider, _) = aimlapi_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref models) if model_ids(models) == [AIMLAPI_MODEL]) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "aimlapi".to_string(), empty).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: matrix wire");
+    let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "aimlapi".to_string(), empty.clone()).expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(AIMLAPI_REF, SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_aimlapi` case below: its ignored count is
+    // the explicit NOT_RUN signal this matrix asserts — the row stays
+    // a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::aimlapi ----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::aimlapi = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::aimlapi = NOT_RUN"]
+fn provider_installed_aimlapi() {}
