@@ -1,17 +1,19 @@
-//! The `openai` connection's adapter — the OpenAI Responses dialect
-//! (DEC-007/DEC-025, HZN-008). Dialect selection keys on the literal
-//! connection id, never an auth label or a catalogue answer, and
-//! `openai-codex` is a distinct literal id with its own recorded
-//! class. The adapter authors no async code — [`Provider::send`] is
+//! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
+//! the literal connection ids `openai` and `abliteration` record this
+//! dialect. Dialect selection keys on the literal connection id,
+//! never an auth label or a catalogue answer, and `openai-codex` is
+//! a distinct literal id with its own recorded class. The adapter
+//! authors no async code — [`Provider::send`] is
 //! a blocking single-shot seam and Tokio appears only inside reqwest's
 //! blocking client plus the dev-dependency test harness — and
 //! `store: false` is sent verbatim on
 //! every request: an explicit wire field, not a zero-retention claim.
 //! Because the provider keeps no server-side state, cross-turn
 //! context replays through the lineage the adapter holds (DEC-012),
-//! and `include = ["reasoning.encrypted_content"]` rides the same body:
-//! without it the peer returns reasoning items without the artifact the
-//! replay contract needs (SRC-019/D-006).
+//! and `include = ["reasoning.encrypted_content"]` rides the same body
+//! where the recorded peer returns reasoning items with the artifact
+//! the replay contract needs (SRC-019/D-006) — a connection whose
+//! recorded compat says the peer never returns them never asks.
 //! Secret material crosses only from [`CredentialStore`] into the
 //! `Authorization` header per send — never into config, manifests,
 //! diagnostics or this type's `Debug` (INV-001/INV-006).
@@ -49,11 +51,75 @@ const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 /// the same budget as a streamed response.
 const CATALOG_MAX_BYTES: usize = 1024 * 1024;
 
-/// The recorded source sample of Responses-capable model ids this
-/// dialect's catalogue surface filters `/models` to (HZN-008): the
-/// static sample the offline contract pins — live discovery is a
-/// later leg.
+/// The recorded source sample of Responses-capable model ids the
+/// `openai` connection's catalogue surface filters `/models` to
+/// (HZN-008): the static sample the offline contract pins — live
+/// discovery is a later leg.
 const RESPONSES_MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "o4-mini", "o3"];
+
+/// The recorded static seed of `abliteration` model ids (HZN-008,
+/// `ABLITERATION_STATIC_MODELS`): the merge floor the catalogue
+/// unions over the authoritative `/models` listing — a seeded id
+/// offers even when the listing omits it. The recorded source seeded
+/// them so generation and first boot could offer models with no live
+/// key; that rationale stays upstream's — this adapter resolves a
+/// credential before any catalogue call, so the seed's role here is
+/// the floor, never a keyless offer path.
+const ABLITERATION_MODELS: &[&str] = &[
+    "abliterated-model",
+    "abliterated-model-large",
+    "abliterated-model-large-v2",
+];
+
+/// The predicates the recorded source class binds to a literal
+/// Responses id (HZN-008): the dialect is shared across connection
+/// ids — the catalogue rule and the reasoning-artifact surface are
+/// not. The `abliteration` compat's recorded `stream-idle-timeout-ms
+/// 0` maps to construction rather than a field: the stream read loop
+/// runs no per-read idle watchdog, so a peer idling between chunks
+/// mid reasoning turn is bounded only by the whole-call `deadline` —
+/// the predicate holds by the loop's shape for every id.
+struct SourceContract {
+    /// The static source-sample model ids the connection offers.
+    seed: &'static [&'static str],
+    /// `true` — `/models` is authoritative and `seed` merges on top
+    /// of the listing as the offer floor (`abliteration`: the
+    /// recorded model manager marks the listing authoritative while
+    /// the recorded seed's ids stay offered even when the listing
+    /// omits them); `false` — the listing filters to `seed`
+    /// (`openai`: the recorded sample is the offer set).
+    authoritative_models: bool,
+    /// `true` — the request asks for the `reasoning.encrypted_content`
+    /// artifact the replay contract carries (SRC-019/D-006); `false`
+    /// — the recorded peer compat marks the gateway as never
+    /// returning encrypted reasoning items, so the include is never
+    /// requested (`abliteration`: every model reasons intrinsically —
+    /// `reasoning: true` forced in the recorded mapper — and none
+    /// returns a replayable artifact).
+    reasoning_artifact: bool,
+}
+
+/// The recorded per-connection contract for a Responses id
+/// (DEC-007/DEC-025): `build` denies every id without the recorded
+/// Responses class before this lookup runs, and an id the dialect map
+/// admits but this table does not name resolves `None` — denied the
+/// same way. A further Responses id records its own predicates as a
+/// named arm here, never inherits another's.
+fn contract_for(connection: &str) -> Option<SourceContract> {
+    match connection {
+        "openai" => Some(SourceContract {
+            seed: RESPONSES_MODELS,
+            authoritative_models: false,
+            reasoning_artifact: true,
+        }),
+        "abliteration" => Some(SourceContract {
+            seed: ABLITERATION_MODELS,
+            authoritative_models: true,
+            reasoning_artifact: false,
+        }),
+        _ => None,
+    }
+}
 
 /// The manifest-bound session/epoch a replay set belongs to
 /// (DEC-012): keyed by the frozen execution world, purpose and epoch
@@ -86,13 +152,17 @@ struct StreamState {
     terminal: Option<Terminal>,
 }
 
-/// The `openai` Responses adapter. Constructed per connection from the
+/// The shared Responses adapter. Constructed per connection from the
 /// validated config; the broker owns the handle — workers never hold
 /// one.
 pub struct OpenAiProvider {
     /// The literal connection id this adapter serves — the dialect
     /// key, not a label.
     connection: String,
+    /// The recorded per-connection predicates (HZN-008): resolved
+    /// from the literal id at build and never re-keyed — the dialect
+    /// is shared, the contract is not.
+    contract: SourceContract,
     /// The configured endpoint base, trailing slashes trimmed.
     endpoint: String,
     /// The scoped credential binding resolved under DEC-013
@@ -169,6 +239,12 @@ impl OpenAiProvider {
                 connection: connection.to_string(),
             });
         }
+        // A Responses-classed id without its own recorded contract arm
+        // is denied the same way — the predicates are recorded per
+        // literal id, never inherited silently.
+        let contract = contract_for(connection).ok_or(ProviderError::DialectMismatch {
+            connection: connection.to_string(),
+        })?;
         let conn = config
             .connections
             .get(connection)
@@ -194,6 +270,7 @@ impl OpenAiProvider {
             })?;
         Ok(Self {
             connection: connection.to_string(),
+            contract,
             endpoint: conn.endpoint.trim_end_matches('/').to_string(),
             credential,
             store,
@@ -205,9 +282,11 @@ impl OpenAiProvider {
     }
 
     /// The model catalogue for this connection (HZN-008): `GET
-    /// /models` filtered to the recorded Responses-capable sample —
-    /// ids the dialect cannot serve are never offered, returned in
-    /// deterministic sorted order.
+    /// /models` under the literal id's recorded rule — `openai`
+    /// filters the listing to the recorded Responses-capable sample,
+    /// `abliteration` treats the listing as authoritative and merges
+    /// its static source seed on top — returned in deterministic
+    /// sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -258,13 +337,31 @@ impl OpenAiProvider {
         let Some(data) = body.get("data").and_then(Value::as_array) else {
             return Err(self.violation("models payload carries no data array"));
         };
+        // The catalogue rule is the literal id's recorded contract
+        // (HZN-008): `openai` filters the listing to the recorded
+        // sample — ids the dialect does not serve are never offered —
+        // while `abliteration` treats the listing as authoritative:
+        // every non-empty id offers, and the recorded seed merges on
+        // top as the offer floor.
         let mut ids: Vec<String> = data
             .iter()
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-            .filter(|id| RESPONSES_MODELS.contains(id))
+            .filter(|id| {
+                if self.contract.authoritative_models {
+                    !id.is_empty()
+                } else {
+                    self.contract.seed.contains(id)
+                }
+            })
             .map(str::to_string)
             .collect();
-        ids.sort();
+        if self.contract.authoritative_models {
+            ids.extend(self.contract.seed.iter().map(|id| (*id).to_string()));
+            ids.sort();
+            ids.dedup();
+        } else {
+            ids.sort();
+        }
         Ok(ids)
     }
 
@@ -281,8 +378,8 @@ impl OpenAiProvider {
     /// The frozen manifest as the Responses wire request (AC-013):
     /// model pin, instructions and the declared tool surface verbatim,
     /// `store: false` and `stream: true` always,
-    /// `include = ["reasoning.encrypted_content"]` so the peer returns
-    /// the reasoning artifact the replay contract carries
+    /// `include = ["reasoning.encrypted_content"]` where the recorded
+    /// peer returns the reasoning artifact the replay contract carries
     /// (SRC-019/D-006), the pinned effort on the reasoning surface,
     /// and the epoch's recorded output items replayed ahead of the new
     /// input — the stateless replay the `store: false` contract
@@ -315,8 +412,15 @@ impl OpenAiProvider {
             "input": input,
             "store": false,
             "stream": true,
-            "include": ["reasoning.encrypted_content"],
         });
+        // The replay-artifact include rides only where the recorded
+        // peer returns encrypted reasoning items (SRC-019/D-006): the
+        // `abliteration` gateway never does — its recorded compat
+        // marks `include-encrypted-reasoning #false` and every model
+        // reasons intrinsically — so its request never asks.
+        if self.contract.reasoning_artifact {
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
         if let EffortAssign::Fixed { value } = &manifest.effort {
             body["reasoning"] = json!({ "effort": value.name() });
         }
@@ -579,17 +683,32 @@ impl OpenAiProvider {
                         path: args.get("path").and_then(Value::as_str).map(str::to_string),
                     });
                 }
-                // DEC-012: a reasoning item must carry the opaque
-                // artifact the lineage contract needs — absent content
-                // is a provenance failure, never a silent drop.
+                // DEC-012: where the recorded peer returns the replay
+                // artifact, a reasoning item must carry the opaque
+                // `encrypted_content` the lineage contract needs —
+                // absent content is a provenance failure, never a
+                // silent drop. Where the recorded peer never returns
+                // it, a blobless item is the peer's normal shape —
+                // observed, then excluded from the lineage below since
+                // there is no artifact to replay under — while any
+                // `encrypted_content` member it does carry is
+                // off-contract foreign material, the same denial.
                 "reasoning" => {
-                    let Some(blob) = item.get("encrypted_content").and_then(Value::as_str) else {
+                    if self.contract.reasoning_artifact {
+                        let Some(blob) = item.get("encrypted_content").and_then(Value::as_str)
+                        else {
+                            return Err(ProviderError::ReasoningProvenance {
+                                connection: self.connection.clone(),
+                                reason: "a reasoning item carried no encrypted_content".to_string(),
+                            });
+                        };
+                        blobs.push(blob.to_string());
+                    } else if item.get("encrypted_content").is_some() {
                         return Err(ProviderError::ReasoningProvenance {
                             connection: self.connection.clone(),
-                            reason: "a reasoning item carried no encrypted_content".to_string(),
+                            reason: "a reasoning item carried an artifact the recorded peer never returns".to_string(),
                         });
-                    };
-                    blobs.push(blob.to_string());
+                    }
                 }
                 // A well-formed item the dialect cannot honour —
                 // server-side tool kinds the request never declared.
@@ -638,10 +757,18 @@ impl OpenAiProvider {
             manifest.purpose.clone(),
             manifest.epoch_id.clone(),
         );
-        self.lineages
-            .entry(key)
-            .or_default()
-            .extend(output.iter().cloned());
+        // Under the no-artifact contract a reasoning item carries
+        // nothing the stateless replay can adopt — it never joins the
+        // lineage (a blobbed one was already refused above).
+        self.lineages.entry(key).or_default().extend(
+            output
+                .iter()
+                .filter(|item| {
+                    self.contract.reasoning_artifact
+                        || item.get("type").and_then(Value::as_str) != Some("reasoning")
+                })
+                .cloned(),
+        );
         for blob in blobs {
             self.blob_owner.insert(blob, claim.clone());
         }
@@ -793,7 +920,8 @@ impl Provider for OpenAiProvider {
         // single-member auto pool naming this connection is an
         // explicit pick of it — the pick pins the connection, and the
         // live catalogue names the model: the deterministic
-        // sorted-first Responses-capable id it answers, the recorded
+        // sorted-first id it answers under the connection's recorded
+        // catalogue rule, the recorded
         // auto semantic of resolving the model at catalogue time. Any
         // other assignment is a model this adapter cannot pin.
         let fixed = match &manifest.model {

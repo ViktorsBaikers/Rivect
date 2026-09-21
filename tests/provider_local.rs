@@ -1,15 +1,17 @@
-//! OpenAI-compatible Chat Completions provider proof legs
+//! Provider proof legs for two literal connection ids whose source
+//! classes resolve through this offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
-//! custom-chat-completions): the configured literal
+//! custom-chat-completions, abliteration): the configured literal
 //! `custom-chat-completions` connection returns a verified model
-//! outcome through the standard Broker — the real synchronous adapter
-//! against the source-derived `chat/completions` peer as localhost
-//! wiremock fixtures, no OMP, no user adapter, no real host. The
-//! shared SSE parser's WHATWG §9.2.5–9.2.6 conformance is pinned in
-//! provider_openai.rs; this file pins the Chat Completions dialect
-//! surface on top of it. TP-PROVIDER-INSTALLED::custom-chat-completions
-//! stays NOT_RUN — the ignored named case carries that status
-//! explicitly.
+//! outcome through the standard Broker against the source-derived
+//! `chat/completions` peer, and `abliteration` does the same through
+//! the shared SLICE-016 Responses adapter — no copied codec — as
+//! localhost wiremock fixtures, no OMP, no user adapter, no real
+//! host. The shared SSE parser's WHATWG §9.2.5–9.2.6 conformance is
+//! pinned in provider_openai.rs; this file pins the Chat Completions
+//! dialect surface and the abliteration per-connection predicates on
+//! top of it. TP-PROVIDER-INSTALLED::<id> stays NOT_RUN — the
+//! ignored named cases carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -24,10 +26,11 @@
 use rivect::config::Config;
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::ChatCompletionsProvider;
+use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::{CredentialStore, Provider, ProviderError, SecretRef, StoreKind};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
@@ -221,14 +224,12 @@ fn drop_blocking<T: Send + 'static>(value: T) {
 
 /// A bare `provider.send` must not run inside any tokio context for
 /// the same reason — sends go to a plain OS thread and the provider
-/// comes back.
-fn send_on_thread(
-    mut provider: ChatCompletionsProvider,
+/// comes back. Generic over the dialect adapter: the send seam is
+/// the `Provider` trait's, not one implementation's.
+fn send_on_thread<P: Provider + 'static>(
+    mut provider: P,
     manifest: RequestManifest,
-) -> (
-    ChatCompletionsProvider,
-    Result<rivect::providers::ProviderReply, ProviderError>,
-) {
+) -> (P, Result<rivect::providers::ProviderReply, ProviderError>) {
     std::thread::spawn(move || {
         let outcome = provider.send(&manifest);
         (provider, outcome)
@@ -2627,3 +2628,1191 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::custom-chat-completions = NOT_RUN"]
 fn provider_installed_custom_chat_completions() {}
+
+// ----- abliteration -----------------------------------------------------
+//
+// The `abliteration` connection's proof legs (HZN-008 class A): the
+// shared Responses adapter serves the literal id — no copied codec —
+// under the connection's own recorded predicates. `/models` is
+// authoritative, with the static source seed merging on top as the
+// offer floor (its recorded rationale — offering models before a live
+// key exists — stays upstream's); every offered model is
+// reasoning-forced (the recorded
+// mapper marks even unseeded ids `reasoning: true`), so a pinned
+// effort rides the reasoning surface on any catalogue id; and the
+// recorded peer compat marks the gateway as never returning encrypted
+// reasoning items (`include-encrypted-reasoning #false`), so the
+// replay include is never requested.
+
+/// The scoped credential ref the `abliteration` connection binds.
+const ABLITERATION_REF: &str = "keyring:rivect-test/abliteration";
+
+/// The pinned model id the fixed-pin `abliteration` legs carry — one
+/// of the recorded static-seed ids (HZN-008).
+const ABLITERATION_MODEL: &str = "abliterated-model";
+
+/// One configured `abliteration` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base's `/v1` segment
+/// verbatim — like the recorded default `api.abliteration.ai/v1`.
+fn abliteration_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{ABLITERATION_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"abliteration\", model_id = \"{ABLITERATION_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same construction seam as `provider_result`, over the shared
+/// Responses adapter: reqwest's blocking client still builds on a
+/// plain OS thread, and the literal id decides the dialect.
+fn abliteration_provider_result(
+    config: Config,
+    connection: String,
+    store: Arc<support::MapStore>,
+) -> Result<OpenAiProvider, ProviderError> {
+    std::thread::spawn(move || OpenAiProvider::new(&config, &connection, store))
+        .join()
+        .expect("the provider thread joins")
+}
+
+fn abliteration_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ABLITERATION_REF, SECRET)],
+    ));
+    let provider =
+        abliteration_provider_result(config.clone(), "abliteration".to_string(), store.clone())
+            .expect("the shared adapter builds for the abliteration id");
+    (provider, store)
+}
+
+/// One named SSE block on the Responses wire — the event-tagged
+/// framing provider_openai.rs pins.
+fn sse_block(event: &str, data: &Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+/// A completed Responses stream: an in-progress message item, a text
+/// delta, the done item, any extra output items, then the mandatory
+/// `response.completed` terminal carrying the full output set and
+/// usage.
+fn responses_completed_stream(text: &str, extra_items: Vec<Value>, usage: Option<Value>) -> String {
+    let message = json!({
+        "id": "msg_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text }],
+    });
+    let mut output = extra_items;
+    output.push(message.clone());
+    let mut response = json!({
+        "id": "resp_1",
+        "status": "completed",
+        "output": output,
+    });
+    if let Some(usage) = usage {
+        response["usage"] = usage;
+    }
+    format!(
+        "{}{}{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.output_text.delta",
+            &json!({"delta": text, "item_id": "msg_1", "output_index": 0, "content_index": 0}),
+        ),
+        sse_block(
+            "response.output_item.done",
+            &json!({"item": message, "output_index": 0}),
+        ),
+        sse_block("response.completed", &json!({"response": response})),
+    )
+}
+
+async fn mount_responses(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the `abliteration` pin.
+fn prepared_abliteration(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+    let (provider, _store) = abliteration_provider(config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the abliteration pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+// ----- TP-PROVIDER-WIRE::abliteration ----------------------------------
+
+/// A configured `abliteration` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the shared adapter posts exactly the frozen
+/// manifest as a Responses request — `store: false`, `stream: true`,
+/// pinned model, instructions, tool surface and pinned effort
+/// verbatim, and no `include` member, since the recorded peer compat
+/// marks the gateway as never returning encrypted reasoning items —
+/// the SSE stream validates its terminal, and the one physical send
+/// is charged once with the provider's reported usage.
+#[tokio::test]
+async fn abliteration_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified outcome text",
+            Vec::new(),
+            Some(json!({"input_tokens": 11, "output_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: prove the wire");
+
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the body rides the recorded json content type"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SECRET),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], ABLITERATION_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the recorded gateway never returns encrypted reasoning items — the artifact include is never requested: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "abliteration");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/abliteration", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Responses class builds no
+/// adapter, a manifest pinning a different connection id is refused
+/// at send, and `dialect_for` reserving `abliteration` means the id
+/// is never fixture-served even when it declares `local` kind.
+#[test]
+fn abliteration_dialect_is_keyed_on_the_literal_connection_id() {
+    let config =
+        Config::parse_validated(&abliteration_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = abliteration_provider_result(config.clone(), "abliteration-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `abliteration` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"abliteration\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("abliteration").expect("declared");
+    assert!(
+        !loopback.serves("abliteration", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send
+    let (provider, _store) = abliteration_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{ABLITERATION_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/abliteration", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::abliteration -------------------------------
+
+/// `GET /models` is authoritative for `abliteration` (HZN-008): every
+/// non-empty `data[].id` is offered — never filtered to a sample —
+/// the recorded static seed merges on top as the offer floor (its
+/// recorded rationale — offering models before a live key exists —
+/// stays upstream's), the union deduplicates and sorts, and the
+/// bearer credential came through the store seam.
+#[tokio::test]
+async fn abliteration_catalog_is_the_authoritative_listing_over_the_static_seed() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "unseeded-future-model"}),
+            // a seed id already listed deduplicates rather than doubling
+            json!({"id": "abliterated-model-large"}),
+            json!({"id": ""}),
+            json!({"owned_by": "nobody"}),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = abliteration_provider(&config);
+    let ids = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalog thread joins")
+        .expect("the catalog answers");
+    assert_eq!(
+        ids,
+        vec![
+            "abliterated-model".to_string(),
+            "abliterated-model-large".to_string(),
+            "abliterated-model-large-v2".to_string(),
+            "unseeded-future-model".to_string(),
+        ],
+        "the authoritative listing and the static seed merge, sorted and deduplicated"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+}
+
+/// The recorded `abliteration` reasoning predicates bind from the
+/// catalogue through the dispatch to the wire: every offered model —
+/// a static-seed id or an id only `/models` ever named — is
+/// reasoning-forced (the recorded mapper marks even unseeded ids
+/// `reasoning: true`), so a pinned effort rides the reasoning
+/// surface verbatim on any of them, and because the recorded peer
+/// compat marks the gateway as never returning encrypted reasoning
+/// items (`include-encrypted-reasoning #false`), no `include` member
+/// is emitted. The dialect's other recorded id keeps its own
+/// predicates — the suppression binds the literal `abliteration` id,
+/// never the shared Responses dialect.
+#[tokio::test]
+async fn abliteration_forced_reasoning_models_are_bound_to_their_source_predicates() {
+    // Catalogue → dispatch: an auto-ranked send's catalogue leg
+    // resolves the wire model. The discovered id sorts before the
+    // static seed, so it is the pick — and being reasoning-forced is
+    // a model predicate, not a seed membership, so the discovered id
+    // still carries the effort dial while the artifact include stays
+    // off.
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "a-unseeded-model"})]).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("forced", Vec::new(), None),
+    )
+    .await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{ABLITERATION_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&auto, "/world/abliteration", "goal: forced reasoning");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    outcome.expect("the auto send resolves through the catalogue");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    let send = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/responses")
+        .expect("the send crossed the wire");
+    let body: Value = serde_json::from_slice(&send.body).expect("json body");
+    assert_eq!(
+        body["model"], "a-unseeded-model",
+        "the discovered id the catalogue offered rides the wire"
+    );
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high"}),
+        "an unseeded model still carries the reasoning dial — the forced predicate is not seed-bound"
+    );
+    assert!(
+        body.get("include").is_none(),
+        "the recorded peer never returns encrypted reasoning items: {body}"
+    );
+
+    // A fixed pin on a static-seed id carries the same surface, and
+    // an unpinned effort declares no level — reasoning stays
+    // intrinsic to the model, the wire asks for nothing extra.
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream("seeded", Vec::new(), None),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = abliteration_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the seed-pin send completes");
+    let mut unpinned = prepared_manifest(&config);
+    unpinned.effort = rivect::config::EffortAssign::Auto;
+    let (provider, outcome) = send_on_thread(provider, unpinned);
+    outcome.expect("the unpinned send completes");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the two fixture sends");
+    let pinned: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(pinned["model"], ABLITERATION_MODEL);
+    assert_eq!(
+        pinned["reasoning"],
+        json!({"effort": "medium"}),
+        "the pinned effort rides the reasoning surface verbatim"
+    );
+    assert!(pinned.get("include").is_none());
+    let bare: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert!(
+        bare.get("reasoning").is_none(),
+        "an unpinned effort declares no level — the wire injects none: {bare}"
+    );
+    assert!(bare.get("include").is_none());
+
+    // The non-forced arm: `openai` keeps its own recorded predicates —
+    // the suppression binds the literal `abliteration` id, never the
+    // shared dialect.
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream("openai", Vec::new(), None),
+    )
+    .await;
+    let openai = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{ABLITERATION_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"openai\", model_id = \"gpt-5.2\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ABLITERATION_REF, SECRET)],
+    ));
+    let provider = abliteration_provider_result(openai.clone(), "openai".to_string(), store)
+        .expect("the shared adapter builds for openai too");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &openai, "/world/abliteration", "goal: openai arm")
+            .expect("the openai pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    outcome.expect("the openai send completes");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "the artifact include stays on for the dialect's other id — the predicate binds the literal id"
+    );
+}
+
+/// A `response.completed` carrying a blobless reasoning item next to
+/// the message is the recorded peer's normal shape: the send verifies
+/// with its exact text and one usage record, and the item is never
+/// adopted into the lineage — a follow-up send under the same epoch
+/// replays the message item but carries no `type:"reasoning"` input
+/// item.
+#[tokio::test]
+async fn abliteration_blobless_reasoning_item_is_dropped_from_the_replay() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "reasoned answer",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": []})],
+            Some(json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = abliteration_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let first = broker
+        .prepare("main", &config, "/world/abliteration", "goal: first turn")
+        .expect("prepare turn 1");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", first);
+    let reply = outcome.expect("a blobless reasoning item is the peer's normal shape");
+    assert_eq!(reply.text, "reasoned answer");
+    assert!(reply.tool_calls.is_empty());
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the one send is charged once"
+    );
+    let mut broker = broker;
+
+    // Same epoch: turn 2's replayed input carries the adopted message
+    // item ahead of the new user item — the dropped reasoning item is
+    // absent from the wire.
+    let second = broker
+        .prepare("main", &config, "/world/abliteration", "goal: second turn")
+        .expect("prepare turn 2 — same epoch");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", second.clone());
+    outcome.expect("turn 2 completes");
+    assert_eq!(broker.accounted_requests(), 2);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "two physical sends");
+    let replayed: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        replayed["input"],
+        json!([
+            {
+                "id": "msg_1", "type": "message", "status": "completed", "role": "assistant",
+                "content": [{ "type": "output_text", "text": "reasoned answer" }],
+            },
+            {
+                "role": "user",
+                "content": [{ "type": "input_text", "text": second.inputs }],
+            }
+        ]),
+        "the blobless reasoning item never joined the lineage — the replay carries only the adopted message item"
+    );
+}
+
+/// The recorded compat's `stream-idle-timeout-ms 0` holds by
+/// construction: the read loop runs no per-read idle watchdog, so a
+/// peer answering in spaced fragments — each gap a real idle stretch
+/// like a long reasoning turn — still completes under the one
+/// whole-call deadline instead of tripping an idle denial.
+#[tokio::test]
+async fn abliteration_stream_gaps_inside_the_deadline_still_complete() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let body = responses_completed_stream(
+        "paced answer",
+        Vec::new(),
+        Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+    );
+    // serve every connection the transport opens the same spaced
+    // fragments — a reset or retried leg gets the same answer — until
+    // the test releases the flag and the thread joins
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let peer = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // drain the request before answering: closing a
+                    // socket that still holds unread request bytes
+                    // RSTs the connection and can race the reply out
+                    // of the client's buffer
+                    if stream
+                        .set_read_timeout(Some(Duration::from_millis(150)))
+                        .is_ok()
+                    {
+                        let mut sink = [0u8; 8192];
+                        while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    for piece in body.as_bytes().chunks(64) {
+                        if stream.write_all(piece).is_err()
+                            || flag.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        // the real gap between fragments — the idle
+                        // stretch a per-read watchdog would trip on
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                }
+                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let endpoint = format!("http://{address}/v1");
+    let config = Config::parse_validated(&abliteration_config(&endpoint)).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ABLITERATION_REF, SECRET)],
+    ));
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        OpenAiProvider::with_deadline(&built, "abliteration", store, Duration::from_millis(1500))
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the adapter builds");
+
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("idle gaps inside the whole-call deadline still complete");
+    assert_eq!(reply.text, "paced answer");
+    drop_blocking(provider);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    peer.join().expect("the peer thread joins");
+}
+
+// ----- TP-PROVIDER-AUTH::abliteration ----------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `abliteration`: a configured region — the recorded contract names
+/// none, so global data placement is never asserted — the
+/// profile-bound ref whose scope disagrees with the binding, an
+/// absent credential and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn abliteration_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+{
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(&abliteration_config(&server_uri_v1(&server)).replace(
+        "kind = \"api_key\"",
+        "kind = \"api_key\"\nregion = \"eu-1\"",
+    ))
+    .expect("valid");
+    let err = abliteration_provider_result(
+        regioned,
+        "abliteration".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "abliteration");
+    assert_eq!(region, "eu-1");
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"abliteration\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = abliteration_provider_result(
+        mismatched,
+        "abliteration".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let provider = abliteration_provider_result(
+        config.clone(),
+        "abliteration".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ABLITERATION_REF, SECRET)],
+    ));
+    let provider = abliteration_provider_result(config.clone(), "abliteration".to_string(), store)
+        .expect("builds");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, reason } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "abliteration");
+    assert!(
+        reason.contains("401"),
+        "the status code is the context: {reason}"
+    );
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ABLITERATION_REF, SECRET)],
+    ));
+    let provider = abliteration_provider_result(config.clone(), "abliteration".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(SECRET),
+        "provider Debug never carries credential material"
+    );
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "accounted",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: debug surfaces");
+    assert!(
+        !format!("{manifest:?}").contains(SECRET),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(SECRET),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(SECRET),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-abliteration",
+        Some(&abliteration_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(SECRET),
+        "runtime Debug never carries credential material"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::abliteration ------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling material at the scope
+/// admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn abliteration_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "recovered",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        abliteration_provider_result(config.clone(), "abliteration".to_string(), store.clone())
+            .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(ABLITERATION_REF, SECRET.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The failure legs never produce a false success or a usage record:
+/// a stream ending mid `function_call` item is a partial-tool
+/// violation, an EOF without a terminal is the unknown terminal, a
+/// `function_call` naming a tool the frozen request never declared is
+/// incompatible output, and a reasoning item carrying
+/// `encrypted_content` is the provenance denial — the recorded
+/// gateway never returns encrypted reasoning items, so any present
+/// member, whatever its value, is off-contract foreign material. The
+/// peer's normal blobless
+/// reasoning item is not a failure leg at all: it is tolerated —
+/// dropped from the lineage, the reply unaffected, the one send
+/// charged once.
+#[tokio::test]
+async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
+    // a stream ended mid `function_call` item — a partial tool call
+    // is never a usable one
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "call_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""}, "output_index": 0}),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: partial item");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a stream ended mid output item is a typed violation: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denied stream charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a stream that ends without a terminal event is the unknown
+    // terminal — never success
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        format!(
+            "{}{}",
+            sse_block(
+                "response.output_item.added",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}, "output_index": 0}),
+            ),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: no terminal");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF without a terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a completed `function_call` naming a tool the frozen request
+    // never declared is incompatible output — never executed
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({
+                "id": "call_1", "type": "function_call", "status": "completed",
+                "name": "exec_shell", "arguments": "{}",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: undeclared call");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::IncompatibleOutput { .. }
+            ))
+        ),
+        "an undeclared tool name is a typed rejection: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a blobless reasoning item is the recorded peer's normal shape —
+    // every model reasons intrinsically and none returns the artifact:
+    // the item is tolerated — dropped from the lineage rather than
+    // adopted — the reply is unaffected and the one send charges once
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "answered",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": []})],
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: blobless reasoning");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    let reply = outcome.expect("a blobless reasoning item is the peer's normal shape");
+    assert_eq!(reply.text, "answered");
+    assert!(reply.tool_calls.is_empty());
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the tolerated item still charges the one send"
+    );
+    drop_blocking(broker);
+
+    // a reasoning item carrying `encrypted_content` is off-contract
+    // foreign material where the recorded peer never returns one —
+    // the DEC-012 provenance denial, refused and never adopted
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "enc-foreign-blob"})],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: foreign artifact");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::ReasoningProvenance { .. }
+            ))
+        ),
+        "a reasoning item carrying an artifact the peer never returns is the provenance denial: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // the denial keys on the member's presence, not its value —
+    // upstream types `encrypted_content` `string | null`, and a
+    // carried `null` is the same off-contract foreign material,
+    // never a tolerated blobless shape
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": null})],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: null artifact member");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::ReasoningProvenance { .. }
+            ))
+        ),
+        "a reasoning item carrying `encrypted_content: null` is still the provenance denial: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a non-string `encrypted_content` is equally present — the
+    // member exists off-contract, so the denial never waits on the
+    // value parsing as a string
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![
+                json!({"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": 42}),
+            ],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_abliteration(
+        &config,
+        "/world/abliteration",
+        "goal: non-string artifact member",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::ReasoningProvenance { .. }
+            ))
+        ),
+        "a reasoning item carrying a non-string `encrypted_content` is still the provenance denial: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `abliteration`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn abliteration_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "abliterated-model"})]).await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative listing plus the static seed answer
+    // through the credential seam.
+    let (provider, _) = abliteration_provider(&config);
+    let catalog = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("catalog thread joins");
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref ids) if ids == &[
+            "abliterated-model".to_string(),
+            "abliterated-model-large".to_string(),
+            "abliterated-model-large-v2".to_string(),
+        ]) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = abliteration_provider_result(config.clone(), "abliteration".to_string(), empty)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) =
+        prepared_abliteration(&config, "/world/abliteration", "goal: matrix wire");
+    let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        abliteration_provider_result(config.clone(), "abliteration".to_string(), empty.clone())
+            .expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(ABLITERATION_REF, SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_abliteration` case below: its ignored count
+    // is the explicit NOT_RUN signal this matrix asserts — the row
+    // stays a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::abliteration ----------------------------
+
+/// TP-PROVIDER-INSTALLED::abliteration = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline
+/// slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::abliteration = NOT_RUN"]
+fn provider_installed_abliteration() {}

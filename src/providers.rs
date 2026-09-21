@@ -876,13 +876,14 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 
 /// The recorded wire dialect of a connection id (DEC-007/DEC-025):
 /// keyed by the literal id's source class — `openai` speaks the
-/// OpenAI Responses API, `google` speaks the Gemini
-/// `streamGenerateContent` dialect, `custom-chat-completions` speaks
-/// the OpenAI-compatible Chat Completions dialect — never inferred
-/// from an auth label or a catalogue answer. `openai-codex`,
-/// `google-vertex`, `google-antigravity` and `google-gemini-cli` are
-/// distinct literal ids and stay unrouted until their own dialects
-/// land.
+/// OpenAI Responses API and `abliteration` is its recorded class-A
+/// exception speaking the same dialect (HZN-008), `google` speaks
+/// the Gemini `streamGenerateContent` dialect,
+/// `custom-chat-completions` speaks the OpenAI-compatible Chat
+/// Completions dialect — never inferred from an auth label or a
+/// catalogue answer. `openai-codex`, `google-vertex`,
+/// `google-antigravity` and `google-gemini-cli` are distinct literal
+/// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
@@ -903,6 +904,7 @@ pub enum Dialect {
 pub fn dialect_for(connection: &str) -> Option<Dialect> {
     match connection {
         "openai" => Some(Dialect::Responses),
+        "abliteration" => Some(Dialect::Responses),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         _ => None,
