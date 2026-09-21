@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 pub mod gemini;
+pub mod local;
 pub mod openai;
 pub mod sse;
 
@@ -876,10 +877,12 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// The recorded wire dialect of a connection id (DEC-007/DEC-025):
 /// keyed by the literal id's source class — `openai` speaks the
 /// OpenAI Responses API, `google` speaks the Gemini
-/// `streamGenerateContent` dialect — never inferred from an auth
-/// label or a catalogue answer. `openai-codex`, `google-vertex`,
-/// `google-antigravity` and `google-gemini-cli` are distinct literal
-/// ids and stay unrouted until their own dialects land.
+/// `streamGenerateContent` dialect, `custom-chat-completions` speaks
+/// the OpenAI-compatible Chat Completions dialect — never inferred
+/// from an auth label or a catalogue answer. `openai-codex`,
+/// `google-vertex`, `google-antigravity` and `google-gemini-cli` are
+/// distinct literal ids and stay unrouted until their own dialects
+/// land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
@@ -887,6 +890,11 @@ pub enum Dialect {
     /// The Google Gemini generate-content API
     /// (`POST {endpoint}/models/{id}:streamGenerateContent?alt=sse`, SSE).
     Gemini,
+    /// The OpenAI-compatible Chat Completions API
+    /// (`POST {endpoint}/chat/completions`, SSE) — the dialect every
+    /// compatible host wired under the literal `custom-chat-completions`
+    /// id shares (HZN-008 class S).
+    ChatCompletions,
 }
 
 /// The recorded dialect for a literal connection id; `None` for ids
@@ -896,6 +904,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
     match connection {
         "openai" => Some(Dialect::Responses),
         "google" => Some(Dialect::Gemini),
+        "custom-chat-completions" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
