@@ -735,19 +735,30 @@ impl TaskStore {
     }
 
     pub fn current_question(&self, task_id: &TaskId) -> Result<Option<(Question, u64)>> {
+        // A pending question is pinned to the intent revision it was
+        // authored under. Once a steer supersedes that intent the row
+        // stays for audit but is no longer the task's current question.
+        // The pending row and the task's live intent revision read in
+        // one statement — the pin comparison below never sees a task
+        // row younger than the question it judges.
         let row = self
             .conn
-            .query_row(
-                sql::CURRENT_QUESTION,
-                params![task_id.0, task_id.0],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
+            .query_row(sql::CURRENT_QUESTION, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
             .optional()
             .map_err(storage)?;
         match row {
             None => Ok(None),
-            Some((body, revision)) => {
+            Some((body, revision, intent_revision)) => {
                 let question: Question = serde_json::from_str(&body).map_err(storage)?;
+                if question.intent_revision != intent_revision as u64 {
+                    return Ok(None);
+                }
                 Ok(Some((question, revision as u64)))
             }
         }
@@ -794,6 +805,16 @@ impl TaskStore {
             }));
         }
         let question: Question = serde_json::from_str(&body_json).map_err(storage)?;
+        // The question is pinned to the intent it was authored under.
+        // A steer since then supersedes it: an answer quoting the live
+        // intent must not commit against a stale pin — the frozen
+        // manifest it would resume no longer reflects the task intent.
+        if question.intent_revision != intent_revision {
+            return Err(StoreError::StaleIntent {
+                expected: intent_revision,
+                current: question.intent_revision,
+            });
+        }
         match selection {
             AnswerSelection::Option { option_id } => {
                 let Some(option) = question.options.iter().find(|o| o.option_id == *option_id)

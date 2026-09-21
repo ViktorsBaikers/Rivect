@@ -1445,6 +1445,13 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 instruction,
             ) {
                 Ok(result) => {
+                    // The steer supersedes the intent a paused
+                    // manual-fallback attempt was pinned under — drain
+                    // the pause so the frozen manifest can never
+                    // dispatch. The pending question row stays for
+                    // audit; `current_question` retracts it and
+                    // `answer_question` denies its stale pin.
+                    rt.tombstone_paused(&task);
                     RpcResponse::ok(id, serde_json::to_value(&result).unwrap_or(Value::Null))
                 }
                 Err(err) => store_error(id, &err),

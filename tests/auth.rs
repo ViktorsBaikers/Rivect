@@ -1412,6 +1412,99 @@ fn concurrent_refresh_on_one_profile_serializes_to_a_single_in_flight_operation(
     assert_eq!(inner.calls.load(Ordering::SeqCst), 7);
 }
 
+/// A joiner parked behind a wedged leader cannot wait on the leader's
+/// synchronous store call — the join bound releases it with a typed
+/// `StoreUnavailable` instead. The flight stays the leader's to finish:
+/// the leader's write still lands and the next refresh on the scope is
+/// a fresh leader.
+#[test]
+fn refresh_join_on_a_wedged_leader_denies_within_the_join_bound() {
+    const JOIN_BOUND: Duration = Duration::from_millis(250);
+    let (release_tx, release_rx) = mpsc::channel();
+    let inner = Arc::new(CountingStore {
+        calls: AtomicU64::new(0),
+        release: Mutex::new(release_rx),
+        written: Mutex::new(HashMap::new()),
+    });
+    let store = Arc::new(FlightedStore::with_join_bound(
+        Box::new(CountingStoreAdapter {
+            inner: Arc::clone(&inner),
+        }),
+        JOIN_BOUND,
+    ));
+    let credential = keychain_ref("bounded-join");
+
+    // Leader enters the inner op and parks on the release channel.
+    let leader = {
+        let store = Arc::clone(&store);
+        let credential = credential.clone();
+        std::thread::spawn(move || store.refresh(&credential, b"leader-bytes"))
+    };
+    wait_until_eq(|| inner.calls.load(Ordering::SeqCst), 1);
+
+    // The joiner parks on the live flight — then the bound, not the
+    // leader's release, is what returns its verdict.
+    let joiner = {
+        let store = Arc::clone(&store);
+        let credential = credential.clone();
+        std::thread::spawn(move || store.refresh(&credential, b"joiner-bytes"))
+    };
+    wait_until_eq(|| store.refresh_waiters(), 1);
+    let started = std::time::Instant::now();
+    let outcome = join_bounded(joiner).expect("joiner thread did not panic");
+    assert!(
+        started.elapsed() < PROBE_TIMEOUT,
+        "the join bound released the joiner, not the leader's wedge: {:?}",
+        started.elapsed()
+    );
+    match outcome {
+        Err(ProviderError::StoreUnavailable {
+            store: StoreKind::Keychain,
+            reason,
+        }) if reason == "refresh join exceeded its bound" => {}
+        other => panic!(
+            "a wedged flight denies its joiner typed: {}",
+            outcome_variant(&other)
+        ),
+    }
+    assert_eq!(
+        store.refresh_waiters(),
+        0,
+        "a bound-released joiner leaves the waiter count honest"
+    );
+
+    // The leader's op was never the joiner's to cancel — it still owns
+    // the flight and its write still lands on release.
+    release_tx
+        .send(Release::Commit)
+        .expect("release the wedged leader");
+    join_bounded(leader)
+        .expect("leader thread did not panic")
+        .unwrap_or_else(|e| panic!("leader refresh ok: {}", error_variant(&e)));
+    assert_eq!(
+        inner
+            .resolve(&credential)
+            .as_deref()
+            .unwrap_or_else(|e| panic!("resolve: {}", error_variant(e))),
+        b"leader-bytes".as_slice(),
+        "the wedged leader's write lands when its call returns"
+    );
+    release_tx
+        .send(Release::Commit)
+        .expect("release the next leader");
+    store.refresh(&credential, b"after").unwrap_or_else(|e| {
+        panic!(
+            "refresh after a bound-denied join is a fresh leader: {}",
+            error_variant(&e)
+        )
+    });
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        2,
+        "the bound-denied joiner never ran a store op; only leaders did"
+    );
+}
+
 /// DEC-002 enrollment serialization: threads racing `login` on one scope
 /// pass through the per-scope mutex one at a time — exactly one observes
 /// the slot empty and writes; the rest get `CredentialOccupied`. The

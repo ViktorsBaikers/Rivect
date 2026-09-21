@@ -1340,6 +1340,149 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
     );
 }
 
+/// A steer that lands while a manual-fallback choice is pending
+/// supersedes the intent the question and the paused attempt were
+/// pinned under: the paused broker admission is tombstoned,
+/// `question.current` stops serving the stale record, and an answer
+/// naming it — under the stale pin or the live intent — is denied
+/// typed and never dispatches the frozen manifest.
+#[test]
+fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-steer",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(rivect::executor::macos::MacosReadWorker),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-steer-boot");
+    let task = world.create_task(&session, "manual-steer-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "steer-first",
+        &task,
+        &question,
+        "steps",
+        json!(4401),
+    ));
+    assert!(answered.get("error").is_none());
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4402),
+    ));
+    let served_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the pending choice question");
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the choice-pending attempt is admitted"
+    );
+
+    // the steer commits under the pre-pause revisions and advances the
+    // intent the question and the frozen manifest were pinned under
+    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let steered = world.dispatch(&support::corpus_steer(
+        &session,
+        "steer-mid-choice",
+        &task,
+        snapshot.intent_revision,
+        snapshot.revision,
+        json!(4403),
+    ));
+    assert!(
+        steered.get("error").is_none(),
+        "steer commits on a waiting task: {steered}"
+    );
+    let live_intent = steered["result"]["intent_revision"]
+        .as_u64()
+        .expect("the steer reports the new intent");
+    assert_eq!(live_intent, snapshot.intent_revision + 1);
+
+    // the pause record is gone and the broker admission is tombstoned —
+    // the frozen manifest has nothing left to dispatch through
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the steer drained the pause record"
+    );
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the steer tombstoned the paused admission"
+    );
+
+    // `question.current` retracts the stale record — the answer a client
+    // could build from it can no longer be constructed
+    let retracted = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4404),
+    ));
+    assert!(
+        retracted["result"]["question"].is_null(),
+        "the stale question is retracted: {retracted}"
+    );
+
+    // the stale-pin answer is denied typed before the store leg — and
+    // an answer that quotes the LIVE intent with the stale question id
+    // is denied the same way: the question's own intent pin is stale,
+    // so neither shape can dispatch the frozen manifest
+    let stale = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "stale-answer",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4405),
+    ));
+    assert_eq!(
+        stale["error"]["data"]["code"].as_str(),
+        Some("stale_intent"),
+        "the stale-pin answer is refused typed: {stale}"
+    );
+    let live = world.dispatch(
+        &json!({
+            "jsonrpc": "2.0", "id": 4406, "method": "task.submit",
+            "params": {
+                "schema_version": 1, "command_id": "live-intent-answer",
+                "session_id": session.0, "kind": "answer", "task_id": task.0,
+                "expected_intent_revision": live_intent,
+                "question_id": served_question.question_id.0,
+                "question_revision": served_question.question_revision,
+                "selection": { "kind": "option", "option_id": "reserve" }
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        live["error"]["data"]["code"].as_str(),
+        Some("stale_intent"),
+        "the live-intent answer to a stale question is refused typed: {live}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "no answer dispatched the frozen manifest"
+    );
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
+}
+
 /// AC-045: `mode = "off"` never substitutes — the provider's own error
 /// surfaces typed, the task stays paused on its admission, and an
 /// operator retry of the same frozen manifest resumes the intent.

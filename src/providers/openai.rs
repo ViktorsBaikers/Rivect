@@ -23,8 +23,8 @@ use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, check_deadline, dialect_for, read_catalog_body, read_chunk,
-    resolve_credential, sse, transport, transport_status, violation, wire_body,
+    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, read_catalog_body,
+    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -286,6 +286,10 @@ impl OpenAiProvider {
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
         let started = Instant::now();
+        // The store call itself cannot be interrupted once running —
+        // the check before it is the only point an expired budget
+        // still denies the resolve without touching the seam.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         self.catalog_within(&token, started)
     }
@@ -458,7 +462,7 @@ impl OpenAiProvider {
             Some(Terminal::Failed { reason }) | Some(Terminal::Incomplete { reason }) => {
                 Err(ProviderError::ProviderFailed {
                     connection: self.connection.clone(),
-                    reason,
+                    reason: bounded_reason(reason),
                 })
             }
             None => Err(ProviderError::UnknownTerminal {
@@ -587,7 +591,9 @@ impl OpenAiProvider {
             {
                 return Err(ProviderError::StreamViolation {
                     connection: self.connection.clone(),
-                    reason: format!("{item_type} item in a completed response is not completed"),
+                    reason: bounded_reason(format!(
+                        "{item_type} item in a completed response is not completed"
+                    )),
                 });
             }
             match item_type {
@@ -640,7 +646,9 @@ impl OpenAiProvider {
                     if !manifest.tools.iter().any(|declared| declared == name) {
                         return Err(ProviderError::IncompatibleOutput {
                             connection: self.connection.clone(),
-                            reason: format!("function_call names undeclared tool {name}"),
+                            reason: bounded_reason(format!(
+                                "function_call names undeclared tool {name}"
+                            )),
                         });
                     }
                     let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
@@ -695,7 +703,7 @@ impl OpenAiProvider {
                 other => {
                     return Err(ProviderError::IncompatibleOutput {
                         connection: self.connection.clone(),
-                        reason: format!("unsupported output item type {other}"),
+                        reason: bounded_reason(format!("unsupported output item type {other}")),
                     });
                 }
             }
@@ -855,12 +863,16 @@ impl Provider for OpenAiProvider {
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         // The whole call spends one budget: credential resolution, the
         // auto-pool catalogue leg, and the streamed response all count
-        // against the same clock — no leg runs past the deadline the
-        // caller was promised.
+        // against the same clock — no leg starts past the deadline the
+        // caller was promised; an in-flight credential-store call runs
+        // to completion (uninterruptible).
         let started = Instant::now();
         // The credential resolves once per send — the catalogue leg and
         // the post both bear the same material, so a rotation mid-send
-        // can never split one request across two secrets.
+        // can never split one request across two secrets. The store call
+        // cannot be interrupted once running, so an already-spent budget
+        // must deny it here rather than on the far side.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an

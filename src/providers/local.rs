@@ -47,8 +47,9 @@ use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, check_deadline, dialect_for, payload_reason, read_catalog_body,
-    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
+    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, payload_reason,
+    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
+    wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -670,6 +671,10 @@ impl ChatCompletionsProvider {
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
         let started = Instant::now();
+        // The store call itself cannot be interrupted once running —
+        // the check before it is the only point an expired budget
+        // still denies the resolve without touching the seam.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         self.catalog_within(&token, started)
     }
@@ -1000,7 +1005,7 @@ impl ChatCompletionsProvider {
             Some(Terminal::Completed) => self.complete(manifest, state),
             Some(Terminal::Failed { reason }) => Err(ProviderError::ProviderFailed {
                 connection: self.connection.clone(),
-                reason,
+                reason: bounded_reason(reason),
             }),
             Some(Terminal::Unclassifiable) => Err(ProviderError::UnknownTerminal {
                 connection: self.connection.clone(),
@@ -1479,7 +1484,7 @@ impl ChatCompletionsProvider {
             if !manifest.tools.iter().any(|declared| declared == &name) {
                 return Err(ProviderError::IncompatibleOutput {
                     connection: self.connection.clone(),
-                    reason: format!("tool_call names undeclared tool {name}"),
+                    reason: bounded_reason(format!("tool_call names undeclared tool {name}")),
                 });
             }
             let path = if block.args.is_empty() {
@@ -1772,12 +1777,16 @@ impl Provider for ChatCompletionsProvider {
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         // The whole call spends one budget: credential resolution, the
         // auto-pool catalogue leg, and the streamed response all count
-        // against the same clock — no leg runs past the deadline the
-        // caller was promised.
+        // against the same clock — no leg starts past the deadline the
+        // caller was promised; an in-flight credential-store call runs
+        // to completion (uninterruptible).
         let started = Instant::now();
         // The credential resolves once per send — the catalogue leg and
         // the post both bear the same material, so a rotation mid-send
-        // can never split one request across two secrets.
+        // can never split one request across two secrets. The store call
+        // cannot be interrupted once running, so an already-spent budget
+        // must deny it here rather than on the far side.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an

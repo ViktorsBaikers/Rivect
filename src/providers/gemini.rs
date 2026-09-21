@@ -33,8 +33,9 @@ use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, check_deadline, dialect_for, payload_reason, read_catalog_body,
-    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
+    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, payload_reason,
+    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
+    wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -246,6 +247,10 @@ impl GeminiProvider {
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
         let started = Instant::now();
+        // The store call itself cannot be interrupted once running —
+        // the check before it is the only point an expired budget
+        // still denies the resolve without touching the seam.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         self.catalog_within(&token, started)
     }
@@ -433,7 +438,7 @@ impl GeminiProvider {
             Some(Terminal::Completed) => self.complete(manifest, state),
             Some(Terminal::Failed { reason }) => Err(ProviderError::ProviderFailed {
                 connection: self.connection.clone(),
-                reason,
+                reason: bounded_reason(reason),
             }),
             Some(Terminal::Unclassifiable) | None => Err(ProviderError::UnknownTerminal {
                 connection: self.connection.clone(),
@@ -622,7 +627,7 @@ impl GeminiProvider {
             ) {
                 return Err(ProviderError::IncompatibleOutput {
                     connection: self.connection.clone(),
-                    reason: format!("unsupported part kind {key}"),
+                    reason: bounded_reason(format!("unsupported part kind {key}")),
                 });
             }
         }
@@ -672,7 +677,7 @@ impl GeminiProvider {
             if !manifest.tools.iter().any(|declared| declared == name) {
                 return Err(ProviderError::IncompatibleOutput {
                     connection: self.connection.clone(),
-                    reason: format!("functionCall names undeclared tool {name}"),
+                    reason: bounded_reason(format!("functionCall names undeclared tool {name}")),
                 });
             }
             let path = match call.get("args") {
@@ -809,9 +814,11 @@ impl GeminiProvider {
 }
 
 /// A model id is exactly one URL path segment — non-empty and inside
-/// the recorded `[A-Za-z0-9._-]` id charset. Anything else is denied:
-/// `..`, `/`, `?` or `%` would traverse the `/models/` collection or
-/// rewrite the request's method suffix.
+/// the recorded `[A-Za-z0-9._-]` id charset. Dots are admitted — the
+/// pinned `:streamGenerateContent` suffix means the id can never form
+/// a bare `.`/`..` segment — while `/`, `?` or `%` are denied: they
+/// would split the path, open the query early or percent-rewrite the
+/// request.
 fn valid_model_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -864,12 +871,16 @@ impl Provider for GeminiProvider {
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         // The whole call spends one budget: credential resolution, the
         // auto-pool catalogue leg, and the streamed response all count
-        // against the same clock — no leg runs past the deadline the
-        // caller was promised.
+        // against the same clock — no leg starts past the deadline the
+        // caller was promised; an in-flight credential-store call runs
+        // to completion (uninterruptible).
         let started = Instant::now();
         // The credential resolves once per send — the catalogue leg and
         // the post both bear the same material, so a rotation mid-send
-        // can never split one request across two secrets.
+        // can never split one request across two secrets. The store call
+        // cannot be interrupted once running, so an already-spent budget
+        // must deny it here rather than on the far side.
+        check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an
@@ -914,10 +925,10 @@ impl Provider for GeminiProvider {
         if !valid_model_id(&fixed.model_id) {
             return Err(ProviderError::StreamViolation {
                 connection: self.connection.clone(),
-                reason: format!(
+                reason: bounded_reason(format!(
                     "model id {:?} is not a usable request path segment",
                     fixed.model_id
-                ),
+                )),
             });
         }
         let body = self.request_body(manifest)?;

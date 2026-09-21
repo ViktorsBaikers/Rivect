@@ -9,10 +9,10 @@
 //! fields are ignored; exactly one space after the field colon is
 //! stripped; a field without a colon carries an empty value; `data`
 //! lines join and lose the final LF; a block without `data` never
-//! dispatches (the `id` it carried still applies); an `id` containing
-//! U+0000 and a non-ASCII-digit `retry` are ignored; and an incomplete
-//! block at EOF is discarded — the caller's unknown terminal, never an
-//! implicit success.
+//! dispatches; `id` and `retry` parse as ignored fields — stream-
+//! reconnection state no adapter consumes, so nothing retains it — and
+//! an incomplete block at EOF is discarded — the caller's unknown
+//! terminal, never an implicit success.
 //!
 //! Bounds are the fail-closed contract: one physical line and one
 //! event's accumulated `data` each carry a hard cap, and an overrun is
@@ -32,16 +32,15 @@ const MAX_DATA_BYTES: usize = 4 * 1024 * 1024;
 const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// One dispatched event block (§9.2.6): the accumulated `data` buffer
-/// with its final LF removed, the event-type buffer verbatim (empty
+/// with its final LF removed and the event-type buffer verbatim (empty
 /// when the block carried no `event` field — the caller maps that to
-/// the default message type), the last event id the stream set, and
-/// the last ASCII-digit `retry` it set.
+/// the default message type). `id`/`retry` are deliberately absent:
+/// emitting them would clone the stream's largest-seen id into every
+/// event, and no consumer reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: String,
     pub data: String,
-    pub id: Option<String>,
-    pub retry: Option<u64>,
 }
 
 /// The parser's fail-closed diagnostics — every refusal names the
@@ -58,20 +57,16 @@ pub enum SseError {
     InvalidUtf8,
 }
 
-/// The pending block's field buffers plus the stream-level `id`/`retry`
-/// values — kept apart from the byte buffer so a complete line can be
-/// processed while the byte tail is still borrowed.
+/// The pending block's field buffers — kept apart from the byte buffer
+/// so a complete line can be processed while the byte tail is still
+/// borrowed. No stream-level `id`/`retry` is held: retaining the
+/// largest-seen id would pin its allocation for the whole stream.
 #[derive(Default)]
 struct Block {
     /// The pending block's `event` buffer.
     event_type: String,
     /// The pending block's `data` buffer — one LF per `data` field.
     data: String,
-    /// The stream's last event id — applied at dispatch even when the
-    /// intervening blocks carried no `data`.
-    last_id: Option<String>,
-    /// The stream's last `retry` field value.
-    retry: Option<u64>,
 }
 
 impl Block {
@@ -114,22 +109,9 @@ impl Block {
                 self.data.push_str(value);
                 self.data.push('\n');
             }
-            // An id containing U+0000 is ignored outright; any other
-            // value becomes the stream's last event id.
-            "id" => {
-                if !value.contains('\0') {
-                    self.last_id = Some(value.to_string());
-                }
-            }
-            // Only a pure ASCII-digit retry applies.
-            "retry" => {
-                if !value.is_empty()
-                    && value.bytes().all(|b| b.is_ascii_digit())
-                    && let Ok(ms) = value.parse::<u64>()
-                {
-                    self.retry = Some(ms);
-                }
-            }
+            // `id`, `retry` and unknown fields carry nothing a consumer
+            // reads — WHATWG ignores them for dispatch, so the parser
+            // holds none of their bytes.
             _ => {}
         }
         Ok(())
@@ -137,7 +119,7 @@ impl Block {
 
     /// A block dispatches only when its `data` buffer is non-empty —
     /// the final LF each `data` field appended is removed — and the
-    /// field buffers reset either way while `id`/`retry` persist.
+    /// field buffers reset either way.
     fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
         if !self.data.is_empty() {
             let mut data = std::mem::take(&mut self.data);
@@ -145,8 +127,6 @@ impl Block {
             events.push(SseEvent {
                 event: std::mem::take(&mut self.event_type),
                 data,
-                id: self.last_id.clone(),
-                retry: self.retry,
             });
         }
         self.event_type.clear();

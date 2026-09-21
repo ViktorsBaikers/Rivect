@@ -344,6 +344,14 @@ pub trait CredentialStore: Send + Sync {
     fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError>;
     /// Reads the material at the scope.
     ///
+    /// The call is synchronous and cannot be cancelled once running:
+    /// a native backend may block past the caller's request deadline —
+    /// no safe mechanism interrupts a blocking store op in flight, and
+    /// a detached watchdog thread is not one. Callers bound the seam by
+    /// checking their deadline *before* the call and again before the
+    /// resolved material is used; only test/probe harnesses may hold a
+    /// real wall-clock bound around it.
+    ///
     /// # Errors
     /// [`ProviderError::CredentialAbsent`] when the scope is empty;
     /// `CredentialOutsideNamespace`/`StoreUnavailable`/`StoreAmbiguous` on
@@ -573,6 +581,12 @@ struct RefreshFlight {
     ready: Condvar,
 }
 
+/// The default bound a refresh joiner parks under — the whole-request
+/// deadline the seam's callers run on. An outcome arriving after the
+/// caller's budget is spent is no use to it, so a longer park could
+/// only ever wedge the thread.
+const JOIN_BOUND: Duration = Duration::from_secs(120);
+
 /// Per-profile refresh single-flight (INV-009): while a refresh for one
 /// credential scope is in flight, concurrent refreshes for the same scope
 /// join it — the leader's inner op is the only store write and its outcome
@@ -582,17 +596,27 @@ pub struct FlightedStore {
     inner: Box<dyn CredentialStore>,
     flights: Mutex<BTreeMap<String, Arc<RefreshFlight>>>,
     waiters: AtomicU64,
+    join_bound: Duration,
 }
 
 impl FlightedStore {
     /// Wraps any backend with the refresh flight serializer — the one
     /// constructor [`native_store`] uses, and the one tests use to pin the
-    /// coalescing behavior deterministically.
+    /// coalescing behavior deterministically. Joiners park under
+    /// `JOIN_BOUND`.
     pub fn new(inner: Box<dyn CredentialStore>) -> Self {
+        Self::with_join_bound(inner, JOIN_BOUND)
+    }
+
+    /// The same seam under an explicit join bound — the constructor a
+    /// test uses to prove a wedged leader denies its joiners instead of
+    /// parking them past the bound.
+    pub fn with_join_bound(inner: Box<dyn CredentialStore>, join_bound: Duration) -> Self {
         Self {
             inner,
             flights: Mutex::new(BTreeMap::new()),
             waiters: AtomicU64::new(0),
+            join_bound,
         }
     }
 
@@ -609,22 +633,40 @@ impl FlightedStore {
         self.flights.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Parks on the flight until the leader publishes its outcome, then
-    /// returns that outcome — the joiner never runs a second store op.
+    /// Parks on the flight until the leader publishes its outcome or the
+    /// join bound lapses, then returns that outcome or a typed denial —
+    /// the joiner never runs a second store op and never parks forever.
+    /// The bound cannot reach into the leader's synchronous store op: a
+    /// call already running completes or wedges on its own thread, and
+    /// no safe mechanism cancels it — the joiner is released while the
+    /// flight stays the leader's to finish.
     fn join(&self, flight: &Arc<RefreshFlight>) -> Result<(), ProviderError> {
-        // Same poison argument as `flights`: the slot holds at most one
-        // completed outcome write.
-        let mut outcome = flight.outcome.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if let Some(result) = outcome.clone() {
-                self.waiters.fetch_sub(1, Ordering::SeqCst);
-                return result;
+        let started = Instant::now();
+        let result = {
+            // Same poison argument as `flights`: the slot holds at most
+            // one completed outcome write — the guard drops with the
+            // block, never held past the verdict.
+            let mut outcome = flight.outcome.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(result) = outcome.clone() {
+                    break result;
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= self.join_bound {
+                    break Err(ProviderError::StoreUnavailable {
+                        store: self.inner.kind(),
+                        reason: "refresh join exceeded its bound".to_string(),
+                    });
+                }
+                let (guard, _wait) = flight
+                    .ready
+                    .wait_timeout(outcome, self.join_bound - elapsed)
+                    .unwrap_or_else(|e| e.into_inner());
+                outcome = guard;
             }
-            outcome = flight
-                .ready
-                .wait(outcome)
-                .unwrap_or_else(|e| e.into_inner());
-        }
+        };
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        result
     }
 }
 
@@ -1210,6 +1252,26 @@ pub(crate) fn violation(connection: &str, reason: impl Into<String>) -> Provider
         connection: connection.to_string(),
         reason: reason.into(),
     }
+}
+
+/// The byte bound on a peer-provided failure reason — enough for a real
+/// verdict, far short of a payload a hostile peer could park in the
+/// diagnostic surface.
+pub(crate) const REASON_MAX_BYTES: usize = 1024;
+
+/// Bounds a peer-provided failure reason to [`REASON_MAX_BYTES`] on a
+/// UTF-8 char boundary — the reason stays valid text, never a
+/// mid-sequence cut.
+pub(crate) fn bounded_reason(reason: impl Into<String>) -> String {
+    let reason = reason.into();
+    if reason.len() <= REASON_MAX_BYTES {
+        return reason;
+    }
+    let mut end = REASON_MAX_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
 }
 
 /// The reason a failed verdict carries — the peer's own `message`,

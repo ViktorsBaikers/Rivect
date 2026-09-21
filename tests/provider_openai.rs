@@ -710,6 +710,47 @@ async fn expired_budget_denies_the_send_before_any_wire_leg() {
     drop_blocking(provider);
 }
 
+/// DEC-014: an already-spent budget denies the credential call before
+/// the store seam runs — the deadline check is the only point a spent
+/// clock can refuse, because the synchronous resolve behind it cannot
+/// be interrupted once it starts.
+#[tokio::test]
+async fn spent_budget_denies_the_credential_call_before_the_store() {
+    let config = Config::parse_validated(&openai_config("https://127.0.0.1:1/v1")).expect("valid");
+    // The delay is the wedge marker: had the resolve run, the send
+    // could not have returned inside it.
+    let store_delay = Duration::from_secs(30);
+    let store = Arc::new(SlowStore {
+        inner: support::MapStore::seeded(STORE_KIND, &[(CREDENTIAL_REF, SECRET)]),
+        delay: store_delay,
+    });
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        OpenAiProvider::with_deadline(&built, "openai", store, Duration::ZERO)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the adapter builds");
+
+    let started = Instant::now();
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ProviderError::Transport { reason, .. }) => {
+            assert!(
+                reason.contains("deadline"),
+                "the spent budget is the named cause: {reason}"
+            );
+        }
+        other => panic!("a spent budget is a typed transport denial: {other:?}"),
+    }
+    assert!(
+        elapsed < store_delay,
+        "the denial returned before the store's resolve could: {elapsed:?}"
+    );
+    drop_blocking(provider);
+}
+
 // ----- TP-PROVIDER-AUTH::openai -------------------------------------
 
 /// A marker the 401 fixture's body carries so an error that echoes
@@ -1133,6 +1174,35 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
         "an undeclared tool name is a typed rejection: {outcome:?}"
     );
     drop_blocking(broker);
+
+    // a peer name past the reason bound truncates on the boundary —
+    // the diagnostic surface never parks a payload
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "",
+            vec![json!({
+                "id": "fc_1", "type": "function_call", "status": "completed",
+                "name": "x".repeat(2000), "arguments": "{}", "call_id": "call_1",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared(&config, "/world/openai", "goal: oversized name");
+    let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
+    let Err(ModelError::Provider(ProviderError::IncompatibleOutput { reason, .. })) = outcome
+    else {
+        panic!("the oversized tool name is a typed rejection: {outcome:?}")
+    };
+    assert_eq!(
+        reason.len(),
+        1024,
+        "the peer name is capped at the reason bound"
+    );
+    drop_blocking(broker);
 }
 
 /// A completed terminal may only carry finished items: a
@@ -1238,6 +1308,27 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
             Err(ModelError::Provider(ProviderError::ProviderFailed { .. }))
         ),
         "an error event is a peer failure: {outcome:?}"
+    );
+    drop_blocking(broker);
+
+    // a payload-length peer reason is bounded: the cap lands on a UTF-8
+    // char boundary, so '€' (3 bytes) cuts at 1023, never mid-codepoint
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block("error", &json!({"message": "€".repeat(400)})),
+    )
+    .await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared(&config, "/world/openai", "goal: oversized reason");
+    let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
+    let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
+        panic!("the oversized reason is a peer failure: {outcome:?}")
+    };
+    assert_eq!(
+        reason.len(),
+        1023,
+        "the peer reason is capped on a char boundary"
     );
     drop_blocking(broker);
 
@@ -2287,13 +2378,13 @@ fn sse_field_without_colon_is_name_with_empty_value() {
 
 #[test]
 fn sse_block_without_data_is_not_dispatched() {
-    // the id applies to the stream even though the block dispatches
-    // nothing (§9.2.6)
+    // a data-less block dispatches nothing and its field buffers reset —
+    // neither the event type nor the ignored id leaks into the next block
     let events =
-        parse_all(&[b"event: ping\nid: 7\n\ndata: next\n\n".as_slice()]).expect("id applies");
+        parse_all(&[b"event: ping\nid: 7\n\ndata: next\n\n".as_slice()]).expect("block dropped");
     assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "");
     assert_eq!(events[0].data, "next");
-    assert_eq!(events[0].id.as_deref(), Some("7"));
 }
 
 #[test]
@@ -2304,19 +2395,51 @@ fn sse_multiline_data_fields_joined_and_final_lf_removed() {
 }
 
 #[test]
-fn sse_id_with_nul_and_non_ascii_retry_ignored() {
+fn sse_reconnection_fields_parse_clean_and_carry_nothing() {
+    // `id`/`retry` — including a NUL-carrying id and a non-digit retry —
+    // parse as ignored fields: dispatch is undisturbed and no event
+    // surface exposes them
     let events = parse_all(&[
-        b"id: good\ndata: a\n\n".as_slice(),
+        b"id: good\nretry: 250\ndata: a\n\n".as_slice(),
         b"id: ba\0d\nretry: 12x\ndata: b\n\n".as_slice(),
     ])
-    .expect("nul id and non-digit retry ignored");
+    .expect("reconnection fields are ignored");
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].id.as_deref(), Some("good"));
-    // the nul-carrying id was ignored — the previous id persists
-    assert_eq!(events[1].id.as_deref(), Some("good"));
-    assert_eq!(events[1].retry, None);
-    let events = parse_all(&[b"retry: 250\ndata: c\n\n".as_slice()]).expect("digit retry");
-    assert_eq!(events[0].retry, Some(250));
+    assert_eq!(events[0].data, "a");
+    assert_eq!(events[1].data, "b");
+    // an event is exactly the two buffers a consumer reads — no
+    // stream-level field can ride along
+    assert_eq!(
+        size_of::<rivect::providers::sse::SseEvent>(),
+        2 * size_of::<String>(),
+        "an event must carry no retained id/retry state"
+    );
+}
+
+#[test]
+fn sse_maximal_id_line_is_not_retained_across_events() {
+    // a near-cap id line then many minimal events: the id is parsed and
+    // dropped, so the per-event output stays minimal no matter how large
+    // the reconnection state the peer sent
+    let mut chunk = b"id: ".to_vec();
+    chunk.extend(std::iter::repeat_n(b'x', 200 * 1024));
+    chunk.extend(b"\n\n");
+    let mut parser = SseParser::new();
+    assert!(parser.feed(&chunk).expect("id block").is_empty());
+    let mut emitted = 0usize;
+    let mut payload_bytes = 0usize;
+    for _ in 0..256 {
+        for event in parser.feed(b"data: x\n\n").expect("minimal event") {
+            emitted += 1;
+            payload_bytes += event.event.len() + event.data.len();
+        }
+    }
+    parser.finish().expect("clean eof");
+    assert_eq!(emitted, 256);
+    assert_eq!(
+        payload_bytes, 256,
+        "the 200KiB id never rode along on a minimal event"
+    );
 }
 
 #[test]

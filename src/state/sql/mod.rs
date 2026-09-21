@@ -49,8 +49,9 @@ pub const INSERT_QUESTION: &str = "INSERT INTO questions (question_id, task_id, 
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')";
 pub const TASK_SET_WAITING: &str = "UPDATE tasks SET revision = ?2, lifecycle = 'waiting', event_cursor = event_cursor + 1 WHERE task_id = ?1";
 pub const CURRENT_QUESTION: &str =
-    "SELECT body_json, (SELECT revision FROM tasks WHERE task_id = ?2) FROM questions
-                 WHERE task_id = ?2 AND state = 'pending' ORDER BY revision DESC LIMIT 1";
+    "SELECT q.body_json, t.revision, t.intent_revision FROM questions q
+                 JOIN tasks t ON t.task_id = q.task_id
+                 WHERE q.task_id = ?1 AND q.state = 'pending' ORDER BY q.revision DESC LIMIT 1";
 pub const TASK_REVISIONS: &str =
     "SELECT revision, intent_revision, lifecycle FROM tasks WHERE task_id = ?1";
 pub const QUESTION_BY_ID: &str =

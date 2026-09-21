@@ -540,6 +540,59 @@ fn parse_error_does_not_echo_source_text() {
     );
 }
 
+/// The connection endpoint is a trust boundary: `https` on any host and
+/// `http` on loopback only are admitted, the empty string stays the
+/// local-dialect absent-override sentinel, and schemeless, non-loopback
+/// `http`, credential-carrying or host-less forms are schema refusals —
+/// never deferred to a wire attempt.
+#[test]
+fn connection_endpoint_enforces_the_trust_boundary() {
+    for (endpoint, admitted) in [
+        ("https://api.openai.com/v1", true),
+        ("http://127.0.0.1:11434", true),
+        ("http://localhost:11434/v1", true),
+        ("http://[::1]:11434", true),
+        ("", true),
+        // whitespace-only shares the absent-override arm under the
+        // recorded endpoint rules' trim
+        ("   ", true),
+        ("api.openai.com/v1", false),
+        ("http://api.example.com/v1", false),
+        ("http://10.0.0.5/v1", false),
+        // a `127.`-prefixed dns name is not a loopback address
+        ("http://127.0.0.1.evil.invalid", false),
+        // credentials never ride the url
+        ("https://user:pw@api.openai.com/v1", false),
+        ("http://user@127.0.0.1:11434", false),
+        // the authority must carry a host
+        ("https://", false),
+        ("http://", false),
+        ("ftp://api.openai.com/v1", false),
+    ] {
+        let text = format!(
+            "config_version = 1\n\
+             [connections.c]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"keyring:rivect-test/c\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"c\", model_id = \"m\" }}\n\
+             effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+             fallback = {{ mode = \"off\" }}\n"
+        );
+        let mut parsed = Config::parse(&text).expect("toml parse must succeed");
+        match (parsed.validate(), admitted) {
+            (Ok(_), true) => {}
+            (Ok(_), false) => panic!("endpoint {endpoint:?} must not be admitted"),
+            (Err(err), true) => panic!("endpoint {endpoint:?} must be admitted: {err}"),
+            (Err(err), false) => {
+                expect_stage(&err, Stage::Schema);
+                assert!(
+                    matches!(err.issue, ConfigIssue::EndpointNotAllowed),
+                    "endpoint {endpoint:?} must fail EndpointNotAllowed: {err}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn n_duplicate() {
     let text = support::negative_configs()

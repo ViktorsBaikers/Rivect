@@ -128,6 +128,10 @@ pub enum ConfigIssue {
     SecretRefExpected { key: String },
     #[error("unknown profile reference: profiles.{profile}")]
     UnknownProfileReference { profile: String },
+    #[error(
+        "endpoint must be an https URL, an http URL on a loopback host, or empty for the class default"
+    )]
+    EndpointNotAllowed,
 }
 
 #[derive(Debug)]
@@ -1777,6 +1781,45 @@ fn string_field(
     }
 }
 
+/// The configured endpoint's trust boundary: `https` for any host,
+/// `http` only for a loopback host, or an empty/whitespace-only string
+/// — the absent-override sentinel a local-dialect connection id
+/// resolves to its recorded class default. Anything else would let provider
+/// traffic — and the bearer it carries — leave the configured trust
+/// boundary unreviewed: a schemeless or non-loopback `http` endpoint
+/// is refused, and a userinfo marker is refused the same way because
+/// credentials never ride the URL.
+fn endpoint_allowed(endpoint: &str) -> bool {
+    // The adapter's endpoint rules trim before the empty check — the
+    // sentinel and the scheme verdict both run on the trimmed form.
+    let endpoint = endpoint.trim();
+    let Some(rest) = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+    else {
+        return endpoint.is_empty();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if endpoint.starts_with("https://") {
+        return true;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
     let table = table_like(name, item)?;
     let key = format!("connections.{name}");
@@ -1809,6 +1852,12 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
             },
         )
     })?;
+    if !endpoint_allowed(&endpoint) {
+        return Err(ConfigError::schema(
+            format!("{key}.endpoint"),
+            ConfigIssue::EndpointNotAllowed,
+        ));
+    }
     let credential_ref = string_field(table, &key, "credential_ref")?;
     let region = string_field(table, &key, "region")?;
     let profile = string_field(table, &key, "profile")?;

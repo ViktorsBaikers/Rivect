@@ -918,6 +918,48 @@ async fn expired_budget_denies_the_send_before_any_wire_leg() {
     drop_blocking(provider);
 }
 
+/// DEC-014: an already-spent budget denies the credential call before
+/// the store seam runs — the deadline check is the only point a spent
+/// clock can refuse, because the synchronous resolve behind it cannot
+/// be interrupted once it starts.
+#[tokio::test]
+async fn spent_budget_denies_the_credential_call_before_the_store() {
+    let config =
+        Config::parse_validated(&gemini_config("https://127.0.0.1:1/v1beta")).expect("valid");
+    // The delay is the wedge marker: had the resolve run, the send
+    // could not have returned inside it.
+    let store_delay = Duration::from_secs(30);
+    let store = Arc::new(SlowStore {
+        inner: support::MapStore::seeded(STORE_KIND, &[(CREDENTIAL_REF, SECRET)]),
+        delay: store_delay,
+    });
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        GeminiProvider::with_deadline(&built, "google", store, Duration::ZERO)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the adapter builds");
+
+    let started = Instant::now();
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ProviderError::Transport { reason, .. }) => {
+            assert!(
+                reason.contains("deadline"),
+                "the spent budget is the named cause: {reason}"
+            );
+        }
+        other => panic!("a spent budget is a typed transport denial: {other:?}"),
+    }
+    assert!(
+        elapsed < store_delay,
+        "the denial returned before the store's resolve could: {elapsed:?}"
+    );
+    drop_blocking(provider);
+}
+
 // ----- TP-PROVIDER-AUTH::google -------------------------------------
 
 /// A marker the 401 fixture's body carries so an error that echoes
@@ -1321,6 +1363,33 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
     );
     drop_blocking(broker);
 
+    // a peer name past the reason bound truncates on the boundary —
+    // the diagnostic surface never parks a payload
+    let server = MockServer::start().await;
+    mount_generate(
+        &server,
+        completed_stream(
+            "",
+            vec![json!({"functionCall": {"name": "x".repeat(2000), "args": {}}})],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let (broker, manifest) = prepared(&config, "/world/google", "goal: oversized name");
+    let (broker, outcome) = dispatch(broker, "/world/google", manifest);
+    let Err(ModelError::Provider(ProviderError::IncompatibleOutput { reason, .. })) = outcome
+    else {
+        panic!("the oversized tool name is a typed rejection: {outcome:?}")
+    };
+    assert_eq!(
+        reason.len(),
+        1024,
+        "the peer name is capped at the reason bound"
+    );
+    drop_blocking(broker);
+
     // a pinned effort the recorded ThinkingLevel enum cannot carry is
     // a typed request rejection — never silently clamped to HIGH and
     // never an invented wire spelling
@@ -1647,12 +1716,17 @@ async fn malformed_wire_shapes_are_typed_violations() {
 /// A model id is exactly one URL path segment: a fixed pin carrying
 /// `?`, `/`, `%` or an empty id is denied before any byte crosses —
 /// never a traversal of the `/models/` collection or a rewrite of the
-/// method suffix — and a catalogue name outside the id charset is
+/// method suffix — and the denial reason stays bounded however long
+/// the hostile id. A catalogue name outside the id charset is
 /// dropped, so a hostile listing cannot poison the auto pick with an
 /// empty id that sorts first.
 #[tokio::test]
 async fn hostile_model_ids_and_catalog_names_never_reach_the_wire() {
-    for hostile in ["a?b=1", "models/../x", "%2e%2e%2fadmin", ""] {
+    // An oversized id is denied on the same leg, and the reason it
+    // produces is capped — a hostile pin cannot park an unbounded id
+    // in the diagnostic surface.
+    let oversized = "a?".repeat(1000);
+    for hostile in ["a?b=1", "models/../x", "%2e%2e%2fadmin", "", &oversized] {
         let server = MockServer::start().await;
         mount_generate(&server, completed_stream("never sent", Vec::new(), None)).await;
         let config = Config::parse_validated(&format!(
@@ -1668,9 +1742,12 @@ async fn hostile_model_ids_and_catalog_names_never_reach_the_wire() {
         let (provider, _store) = google_provider(&config);
         let manifest = prepared_manifest(&config);
         let (provider, outcome) = send_on_thread(provider, manifest);
+        let Err(ProviderError::StreamViolation { reason, .. }) = &outcome else {
+            panic!("model id {hostile:?} is a typed denial before the post: {outcome:?}")
+        };
         assert!(
-            matches!(outcome, Err(ProviderError::StreamViolation { .. })),
-            "model id {hostile:?} is a typed denial before the post: {outcome:?}"
+            reason.len() <= 1024,
+            "model id {hostile:?} denial reason stays bounded: {reason:?}"
         );
         let requests = server.received_requests().await.expect("recorded");
         assert!(
@@ -2168,6 +2245,28 @@ async fn provider_reported_failure_is_a_typed_denial() {
         panic!("the coded error payload is a peer failure: {outcome:?}")
     };
     assert_eq!(reason, "503");
+    drop_blocking(broker);
+
+    // a payload-length peer reason is bounded: the cap lands on a UTF-8
+    // char boundary, so '€' (3 bytes) cuts at 1023, never mid-codepoint
+    let server = MockServer::start().await;
+    mount_generate(
+        &server,
+        data_block(&json!({"error": {"message": "€".repeat(400)}})),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let (broker, manifest) = prepared(&config, "/world/google", "goal: oversized reason");
+    let (broker, outcome) = dispatch(broker, "/world/google", manifest);
+    let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
+        panic!("the oversized reason is a peer failure: {outcome:?}")
+    };
+    assert_eq!(
+        reason.len(),
+        1023,
+        "the peer reason is capped on a char boundary"
+    );
     drop_blocking(broker);
 }
 
