@@ -211,6 +211,63 @@ fn error_verdict(err: &ProviderError) -> String {
     )
 }
 
+/// The consumptive-gate boundary map (test-plan "Boundary map +
+/// collision proof"; one-shot-actions §5): every journaled op names
+/// exactly one seam identity. Emit sites sharing a planned seam keep
+/// disjoint boundary-id spaces — precheck verdicts key on scope refs,
+/// the census on account names, probes on case names — and `refresh` /
+/// `logout` get their own identities because they emit on the same
+/// boundary id as `login` / `revoke` inside one lifecycle leg. Ops that
+/// never reach a real store — scripted-backend legs and case
+/// bookkeeping — land on `AUTH-SCRIPTED`, which evidences no boundary
+/// and is exempt from fingerprint injectivity.
+fn seam_of(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "precheck" | "census" | "reap" | "probe" => "AUTH-KC-PRECHECK",
+        "create" | "login" => "AUTH-KC-CREATE",
+        "resolve" => "AUTH-KC-READ",
+        "delete" | "revoke" | "teardown" => "AUTH-KC-DELETE",
+        "refresh" => "AUTH-KC-REFRESH",
+        "logout" => "AUTH-KC-LOGOUT",
+        "unavailable" => "AUTH-STORE-UNAVAILABLE",
+        "ambiguous" => "AUTH-STORE-AMBIGUOUS",
+        "case" | "status" | "lifecycle" | "guard" | "fingerprint" => "AUTH-SCRIPTED",
+        _ => return None,
+    })
+}
+
+/// Asserts a journal row set honors the boundary map: every row's op is
+/// in the closed vocabulary, and no two distinct ops claim one
+/// `(seam, boundary_id)` evidence identity — a retained fingerprint
+/// identifies exactly one emit site, so a row can never satisfy another
+/// op's seam assertion. Distinct seams may share a boundary freely: a
+/// lifecycle leg records precheck, resolve and revoke on one scope.
+fn check_boundary_map(rows: &[Value]) -> Result<(), String> {
+    let mut claimed: HashMap<(&str, &str), &str> = HashMap::new();
+    for row in rows {
+        let op = row["op"]
+            .as_str()
+            .ok_or_else(|| "journal row has no string op".to_string())?;
+        let boundary_id = row["boundary_id"]
+            .as_str()
+            .ok_or_else(|| format!("journal row for op {op} has no string boundary_id"))?;
+        let Some(seam) = seam_of(op) else {
+            return Err(format!("journal op {op} is outside the boundary map"));
+        };
+        if seam == "AUTH-SCRIPTED" {
+            continue;
+        }
+        if let Some(other) = claimed.insert((seam, boundary_id), op)
+            && other != op
+        {
+            return Err(format!(
+                "ops {other} and {op} both claim {seam} evidence at {boundary_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ----- native-store probe ----------------------------------------------
 
 enum Probe {
@@ -367,11 +424,17 @@ fn lifecycle_leg(store: &FlightedStore, credential: &SecretRef, journal: &mut Au
         TEST_NAMESPACE,
         &format!("ok sha256:{}", support::sha256_hex(first.as_bytes())),
     );
+    let resolved = store
+        .resolve(credential)
+        .unwrap_or_else(|e| panic!("resolve: {}", error_variant(&e)));
+    journal.record(
+        "resolve",
+        credential.raw(),
+        TEST_NAMESPACE,
+        &format!("ok sha256:{}", support::sha256_hex(&resolved)),
+    );
     assert_eq!(
-        store
-            .resolve(credential)
-            .as_deref()
-            .unwrap_or_else(|e| panic!("resolve: {}", error_variant(e))),
+        resolved,
         first.as_bytes(),
         "resolve returns exactly the enrolled bytes"
     );
@@ -384,11 +447,17 @@ fn lifecycle_leg(store: &FlightedStore, credential: &SecretRef, journal: &mut Au
         TEST_NAMESPACE,
         &format!("ok sha256:{}", support::sha256_hex(second.as_bytes())),
     );
+    let resolved = store
+        .resolve(credential)
+        .unwrap_or_else(|e| panic!("resolve: {}", error_variant(&e)));
+    journal.record(
+        "resolve",
+        credential.raw(),
+        TEST_NAMESPACE,
+        &format!("ok sha256:{}", support::sha256_hex(&resolved)),
+    );
     assert_eq!(
-        store
-            .resolve(credential)
-            .as_deref()
-            .unwrap_or_else(|e| panic!("resolve: {}", error_variant(e))),
+        resolved,
         second.as_bytes(),
         "resolve returns the rotated bytes"
     );
@@ -396,13 +465,18 @@ fn lifecycle_leg(store: &FlightedStore, credential: &SecretRef, journal: &mut Au
         .revoke(credential)
         .unwrap_or_else(|e| panic!("revoke deletes: {}", error_variant(&e)));
     journal.record("revoke", credential.raw(), TEST_NAMESPACE, "ok");
-    assert!(
-        matches!(
-            store.resolve(credential),
-            Err(ProviderError::CredentialAbsent { .. })
+    match store.resolve(credential) {
+        Err(err @ ProviderError::CredentialAbsent { .. }) => journal.record(
+            "resolve",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
         ),
-        "revoked scope resolves to CredentialAbsent"
-    );
+        other => panic!(
+            "revoked scope resolves to CredentialAbsent, got {}",
+            outcome_variant(&other)
+        ),
+    }
     store
         .login(credential, first.as_bytes())
         .unwrap_or_else(|e| panic!("re-enroll after revoke: {}", error_variant(&e)));
@@ -410,13 +484,18 @@ fn lifecycle_leg(store: &FlightedStore, credential: &SecretRef, journal: &mut Au
         .logout(credential)
         .unwrap_or_else(|e| panic!("logout deletes: {}", error_variant(&e)));
     journal.record("logout", credential.raw(), TEST_NAMESPACE, "ok");
-    assert!(
-        matches!(
-            store.resolve(credential),
-            Err(ProviderError::CredentialAbsent { .. })
+    match store.resolve(credential) {
+        Err(err @ ProviderError::CredentialAbsent { .. }) => journal.record(
+            "resolve",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
         ),
-        "logged-out scope resolves to CredentialAbsent"
-    );
+        other => panic!(
+            "logged-out scope resolves to CredentialAbsent, got {}",
+            outcome_variant(&other)
+        ),
+    }
     assert!(
         !store
             .occupied(credential)
@@ -465,10 +544,22 @@ fn neighbor_profile_is_byte_identical_after_another_profiles_lifecycle() {
     let before = store
         .resolve(&control)
         .unwrap_or_else(|e| panic!("control resolves: {}", error_variant(&e)));
+    journal.record(
+        "resolve",
+        control.raw(),
+        TEST_NAMESPACE,
+        &format!("ok sha256:{}", support::sha256_hex(&before)),
+    );
     lifecycle_leg(&store, &subject, &mut journal);
     let after = store
         .resolve(&control)
         .unwrap_or_else(|e| panic!("control still resolves: {}", error_variant(&e)));
+    journal.record(
+        "resolve",
+        control.raw(),
+        TEST_NAMESPACE,
+        &format!("ok sha256:{}", support::sha256_hex(&after)),
+    );
     assert_eq!(before, control_secret, "control holds its own bytes");
     assert_eq!(
         after, before,
@@ -603,11 +694,17 @@ fn a_foreign_prefix_collision_fails_before_any_write() {
         ),
         "an occupied slot refuses overwrite before any write"
     );
+    let held_bytes = store
+        .resolve(&held)
+        .unwrap_or_else(|e| panic!("resolve: {}", error_variant(&e)));
+    journal.record(
+        "resolve",
+        held.raw(),
+        TEST_NAMESPACE,
+        &format!("ok sha256:{}", support::sha256_hex(&held_bytes)),
+    );
     assert_eq!(
-        store
-            .resolve(&held)
-            .as_deref()
-            .unwrap_or_else(|e| panic!("resolve: {}", error_variant(e))),
+        held_bytes,
         b"held".as_slice(),
         "the occupant's bytes are untouched"
     );
@@ -623,13 +720,21 @@ fn a_foreign_prefix_collision_fails_before_any_write() {
 #[test]
 fn unavailable_or_ambiguous_store_returns_a_named_typed_error_without_plaintext_fallback() {
     let _store_cases = STORE_CASES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut journal = AuthJournal::open("store-errors");
     // Platform-absent backend: the Secret Service class exists only where a
     // D-Bus session store can answer.
     match native_store(StoreKind::SecretService, TEST_NAMESPACE) {
-        Err(ProviderError::StoreUnavailable {
-            store: StoreKind::SecretService,
-            ..
-        }) => {}
+        Err(
+            err @ ProviderError::StoreUnavailable {
+                store: StoreKind::SecretService,
+                ..
+            },
+        ) => journal.record(
+            "unavailable",
+            "store-errors",
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
+        ),
         Err(other) => panic!("expected StoreUnavailable, got {}", error_variant(&other)),
         Ok(store) => {
             // A Linux host with a live session store — the class is
@@ -653,22 +758,34 @@ fn unavailable_or_ambiguous_store_returns_a_named_typed_error_without_plaintext_
         TEST_NAMESPACE,
     );
     let credential = keychain_ref("ambiguous-target");
-    assert!(
-        matches!(
-            ambiguous.resolve(&credential),
-            Err(ProviderError::StoreAmbiguous {
-                store: StoreKind::Keychain
-            })
+    match ambiguous.resolve(&credential) {
+        Err(
+            err @ ProviderError::StoreAmbiguous {
+                store: StoreKind::Keychain,
+            },
+        ) => journal.record(
+            "ambiguous",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
         ),
-        "an ambiguous native answer is a named typed error"
-    );
-    assert!(
-        matches!(
-            ambiguous.login(&credential, b"material"),
-            Err(ProviderError::StoreAmbiguous { .. })
+        other => panic!(
+            "an ambiguous native answer is a named typed error, got {}",
+            outcome_variant(&other)
         ),
-        "ambiguity fails before any write"
-    );
+    }
+    match ambiguous.login(&credential, b"material") {
+        Err(err @ ProviderError::StoreAmbiguous { .. }) => journal.record(
+            "ambiguous",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
+        ),
+        other => panic!(
+            "ambiguity fails before any write, got {}",
+            outcome_variant(&other)
+        ),
+    }
 
     let denied = KeyringBackend::new(
         Arc::new(ScriptedStore {
@@ -677,16 +794,23 @@ fn unavailable_or_ambiguous_store_returns_a_named_typed_error_without_plaintext_
         StoreKind::Keychain,
         TEST_NAMESPACE,
     );
-    assert!(
-        matches!(
-            denied.resolve(&credential),
-            Err(ProviderError::StoreUnavailable {
+    match denied.resolve(&credential) {
+        Err(
+            err @ ProviderError::StoreUnavailable {
                 store: StoreKind::Keychain,
                 ..
-            })
+            },
+        ) => journal.record(
+            "unavailable",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
         ),
-        "a denied native answer is StoreUnavailable"
-    );
+        other => panic!(
+            "a denied native answer is StoreUnavailable, got {}",
+            outcome_variant(&other)
+        ),
+    }
 
     let absent = KeyringBackend::new(
         Arc::new(ScriptedStore {
@@ -695,13 +819,18 @@ fn unavailable_or_ambiguous_store_returns_a_named_typed_error_without_plaintext_
         StoreKind::Keychain,
         TEST_NAMESPACE,
     );
-    assert!(
-        matches!(
-            absent.resolve(&credential),
-            Err(ProviderError::CredentialAbsent { .. })
+    match absent.resolve(&credential) {
+        Err(err @ ProviderError::CredentialAbsent { .. }) => journal.record(
+            "resolve",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("err: {}", error_verdict(&err)),
         ),
-        "a missing entry is CredentialAbsent, not an implicit empty"
-    );
+        other => panic!(
+            "a missing entry is CredentialAbsent, not an implicit empty, got {}",
+            outcome_variant(&other)
+        ),
+    }
     assert!(
         !absent
             .occupied(&credential)
@@ -751,11 +880,17 @@ fn keychain_store_absent_or_locked_records_honest_status_without_hanging() {
                     .unwrap_or_else(|e| panic!("occupied reads: {}", error_variant(&e))),
                 "the precheck reaped the stale entry"
             );
+            let planted = store
+                .resolve(&unplanned)
+                .unwrap_or_else(|e| panic!("unplanned resolves: {}", error_variant(&e)));
+            journal.record(
+                "resolve",
+                unplanned.raw(),
+                TEST_NAMESPACE,
+                &format!("ok sha256:{}", support::sha256_hex(&planted)),
+            );
             assert_eq!(
-                store
-                    .resolve(&unplanned)
-                    .as_deref()
-                    .unwrap_or_else(|e| panic!("unplanned resolves: {}", error_variant(e))),
+                planted,
                 b"planted".as_slice(),
                 "an unplanned entry is outside the delete-only-rivect-test reap path"
             );
@@ -869,6 +1004,86 @@ fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
             panic!("{case}: leg thread exited without a verdict")
         }
     }
+}
+
+/// The consumptive-gate collision proof: a mutant journal that aliases
+/// two distinct ops onto one `(seam, boundary_id)` evidence identity is
+/// rejected — one retained fingerprint must identify exactly one emit
+/// site (one-shot-actions §6). Distinct seams may legitimately share a
+/// boundary id — a lifecycle leg records precheck, resolve and revoke on
+/// one scope — and the live journal validates under the same map.
+#[test]
+fn a_mutant_aliasing_two_seams_to_one_fingerprint_is_rejected() {
+    let mut journal = AuthJournal::open("boundary-map");
+    let mutant = |op: &str, boundary_id: &str| {
+        json!({
+            "op": op,
+            "boundary_id": boundary_id,
+            "namespace": TEST_NAMESPACE,
+            "result": "ok",
+        })
+    };
+
+    // Positive control: three different seams on one boundary id keep
+    // distinct evidence identities — the shape every lifecycle leg
+    // produces honestly.
+    let boundary = "keyring:rivect-test/mutant-boundary";
+    let disjoint = [
+        mutant("precheck", boundary),
+        mutant("resolve", boundary),
+        mutant("delete", boundary),
+    ];
+    check_boundary_map(&disjoint)
+        .unwrap_or_else(|e| panic!("distinct seams on one boundary stay attributable: {e}"));
+
+    // `precheck` and `census` both emit on AUTH-KC-PRECHECK: on one
+    // boundary id their rows are interchangeable evidence, so a census
+    // row could satisfy the precheck seam's assertion.
+    let aliased_precheck = [mutant("precheck", boundary), mutant("census", boundary)];
+    let verdict = check_boundary_map(&aliased_precheck);
+    assert!(
+        verdict.is_err(),
+        "two ops aliased to one seam fingerprint must be rejected: {aliased_precheck:?}"
+    );
+
+    // Same aliasing on the create and delete seams — a `login` row
+    // satisfying the namespaced `create` assertion, a `teardown` row
+    // satisfying `delete`.
+    for aliased in [
+        [mutant("create", boundary), mutant("login", boundary)],
+        [mutant("delete", boundary), mutant("teardown", boundary)],
+        [mutant("precheck", boundary), mutant("reap", boundary)],
+    ] {
+        assert!(
+            check_boundary_map(&aliased).is_err(),
+            "aliased ops on one boundary must be rejected: {aliased:?}"
+        );
+    }
+
+    // The vocabulary is closed: an op outside the map is rejected before
+    // any seam reasoning, and every planned seam has a real emit site.
+    let unknown = [mutant("wipe", boundary)];
+    assert!(
+        check_boundary_map(&unknown).is_err(),
+        "an op outside the boundary map must be rejected"
+    );
+    for (op, seam) in [
+        ("precheck", "AUTH-KC-PRECHECK"),
+        ("create", "AUTH-KC-CREATE"),
+        ("resolve", "AUTH-KC-READ"),
+        ("delete", "AUTH-KC-DELETE"),
+        ("unavailable", "AUTH-STORE-UNAVAILABLE"),
+        ("ambiguous", "AUTH-STORE-AMBIGUOUS"),
+    ] {
+        assert_eq!(seam_of(op), Some(seam), "the map pins op {op} to {seam}");
+    }
+
+    // The live journal under the same validator: every row the suite
+    // emitted this run carries a mapped op and never aliases — read-only,
+    // the journal file itself is untouched.
+    check_boundary_map(&journal_rows())
+        .unwrap_or_else(|e| panic!("live journal violates the boundary map: {e}"));
+    journal.record("status", "boundary-map", TEST_NAMESPACE, "pass");
 }
 
 // ----- serialization ---------------------------------------------------
@@ -1552,11 +1767,17 @@ fn secrets_never_appear_in_config_export_log_output_or_debug() {
         store
             .login(&credential, secret.as_bytes())
             .unwrap_or_else(|e| panic!("canary enrolls: {}", error_variant(&e)));
+        let canary = store
+            .resolve(&credential)
+            .unwrap_or_else(|e| panic!("resolve: {}", error_variant(&e)));
+        journal.record(
+            "resolve",
+            credential.raw(),
+            TEST_NAMESPACE,
+            &format!("ok sha256:{}", support::sha256_hex(&canary)),
+        );
         assert_eq!(
-            store
-                .resolve(&credential)
-                .as_deref()
-                .unwrap_or_else(|e| panic!("resolve: {}", error_variant(e))),
+            canary,
             secret.as_bytes(),
             "the canary really is stored material at the scope"
         );
