@@ -1,17 +1,23 @@
-//! The `custom-chat-completions`, `aiand`, `aimlapi` and
-//! `alibaba-coding-plan` connections' adapter — the OpenAI-compatible
+//! The `custom-chat-completions`, `aiand`, `aimlapi`,
+//! `alibaba-coding-plan` and `alibaba-token-plan` connections'
+//! adapter — the OpenAI-compatible
 //! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class
 //! A and class P). Dialect selection keys on the literal connection
 //! id, never an auth label, an endpoint shape or a catalogue answer:
 //! every compatible host a deployment wires under
 //! `custom-chat-completions` shares the one
-//! recorded generic contract, while `aiand`, `aimlapi` and
-//! `alibaba-coding-plan` carry their own recorded predicates — the
+//! recorded generic contract, while `aiand`, `aimlapi`,
+//! `alibaba-coding-plan` and `alibaba-token-plan` carry their own
+//! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
 //! static allowed-model catalogue and the enrolled-base credential
-//! binding on `alibaba-coding-plan` — resolved per literal id by the
+//! binding on `alibaba-coding-plan`, and the region-choice endpoint,
+//! the region-bound authoritative `/models` catalogue with its
+//! chat-id prefix filter and the enrolled-base credential binding —
+//! the optional quota `cookie` member admitted for shape and dropped —
+//! on `alibaba-token-plan` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -150,6 +156,32 @@ const ALIBABA_PLAN_MODELS: &[(&str, bool)] = &[
 /// serve — a bearer outside the grammar denies before any wire leg.
 const PLAN_KEY_PREFIX: &str = "sk-sp-";
 
+/// The recorded `alibaba-token-plan` international endpoint —
+/// `ALIBABA_TOKEN_PLAN_BASE_URL`, `alibabaTokenPlanModelManagerOptions`'s
+/// `defaultBaseUrl`: the host the required `endpoint` field's empty
+/// string resolves under the recorded
+/// `credential?.baseUrl ?? config?.baseUrl ?? ALIBABA_TOKEN_PLAN_BASE_URL`
+/// fallback. The region choice the upstream login prompt enumerates —
+/// international, China
+/// (`token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`) or a
+/// custom origin — rides the configured `endpoint` itself, so the
+/// adapter's `region` field stays denied.
+const ALIBABA_TOKEN_PLAN_INTL_BASE_URL: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+
+/// The recorded `alibaba-token-plan` `exclude-models` prefix roster
+/// (`runtime/behavior.kdl`: "Alibaba Token Plan serves ASR/image/
+/// embedding SKUs the chat picker cannot route") — `isExcludedModel`'s
+/// `prefix` arm, `startsWith` on the normalized id.
+const ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES: &[&str] = &[
+    "fun-asr",
+    "happyhorse-",
+    "qwen-audio-",
+    "qwen-image-",
+    "text-embedding-",
+    "wan2.7-",
+];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -168,15 +200,16 @@ enum EndpointRule {
     /// field's empty string standing for the absent override the
     /// `??` fallback covers: the recorded default host.
     ConfiguredElseDefault,
-    /// `alibaba-coding-plan`'s base resolution: the configured origin
-    /// verbatim under the recorded ingress normalization — trimmed,
-    /// all trailing slashes stripped, as the login hook's custom-origin
-    /// input is normalized — with the required field's empty string
-    /// standing for the absent override: the recorded international
-    /// endpoint. The region choice — international, China or a
-    /// custom origin — is this configured base itself; no `region`
-    /// field exists in the recorded contract.
-    PlanBaseOrDefault,
+    /// The plan providers' shared base resolution
+    /// (`alibaba-coding-plan`, `alibaba-token-plan`): the configured
+    /// origin verbatim under the recorded ingress normalization —
+    /// trimmed, all trailing slashes stripped, as the login hook's
+    /// custom-origin input is normalized — with the required field's
+    /// empty string standing for the absent override: the carried
+    /// recorded international endpoint. The region choice —
+    /// international, China or a custom origin — is this configured
+    /// base itself; neither recorded contract names a `region` field.
+    PlanBaseOrDefault(&'static str),
 }
 
 /// The recorded catalogue source a literal id binds (HZN-008): the
@@ -215,6 +248,18 @@ enum CredentialRule {
     /// base — and denies as malformed. The bearer must carry the
     /// recorded plan-key grammar.
     AlibabaPlan,
+    /// `alibaba-token-plan`'s recorded credential
+    /// (`parseAlibabaTokenPlanCredential`): a bare `sk-…` token, or a
+    /// JSON object whose `token` is the bearer, whose optional
+    /// `baseUrl` is the region base the key was enrolled and validated
+    /// against — absent meaning the recorded international endpoint —
+    /// required to equal the connection's configured base, and whose
+    /// optional `cookie` is the separately admitted quota credential:
+    /// shape-checked and dropped — the recorded login pastes it by
+    /// hand for a usage API this adapter has no leg for, so no wire
+    /// leg, diagnostic or surface ever reads it. The bearer must carry
+    /// the recorded `TOKEN_PATTERN` grammar.
+    AlibabaTokenPlan,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -239,6 +284,15 @@ enum EntryRule {
     /// entry only through a bundled reference index this adapter does
     /// not carry, so the listing states the id alone.
     Aimlapi,
+    /// The `alibaba-token-plan` transform: the id must pass the
+    /// recorded chat-id filter (`isAlibabaTokenPlanChatModelId` — the
+    /// provider's `exclude-models` prefix roster drops the
+    /// ASR/image/embedding SKUs the chat picker cannot route); an
+    /// admitted id lands the defaults surface alone — the recorded
+    /// `mapModel` reference/limits hydration is the enrichment layer
+    /// this adapter does not carry, the same boundary `aimlapi`
+    /// applies.
+    AlibabaTokenPlan,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -305,10 +359,26 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // credential binding a key to the base it was enrolled for.
         "alibaba-coding-plan" => Some(SourceContract {
             seed: &[],
-            endpoint: EndpointRule::PlanBaseOrDefault,
+            endpoint: EndpointRule::PlanBaseOrDefault(ALIBABA_PLAN_INTL_BASE_URL),
             catalog: CatalogRule::Allowlist(ALIBABA_PLAN_MODELS),
             credential: CredentialRule::AlibabaPlan,
             entries: EntryRule::IdsOnly,
+        }),
+        // `alibabaTokenPlanModelManagerOptions`: the configured-or-
+        // recorded-international base carrying the region choice, the
+        // configured base's own authoritative `/models` listing under
+        // the recorded chat-id filter (`dynamicModelsAuthoritative` —
+        // the discovered set alone; the recorded static fallback list
+        // rides the upstream client cache layer, never a seed union
+        // here), and the structured `{token, cookie?, baseUrl?}`
+        // credential binding a key to the region base it was enrolled
+        // for.
+        "alibaba-token-plan" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(ALIBABA_TOKEN_PLAN_INTL_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::AlibabaTokenPlan,
+            entries: EntryRule::AlibabaTokenPlan,
         }),
         _ => None,
     }
@@ -345,16 +415,16 @@ impl SourceContract {
                 }
                 trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
             }
-            EndpointRule::PlanBaseOrDefault => {
+            EndpointRule::PlanBaseOrDefault(default) => {
                 // The login hook's custom-origin ingress normalization
                 // — trim, all trailing slashes stripped — applied to
                 // whichever base the connection configures; the empty
                 // string is the absent-override case the recorded
-                // `config?.baseUrl ?? defaultBaseUrl` covers with the
+                // `… ?? defaultBaseUrl` covers with the class's
                 // international endpoint.
                 let trimmed = configured.trim();
                 if trimmed.is_empty() {
-                    return ALIBABA_PLAN_INTL_BASE_URL.to_string();
+                    return default.to_string();
                 }
                 trimmed.trim_end_matches('/').to_string()
             }
@@ -498,7 +568,7 @@ impl ChatCompletionsProvider {
     /// Builds the adapter for one connection id: the id must record
     /// the Chat Completions dialect (DEC-007) and name a recorded
     /// per-connection contract (HZN-008), the connection must be
-    /// declared, carry no configured region — neither recorded class
+    /// declared, carry no configured region — no recorded class
     /// has one — and resolve a scoped credential under DEC-013
     /// precedence.
     ///
@@ -704,6 +774,12 @@ impl ChatCompletionsProvider {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
+            EntryRule::AlibabaTokenPlan => {
+                is_alibaba_token_plan_chat_id(id).then(|| CatalogModel {
+                    id: id.to_string(),
+                    ..CatalogModel::default()
+                })
+            }
         }
     }
 
@@ -722,6 +798,7 @@ impl ChatCompletionsProvider {
         match self.contract.credential {
             CredentialRule::Bearer => Ok(text),
             CredentialRule::AlibabaPlan => self.plan_bearer(&text),
+            CredentialRule::AlibabaTokenPlan => self.token_plan_bearer(&text),
         }
     }
 
@@ -773,6 +850,90 @@ impl ChatCompletionsProvider {
             });
         }
         Ok(token.to_string())
+    }
+
+    /// The bearer an `alibaba-token-plan` credential resolves
+    /// (`parseAlibabaTokenPlanCredential`): a bare `sk-…` token, or a
+    /// JSON object whose `token` is the bearer, whose optional
+    /// `baseUrl` is the region base the key was enrolled and validated
+    /// against — absent meaning the recorded international endpoint,
+    /// the base the recorded login leaves unwritten — required to
+    /// equal the connection's configured base, so a key enrolled for
+    /// one region can never serve another (#6682), and whose optional
+    /// `cookie` is the separately admitted quota credential: checked
+    /// for its recorded string shape and dropped — the usage API it
+    /// reports to is a client side-channel this adapter has no leg
+    /// for, so the member is never read into a header, a request part
+    /// or a diagnostic. Upstream lets the credential's `baseUrl` steer
+    /// discovery (`credential?.baseUrl ?? config?.baseUrl ?? …`);
+    /// the adapter instead keeps egress bound to the configured
+    /// endpoint alone and treats the enrolled base as the region
+    /// evidence it must match — the same bound `plan_bearer` applies
+    /// to `enterpriseUrl`. Anything else is material the recorded
+    /// parse never produces — a non-`sk-…` token, a non-string member
+    /// — and denies as malformed. Every denial is typed and lands
+    /// before any wire leg.
+    fn token_plan_bearer(&self, material: &str) -> Result<String, ProviderError> {
+        let malformed = || ProviderError::CredentialMalformed {
+            connection: self.connection.clone(),
+        };
+        let trimmed = material.trim();
+        if trimmed.is_empty() {
+            return Err(malformed());
+        }
+        let (token, enrolled) = if trimmed.starts_with('{') {
+            let parsed: Value = serde_json::from_str(trimmed).map_err(|_parse| malformed())?;
+            let token = parsed
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| is_token_plan_key(token))
+                .ok_or_else(&malformed)?;
+            // The recorded optional members: non-string shapes are
+            // material the parse never produces — denied; the cookie
+            // is then dropped unread, the baseUrl binds the region.
+            match parsed.get("cookie") {
+                None | Some(Value::String(_)) => {}
+                Some(_) => return Err(malformed()),
+            }
+            let enrolled = match parsed.get("baseUrl") {
+                None => None,
+                // The recorded ingress normalization applied to the
+                // enrolled base — the same rule the configured
+                // endpoint resolved under at build, so the comparison
+                // is over the normalized bases; the empty string is
+                // the absent case the recorded parse leaves unset.
+                Some(Value::String(base)) => {
+                    let base = base.trim().trim_end_matches('/');
+                    if base.is_empty() {
+                        None
+                    } else {
+                        Some(base.to_string())
+                    }
+                }
+                Some(_) => return Err(malformed()),
+            };
+            (token.to_string(), enrolled)
+        } else {
+            // A bare `sk-…` token: the recorded serialize writes this
+            // shape only when the enrolled base is the international
+            // default, so absent `baseUrl` is the intl class.
+            if !is_token_plan_key(trimmed) {
+                return Err(malformed());
+            }
+            (trimmed.to_string(), None)
+        };
+        let enrolled = enrolled.unwrap_or_else(|| ALIBABA_TOKEN_PLAN_INTL_BASE_URL.to_string());
+        if enrolled != self.endpoint {
+            return Err(ProviderError::CredentialBaseMismatch {
+                connection: self.connection.clone(),
+                // The canonical egress rendering — userinfo, query and
+                // fragment inside store content never reach the
+                // diagnostic.
+                enrolled: canonical_egress_target(&enrolled),
+            });
+        }
+        Ok(token)
     }
 
     /// The frozen manifest as the Chat Completions wire request:
@@ -1539,6 +1700,38 @@ fn is_likely_aimlapi_chat_id(id: &str) -> bool {
     !normalized
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|part| AIMLAPI_EXCLUDED_TOKENS.contains(&part))
+}
+
+/// The recorded `alibaba-token-plan` key grammar (`TOKEN_PATTERN` —
+/// `^sk-[A-Za-z0-9._~+/-]+={0,2}$`): `sk-`, then one or more base
+/// characters, then at most two trailing `=` pad characters. A key
+/// outside the grammar is a different product on every plan base.
+fn is_token_plan_key(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix("sk-") else {
+        return false;
+    };
+    let core = rest.trim_end_matches('=');
+    if rest.len() - core.len() > 2 || core.is_empty() {
+        return false;
+    }
+    core.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'-'))
+}
+
+/// The recorded `alibaba-token-plan` chat-id filter
+/// (`isAlibabaTokenPlanChatModelId` → `isExcludedModel`'s `prefix`
+/// arm, openai-compat.ts §11): the id is trimmed and lowered, then
+/// dropped when the `exclude-models` prefix roster matches — the
+/// ASR/image/embedding SKUs the chat picker cannot route. Every
+/// other non-empty listed id is offered.
+fn is_alibaba_token_plan_chat_id(id: &str) -> bool {
+    let normalized = id.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    !ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
 }
 
 impl std::fmt::Debug for ChatCompletionsProvider {

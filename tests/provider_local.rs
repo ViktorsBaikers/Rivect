@@ -6694,3 +6694,1354 @@ async fn alibaba_coding_plan_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::alibaba-coding-plan = NOT_RUN"]
 fn provider_installed_alibaba_coding_plan() {}
+
+// ----- alibaba-token-plan -----------------------------------------------------
+//
+// The `alibaba-token-plan` connection's proof legs (HZN-008 class
+// P): the shared Chat Completions adapter serves the literal id —
+// no copied codec — under its own recorded predicates
+// (`alibabaTokenPlanModelManagerOptions`, `loginAlibabaTokenPlan`,
+// `parseAlibabaTokenPlanCredential`). The configured `endpoint`
+// carries the region choice — the recorded international
+// `token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`,
+// the China `token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`,
+// or an explicitly configured custom origin — an empty one resolves
+// the recorded international default (`credential?.baseUrl ??
+// config?.baseUrl ?? ALIBABA_TOKEN_PLAN_BASE_URL`'s configured arm),
+// and a configured `region` is denied: the contract names none. The
+// catalogue is the configured region's own authoritative `/models`
+// listing (`dynamicModelsAuthoritative` — the discovered set alone,
+// never unioned with the recorded static fallback) under the
+// recorded exclusion prefixes — the ASR/image/embedding SKUs the
+// chat picker cannot route — each admitted id landing the defaults
+// surface: the recorded reference and limits hydration is the
+// enrichment layer this adapter does not carry, the same boundary
+// `aimlapi` applies. The credential follows
+// `parseAlibabaTokenPlanCredential`: a bare `sk-…` token, or the
+// JSON `{"token": …, "cookie": …, "baseUrl": …}` — `baseUrl` is the
+// region base the key authenticates against, the recorded
+// international default when absent, and must equal the
+// connection's configured endpoint: keys are region-locked (#6682),
+// so a key recorded for one base never serves another. The optional
+// `cookie` member is the separately admitted quota credential the
+// recorded login pastes by hand — validated for shape and dropped:
+// no wire leg reads it and no extraction path exists.
+
+/// The scoped credential ref the `alibaba-token-plan` connection
+/// binds.
+const ALIBABA_TP_REF: &str = "keyring:rivect-test/alibaba-token-plan";
+
+/// Fixture token-plan material — the recorded `sk-…` grammar
+/// (`TOKEN_PATTERN`), never a real credential, only ever sent to
+/// localhost.
+const TOKEN_PLAN_KEY: &str = "sk-tp-fixture-key";
+
+/// The recorded international and China token-plan endpoints —
+/// credential `baseUrl` literals only: they ride the stored
+/// material, and no configured endpoint ever names a real host
+/// offline.
+const TOKEN_PLAN_INTL_BASE: &str =
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+const TOKEN_PLAN_CN_BASE: &str =
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+
+/// The pinned model id the fixed-pin legs carry — the recorded
+/// `defaultModel` of the catalogue descriptors.
+const ALIBABA_TP_MODEL: &str = "qwen3.7-plus";
+
+/// Fixture quota-cookie material — the recorded optional member's
+/// `name=value` shape, never a real Cookie header, only ever
+/// asserted absent from the wire.
+const QUOTA_COOKIE: &str = "fixture_quota=never-on-the-wire; session=fixture";
+
+/// Distinctive quota-cookie material one denied credential carries —
+/// the pin that no diagnostic surface ever renders it, complementing
+/// the wire-absence legs.
+const QUOTA_COOKIE_XYZ: &str = "diag_quota=QUOTA_COOKIE_XYZ";
+
+/// One configured `alibaba-token-plan` connection pointing at the
+/// fixture peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim — the
+/// region choice rides it, like the recorded bases' own
+/// `compatible-mode/v1` roots.
+fn alibaba_tp_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.alibaba-token-plan]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{ALIBABA_TP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"alibaba-token-plan\", model_id = \"{ALIBABA_TP_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded structured credential
+/// (`parseAlibabaTokenPlanCredential`'s JSON shape): `token` bears
+/// the wire and `baseUrl` is the region base the key was enrolled
+/// and validated against.
+fn token_plan_credential(token: &str, enrolled_base: &str) -> String {
+    json!({"token": token, "baseUrl": enrolled_base}).to_string()
+}
+
+fn alibaba_tp_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_TP_REF, material)],
+    ));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-token-plan".to_string(),
+        store.clone(),
+    )
+    .expect("the shared adapter builds for the alibaba-token-plan id");
+    (provider, store)
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the `alibaba-token-plan` pin. The store holds
+/// the structured credential enrolled for this connection's own
+/// configured base — the shape the recorded login writes for a
+/// region diverging from the default.
+fn prepared_alibaba_tp(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+    let enrolled = &config
+        .connections
+        .get("alibaba-token-plan")
+        .expect("the alibaba-token-plan connection is declared")
+        .endpoint;
+    let (provider, _store) =
+        alibaba_tp_provider(config, &token_plan_credential(TOKEN_PLAN_KEY, enrolled));
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the alibaba-token-plan pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+// ----- TP-PROVIDER-WIRE::alibaba-token-plan -----------------------------------
+
+/// A configured `alibaba-token-plan` connection returns a verified
+/// model outcome through the standard Broker: prepare admits the
+/// api_key pin under DEC-011, the recorded structured credential
+/// unwraps to its bearer token — the enrolled `baseUrl` matching the
+/// configured base — and the shared adapter posts exactly the frozen
+/// manifest as a `chat/completions` request — pinned model,
+/// system+user messages, `stream` with `stream_options.include_usage`
+/// and the pinned effort as `reasoning_effort` verbatim — the SSE
+/// stream validates its finish_reason/`[DONE]` terminal, and the one
+/// physical send is charged once with the provider's reported usage.
+#[tokio::test]
+async fn alibaba_token_plan_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&base)).expect("valid");
+    // the recorded structured credential: `token` bears the wire and
+    // `baseUrl` confirms the enrolled region is the configured one
+    let (provider, _store) =
+        alibaba_tp_provider(&config, &token_plan_credential(TOKEN_PLAN_KEY, &base));
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/alibaba-tp", "goal: prove the wire")
+        .expect("the alibaba-token-plan pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {TOKEN_PLAN_KEY}"),
+        "the structured credential's token bears the wire — never the JSON blob"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(TOKEN_PLAN_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(ALIBABA_TP_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "alibaba-token-plan");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/alibaba-tp", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving
+/// `alibaba-token-plan` means the id is never fixture-served even
+/// when it declares `local` kind, and a manifest pinning a different
+/// connection id is refused at send.
+#[test]
+fn alibaba_token_plan_dialect_is_keyed_on_the_literal_connection_id() {
+    let config =
+        Config::parse_validated(&alibaba_tp_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "alibaba-token-plan-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `alibaba-token-plan` pinned `local` keeps the typed
+    // denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.alibaba-token-plan]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"alibaba-token-plan\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local
+        .connections
+        .get("alibaba-token-plan")
+        .expect("declared");
+    assert!(
+        !loopback.serves("alibaba-token-plan", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) = alibaba_tp_provider(
+        &config,
+        &token_plan_credential(TOKEN_PLAN_KEY, "http://127.0.0.1:1/v1"),
+    );
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{ALIBABA_TP_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/alibaba-tp", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::alibaba-token-plan ---------------------------------
+
+/// The `alibaba-token-plan` catalogue is the configured region's own
+/// authoritative `/models` listing (HZN-008 class P —
+/// `dynamicModelsAuthoritative`): the lookup resolves the structured
+/// credential — its enrolled `baseUrl` bound to the configured base —
+/// and opens the one `GET {endpoint}/models` leg under the bearer;
+/// every admitted id is an offer under the recorded chat-id filter
+/// (`isAlibabaTokenPlanChatModelId` — the `exclude-models` prefix
+/// roster drops the ASR/image/embedding SKUs the chat picker cannot
+/// route) and lands the defaults surface: the recorded reference and
+/// limits hydration is the enrichment layer this adapter does not
+/// carry, the same boundary `aimlapi` applies.
+#[tokio::test]
+async fn alibaba_token_plan_catalog_is_the_region_bound_authoritative_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // chat ids — admitted, offered verbatim
+            json!({"id": ALIBABA_TP_MODEL}),
+            json!({"id": "deepseek-v4-flash"}),
+            json!({"id": "glm-5.1"}),
+            // the recorded `exclude-models` prefix roster — the ASR,
+            // image and embedding SKUs the chat picker cannot route
+            json!({"id": "fun-asr-plus"}),
+            json!({"id": "happyhorse-v1"}),
+            json!({"id": "qwen-audio-asr"}),
+            json!({"id": "qwen-image-2.5"}),
+            json!({"id": "text-embedding-v4"}),
+            json!({"id": "wan2.7-t2v"}),
+            // the match runs on the normalized id — a spaced,
+            // uppercased media id still fails the filter
+            json!({"id": "  QWEN-IMAGE-3  "}),
+            // a near miss: the roster is prefixes, not substrings —
+            // `qwen-image` inside an id that does not start with it
+            // still offers
+            json!({"id": "vendor/qwen-image-captioner"}),
+            // fields the listing may state are not a surface this
+            // dialect reads — none of them lands
+            json!({
+                "id": "priced-chat",
+                "context_window": 262144,
+                "input": ["text", "image"],
+            }),
+            // empty or absent ids can never name a model
+            json!({"id": ""}),
+            json!({"id": "   "}),
+            json!({"owned_by": "nobody"}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&base)).expect("valid");
+    let (provider, _store) =
+        alibaba_tp_provider(&config, &token_plan_credential(TOKEN_PLAN_KEY, &base));
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the region's authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec![
+            "deepseek-v4-flash",
+            "glm-5.1",
+            "priced-chat",
+            ALIBABA_TP_MODEL,
+            "vendor/qwen-image-captioner",
+        ],
+        "the authoritative listing filters to chat ids, sorted"
+    );
+    // every admitted id lands the defaults surface — a stated context
+    // window or modality list is never adopted
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{}: the listing states the id alone",
+            model.id
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — no other endpoint is consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {TOKEN_PLAN_KEY}"),
+        "the unwrapped token bears the discovery leg"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded international
+/// default — the `config?.baseUrl ?? ALIBABA_TOKEN_PLAN_BASE_URL`
+/// absent arm our required `endpoint` field expresses as the empty
+/// string, and whitespace-only shares the arm under the recorded
+/// trim. Offline pin: the adapter's `Debug` surface reports the
+/// resolved endpoint, so the arm is proved without one byte toward
+/// `token-plan.ap-southeast-1.maas.aliyuncs.com` — the host the
+/// bearer credential would egress to.
+#[test]
+fn alibaba_token_plan_empty_endpoint_resolves_the_recorded_intl_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&alibaba_tp_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = alibaba_tp_provider(
+            &config,
+            &token_plan_credential(TOKEN_PLAN_KEY, TOKEN_PLAN_INTL_BASE),
+        );
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains(&format!("endpoint: \"{TOKEN_PLAN_INTL_BASE}\"")),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the filtered listing: the
+/// dispatch narrows the pool to the `alibaba-token-plan` member and
+/// the shared adapter resolves the deterministic sorted-first
+/// admitted id as the wire model — a listing whose every id the
+/// roster excludes names no model, and the send denies unpinned
+/// rather than offering a non-chat id.
+#[tokio::test]
+async fn alibaba_token_plan_auto_pick_resolves_through_the_authoritative_catalog() {
+    let server = MockServer::start().await;
+    // a rostered SKU sorts ahead of every admitted id yet never
+    // enters the pick — the filtered listing alone names the wire
+    // model, so the leg proves filter-before-pick rather than
+    // ordering luck
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "fun-asr-9-ultra"}),
+            json!({"id": "qwen3.7-plus"}),
+            json!({"id": "qwen3.8-flash"}),
+        ],
+    )
+    .await;
+    mount_chat(&server, completed_stream("auto pick", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.alibaba-token-plan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{ALIBABA_TP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_alibaba_tp(&auto, "/world/alibaba-tp", "goal: auto pick");
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
+    outcome.expect("the auto send resolves through the catalogue");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the auto pick spends the one listing leg plus the send"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {TOKEN_PLAN_KEY}"),
+        "the discovery leg bears the unwrapped token"
+    );
+    let send = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("the send crossed the wire");
+    let body: Value = serde_json::from_slice(&send.body).expect("json body");
+    assert_eq!(
+        body["model"], "qwen3.7-plus",
+        "the sorted-first admitted id rides the wire"
+    );
+
+    // a listing whose every id is rostered names no model — the send
+    // denies unpinned, and the chat endpoint is never reached
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "qwen-image-2.5"})]).await;
+    mount_chat(&server, completed_stream("unreachable", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.alibaba-token-plan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{ALIBABA_TP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_alibaba_tp(&auto, "/world/alibaba-tp", "goal: empty pick");
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnpinnedModel { .. }))
+        ),
+        "a fully filtered listing denies unpinned: {outcome:?}"
+    );
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/v1/chat/completions"),
+        "no send crosses the wire without a model the filter admitted"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::alibaba-token-plan ------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `alibaba-token-plan`: a configured `region` — the recorded
+/// contract carries the region choice on the endpoint and names no
+/// `region` field — the profile-bound ref whose scope disagrees with
+/// the binding, an absent credential, a structured credential with
+/// no usable `token` and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn alibaba_token_plan_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+ {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &alibaba_tp_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"cn\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "alibaba-token-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, TOKEN_PLAN_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "alibaba-token-plan");
+    assert_eq!(region, "cn");
+    assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.alibaba-token-plan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"alibaba-token-plan\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "alibaba-token-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, TOKEN_PLAN_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&alibaba_tp_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-token-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, TOKEN_PLAN_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // a structured credential whose `token` is unusable is malformed —
+    // the JSON blob is never sent as the bearer
+    let blob = "{\"baseUrl\": \"https://elsewhere.example.com/v1\"}";
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_TP_REF, blob)],
+    ));
+    let provider = provider_result(config.clone(), "alibaba-token-plan".to_string(), store)
+        .expect("binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a structured credential without a token is malformed");
+    assert!(matches!(err, ProviderError::CredentialMalformed { .. }));
+    assert_no_secret_or_body(&err, blob.as_bytes());
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = alibaba_tp_provider(
+        &config,
+        &token_plan_credential(TOKEN_PLAN_KEY, &server_uri_v1(&server)),
+    );
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, reason } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "alibaba-token-plan");
+    assert!(
+        reason.contains("401"),
+        "the status code is the context: {reason}"
+    );
+    assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&base)).expect("valid");
+    let material = token_plan_credential(TOKEN_PLAN_KEY, &base);
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_TP_REF, &material)],
+    ));
+    let provider = provider_result(config.clone(), "alibaba-token-plan".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(TOKEN_PLAN_KEY),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = alibaba_tp_provider(&config, &material);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/alibaba-tp", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(TOKEN_PLAN_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(TOKEN_PLAN_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(TOKEN_PLAN_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-alibaba-tp",
+        Some(&alibaba_tp_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(TOKEN_PLAN_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+/// The recorded non-interchangeability predicate (HZN-008 class P):
+/// a key enrolled for one region — international, China or a custom
+/// origin — can never serve another, because the credential's
+/// `baseUrl` is the region base the key authenticates against and
+/// must equal the connection's configured endpoint; every mismatch
+/// or foreign-grammar credential lands a typed denial before any
+/// wire leg — zero requests reach any mock. A bare `sk-…` token or a
+/// blob without `baseUrl` records the absent case — the default
+/// international endpoint — so it is the intl class credential and
+/// binds that base alone; material the recorded parse never produces
+/// — a non-`sk-…` token, a non-string member — is malformed on every
+/// base.
+#[tokio::test]
+async fn alibaba_token_plan_enrolled_bases_are_not_interchangeable() {
+    // Three stand-in bases — distinct mock origins: a denied send
+    // that still egressed would be observed, and no configured
+    // endpoint ever names a real host. The recorded base literals
+    // appear only inside credential material — they ride the store,
+    // never a socket.
+    let intl = MockServer::start().await;
+    let cn = MockServer::start().await;
+    let custom = MockServer::start().await;
+    let intl_base = server_uri_v1(&intl);
+    let cn_base = server_uri_v1(&cn);
+    let custom_base = server_uri_v1(&custom);
+    let bases: [(&str, &String, &MockServer); 3] = [
+        ("intl", &intl_base, &intl),
+        ("cn", &cn_base, &cn),
+        ("custom", &custom_base, &custom),
+    ];
+
+    // (credential material, the only base it may serve, the typed
+    // denial every other pairing lands): a denied send never reaches
+    // a socket — the enrolled host included
+    let credentials: [(&str, String, PlanDeny); 25] = [
+        // keys enrolled for each base class serve that base alone
+        (
+            "intl",
+            token_plan_credential(TOKEN_PLAN_KEY, &intl_base),
+            PlanDeny::BaseMismatch(intl_base.clone()),
+        ),
+        (
+            "cn",
+            token_plan_credential(TOKEN_PLAN_KEY, &cn_base),
+            PlanDeny::BaseMismatch(cn_base.clone()),
+        ),
+        (
+            "custom",
+            token_plan_credential(TOKEN_PLAN_KEY, &custom_base),
+            PlanDeny::BaseMismatch(custom_base.clone()),
+        ),
+        // the real recorded base literals are classes of their own —
+        // a credential enrolled at the real intl or CN endpoint is
+        // not a mock's credential either
+        (
+            "none",
+            token_plan_credential(TOKEN_PLAN_KEY, TOKEN_PLAN_INTL_BASE),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_INTL_BASE.to_string()),
+        ),
+        (
+            "none",
+            token_plan_credential(TOKEN_PLAN_KEY, TOKEN_PLAN_CN_BASE),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_CN_BASE.to_string()),
+        ),
+        // a key enrolled at an unrelated origin serves none of them
+        (
+            "none",
+            token_plan_credential(TOKEN_PLAN_KEY, "https://elsewhere.example.com/v1"),
+            PlanDeny::BaseMismatch("https://elsewhere.example.com/v1".to_string()),
+        ),
+        // the recorded absent case: a bare `sk-…` token or a blob
+        // without `baseUrl` is enrolled for the default international
+        // endpoint — it is the intl class credential on every other
+        // configured base
+        (
+            "none",
+            TOKEN_PLAN_KEY.to_string(),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_INTL_BASE.to_string()),
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY}).to_string(),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_INTL_BASE.to_string()),
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "baseUrl": ""}).to_string(),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_INTL_BASE.to_string()),
+        ),
+        // the separately admitted quota `cookie` never alters the
+        // binding — this blob records no base, so it is intl-enrolled
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "cookie": QUOTA_COOKIE}).to_string(),
+            PlanDeny::BaseMismatch(TOKEN_PLAN_INTL_BASE.to_string()),
+        ),
+        // …and never reaches a diagnostic: this blob denies on a
+        // foreign enrolled base, and the deny loop scans both
+        // renderings for the distinctive cookie material
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "cookie": QUOTA_COOKIE_XYZ, "baseUrl": "https://elsewhere.example.com/v1"})
+                .to_string(),
+            PlanDeny::BaseMismatch("https://elsewhere.example.com/v1".to_string()),
+        ),
+        // material the recorded parse never produces — malformed on
+        // every base, enrolled host included: a present-but-empty
+        // store blob is malformed, never absent
+        ("none", String::new(), PlanDeny::Malformed),
+        ("none", "   ".to_string(), PlanDeny::Malformed),
+        (
+            "none",
+            "fixture-token-not-a-real-credential".to_string(),
+            PlanDeny::Malformed,
+        ),
+        // the recorded key grammar's reject arms — an empty core,
+        // more than two pad characters, `=` inside the core: a
+        // cookie-shaped blob is never a token
+        ("none", "sk-".to_string(), PlanDeny::Malformed),
+        ("none", "sk-abc===".to_string(), PlanDeny::Malformed),
+        ("none", "sk-a=b".to_string(), PlanDeny::Malformed),
+        ("none", "{\"token\": 42}".to_string(), PlanDeny::Malformed),
+        ("none", "{not-json".to_string(), PlanDeny::Malformed),
+        (
+            "none",
+            json!({"token": "fixture-token-not-a-real-credential", "baseUrl": intl_base.as_str()})
+                .to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "baseUrl": null}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "baseUrl": 42}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "cookie": 42, "baseUrl": intl_base.as_str()})
+                .to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": TOKEN_PLAN_KEY, "cookie": null, "baseUrl": intl_base.as_str()})
+                .to_string(),
+            PlanDeny::Malformed,
+        ),
+        // the recorded ingress normalization: a trailing slash on the
+        // enrolled base still matches the configured one
+        (
+            "intl",
+            token_plan_credential(TOKEN_PLAN_KEY, &format!("{intl_base}/")),
+            PlanDeny::BaseMismatch(intl_base.clone()),
+        ),
+    ];
+
+    // every deny pairing first, while no mock has seen a request —
+    // a wrong credential never reaches a socket, enrolled host
+    // included
+    for (serves, material, deny) in &credentials {
+        for (base_label, base, _server) in &bases {
+            if serves == base_label {
+                continue;
+            }
+            let config = Config::parse_validated(&alibaba_tp_config(base)).expect("valid");
+            let store = Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(ALIBABA_TP_REF, material.as_str())],
+            ));
+            let provider = provider_result(config.clone(), "alibaba-token-plan".to_string(), store)
+                .expect("binding resolves");
+            let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+            let err = outcome.expect_err("a wrong-base or wrong-grammar credential denies");
+            match (deny, &err) {
+                (PlanDeny::Malformed, ProviderError::CredentialMalformed { connection }) => {
+                    assert_eq!(connection, "alibaba-token-plan");
+                }
+                (
+                    PlanDeny::BaseMismatch(enrolled),
+                    ProviderError::CredentialBaseMismatch {
+                        connection,
+                        enrolled: reported,
+                    },
+                ) => {
+                    assert_eq!(connection, "alibaba-token-plan");
+                    assert_eq!(
+                        reported, enrolled,
+                        "the denial reports the credential's own enrolled base"
+                    );
+                }
+                _ => panic!(
+                    "{serves}-enrolled credential on {base_label} base denies as {deny:?}: {err}"
+                ),
+            }
+            assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
+            // a denied credential's `cookie` member never reaches a
+            // diagnostic — Display or Debug — at any granularity
+            for rendered in [format!("{err}"), format!("{err:?}")] {
+                for marker in [QUOTA_COOKIE_XYZ, "diag_quota", "QUOTA_COOKIE_XYZ"] {
+                    assert!(
+                        !rendered.contains(marker),
+                        "the quota cookie never renders: {rendered}"
+                    );
+                }
+            }
+            drop_blocking(provider);
+            for (_, _, server) in &bases {
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .expect("recorded")
+                        .is_empty(),
+                    "no wire leg left the denied send — the enrolled host included"
+                );
+            }
+        }
+    }
+
+    // the serve pairings: each enrolled key on its own base — the
+    // enrolled base equals the configured one
+    for (label, server) in [("intl", &intl), ("cn", &cn), ("custom", &custom)] {
+        mount_chat(server, completed_stream(&format!("served-{label}"), None)).await;
+    }
+    for (serves, material, _deny) in &credentials {
+        for (base_label, base, server) in &bases {
+            if serves != base_label {
+                continue;
+            }
+            let config = Config::parse_validated(&alibaba_tp_config(base)).expect("valid");
+            let store = Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(ALIBABA_TP_REF, material.as_str())],
+            ));
+            let provider = provider_result(config.clone(), "alibaba-token-plan".to_string(), store)
+                .expect("binding resolves");
+            let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+            let reply = outcome.unwrap_or_else(|err| {
+                panic!("{serves}-enrolled credential serves the {base_label} base: {err}")
+            });
+            assert_eq!(reply.text, format!("served-{base_label}"));
+            drop_blocking(provider);
+            let requests = server.received_requests().await.expect("recorded");
+            let last = requests.last().expect("the serve crossed the wire");
+            assert_eq!(
+                received_auth(last),
+                format!("Bearer {TOKEN_PLAN_KEY}"),
+                "the unwrapped plan token bears the wire"
+            );
+        }
+    }
+
+    // exactly the serve legs crossed the wire — each enrolled key on
+    // its own base plus intl's extra trailing-slash enrolled leg —
+    // and every denial left none
+    for (label, _, server) in &bases {
+        let expected = if label == &"intl" { 2 } else { 1 };
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(
+            requests.len(),
+            expected,
+            "the serve legs alone egressed on the {label} base"
+        );
+    }
+    // Let the mock servers' in-flight handler tasks drain before the
+    // servers drop: `MockServer::drop` verifies through a futures
+    // `block_on` that cannot drive this runtime, so a handler still
+    // holding the state write lock would park the teardown forever.
+    tokio::task::yield_now().await;
+}
+
+/// A `CredentialBaseMismatch` reports the enrolled base in the
+/// canonical egress form — the same rendering consent and journal
+/// surfaces use — so store content carrying userinfo or a query
+/// never reaches the diagnostic.
+#[tokio::test]
+async fn alibaba_token_plan_base_mismatch_redacts_enrolled_url_parts() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&alibaba_tp_config(&server_uri_v1(&server))).expect("valid");
+    let material = json!({
+        "token": TOKEN_PLAN_KEY,
+        "baseUrl": "https://user:pw@host.invalid/v1?x=1",
+    })
+    .to_string();
+    let (provider, _store) = alibaba_tp_provider(&config, &material);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a foreign enrolled base denies");
+    let ProviderError::CredentialBaseMismatch {
+        connection,
+        enrolled,
+    } = &err
+    else {
+        panic!("the foreign enrolled base is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "alibaba-token-plan");
+    assert_eq!(
+        enrolled, "https://host.invalid/v1",
+        "the reported enrolled base drops userinfo and query"
+    );
+    let rendered = err.to_string();
+    for secret_part in ["user", "pw", "x=1"] {
+        assert!(
+            !rendered.contains(secret_part),
+            "the enrolled base's {secret_part:?} never renders: {rendered}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no wire leg left the denied send"
+    );
+    tokio::task::yield_now().await;
+}
+
+/// The headline discriminator, both clauses. Region-bound catalogue:
+/// a credential enrolled for the configured base discovers the
+/// listing there, while one enrolled for a foreign region is denied
+/// before any wire leg — the discovery endpoint is never borrowed
+/// from store material, so a credential's own `baseUrl` cannot steer
+/// egress to its recorded host either. Optional quota cookie: the
+/// recorded `cookie` member is the separately admitted capability the
+/// login pastes by hand for a usage API this adapter has no leg for —
+/// the parse admits its shape, then drops it: no `Cookie` header, no
+/// request part and no Debug surface ever carries the material, and
+/// no browser/DevTools extraction path exists to produce it.
+#[tokio::test]
+async fn alibaba_token_plan_region_bound_catalog_and_optional_quota_cookie_is_never_auto_extracted()
+{
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": ALIBABA_TP_MODEL}),
+            json!({"id": "qwen-audio-asr"}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&base)).expect("valid");
+    // the full recorded credential shape — token, the enrolled region
+    // base and the pasted quota cookie
+    let material = json!({
+        "token": TOKEN_PLAN_KEY,
+        "cookie": QUOTA_COOKIE,
+        "baseUrl": base,
+    })
+    .to_string();
+
+    // region-bound: the catalogue leg discovers the configured
+    // region's own listing under the bound credential
+    let (provider, _store) = alibaba_tp_provider(&config, &material);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the region-bound listing answers");
+    assert_eq!(
+        model_ids(&models),
+        vec![ALIBABA_TP_MODEL],
+        "the filtered authoritative listing"
+    );
+    drop_blocking(provider);
+
+    // a credential enrolled for the recorded CN endpoint binds no
+    // catalogue on this configured base — the region mismatch is
+    // typed before any wire leg, and no request ever reaches the
+    // credential's recorded host: the configured endpoint alone
+    // decides egress
+    let (provider, _store) = alibaba_tp_provider(
+        &config,
+        &token_plan_credential(TOKEN_PLAN_KEY, TOKEN_PLAN_CN_BASE),
+    );
+    let (provider, denied) = catalog_on_thread(provider);
+    let err = denied.expect_err("a foreign-enrolled credential binds no catalogue");
+    let ProviderError::CredentialBaseMismatch {
+        connection,
+        enrolled,
+    } = &err
+    else {
+        panic!("the foreign region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "alibaba-token-plan");
+    assert_eq!(enrolled, TOKEN_PLAN_CN_BASE);
+    drop_blocking(provider);
+
+    // the quota cookie never reaches the wire: the send under the
+    // cookie-bearing credential carries the bearer alone — no
+    // `Cookie` header, no cookie material in any request part
+    mount_chat(&server, completed_stream("wired", None)).await;
+    let (provider, _store) = alibaba_tp_provider(&config, &material);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the cookie-bearing credential serves its own base");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the models leg and the send leg alone crossed"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    for request in &requests {
+        assert!(
+            request.headers.get("cookie").is_none(),
+            "no Cookie header ever rides a leg: {:?}",
+            request.headers
+        );
+        assert_eq!(
+            received_auth(request),
+            format!("Bearer {TOKEN_PLAN_KEY}"),
+            "the unwrapped token bears every leg — never the JSON blob"
+        );
+        let rendered = format!(
+            "{}{:?}",
+            request.url,
+            String::from_utf8_lossy(&request.body)
+        );
+        for marker in [QUOTA_COOKIE, "fixture_quota", "session=fixture"] {
+            assert!(
+                !rendered.contains(marker),
+                "no part of the quota cookie reaches the wire: {marker}"
+            );
+        }
+        for value in request.headers.values() {
+            let value = value.to_str().expect("header values are ascii");
+            for marker in [QUOTA_COOKIE, "fixture_quota", "session=fixture"] {
+                assert!(
+                    !value.contains(marker),
+                    "no header carries the quota cookie: {marker}"
+                );
+            }
+        }
+    }
+}
+
+/// The configured side of the binding takes the same recorded ingress
+/// normalization: an `endpoint` carrying a trailing slash resolves to
+/// the same base the credential enrolled, and the request path never
+/// doubles the slash.
+#[tokio::test]
+async fn alibaba_token_plan_configured_trailing_slash_binds_the_same_base() {
+    let server = MockServer::start().await;
+    mount_chat(&server, completed_stream("slashed", None)).await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&format!("{base}/"))).expect("valid");
+    let (provider, _store) =
+        alibaba_tp_provider(&config, &token_plan_credential(TOKEN_PLAN_KEY, &base));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the normalized configured base binds the enrolled credential");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/chat/completions",
+        "the resolved base carries no doubled slash"
+    );
+    tokio::task::yield_now().await;
+}
+
+// ----- TP-PROVIDER-RECOVERY::alibaba-token-plan --------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling a plan key at the
+/// scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn alibaba_token_plan_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&alibaba_tp_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-token-plan".to_string(),
+        store.clone(),
+    )
+    .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(
+        ALIBABA_TP_REF,
+        token_plan_credential(TOKEN_PLAN_KEY, &server_uri_v1(&server)).as_bytes(),
+    );
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `alibaba-token-plan`: CATALOG, AUTH, WIRE and RECOVERY each
+/// execute and report inside this run, and INSTALLED reports
+/// NOT_RUN — an omitted leg fails the suite rather than silently
+/// absenting.
+#[tokio::test]
+async fn alibaba_token_plan_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": ALIBABA_TP_MODEL}),
+            json!({"id": "text-embedding-v4"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_tp_config(&base)).expect("valid");
+
+    // CATALOG: the region's authoritative `/models` listing answers
+    // under the bound credential — filtered to the admitted ids.
+    let (provider, _store) =
+        alibaba_tp_provider(&config, &token_plan_credential(TOKEN_PLAN_KEY, &base));
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref models) if model_ids(models) == [ALIBABA_TP_MODEL]) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "alibaba-token-plan".to_string(), empty)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_alibaba_tp(&config, "/world/alibaba-tp", "goal: matrix wire");
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-token-plan".to_string(),
+        empty.clone(),
+    )
+    .expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(
+        ALIBABA_TP_REF,
+        token_plan_credential(TOKEN_PLAN_KEY, &server_uri_v1(&server)).as_bytes(),
+    );
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_alibaba_token_plan` case below: its ignored
+    // count is the explicit NOT_RUN signal this matrix asserts — the
+    // row stays a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::alibaba-token-plan -------------------------------
+
+/// TP-PROVIDER-INSTALLED::alibaba-token-plan = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline
+/// slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::alibaba-token-plan = NOT_RUN"]
+fn provider_installed_alibaba_token_plan() {}
