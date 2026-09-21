@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+pub mod gemini;
 pub mod openai;
 pub mod sse;
 
@@ -874,13 +875,18 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 
 /// The recorded wire dialect of a connection id (DEC-007/DEC-025):
 /// keyed by the literal id's source class — `openai` speaks the
-/// OpenAI Responses API — never inferred from an auth label or a
-/// catalogue answer. `openai-codex` is a distinct literal id and
-/// stays unrouted until its own dialect lands.
+/// OpenAI Responses API, `google` speaks the Gemini
+/// `streamGenerateContent` dialect — never inferred from an auth
+/// label or a catalogue answer. `openai-codex`, `google-vertex`,
+/// `google-antigravity` and `google-gemini-cli` are distinct literal
+/// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
     Responses,
+    /// The Google Gemini generate-content API
+    /// (`POST {endpoint}/models/{id}:streamGenerateContent?alt=sse`, SSE).
+    Gemini,
 }
 
 /// The recorded dialect for a literal connection id; `None` for ids
@@ -889,6 +895,7 @@ pub enum Dialect {
 pub fn dialect_for(connection: &str) -> Option<Dialect> {
     match connection {
         "openai" => Some(Dialect::Responses),
+        "google" => Some(Dialect::Gemini),
         _ => None,
     }
 }
