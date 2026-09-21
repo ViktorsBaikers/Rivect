@@ -8,12 +8,16 @@
 //! between a native secret store and an adapter — secret bytes never
 //! leave the store boundary (INV-001).
 
-use crate::config::{Config, ConnKind, ModelAssign};
+use crate::config::{Config, ConnKind, Connection, ModelAssign, Profile};
 use crate::model::RequestManifest;
+use crate::resources::UsageDelta;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+pub mod openai;
+pub mod sse;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -25,6 +29,12 @@ pub struct ToolCall {
 pub struct ProviderReply {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// The physical usage report of this one send (INV-022/INV-024):
+    /// it travels inside the reply, so one physical send produces one
+    /// accounting record — `Unknown` when the provider reported none,
+    /// never an estimate and never a zero the retained bound could
+    /// release as.
+    pub usage: UsageDelta,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -72,6 +82,54 @@ pub enum ProviderError {
     /// No material exists at the scope — distinct from an empty secret.
     #[error("no credential material at scope {scope}")]
     CredentialAbsent { scope: String },
+    /// The resolved credential material cannot serve this dialect —
+    /// non-UTF-8 bytes where the contract needs a bearer token. The
+    /// material itself never appears in the error.
+    #[error("credential material for connection {connection} is not usable by this dialect")]
+    CredentialMalformed { connection: String },
+    /// DEC-007: the manifest's pin names a connection whose recorded
+    /// source class is not this adapter's dialect — dialect selection
+    /// keys on the literal connection id, never an auth label.
+    #[error("connection {connection} does not speak this adapter's dialect")]
+    DialectMismatch { connection: String },
+    /// The manifest carries no pinned model id for the wire request —
+    /// an auto assignment resolves its model at catalogue time, which
+    /// this adapter does not hold.
+    #[error("connection {connection} requires a fixed model pin on the wire request")]
+    UnpinnedModel { connection: String },
+    /// DEC-014: the connection's configured region names an endpoint
+    /// outside this dialect's recorded contract — a configured region
+    /// is never silently ignored.
+    #[error("connection {connection} region {region} is outside the dialect's endpoint contract")]
+    RegionMismatch { connection: String, region: String },
+    /// The transport failed before a usable reply — connect, TLS,
+    /// status or read failure. `reason` carries the client's own text;
+    /// it never contains secret material.
+    #[error("connection {connection} transport failed: {reason}")]
+    Transport { connection: String, reason: String },
+    /// The provider's own terminal event reported a failed or
+    /// incomplete response — a peer verdict, not a parse error.
+    #[error("connection {connection} reported failure: {reason}")]
+    ProviderFailed { connection: String, reason: String },
+    /// The stream ended without a terminal event the dialect can
+    /// classify, or a terminal carried an outcome it cannot — unknown
+    /// is never success.
+    #[error("connection {connection} ended without a classifiable terminal event")]
+    UnknownTerminal { connection: String },
+    /// A wire event or item was malformed — bad JSON, a missing
+    /// mandatory field, a truncated item or an over-limit line.
+    #[error("connection {connection} stream violated the dialect contract: {reason}")]
+    StreamViolation { connection: String, reason: String },
+    /// A well-formed output item the dialect cannot honour — an
+    /// unbounded server-side tool kind or a tool shape the frozen
+    /// request never declared.
+    #[error("connection {connection} produced an incompatible output: {reason}")]
+    IncompatibleOutput { connection: String, reason: String },
+    /// DEC-012: a reasoning artifact outside this manifest's
+    /// session/epoch lineage — absent or foreign `encrypted_content`
+    /// is a provenance failure, never silently dropped or replayed.
+    #[error("connection {connection} returned a reasoning artifact outside the lineage: {reason}")]
+    ReasoningProvenance { connection: String, reason: String },
 }
 
 /// The native secret-store class a credential reference resolves to
@@ -756,13 +814,24 @@ fn secret_service_backend() -> Result<Arc<keyring_core::CredentialStore>, Provid
 /// ref, or the connection's own ref is absent or malformed;
 /// [`ProviderError::CredentialProfileMismatch`] as documented above.
 pub fn resolve_credential(config: &Config, connection: &str) -> Result<SecretRef, ProviderError> {
-    let Some(conn) = config.connections.get(connection) else {
+    resolve_credential_in(&config.connections, &config.profiles, connection)
+}
+
+/// The catalogue-level half of [`resolve_credential`] (DEC-011): the
+/// broker's dispatch-time re-check and [`offline_usable`] run the same
+/// profile-precedence resolution without owning a `Config` — a
+/// connection whose binding cannot resolve keeps the typed denial.
+pub(crate) fn resolve_credential_in(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+) -> Result<SecretRef, ProviderError> {
+    let Some(conn) = connections.get(connection) else {
         return Err(ProviderError::UnknownConnection);
     };
     if let Some(profile) = &conn.profile {
         let key = format!("profiles.{profile}.credential_ref");
-        let raw = config
-            .profiles
+        let raw = profiles
             .get(profile)
             .and_then(|profile| profile.credential_ref.clone())
             .ok_or_else(|| ProviderError::CredentialUnresolved {
@@ -803,8 +872,37 @@ pub fn resolve_credential(config: &Config, connection: &str) -> Result<SecretRef
 const ADMITTED_READ: &str = "performing the admitted read";
 const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision";
 
+/// The recorded wire dialect of a connection id (DEC-007/DEC-025):
+/// keyed by the literal id's source class — `openai` speaks the
+/// OpenAI Responses API — never inferred from an auth label or a
+/// catalogue answer. `openai-codex` is a distinct literal id and
+/// stays unrouted until its own dialect lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
+    Responses,
+}
+
+/// The recorded dialect for a literal connection id; `None` for ids
+/// whose source class has no wired dialect in this build.
+#[must_use]
+pub fn dialect_for(connection: &str) -> Option<Dialect> {
+    match connection {
+        "openai" => Some(Dialect::Responses),
+        _ => None,
+    }
+}
+
 pub trait Provider: Send {
     fn name(&self) -> &'static str;
+    /// Whether this adapter's dialect serves `connection` — the send
+    /// seam's fail-closed gate (AC-046): eligibility says a connection
+    /// is theoretically usable; only the injected provider can say it
+    /// speaks its dialect, and a manifest it cannot honour is a typed
+    /// denial, never a fabricated reply. Every implementor — test
+    /// doubles included — declares the rule; a scripted double that
+    /// answers anything returns `true`.
+    fn serves(&self, connection: &str, entry: &Connection) -> bool;
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError>;
 }
 
@@ -836,6 +934,16 @@ impl Provider for LoopbackProvider {
         "loopback"
     }
 
+    /// The offline fixture answers local connections only — a pin to
+    /// a credentialled or subscribed class is a dialect it does not
+    /// speak, so the seam denies it rather than fabricating a reply.
+    /// An id [`dialect_for`] reserves is a live dialect's connection
+    /// even when it declares `local` kind: reserved ids are never
+    /// fixture-served.
+    fn serves(&self, connection: &str, entry: &Connection) -> bool {
+        entry.kind == ConnKind::Local && dialect_for(connection).is_none()
+    }
+
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         self.calls += 1;
         let path = manifest
@@ -850,34 +958,75 @@ impl Provider for LoopbackProvider {
                     tool: "read_file".to_string(),
                     path: Some(path),
                 }],
+                usage: UsageDelta::Unknown,
             }),
             None => Ok(ProviderReply {
                 text: WAITING_FOR_DECISION.to_string(),
                 tool_calls: Vec::new(),
+                usage: UsageDelta::Unknown,
             }),
         }
     }
 }
 
-/// Connection eligibility for offline dispatch: only local connections are
-/// usable without a separate live grant; fail closed otherwise.
+/// Whether the connection's recorded auth class resolves a scoped
+/// [`SecretRef`] under DEC-013 precedence (DEC-011): the offline
+/// dispatch precondition for `api_key` connections. Resolution is
+/// binding-level — the store is read at send time — so a missing,
+/// malformed or mismatched binding is the unresolved case.
+fn credential_resolves(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+) -> bool {
+    resolve_credential_in(connections, profiles, connection).is_ok()
+}
+
+/// Connection eligibility for offline dispatch (DEC-011): local
+/// connections are always usable; an `api_key` connection is usable
+/// exactly when its recorded auth class resolves a scoped
+/// [`SecretRef`] — catalogue presence is never entitlement, and an
+/// unresolved binding keeps the typed live-grant denial.
+///
+/// # Errors
+/// [`ProviderError::UnknownConnection`] for a fixed pin on an
+/// undeclared connection; [`ProviderError::LiveGrantRequired`] for a
+/// non-local pin whose credential does not resolve.
 pub fn offline_eligible(
     model: &ModelAssign,
-    connection_kind: Option<ConnKind>,
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
 ) -> Result<(), ProviderError> {
-    match (model, connection_kind) {
-        (ModelAssign::Fixed(_), Some(ConnKind::Local)) => Ok(()),
-        (ModelAssign::Fixed(_), Some(kind)) => Err(ProviderError::LiveGrantRequired { kind }),
-        (ModelAssign::Fixed(_), None) => Err(ProviderError::UnknownConnection),
-        _ => Ok(()),
+    let ModelAssign::Fixed(fixed) = model else {
+        return Ok(());
+    };
+    match connections.get(&fixed.connection) {
+        None => Err(ProviderError::UnknownConnection),
+        Some(_) if offline_usable(connections, profiles, &fixed.connection) => Ok(()),
+        Some(entry) => Err(ProviderError::LiveGrantRequired { kind: entry.kind }),
     }
 }
 
-/// Offline kind eligibility as a ranking predicate (AC-044): a
-/// candidate usable without a separate live grant. Ranking filters
-/// candidates with this; [`offline_eligible`] keeps the typed
-/// rejection vocabulary for the single-candidate fixed path.
+/// Offline eligibility as a ranking predicate (AC-044/DEC-011): a
+/// candidate usable without a separate live grant — a local
+/// connection always; an `api_key` one exactly when its credential
+/// resolves. A `subscription` names a live grant no scoped reference
+/// confers — it stays grant-gated until the subscription machinery
+/// lands. Ranking filters candidates with this; [`offline_eligible`]
+/// keeps the typed rejection vocabulary for the single-candidate
+/// fixed path.
 #[must_use]
-pub fn offline_usable(connection_kind: Option<ConnKind>) -> bool {
-    matches!(connection_kind, Some(ConnKind::Local))
+pub fn offline_usable(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+) -> bool {
+    match connections.get(connection) {
+        None => false,
+        Some(entry) => match entry.kind {
+            ConnKind::Local => true,
+            ConnKind::ApiKey => credential_resolves(connections, profiles, connection),
+            ConnKind::Subscription => false,
+        },
+    }
 }

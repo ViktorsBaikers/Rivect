@@ -29,6 +29,36 @@ pub enum Delivery {
     ResyncMarker,
 }
 
+/// The single physical usage report of one sent provider request
+/// (INV-024): what the peer actually charged, reported once. `Unknown`
+/// is a carried state — a reply without provider usage stays unknown at
+/// the retained bound, never released as zero (EDGE-008, INV-022).
+/// Cumulative callers dedupe on the accounting record's attempt id, so
+/// a fallback or replay can never double-charge one physical send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageDelta {
+    /// The provider reported no usable usage accounting.
+    Unknown,
+    /// Exact token counts the provider reported for this send.
+    Exact {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
+}
+
+impl UsageDelta {
+    /// The confirmed total the charge path may release — `None` while
+    /// usage is unknown, so the retained bound never collapses to zero.
+    #[must_use]
+    pub fn confirmed_total(&self) -> Option<u64> {
+        match self {
+            Self::Unknown => None,
+            Self::Exact { total_tokens, .. } => Some(*total_tokens),
+        }
+    }
+}
+
 pub struct NotificationQueue {
     capacity: usize,
     pending: VecDeque<Event>,

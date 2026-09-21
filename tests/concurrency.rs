@@ -34,7 +34,7 @@ use rivect::executor::{
 use rivect::model::{ModelError, RequestManifest};
 use rivect::policy::{PermissionMode, PolicyError};
 use rivect::providers::{Provider, ProviderError, ProviderReply, ToolCall};
-use rivect::resources::{FlightRole, ReadFlights};
+use rivect::resources::{FlightRole, ReadFlights, UsageDelta};
 use rivect::scheduler::{
     CompleteTransition, DeliverVerdict, NodeState, Scheduler, SchedulerError, WaitTransition,
 };
@@ -2133,10 +2133,16 @@ impl Provider for NoReadProvider {
         "no-read"
     }
 
+    /// The scripted double answers any manifest it is handed.
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         Ok(ProviderReply {
             text: "no permitted action".to_string(),
             tool_calls: Vec::new(),
+            usage: UsageDelta::Unknown,
         })
     }
 }
@@ -2153,6 +2159,11 @@ impl Provider for OutsideScopeProvider {
         "outside-scope"
     }
 
+    /// The scripted double answers any manifest it is handed.
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         Ok(ProviderReply {
             text: "read outside the scope".to_string(),
@@ -2160,6 +2171,7 @@ impl Provider for OutsideScopeProvider {
                 tool: "read_file".to_string(),
                 path: Some(self.target.clone()),
             }],
+            usage: UsageDelta::Unknown,
         })
     }
 }
@@ -2171,6 +2183,12 @@ struct FailingProvider;
 impl Provider for FailingProvider {
     fn name(&self) -> &'static str {
         "failing"
+    }
+
+    /// The scripted double answers any manifest it is handed — its
+    /// failure arrives from `send`, preserving the scripted outcome.
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
     }
 
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {

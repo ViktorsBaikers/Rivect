@@ -68,6 +68,21 @@ pub struct Runtime {
     pub paused_attempts: BTreeMap<String, PausedAttempt>,
 }
 
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Credential material lives only behind the store boundary;
+        // the runtime's diagnostic surface names its scope and
+        // counters, never the effective config's bindings or the
+        // injected worker seam.
+        f.debug_struct("Runtime")
+            .field("purpose", &self.purpose)
+            .field("scope_root", &self.scope_root)
+            .field("provider_calls", &self.provider_calls)
+            .field("config_path", &self.config_path)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The broker-side pause state of one task waiting on a manual
 /// fallback answer: the frozen manifest whose dispatch paused, plus
 /// the pending choice already consumed for publication — kept so a

@@ -21,7 +21,7 @@ use rivect::contracts::{AnswerSelection, Lifecycle, OptionId};
 use rivect::executor::{EffectRequest, Executor};
 use rivect::model::RequestManifest;
 use rivect::providers::{Provider, ProviderError, ProviderReply};
-use rivect::resources::{Delivery, NotificationQueue};
+use rivect::resources::{Delivery, NotificationQueue, UsageDelta};
 use rivect::ui::{ApplyVerdict, Projection};
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -84,10 +84,16 @@ impl Provider for NoToolProvider {
         "no-tool"
     }
 
+    /// The scripted double answers any manifest it is handed.
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         Ok(ProviderReply {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: UsageDelta::Unknown,
         })
     }
 }

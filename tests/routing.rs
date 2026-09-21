@@ -20,6 +20,9 @@
 //! substitutes, a confirmed effect is never replayed, adapter retries
 //! spend the shared outer cap, and a cancelled attempt is never
 //! resurrected by a retry or a late callback (AC-045/045b, EDGE-004).
+//! SLICE-016 leg — the accounting record reflects the provider's
+//! reported usage exactly, and an unreported send stays `Unknown`,
+//! never a released zero (INV-022/INV-024).
 
 #![allow(
     clippy::unwrap_used,
@@ -37,6 +40,7 @@ use rivect::config::{
 use rivect::contracts::{MODEL_WIRE_MAX_BYTES, Question};
 use rivect::model::{Broker, CandidateRejection, ModelError, RejectionCause, RequestManifest};
 use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
+use rivect::resources::UsageDelta;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,11 +76,20 @@ struct RecordingProvider {
 enum Respond {
     Delegate,
     Fail(ProviderError),
+    /// A crafted reply; its `usage` field carries the provider's
+    /// physical usage report.
+    Reply(ProviderReply),
 }
 
 impl Provider for RecordingProvider {
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    /// The double's serving rule is its wrapped provider's — the
+    /// script decides the reply, not the dialect claim.
+    fn serves(&self, connection: &str, entry: &rivect::config::Connection) -> bool {
+        self.inner.serves(connection, entry)
     }
 
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
@@ -96,6 +109,7 @@ impl Provider for RecordingProvider {
         match respond {
             Respond::Fail(error) => Err(error),
             Respond::Delegate => self.inner.send(manifest),
+            Respond::Reply(reply) => Ok(reply),
         }
     }
 }
@@ -131,7 +145,7 @@ fn fallback_config(purpose_toml: &str) -> String {
         "config_version = 1\n\
          [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
          [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
-         [connections.web]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"keyring:web\"\n\
+         [connections.web]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"vault:web\"\n\
          [connections.denied]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11436\"\n\
          [connections.shadowed]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11437\"\n\
          [connections.gone]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11438\"\n\
@@ -465,7 +479,7 @@ fn pending_config_and_draft_never_rewrite_the_in_flight_request() {
 /// candidates to exclude. The learned role pins its own connection.
 fn pools_config() -> String {
     "config_version = 1\n\
-     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:primary\"\n\
+     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"vault:primary\"\n\
      [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
      [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
      [models.defaults]\n\
@@ -1950,6 +1964,70 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     );
 }
 
+/// AC-045 edge: a manual fallback whose pause would serve an empty
+/// candidate set can never be answered — the pick must name a served
+/// member, so a `paused = {}` pin is a wedge, not a question. The
+/// broker reports the exhaustion honestly instead: every evaluated
+/// connection's typed cause, no pending choice published, and the
+/// failed primary's admission stays live for a retry exactly like an
+/// exhausted auto chain's.
+#[test]
+fn manual_fallback_with_no_servable_candidate_exhausts_instead_of_wedging() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\"]\nfallback = { mode = \"manual\" }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) =
+        scripted_broker(vec![Respond::Fail(ProviderError::UnknownConnection)], 0);
+    let manifest = broker
+        .prepare("relay", &config, "/world/wedge", "goal: wedge")
+        .expect("manifest");
+    let error = broker
+        .dispatch("/world/wedge", &manifest)
+        .expect_err("a pause with no servable candidate is exhaustion");
+    assert!(
+        matches!(&error, ModelError::FallbackExhausted {
+            attempt_id, purpose, rejected, attempted, ..
+        } if attempt_id == &manifest.attempt_id
+            && purpose == "relay"
+            && attempted.is_empty()
+            && rejected == &vec![
+                CandidateRejection {
+                    connection: "denied".to_string(),
+                    cause: RejectionCause::NotPurposeEligible,
+                },
+                CandidateRejection {
+                    connection: "gone".to_string(),
+                    cause: RejectionCause::NotPurposeEligible,
+                },
+                CandidateRejection {
+                    connection: "reserve".to_string(),
+                    cause: RejectionCause::NotPurposeEligible,
+                },
+                CandidateRejection {
+                    connection: "shadowed".to_string(),
+                    cause: RejectionCause::NotPurposeEligible,
+                },
+                CandidateRejection {
+                    connection: "web".to_string(),
+                    cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
+                },
+            ]),
+        "the exhaustion names every evaluated candidate's cause: {error}"
+    );
+    // no question was ever published — nothing can answer an empty set
+    assert!(broker.pending_choice(&manifest.attempt_id).is_none());
+    // the failed primary stays admitted for a retry — intent, effects
+    // and budget preserved, and only the primary ever sent
+    assert!(broker.admission(&manifest.attempt_id).is_some());
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the exhausted manual pause dispatched nothing"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+}
+
 /// AC-045b: the dispatch-time re-check view refreshes only on a
 /// successful prepare — a prepare that fails purpose resolution must not
 /// steer the retained view with its caller-supplied config.
@@ -2115,4 +2193,158 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
             if attempt_id == &substitute_attempt),
         "wrong rejection: {again}"
     );
+}
+
+/// INV-022/INV-024: the one accounting record of a physical send
+/// reflects exactly the usage the provider reported — a crafted reply
+/// usage lands verbatim on the record, and a send that reported none
+/// keeps `Unknown` (the retained bound is never released as zero).
+/// Usage is consumed through the provider seam exactly once — a second
+/// send cannot re-charge the first send's report.
+#[test]
+fn accounting_record_reflects_provider_reply_usage_exactly_unknown_never_zero() {
+    let reported = UsageDelta::Exact {
+        prompt_tokens: 11,
+        completion_tokens: 7,
+        total_tokens: 18,
+    };
+    let (mut broker, sent, _) = scripted_broker(
+        vec![
+            Respond::Reply(ProviderReply {
+                text: "one".to_string(),
+                tool_calls: Vec::new(),
+                usage: reported,
+            }),
+            Respond::Reply(ProviderReply {
+                text: "two".to_string(),
+                tool_calls: Vec::new(),
+                usage: UsageDelta::Unknown,
+            }),
+        ],
+        0,
+    );
+    let config =
+        Config::parse_validated(&local_config("m", "{ mode = \"fixed\", value = \"low\" }"))
+            .expect("valid");
+
+    let first = broker
+        .prepare("main", &config, "/world/usage", "goal: first")
+        .expect("first prepares");
+    let first_reply = broker
+        .dispatch("/world/usage", &first)
+        .expect("the crafted reply dispatches");
+    assert_eq!(
+        first_reply.usage, reported,
+        "the reply carries the provider's report"
+    );
+    let record = broker
+        .accounting_record(&first.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(
+        record.usage, reported,
+        "the record carries the provider's report verbatim"
+    );
+    let explain = broker.sent_cost_explain(&first);
+    assert_eq!(explain.bound, first.cost_bound);
+    assert_eq!(
+        explain.confirmed,
+        Some(18),
+        "the provider's totals confirm the charge"
+    );
+
+    let second = broker
+        .prepare("main", &config, "/world/usage", "goal: second")
+        .expect("second prepares");
+    let second_reply = broker
+        .dispatch("/world/usage", &second)
+        .expect("the usage-less reply dispatches");
+    assert_eq!(
+        second_reply.usage,
+        UsageDelta::Unknown,
+        "a usage-less reply stays unknown at the seam"
+    );
+    let record = broker
+        .accounting_record(&second.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Unknown,
+        "no report stays unknown — never a fabricated zero"
+    );
+    let explain = broker.sent_cost_explain(&second);
+    assert_eq!(explain.bound, second.cost_bound);
+    assert_eq!(explain.confirmed, None, "unknown usage retains the bound");
+
+    // two physical sends, two records, each charged its own usage —
+    // the seam consumes a report exactly once.
+    assert_eq!(sent.lock().expect("wire log lock").len(), 2);
+    assert_eq!(broker.accounted_requests(), 2);
+}
+
+/// DEC-013 at the dispatch re-check: a profile-bound api_key
+/// connection is usable through the profile's ref — precedence
+/// actually reaches eligibility, so the dialect gate is the only
+/// denial left — and a post-prepare profile removal re-denies the
+/// same candidate as a live grant, proving the credential leg ran.
+#[test]
+fn profile_bound_credential_reaches_the_dispatch_recheck() {
+    let mut config = Config::parse_validated(&fallback_config(
+        "fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"probed\", model_id = \"probed-model\" }] }\n\
+         [connections.probed]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"vault:probed\"\nprofile = \"p\"\n\
+         [profiles.p]\ncredential_ref = \"keyring:rivect-test/p\"",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection),
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/profiles",
+            "goal: profile precedence",
+        )
+        .expect("manifest");
+
+    // the profile's ref resolves under DEC-013 precedence, so the
+    // candidate passes the credential gate — the dialect gate is the
+    // only denial left: no installed adapter serves its class
+    let error = broker
+        .dispatch("/world/profiles", &manifest)
+        .expect_err("a candidate no adapter serves is skipped");
+    assert!(
+        matches!(&error, ModelError::FallbackExhausted { rejected, .. }
+        if rejected == &vec![CandidateRejection {
+            connection: "probed".to_string(),
+            cause: RejectionCause::DialectMismatch,
+        }]),
+        "the profile ref reached eligibility: {error}"
+    );
+
+    // remove the profile: the same candidate now fails the credential
+    // gate itself — precedence, not a blanket api_key denial, decided
+    config.profiles.remove("p");
+    broker.set_config(&config);
+    let error = broker
+        .dispatch("/world/profiles", &manifest)
+        .expect_err("the profile-less candidate loses its grant");
+    assert!(
+        matches!(&error, ModelError::FallbackExhausted { rejected, .. }
+        if rejected == &vec![CandidateRejection {
+            connection: "probed".to_string(),
+            cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
+        }]),
+        "without the profile the credential gate denies: {error}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        2,
+        "only the two scripted primary sends ran — a rejected candidate never received a request"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
 }

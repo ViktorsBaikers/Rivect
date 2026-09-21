@@ -6,9 +6,10 @@
 
 use crate::config::{
     Config, ConfigError, ConnKind, Connection, EffortAssign, EffortLevel, FallbackAssign,
-    FixedModel, ModelAssign, PurposeDef,
+    FixedModel, ModelAssign, Profile, PurposeDef,
 };
-use crate::providers::{self, Provider, ProviderError};
+use crate::providers::{self, Provider, ProviderError, ProviderReply};
+use crate::resources::UsageDelta;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -170,6 +171,10 @@ pub enum RejectionCause {
     /// The pick was never among the candidates the recorded pause
     /// served — the broker never widens the question's offer.
     NotOffered,
+    /// The candidate's source class passed eligibility but no adapter
+    /// the broker holds speaks its dialect — the send seam fails
+    /// closed rather than fabricating a reply.
+    DialectMismatch,
     /// The candidate passed the re-check but its own send failed.
     SendFailed(ProviderError),
 }
@@ -184,6 +189,7 @@ impl std::fmt::Display for RejectionCause {
             Self::NotEntitled => f.write_str("outside the account entitlement"),
             Self::NotPurposeEligible => f.write_str("outside the purpose's eligible list"),
             Self::NotOffered => f.write_str("not among the candidates the pending choice served"),
+            Self::DialectMismatch => f.write_str("no adapter serves this connection's dialect"),
             Self::SendFailed(source) => write!(f, "send failed: {source}"),
         }
     }
@@ -288,6 +294,43 @@ pub struct AccountingRecord {
     pub purpose: String,
     pub connection: String,
     pub cost_bound: u64,
+    /// The physical usage the provider reported for this one send
+    /// (INV-022): `Unknown` when it reported none — the retained bound
+    /// is never released as a fabricated zero.
+    pub usage: UsageDelta,
+}
+
+/// The broker-side typed outcome of one dispatched physical request —
+/// the recorded `ProviderReply → ModelOutcome → AccountingRecord`
+/// seam: produced inside `Broker::complete_send`, its usage feeds
+/// the attempt's single accounting record exactly once, and the reply
+/// itself is what the dispatch caller continues with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelOutcome {
+    /// A verified provider reply and the physical usage its one send
+    /// reported.
+    Reply {
+        reply: ProviderReply,
+        usage: UsageDelta,
+    },
+}
+
+impl ModelOutcome {
+    /// The physical usage report the accounting record charges.
+    #[must_use]
+    pub fn usage(&self) -> UsageDelta {
+        match self {
+            Self::Reply { usage, .. } => *usage,
+        }
+    }
+
+    /// The reply the dispatch caller continues with.
+    #[must_use]
+    pub fn into_reply(self) -> ProviderReply {
+        match self {
+            Self::Reply { reply, .. } => reply,
+        }
+    }
 }
 
 /// The last frozen model-visible prefix digest of one purpose (AC-061
@@ -338,6 +381,10 @@ pub struct Broker {
     /// reads (AC-045b): refreshed from the latest observed config, so a
     /// candidate removed after admission fails the current check.
     view_connections: BTreeMap<String, Connection>,
+    /// The credential profiles the re-check's credential-resolution
+    /// leg reads (DEC-011): a profile edit between prepare and
+    /// dispatch re-decides a non-local candidate's usability.
+    view_profiles: BTreeMap<String, Profile>,
     /// The purpose definitions the re-check's `eligible` input reads.
     view_purposes: BTreeMap<String, PurposeDef>,
     /// Cancelled-attempt tombstones (EDGE-004): a late retry or provider
@@ -360,6 +407,19 @@ pub struct Broker {
     bound_profile: Option<ProfileBinding>,
 }
 
+impl std::fmt::Debug for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The provider is a trait object without Debug; its name and
+        // the broker's own counters are the observability surface —
+        // manifests, credentials and wire data never render here.
+        f.debug_struct("Broker")
+            .field("provider", &self.provider.name())
+            .field("admissions", &self.admissions.len())
+            .field("accounted", &self.accounting.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Broker {
     pub fn new(provider: Box<dyn Provider>) -> Self {
         Self {
@@ -369,6 +429,7 @@ impl Broker {
             admissions: BTreeMap::new(),
             accounting: BTreeMap::new(),
             view_connections: BTreeMap::new(),
+            view_profiles: BTreeMap::new(),
             view_purposes: BTreeMap::new(),
             cancelled: BTreeSet::new(),
             pending: BTreeMap::new(),
@@ -392,6 +453,7 @@ impl Broker {
 
     fn observe_config(&mut self, config: &Config) {
         self.view_connections = config.connections.clone();
+        self.view_profiles = config.profiles.clone();
         self.view_purposes = config.models.purposes.clone();
     }
 
@@ -512,6 +574,7 @@ impl Broker {
             &resolved.model,
             purpose_def,
             &config.connections,
+            &config.profiles,
             &self.entitlements,
         )?;
         let instructions = MANDATORY_INSTRUCTIONS.to_string();
@@ -613,13 +676,14 @@ impl Broker {
     /// [`ModelError::ManualFallbackPending`] when the frozen fallback is
     /// `manual` and the send failed — the pending choice rides
     /// question.current — [`ModelError::FallbackExhausted`] when the
-    /// auto chain ran out with every entry rejected or failed, and
+    /// auto chain ran out with every entry rejected or failed, or a
+    /// `manual` fallback found no servable candidate to pause on, and
     /// [`ModelError::Provider`] when the provider rejects the request.
     pub fn dispatch(
         &mut self,
         world: &str,
         manifest: &RequestManifest,
-    ) -> Result<providers::ProviderReply, ModelError> {
+    ) -> Result<ProviderReply, ModelError> {
         if manifest.world != world {
             return Err(ModelError::WorldMismatch {
                 frozen: manifest.world.clone(),
@@ -692,8 +756,47 @@ impl Broker {
         &mut self,
         manifest: &RequestManifest,
         connection: &str,
-    ) -> Result<providers::ProviderReply, ProviderError> {
+    ) -> Result<ProviderReply, ProviderError> {
+        // Fail closed on the provider's own dialect claim (AC-046):
+        // the frozen manifest's connection must still be declared, and
+        // the injected adapter must actually serve it — eligibility
+        // alone never authorizes a send, and the denial lands before
+        // the provider sees the request or anything is accounted.
+        let Some(entry) = self.view_connections.get(connection) else {
+            return Err(ProviderError::UnknownConnection);
+        };
+        if !self.provider.serves(connection, entry) {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
+        // The dispatch decision IS the auto pool's choice: the send
+        // narrows the assignment to the one connection this broker
+        // routed to, and the adapter's catalogue leg resolves the
+        // model id from there — primary and substitute sends share the
+        // rule, and a manual pick arrives already narrowed to the same
+        // pool of one. A fixed pin passes verbatim.
+        let send_manifest;
+        let manifest = match &manifest.model {
+            ModelAssign::Auto { .. } => {
+                send_manifest = RequestManifest {
+                    model: ModelAssign::Auto {
+                        pool: Some(vec![connection.to_string()]),
+                    },
+                    ..manifest.clone()
+                };
+                &send_manifest
+            }
+            _ => manifest,
+        };
         let reply = self.provider.send(manifest)?;
+        // The reply carries this send's physical usage report; the
+        // outcome lifts it into the attempt's single accounting
+        // record — the only place it charges.
+        let outcome = ModelOutcome::Reply {
+            usage: reply.usage,
+            reply,
+        };
         self.accounting.insert(
             manifest.attempt_id.clone(),
             AccountingRecord {
@@ -701,6 +804,7 @@ impl Broker {
                 purpose: manifest.purpose.clone(),
                 connection: connection.to_string(),
                 cost_bound: manifest.cost_bound,
+                usage: outcome.usage(),
             },
         );
         // The attempt is spent and its admission is dead weight: prune
@@ -709,7 +813,7 @@ impl Broker {
         self.admissions.remove(&manifest.attempt_id);
         self.pending.remove(&manifest.attempt_id);
         self.paused.remove(&manifest.attempt_id);
-        Ok(reply)
+        Ok(outcome.into_reply())
     }
 
     /// Dispatches the manual-fallback candidate the human picked
@@ -744,7 +848,7 @@ impl Broker {
         world: &str,
         attempt_id: &str,
         connection: &str,
-    ) -> Result<providers::ProviderReply, ModelError> {
+    ) -> Result<ProviderReply, ModelError> {
         let admission = self.admissions.get(attempt_id).cloned().ok_or_else(|| {
             if self.cancelled.contains(attempt_id) {
                 ModelError::AttemptCancelled {
@@ -793,9 +897,12 @@ impl Broker {
                 cause,
             });
         }
-        // A fixed model pin survives the substitution on the picked
-        // connection; an auto ranking narrows to a pool of one — the
-        // human's pick IS the ranked pool.
+        // A fixed pin's model_id crosses verbatim onto the picked
+        // connection — the recorded F22 semantic: the pin survives the
+        // substitution, and a peer that does not serve that id answers
+        // 400 rather than the broker rewriting it. An auto ranking
+        // narrows to a pool of one — the human's pick IS the ranked
+        // pool.
         let model = match &manifest.model {
             ModelAssign::Fixed(fixed) => ModelAssign::Fixed(FixedModel {
                 connection: connection.to_string(),
@@ -827,7 +934,9 @@ impl Broker {
     /// The resolved `FallbackAssign` frozen on the failed attempt's
     /// admission decides the pause shape (AC-045): `off` reports the
     /// provider's own error unchanged, `manual` records the pending
-    /// choice and reports it without dispatching a substitute, `auto`
+    /// choice and reports it without dispatching a substitute — unless
+    /// no candidate survives the re-check, where an unanswerable pause
+    /// is the honest exhaustion instead — `auto`
     /// walks the chain — every entry is re-checked against the CURRENT
     /// catalogue, egress, entitlement and purpose-eligibility gates, so
     /// a candidate failing the check never receives the request. An
@@ -840,7 +949,7 @@ impl Broker {
         manifest: &RequestManifest,
         admission: &AdmissionRecord,
         source: ProviderError,
-    ) -> Result<providers::ProviderReply, ModelError> {
+    ) -> Result<ProviderReply, ModelError> {
         match &admission.fallback {
             FallbackAssign::Off => Err(ModelError::Provider(source)),
             FallbackAssign::Manual => {
@@ -848,6 +957,33 @@ impl Broker {
                 // The failed primary never re-enters its own choice
                 // list — it already produced this failure.
                 candidates.retain(|name| name != &admission.connection);
+                if candidates.is_empty() {
+                    // An empty served set can never be answered — the
+                    // pick must name a served member, so pausing here
+                    // would pin a question nothing satisfies. Report
+                    // the exhaustion honestly instead: every evaluated
+                    // non-primary connection's cause, no send attempted,
+                    // the primary's own failure as the source.
+                    let rejected = self
+                        .view_connections
+                        .keys()
+                        .filter(|name| name.as_str() != admission.connection)
+                        .filter_map(|name| {
+                            self.candidate_rejection(&admission.purpose, name)
+                                .map(|cause| CandidateRejection {
+                                    connection: name.clone(),
+                                    cause,
+                                })
+                        })
+                        .collect();
+                    return Err(ModelError::FallbackExhausted {
+                        attempt_id: manifest.attempt_id.clone(),
+                        purpose: admission.purpose.clone(),
+                        rejected,
+                        attempted: Vec::new(),
+                        source: Box::new(source),
+                    });
+                }
                 let pending = PendingFallback {
                     attempt_id: manifest.attempt_id.clone(),
                     purpose: admission.purpose.clone(),
@@ -996,8 +1132,14 @@ impl Broker {
         let Some(entry) = self.view_connections.get(connection) else {
             return Some(RejectionCause::UnknownConnection);
         };
-        if !providers::offline_usable(Some(entry.kind)) {
+        if !providers::offline_usable(&self.view_connections, &self.view_profiles, connection) {
             return Some(RejectionCause::LiveGrantRequired { kind: entry.kind });
+        }
+        // An eligible candidate the injected adapter cannot serve is
+        // skipped before the walk ever reaches a send — eligibility
+        // and dialect are separate gates (AC-046).
+        if !self.provider.serves(connection, entry) {
+            return Some(RejectionCause::DialectMismatch);
         }
         if !self.entitlements.allows(connection) {
             return Some(RejectionCause::NotEntitled);
@@ -1031,12 +1173,16 @@ impl Broker {
 
     /// Explains the sent cost of one frozen manifest (EDGE-008,
     /// INV-022): the bound is what admission reserved; the confirmed
-    /// units stay `None` because no offline provider data exists, so
-    /// the charge path retains the bound instead of releasing zero.
+    /// units come from the provider's physical usage report on the
+    /// accounted send — `None` while it reported none, so an unknown
+    /// sent cost is retained at the bound, never released as zero.
     pub fn sent_cost_explain(&self, manifest: &RequestManifest) -> SentCostExplain {
         SentCostExplain {
             bound: manifest.cost_bound,
-            confirmed: None,
+            confirmed: self
+                .accounting
+                .get(&manifest.attempt_id)
+                .and_then(|record| record.usage.confirmed_total()),
         }
     }
 
@@ -1090,14 +1236,12 @@ fn rank_connection(
     assignment: &ModelAssign,
     purpose_def: Option<&PurposeDef>,
     connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
     entitlements: &Entitlements,
 ) -> Result<(String, Option<String>), ModelError> {
     match assignment {
         ModelAssign::Fixed(fixed) => {
-            providers::offline_eligible(
-                assignment,
-                connections.get(&fixed.connection).map(|c| c.kind),
-            )?;
+            providers::offline_eligible(assignment, connections, profiles)?;
             if !entitled(entitlements, purpose_def, &fixed.connection) {
                 return Err(ModelError::NoEligibleCandidate {
                     purpose: purpose.to_string(),
@@ -1118,9 +1262,7 @@ fn rank_connection(
             candidates
                 .into_iter()
                 .find(|name| {
-                    connections
-                        .get(name)
-                        .is_some_and(|c| providers::offline_usable(Some(c.kind)))
+                    providers::offline_usable(connections, profiles, name)
                         && entitled(entitlements, purpose_def, name)
                 })
                 .map(|connection| (connection, None))

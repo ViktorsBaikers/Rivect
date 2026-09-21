@@ -238,6 +238,18 @@ impl EffortLevel {
             _ => None,
         }
     }
+
+    /// The level's wire name — config emission and provider dialects
+    /// transmit the one spelling.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1343,20 +1355,10 @@ fn effort_item(effort: &EffortAssign) -> Item {
         }
         EffortAssign::Fixed { value } => {
             table.insert("mode", "fixed".into());
-            table.insert("value", effort_level_name(*value).into());
+            table.insert("value", value.name().into());
         }
     };
     Item::Value(toml_edit::Value::InlineTable(table))
-}
-
-fn effort_level_name(level: EffortLevel) -> &'static str {
-    match level {
-        EffortLevel::Minimal => "minimal",
-        EffortLevel::Low => "low",
-        EffortLevel::Medium => "medium",
-        EffortLevel::High => "high",
-        EffortLevel::Xhigh => "xhigh",
-    }
 }
 
 fn fallback_item(fallback: &FallbackAssign) -> Item {

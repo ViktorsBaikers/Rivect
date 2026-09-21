@@ -180,6 +180,16 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::CredentialOutsideNamespace { .. } => "CredentialOutsideNamespace",
         ProviderError::CredentialOccupied { .. } => "CredentialOccupied",
         ProviderError::CredentialAbsent { .. } => "CredentialAbsent",
+        ProviderError::CredentialMalformed { .. } => "CredentialMalformed",
+        ProviderError::DialectMismatch { .. } => "DialectMismatch",
+        ProviderError::UnpinnedModel { .. } => "UnpinnedModel",
+        ProviderError::RegionMismatch { .. } => "RegionMismatch",
+        ProviderError::Transport { .. } => "Transport",
+        ProviderError::ProviderFailed { .. } => "ProviderFailed",
+        ProviderError::UnknownTerminal { .. } => "UnknownTerminal",
+        ProviderError::StreamViolation { .. } => "StreamViolation",
+        ProviderError::IncompatibleOutput { .. } => "IncompatibleOutput",
+        ProviderError::ReasoningProvenance { .. } => "ReasoningProvenance",
     }
 }
 

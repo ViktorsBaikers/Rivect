@@ -17,7 +17,9 @@
 use rivect::commands::{Ingress, Runtime};
 use rivect::contracts::{AnswerSelection, Event, Question, SessionId, TaskId};
 use rivect::model::RequestManifest;
-use rivect::providers::{Provider, ProviderReply};
+use rivect::providers::{
+    CredentialStore, Provider, ProviderError, ProviderReply, SecretRef, StoreKind,
+};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -104,6 +106,116 @@ pub fn config_learned_role() -> String {
 }
 
 pub const SECRET_CANARY: &str = "sk-live-canary-0123456789abcdef";
+
+/// Offline credential-store double (SRC-010 test seam): resolves
+/// exactly the scoped refs it was seeded with and answers the same
+/// typed denial vocabulary the native seam returns — no platform
+/// store is touched and no plaintext fallback exists. Material is
+/// keyed by the ref's scope, the same identity the real backends use.
+pub struct MapStore {
+    kind: StoreKind,
+    secrets: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+
+impl MapStore {
+    /// An empty store of the given class; `enroll` seeds scopes.
+    pub fn new(kind: StoreKind) -> Self {
+        Self {
+            kind,
+            secrets: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// A store pre-seeded with `(store:scope, material)` pairs.
+    pub fn seeded(kind: StoreKind, entries: &[(&str, &str)]) -> Self {
+        let store = Self::new(kind);
+        for (raw, secret) in entries {
+            store.enroll(raw, secret.as_bytes());
+        }
+        store
+    }
+
+    /// Enrolls material at a `store:scope` ref — the enrollment path
+    /// tests use to place a credential without a platform store.
+    pub fn enroll(&self, raw: &str, secret: &[u8]) {
+        let credential = SecretRef::parse(raw).expect("seed ref is a scoped store:scope");
+        self.secrets
+            .lock()
+            .expect("store lock")
+            .insert(credential.scope().to_string(), secret.to_vec());
+    }
+}
+
+impl CredentialStore for MapStore {
+    fn kind(&self) -> StoreKind {
+        self.kind
+    }
+
+    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+        Ok(self
+            .secrets
+            .lock()
+            .expect("store lock")
+            .contains_key(credential.scope()))
+    }
+
+    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .secrets
+            .lock()
+            .expect("store lock")
+            .keys()
+            .filter(|scope| scope.as_str() == service || scope.starts_with(&format!("{service}/")))
+            .cloned()
+            .collect())
+    }
+
+    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        let mut secrets = self.secrets.lock().expect("store lock");
+        if secrets.contains_key(credential.scope()) {
+            return Err(ProviderError::CredentialOccupied {
+                scope: credential.scope().to_string(),
+            });
+        }
+        secrets.insert(credential.scope().to_string(), secret.to_vec());
+        drop(secrets);
+        Ok(())
+    }
+
+    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+        self.secrets
+            .lock()
+            .expect("store lock")
+            .get(credential.scope())
+            .cloned()
+            .ok_or_else(|| ProviderError::CredentialAbsent {
+                scope: credential.scope().to_string(),
+            })
+    }
+
+    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.secrets
+            .lock()
+            .expect("store lock")
+            .insert(credential.scope().to_string(), secret.to_vec());
+        Ok(())
+    }
+
+    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.secrets
+            .lock()
+            .expect("store lock")
+            .remove(credential.scope())
+            .map(|_| ())
+            .ok_or_else(|| ProviderError::CredentialAbsent {
+                scope: credential.scope().to_string(),
+            })
+    }
+
+    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.revoke(credential)
+    }
+}
 
 pub fn negative_configs() -> Vec<(&'static str, String)> {
     vec![
@@ -293,10 +405,13 @@ impl Provider for CountingProvider {
         self.inner.name()
     }
 
-    fn send(
-        &mut self,
-        manifest: &RequestManifest,
-    ) -> Result<ProviderReply, rivect::providers::ProviderError> {
+    /// The double's serving rule is its wrapped provider's — the
+    /// count observes sends, not the dialect claim.
+    fn serves(&self, connection: &str, entry: &rivect::config::Connection) -> bool {
+        self.inner.serves(connection, entry)
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_manifest.lock().expect("manifest lock") = Some(manifest.clone());
         self.inner.send(manifest)
