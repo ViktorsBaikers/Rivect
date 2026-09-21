@@ -1,17 +1,18 @@
-//! Provider proof legs for two literal connection ids whose source
+//! Provider proof legs for three literal connection ids whose source
 //! classes resolve through this offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
-//! custom-chat-completions, abliteration): the configured literal
-//! `custom-chat-completions` connection returns a verified model
-//! outcome through the standard Broker against the source-derived
-//! `chat/completions` peer, and `abliteration` does the same through
-//! the shared SLICE-016 Responses adapter — no copied codec — as
-//! localhost wiremock fixtures, no OMP, no user adapter, no real
+//! custom-chat-completions, abliteration, aiand): the configured
+//! literal `custom-chat-completions` connection returns a verified
+//! model outcome through the standard Broker against the
+//! source-derived `chat/completions` peer, `abliteration` does the
+//! same through the shared SLICE-016 Responses adapter, and `aiand`
+//! through the shared Chat Completions adapter — no copied codec —
+//! as localhost wiremock fixtures, no OMP, no user adapter, no real
 //! host. The shared SSE parser's WHATWG §9.2.5–9.2.6 conformance is
 //! pinned in provider_openai.rs; this file pins the Chat Completions
-//! dialect surface and the abliteration per-connection predicates on
-//! top of it. TP-PROVIDER-INSTALLED::<id> stays NOT_RUN — the
-//! ignored named cases carry that status explicitly.
+//! dialect surface plus the abliteration and aiand per-connection
+//! predicates on top of it. TP-PROVIDER-INSTALLED::<id> stays
+//! NOT_RUN — the ignored named cases carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -23,9 +24,9 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::Config;
+use rivect::config::{Config, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
-use rivect::providers::local::ChatCompletionsProvider;
+use rivect::providers::local::{CatalogModel, ChatCompletionsProvider, ModelPrice};
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::{CredentialStore, Provider, ProviderError, SecretRef, StoreKind};
 use rivect::resources::UsageDelta;
@@ -243,13 +244,22 @@ fn send_on_thread<P: Provider + 'static>(
 /// comes back.
 fn catalog_on_thread(
     provider: ChatCompletionsProvider,
-) -> (ChatCompletionsProvider, Result<Vec<String>, ProviderError>) {
+) -> (
+    ChatCompletionsProvider,
+    Result<Vec<CatalogModel>, ProviderError>,
+) {
     std::thread::spawn(move || {
         let outcome = provider.catalog();
         (provider, outcome)
     })
     .join()
     .expect("the catalog thread joins")
+}
+
+/// The offered model ids of a catalogue answer, in order — the id is
+/// the wire name the dispatch surface compares.
+fn model_ids(models: &[CatalogModel]) -> Vec<&str> {
+    models.iter().map(|model| model.id.as_str()).collect()
 }
 
 /// A store double whose `resolve` parks for a fixed delay before
@@ -572,17 +582,13 @@ async fn catalog_lists_the_configured_endpoints_models() {
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
     let (provider, _store) = local_provider(&config);
-    let ids = std::thread::spawn(move || provider.catalog())
+    let models = std::thread::spawn(move || provider.catalog())
         .join()
         .expect("the catalog thread joins")
         .expect("the catalog answers");
     assert_eq!(
-        ids,
-        vec![
-            "alpha-1".to_string(),
-            "vendor/mid-2".to_string(),
-            "zeta-9".to_string(),
-        ],
+        model_ids(&models),
+        vec!["alpha-1", "vendor/mid-2", "zeta-9"],
         "the listing's non-empty ids deduplicate and sort"
     );
     let requests = server.received_requests().await.expect("recorded");
@@ -1072,8 +1078,8 @@ async fn custom_chat_completions_egress_is_bound_to_the_configured_origin() {
 
     let (provider, catalog) = catalog_on_thread(provider);
     assert_eq!(
-        catalog.expect("the configured origin's listing answers"),
-        vec![MODEL.to_string()]
+        model_ids(&catalog.expect("the configured origin's listing answers")),
+        vec![MODEL]
     );
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let reply = outcome.expect("the configured origin's send completes");
@@ -2545,7 +2551,7 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
         .expect("catalog thread joins");
     reported.insert(
         "CATALOG",
-        if matches!(catalog, Ok(ref ids) if ids == &["fixture-chat-model".to_string()]) {
+        if matches!(catalog, Ok(ref models) if model_ids(models) == ["fixture-chat-model"]) {
             "PASS"
         } else {
             "FAIL"
@@ -3816,3 +3822,927 @@ async fn abliteration_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::abliteration = NOT_RUN"]
 fn provider_installed_abliteration() {}
+
+// ----- aiand ---------------------------------------------------------------
+//
+// The `aiand` connection's proof legs (HZN-008 class A): the shared
+// Chat Completions adapter serves the literal id — no copied codec —
+// under the connection's own recorded predicates. The configured
+// endpoint normalizes onto the recorded `/v1` API root
+// (`normalizeAiandBaseUrl`: a bare configured base gains the `/v1`
+// tail, an empty one resolves to `api.aiand.com/v1`); the org-scoped
+// `/models` listing is authoritative, with the recorded static seed
+// merging on top as the offer floor (its recorded rationale —
+// offering models before a live key exists — stays upstream's, while
+// the listing alone states a model's metadata); and every listed
+// entry runs the recorded capability/effort/currency transform — a
+// model whose stated price carries an unrecognized or missing
+// billing currency stays `ModelPrice::Unknown`, never a coerced
+// zero, never a silent USD default.
+
+/// The scoped credential ref the `aiand` connection binds.
+const AIAND_REF: &str = "keyring:rivect-test/aiand";
+
+/// The pinned model id the fixed-pin `aiand` legs carry — the
+/// recorded `defaultModel` of the bundled static seed.
+const AIAND_MODEL: &str = "moonshotai/kimi-k2.7-code";
+
+/// The recorded static-seed ids in catalogue order — the sorted
+/// union the offer floor contributes.
+const AIAND_SEED_IDS: [&str; 9] = [
+    "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v4-pro",
+    "google/gemma-4-31b-it",
+    "moonshotai/kimi-k2.6",
+    "moonshotai/kimi-k2.7-code",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.6-27b",
+    "zai-org/glm-5.1",
+    "zai-org/glm-5.2",
+];
+
+/// One configured `aiand` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011),
+/// the dialect comes from the literal connection id (DEC-007), and
+/// the endpoint carries the API base's `/v1` segment verbatim — like
+/// the recorded default `api.aiand.com/v1`.
+fn aiand_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.aiand]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{AIAND_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"aiand\", model_id = \"{AIAND_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same construction seam as `provider_result`, over the shared
+/// Chat Completions adapter: reqwest's blocking client still builds
+/// on a plain OS thread, and the literal id decides the dialect.
+fn aiand_provider_result(
+    config: Config,
+    connection: String,
+    store: Arc<support::MapStore>,
+) -> Result<ChatCompletionsProvider, ProviderError> {
+    std::thread::spawn(move || ChatCompletionsProvider::new(&config, &connection, store))
+        .join()
+        .expect("the provider thread joins")
+}
+
+fn aiand_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIAND_REF, SECRET)],
+    ));
+    let provider = aiand_provider_result(config.clone(), "aiand".to_string(), store.clone())
+        .expect("the shared adapter builds for the aiand id");
+    (provider, store)
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the `aiand` pin.
+fn prepared_aiand(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+    let (provider, _store) = aiand_provider(config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the aiand pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+// ----- TP-PROVIDER-WIRE::aiand ---------------------------------------------
+
+/// A configured `aiand` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — pinned model, system+user messages,
+/// `stream` with `stream_options.include_usage`, the declared tool
+/// surface as function tools and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn aiand_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: prove the wire");
+
+    let (broker, outcome) = dispatch(broker, "/world/aiand", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SECRET),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(AIAND_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "aiand");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/aiand", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds no
+/// adapter — a Chat-Completions-classed id is reserved for its own
+/// named contract arm — `dialect_for` reserving `aiand` means the id
+/// is never fixture-served even when it declares `local` kind, and a
+/// manifest pinning a different connection id is refused at send.
+#[test]
+fn aiand_dialect_is_keyed_on_the_literal_connection_id() {
+    let config = Config::parse_validated(&aiand_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = aiand_provider_result(config.clone(), "aiand-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `aiand` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.aiand]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"aiand\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("aiand").expect("declared");
+    assert!(
+        !loopback.serves("aiand", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send
+    let (provider, _store) = aiand_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{AIAND_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/aiand", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::aiand -------------------------------------------
+
+/// `GET /models` is the authoritative org-scoped listing for `aiand`
+/// (HZN-008): the configured endpoint normalizes onto the recorded
+/// `/v1` API root — a bare configured origin gains the version tail —
+/// every non-empty `data[].id` is offered, the recorded static seed
+/// merges on top as the offer floor, the union deduplicates and
+/// sorts, every listed entry runs the recorded
+/// capability/effort/currency transform, and the bearer credential
+/// came through the store seam. The generic arm keeps the verbatim
+/// endpoint rule — the normalization binds the literal `aiand` id,
+/// never the shared dialect.
+#[tokio::test]
+async fn aiand_catalog_is_the_authoritative_org_listing_over_the_static_seed() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({
+                "id": "unseeded-org-model",
+                "description": "the org's own listing entry",
+                "capabilities": ["reasoning", "vision"],
+                "reasoning_efforts": ["low", "medium", "high", "max"],
+                "reasoning_effort_default": "medium",
+                "context_window": 262144,
+                "currency": "usd",
+                "input_per_1m": "0.75",
+                "output_per_1m": "3.5",
+            }),
+            // a seed id already listed deduplicates rather than
+            // doubling — and the listing's entry keeps its transform:
+            // the stated USD price is the discriminating surface the
+            // seed stub's empty `Unknown` loses to
+            json!({
+                "id": "qwen/qwen3.6-27b",
+                "currency": "usd",
+                "input_per_1m": "9",
+                "output_per_1m": "27",
+            }),
+            // the transform's negative arms: a declared default lands
+            // only as a declared level — one absent from the ladder
+            // drops, the unmappable `max` never lands — and an entry
+            // without the reasoning capability maps no effort surface
+            json!({
+                "id": "default-outside-ladder",
+                "capabilities": ["reasoning"],
+                "reasoning_efforts": ["low", "medium"],
+                "reasoning_effort_default": "high",
+            }),
+            json!({
+                "id": "efforts-without-reasoning",
+                "reasoning_efforts": ["low", "high"],
+            }),
+            json!({
+                "id": "unmapped-effort-default",
+                "capabilities": ["reasoning"],
+                "reasoning_efforts": ["low", "high"],
+                "reasoning_effort_default": "max",
+            }),
+            json!({"id": ""}),
+            json!({"owned_by": "nobody"}),
+        ],
+    )
+    .await;
+    // a bare origin — no `/v1` tail — proves the recorded endpoint
+    // normalization: the lookup still lands on `/v1/models`
+    let config = Config::parse_validated(&aiand_config(&server.uri())).expect("valid");
+    let (provider, _store) = aiand_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the org listing answers");
+    drop_blocking(provider);
+    let mut expected: Vec<&str> = AIAND_SEED_IDS.to_vec();
+    expected.extend([
+        "unseeded-org-model",
+        "default-outside-ladder",
+        "efforts-without-reasoning",
+        "unmapped-effort-default",
+    ]);
+    expected.sort_unstable();
+    assert_eq!(
+        model_ids(&models),
+        expected,
+        "the authoritative org listing and the static seed merge, sorted and deduplicated"
+    );
+    // the listed entry carries the recorded transform: reasoning and
+    // vision capabilities, the effort ladder with the unmapped `max`
+    // wire value dropped, the declared default only as a declared
+    // level, the context window, and the stated USD price
+    let listed = models
+        .iter()
+        .find(|model| model.id == "unseeded-org-model")
+        .expect("the listed model is offered");
+    assert_eq!(
+        listed,
+        &CatalogModel {
+            id: "unseeded-org-model".to_string(),
+            reasoning: true,
+            vision: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            effort_default: Some(EffortLevel::Medium),
+            context_window: Some(262144),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.75,
+                output_per_1m: 3.5,
+            },
+        }
+    );
+    // the transform's negative arms land too: the declared default
+    // survives only as a declared level — `high` absent from the
+    // ladder drops, the unmappable `max` never lands — and an entry
+    // without the reasoning capability ignores `reasoning_efforts`
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+    };
+    assert_eq!(
+        model("default-outside-ladder"),
+        &CatalogModel {
+            id: "default-outside-ladder".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::Medium],
+            ..CatalogModel::default()
+        },
+        "a default the ladder does not declare drops"
+    );
+    assert_eq!(
+        model("efforts-without-reasoning"),
+        &CatalogModel {
+            id: "efforts-without-reasoning".to_string(),
+            ..CatalogModel::default()
+        },
+        "a non-reasoning entry maps no effort surface"
+    );
+    assert_eq!(
+        model("unmapped-effort-default"),
+        &CatalogModel {
+            id: "unmapped-effort-default".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            ..CatalogModel::default()
+        },
+        "the recorded `max` has no landing level — default included"
+    );
+    // a seed id the listing restated carries the listing's transform
+    // — here the stated USD price is the discriminating leg that a
+    // reversed seed-over-listing merge would lose — while a seed id
+    // the listing omitted still offers with the empty surface: the
+    // seed never states metadata the listing did not
+    assert_eq!(
+        model("qwen/qwen3.6-27b"),
+        &CatalogModel {
+            id: "qwen/qwen3.6-27b".to_string(),
+            price: ModelPrice::Usd {
+                input_per_1m: 9.0,
+                output_per_1m: 27.0,
+            },
+            ..CatalogModel::default()
+        },
+        "the listed entry's transform wins the seed collision"
+    );
+    assert_eq!(
+        model(AIAND_MODEL),
+        &CatalogModel {
+            id: AIAND_MODEL.to_string(),
+            ..CatalogModel::default()
+        },
+        "a seed id the listing omitted carries the empty surface"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/models",
+        "the bare configured origin normalized onto the /v1 root"
+    );
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+
+    // the generic arm keeps the verbatim endpoint rule: the same bare
+    // origin serves its listing at `/models`, never normalized —
+    // the predicate binds the literal `aiand` id, not the dialect
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"object": "list", "data": [{"id": "plain"}]})),
+        )
+        .mount(&server)
+        .await;
+    let generic = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.custom-chat-completions]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{CREDENTIAL_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"custom-chat-completions\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server.uri()
+    ))
+    .expect("valid");
+    let (provider, _store) = local_provider(&generic);
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        model_ids(&catalog.expect("the generic listing answers")),
+        vec!["plain"]
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests[0].url.path(),
+        "/models",
+        "the generic arm hits the configured origin verbatim"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default host —
+/// `normalizeAiandBaseUrl`'s empty arm (`AIAND_DEFAULT_BASE_URL`):
+/// the schema admits the empty string, and whitespace-only shares
+/// the arm under the rule's trim. Offline pin: the adapter's `Debug`
+/// surface reports the resolved endpoint, so the arm is proved
+/// without one byte toward `api.aiand.com` — the host the bearer
+/// credential would egress to.
+#[test]
+fn aiand_empty_endpoint_resolves_the_recorded_default_host() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&aiand_config(endpoint)).expect("an empty endpoint is valid");
+        let (provider, _store) = aiand_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.aiand.com/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default host: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The recorded currency rule (`mapAiandCost`): the org's billing
+/// currency decides whether a stated price lands — only a `usd`
+/// entry's figures carry onto the surface, a stated zero included,
+/// while every other currency, a missing member or an unreadable
+/// shape stays `ModelPrice::Unknown`: never coerced to a zero the
+/// accounting could release, never defaulted to USD.
+#[tokio::test]
+async fn aiand_unknown_currency_stays_unknown_never_zero() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // a stated USD price lands verbatim — a stated zero too:
+            // a free model's 0 is a real figure, not an unknown
+            json!({"id": "priced-usd", "currency": "usd", "input_per_1m": "0.15", "output_per_1m": "0.25"}),
+            json!({"id": "free-usd", "currency": "usd", "input_per_1m": "0", "output_per_1m": "0"}),
+            // a currency the org bills that is not USD — upstream
+            // zeroes it; here it stays unknown
+            json!({"id": "priced-jpy", "currency": "jpy", "input_per_1m": "20", "output_per_1m": "40"}),
+            json!({"id": "priced-credits", "currency": "credits", "input_per_1m": "1", "output_per_1m": "2"}),
+            json!({"id": "no-currency", "input_per_1m": "0.5", "output_per_1m": "0.5"}),
+            json!({"id": "odd-currency", "currency": 42, "input_per_1m": "1", "output_per_1m": "1"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = aiand_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+
+    let price = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+            .price
+    };
+    assert_eq!(
+        price("priced-usd"),
+        ModelPrice::Usd {
+            input_per_1m: 0.15,
+            output_per_1m: 0.25,
+        },
+        "a usd entry's stated figures land verbatim"
+    );
+    assert_eq!(
+        price("free-usd"),
+        ModelPrice::Usd {
+            input_per_1m: 0.0,
+            output_per_1m: 0.0,
+        },
+        "a stated zero under usd is a real figure, never mistaken for unknown"
+    );
+    for id in [
+        "priced-jpy",
+        "priced-credits",
+        "no-currency",
+        "odd-currency",
+    ] {
+        assert_eq!(
+            price(id),
+            ModelPrice::Unknown,
+            "{id}: an unrecognized or missing currency stays unknown — never a coerced zero"
+        );
+    }
+}
+
+// ----- TP-PROVIDER-AUTH::aiand ----------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `aiand`: a configured region — the recorded contract names none —
+/// the profile-bound ref whose scope disagrees with the binding, an
+/// absent credential and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn aiand_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(&aiand_config(&server_uri_v1(&server)).replace(
+        "kind = \"api_key\"",
+        "kind = \"api_key\"\nregion = \"eu-1\"",
+    ))
+    .expect("valid");
+    let err = aiand_provider_result(
+        regioned,
+        "aiand".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "aiand");
+    assert_eq!(region, "eu-1");
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aiand]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"aiand\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = aiand_provider_result(
+        mismatched,
+        "aiand".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+    let provider = aiand_provider_result(
+        config.clone(),
+        "aiand".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIAND_REF, SECRET)],
+    ));
+    let provider =
+        aiand_provider_result(config.clone(), "aiand".to_string(), store).expect("builds");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, reason } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "aiand");
+    assert!(
+        reason.contains("401"),
+        "the status code is the context: {reason}"
+    );
+    assert_no_secret_or_body(&err, SECRET.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AIAND_REF, SECRET)],
+    ));
+    let provider = aiand_provider_result(config.clone(), "aiand".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(SECRET),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: debug surfaces");
+    assert!(
+        !format!("{manifest:?}").contains(SECRET),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/aiand", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(SECRET),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(SECRET),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-aiand",
+        Some(&aiand_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(SECRET),
+        "runtime Debug never carries credential material"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::aiand ------------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling material at the scope
+/// admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn aiand_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = aiand_provider_result(config.clone(), "aiand".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(AIAND_REF, SECRET.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The auto-pick catalogue leg rides the merged catalogue: the
+/// dispatch narrows the pool to the `aiand` winner and the shared
+/// adapter resolves the deterministic sorted-first id of the
+/// authoritative-listing-over-seed union as the wire model.
+#[tokio::test]
+async fn aiand_auto_pick_resolves_through_the_merged_catalog() {
+    let server = MockServer::start().await;
+    // a discovered id that sorts before the seed floor is the pick —
+    // the catalogue names the model, never the config
+    mount_models(&server, vec![json!({"id": "a-unlisted-org-model"})]).await;
+    mount_chat(&server, completed_stream("auto pick", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aiand]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{AIAND_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_aiand(&auto, "/world/aiand", "goal: auto pick");
+    let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
+    outcome.expect("the auto send resolves through the catalogue");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    let send = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("the send crossed the wire");
+    let body: Value = serde_json::from_slice(&send.body).expect("json body");
+    assert_eq!(
+        body["model"], "a-unlisted-org-model",
+        "the sorted-first id of the merged catalogue rides the wire"
+    );
+
+    // and the floor itself: a listing naming nothing usable still
+    // offers the seed — the sorted-first seed id is the pick
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"owned_by": "nobody"})]).await;
+    mount_chat(&server, completed_stream("seed pick", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.aiand]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{AIAND_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_aiand(&auto, "/world/aiand", "goal: seed pick");
+    let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
+    outcome.expect("the seed floor still offers a model");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    let send = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("the send crossed the wire");
+    let body: Value = serde_json::from_slice(&send.body).expect("json body");
+    assert_eq!(
+        body["model"], "deepseek-ai/deepseek-v4-flash",
+        "the sorted-first seed id is the floor's offer"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `aiand`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside
+/// this run, and INSTALLED reports NOT_RUN — an omitted leg fails the
+/// suite rather than silently absenting.
+#[tokio::test]
+async fn aiand_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": AIAND_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the org listing plus the static seed answer through
+    // the credential seam — the seed's own id listed deduplicates
+    // into the floor.
+    let (provider, _) = aiand_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref models) if model_ids(models) == AIAND_SEED_IDS) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = aiand_provider_result(config.clone(), "aiand".to_string(), empty)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: matrix wire");
+    let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = aiand_provider_result(config.clone(), "aiand".to_string(), empty.clone())
+        .expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(AIAND_REF, SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_aiand` case below: its ignored count is the
+    // explicit NOT_RUN signal this matrix asserts — the row stays a
+    // literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::aiand ------------------------------------------
+
+/// TP-PROVIDER-INSTALLED::aiand = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::aiand = NOT_RUN"]
+fn provider_installed_aiand() {}

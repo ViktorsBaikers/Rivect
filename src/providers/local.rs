@@ -1,9 +1,13 @@
-//! The `custom-chat-completions` connection's adapter — the
-//! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
-//! HZN-008 class S). Dialect selection keys on the literal connection
-//! id, never an auth label, an endpoint shape or a catalogue answer:
-//! every compatible host a deployment wires under this literal id
-//! shares the one recorded wire contract. The adapter authors no
+//! The `custom-chat-completions` and `aiand` connections' adapter —
+//! the OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
+//! HZN-008 class S and class A). Dialect selection keys on the
+//! literal connection id, never an auth label, an endpoint shape or
+//! a catalogue answer: every compatible host a deployment wires
+//! under `custom-chat-completions` shares the one recorded generic
+//! contract, while `aiand` carries its own recorded predicates —
+//! the `/v1` base normalization and the org-scoped catalogue
+//! transform — resolved per literal id by the contract table, never
+//! inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -26,7 +30,7 @@
 //! `Authorization` header per send — never into config, manifests,
 //! diagnostics or this type's `Debug` (INV-001/INV-006).
 
-use crate::config::{Config, Connection, EffortAssign, FixedModel, ModelAssign};
+use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
 use crate::providers::sse::{SseError, SseEvent, SseParser};
 use crate::providers::{
@@ -71,6 +75,157 @@ const MAX_TOOL_CALLS: usize = 32;
 /// unbounded.
 const MAX_TOOL_ARGS_BYTES: usize = 1024 * 1024;
 
+/// The recorded static seed of `aiand` model ids (HZN-008,
+/// `AIAND_STATIC_MODELS`): the merge floor the catalogue unions over
+/// the authoritative org-scoped `/models` listing — a seeded id
+/// offers even when the listing omits it. The recorded source seeded
+/// them so generation and first boot could offer models with no live
+/// key; that rationale stays upstream's — this adapter resolves a
+/// credential before any catalogue call, so the seed's role here is
+/// the offer floor, never a keyless offer path, and it carries ids
+/// only: the listing alone states a model's metadata.
+const AIAND_MODELS: &[&str] = &[
+    "qwen/qwen3.6-27b",
+    "deepseek-ai/deepseek-v4-flash",
+    "google/gemma-4-31b-it",
+    "openai/gpt-oss-120b",
+    "deepseek-ai/deepseek-v4-pro",
+    "moonshotai/kimi-k2.7-code",
+    "moonshotai/kimi-k2.6",
+    "zai-org/glm-5.2",
+    "zai-org/glm-5.1",
+];
+
+/// The recorded default API root of an `aiand` connection
+/// (`AIAND_DEFAULT_BASE_URL`): the host an absent or empty configured
+/// endpoint resolves to under the recorded base normalization.
+const AIAND_DEFAULT_BASE_URL: &str = "https://api.aiand.com/v1";
+
+/// The recorded per-entry transform a `data[]` listing runs
+/// (HZN-008): the generic class carries model ids only, while
+/// `aiand`'s org-scoped listing applies the recorded
+/// capability/effort/currency map (`mapAiandModel`).
+enum EntryRule {
+    /// Every non-empty `id` verbatim — the generic class records no
+    /// per-model metadata surface.
+    IdsOnly,
+    /// The org-scoped `aiand` transform: `capabilities` names the
+    /// reasoning and image-input surface, `reasoning_efforts` maps
+    /// onto the effort ladder, and the org's billing currency decides
+    /// whether the stated per-1M-token price lands.
+    Aiand,
+}
+
+/// The predicates the recorded source class binds to a literal Chat
+/// Completions id (HZN-008): the dialect is shared across connection
+/// ids — the endpoint rule, the catalogue seed and the per-entry
+/// transform are not.
+struct SourceContract {
+    /// The recorded static-seed model ids merging into the listing as
+    /// the offer floor — empty where the class records no seed.
+    seed: &'static [&'static str],
+    /// `true` — the configured endpoint normalizes onto the recorded
+    /// `/v1` API root (`aiand`'s `normalizeAiandBaseUrl`: a bare
+    /// configured base gains the `/v1` tail, an empty one resolves to
+    /// the recorded default host); `false` — the configured origin is
+    /// the API base verbatim, trailing slashes trimmed
+    /// (`custom-chat-completions` binds egress to the configured
+    /// origin and records no fixed host).
+    normalized_v1_root: bool,
+    /// The recorded per-entry transform over `data[]` entries.
+    entries: EntryRule,
+}
+
+/// The recorded per-connection contract for a Chat Completions id
+/// (DEC-007/DEC-025): `build` denies every id without the recorded
+/// Chat Completions class before this lookup runs, and an id the
+/// dialect map admits but this table does not name resolves `None` —
+/// denied the same way. A further Chat Completions id records its own
+/// predicates as a named arm here, never inherits another's.
+fn contract_for(connection: &str) -> Option<SourceContract> {
+    match connection {
+        "custom-chat-completions" => Some(SourceContract {
+            seed: &[],
+            normalized_v1_root: false,
+            entries: EntryRule::IdsOnly,
+        }),
+        "aiand" => Some(SourceContract {
+            seed: AIAND_MODELS,
+            normalized_v1_root: true,
+            entries: EntryRule::Aiand,
+        }),
+        _ => None,
+    }
+}
+
+impl SourceContract {
+    /// The connection's API root under the recorded endpoint rule:
+    /// egress stays bound to the configured endpoint — the `aiand`
+    /// normalization only supplies the `/v1` tail a configured base
+    /// lacks, and the recorded default host for an empty one.
+    fn endpoint(&self, configured: &str) -> String {
+        if !self.normalized_v1_root {
+            return configured.trim_end_matches('/').to_string();
+        }
+        let trimmed = configured.trim();
+        if trimmed.is_empty() {
+            return AIAND_DEFAULT_BASE_URL.to_string();
+        }
+        let base = trimmed.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            base.to_string()
+        } else {
+            format!("{base}/v1")
+        }
+    }
+}
+
+/// The stated price a catalogued model carries (HZN-008): the literal
+/// id's recorded currency rule decides — `Unknown` is a carried
+/// state, never a coerced zero and never a silent USD default.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ModelPrice {
+    /// The listing named an unrecognized or no billing currency — the
+    /// price stays unknown rather than releasing as a zero.
+    #[default]
+    Unknown,
+    /// The entry's stated USD figures per 1M tokens — a stated zero
+    /// is a real figure (a free model), never the unknown state.
+    Usd {
+        /// The stated input-token price per 1M.
+        input_per_1m: f64,
+        /// The stated output-token price per 1M.
+        output_per_1m: f64,
+    },
+}
+
+/// One catalogued model a Chat Completions connection offers
+/// (HZN-008): `id` is the wire name — the request body's `model`,
+/// never URL material. The remaining fields carry the literal id's
+/// recorded per-entry transform; a class recording none keeps every
+/// one at its empty or unknown surface.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CatalogModel {
+    /// The model id the wire request names.
+    pub id: String,
+    /// The listing's declared reasoning capability; `false` where the
+    /// class records no capability surface.
+    pub reasoning: bool,
+    /// The listing's declared image-input capability.
+    pub vision: bool,
+    /// The reasoning-effort levels the listing declared, in wire
+    /// order — wire values our effort enum cannot name never land.
+    pub efforts: Vec<EffortLevel>,
+    /// The listing's declared default effort — carried only when it
+    /// is itself a declared level.
+    pub effort_default: Option<EffortLevel>,
+    /// The listing's declared context window in tokens.
+    pub context_window: Option<u64>,
+    /// The listing's stated per-1M-token price under the recorded
+    /// currency rule.
+    pub price: ModelPrice,
+}
+
 /// The terminal classification one finished stream reduces to: a
 /// recorded completion `finish_reason`, the peer's own failure
 /// verdict, or a reason the dialect cannot classify.
@@ -109,15 +264,21 @@ struct StreamState {
     done: bool,
 }
 
-/// The `custom-chat-completions` Chat Completions adapter.
-/// Constructed per connection from the validated config; the broker
-/// owns the handle — workers never hold one.
+/// The shared Chat Completions adapter — `custom-chat-completions`
+/// and `aiand` alike (DEC-007). Constructed per connection from the
+/// validated config; the broker owns the handle — workers never hold
+/// one.
 pub struct ChatCompletionsProvider {
     /// The literal connection id this adapter serves — the dialect
     /// key, not a label.
     connection: String,
-    /// The configured endpoint base, trailing slashes trimmed — the
-    /// API root including its version segment (`/v1`).
+    /// The recorded per-connection predicates (HZN-008): resolved
+    /// from the literal id at build and never re-keyed — the dialect
+    /// is shared, the contract is not.
+    contract: SourceContract,
+    /// The configured endpoint base under the literal id's recorded
+    /// endpoint rule — the API root including its version segment
+    /// (`/v1`).
     endpoint: String,
     /// The scoped credential binding resolved under DEC-013
     /// precedence — material is read from the store per send so a
@@ -137,14 +298,15 @@ pub struct ChatCompletionsProvider {
 
 impl ChatCompletionsProvider {
     /// Builds the adapter for one connection id: the id must record
-    /// the Chat Completions dialect (DEC-007), the connection must be
-    /// declared, carry no configured region — the recorded generic
-    /// class has none — and resolve a scoped credential under DEC-013
+    /// the Chat Completions dialect (DEC-007) and name a recorded
+    /// per-connection contract (HZN-008), the connection must be
+    /// declared, carry no configured region — neither recorded class
+    /// has one — and resolve a scoped credential under DEC-013
     /// precedence.
     ///
     /// # Errors
     /// [`ProviderError::DialectMismatch`] for a connection id without
-    /// the Chat Completions source class;
+    /// the Chat Completions source class or its own contract arm;
     /// [`ProviderError::UnknownConnection`] for an undeclared id;
     /// [`ProviderError::RegionMismatch`] for a configured region;
     /// [`resolve_credential`]'s typed denials for a missing, malformed
@@ -184,6 +346,12 @@ impl ChatCompletionsProvider {
                 connection: connection.to_string(),
             });
         }
+        // A Chat-Completions-classed id without its own recorded
+        // contract arm is denied the same way — the predicates are
+        // recorded per literal id, never inherited silently.
+        let contract = contract_for(connection).ok_or(ProviderError::DialectMismatch {
+            connection: connection.to_string(),
+        })?;
         let conn = config
             .connections
             .get(connection)
@@ -209,7 +377,8 @@ impl ChatCompletionsProvider {
             })?;
         Ok(Self {
             connection: connection.to_string(),
-            endpoint: conn.endpoint.trim_end_matches('/').to_string(),
+            endpoint: contract.endpoint(&conn.endpoint),
+            contract,
             credential,
             store,
             client,
@@ -218,19 +387,21 @@ impl ChatCompletionsProvider {
     }
 
     /// The model catalogue for this connection (HZN-008): the
-    /// configured endpoint's own `models` listing — every non-empty
-    /// `data[].id` is an offered model, in deterministic sorted order.
-    /// The generic class admits the listing verbatim: gateway-style
-    /// ids carry path characters legitimately, since a model id is
-    /// never URL material in this dialect — it rides the request
-    /// body.
+    /// configured endpoint's own `models` listing under the literal
+    /// id's recorded contract — every non-empty `data[].id` is an
+    /// offered model under its per-entry transform, the recorded
+    /// static seed merges on top as the offer floor, and the union
+    /// returns in deterministic sorted order. The generic class
+    /// admits the listing verbatim: gateway-style ids carry path
+    /// characters legitimately, since a model id is never URL
+    /// material in this dialect — it rides the request body.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
     /// on a failed call or non-success status or an expired whole-call
     /// budget, and [`ProviderError::StreamViolation`] when the payload
     /// does not carry the `data` array the contract requires.
-    pub fn catalog(&self) -> Result<Vec<String>, ProviderError> {
+    pub fn catalog(&self) -> Result<Vec<CatalogModel>, ProviderError> {
         // A standalone lookup opens its own whole-call budget — the
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
@@ -243,7 +414,11 @@ impl ChatCompletionsProvider {
     /// a send passes its own `started` so the lookup spends the same
     /// whole-request budget instead of opening a second, unaccounted
     /// one.
-    fn catalog_within(&self, token: &str, started: Instant) -> Result<Vec<String>, ProviderError> {
+    fn catalog_within(
+        &self,
+        token: &str,
+        started: Instant,
+    ) -> Result<Vec<CatalogModel>, ProviderError> {
         self.check_deadline(started)?;
         let mut response = self
             .client
@@ -274,17 +449,43 @@ impl ChatCompletionsProvider {
         let Some(data) = body.get("data").and_then(Value::as_array) else {
             return Err(self.violation("models payload carries no data array"));
         };
-        // Every listed `id` is an offer — an empty or absent one can
+        // Every listed `id` is an offer under the literal id's
+        // recorded per-entry transform — an empty or absent one can
         // never name a model.
-        let mut ids: Vec<String> = data
+        let mut models: Vec<CatalogModel> = data
             .iter()
-            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
+            .filter_map(|entry| self.catalog_entry(entry))
             .collect();
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        // The recorded seed unions on top as the offer floor — a
+        // seeded id the listing omitted still offers, carrying the
+        // empty transform surface: the seed never states metadata the
+        // listing did not. Listed entries precede the stubs, so the
+        // stable sort keeps a listing entry's transform over its
+        // seed stub on a collision.
+        models.extend(self.contract.seed.iter().map(|id| CatalogModel {
+            id: (*id).to_string(),
+            ..CatalogModel::default()
+        }));
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        Ok(models)
+    }
+
+    /// One `data[]` entry under the literal id's recorded transform —
+    /// `None` when the entry names no usable id: an empty or absent
+    /// id can never name a model.
+    fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())?;
+        Some(match self.contract.entries {
+            EntryRule::IdsOnly => CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            },
+            EntryRule::Aiand => aiand_entry(id, entry),
+        })
     }
 
     /// Reads the credential material for this send — the only place
@@ -914,6 +1115,106 @@ fn payload_reason(payload: &Value) -> String {
     "unclassified".to_string()
 }
 
+/// The recorded `aiand` effort wire value
+/// (`AIAND_EFFORT_BY_WIRE_VALUE`), restricted to the levels our
+/// effort enum names — the recorded `max` has no landing level and
+/// never maps onto a lower one.
+fn aiand_effort(value: &str) -> Option<EffortLevel> {
+    match value {
+        "minimal" => Some(EffortLevel::Minimal),
+        "low" => Some(EffortLevel::Low),
+        "medium" => Some(EffortLevel::Medium),
+        "high" => Some(EffortLevel::High),
+        "xhigh" => Some(EffortLevel::Xhigh),
+        _ => None,
+    }
+}
+
+/// `toPositiveNumber(_, null)`: a positive whole count or its decimal
+/// string reads; anything else — a stated zero included — is absent.
+fn positive_count(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .filter(|count| *count > 0)
+}
+
+/// `toPositiveNumber(_, 0)` inside a `usd` entry: a finite
+/// non-negative number or its decimal string is the stated figure —
+/// a stated zero is a real figure, a free model's price — anything
+/// else reads as the recorded zero fallback.
+fn stated_price(value: Option<&Value>) -> f64 {
+    value
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .unwrap_or(0.0)
+}
+
+/// The recorded `aiand` currency rule (`mapAiandCost`): the org's
+/// billing currency decides whether a stated price lands — only a
+/// `usd` entry's figures carry onto the surface, while every other
+/// currency, a missing member or an unreadable shape stays
+/// [`ModelPrice::Unknown`]: never coerced to a zero the accounting
+/// could release, never defaulted to USD.
+fn aiand_price(entry: &Value) -> ModelPrice {
+    if entry.get("currency").and_then(Value::as_str) != Some("usd") {
+        return ModelPrice::Unknown;
+    }
+    ModelPrice::Usd {
+        input_per_1m: stated_price(entry.get("input_per_1m")),
+        output_per_1m: stated_price(entry.get("output_per_1m")),
+    }
+}
+
+/// The recorded `aiand` entry transform (`mapAiandModel` /
+/// `mapAiandThinking`): `capabilities` names the reasoning and
+/// image-input surface; only a reasoning entry's `reasoning_efforts`
+/// maps onto the effort ladder, unmappable wire values dropped, the
+/// declared default landing only as a declared level; the currency
+/// rule decides the price.
+fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
+    let capabilities = entry.get("capabilities").and_then(Value::as_array);
+    let capability = |name: &str| {
+        capabilities.is_some_and(|list| list.iter().any(|member| member.as_str() == Some(name)))
+    };
+    let reasoning = capability("reasoning");
+    let efforts: Vec<EffortLevel> = if reasoning {
+        entry
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(aiand_effort)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let effort_default = entry
+        .get("reasoning_effort_default")
+        .and_then(Value::as_str)
+        .and_then(aiand_effort)
+        .filter(|default| reasoning && efforts.contains(default));
+    CatalogModel {
+        id: id.to_string(),
+        reasoning,
+        vision: capability("vision"),
+        efforts,
+        effort_default,
+        context_window: positive_count(entry.get("context_window")),
+        price: aiand_price(entry),
+    }
+}
+
 impl std::fmt::Debug for ChatCompletionsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The scoped ref is the visible token — the store and its
@@ -980,6 +1281,7 @@ impl Provider for ChatCompletionsProvider {
                     .catalog_within(&token, started)?
                     .into_iter()
                     .next()
+                    .map(|model| model.id)
                     .ok_or_else(|| ProviderError::UnpinnedModel {
                         connection: self.connection.clone(),
                     })?;

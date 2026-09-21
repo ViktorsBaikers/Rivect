@@ -880,8 +880,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// exception speaking the same dialect (HZN-008), `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
-/// Completions dialect — never inferred from an auth label or a
-/// catalogue answer. `openai-codex`, `google-vertex`,
+/// Completions dialect and `aiand` is its recorded class-A plug
+/// speaking the same dialect (HZN-008) — never inferred from an auth
+/// label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,6 +908,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "abliteration" => Some(Dialect::Responses),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
+        "aiand" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
