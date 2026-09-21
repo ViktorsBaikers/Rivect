@@ -1,15 +1,18 @@
-//! The `custom-chat-completions`, `aiand` and `aimlapi` connections'
-//! adapter — the OpenAI-compatible Chat Completions dialect
-//! (DEC-007/DEC-025, HZN-008 class S and class A). Dialect selection
-//! keys on the literal connection id, never an auth label, an
-//! endpoint shape or a catalogue answer: every compatible host a
-//! deployment wires under `custom-chat-completions` shares the one
-//! recorded generic contract, while `aiand` and `aimlapi` carry their
-//! own recorded predicates — the `/v1` base normalization and the
-//! org-scoped catalogue transform on `aiand`, the default-host
-//! endpoint rule and the chat-id catalogue filter on `aimlapi` —
-//! resolved per literal id by the contract table, never inherited
-//! across ids. The adapter authors no
+//! The `custom-chat-completions`, `aiand`, `aimlapi` and
+//! `alibaba-coding-plan` connections' adapter — the OpenAI-compatible
+//! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class
+//! A and class P). Dialect selection keys on the literal connection
+//! id, never an auth label, an endpoint shape or a catalogue answer:
+//! every compatible host a deployment wires under
+//! `custom-chat-completions` shares the one
+//! recorded generic contract, while `aiand`, `aimlapi` and
+//! `alibaba-coding-plan` carry their own recorded predicates — the
+//! `/v1` base normalization and the org-scoped catalogue transform
+//! on `aiand`, the default-host endpoint rule and the chat-id
+//! catalogue filter on `aimlapi`, the region-choice endpoint, the
+//! static allowed-model catalogue and the enrolled-base credential
+//! binding on `alibaba-coding-plan` — resolved per literal id by the
+//! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -34,6 +37,7 @@
 
 use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
+use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseError, SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, ToolCall,
@@ -110,6 +114,42 @@ const AIAND_DEFAULT_BASE_URL: &str = "https://api.aiand.com/v1";
 /// the upstream absent-override case.
 const AIMLAPI_DEFAULT_BASE_URL: &str = "https://api.aimlapi.com/v1";
 
+/// The recorded `alibaba-coding-plan` international endpoint —
+/// `alibabaCodingPlanModelManagerOptions`'s `defaultBaseUrl`: the
+/// host the required `endpoint` field's empty string resolves under
+/// the recorded `config?.baseUrl ?? defaultBaseUrl` fallback. The
+/// region choice the upstream login prompt enumerates —
+/// international, China (`coding.dashscope.aliyuncs.com/v1`) or a
+/// custom origin — rides the configured `endpoint` itself, so the
+/// adapter's `region` field stays denied.
+const ALIBABA_PLAN_INTL_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
+
+/// The recorded `alibaba-coding-plan` allowed-model list (HZN-008
+/// class P — `mapWithBundledReference` over the bundled descriptors):
+/// the plan's whole model surface. No `/models` discovery leg exists
+/// for this class, so the catalogue is this list alone. Each entry
+/// carries the bundled descriptor's image-input mark and nothing
+/// else — the allowlist states ids and that mark, never reasoning,
+/// effort, window or price data the class does not record.
+const ALIBABA_PLAN_MODELS: &[(&str, bool)] = &[
+    ("qwen3.7-plus", true),
+    ("qwen3.6-plus", true),
+    ("kimi-k2.5", true),
+    ("glm-5", false),
+    ("MiniMax-M2.5", false),
+    ("qwen3.5-plus", false),
+    ("qwen3-max-2026-01-23", false),
+    ("qwen3-coder-next", false),
+    ("qwen3-coder-plus", false),
+    ("glm-4.7", false),
+];
+
+/// The recorded `alibaba-coding-plan` key grammar (`sk-sp-…`): the
+/// Coding Plan subscription key class. PAYG keys carry the ordinary
+/// `sk-…` grammar and are a different product the plan's bases never
+/// serve — a bearer outside the grammar denies before any wire leg.
+const PLAN_KEY_PREFIX: &str = "sk-sp-";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -128,6 +168,53 @@ enum EndpointRule {
     /// field's empty string standing for the absent override the
     /// `??` fallback covers: the recorded default host.
     ConfiguredElseDefault,
+    /// `alibaba-coding-plan`'s base resolution: the configured origin
+    /// verbatim under the recorded ingress normalization — trimmed,
+    /// all trailing slashes stripped, as the login hook's custom-origin
+    /// input is normalized — with the required field's empty string
+    /// standing for the absent override: the recorded international
+    /// endpoint. The region choice — international, China or a
+    /// custom origin — is this configured base itself; no `region`
+    /// field exists in the recorded contract.
+    PlanBaseOrDefault,
+}
+
+/// The recorded catalogue source a literal id binds (HZN-008): the
+/// dialect shares the response shape — where the offered ids come
+/// from is per-connection contract.
+enum CatalogRule {
+    /// The configured endpoint's own `GET {endpoint}/models` listing
+    /// under the per-entry transform, with the recorded static seed
+    /// merged on top as the offer floor.
+    Listing,
+    /// The recorded fixed allowed-model list alone — the class
+    /// records no dynamic `/models` discovery, so the lookup opens
+    /// no wire leg and resolves no credential. Each tuple is the
+    /// model id and its bundled-descriptor vision mark. An auto pick
+    /// resolves the sorted-first id — the adapter's one uniform auto
+    /// semantic; a descriptor's recorded `defaultModel` is a
+    /// catalogue hint, not a product ranking this contract performs.
+    Allowlist(&'static [(&'static str, bool)]),
+}
+
+/// The recorded credential grammar a literal id binds (HZN-008):
+/// what the resolved store material may be before it bears a wire
+/// leg is per-connection contract, enforced inside the credential
+/// seam — before any request.
+enum CredentialRule {
+    /// The material is the bearer token verbatim — any UTF-8 string
+    /// the store resolves.
+    Bearer,
+    /// `alibaba-coding-plan`'s recorded `api-key-format "structured"`
+    /// credential: a JSON object whose `token` is the bearer and whose
+    /// `enterpriseUrl` is the base the key was enrolled and validated
+    /// against — required to equal the connection's configured base,
+    /// so a key enrolled for one base class can never serve another.
+    /// It is the only shape the recorded login writes: a bare key or
+    /// a token-only blob is unbound material — attributable to no
+    /// base — and denies as malformed. The bearer must carry the
+    /// recorded plan-key grammar.
+    AlibabaPlan,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -156,16 +243,25 @@ enum EntryRule {
 
 /// The predicates the recorded source class binds to a literal Chat
 /// Completions id (HZN-008): the dialect is shared across connection
-/// ids — the endpoint rule, the catalogue seed and the per-entry
-/// transform are not.
+/// ids — the endpoint rule, the catalogue source, the credential
+/// grammar, the catalogue seed and the per-entry transform are not.
 struct SourceContract {
     /// The recorded static-seed model ids merging into the listing as
     /// the offer floor — empty where the class records no seed.
+    /// Unreached under [`CatalogRule::Allowlist`]: a static catalogue
+    /// carries its whole surface in the allowlist itself.
     seed: &'static [&'static str],
     /// The recorded endpoint rule the configured `endpoint` resolves
     /// under.
     endpoint: EndpointRule,
+    /// The recorded catalogue source the lookup resolves under.
+    catalog: CatalogRule,
+    /// The recorded credential grammar the resolved material must
+    /// satisfy before it bears a wire leg.
+    credential: CredentialRule,
     /// The recorded per-entry transform over `data[]` entries.
+    /// Unreached under [`CatalogRule::Allowlist`]: no listing exists
+    /// to transform.
     entries: EntryRule,
 }
 
@@ -180,11 +276,15 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "custom-chat-completions" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::Verbatim,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
         "aiand" => Some(SourceContract {
             seed: AIAND_MODELS,
             endpoint: EndpointRule::NormalizedV1Root,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
             entries: EntryRule::Aiand,
         }),
         // `aimlApiModelManagerOptions`: no static seed, the
@@ -194,7 +294,21 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "aimlapi" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::ConfiguredElseDefault,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
             entries: EntryRule::Aimlapi,
+        }),
+        // `alibabaCodingPlanModelManagerOptions`: the configured-or-
+        // recorded-international base carrying the region choice, the
+        // recorded allowed-model list alone — the class records no
+        // `/models` discovery — and the `api-key-format "structured"`
+        // credential binding a key to the base it was enrolled for.
+        "alibaba-coding-plan" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault,
+            catalog: CatalogRule::Allowlist(ALIBABA_PLAN_MODELS),
+            credential: CredentialRule::AlibabaPlan,
+            entries: EntryRule::IdsOnly,
         }),
         _ => None,
     }
@@ -230,6 +344,19 @@ impl SourceContract {
                     return AIMLAPI_DEFAULT_BASE_URL.to_string();
                 }
                 trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
+            }
+            EndpointRule::PlanBaseOrDefault => {
+                // The login hook's custom-origin ingress normalization
+                // — trim, all trailing slashes stripped — applied to
+                // whichever base the connection configures; the empty
+                // string is the absent-override case the recorded
+                // `config?.baseUrl ?? defaultBaseUrl` covers with the
+                // international endpoint.
+                let trimmed = configured.trim();
+                if trimmed.is_empty() {
+                    return ALIBABA_PLAN_INTL_BASE_URL.to_string();
+                }
+                trimmed.trim_end_matches('/').to_string()
             }
         }
     }
@@ -288,6 +415,22 @@ enum Terminal {
     Completed,
     Failed { reason: String },
     Unclassifiable,
+}
+
+/// The recorded allowlist as catalogue entries — deterministic sorted
+/// order, each id carrying its bundled-descriptor vision mark and
+/// nothing else.
+fn allowlist_models(list: &[(&str, bool)]) -> Vec<CatalogModel> {
+    let mut models: Vec<CatalogModel> = list
+        .iter()
+        .map(|(id, vision)| CatalogModel {
+            id: (*id).to_string(),
+            vision: *vision,
+            ..CatalogModel::default()
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 /// One in-flight streamed tool call: fragments of a single
@@ -446,7 +589,10 @@ impl ChatCompletionsProvider {
     /// id's recorded contract — every non-empty `data[].id` is an
     /// offered model under its per-entry transform, the recorded
     /// static seed merges on top as the offer floor, and the union
-    /// returns in deterministic sorted order. The generic class
+    /// returns in deterministic sorted order. A class whose recorded
+    /// catalogue is a fixed allowlist answers it alone: no listing
+    /// leg exists, so no credential is resolved and no byte crosses
+    /// the wire. The generic class
     /// admits the listing verbatim: gateway-style ids carry path
     /// characters legitimately, since a model id is never URL
     /// material in this dialect — it rides the request body.
@@ -457,6 +603,11 @@ impl ChatCompletionsProvider {
     /// budget, and [`ProviderError::StreamViolation`] when the payload
     /// does not carry the `data` array the contract requires.
     pub fn catalog(&self) -> Result<Vec<CatalogModel>, ProviderError> {
+        // The recorded allowlist is the whole catalogue — no wire
+        // leg, no credential resolution.
+        if let CatalogRule::Allowlist(list) = self.contract.catalog {
+            return Ok(allowlist_models(list));
+        }
         // A standalone lookup opens its own whole-call budget — the
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
@@ -475,6 +626,11 @@ impl ChatCompletionsProvider {
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         self.check_deadline(started)?;
+        // The recorded allowlist answers in place — a send's
+        // auto-pick never opens a `/models` leg.
+        if let CatalogRule::Allowlist(list) = self.contract.catalog {
+            return Ok(allowlist_models(list));
+        }
         let mut response = self
             .client
             .get(format!("{}/models", self.endpoint))
@@ -552,13 +708,71 @@ impl ChatCompletionsProvider {
     }
 
     /// Reads the credential material for this send — the only place
-    /// secret bytes cross the store boundary. A non-UTF-8 secret
-    /// cannot be a bearer token: typed denial, never a mangled header.
+    /// secret bytes cross the store boundary — and answers the bearer
+    /// token the literal id's recorded credential grammar binds. A
+    /// non-UTF-8 secret cannot be a bearer token: typed denial, never
+    /// a mangled header. Every grammar or base denial lands here —
+    /// before any wire leg.
     fn secret(&self) -> Result<String, ProviderError> {
         let material = self.store.resolve(&self.credential)?;
-        String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+        let text =
+            String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            })?;
+        match self.contract.credential {
+            CredentialRule::Bearer => Ok(text),
+            CredentialRule::AlibabaPlan => self.plan_bearer(&text),
+        }
+    }
+
+    /// The bearer an `alibaba-coding-plan` credential resolves
+    /// (`alibabaCodingPlanAuth`, `api-key-format "structured"`): the
+    /// only shape the recorded login writes is a JSON object whose
+    /// `token` is the bearer and whose `enterpriseUrl` is the base the
+    /// key was enrolled and validated against — required to equal the
+    /// connection's configured base, so a key enrolled for one
+    /// recorded base class can never serve another. Anything else is
+    /// unbound material the recorded flow never produces — a bare
+    /// key, a token-only blob, a missing or unusable field — and
+    /// denies as malformed rather than borrowing the slot's
+    /// configured base. The recorded `apiEndpoint` steering field is
+    /// never read — the configured endpoint alone decides egress.
+    /// The bearer must carry the recorded plan-key grammar: a PAYG
+    /// `sk-…` is a different product on every plan base. Every denial
+    /// is typed and lands before any wire leg.
+    fn plan_bearer(&self, material: &str) -> Result<String, ProviderError> {
+        let malformed = || ProviderError::CredentialMalformed {
             connection: self.connection.clone(),
-        })
+        };
+        let parsed: Value = serde_json::from_str(material.trim()).map_err(|_parse| malformed())?;
+        let token = parsed
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| token.starts_with(PLAN_KEY_PREFIX))
+            .ok_or_else(&malformed)?;
+        // The recorded ingress normalization applied to the enrolled
+        // base — the same rule the configured endpoint resolved under
+        // at build, so the comparison is over the normalized bases.
+        let enrolled = parsed
+            .get("enterpriseUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(&malformed)?
+            .trim()
+            .trim_end_matches('/');
+        if enrolled.is_empty() {
+            return Err(malformed());
+        }
+        if enrolled != self.endpoint {
+            return Err(ProviderError::CredentialBaseMismatch {
+                connection: self.connection.clone(),
+                // The canonical egress rendering — userinfo, query and
+                // fragment inside store content never reach the
+                // diagnostic.
+                enrolled: canonical_egress_target(enrolled),
+            });
+        }
+        Ok(token.to_string())
     }
 
     /// The frozen manifest as the Chat Completions wire request:

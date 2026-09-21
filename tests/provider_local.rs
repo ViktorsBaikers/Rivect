@@ -5554,3 +5554,1143 @@ async fn aimlapi_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::aimlapi = NOT_RUN"]
 fn provider_installed_aimlapi() {}
+
+// ----- alibaba-coding-plan ----------------------------------------------------
+//
+// The `alibaba-coding-plan` connection's proof legs (HZN-008 class
+// P): the shared Chat Completions adapter serves the literal id —
+// no copied codec — under its own recorded predicates
+// (`alibabaCodingPlanModelManagerOptions`, `loginAlibabaCodingPlan`).
+// The configured `endpoint` carries the region choice: the recorded
+// international `coding-intl.dashscope.aliyuncs.com/v1`, the China
+// `coding.dashscope.aliyuncs.com/v1`, or an explicitly configured
+// custom origin — an empty one resolves the recorded international
+// default (`config?.baseUrl ?? defaultBaseUrl`), and a configured
+// `region` is denied: the contract names none. The catalogue is the
+// recorded fixed allowed-model list alone — the plan's model surface
+// is static, so no `/models` leg ever runs and no credential is
+// consulted. The credential follows the recorded `api-key-format
+// "structured"` rule (`alibabaCodingPlanAuth`): the only shape the
+// recorded login writes is a JSON `{"token": …, "enterpriseUrl": …}`
+// whose `token` bears the wire and whose `enterpriseUrl` — the base
+// the key was enrolled and validated against — must equal the
+// connection's configured base. A bare key or a token-only blob is
+// unbound material the recorded flow never produces — attributable
+// to no base — and denies as malformed; the recorded `apiEndpoint`
+// steering field is never followed either — the configured endpoint
+// alone decides egress. The bearer always carries the recorded
+// plan-key grammar (`sk-sp-…`): a PAYG `sk-…` is a different product
+// that never serves these bases, and every class or base mismatch
+// denies before any wire leg reaches the wrong host.
+
+/// The scoped credential ref the `alibaba-coding-plan` connection
+/// binds.
+const ALIBABA_CP_REF: &str = "keyring:rivect-test/alibaba-coding-plan";
+
+/// Fixture plan-key material — the recorded `sk-sp-…` grammar, never
+/// a real credential, only ever sent to localhost.
+const PLAN_KEY: &str = "sk-sp-fixture-plan-key";
+
+/// Fixture PAYG material — the recorded `sk-…` non-plan grammar —
+/// the wrong credential class on every plan base.
+const PAYG_KEY: &str = "sk-fixture-payg-key";
+
+/// The recorded international and China plan endpoints — credential
+/// enrollment literals only: they ride the stored material, and no
+/// configured endpoint ever names a real host offline.
+const PLAN_INTL_BASE: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
+const PLAN_CN_BASE: &str = "https://coding.dashscope.aliyuncs.com/v1";
+
+/// The recorded PAYG product endpoint — a different base class the
+/// plan connection never serves.
+const PAYG_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
+/// The pinned model id the fixed-pin legs carry — the recorded
+/// `defaultModel` of the catalogue descriptors.
+const ALIBABA_CP_MODEL: &str = "qwen3.7-plus";
+
+/// The recorded allowed-model list's ids in catalogue order — the
+/// static surface `catalog` answers.
+const ALIBABA_CP_MODEL_IDS: [&str; 10] = [
+    "MiniMax-M2.5",
+    "glm-4.7",
+    "glm-5",
+    "kimi-k2.5",
+    "qwen3-coder-next",
+    "qwen3-coder-plus",
+    "qwen3-max-2026-01-23",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-plus",
+];
+
+/// One configured `alibaba-coding-plan` connection pointing at the
+/// fixture peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim — the
+/// region choice rides it, like the recorded bases' own `/v1` roots.
+fn alibaba_cp_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.alibaba-coding-plan]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{ALIBABA_CP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"alibaba-coding-plan\", model_id = \"{ALIBABA_CP_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded structured credential (`api-key-format
+/// "structured"`): the enrolled base rides beside the token.
+fn plan_credential(token: &str, enrolled_base: &str) -> String {
+    json!({"token": token, "enterpriseUrl": enrolled_base}).to_string()
+}
+
+fn alibaba_cp_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_CP_REF, material)],
+    ));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-coding-plan".to_string(),
+        store.clone(),
+    )
+    .expect("the shared adapter builds for the alibaba-coding-plan id");
+    (provider, store)
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the `alibaba-coding-plan` pin. The store holds
+/// the structured credential enrolled for this connection's own
+/// configured base — the only shape the recorded login writes.
+fn prepared_alibaba_cp(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+    let enrolled = &config
+        .connections
+        .get("alibaba-coding-plan")
+        .expect("the alibaba-coding-plan connection is declared")
+        .endpoint;
+    let (provider, _store) = alibaba_cp_provider(config, &plan_credential(PLAN_KEY, enrolled));
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the alibaba-coding-plan pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+// ----- TP-PROVIDER-WIRE::alibaba-coding-plan ----------------------------------
+
+/// A configured `alibaba-coding-plan` connection returns a verified
+/// model outcome through the standard Broker: prepare admits the
+/// api_key pin under DEC-011, the recorded structured credential
+/// unwraps to its bearer token — the enrolled `enterpriseUrl`
+/// matching the configured base — and the shared adapter posts
+/// exactly the frozen manifest as a `chat/completions` request —
+/// pinned model, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn alibaba_coding_plan_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_cp_config(&base)).expect("valid");
+    // the recorded structured credential: `token` bears the wire and
+    // `enterpriseUrl` confirms the enrolled base is the configured one
+    let (provider, _store) = alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, &base));
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/alibaba-cp", "goal: prove the wire")
+        .expect("the alibaba-coding-plan pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; the catalogue never opens a leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {PLAN_KEY}"),
+        "the structured credential's token bears the wire — never the JSON blob"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(PLAN_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(ALIBABA_CP_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "alibaba-coding-plan");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/alibaba-cp", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving
+/// `alibaba-coding-plan` means the id is never fixture-served even
+/// when it declares `local` kind, and a manifest pinning a different
+/// connection id is refused at send.
+#[test]
+fn alibaba_coding_plan_dialect_is_keyed_on_the_literal_connection_id() {
+    let config =
+        Config::parse_validated(&alibaba_cp_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "alibaba-coding-plan-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `alibaba-coding-plan` pinned `local` keeps the typed
+    // denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.alibaba-coding-plan]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"alibaba-coding-plan\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local
+        .connections
+        .get("alibaba-coding-plan")
+        .expect("declared");
+    assert!(
+        !loopback.serves("alibaba-coding-plan", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) =
+        alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, "http://127.0.0.1:1/v1"));
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{ALIBABA_CP_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/alibaba-cp", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::alibaba-coding-plan --------------------------------
+
+/// The `alibaba-coding-plan` catalogue is the recorded fixed
+/// allowed-model list alone (HZN-008 class P): the plan's model
+/// surface is static — the lookup opens no `/models` leg and
+/// resolves no credential, so an empty store still answers — and
+/// the listed entries carry their recorded surface: the vision
+/// marks the allowlist states, nothing more.
+#[tokio::test]
+async fn alibaba_coding_plan_catalog_is_the_recorded_allowlist_without_a_wire_leg() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&alibaba_cp_config(&server_uri_v1(&server))).expect("valid");
+    // an empty store proves the lookup consults no credential — the
+    // static list is the whole catalogue
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-coding-plan".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the adapter builds");
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the allowlist answers with no credential at all");
+    drop_blocking(provider);
+    // the whole catalogue pinned row for row — the recorded vision
+    // marks land on the three marked entries and every other field of
+    // every row stays at its unstated default
+    let row = |id: &str, vision: bool| CatalogModel {
+        id: id.to_string(),
+        reasoning: false,
+        vision,
+        efforts: vec![],
+        effort_default: None,
+        context_window: None,
+        price: ModelPrice::Unknown,
+    };
+    assert_eq!(
+        models,
+        vec![
+            row("MiniMax-M2.5", false),
+            row("glm-4.7", false),
+            row("glm-5", false),
+            row("kimi-k2.5", true),
+            row("qwen3-coder-next", false),
+            row("qwen3-coder-plus", false),
+            row("qwen3-max-2026-01-23", false),
+            row("qwen3.5-plus", false),
+            row("qwen3.6-plus", true),
+            row("qwen3.7-plus", true),
+        ],
+        "the recorded allowed-model list answers sorted, every field pinned"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests.is_empty(),
+        "a static catalogue never opens a wire leg"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded international
+/// default — the `config?.baseUrl ?? defaultBaseUrl` absent arm our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so the arm is proved without one byte toward
+/// `coding-intl.dashscope.aliyuncs.com` — the host the bearer
+/// credential would egress to.
+#[test]
+fn alibaba_coding_plan_empty_endpoint_resolves_the_recorded_intl_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&alibaba_cp_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) =
+            alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, PLAN_INTL_BASE));
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains(&format!("endpoint: \"{PLAN_INTL_BASE}\"")),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg resolves the deterministic
+/// sorted-first id of the recorded allowlist as the wire model —
+/// with no `/models` leg: the send's catalogue lookup is the static
+/// list, so exactly one request crosses the wire.
+#[tokio::test]
+async fn alibaba_coding_plan_auto_pick_resolves_through_the_static_allowlist() {
+    let server = MockServer::start().await;
+    mount_chat(&server, completed_stream("auto pick", None)).await;
+    let auto = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.alibaba-coding-plan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{ALIBABA_CP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_alibaba_cp(&auto, "/world/alibaba-cp", "goal: auto pick");
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest);
+    outcome.expect("the auto send resolves through the allowlist");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "no /models leg — the allowlist is static"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], "MiniMax-M2.5",
+        "the sorted-first allowlist id rides the wire"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::alibaba-coding-plan -----------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `alibaba-coding-plan`: a configured `region` — the recorded
+/// contract carries the region choice on the endpoint and names no
+/// `region` field — the profile-bound ref whose scope disagrees with
+/// the binding, an absent credential, a structured credential with
+/// no usable `token` and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn alibaba_coding_plan_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+ {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &alibaba_cp_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"cn\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "alibaba-coding-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, PLAN_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "alibaba-coding-plan");
+    assert_eq!(region, "cn");
+    assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.alibaba-coding-plan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"alibaba-coding-plan\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "alibaba-coding-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, PLAN_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&alibaba_cp_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-coding-plan".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, PLAN_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // a structured credential whose `token` is unusable is malformed —
+    // the JSON blob is never sent as the bearer
+    let blob = "{\"enterpriseUrl\": \"https://elsewhere.example.com/v1\"}";
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_CP_REF, blob)],
+    ));
+    let provider = provider_result(config.clone(), "alibaba-coding-plan".to_string(), store)
+        .expect("binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a structured credential without a token is malformed");
+    assert!(matches!(err, ProviderError::CredentialMalformed { .. }));
+    assert_no_secret_or_body(&err, blob.as_bytes());
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) =
+        alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, &server_uri_v1(&server)));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, reason } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "alibaba-coding-plan");
+    assert!(
+        reason.contains("401"),
+        "the status code is the context: {reason}"
+    );
+    assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_cp_config(&base)).expect("valid");
+    let material = plan_credential(PLAN_KEY, &base);
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ALIBABA_CP_REF, &material)],
+    ));
+    let provider = provider_result(config.clone(), "alibaba-coding-plan".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(PLAN_KEY),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = alibaba_cp_provider(&config, &material);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/alibaba-cp", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(PLAN_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(PLAN_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(PLAN_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-alibaba-cp",
+        Some(&alibaba_cp_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(PLAN_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+/// The typed denial one credential/base pairing lands: every matrix
+/// row declares its variant so a wrong-class denial can never pass as
+/// the expected one. `BaseMismatch` carries the enrolled base the
+/// error reports — the canonical egress rendering of the credential's
+/// `enterpriseUrl`, never the raw store bytes.
+#[derive(Debug)]
+enum PlanDeny {
+    Malformed,
+    BaseMismatch(String),
+}
+
+/// The recorded non-interchangeability predicate (HZN-008 class P):
+/// a key enrolled for one base class — international, China or a
+/// custom origin — can never serve another, and a PAYG key serves
+/// none of them. The enrolled base rides the recorded structured
+/// credential's `enterpriseUrl` and must equal the connection's
+/// configured endpoint; every mismatch or foreign-class credential
+/// lands a typed denial before any wire leg — zero requests reach
+/// any mock. A bare plan key, a token-only blob, an `apiEndpoint`
+/// steering field without `enterpriseUrl`, or a structured credential
+/// with an unusable field is unbound material the recorded login
+/// never writes — attributable to no base and malformed on every one.
+#[tokio::test]
+async fn alibaba_coding_plan_intl_cn_custom_and_payg_keys_are_not_interchangeable() {
+    // Three stand-in bases — distinct mock origins: a denied send
+    // that still egressed would be observed, and no configured
+    // endpoint ever names a real host. The recorded base literals
+    // appear only inside credential material — they ride the store,
+    // never a socket.
+    let intl = MockServer::start().await;
+    let cn = MockServer::start().await;
+    let custom = MockServer::start().await;
+    let intl_base = server_uri_v1(&intl);
+    let cn_base = server_uri_v1(&cn);
+    let custom_base = server_uri_v1(&custom);
+    let bases: [(&str, &String, &MockServer); 3] = [
+        ("intl", &intl_base, &intl),
+        ("cn", &cn_base, &cn),
+        ("custom", &custom_base, &custom),
+    ];
+
+    // (credential material, the only base it may serve, the typed
+    // denial every other pairing lands): a denied send never reaches
+    // a socket — the enrolled host included
+    let credentials: [(&str, String, PlanDeny); 19] = [
+        // keys enrolled for each base class serve that base alone
+        (
+            "intl",
+            plan_credential(PLAN_KEY, &intl_base),
+            PlanDeny::BaseMismatch(intl_base.clone()),
+        ),
+        (
+            "cn",
+            plan_credential(PLAN_KEY, &cn_base),
+            PlanDeny::BaseMismatch(cn_base.clone()),
+        ),
+        (
+            "custom",
+            plan_credential(PLAN_KEY, &custom_base),
+            PlanDeny::BaseMismatch(custom_base.clone()),
+        ),
+        // the real recorded base literals are classes of their own —
+        // a credential enrolled at the real intl or CN endpoint is
+        // not a mock's credential either
+        (
+            "none",
+            plan_credential(PLAN_KEY, PLAN_INTL_BASE),
+            PlanDeny::BaseMismatch(PLAN_INTL_BASE.to_string()),
+        ),
+        (
+            "none",
+            plan_credential(PLAN_KEY, PLAN_CN_BASE),
+            PlanDeny::BaseMismatch(PLAN_CN_BASE.to_string()),
+        ),
+        // a key enrolled at an unrelated origin serves none of them
+        (
+            "none",
+            plan_credential(PLAN_KEY, "https://elsewhere.example.com/v1"),
+            PlanDeny::BaseMismatch("https://elsewhere.example.com/v1".to_string()),
+        ),
+        // an `apiEndpoint` steering field naming the configured intl
+        // base never rescues a foreign enrolled base — the steering
+        // field is never a second enrolled-base source
+        (
+            "none",
+            json!({"token": PLAN_KEY, "enterpriseUrl": "https://elsewhere.example.com/v1", "apiEndpoint": intl_base.as_str()})
+                .to_string(),
+            PlanDeny::BaseMismatch("https://elsewhere.example.com/v1".to_string()),
+        ),
+        // PAYG keys — the recorded `sk-…` non-plan grammar — are a
+        // different product on every plan base, structured or bare,
+        // even when the enrolled field names the right base
+        (
+            "none",
+            plan_credential(PAYG_KEY, PAYG_BASE),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            plan_credential(PAYG_KEY, &intl_base),
+            PlanDeny::Malformed,
+        ),
+        ("none", PAYG_KEY.to_string(), PlanDeny::Malformed),
+        // unbound material the recorded login never writes — a bare
+        // key, a token-only blob, an `apiEndpoint` steering field
+        // without `enterpriseUrl`: attributable to no base
+        ("none", PLAN_KEY.to_string(), PlanDeny::Malformed),
+        (
+            "none",
+            json!({"token": PLAN_KEY}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": PLAN_KEY, "apiEndpoint": cn_base.as_str()}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        // malformed structured material never reaches a socket either
+        ("none", "{\"token\": 42}".to_string(), PlanDeny::Malformed),
+        ("none", "{not-json".to_string(), PlanDeny::Malformed),
+        (
+            "none",
+            json!({"token": PLAN_KEY, "enterpriseUrl": ""}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": PLAN_KEY, "enterpriseUrl": null}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        (
+            "none",
+            json!({"token": PLAN_KEY, "enterpriseUrl": 42}).to_string(),
+            PlanDeny::Malformed,
+        ),
+        // the recorded ingress normalization: a trailing slash on the
+        // enrolled base still matches the configured one
+        (
+            "intl",
+            plan_credential(PLAN_KEY, &format!("{intl_base}/")),
+            PlanDeny::BaseMismatch(intl_base.clone()),
+        ),
+    ];
+
+    // every deny pairing first, while no mock has seen a request —
+    // a wrong credential never reaches a socket, enrolled host
+    // included
+    for (serves, material, deny) in &credentials {
+        for (base_label, base, _server) in &bases {
+            if serves == base_label {
+                continue;
+            }
+            let config = Config::parse_validated(&alibaba_cp_config(base)).expect("valid");
+            let store = Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(ALIBABA_CP_REF, material.as_str())],
+            ));
+            let provider =
+                provider_result(config.clone(), "alibaba-coding-plan".to_string(), store)
+                    .expect("binding resolves");
+            let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+            let err = outcome.expect_err("a wrong-base or wrong-class credential denies");
+            match (deny, &err) {
+                (PlanDeny::Malformed, ProviderError::CredentialMalformed { connection }) => {
+                    assert_eq!(connection, "alibaba-coding-plan");
+                }
+                (
+                    PlanDeny::BaseMismatch(enrolled),
+                    ProviderError::CredentialBaseMismatch {
+                        connection,
+                        enrolled: reported,
+                    },
+                ) => {
+                    assert_eq!(connection, "alibaba-coding-plan");
+                    assert_eq!(
+                        reported, enrolled,
+                        "the denial reports the credential's own enrolled base"
+                    );
+                }
+                _ => panic!(
+                    "{serves}-enrolled credential on {base_label} base denies as {deny:?}: {err}"
+                ),
+            }
+            assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
+            assert_no_secret_or_body(&err, PAYG_KEY.as_bytes());
+            drop_blocking(provider);
+            for (_, _, server) in &bases {
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .expect("recorded")
+                        .is_empty(),
+                    "no wire leg left the denied send — the enrolled host included"
+                );
+            }
+        }
+    }
+
+    // the serve pairings: each enrolled key on its own base — the
+    // enrolled base equals the configured one
+    for (label, server) in [("intl", &intl), ("cn", &cn), ("custom", &custom)] {
+        mount_chat(server, completed_stream(&format!("served-{label}"), None)).await;
+    }
+    for (serves, material, _deny) in &credentials {
+        for (base_label, base, server) in &bases {
+            if serves != base_label {
+                continue;
+            }
+            let config = Config::parse_validated(&alibaba_cp_config(base)).expect("valid");
+            let store = Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(ALIBABA_CP_REF, material.as_str())],
+            ));
+            let provider =
+                provider_result(config.clone(), "alibaba-coding-plan".to_string(), store)
+                    .expect("binding resolves");
+            let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+            let reply = outcome.unwrap_or_else(|err| {
+                panic!("{serves}-enrolled credential serves the {base_label} base: {err}")
+            });
+            assert_eq!(reply.text, format!("served-{base_label}"));
+            drop_blocking(provider);
+            let requests = server.received_requests().await.expect("recorded");
+            let last = requests.last().expect("the serve crossed the wire");
+            assert_eq!(
+                received_auth(last),
+                format!("Bearer {PLAN_KEY}"),
+                "the unwrapped plan token bears the wire"
+            );
+        }
+    }
+
+    // exactly the serve legs crossed the wire — each enrolled key on
+    // its own base plus intl's extra trailing-slash enrolled leg —
+    // and every denial left none
+    for (label, _, server) in &bases {
+        let expected = if label == &"intl" { 2 } else { 1 };
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(
+            requests.len(),
+            expected,
+            "the serve legs alone egressed on the {label} base"
+        );
+    }
+    // Let the mock servers' in-flight handler tasks drain before the
+    // servers drop: `MockServer::drop` verifies through a futures
+    // `block_on` that cannot drive this runtime, so a handler still
+    // holding the state write lock would park the teardown forever.
+    tokio::task::yield_now().await;
+}
+
+/// `apiEndpoint` is the recorded credential's steering field, not
+/// this adapter's: a structured credential carrying it beside a
+/// matching `enterpriseUrl` still serves the configured base alone —
+/// the steering field is never read, so an `apiEndpoint` naming a
+/// different origin redirects no egress.
+#[tokio::test]
+async fn alibaba_coding_plan_api_endpoint_field_never_steers_egress() {
+    let intl = MockServer::start().await;
+    let cn = MockServer::start().await;
+    mount_chat(&intl, completed_stream("served-intl", None)).await;
+    let intl_base = server_uri_v1(&intl);
+    let config = Config::parse_validated(&alibaba_cp_config(&intl_base)).expect("valid");
+    // the steering field names the China mock while `enterpriseUrl`
+    // binds the configured intl base — the credential serves the
+    // configured base alone
+    let material = json!({
+        "token": PLAN_KEY,
+        "apiEndpoint": server_uri_v1(&cn),
+        "enterpriseUrl": intl_base,
+    })
+    .to_string();
+    let (provider, _store) = alibaba_cp_provider(&config, &material);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("the bound credential serves the configured base");
+    assert_eq!(reply.text, "served-intl");
+    drop_blocking(provider);
+    let requests = intl.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the configured intl base served");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {PLAN_KEY}"),
+        "the unwrapped plan token bears the wire"
+    );
+    assert!(
+        cn.received_requests().await.expect("recorded").is_empty(),
+        "the apiEndpoint-named origin never saw a request"
+    );
+    tokio::task::yield_now().await;
+}
+
+/// The configured side of the binding takes the same recorded ingress
+/// normalization: an `endpoint` carrying a trailing slash resolves to
+/// the same base the credential enrolled, and the request path never
+/// doubles the slash.
+#[tokio::test]
+async fn alibaba_coding_plan_configured_trailing_slash_binds_the_same_base() {
+    let server = MockServer::start().await;
+    mount_chat(&server, completed_stream("slashed", None)).await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&alibaba_cp_config(&format!("{base}/"))).expect("valid");
+    let (provider, _store) = alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, &base));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the normalized configured base binds the enrolled credential");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/chat/completions",
+        "the resolved base carries no doubled slash"
+    );
+    tokio::task::yield_now().await;
+}
+
+/// A `CredentialBaseMismatch` reports the enrolled base in the
+/// canonical egress form — the same rendering consent and journal
+/// surfaces use — so store content carrying userinfo or a query
+/// never reaches the diagnostic.
+#[tokio::test]
+async fn alibaba_coding_plan_base_mismatch_redacts_enrolled_url_parts() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&alibaba_cp_config(&server_uri_v1(&server))).expect("valid");
+    let material = json!({
+        "token": PLAN_KEY,
+        "enterpriseUrl": "https://user:pw@host.invalid/v1?x=1",
+    })
+    .to_string();
+    let (provider, _store) = alibaba_cp_provider(&config, &material);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a foreign enrolled base denies");
+    let ProviderError::CredentialBaseMismatch {
+        connection,
+        enrolled,
+    } = &err
+    else {
+        panic!("the foreign enrolled base is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "alibaba-coding-plan");
+    assert_eq!(
+        enrolled, "https://host.invalid/v1",
+        "the reported enrolled base drops userinfo and query"
+    );
+    let rendered = err.to_string();
+    for secret_part in ["user", "pw", "x=1"] {
+        assert!(
+            !rendered.contains(secret_part),
+            "the enrolled base's {secret_part:?} never renders: {rendered}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no wire leg left the denied send"
+    );
+    tokio::task::yield_now().await;
+}
+
+// ----- TP-PROVIDER-RECOVERY::alibaba-coding-plan -------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling a plan key at the
+/// scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn alibaba_coding_plan_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&alibaba_cp_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-coding-plan".to_string(),
+        store.clone(),
+    )
+    .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(
+        ALIBABA_CP_REF,
+        plan_credential(PLAN_KEY, &server_uri_v1(&server)).as_bytes(),
+    );
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `alibaba-coding-plan`: CATALOG, AUTH, WIRE and RECOVERY each
+/// execute and report inside this run, and INSTALLED reports
+/// NOT_RUN — an omitted leg fails the suite rather than silently
+/// absenting.
+#[tokio::test]
+async fn alibaba_coding_plan_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&alibaba_cp_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the static allowlist answers with no credential and
+    // no wire leg — the empty store proves both.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "alibaba-coding-plan".to_string(), empty)
+        .expect("the adapter builds");
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref models) if model_ids(models) == ALIBABA_CP_MODEL_IDS) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "alibaba-coding-plan".to_string(), empty)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_alibaba_cp(&config, "/world/alibaba-cp", "goal: matrix wire");
+    let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(
+        config.clone(),
+        "alibaba-coding-plan".to_string(),
+        empty.clone(),
+    )
+    .expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(
+        ALIBABA_CP_REF,
+        plan_credential(PLAN_KEY, &server_uri_v1(&server)).as_bytes(),
+    );
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_alibaba_coding_plan` case below: its
+    // ignored count is the explicit NOT_RUN signal this matrix
+    // asserts — the row stays a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::alibaba-coding-plan ------------------------------
+
+/// TP-PROVIDER-INSTALLED::alibaba-coding-plan = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline
+/// slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::alibaba-coding-plan = NOT_RUN"]
+fn provider_installed_alibaba_coding_plan() {}

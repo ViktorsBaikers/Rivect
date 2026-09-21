@@ -85,10 +85,28 @@ pub enum ProviderError {
     #[error("no credential material at scope {scope}")]
     CredentialAbsent { scope: String },
     /// The resolved credential material cannot serve this dialect —
-    /// non-UTF-8 bytes where the contract needs a bearer token. The
-    /// material itself never appears in the error.
+    /// non-UTF-8 bytes where the contract needs a bearer token, or a
+    /// token outside the dialect's recorded credential grammar (a
+    /// PAYG `sk-…` key where the contract binds plan `sk-sp-…`
+    /// keys). The material itself never appears in the error.
     #[error("credential material for connection {connection} is not usable by this dialect")]
     CredentialMalformed { connection: String },
+    /// The credential's enrolled endpoint base does not match the
+    /// connection's configured endpoint (HZN-008 class P): a key
+    /// enrolled for one recorded base — international, China or a
+    /// custom origin — can never serve another, and the denial lands
+    /// before any wire leg reaches the wrong host. `enrolled` is the
+    /// credential's recorded endpoint rendered in the canonical egress
+    /// form (`canonical_egress_target`) — userinfo, query and fragment
+    /// inside the stored material never reach diagnostics, and the
+    /// field stays config-class data, never secret material.
+    #[error(
+        "credential for connection {connection} is enrolled for a different endpoint base: {enrolled}"
+    )]
+    CredentialBaseMismatch {
+        connection: String,
+        enrolled: String,
+    },
     /// DEC-007: the manifest's pin names a connection whose recorded
     /// source class is not this adapter's dialect — dialect selection
     /// keys on the literal connection id, never an auth label.
@@ -880,8 +898,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// exception speaking the same dialect (HZN-008), `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
-/// Completions dialect and `aiand`/`aimlapi` are its recorded class-A
-/// plugs speaking the same dialect (HZN-008) — never inferred from an
+/// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`
+/// are its recorded class-A/class-P plugs speaking the same dialect
+/// (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
@@ -910,6 +929,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         "aiand" => Some(Dialect::ChatCompletions),
         "aimlapi" => Some(Dialect::ChatCompletions),
+        "alibaba-coding-plan" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
