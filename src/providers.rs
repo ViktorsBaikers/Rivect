@@ -11,10 +11,13 @@
 use crate::config::{Config, ConnKind, Connection, ModelAssign, Profile};
 use crate::model::RequestManifest;
 use crate::resources::UsageDelta;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub mod gemini;
 pub mod local;
@@ -859,12 +862,7 @@ pub(crate) fn resolve_credential_in(
                 scope: key.clone(),
                 cause: None,
             })?;
-        let credential =
-            SecretRef::parse(&raw).map_err(|parse| ProviderError::CredentialUnresolved {
-                connection: connection.to_string(),
-                scope: key.clone(),
-                cause: Some(parse),
-            })?;
+        let credential = parse_scoped(connection, &key, &raw)?;
         if credential.profile() != profile {
             return Err(ProviderError::CredentialProfileMismatch {
                 connection: connection.to_string(),
@@ -882,9 +880,16 @@ pub(crate) fn resolve_credential_in(
             scope: key.clone(),
             cause: None,
         })?;
-    SecretRef::parse(&raw).map_err(|parse| ProviderError::CredentialUnresolved {
+    parse_scoped(connection, &key, &raw)
+}
+
+/// The `SecretRef::parse` leg both credential bindings share: a
+/// malformed bound ref is [`ProviderError::CredentialUnresolved`]
+/// under the failed key path, the parse verdict as its cause.
+fn parse_scoped(connection: &str, key: &str, raw: &str) -> Result<SecretRef, ProviderError> {
+    SecretRef::parse(raw).map_err(|parse| ProviderError::CredentialUnresolved {
         connection: connection.to_string(),
-        scope: key,
+        scope: key.to_string(),
         cause: Some(parse),
     })
 }
@@ -1072,4 +1077,153 @@ pub fn offline_usable(
             ConnKind::Subscription => false,
         },
     }
+}
+
+/// Bytes read from a response stream per pass — the chunking is an
+/// implementation detail the SSE parser is indifferent to.
+pub(crate) const STREAM_CHUNK_BYTES: usize = 8 * 1024;
+
+/// The bound on one catalogue payload — a listing never needs more,
+/// and an unbounded or dribbling body is denied under the same budget
+/// as a streamed response.
+pub(crate) const CATALOG_MAX_BYTES: usize = 1024 * 1024;
+
+/// The whole-request budget check (DEC-014): evaluated before the
+/// post, before every stream read and before the final pass, so
+/// connect, request send, reads and finalization share one deadline —
+/// a peer dribbling a byte inside each per-read window parks the
+/// stream only until the total budget is spent.
+pub(crate) fn check_deadline(
+    connection: &str,
+    deadline: Duration,
+    started: Instant,
+) -> Result<(), ProviderError> {
+    if started.elapsed() >= deadline {
+        return Err(ProviderError::Transport {
+            connection: connection.to_string(),
+            reason: format!("request exceeded the {deadline:?} send deadline"),
+        });
+    }
+    Ok(())
+}
+
+/// One bounded read under the shared deadline: the check runs before
+/// the call, `Interrupted` retries in place, and any other read
+/// failure is the typed transport error. Returns the bytes read — `0`
+/// is the stream's end.
+pub(crate) fn read_chunk(
+    connection: &str,
+    deadline: Duration,
+    response: &mut reqwest::blocking::Response,
+    chunk: &mut [u8],
+    started: Instant,
+) -> Result<usize, ProviderError> {
+    loop {
+        check_deadline(connection, deadline, started)?;
+        match response.read(chunk) {
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(transport_io(connection, err)),
+            Ok(read) => return Ok(read),
+        }
+    }
+}
+
+/// The catalogue body read under the shared deadline and byte bound —
+/// a dribbling or oversized payload is denied, never parked or
+/// buffered unbounded.
+pub(crate) fn read_catalog_body(
+    connection: &str,
+    deadline: Duration,
+    response: &mut reqwest::blocking::Response,
+    started: Instant,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut body = Vec::new();
+    let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let read = read_chunk(connection, deadline, response, &mut chunk, started)?;
+        if read == 0 {
+            break;
+        }
+        if body.len() + read > CATALOG_MAX_BYTES {
+            return Err(violation(
+                connection,
+                "models payload exceeds the byte bound",
+            ));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Ok(body)
+}
+
+/// The serialized body is what crosses the wire: it carries the
+/// replayed lineage set, so the same byte bound the manifest's
+/// accounted size promised is enforced on the actual bytes —
+/// oversized, never truncated (AC-013).
+pub(crate) fn wire_body(connection: &str, body: &Value) -> Result<Vec<u8>, ProviderError> {
+    let body_bytes = serde_json::to_vec(body)
+        .map_err(|_ser| violation(connection, "request body could not serialize"))?;
+    if body_bytes.len() > crate::contracts::MODEL_WIRE_MAX_BYTES {
+        return Err(ProviderError::StreamViolation {
+            connection: connection.to_string(),
+            reason: format!(
+                "request body of {} bytes exceeds the {} byte wire bound",
+                body_bytes.len(),
+                crate::contracts::MODEL_WIRE_MAX_BYTES
+            ),
+        });
+    }
+    Ok(body_bytes)
+}
+
+pub(crate) fn transport(connection: &str, err: reqwest::Error) -> ProviderError {
+    ProviderError::Transport {
+        connection: connection.to_string(),
+        reason: err.without_url().to_string(),
+    }
+}
+
+fn transport_io(connection: &str, err: std::io::Error) -> ProviderError {
+    ProviderError::Transport {
+        connection: connection.to_string(),
+        reason: err.to_string(),
+    }
+}
+
+/// A non-success status is reported by code alone — the response
+/// body is uncontrolled peer text and never enters diagnostics.
+pub(crate) fn transport_status(connection: &str, status: reqwest::StatusCode) -> ProviderError {
+    ProviderError::Transport {
+        connection: connection.to_string(),
+        reason: format!("status {}", status.as_u16()),
+    }
+}
+
+pub(crate) fn sse(connection: &str, err: sse::SseError) -> ProviderError {
+    ProviderError::StreamViolation {
+        connection: connection.to_string(),
+        reason: err.to_string(),
+    }
+}
+
+pub(crate) fn violation(connection: &str, reason: impl Into<String>) -> ProviderError {
+    ProviderError::StreamViolation {
+        connection: connection.to_string(),
+        reason: reason.into(),
+    }
+}
+
+/// The reason a failed verdict carries — the peer's own `message`,
+/// `status` or `code` field, whichever it populated. Strings render
+/// verbatim and scalar numbers/booleans still read; a nested object or
+/// array is structure, not prose, and is never serialized into the
+/// reason.
+pub(crate) fn payload_reason(payload: &Value) -> String {
+    for field in ["message", "status", "code"] {
+        match payload.get(field) {
+            Some(Value::String(text)) => return text.clone(),
+            Some(scalar @ (Value::Number(_) | Value::Bool(_))) => return scalar.to_string(),
+            _ => {}
+        }
+    }
+    "unclassified".to_string()
 }

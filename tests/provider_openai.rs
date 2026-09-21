@@ -21,7 +21,7 @@ use rivect::config::Config;
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
-use rivect::providers::{CredentialStore, Provider, ProviderError, SecretRef, StoreKind};
+use rivect::providers::{Provider, ProviderError, StoreKind};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -31,6 +31,11 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+use support::{
+    SlowStore, drop_blocking, mount_responses, received_bodies, responses_completed_stream,
+    send_on_thread, sse_block,
+};
 
 /// The scoped credential ref the `openai` connection binds — a
 /// `keyring:` ref resolves to the platform's native class, which the
@@ -86,81 +91,11 @@ fn openai_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) 
     (provider, store)
 }
 
-/// One SSE block on the wire.
-fn sse_block(event: &str, data: &Value) -> String {
-    format!("event: {event}\ndata: {data}\n\n")
-}
-
-/// A completed Responses stream: an in-progress message item, a text
-/// delta, the done item, any extra output items, then the mandatory
-/// `response.completed` terminal carrying the full output set and
-/// usage.
-fn completed_stream(text: &str, extra_items: Vec<Value>, usage: Option<Value>) -> String {
-    let message = json!({
-        "id": "msg_1",
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{ "type": "output_text", "text": text }],
-    });
-    let mut output = extra_items;
-    output.push(message.clone());
-    let mut response = json!({
-        "id": "resp_1",
-        "status": "completed",
-        "output": output,
-    });
-    if let Some(usage) = usage {
-        response["usage"] = usage;
-    }
-    format!(
-        "{}{}{}{}",
-        sse_block(
-            "response.output_item.added",
-            &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
-        ),
-        sse_block(
-            "response.output_text.delta",
-            &json!({"delta": text, "item_id": "msg_1", "output_index": 0, "content_index": 0}),
-        ),
-        sse_block(
-            "response.output_item.done",
-            &json!({"item": message, "output_index": 0}),
-        ),
-        sse_block("response.completed", &json!({"response": response})),
-    )
-}
-
 /// The configured endpoint is the API base — `/v1` included, like
 /// `https://api.openai.com/v1` — and the adapter appends the recorded
 /// resource paths.
 fn server_uri_v1(server: &MockServer) -> String {
     format!("{}/v1", server.uri())
-}
-
-async fn mount_responses(server: &MockServer, body: String) {
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body),
-        )
-        .mount(server)
-        .await;
-}
-
-/// The request bodies the fixture peer received, parsed as JSON.
-async fn received_bodies(server: &MockServer) -> Vec<Value> {
-    server
-        .received_requests()
-        .await
-        .expect("the mock recorded requests")
-        .iter()
-        .map(|request: &Request| {
-            serde_json::from_slice(&request.body).expect("the wire body is json")
-        })
-        .collect()
 }
 
 fn received_auth(request: &Request) -> String {
@@ -208,76 +143,6 @@ fn dispatch(
     .expect("the dispatch thread joins")
 }
 
-/// reqwest's blocking client owns an internal runtime that must never
-/// be dropped inside any tokio context — even the blocking pool — so
-/// every broker/provider drop goes to a plain OS thread.
-fn drop_blocking<T: Send + 'static>(value: T) {
-    std::thread::spawn(move || drop(value))
-        .join()
-        .expect("the drop thread joins");
-}
-
-/// A bare `provider.send` must not run inside any tokio context for
-/// the same reason — sends go to a plain OS thread and the provider
-/// comes back.
-fn send_on_thread(
-    mut provider: OpenAiProvider,
-    manifest: RequestManifest,
-) -> (
-    OpenAiProvider,
-    Result<rivect::providers::ProviderReply, ProviderError>,
-) {
-    std::thread::spawn(move || {
-        let outcome = provider.send(&manifest);
-        (provider, outcome)
-    })
-    .join()
-    .expect("the send thread joins")
-}
-
-/// A store double whose `resolve` parks for a fixed delay before
-/// delegating — the seam a credential leg that consumes the send's
-/// whole budget is proved through (DEC-014).
-struct SlowStore {
-    inner: support::MapStore,
-    delay: Duration,
-}
-
-impl CredentialStore for SlowStore {
-    fn kind(&self) -> StoreKind {
-        self.inner.kind()
-    }
-
-    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
-        self.inner.occupied(credential)
-    }
-
-    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
-        self.inner.entry_accounts(service)
-    }
-
-    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.login(credential, secret)
-    }
-
-    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
-        std::thread::sleep(self.delay);
-        self.inner.resolve(credential)
-    }
-
-    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.refresh(credential, secret)
-    }
-
-    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.revoke(credential)
-    }
-
-    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.logout(credential)
-    }
-}
-
 // ----- TP-PROVIDER-WIRE::openai -------------------------------------
 
 /// A configured `openai` connection returns a verified model outcome
@@ -292,7 +157,7 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "verified outcome text",
             Vec::new(),
             Some(json!({"input_tokens": 11, "output_tokens": 7, "total_tokens": 18})),
@@ -608,7 +473,7 @@ async fn a_manual_pick_of_an_openai_candidate_reaches_the_real_send() {
         .await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "picked outcome",
             Vec::new(),
             Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
@@ -700,7 +565,7 @@ async fn auto_ranked_openai_primary_send_resolves_via_catalog() {
         .await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "auto outcome",
             Vec::new(),
             Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
@@ -807,7 +672,11 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
 #[tokio::test]
 async fn expired_budget_denies_the_send_before_any_wire_leg() {
     let server = MockServer::start().await;
-    mount_responses(&server, completed_stream("never sent", Vec::new(), None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("never sent", Vec::new(), None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let deadline = Duration::from_millis(1500);
     let store = Arc::new(SlowStore {
@@ -990,7 +859,7 @@ async fn wrong_credential_profile_or_region_denies_with_typed_context_without_se
     );
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "accounted",
             Vec::new(),
             Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
@@ -1056,7 +925,7 @@ async fn typed_denial_recovers_through_the_same_credential_seam() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "recovered",
             Vec::new(),
             Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
@@ -1188,7 +1057,7 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "",
             vec![json!({
                 "id": "mcp_1", "type": "mcp_call", "name": "server.tool",
@@ -1215,7 +1084,7 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "",
             vec![json!({"id": "rs_1", "type": "reasoning", "summary": []})],
             None,
@@ -1241,7 +1110,7 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "",
             vec![json!({
                 "id": "fc_1", "type": "function_call", "status": "completed",
@@ -1275,7 +1144,7 @@ async fn incomplete_output_item_in_a_completed_terminal_is_rejected() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "reading",
             vec![json!({
                 "id": "fc_1", "type": "function_call", "status": "incomplete",
@@ -1306,7 +1175,11 @@ async fn incomplete_output_item_in_a_completed_terminal_is_rejected() {
         "content": [{ "type": "output_text", "text": "hi" }],
     });
     statusless.as_object_mut().unwrap().remove("status");
-    mount_responses(&server, completed_stream("hi", vec![statusless], None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("hi", vec![statusless], None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (broker, manifest) = prepared(&config, "/world/openai", "goal: unlabelled item");
     let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
@@ -1375,7 +1248,7 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
         &server,
         format!(
             "{}{}",
-            completed_stream("first", Vec::new(), None),
+            responses_completed_stream("first", Vec::new(), None),
             sse_block(
                 "response.failed",
                 &json!({"response": {"id": "resp_2", "status": "failed"}}),
@@ -1419,7 +1292,7 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "counted",
             Vec::new(),
             Some(json!({"input_tokens": "many", "output_tokens": 7, "total_tokens": 7})),
@@ -1494,11 +1367,11 @@ async fn malformed_wire_shapes_are_typed_violations() {
         ),
         (
             "an output item without a type",
-            completed_stream("", vec![json!({"id": "x_1"})], None),
+            responses_completed_stream("", vec![json!({"id": "x_1"})], None),
         ),
         (
             "a message item without content",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({
                     "id": "msg_0", "type": "message", "status": "completed",
@@ -1509,7 +1382,7 @@ async fn malformed_wire_shapes_are_typed_violations() {
         ),
         (
             "a function_call without a name",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({
                     "id": "fc_1", "type": "function_call", "status": "completed",
@@ -1520,7 +1393,7 @@ async fn malformed_wire_shapes_are_typed_violations() {
         ),
         (
             "function_call arguments that are not json",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({
                     "id": "fc_1", "type": "function_call", "status": "completed",
@@ -1531,7 +1404,7 @@ async fn malformed_wire_shapes_are_typed_violations() {
         ),
         (
             "function_call arguments that are not an object",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({
                     "id": "fc_1", "type": "function_call", "status": "completed",
@@ -1582,7 +1455,7 @@ async fn reported_total_is_charged_verbatim_and_a_missing_total_is_a_violation()
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "verbatim",
             Vec::new(),
             Some(json!({"input_tokens": 11, "output_tokens": 7, "total_tokens": 25})),
@@ -1610,7 +1483,7 @@ async fn reported_total_is_charged_verbatim_and_a_missing_total_is_a_violation()
     let server = MockServer::start().await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "no total",
             Vec::new(),
             Some(json!({"input_tokens": 11, "output_tokens": 7})),
@@ -1640,7 +1513,11 @@ async fn foreign_reasoning_blob_rejected() {
         "id": "rs_1", "type": "reasoning", "summary": [],
         "encrypted_content": "enc-fixture-blob-aaa",
     });
-    mount_responses(&server, completed_stream("ok", vec![reasoning], None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("ok", vec![reasoning], None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (provider, _store) = openai_provider(&config);
     let mut broker = Broker::new(Box::new(provider));
@@ -1764,7 +1641,11 @@ async fn responses_store_false_is_explicit_and_stateless_replay_carries_prior_ou
 #[tokio::test]
 async fn unknown_usage_never_releases_the_admission_bound() {
     let server = MockServer::start().await;
-    mount_responses(&server, completed_stream("no usage", Vec::new(), None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("no usage", Vec::new(), None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (broker, manifest) = prepared(&config, "/world/openai", "goal: unknown usage");
     let (broker, outcome) = dispatch(broker, "/world/openai", manifest.clone());
@@ -1848,7 +1729,11 @@ async fn reasoning_item_status_is_not_the_provenance_gate() {
         "id": "rs_1", "type": "reasoning", "status": "in_progress",
         "summary": [], "encrypted_content": "enc-fixture-blob-aaa",
     });
-    mount_responses(&server, completed_stream("ok", vec![reasoning], None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("ok", vec![reasoning], None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (broker, manifest) = prepared(&config, "/world/openai", "goal: labelled reasoning");
     let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
@@ -1867,7 +1752,7 @@ async fn refusal_content_part_reaches_the_reply_text() {
     });
     mount_responses(
         &server,
-        completed_stream("answer", vec![refusal_message], None),
+        responses_completed_stream("answer", vec![refusal_message], None),
     )
     .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
@@ -1891,7 +1776,11 @@ async fn completed_tool_call_reaches_the_reply_typed() {
         "name": "read_file", "arguments": "{\"path\": \"src/lib.rs\"}",
         "call_id": "call_1",
     });
-    mount_responses(&server, completed_stream("reading", vec![call], None)).await;
+    mount_responses(
+        &server,
+        responses_completed_stream("reading", vec![call], None),
+    )
+    .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let (broker, manifest) = prepared(&config, "/world/openai", "goal: tool call");
     let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
@@ -1917,7 +1806,7 @@ async fn retired_epoch_reasoning_blob_is_rejected_not_readopted() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(completed_stream("ok", vec![reasoning], None)),
+                .set_body_string(responses_completed_stream("ok", vec![reasoning], None)),
         )
         .expect(2)
         .mount(&server)
@@ -1983,7 +1872,7 @@ async fn rejected_output_items_never_join_the_replay_lineage() {
     let legs: Vec<DenialLeg> = vec![
         (
             "a reasoning item without its artifact",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({"id": "rs_1", "type": "reasoning", "summary": []})],
                 None,
@@ -1992,7 +1881,7 @@ async fn rejected_output_items_never_join_the_replay_lineage() {
         ),
         (
             "an unhonourable output item",
-            completed_stream(
+            responses_completed_stream(
                 "",
                 vec![json!({
                     "id": "mcp_1", "type": "mcp_call", "name": "server.tool",
@@ -2004,7 +1893,7 @@ async fn rejected_output_items_never_join_the_replay_lineage() {
         ),
         (
             "a malformed output item",
-            completed_stream("", vec![json!({"id": "x_1"})], None),
+            responses_completed_stream("", vec![json!({"id": "x_1"})], None),
             |err| matches!(err, ProviderError::StreamViolation { .. }),
         ),
     ];
@@ -2020,7 +1909,11 @@ async fn rejected_output_items_never_join_the_replay_lineage() {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        mount_responses(&server, completed_stream("clean answer", Vec::new(), None)).await;
+        mount_responses(
+            &server,
+            responses_completed_stream("clean answer", Vec::new(), None),
+        )
+        .await;
         let config =
             Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
         let (provider, _store) = openai_provider(&config);
@@ -2072,14 +1965,18 @@ async fn interleaved_epoch_sends_preserve_the_live_epochs_replay_set() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(completed_stream("epoch-one answer", Vec::new(), None)),
+                .set_body_string(responses_completed_stream(
+                    "epoch-one answer",
+                    Vec::new(),
+                    None,
+                )),
         )
         .up_to_n_times(1)
         .mount(&server)
         .await;
     mount_responses(
         &server,
-        completed_stream("epoch-two answer", Vec::new(), None),
+        responses_completed_stream("epoch-two answer", Vec::new(), None),
     )
     .await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
@@ -2177,7 +2074,7 @@ async fn replay_body_is_bounded_by_the_wire_limit() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string(completed_stream(&big, Vec::new(), None)),
+                .set_body_string(responses_completed_stream(&big, Vec::new(), None)),
         )
         .expect(5)
         .mount(&server)
@@ -2223,7 +2120,7 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
         .await;
     mount_responses(
         &server,
-        completed_stream(
+        responses_completed_stream(
             "matrix",
             Vec::new(),
             Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),

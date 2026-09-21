@@ -15,8 +15,9 @@
 )]
 
 use rivect::commands::{Ingress, Runtime};
+use rivect::config::Config;
 use rivect::contracts::{AnswerSelection, Event, Question, SessionId, TaskId};
-use rivect::model::RequestManifest;
+use rivect::model::{Broker, RequestManifest};
 use rivect::providers::{
     CredentialStore, Provider, ProviderError, ProviderReply, SecretRef, StoreKind,
 };
@@ -26,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 pub const CONNECTION_ID: &str = "test-conn-1";
 
@@ -214,6 +217,49 @@ impl CredentialStore for MapStore {
 
     fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
         self.revoke(credential)
+    }
+}
+
+/// A store double whose `resolve` parks for a fixed delay before
+/// delegating — the seam a credential leg that consumes the send's
+/// whole budget is proved through (DEC-014).
+pub struct SlowStore {
+    pub inner: MapStore,
+    pub delay: Duration,
+}
+
+impl CredentialStore for SlowStore {
+    fn kind(&self) -> StoreKind {
+        self.inner.kind()
+    }
+
+    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+        self.inner.occupied(credential)
+    }
+
+    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
+        self.inner.entry_accounts(service)
+    }
+
+    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.inner.login(credential, secret)
+    }
+
+    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+        std::thread::sleep(self.delay);
+        self.inner.resolve(credential)
+    }
+
+    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.inner.refresh(credential, secret)
+    }
+
+    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.inner.revoke(credential)
+    }
+
+    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.inner.logout(credential)
     }
 }
 
@@ -902,4 +948,121 @@ pub fn sandbox_world(
     let grant = world.runtime.set_read_scope(scope, file.clone());
     world.runtime.read_worker = Box::new(worker);
     (world, task, file, grant)
+}
+
+// ----- provider wire harness ----------------------------------------
+
+/// reqwest's blocking client owns an internal runtime that must never
+/// be dropped inside any tokio context — even the blocking pool — so
+/// every broker/provider drop goes to a plain OS thread.
+pub fn drop_blocking<T: Send + 'static>(value: T) {
+    std::thread::spawn(move || drop(value))
+        .join()
+        .expect("the drop thread joins");
+}
+
+/// A bare `provider.send` must not run inside any tokio context for
+/// the same reason — sends go to a plain OS thread and the provider
+/// comes back.
+pub fn send_on_thread<P: Provider + 'static>(
+    mut provider: P,
+    manifest: RequestManifest,
+) -> (P, Result<ProviderReply, ProviderError>) {
+    std::thread::spawn(move || {
+        let outcome = provider.send(&manifest);
+        (provider, outcome)
+    })
+    .join()
+    .expect("the send thread joins")
+}
+
+/// A prepared manifest plus the broker that admitted it — the real
+/// admission path for the caller's provider pin. The store half of
+/// the `*_provider` builders is the credential seam the provider
+/// already holds; the caller's clone is done.
+pub fn prepared_with<P: Provider + 'static>(
+    (provider, _store): (P, Arc<MapStore>),
+    config: &Config,
+    world: &str,
+    inputs: &str,
+) -> (Broker, RequestManifest) {
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", config, world, inputs)
+        .expect("the pin passes DEC-011 eligibility");
+    (broker, manifest)
+}
+
+/// One SSE block on the wire.
+pub fn sse_block(event: &str, data: &Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+/// A completed Responses stream: an in-progress message item, a text
+/// delta, the done item, any extra output items, then the mandatory
+/// `response.completed` terminal carrying the full output set and
+/// usage.
+pub fn responses_completed_stream(
+    text: &str,
+    extra_items: Vec<Value>,
+    usage: Option<Value>,
+) -> String {
+    let message = json!({
+        "id": "msg_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text }],
+    });
+    let mut output = extra_items;
+    output.push(message.clone());
+    let mut response = json!({
+        "id": "resp_1",
+        "status": "completed",
+        "output": output,
+    });
+    if let Some(usage) = usage {
+        response["usage"] = usage;
+    }
+    format!(
+        "{}{}{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.output_text.delta",
+            &json!({"delta": text, "item_id": "msg_1", "output_index": 0, "content_index": 0}),
+        ),
+        sse_block(
+            "response.output_item.done",
+            &json!({"item": message, "output_index": 0}),
+        ),
+        sse_block("response.completed", &json!({"response": response})),
+    )
+}
+
+pub async fn mount_responses(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The request bodies the fixture peer received, parsed as JSON.
+pub async fn received_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock recorded requests")
+        .iter()
+        .map(|request: &Request| {
+            serde_json::from_slice(&request.body).expect("the wire body is json")
+        })
+        .collect()
 }

@@ -807,12 +807,7 @@ impl Broker {
                 usage: outcome.usage(),
             },
         );
-        // The attempt is spent and its admission is dead weight: prune
-        // it, and a later replay still answers through the accounting
-        // map above.
-        self.admissions.remove(&manifest.attempt_id);
-        self.pending.remove(&manifest.attempt_id);
-        self.paused.remove(&manifest.attempt_id);
+        self.clear_attempt(&manifest.attempt_id);
         Ok(outcome.into_reply())
     }
 
@@ -917,15 +912,12 @@ impl Broker {
             Ok(reply) => {
                 // The substitute answered the intent: the paused
                 // primary's admission is spent with it, so neither id
-                // can replay — and its pending record dies with it.
-                self.admissions.remove(attempt_id);
-                self.pending.remove(attempt_id);
-                self.paused.remove(attempt_id);
+                // can replay.
+                self.clear_attempt(attempt_id);
                 Ok(reply)
             }
             Err(source) => {
-                self.admissions.remove(&substitute.attempt_id);
-                self.restore_epoch(&admission.purpose, displaced);
+                self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
                 Err(ModelError::Provider(source))
             }
         }
@@ -1032,13 +1024,11 @@ impl Broker {
                             return Ok(reply);
                         }
                         Err(send_error) => {
-                            // The minted manifest never leaves this
-                            // scope, so its unspent admission is dead
-                            // weight — prune it, and roll the
-                            // provisional epoch mint back to the entry
-                            // the failed send displaced.
-                            self.admissions.remove(&fallback_manifest.attempt_id);
-                            self.restore_epoch(&admission.purpose, displaced);
+                            self.abandon_substitute(
+                                &fallback_manifest.attempt_id,
+                                &admission.purpose,
+                                displaced,
+                            );
                             rejected.push(CandidateRejection {
                                 connection: entry.connection.clone(),
                                 cause: RejectionCause::SendFailed(send_error),
@@ -1120,6 +1110,32 @@ impl Broker {
                 self.epochs.remove(purpose);
             }
         }
+    }
+
+    /// The attempt is spent and its admission is dead weight: prune it
+    /// — a later replay still answers through the accounting map.
+    fn clear_attempt(&mut self, attempt_id: &str) {
+        self.admissions.remove(attempt_id);
+        self.pending.remove(attempt_id);
+        self.paused.remove(attempt_id);
+    }
+
+    /// A failed substitute send abandons the minted attempt: the
+    /// minted manifest never leaves the dispatch scope, so its unspent
+    /// admission is dead weight — prune it — and the provisional epoch
+    /// mint rolls back to the entry the failed send displaced, so no
+    /// phantom epoch outlives a request that went nowhere. A substitute
+    /// id provably carries no `pending`/`paused` pins —
+    /// [`Broker::mint_substitute`] writes only `admissions` — so
+    /// pruning the admission alone is complete.
+    fn abandon_substitute(
+        &mut self,
+        attempt_id: &str,
+        purpose: &str,
+        displaced: Option<EpochState>,
+    ) {
+        self.admissions.remove(attempt_id);
+        self.restore_epoch(purpose, displaced);
     }
 
     /// The dispatch-time candidate check (AC-045b): the same gates the

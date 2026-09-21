@@ -430,9 +430,7 @@ impl Runtime {
                 // The send landed: any attempt this task was paused on
                 // is superseded — tombstone it so a late retry of its
                 // frozen manifest is refused, not resurrected.
-                if let Some(previous) = self.paused_attempts.remove(&task_id.0) {
-                    self.broker.cancel_attempt(&previous.manifest.attempt_id);
-                }
+                self.tombstone_paused(task_id);
                 self.read_target_from_reply(task_id, reply, Some(manifest.attempt_id))
             }
             Err(ModelError::ManualFallbackPending { .. }) => {

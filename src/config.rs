@@ -762,44 +762,7 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             "profiles" => {
                 let table = table_like(key, item)?;
                 for (name, entry) in table.iter() {
-                    let profile_table = table_like(name, entry)?;
-                    let profile_key = format!("profiles.{name}");
-                    let mut credential_ref = None;
-                    for (field, value) in profile_table.iter() {
-                        match field {
-                            "credential_ref" => {
-                                let raw = value.as_str().ok_or_else(|| {
-                                    ConfigError::schema(
-                                        format!("{profile_key}.credential_ref"),
-                                        ConfigIssue::ExpectedString {
-                                            field: "credential_ref".to_string(),
-                                        },
-                                    )
-                                })?;
-                                if !scoped_secret_ref(raw) {
-                                    // Never echo the value: diagnostics
-                                    // stay secret-free.
-                                    return Err(ConfigError::schema(
-                                        format!("{profile_key}.credential_ref"),
-                                        ConfigIssue::SecretRefExpected {
-                                            key: format!("{profile_key}.credential_ref"),
-                                        },
-                                    ));
-                                }
-                                credential_ref = Some(raw.to_string());
-                            }
-                            other => {
-                                return Err(ConfigError::schema(
-                                    format!("{profile_key}.{other}"),
-                                    ConfigIssue::UnknownKey {
-                                        key: other.to_string(),
-                                        known: PROFILE_KEYS,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    profiles.insert(name.to_string(), Profile { credential_ref });
+                    profiles.insert(name.to_string(), profile(name, entry)?);
                 }
             }
             "models" => {
@@ -1877,6 +1840,46 @@ fn connection(name: &str, item: &Item) -> Result<Connection, ConfigError> {
         region,
         profile,
     })
+}
+
+fn profile(name: &str, item: &Item) -> Result<Profile, ConfigError> {
+    let profile_table = table_like(name, item)?;
+    let profile_key = format!("profiles.{name}");
+    let mut credential_ref = None;
+    for (field, value) in profile_table.iter() {
+        match field {
+            "credential_ref" => {
+                let raw = value.as_str().ok_or_else(|| {
+                    ConfigError::schema(
+                        format!("{profile_key}.credential_ref"),
+                        ConfigIssue::ExpectedString {
+                            field: "credential_ref".to_string(),
+                        },
+                    )
+                })?;
+                if !scoped_secret_ref(raw) {
+                    // Never echo the value: diagnostics stay secret-free.
+                    return Err(ConfigError::schema(
+                        format!("{profile_key}.credential_ref"),
+                        ConfigIssue::SecretRefExpected {
+                            key: format!("{profile_key}.credential_ref"),
+                        },
+                    ));
+                }
+                credential_ref = Some(raw.to_string());
+            }
+            other => {
+                return Err(ConfigError::schema(
+                    format!("{profile_key}.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: PROFILE_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(Profile { credential_ref })
 }
 
 fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {

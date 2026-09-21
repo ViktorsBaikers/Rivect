@@ -29,7 +29,7 @@ use rivect::config::{Config, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::{CatalogModel, ChatCompletionsProvider, ModelPrice};
 use rivect::providers::openai::OpenAiProvider;
-use rivect::providers::{CredentialStore, Provider, ProviderError, SecretRef, StoreKind};
+use rivect::providers::{Provider, ProviderError, StoreKind};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -39,6 +39,11 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+use support::{
+    SlowStore, drop_blocking, mount_responses, prepared_with, responses_completed_stream,
+    send_on_thread, sse_block,
+};
 
 /// The literal connection id this dialect serves.
 const CONNECTION: &str = "custom-chat-completions";
@@ -179,17 +184,6 @@ fn received_auth(request: &Request) -> String {
         .to_string()
 }
 
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path, not a constructed manifest.
-fn prepared(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
-    let (provider, _store) = local_provider(config);
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the custom-chat-completions pin passes DEC-011 eligibility");
-    (broker, manifest)
-}
-
 /// One frozen manifest through the real admission path.
 fn prepared_manifest(config: &Config) -> RequestManifest {
     let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
@@ -215,31 +209,6 @@ fn dispatch(
     .expect("the dispatch thread joins")
 }
 
-/// reqwest's blocking client owns an internal runtime that must never
-/// be dropped inside any tokio context — even the blocking pool — so
-/// every broker/provider drop goes to a plain OS thread.
-fn drop_blocking<T: Send + 'static>(value: T) {
-    std::thread::spawn(move || drop(value))
-        .join()
-        .expect("the drop thread joins");
-}
-
-/// A bare `provider.send` must not run inside any tokio context for
-/// the same reason — sends go to a plain OS thread and the provider
-/// comes back. Generic over the dialect adapter: the send seam is
-/// the `Provider` trait's, not one implementation's.
-fn send_on_thread<P: Provider + 'static>(
-    mut provider: P,
-    manifest: RequestManifest,
-) -> (P, Result<rivect::providers::ProviderReply, ProviderError>) {
-    std::thread::spawn(move || {
-        let outcome = provider.send(&manifest);
-        (provider, outcome)
-    })
-    .join()
-    .expect("the send thread joins")
-}
-
 /// A bare `provider.catalog` must not run inside any tokio context for
 /// the same reason — lookups go to a plain OS thread and the provider
 /// comes back.
@@ -261,49 +230,6 @@ fn catalog_on_thread(
 /// the wire name the dispatch surface compares.
 fn model_ids(models: &[CatalogModel]) -> Vec<&str> {
     models.iter().map(|model| model.id.as_str()).collect()
-}
-
-/// A store double whose `resolve` parks for a fixed delay before
-/// delegating — the seam a credential leg that consumes the send's
-/// whole budget is proved through (DEC-014).
-struct SlowStore {
-    inner: support::MapStore,
-    delay: Duration,
-}
-
-impl CredentialStore for SlowStore {
-    fn kind(&self) -> StoreKind {
-        self.inner.kind()
-    }
-
-    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
-        self.inner.occupied(credential)
-    }
-
-    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
-        self.inner.entry_accounts(service)
-    }
-
-    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.login(credential, secret)
-    }
-
-    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
-        std::thread::sleep(self.delay);
-        self.inner.resolve(credential)
-    }
-
-    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.refresh(credential, secret)
-    }
-
-    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.revoke(credential)
-    }
-
-    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.logout(credential)
-    }
 }
 
 // ----- TP-PROVIDER-WIRE::custom-chat-completions ---------------------
@@ -329,7 +255,12 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: prove the wire");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: prove the wire",
+    );
 
     let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
     let reply = outcome.expect("the verified outcome dispatches");
@@ -884,7 +815,12 @@ async fn auto_ranked_primary_send_resolves_via_catalog() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: auto route");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: auto route",
+    );
     assert!(
         matches!(
             manifest.model,
@@ -1326,7 +1262,12 @@ async fn wrong_credential_profile_or_region_denies_with_typed_context_without_se
         ),
     )
     .await;
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: debug surfaces");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: debug surfaces",
+    );
     assert!(
         !format!("{manifest:?}").contains(SECRET),
         "manifest Debug never carries credential material"
@@ -1436,7 +1377,12 @@ async fn partial_tool_block_never_executes() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: partial tool");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: partial tool",
+    );
 
     let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
     let error = outcome.expect_err("a truncated stream is never success");
@@ -1467,7 +1413,12 @@ async fn unknown_mandatory_terminal_is_not_success() {
     // no [DONE] ever arrive
     mount_chat(&server, data_block(&delta_chunk(json!({"content": "hi"})))).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: no terminal");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: no terminal",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1491,7 +1442,12 @@ async fn unknown_mandatory_terminal_is_not_success() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: strange terminal");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: strange terminal",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1552,7 +1508,12 @@ async fn streamed_tool_calls_accumulate_across_chunks() {
     );
     mount_chat(&server, stream).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: accumulate calls");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: accumulate calls",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let reply = outcome.expect("the accumulated calls dispatch");
     assert_eq!(reply.tool_calls.len(), 2);
@@ -1587,7 +1548,12 @@ async fn streamed_tool_call_bounds_are_typed_violations() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: call bound");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: call bound",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1620,7 +1586,12 @@ async fn streamed_tool_call_bounds_are_typed_violations() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: args bound");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: args bound",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1660,7 +1631,12 @@ async fn incompatible_tool_surface_is_a_typed_rejection() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: undeclared call");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: undeclared call",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1697,7 +1673,12 @@ async fn incompatible_tool_surface_is_a_typed_rejection() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: foreign tool kind");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: foreign tool kind",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1739,7 +1720,12 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: filtered verdict");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: filtered verdict",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1758,7 +1744,12 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: in-band error");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: in-band error",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1783,7 +1774,12 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: duplicate terminal");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: duplicate terminal",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1798,7 +1794,12 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     let server = MockServer::start().await;
     mount_chat(&server, "data: {broken\n\n".to_string()).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: malformed chunk");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: malformed chunk",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -1821,7 +1822,12 @@ async fn remaining_terminals_and_malformed_wire_shapes_are_typed() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: unreadable usage");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: unreadable usage",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -2097,7 +2103,12 @@ async fn malformed_wire_shapes_are_typed_violations() {
         mount_chat(&server, body).await;
         let config =
             Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-        let (broker, manifest) = prepared(&config, "/world/local", "goal: malformed");
+        let (broker, manifest) = prepared_with(
+            local_provider(&config),
+            &config,
+            "/world/local",
+            "goal: malformed",
+        );
         let (broker, outcome) = dispatch(broker, "/world/local", manifest);
         assert!(
             matches!(
@@ -2135,7 +2146,12 @@ async fn post_terminal_content_is_refused_and_a_usage_tail_still_lands() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: late content");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: late content",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -2163,7 +2179,12 @@ async fn post_terminal_content_is_refused_and_a_usage_tail_still_lands() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: usage tail");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: usage tail",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
     outcome.expect("a usage-only tail after the terminal is the recorded shape");
     let record = broker
@@ -2221,7 +2242,12 @@ async fn every_recorded_finish_reason_maps_to_its_terminal_class() {
         .await;
         let config =
             Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-        let (broker, manifest) = prepared(&config, "/world/local", "goal: finish table");
+        let (broker, manifest) = prepared_with(
+            local_provider(&config),
+            &config,
+            "/world/local",
+            "goal: finish table",
+        );
         let (broker, outcome) = dispatch(broker, "/world/local", manifest);
         match verdict {
             Verdict::Completed => {
@@ -2267,7 +2293,12 @@ async fn reported_usage_is_charged_verbatim_and_a_missing_counter_is_a_violation
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: verbatim total");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: verbatim total",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
     outcome.expect("the reported total charges");
     let record = broker
@@ -2294,7 +2325,12 @@ async fn reported_usage_is_charged_verbatim_and_a_missing_counter_is_a_violation
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: missing total");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: missing total",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -2314,7 +2350,12 @@ async fn unknown_usage_never_releases_the_admission_bound() {
     let server = MockServer::start().await;
     mount_chat(&server, completed_stream("unmetered", None)).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: unknown usage");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: unknown usage",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
     outcome.expect("the unmetered send completes");
     let record = broker
@@ -2347,7 +2388,12 @@ async fn declared_terminal_or_done_sentinel_closes_the_stream() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: done only");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: done only",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let reply = outcome.expect("[DONE] alone is the server-agreed completion");
     assert_eq!(reply.text, "server closed");
@@ -2367,7 +2413,12 @@ async fn declared_terminal_or_done_sentinel_closes_the_stream() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: finish only");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: finish only",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let reply = outcome.expect("a declared terminal completes without the sentinel");
     assert_eq!(reply.text, "declared close");
@@ -2389,7 +2440,12 @@ async fn provider_reported_failure_is_a_typed_denial() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: failure");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: failure",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     assert!(
         matches!(
@@ -2410,7 +2466,12 @@ async fn provider_reported_failure_is_a_typed_denial() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: structured reason");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: structured reason",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
         panic!("the structured error payload is a peer failure: {outcome:?}")
@@ -2422,7 +2483,12 @@ async fn provider_reported_failure_is_a_typed_denial() {
     let server = MockServer::start().await;
     mount_chat(&server, data_block(&json!({"error": {"code": 503}}))).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: scalar reason");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: scalar reason",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
         panic!("the coded error payload is a peer failure: {outcome:?}")
@@ -2434,7 +2500,12 @@ async fn provider_reported_failure_is_a_typed_denial() {
     let server = MockServer::start().await;
     mount_chat(&server, data_block(&json!({"message": "model not loaded"}))).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: flat error");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: flat error",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
         panic!("the flat error payload is a peer failure: {outcome:?}")
@@ -2447,7 +2518,12 @@ async fn provider_reported_failure_is_a_typed_denial() {
     let server = MockServer::start().await;
     mount_chat(&server, data_block(&json!({"error": "boom"}))).await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: string error");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: string error",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let Err(ModelError::Provider(ProviderError::ProviderFailed { reason, .. })) = outcome else {
         panic!("the string error payload is a peer failure: {outcome:?}")
@@ -2478,7 +2554,12 @@ async fn falsy_error_and_message_members_carry_no_verdict() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: falsy members");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: falsy members",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let reply = outcome.expect("falsy verdict members are ignored");
     assert_eq!(reply.text, "carried");
@@ -2512,7 +2593,12 @@ async fn reasoning_and_refusal_deltas_never_join_the_answer() {
     )
     .await;
     let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: thinking surface");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: thinking surface",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     let reply = outcome.expect("the thinking-and-answer reply dispatches");
     assert_eq!(
@@ -2575,7 +2661,12 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) = prepared(&config, "/world/local", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/local", manifest);
     reported.insert(
         "WIRE",
@@ -2698,75 +2789,6 @@ fn abliteration_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapSt
     (provider, store)
 }
 
-/// One named SSE block on the Responses wire — the event-tagged
-/// framing provider_openai.rs pins.
-fn sse_block(event: &str, data: &Value) -> String {
-    format!("event: {event}\ndata: {data}\n\n")
-}
-
-/// A completed Responses stream: an in-progress message item, a text
-/// delta, the done item, any extra output items, then the mandatory
-/// `response.completed` terminal carrying the full output set and
-/// usage.
-fn responses_completed_stream(text: &str, extra_items: Vec<Value>, usage: Option<Value>) -> String {
-    let message = json!({
-        "id": "msg_1",
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{ "type": "output_text", "text": text }],
-    });
-    let mut output = extra_items;
-    output.push(message.clone());
-    let mut response = json!({
-        "id": "resp_1",
-        "status": "completed",
-        "output": output,
-    });
-    if let Some(usage) = usage {
-        response["usage"] = usage;
-    }
-    format!(
-        "{}{}{}{}",
-        sse_block(
-            "response.output_item.added",
-            &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
-        ),
-        sse_block(
-            "response.output_text.delta",
-            &json!({"delta": text, "item_id": "msg_1", "output_index": 0, "content_index": 0}),
-        ),
-        sse_block(
-            "response.output_item.done",
-            &json!({"item": message, "output_index": 0}),
-        ),
-        sse_block("response.completed", &json!({"response": response})),
-    )
-}
-
-async fn mount_responses(server: &MockServer, body: String) {
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(body),
-        )
-        .mount(server)
-        .await;
-}
-
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path for the `abliteration` pin.
-fn prepared_abliteration(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
-    let (provider, _store) = abliteration_provider(config);
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the abliteration pin passes DEC-011 eligibility");
-    (broker, manifest)
-}
-
 // ----- TP-PROVIDER-WIRE::abliteration ----------------------------------
 
 /// A configured `abliteration` connection returns a verified model
@@ -2792,8 +2814,12 @@ async fn abliteration_valid_control_yields_one_outcome_and_one_physical_usage() 
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: prove the wire");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: prove the wire",
+    );
 
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest.clone());
     let reply = outcome.expect("the verified outcome dispatches");
@@ -3012,8 +3038,12 @@ async fn abliteration_forced_reasoning_models_are_bound_to_their_source_predicat
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&auto, "/world/abliteration", "goal: forced reasoning");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&auto),
+        &auto,
+        "/world/abliteration",
+        "goal: forced reasoning",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     outcome.expect("the auto send resolves through the catalogue");
     drop_blocking(broker);
@@ -3398,8 +3428,12 @@ async fn abliteration_wrong_credential_profile_or_region_denies_with_typed_conte
         ),
     )
     .await;
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: debug surfaces");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: debug surfaces",
+    );
     assert!(
         !format!("{manifest:?}").contains(SECRET),
         "manifest Debug never carries credential material"
@@ -3495,8 +3529,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: partial item");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: partial item",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     assert!(
         matches!(
@@ -3532,8 +3570,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: no terminal");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: no terminal",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     assert!(
         matches!(
@@ -3562,8 +3604,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: undeclared call");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: undeclared call",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     assert!(
         matches!(
@@ -3593,8 +3639,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: blobless reasoning");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: blobless reasoning",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     let reply = outcome.expect("a blobless reasoning item is the peer's normal shape");
     assert_eq!(reply.text, "answered");
@@ -3621,8 +3671,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: foreign artifact");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: foreign artifact",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     assert!(
         matches!(
@@ -3652,8 +3706,12 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: null artifact member");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: null artifact member",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     assert!(
         matches!(
@@ -3684,7 +3742,8 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
     .await;
     let config =
         Config::parse_validated(&abliteration_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared_abliteration(
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
         &config,
         "/world/abliteration",
         "goal: non-string artifact member",
@@ -3761,8 +3820,12 @@ async fn abliteration_provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) =
-        prepared_abliteration(&config, "/world/abliteration", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        abliteration_provider(&config),
+        &config,
+        "/world/abliteration",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/abliteration", manifest);
     reported.insert(
         "WIRE",
@@ -3901,17 +3964,6 @@ fn aiand_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::Map
     (provider, store)
 }
 
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path for the `aiand` pin.
-fn prepared_aiand(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
-    let (provider, _store) = aiand_provider(config);
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the aiand pin passes DEC-011 eligibility");
-    (broker, manifest)
-}
-
 // ----- TP-PROVIDER-WIRE::aiand ---------------------------------------------
 
 /// A configured `aiand` connection returns a verified model outcome
@@ -3935,7 +3987,12 @@ async fn aiand_valid_control_yields_one_outcome_and_one_physical_usage() {
     )
     .await;
     let config = Config::parse_validated(&aiand_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: prove the wire");
+    let (broker, manifest) = prepared_with(
+        aiand_provider(&config),
+        &config,
+        "/world/aiand",
+        "goal: prove the wire",
+    );
 
     let (broker, outcome) = dispatch(broker, "/world/aiand", manifest.clone());
     let reply = outcome.expect("the verified outcome dispatches");
@@ -4503,7 +4560,12 @@ async fn aiand_wrong_credential_profile_or_region_denies_with_typed_context_with
         ),
     )
     .await;
-    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: debug surfaces");
+    let (broker, manifest) = prepared_with(
+        aiand_provider(&config),
+        &config,
+        "/world/aiand",
+        "goal: debug surfaces",
+    );
     assert!(
         !format!("{manifest:?}").contains(SECRET),
         "manifest Debug never carries credential material"
@@ -4590,7 +4652,12 @@ async fn aiand_auto_pick_resolves_through_the_merged_catalog() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_aiand(&auto, "/world/aiand", "goal: auto pick");
+    let (broker, manifest) = prepared_with(
+        aiand_provider(&auto),
+        &auto,
+        "/world/aiand",
+        "goal: auto pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
     outcome.expect("the auto send resolves through the catalogue");
     drop_blocking(broker);
@@ -4620,7 +4687,12 @@ async fn aiand_auto_pick_resolves_through_the_merged_catalog() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_aiand(&auto, "/world/aiand", "goal: seed pick");
+    let (broker, manifest) = prepared_with(
+        aiand_provider(&auto),
+        &auto,
+        "/world/aiand",
+        "goal: seed pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
     outcome.expect("the seed floor still offers a model");
     drop_blocking(broker);
@@ -4688,7 +4760,12 @@ async fn aiand_provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) = prepared_aiand(&config, "/world/aiand", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        aiand_provider(&config),
+        &config,
+        "/world/aiand",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aiand", manifest);
     reported.insert(
         "WIRE",
@@ -4803,17 +4880,6 @@ fn aimlapi_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::M
     (provider, store)
 }
 
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path for the `aimlapi` pin.
-fn prepared_aimlapi(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
-    let (provider, _store) = aimlapi_provider(config);
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the aimlapi pin passes DEC-011 eligibility");
-    (broker, manifest)
-}
-
 // ----- TP-PROVIDER-WIRE::aimlapi --------------------------------------------
 
 /// A configured `aimlapi` connection returns a verified model outcome
@@ -4837,7 +4903,12 @@ async fn aimlapi_valid_control_yields_one_outcome_and_one_physical_usage() {
     )
     .await;
     let config = Config::parse_validated(&aimlapi_config(&server_uri_v1(&server))).expect("valid");
-    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: prove the wire");
+    let (broker, manifest) = prepared_with(
+        aimlapi_provider(&config),
+        &config,
+        "/world/aimlapi",
+        "goal: prove the wire",
+    );
 
     let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest.clone());
     let reply = outcome.expect("the verified outcome dispatches");
@@ -5298,7 +5369,12 @@ async fn aimlapi_wrong_credential_profile_or_region_denies_with_typed_context_wi
         ),
     )
     .await;
-    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: debug surfaces");
+    let (broker, manifest) = prepared_with(
+        aimlapi_provider(&config),
+        &config,
+        "/world/aimlapi",
+        "goal: debug surfaces",
+    );
     assert!(
         !format!("{manifest:?}").contains(SECRET),
         "manifest Debug never carries credential material"
@@ -5395,7 +5471,12 @@ async fn aimlapi_auto_pick_resolves_through_the_filtered_catalog() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_aimlapi(&auto, "/world/aimlapi", "goal: auto pick");
+    let (broker, manifest) = prepared_with(
+        aimlapi_provider(&auto),
+        &auto,
+        "/world/aimlapi",
+        "goal: auto pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
     outcome.expect("the auto send resolves through the catalogue");
     drop_blocking(broker);
@@ -5425,7 +5506,12 @@ async fn aimlapi_auto_pick_resolves_through_the_filtered_catalog() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_aimlapi(&auto, "/world/aimlapi", "goal: empty pick");
+    let (broker, manifest) = prepared_with(
+        aimlapi_provider(&auto),
+        &auto,
+        "/world/aimlapi",
+        "goal: empty pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
     assert!(
         matches!(
@@ -5495,7 +5581,12 @@ async fn aimlapi_provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) = prepared_aimlapi(&config, "/world/aimlapi", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        aimlapi_provider(&config),
+        &config,
+        "/world/aimlapi",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/aimlapi", manifest);
     reported.insert(
         "WIRE",
@@ -5663,22 +5754,18 @@ fn alibaba_cp_provider(
     (provider, store)
 }
 
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path for the `alibaba-coding-plan` pin. The store holds
-/// the structured credential enrolled for this connection's own
-/// configured base — the only shape the recorded login writes.
-fn prepared_alibaba_cp(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+/// The `alibaba-coding-plan` provider over the structured credential
+/// enrolled for this connection's own configured base — the only
+/// shape the recorded login writes.
+fn enrolled_alibaba_cp_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
     let enrolled = &config
         .connections
         .get("alibaba-coding-plan")
         .expect("the alibaba-coding-plan connection is declared")
         .endpoint;
-    let (provider, _store) = alibaba_cp_provider(config, &plan_credential(PLAN_KEY, enrolled));
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the alibaba-coding-plan pin passes DEC-011 eligibility");
-    (broker, manifest)
+    alibaba_cp_provider(config, &plan_credential(PLAN_KEY, enrolled))
 }
 
 // ----- TP-PROVIDER-WIRE::alibaba-coding-plan ----------------------------------
@@ -5960,7 +6047,12 @@ async fn alibaba_coding_plan_auto_pick_resolves_through_the_static_allowlist() {
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_alibaba_cp(&auto, "/world/alibaba-cp", "goal: auto pick");
+    let (broker, manifest) = prepared_with(
+        enrolled_alibaba_cp_provider(&auto),
+        &auto,
+        "/world/alibaba-cp",
+        "goal: auto pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest);
     outcome.expect("the auto send resolves through the allowlist");
     drop_blocking(broker);
@@ -6627,7 +6719,12 @@ async fn alibaba_coding_plan_provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) = prepared_alibaba_cp(&config, "/world/alibaba-cp", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        enrolled_alibaba_cp_provider(&config),
+        &config,
+        "/world/alibaba-cp",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/alibaba-cp", manifest);
     reported.insert(
         "WIRE",
@@ -6801,24 +6898,18 @@ fn alibaba_tp_provider(
     (provider, store)
 }
 
-/// A prepared manifest plus the broker that admitted it — the real
-/// admission path for the `alibaba-token-plan` pin. The store holds
-/// the structured credential enrolled for this connection's own
-/// configured base — the shape the recorded login writes for a
-/// region diverging from the default.
-fn prepared_alibaba_tp(config: &Config, world: &str, inputs: &str) -> (Broker, RequestManifest) {
+/// The `alibaba-token-plan` provider over the structured credential
+/// enrolled for this connection's own configured base — the shape the
+/// recorded login writes for a region diverging from the default.
+fn enrolled_alibaba_tp_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
     let enrolled = &config
         .connections
         .get("alibaba-token-plan")
         .expect("the alibaba-token-plan connection is declared")
         .endpoint;
-    let (provider, _store) =
-        alibaba_tp_provider(config, &token_plan_credential(TOKEN_PLAN_KEY, enrolled));
-    let mut broker = Broker::new(Box::new(provider));
-    let manifest = broker
-        .prepare("main", config, world, inputs)
-        .expect("the alibaba-token-plan pin passes DEC-011 eligibility");
-    (broker, manifest)
+    alibaba_tp_provider(config, &token_plan_credential(TOKEN_PLAN_KEY, enrolled))
 }
 
 // ----- TP-PROVIDER-WIRE::alibaba-token-plan -----------------------------------
@@ -7157,7 +7248,12 @@ async fn alibaba_token_plan_auto_pick_resolves_through_the_authoritative_catalog
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_alibaba_tp(&auto, "/world/alibaba-tp", "goal: auto pick");
+    let (broker, manifest) = prepared_with(
+        enrolled_alibaba_tp_provider(&auto),
+        &auto,
+        "/world/alibaba-tp",
+        "goal: auto pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
     outcome.expect("the auto send resolves through the catalogue");
     drop_blocking(broker);
@@ -7198,7 +7294,12 @@ async fn alibaba_token_plan_auto_pick_resolves_through_the_authoritative_catalog
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let (broker, manifest) = prepared_alibaba_tp(&auto, "/world/alibaba-tp", "goal: empty pick");
+    let (broker, manifest) = prepared_with(
+        enrolled_alibaba_tp_provider(&auto),
+        &auto,
+        "/world/alibaba-tp",
+        "goal: empty pick",
+    );
     let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
     assert!(
         matches!(
@@ -7978,7 +8079,12 @@ async fn alibaba_token_plan_provider_legs_matrix_executes_all_expected_legs() {
     drop_blocking(provider);
 
     // WIRE: the full broker dispatch returns the verified outcome.
-    let (broker, manifest) = prepared_alibaba_tp(&config, "/world/alibaba-tp", "goal: matrix wire");
+    let (broker, manifest) = prepared_with(
+        enrolled_alibaba_tp_provider(&config),
+        &config,
+        "/world/alibaba-tp",
+        "goal: matrix wire",
+    );
     let (broker, outcome) = dispatch(broker, "/world/alibaba-tp", manifest);
     reported.insert(
         "WIRE",

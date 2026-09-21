@@ -214,6 +214,16 @@ impl Runtime {
     pub fn goal_bytes(&self, task_id: &TaskId) -> Vec<u8> {
         self.owner.store.goal_bytes(task_id).unwrap_or_default()
     }
+
+    /// Tombstones the paused attempt a task still holds (EDGE-004):
+    /// the broker admission is cancelled so a late retry or provider
+    /// callback never resurrects it. No entry means no outstanding
+    /// attempt — nothing to tombstone.
+    pub(crate) fn tombstone_paused(&mut self, task: &TaskId) {
+        if let Some(paused) = self.paused_attempts.remove(&task.0) {
+            self.broker.cancel_attempt(&paused.manifest.attempt_id);
+        }
+    }
 }
 
 /// A failed [`Runtime::open`] still owes the operator the boot verdicts
@@ -1390,9 +1400,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                             // its paused attempt can never dispatch —
                             // tombstone the still-live admission here,
                             // the last point an answer can reach it.
-                            if let Some(paused) = rt.paused_attempts.remove(&task.0) {
-                                rt.broker.cancel_attempt(&paused.manifest.attempt_id);
-                            }
+                            rt.tombstone_paused(&task);
                             serialize_answer(id)
                         }
                         Err(err) => {
@@ -1469,15 +1477,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     // or dispatch (AC-012).
                     match rt.scheduler.cancel_task_tree(&task) {
                         Ok(_) => {
-                            // A task paused on a manual-fallback choice
-                            // still holds a live broker admission:
-                            // tombstone it so a late retry or provider
-                            // callback never resurrects the cancelled
-                            // attempt (EDGE-004). No entry means no
-                            // outstanding attempt — nothing to tombstone.
-                            if let Some(paused) = rt.paused_attempts.remove(&task.0) {
-                                rt.broker.cancel_attempt(&paused.manifest.attempt_id);
-                            }
+                            rt.tombstone_paused(&task);
                             RpcResponse::ok(
                                 id,
                                 serde_json::to_value(&result).unwrap_or(Value::Null),

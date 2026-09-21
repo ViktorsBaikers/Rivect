@@ -30,15 +30,15 @@
 
 use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
-use crate::providers::sse::{SseError, SseEvent, SseParser};
+use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, ToolCall,
-    dialect_for, resolve_credential,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
+    SecretRef, ToolCall, check_deadline, dialect_for, payload_reason, read_catalog_body,
+    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,15 +51,6 @@ use std::time::{Duration, Instant};
 /// in flight answers to the client's per-call backstop instead, so
 /// the worst case is the deadline plus one backstop-bounded call.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
-
-/// Bytes read from the response stream per pass — the chunking is an
-/// implementation detail the SSE parser is indifferent to.
-const STREAM_CHUNK_BYTES: usize = 8 * 1024;
-
-/// The bound on one `models.list` catalogue payload — a listing never
-/// needs more, and an unbounded or dribbling body is denied under
-/// the same budget as a streamed response.
-const CATALOG_MAX_BYTES: usize = 1024 * 1024;
 
 /// The recorded static catalogue the `models.list` answer merges with
 /// (HZN-008): the bundled sample the source ships — `gemini-3.1-pro-preview`
@@ -225,10 +216,7 @@ impl GeminiProvider {
             .timeout(deadline.saturating_mul(2))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| ProviderError::Transport {
-                connection: connection.to_string(),
-                reason: err.without_url().to_string(),
-            })?;
+            .map_err(|err| transport(connection, err))?;
         Ok(Self {
             connection: connection.to_string(),
             endpoint: conn.endpoint.trim_end_matches('/').to_string(),
@@ -267,38 +255,27 @@ impl GeminiProvider {
     /// whole-request budget instead of opening a second, unaccounted
     /// one.
     fn catalog_within(&self, token: &str, started: Instant) -> Result<Vec<String>, ProviderError> {
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         let mut response = self
             .client
             .get(format!("{}/models", self.endpoint))
             .header("x-goog-api-key", token)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
-        // The listing reads under the same whole-request budget and a
-        // byte bound — a dribbling or oversized payload is denied,
-        // never parked or buffered unbounded. A `nextPageToken` tail
-        // is not chased: the static catalogue still applies, so a
-        // long listing only narrows the dynamic share, never invents
-        // an id.
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
-        loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
-            if read == 0 {
-                break;
-            }
-            if body.len() + read > CATALOG_MAX_BYTES {
-                return Err(self.violation("models payload exceeds the byte bound"));
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
+        // A `nextPageToken` tail is not chased: the static catalogue
+        // still applies, so a long listing only narrows the dynamic
+        // share, never invents an id.
+        let body = read_catalog_body(&self.connection, self.deadline, &mut response, started)?;
         let body: Value = serde_json::from_slice(&body)
-            .map_err(|_parse| self.violation("models payload is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "models payload is not json"))?;
         let Some(models) = body.get("models").and_then(Value::as_array) else {
-            return Err(self.violation("models payload carries no models array"));
+            return Err(violation(
+                &self.connection,
+                "models payload carries no models array",
+            ));
         };
         let mut ids: Vec<String> = models
             .iter()
@@ -414,41 +391,6 @@ impl GeminiProvider {
         Ok(body)
     }
 
-    /// The whole-request budget check (DEC-014): evaluated before
-    /// the post, before every stream read and before the final pass,
-    /// so connect, request send, reads and finalization share one
-    /// deadline — a peer dribbling a byte inside each per-read window
-    /// parks the stream only until the total budget is spent.
-    fn check_deadline(&self, started: Instant) -> Result<(), ProviderError> {
-        if started.elapsed() >= self.deadline {
-            return Err(ProviderError::Transport {
-                connection: self.connection.clone(),
-                reason: format!("request exceeded the {:?} send deadline", self.deadline),
-            });
-        }
-        Ok(())
-    }
-
-    /// One bounded read under the shared deadline: the check runs
-    /// before the call, `Interrupted` retries in place, and any other
-    /// read failure is the typed transport error. Returns the bytes
-    /// read — `0` is the stream's end.
-    fn read_chunk(
-        &self,
-        response: &mut reqwest::blocking::Response,
-        chunk: &mut [u8],
-        started: Instant,
-    ) -> Result<usize, ProviderError> {
-        loop {
-            self.check_deadline(started)?;
-            match response.read(chunk) {
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(self.transport_io(err)),
-                Ok(read) => return Ok(read),
-            }
-        }
-    }
-
     /// Reads the SSE body through the shared bounded parser and
     /// reduces it to the one terminal the dialect can classify. A
     /// stream that ends without a `finishReason`, or with one the
@@ -464,18 +406,27 @@ impl GeminiProvider {
         let mut state = StreamState::default();
         let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
         loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
+            let read = read_chunk(
+                &self.connection,
+                self.deadline,
+                &mut response,
+                &mut chunk,
+                started,
+            )?;
             if read == 0 {
                 break;
             }
-            for event in parser.feed(&chunk[..read]).map_err(|err| self.sse(err))? {
+            for event in parser
+                .feed(&chunk[..read])
+                .map_err(|err| sse(&self.connection, err))?
+            {
                 self.on_chunk(&mut state, manifest, event)?;
             }
         }
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
-        self.check_deadline(started)?;
-        for event in parser.finish().map_err(|err| self.sse(err))? {
+        check_deadline(&self.connection, self.deadline, started)?;
+        for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_chunk(&mut state, manifest, event)?;
         }
         match state.terminal {
@@ -504,9 +455,9 @@ impl GeminiProvider {
         event: SseEvent,
     ) -> Result<(), ProviderError> {
         let chunk: Value = serde_json::from_str(&event.data)
-            .map_err(|_parse| self.violation("stream chunk is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "stream chunk is not json"))?;
         if !chunk.is_object() {
-            return Err(self.violation("stream chunk is not an object"));
+            return Err(violation(&self.connection, "stream chunk is not an object"));
         }
         if let Some(error) = chunk.get("error") {
             return self.set_terminal(
@@ -518,11 +469,17 @@ impl GeminiProvider {
         }
         if let Some(feedback) = chunk.get("promptFeedback") {
             if !feedback.is_object() {
-                return Err(self.violation("promptFeedback is not an object"));
+                return Err(violation(
+                    &self.connection,
+                    "promptFeedback is not an object",
+                ));
             }
             if let Some(reason) = feedback.get("blockReason") {
                 let Some(reason) = reason.as_str() else {
-                    return Err(self.violation("promptFeedback blockReason is not a string"));
+                    return Err(violation(
+                        &self.connection,
+                        "promptFeedback blockReason is not a string",
+                    ));
                 };
                 return self.set_terminal(
                     state,
@@ -534,44 +491,63 @@ impl GeminiProvider {
         }
         if let Some(candidates) = chunk.get("candidates") {
             let Some(list) = candidates.as_array() else {
-                return Err(self.violation("stream chunk candidates is not an array"));
+                return Err(violation(
+                    &self.connection,
+                    "stream chunk candidates is not an array",
+                ));
             };
             // The request never declares `candidateCount`, so a second
             // candidate is off-contract input — never a silent
             // first-pick of divergent content.
             if list.len() > 1 {
-                return Err(self.violation("stream chunk carried more than one candidate"));
+                return Err(violation(
+                    &self.connection,
+                    "stream chunk carried more than one candidate",
+                ));
             }
             if let Some(candidate) = list.first() {
                 if !candidate.is_object() {
-                    return Err(self.violation("stream chunk candidate is not an object"));
+                    return Err(violation(
+                        &self.connection,
+                        "stream chunk candidate is not an object",
+                    ));
                 }
                 // A candidate after the declared terminal adopts
                 // nothing: the verdict closed the turn, and only the
                 // recorded usageMetadata-only tail may follow it.
                 if state.terminal.is_some() {
-                    return Err(self.violation("stream carried a candidate after its terminal"));
+                    return Err(violation(
+                        &self.connection,
+                        "stream carried a candidate after its terminal",
+                    ));
                 }
                 if let Some(index) = candidate.get("index") {
                     // proto3 elides the zero index, so a present index
                     // other than 0 belongs to a candidate slot the
                     // request never asked for.
                     if index.as_u64() != Some(0) {
-                        return Err(
-                            self.violation("stream chunk candidate carries a nonzero index")
-                        );
+                        return Err(violation(
+                            &self.connection,
+                            "stream chunk candidate carries a nonzero index",
+                        ));
                     }
                 }
                 if let Some(content) = candidate.get("content") {
                     if !content.is_object() {
-                        return Err(self.violation("candidate content is not an object"));
+                        return Err(violation(
+                            &self.connection,
+                            "candidate content is not an object",
+                        ));
                     }
                     // proto3 elides an empty `repeated parts`: upstream
                     // reads `candidate?.content?.parts`, so a role-only
                     // content folds zero parts rather than violating.
                     if let Some(parts) = content.get("parts") {
                         let Some(parts) = parts.as_array() else {
-                            return Err(self.violation("candidate content parts is not an array"));
+                            return Err(violation(
+                                &self.connection,
+                                "candidate content parts is not an array",
+                            ));
                         };
                         for part in parts {
                             self.on_part(state, manifest, part)?;
@@ -580,7 +556,10 @@ impl GeminiProvider {
                 }
                 if let Some(reason) = candidate.get("finishReason") {
                     let Some(reason) = reason.as_str() else {
-                        return Err(self.violation("candidate finishReason is not a string"));
+                        return Err(violation(
+                            &self.connection,
+                            "candidate finishReason is not a string",
+                        ));
                     };
                     let terminal = match reason {
                         "STOP" | "MAX_TOKENS" => Terminal::Completed,
@@ -634,7 +613,7 @@ impl GeminiProvider {
         part: &Value,
     ) -> Result<(), ProviderError> {
         let Some(object) = part.as_object() else {
-            return Err(self.violation("stream part is not an object"));
+            return Err(violation(&self.connection, "stream part is not an object"));
         };
         for key in object.keys() {
             if !matches!(
@@ -650,11 +629,17 @@ impl GeminiProvider {
         if let Some(thought) = object.get("thought")
             && !thought.is_boolean()
         {
-            return Err(self.violation("part thought marker is not a boolean"));
+            return Err(violation(
+                &self.connection,
+                "part thought marker is not a boolean",
+            ));
         }
         if let Some(signature) = object.get("thoughtSignature") {
             let Some(signature) = signature.as_str() else {
-                return Err(self.violation("part thoughtSignature is not a string"));
+                return Err(violation(
+                    &self.connection,
+                    "part thoughtSignature is not a string",
+                ));
             };
             if !signature.is_empty() {
                 state.signatures.push(signature.to_string());
@@ -662,7 +647,7 @@ impl GeminiProvider {
         }
         if let Some(text) = object.get("text") {
             let Some(text) = text.as_str() else {
-                return Err(self.violation("part text is not a string"));
+                return Err(violation(&self.connection, "part text is not a string"));
             };
             if object.get("thought").and_then(Value::as_bool) != Some(true) {
                 state.text.push_str(text);
@@ -670,10 +655,16 @@ impl GeminiProvider {
         }
         if let Some(call) = object.get("functionCall") {
             let Some(call) = call.as_object() else {
-                return Err(self.violation("functionCall part is not an object"));
+                return Err(violation(
+                    &self.connection,
+                    "functionCall part is not an object",
+                ));
             };
             let Some(name) = call.get("name").and_then(Value::as_str) else {
-                return Err(self.violation("functionCall part carries no name"));
+                return Err(violation(
+                    &self.connection,
+                    "functionCall part carries no name",
+                ));
             };
             // The call must name a tool the frozen request declared —
             // an undeclared name is output the dialect cannot honour,
@@ -688,7 +679,10 @@ impl GeminiProvider {
                 None => None,
                 Some(args) => {
                     let Some(args) = args.as_object() else {
-                        return Err(self.violation("functionCall args are not an object"));
+                        return Err(violation(
+                            &self.connection,
+                            "functionCall args are not an object",
+                        ));
                     };
                     args.get("path").and_then(Value::as_str).map(str::to_string)
                 }
@@ -710,7 +704,10 @@ impl GeminiProvider {
         terminal: Terminal,
     ) -> Result<(), ProviderError> {
         if state.terminal.is_some() {
-            return Err(self.violation("stream carried a duplicate terminal"));
+            return Err(violation(
+                &self.connection,
+                "stream carried a duplicate terminal",
+            ));
         }
         state.terminal = Some(terminal);
         Ok(())
@@ -803,44 +800,10 @@ impl GeminiProvider {
                     total_tokens,
                 })
             }
-            _ => Err(self.violation("usageMetadata is not a readable token shape")),
-        }
-    }
-
-    fn transport(&self, err: reqwest::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.without_url().to_string(),
-        }
-    }
-
-    fn transport_io(&self, err: std::io::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    /// A non-success status is reported by code alone — the response
-    /// body is uncontrolled peer text and never enters diagnostics.
-    fn transport_status(&self, status: reqwest::StatusCode) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: format!("status {}", status.as_u16()),
-        }
-    }
-
-    fn sse(&self, err: SseError) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    fn violation(&self, reason: impl Into<String>) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: reason.into(),
+            _ => Err(violation(
+                &self.connection,
+                "usageMetadata is not a readable token shape",
+            )),
         }
     }
 }
@@ -854,22 +817,6 @@ fn valid_model_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// The reason a failed verdict carries — the peer's own `message`,
-/// `status` or `code` field, whichever it populated. Strings render
-/// verbatim and scalar numbers/booleans still read; a nested object or
-/// array is structure, not prose, and is never serialized into the
-/// reason.
-fn payload_reason(payload: &Value) -> String {
-    for field in ["message", "status", "code"] {
-        match payload.get(field) {
-            Some(Value::String(text)) => return text.clone(),
-            Some(scalar @ (Value::Number(_) | Value::Bool(_))) => return scalar.to_string(),
-            _ => {}
-        }
-    }
-    "unclassified".to_string()
 }
 
 impl std::fmt::Debug for GeminiProvider {
@@ -974,26 +921,11 @@ impl Provider for GeminiProvider {
             });
         }
         let body = self.request_body(manifest)?;
-        // The serialized body is what crosses the wire: it carries
-        // the replayed lineage set, so the same byte bound the
-        // manifest's accounted size promised is enforced on the
-        // actual bytes — oversized, never truncated (AC-013).
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|_ser| self.violation("request body could not serialize"))?;
-        if body_bytes.len() > crate::contracts::MODEL_WIRE_MAX_BYTES {
-            return Err(ProviderError::StreamViolation {
-                connection: self.connection.clone(),
-                reason: format!(
-                    "request body of {} bytes exceeds the {} byte wire bound",
-                    body_bytes.len(),
-                    crate::contracts::MODEL_WIRE_MAX_BYTES
-                ),
-            });
-        }
+        let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         let response = self
             .client
             .post(format!(
@@ -1005,9 +937,9 @@ impl Provider for GeminiProvider {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(body_bytes)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
         self.read_stream(manifest, response, started)
     }

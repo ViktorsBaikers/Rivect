@@ -44,15 +44,15 @@
 use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
 use crate::policy::canonical_egress_target;
-use crate::providers::sse::{SseError, SseEvent, SseParser};
+use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, ToolCall,
-    dialect_for, resolve_credential,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
+    SecretRef, ToolCall, check_deadline, dialect_for, payload_reason, read_catalog_body,
+    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,15 +65,6 @@ use std::time::{Duration, Instant};
 /// in flight answers to the client's per-call backstop instead, so
 /// the worst case is the deadline plus one backstop-bounded call.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
-
-/// Bytes read from the response stream per pass — the chunking is an
-/// implementation detail the SSE parser is indifferent to.
-const STREAM_CHUNK_BYTES: usize = 8 * 1024;
-
-/// The bound on one `models` catalogue payload — a listing never
-/// needs more, and an unbounded or dribbling body is denied under
-/// the same budget as a streamed response.
-const CATALOG_MAX_BYTES: usize = 1024 * 1024;
 
 /// The bound on distinct tool-call blocks one stream may open — a
 /// streamed response to a request declaring a handful of tools never
@@ -639,10 +630,7 @@ impl ChatCompletionsProvider {
             .timeout(deadline.saturating_mul(2))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| ProviderError::Transport {
-                connection: connection.to_string(),
-                reason: err.without_url().to_string(),
-            })?;
+            .map_err(|err| transport(connection, err))?;
         Ok(Self {
             connection: connection.to_string(),
             endpoint: contract.endpoint(&conn.endpoint),
@@ -695,7 +683,7 @@ impl ChatCompletionsProvider {
         token: &str,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         // The recorded allowlist answers in place — a send's
         // auto-pick never opens a `/models` leg.
         if let CatalogRule::Allowlist(list) = self.contract.catalog {
@@ -706,29 +694,18 @@ impl ChatCompletionsProvider {
             .get(format!("{}/models", self.endpoint))
             .bearer_auth(token)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
-        // The listing reads under the same whole-request budget and a
-        // byte bound — a dribbling or oversized payload is denied,
-        // never parked or buffered unbounded.
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
-        loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
-            if read == 0 {
-                break;
-            }
-            if body.len() + read > CATALOG_MAX_BYTES {
-                return Err(self.violation("models payload exceeds the byte bound"));
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
+        let body = read_catalog_body(&self.connection, self.deadline, &mut response, started)?;
         let body: Value = serde_json::from_slice(&body)
-            .map_err(|_parse| self.violation("models payload is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "models payload is not json"))?;
         let Some(data) = body.get("data").and_then(Value::as_array) else {
-            return Err(self.violation("models payload carries no data array"));
+            return Err(violation(
+                &self.connection,
+                "models payload carries no data array",
+            ));
         };
         // Every listed `id` is an offer under the literal id's
         // recorded per-entry transform — an empty or absent one can
@@ -980,41 +957,6 @@ impl ChatCompletionsProvider {
         body
     }
 
-    /// The whole-request budget check (DEC-014): evaluated before
-    /// the post, before every stream read and before the final pass,
-    /// so connect, request send, reads and finalization share one
-    /// deadline — a peer dribbling a byte inside each per-read window
-    /// parks the stream only until the total budget is spent.
-    fn check_deadline(&self, started: Instant) -> Result<(), ProviderError> {
-        if started.elapsed() >= self.deadline {
-            return Err(ProviderError::Transport {
-                connection: self.connection.clone(),
-                reason: format!("request exceeded the {:?} send deadline", self.deadline),
-            });
-        }
-        Ok(())
-    }
-
-    /// One bounded read under the shared deadline: the check runs
-    /// before the call, `Interrupted` retries in place, and any other
-    /// read failure is the typed transport error. Returns the bytes
-    /// read — `0` is the stream's end.
-    fn read_chunk(
-        &self,
-        response: &mut reqwest::blocking::Response,
-        chunk: &mut [u8],
-        started: Instant,
-    ) -> Result<usize, ProviderError> {
-        loop {
-            self.check_deadline(started)?;
-            match response.read(chunk) {
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(self.transport_io(err)),
-                Ok(read) => return Ok(read),
-            }
-        }
-    }
-
     /// Reads the SSE body through the shared bounded parser and
     /// reduces it to the one terminal the dialect can classify. A
     /// stream that ends on `[DONE]` alone is the recorded
@@ -1031,18 +973,27 @@ impl ChatCompletionsProvider {
         let mut state = StreamState::default();
         let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
         loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
+            let read = read_chunk(
+                &self.connection,
+                self.deadline,
+                &mut response,
+                &mut chunk,
+                started,
+            )?;
             if read == 0 {
                 break;
             }
-            for event in parser.feed(&chunk[..read]).map_err(|err| self.sse(err))? {
+            for event in parser
+                .feed(&chunk[..read])
+                .map_err(|err| sse(&self.connection, err))?
+            {
                 self.on_chunk(&mut state, event)?;
             }
         }
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
-        self.check_deadline(started)?;
-        for event in parser.finish().map_err(|err| self.sse(err))? {
+        check_deadline(&self.connection, self.deadline, started)?;
+        for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_chunk(&mut state, event)?;
         }
         match state.terminal {
@@ -1076,30 +1027,44 @@ impl ChatCompletionsProvider {
     fn on_chunk(&self, state: &mut StreamState, event: SseEvent) -> Result<(), ProviderError> {
         if event.data == "[DONE]" {
             if state.done {
-                return Err(self.violation("stream carried a duplicate [DONE] sentinel"));
+                return Err(violation(
+                    &self.connection,
+                    "stream carried a duplicate [DONE] sentinel",
+                ));
             }
             state.done = true;
             return Ok(());
         }
         if state.done {
-            return Err(self.violation("stream carried content after the [DONE] sentinel"));
+            return Err(violation(
+                &self.connection,
+                "stream carried content after the [DONE] sentinel",
+            ));
         }
         let chunk: Value = serde_json::from_str(&event.data)
-            .map_err(|_parse| self.violation("stream chunk is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "stream chunk is not json"))?;
         if !chunk.is_object() {
-            return Err(self.violation("stream chunk is not an object"));
+            return Err(violation(&self.connection, "stream chunk is not an object"));
         }
         if let Some(error) = chunk.get("error").filter(|error| !is_falsy(error)) {
             let reason = match error {
                 Value::String(reason) => reason.clone(),
                 Value::Object(_) => payload_reason(error),
-                _ => return Err(self.violation("stream chunk error is not an object or string")),
+                _ => {
+                    return Err(violation(
+                        &self.connection,
+                        "stream chunk error is not an object or string",
+                    ));
+                }
             };
             return self.set_terminal(state, Terminal::Failed { reason });
         }
         if let Some(message) = chunk.get("message").filter(|message| !is_falsy(message)) {
             let Some(reason) = message.as_str() else {
-                return Err(self.violation("stream chunk message is not a string"));
+                return Err(violation(
+                    &self.connection,
+                    "stream chunk message is not a string",
+                ));
             };
             return self.set_terminal(
                 state,
@@ -1108,57 +1073,70 @@ impl ChatCompletionsProvider {
                 },
             );
         }
-        let choice =
-            match chunk.get("choices") {
-                None => None,
-                Some(choices) => {
-                    let Some(list) = choices.as_array() else {
-                        return Err(self.violation("stream chunk choices is not an array"));
-                    };
-                    // The request never asks for more than one candidate,
-                    // so a second choice is off-contract input — never a
-                    // silent first-pick of divergent content.
-                    if list.len() > 1 {
-                        return Err(self.violation("stream chunk carried more than one choice"));
-                    }
-                    match list.first() {
-                        None => None,
-                        Some(choice) => {
-                            if !choice.is_object() {
-                                return Err(self.violation("stream chunk choice is not an object"));
-                            }
-                            // A choice after the declared terminal adopts
-                            // nothing: the verdict closed the turn, and
-                            // only the usage tail and `[DONE]` may follow.
-                            if state.terminal.is_some() {
-                                return Err(
-                                    self.violation("stream carried a choice after its terminal")
-                                );
-                            }
-                            if let Some(index) = choice.get("index") {
-                                // The single requested slot is index 0;
-                                // any other belongs to a candidate the
-                                // request never asked for.
-                                if index.as_u64() != Some(0) {
-                                    return Err(self
-                                        .violation("stream chunk choice carries a nonzero index"));
-                                }
-                            }
-                            if choice
-                                .get("message")
-                                .is_some_and(|message| !message.is_null())
-                            {
-                                // A `message` member is the non-streamed
-                                // response shape — this stream carries
-                                // deltas only.
-                                return Err(self
-                                    .violation("stream chunk choice carries a non-delta message"));
-                            }
-                            Some(choice)
+        let choice = match chunk.get("choices") {
+            None => None,
+            Some(choices) => {
+                let Some(list) = choices.as_array() else {
+                    return Err(violation(
+                        &self.connection,
+                        "stream chunk choices is not an array",
+                    ));
+                };
+                // The request never asks for more than one candidate,
+                // so a second choice is off-contract input — never a
+                // silent first-pick of divergent content.
+                if list.len() > 1 {
+                    return Err(violation(
+                        &self.connection,
+                        "stream chunk carried more than one choice",
+                    ));
+                }
+                match list.first() {
+                    None => None,
+                    Some(choice) => {
+                        if !choice.is_object() {
+                            return Err(violation(
+                                &self.connection,
+                                "stream chunk choice is not an object",
+                            ));
                         }
+                        // A choice after the declared terminal adopts
+                        // nothing: the verdict closed the turn, and
+                        // only the usage tail and `[DONE]` may follow.
+                        if state.terminal.is_some() {
+                            return Err(violation(
+                                &self.connection,
+                                "stream carried a choice after its terminal",
+                            ));
+                        }
+                        if let Some(index) = choice.get("index") {
+                            // The single requested slot is index 0;
+                            // any other belongs to a candidate the
+                            // request never asked for.
+                            if index.as_u64() != Some(0) {
+                                return Err(violation(
+                                    &self.connection,
+                                    "stream chunk choice carries a nonzero index",
+                                ));
+                            }
+                        }
+                        if choice
+                            .get("message")
+                            .is_some_and(|message| !message.is_null())
+                        {
+                            // A `message` member is the non-streamed
+                            // response shape — this stream carries
+                            // deltas only.
+                            return Err(violation(
+                                &self.connection,
+                                "stream chunk choice carries a non-delta message",
+                            ));
+                        }
+                        Some(choice)
                     }
                 }
-            };
+            }
+        };
         if let Some(choice) = choice {
             self.on_delta(state, choice)?;
             if let Some(reason) = choice.get("finish_reason") {
@@ -1182,7 +1160,12 @@ impl ChatCompletionsProvider {
                             _ => Terminal::Unclassifiable,
                         })
                     }
-                    _ => return Err(self.violation("choice finish_reason is not a string")),
+                    _ => {
+                        return Err(violation(
+                            &self.connection,
+                            "choice finish_reason is not a string",
+                        ));
+                    }
                 };
                 if let Some(terminal) = terminal {
                     self.set_terminal(state, terminal)?;
@@ -1215,32 +1198,37 @@ impl ChatCompletionsProvider {
             return Ok(());
         };
         let Some(delta) = delta.as_object() else {
-            return Err(self.violation("choice delta is not an object"));
+            return Err(violation(&self.connection, "choice delta is not an object"));
         };
         if let Some(role) = delta.get("role") {
             match role {
                 Value::String(_) | Value::Null => {}
-                _ => return Err(self.violation("delta role is not a string")),
+                _ => return Err(violation(&self.connection, "delta role is not a string")),
             }
         }
         if let Some(content) = delta.get("content") {
             match content {
                 Value::String(text) => state.text.push_str(text),
                 Value::Null => {}
-                _ => return Err(self.violation("delta content is not a string")),
+                _ => return Err(violation(&self.connection, "delta content is not a string")),
             }
         }
         if let Some(refusal) = delta.get("refusal") {
             match refusal {
                 Value::String(_) | Value::Null => {}
-                _ => return Err(self.violation("delta refusal is not a string")),
+                _ => return Err(violation(&self.connection, "delta refusal is not a string")),
             }
         }
         for key in ["reasoning_content", "reasoning", "reasoning_text"] {
             if let Some(reasoning) = delta.get(key) {
                 match reasoning {
                     Value::String(_) | Value::Null => {}
-                    _ => return Err(self.violation("delta reasoning is not a string")),
+                    _ => {
+                        return Err(violation(
+                            &self.connection,
+                            "delta reasoning is not a string",
+                        ));
+                    }
                 }
             }
         }
@@ -1248,11 +1236,17 @@ impl ChatCompletionsProvider {
             && !details.is_array()
             && !details.is_null()
         {
-            return Err(self.violation("delta reasoning_details is not an array"));
+            return Err(violation(
+                &self.connection,
+                "delta reasoning_details is not an array",
+            ));
         }
         if let Some(calls) = delta.get("tool_calls") {
             let Some(calls) = calls.as_array() else {
-                return Err(self.violation("delta tool_calls is not an array"));
+                return Err(violation(
+                    &self.connection,
+                    "delta tool_calls is not an array",
+                ));
             };
             for entry in calls {
                 self.on_tool_call_entry(state, entry, calls.len() > 1)?;
@@ -1276,13 +1270,21 @@ impl ChatCompletionsProvider {
         batched: bool,
     ) -> Result<(), ProviderError> {
         let Some(entry) = entry.as_object() else {
-            return Err(self.violation("tool_calls entry is not an object"));
+            return Err(violation(
+                &self.connection,
+                "tool_calls entry is not an object",
+            ));
         };
         let index = match entry.get("index") {
             None => None,
             Some(index) => match index.as_u64() {
                 Some(index) => Some(index),
-                None => return Err(self.violation("tool_calls entry index is not an integer")),
+                None => {
+                    return Err(violation(
+                        &self.connection,
+                        "tool_calls entry index is not an integer",
+                    ));
+                }
             },
         };
         let id = match entry.get("id") {
@@ -1291,7 +1293,12 @@ impl ChatCompletionsProvider {
             // contract treats a falsy id as absent.
             Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
             Some(Value::String(_)) => None,
-            Some(_) => return Err(self.violation("tool_calls entry id is not a string")),
+            Some(_) => {
+                return Err(violation(
+                    &self.connection,
+                    "tool_calls entry id is not a string",
+                ));
+            }
         };
         let position = if let Some(index) = index {
             match state.block_by_index.get(&index) {
@@ -1319,7 +1326,10 @@ impl ChatCompletionsProvider {
                 }
             }
         } else if batched {
-            return Err(self.violation("a tool_calls entry without index or id cannot be routed"));
+            return Err(violation(
+                &self.connection,
+                "a tool_calls entry without index or id cannot be routed",
+            ));
         } else if state.blocks.is_empty() {
             state.blocks.push(ToolBlock::default());
             0
@@ -1327,7 +1337,10 @@ impl ChatCompletionsProvider {
             state.blocks.len() - 1
         };
         if state.blocks.len() > MAX_TOOL_CALLS {
-            return Err(self.violation("stream carried more tool calls than the bound"));
+            return Err(violation(
+                &self.connection,
+                "stream carried more tool calls than the bound",
+            ));
         }
         match entry.get("type") {
             None | Some(Value::Null) => {}
@@ -1340,7 +1353,12 @@ impl ChatCompletionsProvider {
                     reason: "a streamed tool call is not a function call".to_string(),
                 });
             }
-            Some(_) => return Err(self.violation("tool_calls entry type is not a string")),
+            Some(_) => {
+                return Err(violation(
+                    &self.connection,
+                    "tool_calls entry type is not a string",
+                ));
+            }
         }
         // The block's id is set once like its name — a second,
         // different id re-keys a routed block, and an id a sibling
@@ -1350,14 +1368,20 @@ impl ChatCompletionsProvider {
         if let Some(id) = id {
             match &state.blocks[position].id {
                 Some(existing) if existing != &id => {
-                    return Err(self.violation("a tool_call block's id changed mid-stream"));
+                    return Err(violation(
+                        &self.connection,
+                        "a tool_call block's id changed mid-stream",
+                    ));
                 }
                 Some(_) => {}
                 None => {
                     if state.blocks.iter().enumerate().any(|(at, block)| {
                         at != position && block.id.as_deref() == Some(id.as_str())
                     }) {
-                        return Err(self.violation("two tool_call blocks carry the same id"));
+                        return Err(violation(
+                            &self.connection,
+                            "two tool_call blocks carry the same id",
+                        ));
                     }
                     state.blocks[position].id = Some(id);
                 }
@@ -1365,13 +1389,17 @@ impl ChatCompletionsProvider {
         }
         if let Some(function) = entry.get("function") {
             let Some(function) = function.as_object() else {
-                return Err(self.violation("tool_calls entry function is not an object"));
+                return Err(violation(
+                    &self.connection,
+                    "tool_calls entry function is not an object",
+                ));
             };
             if let Some(name) = function.get("name") {
                 match name {
                     Value::String(name) if !name.is_empty() => match &state.blocks[position].name {
                         Some(existing) if existing != name => {
-                            return Err(self.violation(
+                            return Err(violation(
+                                &self.connection,
                                 "a tool_call block's function name changed mid-stream",
                             ));
                         }
@@ -1379,7 +1407,12 @@ impl ChatCompletionsProvider {
                         None => state.blocks[position].name = Some(name.clone()),
                     },
                     Value::String(_) | Value::Null => {}
-                    _ => return Err(self.violation("tool_call function name is not a string")),
+                    _ => {
+                        return Err(violation(
+                            &self.connection,
+                            "tool_call function name is not a string",
+                        ));
+                    }
                 }
             }
             if let Some(arguments) = function.get("arguments") {
@@ -1387,17 +1420,19 @@ impl ChatCompletionsProvider {
                     Value::String(piece) => {
                         let block = &mut state.blocks[position];
                         if block.args.len() + piece.len() > MAX_TOOL_ARGS_BYTES {
-                            return Err(
-                                self.violation("a tool_call's arguments exceed the byte bound")
-                            );
+                            return Err(violation(
+                                &self.connection,
+                                "a tool_call's arguments exceed the byte bound",
+                            ));
                         }
                         block.args.push_str(piece);
                     }
                     Value::Null => {}
                     _ => {
-                        return Err(
-                            self.violation("a tool_call's arguments are not a streamed string")
-                        );
+                        return Err(violation(
+                            &self.connection,
+                            "a tool_call's arguments are not a streamed string",
+                        ));
                     }
                 }
             }
@@ -1413,7 +1448,10 @@ impl ChatCompletionsProvider {
         terminal: Terminal,
     ) -> Result<(), ProviderError> {
         if state.terminal.is_some() {
-            return Err(self.violation("stream carried a duplicate terminal"));
+            return Err(violation(
+                &self.connection,
+                "stream carried a duplicate terminal",
+            ));
         }
         state.terminal = Some(terminal);
         Ok(())
@@ -1433,7 +1471,10 @@ impl ChatCompletionsProvider {
         let mut tool_calls = Vec::with_capacity(state.blocks.len());
         for block in state.blocks {
             let Some(name) = block.name.filter(|name| !name.is_empty()) else {
-                return Err(self.violation("a tool_call block never carried a function name"));
+                return Err(violation(
+                    &self.connection,
+                    "a tool_call block never carried a function name",
+                ));
             };
             if !manifest.tools.iter().any(|declared| declared == &name) {
                 return Err(ProviderError::IncompatibleOutput {
@@ -1444,10 +1485,14 @@ impl ChatCompletionsProvider {
             let path = if block.args.is_empty() {
                 None
             } else {
-                let args: Value = serde_json::from_str(&block.args)
-                    .map_err(|_parse| self.violation("a tool_call's arguments did not parse"))?;
+                let args: Value = serde_json::from_str(&block.args).map_err(|_parse| {
+                    violation(&self.connection, "a tool_call's arguments did not parse")
+                })?;
                 let Some(args) = args.as_object() else {
-                    return Err(self.violation("a tool_call's arguments are not an object"));
+                    return Err(violation(
+                        &self.connection,
+                        "a tool_call's arguments are not an object",
+                    ));
                 };
                 args.get("path").and_then(Value::as_str).map(str::to_string)
             };
@@ -1482,44 +1527,10 @@ impl ChatCompletionsProvider {
                     total_tokens,
                 })
             }
-            _ => Err(self.violation("usage is not a readable token shape")),
-        }
-    }
-
-    fn transport(&self, err: reqwest::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.without_url().to_string(),
-        }
-    }
-
-    fn transport_io(&self, err: std::io::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    /// A non-success status is reported by code alone — the response
-    /// body is uncontrolled peer text and never enters diagnostics.
-    fn transport_status(&self, status: reqwest::StatusCode) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: format!("status {}", status.as_u16()),
-        }
-    }
-
-    fn sse(&self, err: SseError) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    fn violation(&self, reason: impl Into<String>) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: reason.into(),
+            _ => Err(violation(
+                &self.connection,
+                "usage is not a readable token shape",
+            )),
         }
     }
 }
@@ -1535,22 +1546,6 @@ fn is_falsy(value: &Value) -> bool {
         Value::String(s) => s.is_empty(),
         Value::Array(_) | Value::Object(_) => false,
     }
-}
-
-/// The reason a failed verdict carries — the peer's own `message`,
-/// `status` or `code` field, whichever it populated. Strings render
-/// verbatim and scalar numbers/booleans still read; a nested object or
-/// array is structure, not prose, and is never serialized into the
-/// reason.
-fn payload_reason(payload: &Value) -> String {
-    for field in ["message", "status", "code"] {
-        match payload.get(field) {
-            Some(Value::String(text)) => return text.clone(),
-            Some(scalar @ (Value::Number(_) | Value::Bool(_))) => return scalar.to_string(),
-            _ => {}
-        }
-    }
-    "unclassified".to_string()
 }
 
 /// The recorded `aiand` effort wire value
@@ -1821,25 +1816,11 @@ impl Provider for ChatCompletionsProvider {
             });
         }
         let body = self.request_body(manifest, &fixed.model_id);
-        // The serialized body is what crosses the wire: the same byte
-        // bound the manifest's accounted size promised is enforced on
-        // the actual bytes — oversized, never truncated (AC-013).
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|_ser| self.violation("request body could not serialize"))?;
-        if body_bytes.len() > crate::contracts::MODEL_WIRE_MAX_BYTES {
-            return Err(ProviderError::StreamViolation {
-                connection: self.connection.clone(),
-                reason: format!(
-                    "request body of {} bytes exceeds the {} byte wire bound",
-                    body_bytes.len(),
-                    crate::contracts::MODEL_WIRE_MAX_BYTES
-                ),
-            });
-        }
+        let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         let response = self
             .client
             .post(format!("{}/chat/completions", self.endpoint))
@@ -1848,9 +1829,9 @@ impl Provider for ChatCompletionsProvider {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(body_bytes)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
         self.read_stream(manifest, response, started)
     }

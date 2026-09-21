@@ -20,15 +20,15 @@
 
 use crate::config::{Config, Connection, EffortAssign, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
-use crate::providers::sse::{SseError, SseEvent, SseParser};
+use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, ToolCall,
-    dialect_for, resolve_credential,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
+    SecretRef, ToolCall, check_deadline, dialect_for, read_catalog_body, read_chunk,
+    resolve_credential, sse, transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,15 +41,6 @@ use std::time::{Duration, Instant};
 /// in flight answers to the client's per-call backstop instead, so
 /// the worst case is the deadline plus one backstop-bounded call.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
-
-/// Bytes read from the response stream per pass — the chunking is an
-/// implementation detail the SSE parser is indifferent to.
-const STREAM_CHUNK_BYTES: usize = 8 * 1024;
-
-/// The bound on one `/models` catalogue payload — a listing never
-/// needs more, and an unbounded or dribbling body is denied under
-/// the same budget as a streamed response.
-const CATALOG_MAX_BYTES: usize = 1024 * 1024;
 
 /// The recorded source sample of Responses-capable model ids the
 /// `openai` connection's catalogue surface filters `/models` to
@@ -264,10 +255,7 @@ impl OpenAiProvider {
             .timeout(deadline.saturating_mul(2))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|err| ProviderError::Transport {
-                connection: connection.to_string(),
-                reason: err.without_url().to_string(),
-            })?;
+            .map_err(|err| transport(connection, err))?;
         Ok(Self {
             connection: connection.to_string(),
             contract,
@@ -307,35 +295,24 @@ impl OpenAiProvider {
     /// whole-request budget instead of opening a second, unaccounted
     /// one.
     fn catalog_within(&self, token: &str, started: Instant) -> Result<Vec<String>, ProviderError> {
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         let mut response = self
             .client
             .get(format!("{}/models", self.endpoint))
             .bearer_auth(token)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
-        // The listing reads under the same whole-request budget and a
-        // byte bound — a dribbling or oversized payload is denied,
-        // never parked or buffered unbounded.
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
-        loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
-            if read == 0 {
-                break;
-            }
-            if body.len() + read > CATALOG_MAX_BYTES {
-                return Err(self.violation("models payload exceeds the byte bound"));
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
+        let body = read_catalog_body(&self.connection, self.deadline, &mut response, started)?;
         let body: Value = serde_json::from_slice(&body)
-            .map_err(|_parse| self.violation("models payload is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "models payload is not json"))?;
         let Some(data) = body.get("data").and_then(Value::as_array) else {
-            return Err(self.violation("models payload carries no data array"));
+            return Err(violation(
+                &self.connection,
+                "models payload carries no data array",
+            ));
         };
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
@@ -436,41 +413,6 @@ impl OpenAiProvider {
         body
     }
 
-    /// The whole-request budget check (DEC-014): evaluated before
-    /// the post, before every stream read and before the final pass,
-    /// so connect, request send, reads and finalization share one
-    /// deadline — a peer dribbling a byte inside each per-read window
-    /// parks the stream only until the total budget is spent.
-    fn check_deadline(&self, started: Instant) -> Result<(), ProviderError> {
-        if started.elapsed() >= self.deadline {
-            return Err(ProviderError::Transport {
-                connection: self.connection.clone(),
-                reason: format!("request exceeded the {:?} send deadline", self.deadline),
-            });
-        }
-        Ok(())
-    }
-
-    /// One bounded read under the shared deadline: the check runs
-    /// before the call, `Interrupted` retries in place, and any other
-    /// read failure is the typed transport error. Returns the bytes
-    /// read — `0` is the stream's end.
-    fn read_chunk(
-        &self,
-        response: &mut reqwest::blocking::Response,
-        chunk: &mut [u8],
-        started: Instant,
-    ) -> Result<usize, ProviderError> {
-        loop {
-            self.check_deadline(started)?;
-            match response.read(chunk) {
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(self.transport_io(err)),
-                Ok(read) => return Ok(read),
-            }
-        }
-    }
-
     /// Reads the SSE body through the shared bounded parser and
     /// reduces it to the one terminal the dialect can classify. A
     /// stream that ends mid item, without a terminal, or with an
@@ -485,22 +427,31 @@ impl OpenAiProvider {
         let mut state = StreamState::default();
         let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
         loop {
-            let read = self.read_chunk(&mut response, &mut chunk, started)?;
+            let read = read_chunk(
+                &self.connection,
+                self.deadline,
+                &mut response,
+                &mut chunk,
+                started,
+            )?;
             if read == 0 {
                 break;
             }
-            for event in parser.feed(&chunk[..read]).map_err(|err| self.sse(err))? {
+            for event in parser
+                .feed(&chunk[..read])
+                .map_err(|err| sse(&self.connection, err))?
+            {
                 self.on_event(&mut state, event)?;
             }
         }
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
-        self.check_deadline(started)?;
-        for event in parser.finish().map_err(|err| self.sse(err))? {
+        check_deadline(&self.connection, self.deadline, started)?;
+        for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_event(&mut state, event)?;
         }
         if state.open_items > 0 {
-            return Err(self.violation("stream ended mid output item"));
+            return Err(violation(&self.connection, "stream ended mid output item"));
         }
         match state.terminal {
             Some(Terminal::Completed { response }) => self.complete(manifest, &response),
@@ -533,7 +484,10 @@ impl OpenAiProvider {
                 // added (REQ-036): an orphan close is a malformed
                 // stream, never a saturating no-op that hides it.
                 if state.open_items == 0 {
-                    return Err(self.violation("output item done event without its added"));
+                    return Err(violation(
+                        &self.connection,
+                        "output item done event without its added",
+                    ));
                 }
                 state.open_items -= 1;
                 None
@@ -562,8 +516,9 @@ impl OpenAiProvider {
                 reason: payload_reason(&self.response_payload(&event, "response.incomplete")?),
             }),
             "error" => {
-                let payload: Value = serde_json::from_str(&event.data)
-                    .map_err(|_parse| self.violation("error event payload is not json"))?;
+                let payload: Value = serde_json::from_str(&event.data).map_err(|_parse| {
+                    violation(&self.connection, "error event payload is not json")
+                })?;
                 Some(Terminal::Failed {
                     reason: payload_reason(&payload),
                 })
@@ -572,7 +527,10 @@ impl OpenAiProvider {
         };
         if let Some(terminal) = terminal {
             if state.terminal.is_some() {
-                return Err(self.violation("stream carried a duplicate terminal event"));
+                return Err(violation(
+                    &self.connection,
+                    "stream carried a duplicate terminal event",
+                ));
             }
             state.terminal = Some(terminal);
         }
@@ -586,10 +544,10 @@ impl OpenAiProvider {
         name: &'static str,
     ) -> Result<Value, ProviderError> {
         let payload: Value = serde_json::from_str(&event.data)
-            .map_err(|_parse| self.violation("terminal event payload is not json"))?;
+            .map_err(|_parse| violation(&self.connection, "terminal event payload is not json"))?;
         let response = payload.get("response").cloned().unwrap_or(payload);
         if !response.is_object() {
-            return Err(self.violation(name));
+            return Err(violation(&self.connection, name));
         }
         Ok(response)
     }
@@ -604,14 +562,17 @@ impl OpenAiProvider {
         response: &Value,
     ) -> Result<ProviderReply, ProviderError> {
         let Some(output) = response.get("output").and_then(Value::as_array) else {
-            return Err(self.violation("response.completed carries no output array"));
+            return Err(violation(
+                &self.connection,
+                "response.completed carries no output array",
+            ));
         };
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         let mut blobs = Vec::new();
         for item in output {
             let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-                return Err(self.violation("output item without a type"));
+                return Err(violation(&self.connection, "output item without a type"));
             };
             // A completed terminal may only carry finished items: an
             // unfinished or unlabelled message/function_call is
@@ -632,14 +593,20 @@ impl OpenAiProvider {
             match item_type {
                 "message" => {
                     let Some(content) = item.get("content").and_then(Value::as_array) else {
-                        return Err(self.violation("message item carries no content array"));
+                        return Err(violation(
+                            &self.connection,
+                            "message item carries no content array",
+                        ));
                     };
                     for part in content {
                         match part.get("type").and_then(Value::as_str) {
                             Some("output_text") => {
                                 let Some(part_text) = part.get("text").and_then(Value::as_str)
                                 else {
-                                    return Err(self.violation("output_text part carries no text"));
+                                    return Err(violation(
+                                        &self.connection,
+                                        "output_text part carries no text",
+                                    ));
                                 };
                                 text.push_str(part_text);
                             }
@@ -652,14 +619,20 @@ impl OpenAiProvider {
                             // surface — observed, not consumed.
                             Some(_) => {}
                             None => {
-                                return Err(self.violation("message content part without a type"));
+                                return Err(violation(
+                                    &self.connection,
+                                    "message content part without a type",
+                                ));
                             }
                         }
                     }
                 }
                 "function_call" => {
                     let Some(name) = item.get("name").and_then(Value::as_str) else {
-                        return Err(self.violation("function_call item carries no name"));
+                        return Err(violation(
+                            &self.connection,
+                            "function_call item carries no name",
+                        ));
                     };
                     // The call must name a tool the frozen request
                     // declared — an undeclared name is output the
@@ -671,12 +644,19 @@ impl OpenAiProvider {
                         });
                     }
                     let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
-                        return Err(self.violation("function_call item carries no arguments"));
+                        return Err(violation(
+                            &self.connection,
+                            "function_call item carries no arguments",
+                        ));
                     };
-                    let parsed: Value = serde_json::from_str(arguments)
-                        .map_err(|_parse| self.violation("function_call arguments are not json"))?;
+                    let parsed: Value = serde_json::from_str(arguments).map_err(|_parse| {
+                        violation(&self.connection, "function_call arguments are not json")
+                    })?;
                     let args = parsed.as_object().ok_or_else(|| {
-                        self.violation("function_call arguments are not an object")
+                        violation(
+                            &self.connection,
+                            "function_call arguments are not an object",
+                        )
                     })?;
                     tool_calls.push(ToolCall {
                         tool: name.to_string(),
@@ -801,44 +781,10 @@ impl OpenAiProvider {
                     total_tokens,
                 })
             }
-            _ => Err(self.violation("response.usage is not a readable token shape")),
-        }
-    }
-
-    fn transport(&self, err: reqwest::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.without_url().to_string(),
-        }
-    }
-
-    fn transport_io(&self, err: std::io::Error) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    /// A non-success status is reported by code alone — the response
-    /// body is uncontrolled peer text and never enters diagnostics.
-    fn transport_status(&self, status: reqwest::StatusCode) -> ProviderError {
-        ProviderError::Transport {
-            connection: self.connection.clone(),
-            reason: format!("status {}", status.as_u16()),
-        }
-    }
-
-    fn sse(&self, err: SseError) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: err.to_string(),
-        }
-    }
-
-    fn violation(&self, reason: &'static str) -> ProviderError {
-        ProviderError::StreamViolation {
-            connection: self.connection.clone(),
-            reason: reason.to_string(),
+            _ => Err(violation(
+                &self.connection,
+                "response.usage is not a readable token shape",
+            )),
         }
     }
 }
@@ -953,26 +899,11 @@ impl Provider for OpenAiProvider {
             });
         }
         let body = self.request_body(manifest, &fixed);
-        // The serialized body is what crosses the wire: it carries
-        // the replayed lineage set, so the same byte bound the
-        // manifest's accounted size promised is enforced on the
-        // actual bytes — oversized, never truncated (AC-013).
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|_ser| self.violation("request body could not serialize"))?;
-        if body_bytes.len() > crate::contracts::MODEL_WIRE_MAX_BYTES {
-            return Err(ProviderError::StreamViolation {
-                connection: self.connection.clone(),
-                reason: format!(
-                    "request body of {} bytes exceeds the {} byte wire bound",
-                    body_bytes.len(),
-                    crate::contracts::MODEL_WIRE_MAX_BYTES
-                ),
-            });
-        }
+        let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
-        self.check_deadline(started)?;
+        check_deadline(&self.connection, self.deadline, started)?;
         let response = self
             .client
             .post(format!("{}/responses", self.endpoint))
@@ -980,9 +911,9 @@ impl Provider for OpenAiProvider {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes)
             .send()
-            .map_err(|err| self.transport(err))?;
+            .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(self.transport_status(response.status()));
+            return Err(transport_status(&self.connection, response.status()));
         }
         self.read_stream(manifest, response, started)
     }

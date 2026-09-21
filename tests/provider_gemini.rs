@@ -24,7 +24,7 @@ use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::gemini::{
     GOOGLE_PROJECT_BILLED_KEY_TYPE, GOOGLE_STANDARD_KEY_SUNSET, GeminiProvider,
 };
-use rivect::providers::{CredentialStore, Provider, ProviderError, SecretRef, StoreKind};
+use rivect::providers::{Provider, ProviderError, StoreKind};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -34,6 +34,8 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+use support::{SlowStore, drop_blocking, received_bodies, send_on_thread};
 
 /// The scoped credential ref the `google` connection binds — a
 /// `keyring:` ref resolves to the platform's native class, which the
@@ -158,19 +160,6 @@ async fn mount_generate(server: &MockServer, body: String) {
         .await;
 }
 
-/// The request bodies the fixture peer received, parsed as JSON.
-async fn received_bodies(server: &MockServer) -> Vec<Value> {
-    server
-        .received_requests()
-        .await
-        .expect("the mock recorded requests")
-        .iter()
-        .map(|request: &Request| {
-            serde_json::from_slice(&request.body).expect("the wire body is json")
-        })
-        .collect()
-}
-
 /// The API-key header the Gemini dialect authenticates with —
 /// `x-goog-api-key`, never a bearer token.
 fn received_key(request: &Request) -> String {
@@ -216,76 +205,6 @@ fn dispatch(
     })
     .join()
     .expect("the dispatch thread joins")
-}
-
-/// reqwest's blocking client owns an internal runtime that must never
-/// be dropped inside any tokio context — even the blocking pool — so
-/// every broker/provider drop goes to a plain OS thread.
-fn drop_blocking<T: Send + 'static>(value: T) {
-    std::thread::spawn(move || drop(value))
-        .join()
-        .expect("the drop thread joins");
-}
-
-/// A bare `provider.send` must not run inside any tokio context for
-/// the same reason — sends go to a plain OS thread and the provider
-/// comes back.
-fn send_on_thread(
-    mut provider: GeminiProvider,
-    manifest: RequestManifest,
-) -> (
-    GeminiProvider,
-    Result<rivect::providers::ProviderReply, ProviderError>,
-) {
-    std::thread::spawn(move || {
-        let outcome = provider.send(&manifest);
-        (provider, outcome)
-    })
-    .join()
-    .expect("the send thread joins")
-}
-
-/// A store double whose `resolve` parks for a fixed delay before
-/// delegating — the seam a credential leg that consumes the send's
-/// whole budget is proved through (DEC-014).
-struct SlowStore {
-    inner: support::MapStore,
-    delay: Duration,
-}
-
-impl CredentialStore for SlowStore {
-    fn kind(&self) -> StoreKind {
-        self.inner.kind()
-    }
-
-    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
-        self.inner.occupied(credential)
-    }
-
-    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
-        self.inner.entry_accounts(service)
-    }
-
-    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.login(credential, secret)
-    }
-
-    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
-        std::thread::sleep(self.delay);
-        self.inner.resolve(credential)
-    }
-
-    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
-        self.inner.refresh(credential, secret)
-    }
-
-    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.revoke(credential)
-    }
-
-    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
-        self.inner.logout(credential)
-    }
 }
 
 // ----- TP-PROVIDER-WIRE::google -------------------------------------
