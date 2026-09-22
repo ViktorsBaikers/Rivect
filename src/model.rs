@@ -8,7 +8,7 @@ use crate::config::{
     Config, ConfigError, ConnKind, Connection, EffortAssign, EffortLevel, FallbackAssign,
     FixedModel, ModelAssign, Profile, PurposeDef,
 };
-use crate::providers::{self, Provider, ProviderError, ProviderReply};
+use crate::providers::{self, Dialect, Provider, ProviderError, ProviderReply};
 use crate::resources::UsageDelta;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -99,9 +99,15 @@ pub enum ModelError {
     #[error("dispatch world mismatch: manifest froze {frozen}, dispatch attempted from {current}")]
     WorldMismatch { frozen: String, current: String },
     #[error(
-        "no eligible connection for purpose {purpose}: every candidate failed eligibility before ranking"
+        "no eligible connection for purpose {purpose}: every candidate failed eligibility before ranking{}",
+        rejected_text(.rejected.as_slice())
     )]
-    NoEligibleCandidate { purpose: String },
+    NoEligibleCandidate {
+        purpose: String,
+        /// Every candidate the ranking refused, in pool order; an
+        /// inherit resolves no candidates and refuses none.
+        rejected: Vec<CandidateRejection>,
+    },
     #[error(
         "dispatch blocked for attempt {attempt_id}: eligibility snapshot changed since ranking (connection {connection} admitted at version {frozen}, current version {current})"
     )]
@@ -139,7 +145,11 @@ pub enum ModelError {
         connection: String,
         cause: RejectionCause,
     },
-    #[error("fallback for purpose {purpose} exhausted: {source}")]
+    #[error(
+        "fallback for purpose {purpose} exhausted{}{}: {source}",
+        rejected_text(.rejected.as_slice()),
+        attempted_text(.attempted.as_slice())
+    )]
     FallbackExhausted {
         attempt_id: String,
         purpose: String,
@@ -175,6 +185,12 @@ pub enum RejectionCause {
     /// the broker holds speaks its dialect — the send seam fails
     /// closed rather than fabricating a reply.
     DialectMismatch,
+    /// The candidate's id is reserved to a recorded dialect and no
+    /// installed adapter serves that dialect in this build — a
+    /// build-truth denial, not an adapter declining an offered id.
+    DialectUnserved {
+        dialect: Dialect,
+    },
     /// The candidate passed the re-check but its own send failed.
     SendFailed(ProviderError),
 }
@@ -190,6 +206,10 @@ impl std::fmt::Display for RejectionCause {
             Self::NotPurposeEligible => f.write_str("outside the purpose's eligible list"),
             Self::NotOffered => f.write_str("not among the candidates the pending choice served"),
             Self::DialectMismatch => f.write_str("no adapter serves this connection's dialect"),
+            Self::DialectUnserved { dialect } => write!(
+                f,
+                "reserved for dialect {dialect}; no installed adapter serves it in this build"
+            ),
             Self::SendFailed(source) => write!(f, "send failed: {source}"),
         }
     }
@@ -200,6 +220,32 @@ impl std::fmt::Display for RejectionCause {
 pub struct CandidateRejection {
     pub connection: String,
     pub cause: RejectionCause,
+}
+
+/// `connection: cause` pairs in chain order for the refusal list an
+/// exhaustion carries — every cause is typed, so the rendered text can
+/// never embed secret material (INV-006). An empty list renders nothing.
+fn rejected_text(rejected: &[CandidateRejection]) -> String {
+    if rejected.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; rejected {}",
+        rejected
+            .iter()
+            .map(|rejection| format!("{}: {}", rejection.connection, rejection.cause))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The connections that received a send before the chain exhausted;
+/// absent when no candidate was attempted.
+fn attempted_text(attempted: &[String]) -> String {
+    if attempted.is_empty() {
+        return String::new();
+    }
+    format!("; attempted {}", attempted.join(", "))
 }
 
 /// A recorded manual-fallback choice (AC-045, DEC-014): the failed
@@ -763,11 +809,23 @@ impl Broker {
         // alone never authorizes a send, and the denial lands before
         // the provider sees the request or anything is accounted.
         let Some(entry) = self.view_connections.get(connection) else {
-            return Err(ProviderError::UnknownConnection);
+            return Err(ProviderError::UnknownConnection {
+                connection: connection.to_string(),
+            });
         };
         if !self.provider.serves(connection, entry) {
-            return Err(ProviderError::DialectMismatch {
-                connection: connection.to_string(),
+            // An id `dialect_for` reserves fails differently from one
+            // the adapter merely declines: the build carries no adapter
+            // that speaks the recorded dialect — say so instead of
+            // blaming the injected adapter's own dialect.
+            return Err(match providers::dialect_for(connection) {
+                Some(dialect) => ProviderError::DialectUnserved {
+                    connection: connection.to_string(),
+                    dialect,
+                },
+                None => ProviderError::DialectMismatch {
+                    connection: connection.to_string(),
+                },
             });
         }
         // The dispatch decision IS the auto pool's choice: the send
@@ -1155,15 +1213,19 @@ impl Broker {
         // skipped before the walk ever reaches a send — eligibility
         // and dialect are separate gates (AC-046).
         if !self.provider.serves(connection, entry) {
-            return Some(RejectionCause::DialectMismatch);
+            // A reserved id reports the build truth — no installed
+            // adapter serves the recorded dialect — while an
+            // unreserved one is the adapter's own decline.
+            return Some(match providers::dialect_for(connection) {
+                Some(dialect) => RejectionCause::DialectUnserved { dialect },
+                None => RejectionCause::DialectMismatch,
+            });
         }
-        if !self.entitlements.allows(connection) {
-            return Some(RejectionCause::NotEntitled);
-        }
-        if !purpose_entitled(self.view_purposes.get(purpose), connection) {
-            return Some(RejectionCause::NotPurposeEligible);
-        }
-        None
+        entitlement_rejection(
+            &self.entitlements,
+            self.view_purposes.get(purpose),
+            connection,
+        )
     }
 
     /// The connections currently eligible for one purpose — the
@@ -1258,9 +1320,17 @@ fn rank_connection(
     match assignment {
         ModelAssign::Fixed(fixed) => {
             providers::offline_eligible(assignment, connections, profiles)?;
-            if !entitled(entitlements, purpose_def, &fixed.connection) {
+            // `offline_eligible` already answered the catalogue and
+            // live-grant gates, so only the entitlement tail can refuse
+            // a fixed pin here.
+            if let Some(cause) = entitlement_rejection(entitlements, purpose_def, &fixed.connection)
+            {
                 return Err(ModelError::NoEligibleCandidate {
                     purpose: purpose.to_string(),
+                    rejected: vec![CandidateRejection {
+                        connection: fixed.connection.clone(),
+                        cause,
+                    }],
                 });
             }
             Ok((fixed.connection.clone(), Some(fixed.model_id.clone())))
@@ -1275,32 +1345,71 @@ fn rank_connection(
                 Some(pool) => pool.to_vec(),
                 None => connections.keys().cloned().collect(),
             };
-            candidates
-                .into_iter()
-                .find(|name| {
-                    providers::offline_usable(connections, profiles, name)
-                        && entitled(entitlements, purpose_def, name)
-                })
-                .map(|connection| (connection, None))
-                .ok_or_else(|| ModelError::NoEligibleCandidate {
+            let mut rejected = Vec::new();
+            let ranked = candidates.into_iter().find(|name| {
+                match rank_rejection(connections, profiles, entitlements, purpose_def, name) {
+                    Some(cause) => {
+                        rejected.push(CandidateRejection {
+                            connection: name.clone(),
+                            cause,
+                        });
+                        false
+                    }
+                    None => true,
+                }
+            });
+            match ranked {
+                Some(connection) => Ok((connection, None)),
+                None => Err(ModelError::NoEligibleCandidate {
                     purpose: purpose.to_string(),
-                })
+                    rejected,
+                }),
+            }
         }
         // an inherit that survived resolution names no connection and
         // declares no pool: it has no candidate and fails closed
         ModelAssign::Inherit => Err(ModelError::NoEligibleCandidate {
             purpose: purpose.to_string(),
+            rejected: Vec::new(),
         }),
     }
 }
 
-/// Account entitlement and the per-purpose `eligible` input together.
-fn entitled(
+/// The prepare-time twin of [`Broker::candidate_rejection`] minus the
+/// dialect `serves` gate (AC-046 keeps eligibility and dialect
+/// separate): a candidate's refusal cause — undeclared, live-grant
+/// gated or entitlement denied — in the same gate order.
+fn rank_rejection(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
     entitlements: &Entitlements,
     purpose_def: Option<&PurposeDef>,
     connection: &str,
-) -> bool {
-    entitlements.allows(connection) && purpose_entitled(purpose_def, connection)
+) -> Option<RejectionCause> {
+    let Some(entry) = connections.get(connection) else {
+        return Some(RejectionCause::UnknownConnection);
+    };
+    if !providers::offline_usable(connections, profiles, connection) {
+        return Some(RejectionCause::LiveGrantRequired { kind: entry.kind });
+    }
+    entitlement_rejection(entitlements, purpose_def, connection)
+}
+
+/// The entitlement gates as a typed cause: the account's rights first,
+/// then the per-purpose `eligible` input — the tail
+/// [`Broker::candidate_rejection`] and [`rank_rejection`] share.
+fn entitlement_rejection(
+    entitlements: &Entitlements,
+    purpose_def: Option<&PurposeDef>,
+    connection: &str,
+) -> Option<RejectionCause> {
+    if !entitlements.allows(connection) {
+        return Some(RejectionCause::NotEntitled);
+    }
+    if !purpose_entitled(purpose_def, connection) {
+        return Some(RejectionCause::NotPurposeEligible);
+    }
+    None
 }
 
 /// The per-purpose `eligible` input (DEC-012): `None` restricts

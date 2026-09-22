@@ -4,6 +4,7 @@
 //! edits; `parse` is syntax-only (duplicate keys are parser errors), every
 //! typed/semantic rejection happens in `validate` and fails closed.
 
+use crate::providers::{SecretRef, SecretRefError};
 use crate::state::{StoreError, TaskStore};
 use serde::Serialize;
 use serde_json::Value;
@@ -22,7 +23,7 @@ pub const WORKFLOW_KEY: &str = "workflow.enabled";
 /// connection or profile name is never itself a known key.
 pub const READ_KEY_HINT: &str = "workflow.enabled, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
 
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Optional per-connection region and credential profile:\n# [connections.<id>]\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.<name>]\n# credential_ref = \"keyring:rivect/default\"\n";
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -126,6 +127,13 @@ pub enum ConfigIssue {
         "{key} carries raw secret material; a scoped secret reference (store:scope) is required"
     )]
     SecretRefExpected { key: String },
+    /// The reference is well-formed but its store label names no class
+    /// this build serves — refused at ingress under the same grammar
+    /// [`crate::providers::SecretRef::parse`] re-checks at the seam.
+    #[error(
+        "credential reference names an unsupported credential store: {store}; admitted stores: keyring, keychain, secret-service"
+    )]
+    UnsupportedCredentialStore { store: String },
     #[error("unknown profile reference: profiles.{profile}")]
     UnknownProfileReference { profile: String },
     #[error(
@@ -528,6 +536,7 @@ impl Config {
         let (path, field) = target_path(&target);
         let original = self.raw.clone();
         let edited = self.require_document(key).and_then(|doc| {
+            require_declared_connection(doc, &target, key)?;
             ensure_table_like(doc.as_item_mut(), &path, key)
                 .map(|table| set_field(table, field, item))
         });
@@ -545,20 +554,22 @@ impl Config {
             ));
         }
         let original = self.raw.clone();
-        let edited = self.require_document(key).map(|doc| {
+        let edited = self.require_document(key).and_then(|doc| {
+            require_declared_connection(doc, &target, key)?;
             let mut node = doc.as_item_mut();
             for segment in target_path(&target).0 {
                 let Some(next) = node
                     .as_table_like_mut()
                     .and_then(|table| table.get_mut(segment))
                 else {
-                    return;
+                    return Ok(());
                 };
                 node = next;
             }
             if let Some(table) = node.as_table_like_mut() {
                 table.remove(target_path(&target).1);
             }
+            Ok(())
         });
         self.commit_edit(key, &target, original, edited)
     }
@@ -682,24 +693,21 @@ pub fn is_readable_key(key: &str) -> bool {
     }
 }
 
-/// Whether `raw` spells a scoped secret reference (`store:scope`): the
-/// store segment is an identifier, the scope is non-empty and carries
-/// no whitespace. Anything else — including secret-looking material —
-/// is refused (DEC-013).
-fn scoped_secret_ref(raw: &str) -> bool {
-    let Some((store, scope)) = raw.split_once(':') else {
-        return false;
-    };
-    !store.is_empty()
-        && store
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        && store
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-        && !scope.is_empty()
-        && !scope.chars().any(char::is_whitespace)
+/// `credential_ref` ingress is the credential seam's own grammar (INV-006,
+/// DEC-013): [`SecretRef::parse`] admits only the `store:scope` shape with
+/// a store class this build serves, so an unadmitted label — `env:`,
+/// `file:`, `vault:` — is refused where the value enters, not deferred to
+/// a dispatch-time surprise. The value never enters diagnostics.
+fn credential_ref_admitted(raw: &str, key: &str) -> Result<(), ConfigIssue> {
+    match SecretRef::parse(raw) {
+        Ok(_) => Ok(()),
+        Err(SecretRefError::UnsupportedStore { store }) => {
+            Err(ConfigIssue::UnsupportedCredentialStore { store })
+        }
+        Err(SecretRefError::NotScoped) => Err(ConfigIssue::SecretRefExpected {
+            key: key.to_string(),
+        }),
+    }
 }
 
 /// The typed view `validated_document` extracts from the raw TOML:
@@ -824,18 +832,12 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
                 }
             }
         }
-        // A present reference must be a scoped secret reference —
-        // the same shape profiles enforce. Never echo the value:
-        // diagnostics stay secret-free.
-        if let Some(credential_ref) = &connection.credential_ref
-            && !scoped_secret_ref(credential_ref)
-        {
-            return Err(ConfigError::schema(
-                format!("{key}.credential_ref"),
-                ConfigIssue::SecretRefExpected {
-                    key: format!("{key}.credential_ref"),
-                },
-            ));
+        // A present reference must be a scoped secret reference naming
+        // an admitted store — the same grammar profiles enforce. Never
+        // echo the value: diagnostics stay secret-free.
+        if let Some(credential_ref) = &connection.credential_ref {
+            credential_ref_admitted(credential_ref, &format!("{key}.credential_ref"))
+                .map_err(|issue| ConfigError::schema(format!("{key}.credential_ref"), issue))?;
         }
         // A profile binding must name a declared profile — the same
         // referential discipline connection references already carry.
@@ -1112,6 +1114,37 @@ fn target_path(target: &EditTarget) -> (Vec<&str>, &str) {
         EditTarget::ConnectionProfile(name) => (vec!["connections", name], "profile"),
         EditTarget::ProfileCredentialRef(name) => (vec!["profiles", name], "credential_ref"),
     }
+}
+
+/// The `connections.<name>.*` edit targets write onto a connection the
+/// document already declares — the same referential discipline the file
+/// surface and model/profile references carry (DEC-013). Checked before
+/// any mutation: an edit that materialized `[connections.<name>]` from
+/// nothing would publish a stub no valid document can hold — `kind` is
+/// required and never editable. Other name-bearing targets keep their
+/// auto-create semantics.
+fn require_declared_connection(
+    document: &DocumentMut,
+    target: &EditTarget,
+    key: &str,
+) -> Result<(), ConfigError> {
+    let (EditTarget::ConnectionRegion(name) | EditTarget::ConnectionProfile(name)) = target else {
+        return Ok(());
+    };
+    let declared = document
+        .as_item()
+        .get("connections")
+        .and_then(|item| item.as_table_like())
+        .is_some_and(|connections| connections.contains_key(name.as_str()));
+    if declared {
+        return Ok(());
+    }
+    Err(ConfigError::schema(
+        key,
+        ConfigIssue::UnknownConnectionReference {
+            connection: name.clone(),
+        },
+    ))
 }
 
 fn ensure_table_like<'a>(
@@ -1681,15 +1714,8 @@ fn validate_target(
                     },
                 ));
             };
-            if !scoped_secret_ref(raw) {
-                // Never echo the value: diagnostics stay secret-free.
-                return Err(ConfigError::schema(
-                    key,
-                    ConfigIssue::SecretRefExpected {
-                        key: key.to_string(),
-                    },
-                ));
-            }
+            // Never echo the value: diagnostics stay secret-free.
+            credential_ref_admitted(raw, key).map_err(|issue| ConfigError::schema(key, issue))?;
         }
     }
     Ok(())
@@ -1906,15 +1932,10 @@ fn profile(name: &str, item: &Item) -> Result<Profile, ConfigError> {
                         },
                     )
                 })?;
-                if !scoped_secret_ref(raw) {
-                    // Never echo the value: diagnostics stay secret-free.
-                    return Err(ConfigError::schema(
-                        format!("{profile_key}.credential_ref"),
-                        ConfigIssue::SecretRefExpected {
-                            key: format!("{profile_key}.credential_ref"),
-                        },
-                    ));
-                }
+                // Never echo the value: diagnostics stay secret-free.
+                credential_ref_admitted(raw, &format!("{profile_key}.credential_ref")).map_err(
+                    |issue| ConfigError::schema(format!("{profile_key}.credential_ref"), issue),
+                )?;
                 credential_ref = Some(raw.to_string());
             }
             other => {

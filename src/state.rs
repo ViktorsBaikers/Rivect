@@ -811,8 +811,8 @@ impl TaskStore {
         // manifest it would resume no longer reflects the task intent.
         if question.intent_revision != intent_revision {
             return Err(StoreError::StaleIntent {
-                expected: intent_revision,
-                current: question.intent_revision,
+                expected: question.intent_revision,
+                current: intent_revision,
             });
         }
         match selection {

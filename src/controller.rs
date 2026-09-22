@@ -492,6 +492,7 @@ impl Runtime {
             self.record_pause(task_id, manifest, None);
             return Err(ControllerError::Model(ModelError::NoEligibleCandidate {
                 purpose: choice.purpose,
+                rejected: Vec::new(),
             }));
         };
         let snapshot = self.owner.store.snapshot(task_id)?;

@@ -39,7 +39,7 @@ use rivect::config::{
 };
 use rivect::contracts::{MODEL_WIRE_MAX_BYTES, Question};
 use rivect::model::{Broker, CandidateRejection, ModelError, RejectionCause, RequestManifest};
-use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
+use rivect::providers::{Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::UsageDelta;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -135,17 +135,21 @@ fn scripted_broker(
     (Broker::new(Box::new(provider)), sent, inner_attempts)
 }
 
-/// Fallback corpus: six connections so the auto chain can express an
-/// egress-denied candidate (`web`), an account-denied one (`denied`), a
-/// purpose-shadowed one (`shadowed`), a removed one (`gone`), and the
-/// admitted reserve. `purpose_toml` carries the relay purpose's
+/// Fallback corpus: six connections so the auto chain can express a
+/// live-grant-denied candidate (`web`), an account-denied one
+/// (`denied`), a purpose-shadowed one (`shadowed`), a removed one
+/// (`gone`), and the admitted reserve. `web` stays grant-gated through
+/// an admitted `keyring:` ref: its binding resolves against `web-lock`,
+/// a profile that names no ref, so the credential leg fails without an
+/// unsupported store. `purpose_toml` carries the relay purpose's
 /// `fallback`/`eligible` lines.
 fn fallback_config(purpose_toml: &str) -> String {
     format!(
         "config_version = 1\n\
          [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
          [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
-         [connections.web]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"vault:web\"\n\
+         [profiles.web-lock]\n\
+         [connections.web]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"keyring:rivect/web\"\nprofile = \"web-lock\"\n\
          [connections.denied]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11436\"\n\
          [connections.shadowed]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11437\"\n\
          [connections.gone]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11438\"\n\
@@ -479,7 +483,8 @@ fn pending_config_and_draft_never_rewrite_the_in_flight_request() {
 /// candidates to exclude. The learned role pins its own connection.
 fn pools_config() -> String {
     "config_version = 1\n\
-     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"vault:primary\"\n\
+     [profiles.primary-lock]\n\
+     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:rivect/primary\"\nprofile = \"primary-lock\"\n\
      [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
      [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
      [models.defaults]\n\
@@ -576,9 +581,23 @@ fn ineligible_candidates_are_excluded_before_ranking_and_fail_closed() {
     let error = broker
         .prepare("reranker", &config, "/world/pools", "goal: fixture")
         .expect_err("no eligible candidate must fail closed");
+    let ModelError::NoEligibleCandidate { purpose, rejected } = &error else {
+        panic!("wrong rejection: {error}")
+    };
+    assert_eq!(purpose, "reranker");
+    assert_eq!(
+        rejected.as_slice(),
+        [CandidateRejection {
+            connection: "local".to_string(),
+            cause: RejectionCause::NotEntitled,
+        }],
+        "the ranked refusal names the excluded candidate's cause"
+    );
     assert!(
-        matches!(&error, ModelError::NoEligibleCandidate { purpose } if purpose == "reranker"),
-        "wrong rejection: {error}"
+        error
+            .to_string()
+            .contains("local: outside the account entitlement"),
+        "the ranked refusal renders per-candidate causes: {error}"
     );
     assert_eq!(
         broker.admitted_attempts(),
@@ -845,7 +864,9 @@ fn fallback_auto_walks_only_admitted_chain_entries_preserving_primary_pins_and_s
     .expect("valid");
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -936,7 +957,10 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         inner: LoopbackProvider::new(),
         sent: sent.clone(),
         script: Arc::new(Mutex::new(
-            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
         )),
         inner_attempts: Arc::new(AtomicU64::new(0)),
         inner_retries: 0,
@@ -1111,7 +1135,10 @@ fn fallback_manual_choice_recheck_blocks_a_candidate_that_lost_eligibility() {
         inner: LoopbackProvider::new(),
         sent: sent.clone(),
         script: Arc::new(Mutex::new(
-            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
         )),
         inner_attempts: Arc::new(AtomicU64::new(0)),
         inner_retries: 0,
@@ -1224,7 +1251,10 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
         inner: LoopbackProvider::new(),
         sent: sent.clone(),
         script: Arc::new(Mutex::new(
-            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
         )),
         inner_attempts: Arc::new(AtomicU64::new(0)),
         inner_retries: 0,
@@ -1353,7 +1383,10 @@ fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
         inner: LoopbackProvider::new(),
         sent: sent.clone(),
         script: Arc::new(Mutex::new(
-            vec![Respond::Fail(ProviderError::UnknownConnection)].into(),
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
         )),
         inner_attempts: Arc::new(AtomicU64::new(0)),
         inner_retries: 0,
@@ -1492,7 +1525,9 @@ fn fallback_off_never_substitutes_and_leaves_the_task_paused() {
         Config::parse_validated(&fallback_config("fallback = { mode = \"off\" }")).expect("valid");
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -1506,9 +1541,14 @@ fn fallback_off_never_substitutes_and_leaves_the_task_paused() {
     assert!(
         matches!(
             &error,
-            ModelError::Provider(ProviderError::UnknownConnection)
+            ModelError::Provider(ProviderError::UnknownConnection { connection })
+                if connection == "local"
         ),
         "off reports the provider's own error: {error}"
+    );
+    assert!(
+        error.to_string().contains("unknown connection local"),
+        "the denial names the missing id: {error}"
     );
     assert_eq!(
         sent.lock().expect("wire log lock").len(),
@@ -1555,7 +1595,9 @@ fn fallback_candidate_failing_eligibility_or_egress_never_receives_the_request()
 
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -1669,7 +1711,9 @@ fn cancel_then_late_provider_callback_produces_no_new_dispatch_or_effect() {
         .expect("valid");
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -1759,8 +1803,12 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
     config.connections.remove("gone");
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "reserve".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -1811,10 +1859,29 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
                 },
                 CandidateRejection {
                     connection: "reserve".to_string(),
-                    cause: RejectionCause::SendFailed(ProviderError::UnknownConnection),
+                    cause: RejectionCause::SendFailed(ProviderError::UnknownConnection {
+                        connection: "reserve".to_string(),
+                    }),
                 },
             ]),
         "wrong rejection: {error}"
+    );
+    // the display carries the same refusal the typed fields hold:
+    // every rejected candidate with its gate, then the attempted sends
+    let display = error.to_string();
+    assert!(
+        display.contains(
+            "rejected gone: connection no longer declared, \
+             web: api_key connection requires a separate live grant, \
+             denied: outside the account entitlement, \
+             shadowed: outside the purpose's eligible list, \
+             reserve: send failed: provider capability unavailable: model references unknown connection reserve"
+        ),
+        "the exhausted display names each rejected candidate and its gate: {display}"
+    );
+    assert!(
+        display.contains("attempted reserve"),
+        "the exhausted display names the send that ran: {display}"
     );
     // the typed provider cause stays on the error chain — the variant
     // heap-boxes the source so `ModelError` stays small, so the chain node
@@ -1824,7 +1891,7 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
     assert!(
         matches!(
             source.map(|boxed| &**boxed),
-            Some(ProviderError::UnknownConnection)
+            Some(ProviderError::UnknownConnection { connection }) if connection == "local"
         ),
         "the primary provider error stays typed on the error chain"
     );
@@ -1867,8 +1934,12 @@ fn send_failure_walks_the_admitted_chain_in_order() {
         vec![
             // the primary send fails, then reserve's admitted substitute
             // fails its own send — the walk continues to shadowed
-            Respond::Fail(ProviderError::UnknownConnection),
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "reserve".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -1943,8 +2014,12 @@ fn failed_send_leaves_no_phantom_epoch() {
     .expect("valid");
     let (mut broker, _sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "reserve".to_string(),
+            }),
         ],
         0,
     );
@@ -1960,7 +2035,9 @@ fn failed_send_leaves_no_phantom_epoch() {
         } if attempted == &vec!["reserve".to_string()]
             && rejected == &vec![CandidateRejection {
                 connection: "reserve".to_string(),
-                cause: RejectionCause::SendFailed(ProviderError::UnknownConnection),
+                cause: RejectionCause::SendFailed(ProviderError::UnknownConnection {
+                    connection: "reserve".to_string(),
+                }),
             }]),
         "wrong rejection: {error}"
     );
@@ -2006,8 +2083,12 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
         vec![
             // the primary send fails into the pause, the picked
             // substitute's own send fails, the retried pick lands
-            Respond::Fail(ProviderError::UnknownConnection),
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "reserve".to_string(),
+            }),
             Respond::Delegate,
         ],
         0,
@@ -2060,7 +2141,8 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     assert!(
         matches!(
             &picked,
-            ModelError::Provider(ProviderError::UnknownConnection)
+            ModelError::Provider(ProviderError::UnknownConnection { connection })
+                if connection == "reserve"
         ),
         "wrong rejection: {picked}"
     );
@@ -2120,8 +2202,12 @@ fn manual_fallback_with_no_servable_candidate_exhausts_instead_of_wedging() {
         "eligible = [\"local\"]\nfallback = { mode = \"manual\" }",
     ))
     .expect("valid");
-    let (mut broker, sent, _inner) =
-        scripted_broker(vec![Respond::Fail(ProviderError::UnknownConnection)], 0);
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![Respond::Fail(ProviderError::UnknownConnection {
+            connection: "local".to_string(),
+        })],
+        0,
+    );
     let manifest = broker
         .prepare("relay", &config, "/world/wedge", "goal: wedge")
         .expect("manifest");
@@ -2178,8 +2264,12 @@ fn manual_fallback_with_no_servable_candidate_exhausts_instead_of_wedging() {
 fn a_failed_prepare_never_rewrites_the_dispatch_recheck_view() {
     let config = Config::parse_validated(&fallback_config("fallback = { mode = \"manual\" }"))
         .expect("valid");
-    let (mut broker, _sent, _inner) =
-        scripted_broker(vec![Respond::Fail(ProviderError::UnknownConnection)], 0);
+    let (mut broker, _sent, _inner) = scripted_broker(
+        vec![Respond::Fail(ProviderError::UnknownConnection {
+            connection: "local".to_string(),
+        })],
+        0,
+    );
     let manifest = broker
         .prepare("relay", &config, "/world/view", "goal: view")
         .expect("manifest");
@@ -2228,7 +2318,9 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
             // attempt A confirms its tool effect through the loopback
             Respond::Delegate,
             // attempt B's stream breaks on the primary send
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
             // the reserve continues the broken stream through the real
             // loopback — nothing about the reply is preconstructed
             Respond::Delegate,
@@ -2434,14 +2526,18 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
     let mut config = Config::parse_validated(&fallback_config(
         "fallback = { mode = \"auto\", chain = [\
              { mode = \"fixed\", connection = \"probed\", model_id = \"probed-model\" }] }\n\
-         [connections.probed]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"vault:probed\"\nprofile = \"p\"\n\
+         [connections.probed]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"keyring:rivect-test/probed\"\nprofile = \"p\"\n\
          [profiles.p]\ncredential_ref = \"keyring:rivect-test/p\"",
     ))
     .expect("valid");
     let (mut broker, sent, _inner) = scripted_broker(
         vec![
-            Respond::Fail(ProviderError::UnknownConnection),
-            Respond::Fail(ProviderError::UnknownConnection),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "probed".to_string(),
+            }),
         ],
         0,
     );
@@ -2490,4 +2586,48 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
         "only the two scripted primary sends ran — a rejected candidate never received a request"
     );
     assert_eq!(broker.accounted_requests(), 0);
+}
+
+/// A declared id `dialect_for` reserves fails the send gate with the
+/// build truth — no installed adapter serves the recorded dialect — a
+/// distinct typed denial from an adapter declining an offered id, and
+/// the exhausted display carries it per candidate.
+#[test]
+fn a_reserved_connection_denies_with_the_unserved_dialect_truth() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.openai]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11439\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n\
+         [models.purposes.relay]\n\
+         model = { mode = \"fixed\", connection = \"openai\", model_id = \"reserved-model\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(Vec::new(), 0);
+    let manifest = broker
+        .prepare("relay", &config, "/world/reserved", "goal: reserved")
+        .expect("the declared reserved candidate ranks");
+    let error = broker
+        .dispatch("/world/reserved", &manifest)
+        .expect_err("the reserved id denies before any send");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::DialectUnserved { connection, dialect })
+                if connection == "openai" && *dialect == Dialect::Responses
+        ),
+        "the denial is the typed build truth: {error}"
+    );
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert_eq!(
+        source.to_string(),
+        "connection openai is reserved for dialect responses; no installed adapter serves it in this build",
+        "the display carries the honest build truth, not adapter blame"
+    );
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "the reserved id never reached the wire"
+    );
 }

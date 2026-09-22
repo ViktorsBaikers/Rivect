@@ -568,6 +568,15 @@ fn connection_endpoint_enforces_the_trust_boundary() {
         ("https://", false),
         ("http://", false),
         ("ftp://api.openai.com/v1", false),
+        // loopback smuggling: strict parsing admits no hex, integer,
+        // octal, short-form, trailing-dot, case or mapped-v6 bypass
+        ("http://0x7f.1:11434", false),
+        ("http://2130706433:11434", false),
+        ("http://0177.0.0.1:11434", false),
+        ("http://127.1:11434", false),
+        ("http://localhost.:11434", false),
+        ("http://LOCALHOST:11434", false),
+        ("http://[::ffff:127.0.0.1]:11434", false),
     ] {
         let text = format!(
             "config_version = 1\n\
@@ -2206,6 +2215,104 @@ fn cli_root_level_edit_miss_answers_unknown_root_key_like_the_file_surface() {
     );
 }
 
+/// The additive `connections.<name>.*` edit targets carry the same
+/// declared-connection discipline the file surface enforces (DEC-013):
+/// a set or unset naming an undeclared connection is refused by
+/// `UnknownConnectionReference` before the edit materializes a stub
+/// table — the file keeps its bytes and a fresh runtime still opens.
+#[test]
+fn config_set_on_an_undeclared_connection_is_rejected_and_leaves_the_file_untouched() {
+    let mut config = Config::parse_validated(&support::base_config()).expect("valid");
+
+    for key in ["connections.ghost.region", "connections.ghost.profile"] {
+        let set_error = config
+            .set(key, ConfigValue::Text("value".to_string()))
+            .expect_err("an undeclared connection refuses set");
+        expect_stage(&set_error, Stage::Schema);
+        assert!(
+            matches!(
+                &set_error.issue,
+                ConfigIssue::UnknownConnectionReference { connection }
+                    if connection == "ghost"
+            ),
+            "the typed refusal names the connection: {set_error}"
+        );
+        assert!(
+            set_error.to_string().contains("connections.ghost"),
+            "the display names the refused connection: {set_error}"
+        );
+        let unset_error = config
+            .reset(key)
+            .expect_err("an undeclared connection refuses unset");
+        assert!(
+            matches!(
+                &unset_error.issue,
+                ConfigIssue::UnknownConnectionReference { connection }
+                    if connection == "ghost"
+            ),
+            "the typed refusal names the connection: {unset_error}"
+        );
+    }
+
+    // positive control: the declared connection still edits and resets
+    config
+        .set(
+            "connections.primary.region",
+            ConfigValue::Text("us-east-1".to_string()),
+        )
+        .expect("a declared connection edits");
+    config
+        .reset("connections.primary.region")
+        .expect("a declared connection resets");
+
+    // auto-creation stays legal for the models tree
+    config
+        .set(
+            "models.purposes.fresh.effort",
+            ConfigValue::Effort(EffortAssign::Fixed {
+                value: rivect::config::EffortLevel::High,
+            }),
+        )
+        .expect("a fresh purpose still materializes");
+
+    // the wire path: the refused write never reaches the file, and the
+    // document a fresh runtime opens is still the shipped one
+    let (mut world, session) = carrier_world("cli-undeclared-connection");
+    let target = world.root.join("config.toml");
+    let before = std::fs::read(&target).expect("config bytes");
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7410, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.ghost.region", "value": "us-east-1" }
+    }));
+    assert_eq!(
+        response["error"]["data"]["message"],
+        "schema connections.ghost.region: unknown connection reference: connections.ghost",
+        "the wire refusal names the connection: {response}"
+    );
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7411, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.unset" },
+                    "key": "connections.ghost.profile" }
+    }));
+    assert_eq!(
+        response["error"]["data"]["message"],
+        "schema connections.ghost.profile: unknown connection reference: connections.ghost",
+        "the wire refusal names the connection: {response}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("config bytes"),
+        before,
+        "the refused edits never touched the file"
+    );
+    let root = world.root.clone();
+    drop(world);
+    let mut reopened = support::open_world_at(root, None);
+    let _reopen_session = reopened.open_session("reopen-after-refusal");
+}
+
 /// F1: the edit surface's scope walk reaches every scope table the file
 /// surface raises from — the models tree answers MODELS_KEYS, PURPOSE_KEYS
 /// and GROUP_KEYS csvs, never a root-level miss.
@@ -3567,19 +3674,22 @@ fn new_connection_and_profile_keys_are_additive_and_strict_validated() {
         Some("keyring:rivect/p3"),
         "the refused write left nothing"
     );
-    // the shipped defaults document the complete commented profile
-    // block — the connection header, region, profile binding, profile
-    // table, and its scoped credential_ref — and nothing ships live
+    // the shipped defaults document a complete commented connection —
+    // kind, endpoint with the trust boundary, the scoped credential_ref,
+    // region and the profile binding with its table — nothing ships live
     let shipped = rivect::config::SHIPPED_DEFAULTS_TOML;
     assert!(
         shipped.contains(
-            "# [connections.<id>]\n\
+            "# [connections.openai]\n\
+             # kind = \"api_key\"\n\
+             # endpoint = \"https://api.openai.com/v1\"\n\
+             # credential_ref = \"keyring:rivect/openai\"\n\
              # region = \"us-east-1\"\n\
              # profile = \"default\"\n\
-             # [profiles.<name>]\n\
+             # [profiles.default]\n\
              # credential_ref = \"keyring:rivect/default\"\n"
         ),
-        "the complete commented profile block ships verbatim"
+        "the complete commented connection block ships verbatim"
     );
     for line in shipped.lines() {
         let trimmed = line.trim_start();

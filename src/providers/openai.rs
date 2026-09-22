@@ -236,10 +236,13 @@ impl OpenAiProvider {
         let contract = contract_for(connection).ok_or(ProviderError::DialectMismatch {
             connection: connection.to_string(),
         })?;
-        let conn = config
-            .connections
-            .get(connection)
-            .ok_or(ProviderError::UnknownConnection)?;
+        let conn =
+            config
+                .connections
+                .get(connection)
+                .ok_or_else(|| ProviderError::UnknownConnection {
+                    connection: connection.to_string(),
+                })?;
         if let Some(region) = &conn.region {
             return Err(ProviderError::RegionMismatch {
                 connection: connection.to_string(),

@@ -44,8 +44,10 @@ pub struct ProviderReply {
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProviderError {
-    #[error("provider capability unavailable: model references unknown connection")]
-    UnknownConnection,
+    /// DEC-014: the model names a connection id the catalogue does not
+    /// declare — the denial names the id, like every sibling.
+    #[error("provider capability unavailable: model references unknown connection {connection}")]
+    UnknownConnection { connection: String },
     #[error("provider capability unavailable: {kind} connection requires a separate live grant")]
     LiveGrantRequired { kind: ConnKind },
     /// DEC-014: the named store class cannot serve the call — absent,
@@ -115,6 +117,17 @@ pub enum ProviderError {
     /// keys on the literal connection id, never an auth label.
     #[error("connection {connection} does not speak this adapter's dialect")]
     DialectMismatch { connection: String },
+    /// The id [`dialect_for`] reserves failed the send gate: no
+    /// installed adapter serves its recorded dialect in this build —
+    /// the honest build truth, distinct from an adapter declining an
+    /// id it was offered.
+    #[error(
+        "connection {connection} is reserved for dialect {dialect}; no installed adapter serves it in this build"
+    )]
+    DialectUnserved {
+        connection: String,
+        dialect: Dialect,
+    },
     /// The manifest carries no pinned model id for the wire request —
     /// an auto assignment resolves its model at catalogue time, which
     /// this adapter does not hold.
@@ -190,10 +203,10 @@ pub enum SecretRefError {
 
 /// A scoped credential reference — the only token that may cross from a
 /// store into config, adapters, diagnostics or a manifest (INV-001). The
-/// grammar is `store:account[/origin/]profile`, the same `store:scope`
-/// shape `scoped_secret_ref` validates at config ingress and re-validated
-/// here on the trust boundary. A `SecretRef` names where material lives;
-/// it never contains material.
+/// grammar is `store:account[/origin/]profile` — the one shape config
+/// ingress validates through this same [`SecretRef::parse`], so no
+/// admitted-at-ingress ref can fail the trust boundary's re-check. A
+/// `SecretRef` names where material lives; it never contains material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRef {
     store: StoreKind,
@@ -892,7 +905,9 @@ pub(crate) fn resolve_credential_in(
     connection: &str,
 ) -> Result<SecretRef, ProviderError> {
     let Some(conn) = connections.get(connection) else {
-        return Err(ProviderError::UnknownConnection);
+        return Err(ProviderError::UnknownConnection {
+            connection: connection.to_string(),
+        });
     };
     if let Some(profile) = &conn.profile {
         let key = format!("profiles.{profile}.credential_ref");
@@ -964,6 +979,16 @@ pub enum Dialect {
     /// compatible host wired under the literal `custom-chat-completions`
     /// id shares (HZN-008 class S).
     ChatCompletions,
+}
+
+impl std::fmt::Display for Dialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Responses => "responses",
+            Self::Gemini => "gemini",
+            Self::ChatCompletions => "chat-completions",
+        })
+    }
 }
 
 /// The recorded dialect for a literal connection id; `None` for ids
@@ -1091,7 +1116,9 @@ pub fn offline_eligible(
         return Ok(());
     };
     match connections.get(&fixed.connection) {
-        None => Err(ProviderError::UnknownConnection),
+        None => Err(ProviderError::UnknownConnection {
+            connection: fixed.connection.clone(),
+        }),
         Some(_) if offline_usable(connections, profiles, &fixed.connection) => Ok(()),
         Some(entry) => Err(ProviderError::LiveGrantRequired { kind: entry.kind }),
     }

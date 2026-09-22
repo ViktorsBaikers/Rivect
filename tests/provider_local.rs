@@ -472,7 +472,7 @@ async fn dialect_is_keyed_on_the_literal_connection_id() {
     assert!(
         matches!(
             outcome,
-            Err(ModelError::Provider(ProviderError::DialectMismatch { .. }))
+            Err(ModelError::Provider(ProviderError::DialectUnserved { .. }))
         ),
         "a foreign pin through this broker is the typed dialect denial: {outcome:?}"
     );
@@ -650,7 +650,7 @@ fn a_pin_no_adapter_serves_is_denied_before_send_or_accounting() {
     assert!(
         matches!(
             outcome,
-            Err(ModelError::Provider(ProviderError::DialectMismatch { .. }))
+            Err(ModelError::Provider(ProviderError::DialectUnserved { .. }))
         ),
         "a pin the broker's provider cannot serve is a typed denial: {outcome:?}"
     );
@@ -694,7 +694,7 @@ fn a_reserved_dialect_id_is_never_loopback_served() {
     assert!(
         matches!(
             outcome,
-            Err(ModelError::Provider(ProviderError::DialectMismatch { .. }))
+            Err(ModelError::Provider(ProviderError::DialectUnserved { .. }))
         ),
         "a dialect-reserved id is denied, never fabricated: {outcome:?}"
     );

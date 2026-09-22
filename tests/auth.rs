@@ -23,7 +23,7 @@
 
 mod support;
 
-use rivect::config::{Config, ConfigValue, EffortAssign, ModelAssign};
+use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
 use rivect::model::RequestManifest;
 use rivect::providers::{
     CredentialStore, FlightedStore, KeyringBackend, ProviderError, SecretRef, SecretRefError,
@@ -171,7 +171,7 @@ fn journal_rows() -> Vec<Value> {
 /// error text never reaches either surface.
 fn error_variant(err: &ProviderError) -> &'static str {
     match err {
-        ProviderError::UnknownConnection => "UnknownConnection",
+        ProviderError::UnknownConnection { .. } => "UnknownConnection",
         ProviderError::LiveGrantRequired { .. } => "LiveGrantRequired",
         ProviderError::StoreUnavailable { .. } => "StoreUnavailable",
         ProviderError::StoreAmbiguous { .. } => "StoreAmbiguous",
@@ -183,6 +183,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::CredentialMalformed { .. } => "CredentialMalformed",
         ProviderError::CredentialBaseMismatch { .. } => "CredentialBaseMismatch",
         ProviderError::DialectMismatch { .. } => "DialectMismatch",
+        ProviderError::DialectUnserved { .. } => "DialectUnserved",
         ProviderError::UnpinnedModel { .. } => "UnpinnedModel",
         ProviderError::RegionMismatch { .. } => "RegionMismatch",
         ProviderError::Transport { .. } => "Transport",
@@ -2091,12 +2092,18 @@ fn credential_resolution_follows_profile_then_connection_precedence() {
         ),
         "a profile with no credential_ref is CredentialUnresolved"
     );
+    let err = resolve_credential(&config, "undeclared")
+        .expect_err("an undeclared connection is denied typed");
     assert!(
         matches!(
-            resolve_credential(&config, "undeclared"),
-            Err(ProviderError::UnknownConnection)
+            &err,
+            ProviderError::UnknownConnection { connection } if connection == "undeclared"
         ),
-        "an undeclared connection stays UnknownConnection"
+        "an undeclared connection stays UnknownConnection naming the id: {err}"
+    );
+    assert!(
+        err.to_string().contains("undeclared"),
+        "the denial renders the missing id: {err}"
     );
 
     // A profile-bound ref whose trailing scope segment disagrees with the
@@ -2157,9 +2164,10 @@ fn secret_ref_parses_only_scoped_store_tokens() {
 }
 
 /// INV-006 in two layers: `credential_ref` rejects non-scoped shapes at
-/// config ingress, and a well-formed ref naming a non-native store —
-/// `env:`, `file:`, `vault:` — is refused by the seam at resolution. No
-/// path turns either into plaintext credential material.
+/// config ingress, and a well-formed ref naming a store this build does
+/// not serve — `env:`, `file:`, `vault:` — is refused by the same
+/// grammar at the same boundary. No path turns either into plaintext
+/// credential material.
 #[test]
 fn config_rejects_inline_and_secret_looking_credential_values() {
     for value in [SECRET_CANARY, "plaintext", "keyring:has whitespace"] {
@@ -2171,13 +2179,20 @@ fn config_rejects_inline_and_secret_looking_credential_values() {
     }
     for value in ["env:OPENAI_API_KEY", "vault:corp/key", "file:tmp/secret"] {
         let toml = dec013_config().replace("keyring:rivect/direct", value);
-        let config = Config::parse_validated(&toml).expect("shape-valid ref parses");
+        let Err(error) = Config::parse_validated(&toml) else {
+            panic!("an unsupported store label is refused at ingress: {value}")
+        };
         assert!(
             matches!(
-                resolve_credential(&config, "direct"),
-                Err(ProviderError::CredentialUnresolved { .. })
+                &error.issue,
+                ConfigIssue::UnsupportedCredentialStore { store }
+                    if store.as_str() == value.split(':').next().expect("store label")
             ),
-            "a non-native store label is a typed denial at the seam: {value}"
+            "the typed refusal names the refused store class: {error}"
+        );
+        assert!(
+            !error.to_string().contains(value),
+            "the refusal never echoes the credential value: {error}"
         );
     }
 }

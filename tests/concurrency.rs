@@ -2192,7 +2192,9 @@ impl Provider for FailingProvider {
     }
 
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
-        Err(ProviderError::UnknownConnection)
+        Err(ProviderError::UnknownConnection {
+            connection: "local".to_string(),
+        })
     }
 }
 
@@ -2285,7 +2287,9 @@ fn every_outcome_and_error_class_maps_to_a_distinct_typed_observation() {
         ControllerError::Policy(PolicyError::Revoked {
             grant_id: "grant-1".to_string(),
         }),
-        ControllerError::Model(ModelError::Provider(ProviderError::UnknownConnection)),
+        ControllerError::Model(ModelError::Provider(ProviderError::UnknownConnection {
+            connection: "local".to_string(),
+        })),
         ControllerError::Executor(ExecutorError::Cancelled),
         ControllerError::Scheduler(SchedulerError::UnknownNode { node: 7 }),
         ControllerError::Serialization(
