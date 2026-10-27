@@ -13,6 +13,9 @@ pub enum LocalKind {
     ConfigUnset,
     DecisionsControl,
     ProjectInit,
+    SessionNew,
+    ViewClear,
+    ContextCompact,
     PlannedUnimplemented,
     Unknown,
 }
@@ -29,11 +32,14 @@ const CONFIG_UNSET_DESCRIPTION: &str =
     "Remove one config override through the shared schema and journaled publication.";
 const DECISIONS_CONTROL_DESCRIPTION: &str = "Inspect or switch the decision mode (ask, auto, inherit); mutations ride the journaled config publication.";
 const PROJECT_INIT_DESCRIPTION: &str = "Build or repair the project index generation for the pinned project root; the parse runs in the capped index worker, never in-process.";
+const SESSION_NEW_DESCRIPTION: &str = "Start an independent conversation on this connection; the previous session stays resumable and nothing durable is deleted.";
+const VIEW_CLEAR_DESCRIPTION: &str =
+    "Clear the transcript and streamed output; the stored conversation is kept.";
+const CONTEXT_COMPACT_DESCRIPTION: &str = "Fold one task's episodic history into its continuation checkpoint; a fold that would not shorten the context is refused typed.";
 const PLANNED_COMMAND_DESCRIPTION: &str = "A planned command in this catalog.";
 const UNAVAILABLE_REASON: &str = "known command without a handler in this build";
 
 const PLANNED_LOCAL_KINDS: &[&str] = &[
-    "session.new",
     "session.list",
     "session.search",
     "session.resume",
@@ -42,7 +48,6 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
     "session.recap",
     "session.exit",
     "settings.open",
-    "context.compact",
     "context.view",
     "usage.view",
     "checkpoint.preview",
@@ -53,7 +58,6 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
     "workflow.control",
     "harness.control",
     "docs.status",
-    "view.clear",
     "config.list",
     "config.search",
     "config.get",
@@ -80,6 +84,9 @@ pub fn local_command_kind(kind: &str) -> LocalKind {
         // resolve here, not only in the describe listing.
         "decisions.control" | "decisions" => LocalKind::DecisionsControl,
         "project.init" => LocalKind::ProjectInit,
+        "session.new" => LocalKind::SessionNew,
+        "view.clear" => LocalKind::ViewClear,
+        "context.compact" => LocalKind::ContextCompact,
         _ if PLANNED_LOCAL_KINDS.contains(&kind) => LocalKind::PlannedUnimplemented,
         _ => LocalKind::Unknown,
     }
@@ -138,6 +145,21 @@ pub fn describe() -> Page<CommandDescriptor> {
             PROJECT_INIT_DESCRIPTION,
             true,
             BUSY_READ_INDEX,
+        ),
+        descriptor(
+            "session.new",
+            &[],
+            SESSION_NEW_DESCRIPTION,
+            true,
+            BUSY_WRITE,
+        ),
+        descriptor("view.clear", &[], VIEW_CLEAR_DESCRIPTION, true, BUSY_READ),
+        descriptor(
+            "context.compact",
+            &[],
+            CONTEXT_COMPACT_DESCRIPTION,
+            true,
+            BUSY_WRITE,
         ),
     ];
     for kind in PLANNED_LOCAL_KINDS {

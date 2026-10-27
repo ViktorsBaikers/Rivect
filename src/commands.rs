@@ -5,9 +5,10 @@
 use crate::config::{self, EffectiveConfig};
 use crate::context::{ContextError, IsolatedCause};
 use crate::contracts::{
-    AnswerSelection, CommandResult, ErrorCode, LocalCommand, LocalCommandResult, OptionId,
-    PAGE_DEFAULT, Page, ProjectInitResult, QuestionId, QuestionResult, RetryClass, RpcErrorBody,
-    RpcResponse, SCHEMA_VERSION, SessionId, TaskId, WireError,
+    AnswerSelection, CommandId, CommandResult, ErrorCode, Lifecycle, LocalCommand,
+    LocalCommandResult, OptionId, PAGE_DEFAULT, PAGE_MAX, Page, ProjectInitResult, QuestionId,
+    QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId, TaskId,
+    WireError,
 };
 use crate::index::{
     CarryPolicy, Completeness, GenerationState, IndexWatcher, PartialReason, ProjectGraph,
@@ -1154,6 +1155,8 @@ enum RequestError {
     InvalidKey { key: String },
     #[error("unknown local command {command}")]
     UnknownLocalCommand { command: String },
+    #[error("task {task_id} is running")]
+    SessionInFlight { task_id: String },
     #[error("{command} is known but not available in this build")]
     KnownCommandUnavailable { command: String },
     #[error("artifact.read is known but not available in this build")]
@@ -1197,6 +1200,7 @@ impl RequestError {
             | Self::ArtifactReadUnavailable
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
             Self::MachineAnswerDenied => ErrorCode::Denied,
+            Self::SessionInFlight { .. } => ErrorCode::Conflict,
             Self::SourceDigestMismatch => ErrorCode::Conflict,
             Self::Serialization => ErrorCode::InternalError,
             Self::ProjectIndex(source) => source.code(),
@@ -1215,6 +1219,7 @@ impl RequestError {
             Self::UnknownMethod { .. } => -32601,
             Self::UnsupportedVersion { .. }
             | Self::KnownCommandUnavailable { .. }
+            | Self::SessionInFlight { .. }
             | Self::ArtifactReadUnavailable
             | Self::MachineAnswerDenied
             | Self::SourceDigestMismatch
@@ -1937,6 +1942,110 @@ fn commit_config_edit(
     admit_config_command(rt, id, command, key, &edit, before)
 }
 
+/// `/new`: an independent conversation on the same connection. The
+/// previous session is left exactly as it is — every task, event and
+/// attachment stays addressable through `session.attach` — and the fresh
+/// session minted here gets its own bootstrap identity, so the receipt
+/// key cannot replay the old one.
+///
+/// A task that is running refuses the switch. Nothing pauses a running
+/// task on a session switch in this build, so detaching would leave it
+/// with no surface at all while it keeps spending: the refusal names the
+/// task and spends nothing instead of doing that silently. Blocked,
+/// waiting and paused work is not spending anything and stays addressable
+/// through `session.attach`, so it leaves the conversation startable.
+fn session_new(rt: &mut Runtime, id: Value, params: &Value, connection_id: &str) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let running = match running_task(&rt.owner.store, &session) {
+        Ok(task) => task,
+        Err(err) => return store_error(id, &err),
+    };
+    if let Some(task_id) = running {
+        return request_error(id, RequestError::SessionInFlight { task_id: task_id.0 });
+    }
+    let bootstrap = format!("new-{}", CommandId::generate().0);
+    match rt.owner.store.open_session(&bootstrap, connection_id, None) {
+        Ok((session_id, _, _, _)) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "session.new",
+                "session_id": session_id.0,
+                "previous_session_id": session.0,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// The task `/new` would detach mid-run: the oldest task of `session_id`
+/// still `running`. A session with no live task at all — every task
+/// settled — answers in one bounded row read, so a long settled
+/// conversation never walks its history here. Live work does need the
+/// walk: only the rows carry a lifecycle, and walking the pages is what
+/// keeps the answer true for a running task sitting past `PAGE_MAX`.
+fn running_task(store: &TaskStore, session: &SessionId) -> Result<Option<TaskId>, StoreError> {
+    if store.in_flight_task(session)?.is_none() {
+        return Ok(None);
+    }
+    let mut scanned = None;
+    let mut offset = 0_u64;
+    loop {
+        let page = match store.task_status_page(session, PAGE_MAX, scanned) {
+            Ok(page) => page,
+            // Task rows moved between two pages. This read is a safety
+            // check, not a snapshot: the bounded read still names a live
+            // task, so the switch refuses on that rather than failing on a
+            // cursor the operator cannot see.
+            Err(StoreError::Conflict(ConflictCause::CursorGeneration { .. })) => {
+                return store.in_flight_task(session);
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(running) = page
+            .items
+            .iter()
+            .find(|status| status.lifecycle == Lifecycle::Running)
+        {
+            return Ok(Some(running.task_id.clone()));
+        }
+        if page.next_cursor.is_none() {
+            return Ok(None);
+        }
+        offset += u64::from(PAGE_MAX);
+        scanned = Some((page.snapshot_generation, offset));
+    }
+}
+
+/// `context.compact`: one forced compaction of a task's episodic history
+/// (AC-049) — the continuation the near-full warning offers. The fold is the
+/// owner's own, so a history it would not shorten is the owner's typed
+/// refusal rather than a silent no-op the surface could report as a success.
+fn context_compact(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    match rt.store_writer().force_compaction(&session, &task) {
+        Ok(report) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "context.compact",
+                "checkpoint_id": report.checkpoint_id,
+                "before_bytes": report.before_bytes,
+                "after_bytes": report.after_bytes,
+                "folded_records": report.folded_records,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
 /// `decisions.control`: one op per call. `status` is a pure read — the
 /// key's served entry plus the mode a fork would observe — and rejects
 /// mutation fields; `ask`/`auto`/`inherit` write `decisions.mode`
@@ -2450,6 +2559,24 @@ fn handle_method(
                     decisions_control(rt, id, &params, ingress)
                 }
                 crate::tools::LocalKind::ProjectInit => project_init(rt, id, &params),
+                crate::tools::LocalKind::SessionNew => session_new(rt, id, &params, connection_id),
+                crate::tools::LocalKind::ContextCompact => context_compact(rt, id, &params),
+                // The rows belong to the TUI's own projection, so the
+                // handler answers the kind it served and no durable
+                // effect: the composer clears them on the same answer.
+                crate::tools::LocalKind::ViewClear => {
+                    let Some(session) = session_param(&params) else {
+                        return missing_session(id);
+                    };
+                    RpcResponse::ok(
+                        id,
+                        json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "kind": "view.clear",
+                            "session_id": session.0,
+                        }),
+                    )
+                }
                 crate::tools::LocalKind::Unknown => request_error(
                     id,
                     RequestError::UnknownLocalCommand {
@@ -3414,7 +3541,7 @@ fn page_limit(params: &Value) -> Result<u32, RequestError> {
     if page_size == 0 {
         return Err(RequestError::InvalidPageSize);
     }
-    let bounded = page_size.min(u64::from(crate::contracts::PAGE_MAX));
+    let bounded = page_size.min(u64::from(PAGE_MAX));
     match u32::try_from(bounded) {
         Ok(limit) => Ok(limit),
         Err(_) => Err(RequestError::InvalidPageSize),

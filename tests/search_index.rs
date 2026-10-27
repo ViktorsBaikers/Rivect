@@ -1113,6 +1113,157 @@ fn version_aware_lookup_after_lockfile_change() {
 }
 
 #[test]
+fn catalogue_reports_session_new_and_view_clear_available_p7() {
+    // Provider side: the page the catalogue serves carries both kinds as
+    // available with a description of their own, not the generic planned
+    // one every unbuilt kind shares.
+    let page = rivect::tools::describe();
+    let planned = rivect::tools::planned_local_kinds();
+    let planned_description = page
+        .items
+        .iter()
+        .find(|entry| !entry.available)
+        .expect("a still-planned kind stays on the page")
+        .description
+        .clone();
+    for kind in ["session.new", "view.clear"] {
+        let entry = page
+            .items
+            .iter()
+            .find(|entry| entry.canonical_id == kind)
+            .unwrap_or_else(|| panic!("{kind} stays visible in the catalog"));
+        assert!(entry.available, "{kind} is built: {entry:?}");
+        assert!(entry.unavailability_reason.is_none(), "{kind}: {entry:?}");
+        assert!(!entry.description.is_empty(), "{kind}: {entry:?}");
+        assert_ne!(
+            entry.description, planned_description,
+            "{kind} describes itself instead of borrowing the planned line"
+        );
+        assert!(!entry.busy_policy.is_empty(), "{kind}: {entry:?}");
+        assert!(
+            !planned.contains(&kind),
+            "a promoted kind leaves the planned set: {kind}"
+        );
+    }
+
+    // Consumer side: the same canonical id dispatches to a handler rather
+    // than to the known-but-unavailable refusal.
+    let mut world = open_world("promoted-session-view", None);
+    let session = world.open_session("promoted-session-view");
+    let created = world.dispatch(&corpus_command_execute(&session, "session.new", json!(1)));
+    assert!(
+        created.get("error").is_none(),
+        "session.new is served: {created}"
+    );
+    let fresh = created["result"]["session_id"]
+        .as_str()
+        .expect("the started conversation's id");
+    assert_ne!(
+        fresh, session.0,
+        "session.new starts a conversation instead of re-entering the same one"
+    );
+    let cleared = world.dispatch(&corpus_command_execute(&session, "view.clear", json!(2)));
+    assert!(
+        cleared.get("error").is_none(),
+        "view.clear is served: {cleared}"
+    );
+    assert_eq!(cleared["result"]["kind"], "view.clear", "{cleared}");
+}
+
+#[test]
+fn catalogue_reports_context_compact_available_p7() {
+    // Provider side: the kind the near-full warning offers is on the page
+    // with a description of its own, not the generic planned line every
+    // unbuilt kind shares, and it has left the planned set.
+    let page = rivect::tools::describe();
+    let planned = rivect::tools::planned_local_kinds();
+    let planned_description = page
+        .items
+        .iter()
+        .find(|entry| !entry.available)
+        .expect("a still-planned kind stays on the page")
+        .description
+        .clone();
+    let kind = "context.compact";
+    let entry = page
+        .items
+        .iter()
+        .find(|entry| entry.canonical_id == kind)
+        .unwrap_or_else(|| panic!("{kind} stays visible in the catalog"));
+    assert!(entry.available, "{kind} is built: {entry:?}");
+    assert!(entry.unavailability_reason.is_none(), "{kind}: {entry:?}");
+    assert!(!entry.description.is_empty(), "{kind}: {entry:?}");
+    assert_ne!(
+        entry.description, planned_description,
+        "{kind} describes itself instead of borrowing the planned line"
+    );
+    assert!(!entry.busy_policy.is_empty(), "{kind}: {entry:?}");
+    assert!(
+        !planned.contains(&kind),
+        "a promoted kind leaves the planned set: {kind}"
+    );
+
+    // Consumer side: the same canonical id reaches a handler, and the fold
+    // it runs is the owner's own — the history shrinks, which is what the
+    // warning promised it would do.
+    let mut world = open_world("promoted-context-compact", None);
+    let session = world.open_session("promoted-context-compact");
+    let task = world.create_task(&session, "compact-promoted");
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&task)
+        .expect("obligations");
+    let scope = format!("task:{}", task.0);
+    for index in 0..4_u8 {
+        let observation = format!(
+            "read the notes {}",
+            "a scoped line of the file ".repeat(400)
+        );
+        world
+            .runtime
+            .store_writer()
+            .insert_evidence(
+                &task,
+                0,
+                &scope,
+                &observation,
+                &format!("{index:02x}").repeat(32),
+            )
+            .expect("evidence row");
+    }
+    let before = world
+        .runtime
+        .store()
+        .assembled_context(&task)
+        .expect("context assembles")
+        .text
+        .len();
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7410, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": kind }, "task_id": task.0 }
+    }));
+    assert!(
+        response.get("error").is_none(),
+        "{kind} is served: {response}"
+    );
+    assert_eq!(response["result"]["kind"], kind, "{response}");
+    let after = response["result"]["after_bytes"]
+        .as_u64()
+        .expect("the fold reports what it left");
+    assert!(
+        after < before as u64,
+        "the fold shrinks the context it folded: {before} -> {after}"
+    );
+    assert_eq!(
+        response["result"]["folded_records"],
+        json!(4),
+        "the checkpoint names the records it folded: {response}"
+    );
+}
+
+#[test]
 fn unpromoted_planned_kinds_remain_unavailable() {
     // `project.init` is promoted: the triple edit moved it out of the
     // planned list onto a real descriptor.

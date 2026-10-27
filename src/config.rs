@@ -18,14 +18,16 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlErr
 
 pub const WORKFLOW_KEY: &str = "workflow.enabled";
 pub const DECISIONS_MODE_KEY: &str = "decisions.mode";
+pub const CONTEXT_AUTO_COMPACT_KEY: &str = "context.auto_compact";
 
 /// The keys `config.read` serves, named once for the read surface's
-/// unknown-key hint (DEC-013): the workflow flag, the decision mode plus
-/// the additive profile keys. Name-bearing keys print their pattern form —
-/// a connection or profile name is never itself a known key.
-pub const READ_KEY_HINT: &str = "workflow.enabled, decisions.mode, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
+/// unknown-key hint (DEC-013): the workflow flag, the decision mode, the
+/// context guard plus the additive profile keys. Name-bearing keys print
+/// their pattern form — a connection or profile name is never itself a
+/// known key.
+pub const READ_KEY_HINT: &str = "workflow.enabled, decisions.mode, context.auto_compact, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
 
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -119,6 +121,8 @@ pub enum ConfigIssue {
     UnsupportedFallbackMode { mode: String },
     #[error("workflow.enabled must be a boolean")]
     WorkflowEnabledNotBoolean,
+    #[error("context.auto_compact must be a boolean")]
+    ContextAutoCompactNotBoolean,
     #[error("unsupported decisions.mode {mode}; known modes: ask, auto, inherit")]
     UnsupportedDecisionMode { mode: String },
     #[error("{key} is required, not an override; reset removes overrides only")]
@@ -333,6 +337,13 @@ pub struct Workflow {
     pub enabled: Option<bool>,
 }
 
+/// The context guard (DEC-013): `auto_compact` controls the near-full
+/// warning only — nothing compacts automatically in this build.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Context {
+    pub auto_compact: Option<bool>,
+}
+
 /// The wire spelling of `decisions.mode`: `ask` and `auto` resolve
 /// directly; `inherit` names the absent override — the layer below
 /// (today the shipped `ask`) answers instead.
@@ -392,6 +403,7 @@ pub struct Config {
     pub version: u64,
     pub workflow: Workflow,
     pub decisions: Decisions,
+    pub context: Context,
     pub connections: BTreeMap<String, Connection>,
     /// Declared credential profiles (DEC-013): `connections.<id>.profile`
     /// references must resolve here — a dangling profile is the same
@@ -447,15 +459,24 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return Ok(());
         };
-        let (version, workflow, decisions, connections, profiles, models) =
+        let (version, workflow, decisions, context, connections, profiles, models) =
             validated_document(doc)?;
         self.version = version;
         self.workflow = workflow;
         self.decisions = decisions;
+        self.context = context;
         self.connections = connections;
         self.profiles = profiles;
         self.models = models;
         Ok(())
+    }
+
+    /// Whether the near-full guard is silenced: only an explicit
+    /// `auto_compact = true` does it, because nothing compacts
+    /// automatically in this build (DEC-013, DEC-020).
+    #[must_use]
+    pub fn auto_compact(&self) -> bool {
+        self.context.auto_compact.unwrap_or(false)
     }
 
     /// The mode a material fork observes: `inherit` resolves through to
@@ -549,7 +570,10 @@ impl Config {
         let target = edit_target(key)?;
         let item = match value {
             ConfigValue::Bool(enabled) => {
-                if !matches!(&target, EditTarget::WorkflowEnabled) {
+                if !matches!(
+                    &target,
+                    EditTarget::WorkflowEnabled | EditTarget::ContextAutoCompact
+                ) {
                     return Err(type_mismatch(key));
                 }
                 toml_edit::value(enabled)
@@ -681,7 +705,7 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return;
         };
-        let Ok((version, workflow, decisions, connections, profiles, models)) =
+        let Ok((version, workflow, decisions, context, connections, profiles, models)) =
             validated_document(doc)
         else {
             // Targeted edits intentionally remain usable while another path
@@ -691,6 +715,7 @@ impl Config {
         self.version = version;
         self.workflow = workflow;
         self.decisions = decisions;
+        self.context = context;
         self.connections = connections;
         self.profiles = profiles;
         self.models = models;
@@ -728,6 +753,9 @@ impl Config {
         }
         let segments: Vec<&str> = key.split('.').collect();
         match segments.as_slice() {
+            // A key with a documented default serves the effective value,
+            // never null: the shipped document already answers it.
+            ["context", "auto_compact"] => Some(Value::Bool(self.auto_compact())),
             ["decisions", "mode"] => Some(
                 self.decisions
                     .mode
@@ -768,7 +796,7 @@ impl Config {
 /// segment is never itself a known key, and an empty segment reads as
 /// unknown.
 pub fn is_readable_key(key: &str) -> bool {
-    if key == WORKFLOW_KEY || key == DECISIONS_MODE_KEY {
+    if key == WORKFLOW_KEY || key == DECISIONS_MODE_KEY || key == CONTEXT_AUTO_COMPACT_KEY {
         return true;
     }
     let segments: Vec<&str> = key.split('.').collect();
@@ -797,12 +825,13 @@ fn credential_ref_admitted(raw: &str, key: &str) -> Result<(), ConfigIssue> {
 }
 
 /// The typed view `validated_document` extracts from the raw TOML:
-/// version, workflow table, decisions table, connections, credential
-/// profiles and the models section, all schema-checked.
+/// version, workflow, decisions and context tables, connections,
+/// credential profiles and the models section, all schema-checked.
 type ParsedDocument = (
     u64,
     Workflow,
     Decisions,
+    Context,
     BTreeMap<String, Connection>,
     BTreeMap<String, Profile>,
     Models,
@@ -812,6 +841,7 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
     let mut version = None;
     let mut workflow = Workflow::default();
     let mut decisions = Decisions::default();
+    let mut context = Context::default();
     let mut connections = BTreeMap::new();
     let mut profiles = BTreeMap::new();
     let mut models = Models::default();
@@ -882,6 +912,30 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
                                 ConfigIssue::UnknownKey {
                                     key: other.to_string(),
                                     known: DECISIONS_KEYS,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            "context" => {
+                let table = table_like(key, item)?;
+                for (field, value) in table.iter() {
+                    match field {
+                        "auto_compact" => {
+                            context.auto_compact = Some(value.as_bool().ok_or_else(|| {
+                                ConfigError::schema(
+                                    CONTEXT_AUTO_COMPACT_KEY,
+                                    ConfigIssue::ContextAutoCompactNotBoolean,
+                                )
+                            })?);
+                        }
+                        other => {
+                            return Err(ConfigError::schema(
+                                format!("context.{other}"),
+                                ConfigIssue::UnknownKey {
+                                    key: other.to_string(),
+                                    known: CONTEXT_KEYS,
                                 },
                             ));
                         }
@@ -1015,13 +1069,22 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             check_chain_refs(&connections, fallback, &format!("{key}.fallback.chain"))?;
         }
     }
-    Ok((version, workflow, decisions, connections, profiles, models))
+    Ok((
+        version,
+        workflow,
+        decisions,
+        context,
+        connections,
+        profiles,
+        models,
+    ))
 }
 
 #[derive(Debug)]
 enum EditTarget {
     WorkflowEnabled,
     DecisionsMode,
+    ContextAutoCompact,
     DefaultsModel,
     DefaultsEffort,
     DefaultsFallback,
@@ -1055,6 +1118,7 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
     match segments.as_slice() {
         ["workflow", "enabled"] => Ok(EditTarget::WorkflowEnabled),
         ["decisions", "mode"] => Ok(EditTarget::DecisionsMode),
+        ["context", "auto_compact"] => Ok(EditTarget::ContextAutoCompact),
         ["models", "defaults", "model"] => Ok(EditTarget::DefaultsModel),
         ["models", "defaults", "effort"] => Ok(EditTarget::DefaultsEffort),
         ["models", "defaults", "fallback"] => Ok(EditTarget::DefaultsFallback),
@@ -1086,6 +1150,7 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
 /// divergent schema.
 const WORKFLOW_KEYS: &[&str] = &["enabled"];
 const DECISIONS_KEYS: &[&str] = &["mode"];
+const CONTEXT_KEYS: &[&str] = &["auto_compact"];
 const CONNECTION_KEYS: &[&str] = &["kind", "endpoint", "credential_ref", "region", "profile"];
 const PROFILE_KEYS: &[&str] = &["credential_ref"];
 const MODELS_KEYS: &[&str] = &["defaults", "groups", "purposes"];
@@ -1132,6 +1197,10 @@ fn unknown_edit_key(key: &str) -> ConfigError {
         "decisions" => match rest {
             [] => not_editable_key(key),
             _ => unknown_scope_key(key, DECISIONS_KEYS),
+        },
+        "context" => match rest {
+            [] => not_editable_key(key),
+            _ => unknown_scope_key(key, CONTEXT_KEYS),
         },
         "connections" => match rest {
             [] | [_] => not_editable_key(key),
@@ -1233,6 +1302,7 @@ fn target_path(target: &EditTarget) -> (Vec<&str>, &str) {
     match target {
         EditTarget::WorkflowEnabled => (vec!["workflow"], "enabled"),
         EditTarget::DecisionsMode => (vec!["decisions"], "mode"),
+        EditTarget::ContextAutoCompact => (vec!["context"], "auto_compact"),
         EditTarget::DefaultsModel => (vec!["models", "defaults"], "model"),
         EditTarget::DefaultsEffort => (vec!["models", "defaults"], "effort"),
         EditTarget::DefaultsFallback => (vec!["models", "defaults"], "fallback"),
@@ -1524,6 +1594,13 @@ fn wire_value(key: &str, value: &Value) -> Result<ConfigValue, ConfigError> {
     let target = edit_target(key)?;
     match (&target, value) {
         (EditTarget::WorkflowEnabled, Value::Bool(enabled)) => Ok(ConfigValue::Bool(*enabled)),
+        // Both carriers answer one cause for the same value: a non-boolean
+        // is the key's own refusal, not the generic type mismatch.
+        (EditTarget::ContextAutoCompact, Value::Bool(enabled)) => Ok(ConfigValue::Bool(*enabled)),
+        (EditTarget::ContextAutoCompact, _) => Err(ConfigError::schema(
+            CONTEXT_AUTO_COMPACT_KEY,
+            ConfigIssue::ContextAutoCompactNotBoolean,
+        )),
         (EditTarget::DecisionsMode, Value::String(mode)) => Ok(ConfigValue::DecisionMode(
             DecisionModeValue::parse(mode).ok_or_else(|| {
                 ConfigError::schema(
@@ -1786,6 +1863,14 @@ fn validate_target(
                 return Err(ConfigError::schema(
                     key,
                     ConfigIssue::WorkflowEnabledNotBoolean,
+                ));
+            }
+        }
+        EditTarget::ContextAutoCompact => {
+            if item.as_bool().is_none() {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::ContextAutoCompactNotBoolean,
                 ));
             }
         }

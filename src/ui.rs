@@ -5,6 +5,7 @@
 use crate::commands::{
     Ingress, ResumeAdmission, Runtime, dispatch_runtime_request, report_boot_diagnostics,
 };
+use crate::config::Config;
 use crate::contracts::{
     AnswerSelection, Availability, CommandId, EffectClass, Event, Question, QuestionId, SessionId,
     TEXT_MAX_BYTES, TaskId,
@@ -166,10 +167,63 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The near-full context warning as the dock projection paints it: the share
+/// of the admission ceiling the measured context fills and the task its bytes
+/// were measured from, so the continuation the row offers folds that very task
+/// (AC-072, DEC-013). The row itself is written at paint time, where the width
+/// it has to fit is known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextWarning {
+    pub task_id: TaskId,
+    pub percent: usize,
+}
+
+/// How long a dock projection may reuse its own measurement under an
+/// unchanged key. The key is the subject task's revision, but the assembled
+/// context also moves with records `runtime.status` does not carry — an
+/// episode appended, a history folded — while the revision stays put, so the
+/// key alone would serve a stale number until the task's next transition.
+const CONTEXT_MEASURE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The identity of one near-full measurement: whose context was measured, the
+/// revision the status payload reported for it, and the setting the line is
+/// gated on.
+#[derive(Debug, Clone, PartialEq)]
+struct ContextMeasureKey {
+    task_id: TaskId,
+    revision: Option<u64>,
+    auto_compact: bool,
+}
+
+/// The dock projection's remembered measurement — the key it was taken under,
+/// the line it produced, and the beat it was taken on.
+#[derive(Debug)]
+struct ContextMeasurement {
+    key: ContextMeasureKey,
+    warning: Option<ContextWarning>,
+    taken: Instant,
+}
+
+impl ContextMeasurement {
+    /// Whether this measurement still answers `key` at `now`: the key has not
+    /// moved and the backstop interval has not passed.
+    fn answers(&self, key: &ContextMeasureKey, now: Instant) -> bool {
+        self.key == *key && now.saturating_duration_since(self.taken) < CONTEXT_MEASURE_INTERVAL
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalView {
     pub status: String,
     pub dock: Vec<String>,
+    /// The warning the dock projection paints while the assembled context is
+    /// nearly full and auto-compaction is off. Recomputed on the projection's
+    /// own beat from the store, so it never outlives the condition it names.
+    pub context_warning: Option<ContextWarning>,
+    /// The dock's own fault mark: the second consecutive failed projection
+    /// read says so on the status band's own row, where a transcript past the
+    /// panel cannot clip it. Cleared by the next read that succeeds.
+    pub dock_stale: Option<String>,
     pub transcript: Vec<String>,
     pub composer: String,
     /// Streaming external (worker) output with its typed settlement
@@ -719,8 +773,9 @@ pub const TRANSCRIPT_INPUT: &str = "Input is available. Enter a task or a clarif
 pub const TRANSCRIPT_NO_PROJECT: &str =
     "No project or index is selected; ordinary replies are not blocked.";
 pub const HELP_TEXT: &str = concat!(
-    "Commands: Enter submits a task; /help shows help; ",
-    "Esc quits; Ctrl-C cancels.",
+    "Commands: Enter submits a task; Esc quits; Ctrl-C cancels.\n",
+    "/help shows this list; /new starts an independent conversation;\n",
+    "/clear clears the view; /compact folds the context.",
 );
 
 /// Status line while external output streams (design-brief §4).
@@ -742,6 +797,8 @@ pub fn initial_view() -> LocalView {
     LocalView {
         status: STATUS_DISCONNECTED.to_string(),
         dock: vec![DOCK_EMPTY.to_string()],
+        context_warning: None,
+        dock_stale: None,
         transcript: vec![
             TRANSCRIPT_INPUT.to_string(),
             TRANSCRIPT_NO_PROJECT.to_string(),
@@ -760,9 +817,18 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
     terminal.draw(|frame| {
         let area = frame.area();
         let output_active = view.output.is_active();
-        let mut rows = Vec::with_capacity(6);
+        let mut rows = Vec::with_capacity(7);
         rows.push(Constraint::Length(1));
         rows.push(Constraint::Min(1));
+        // The status band takes two rows while it has something to say: a
+        // message chained after the transcript is painted below the panel the
+        // moment the transcript outgrows it, and the long session AC-072
+        // targets is that shape. Its rows are one message each — the warning
+        // and the dock's fault mark — so a dead refresh never hides behind a
+        // warning. An idle band takes no row, so the panels keep the geometry
+        // they have without it.
+        let band = status_band(view, usize::from(area.width));
+        rows.push(Constraint::Length(if band.is_empty() { 0 } else { 2 }));
         if output_active {
             rows.push(Constraint::Length(1));
             rows.push(Constraint::Min(1));
@@ -784,7 +850,11 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             ),
             chunks[1],
         );
-        let mut next = 2;
+        frame.render_widget(
+            Paragraph::new(band).wrap(ratatui::widgets::Wrap { trim: true }),
+            chunks[2],
+        );
+        let mut next = 3;
         if output_active {
             frame.render_widget(
                 Paragraph::new(output_status_line(
@@ -1074,6 +1144,21 @@ fn wrapped_line_rows(line: &Line<'_>, max_line_width: u16) -> usize {
 
 const TUI_CONNECTION: &str = "tui";
 
+/// A frame the runtime refused, carried as the dispatch error's payload:
+/// the typed refusal a caller paints as one transcript line, kept apart
+/// from a transport fault, which still leaves through the loop's error
+/// path. Same carrier shape as [`TuiExitError`].
+#[derive(Debug)]
+struct RejectedRequest(String);
+
+impl fmt::Display for RejectedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RejectedRequest {}
+
 fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Value> {
     let request = serde_json::to_string(&request)
         .map_err(|source| io::Error::other(format!("tui request encoding failed: {source}")))?;
@@ -1088,7 +1173,7 @@ fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Val
             .and_then(Value::as_str)
             .or_else(|| error.get("message").and_then(Value::as_str))
             .unwrap_or("request rejected");
-        return Err(io::Error::other(format!("tui request rejected: {message}")));
+        return Err(io::Error::other(RejectedRequest(message.to_owned())));
     }
     response
         .get("result")
@@ -1255,9 +1340,24 @@ fn is_context_only(error: &(dyn std::error::Error + 'static)) -> bool {
             .is_some_and(|payload| payload.is::<RuntimeOpenFailure>())
 }
 
+/// The injected `runtime.status` failure the dock refresh's fault leg
+/// reads, named so a test never matches on a bare `is_err`.
+#[cfg(test)]
+const STATUS_FAULT_REPORT: &str = "runtime.status unavailable";
+
 struct TuiDispatch {
     runtime: Runtime,
     session_id: String,
+    /// The dock projection's own measurement of the conversation it watches:
+    /// measured once per key change, not once per beat, because assembling
+    /// the context is the expensive half of the projection and its bytes only
+    /// move when the task's state does.
+    context_measurement: Option<ContextMeasurement>,
+    /// Test-only fault seam: the next `status()` calls fail, so the dock
+    /// refresh's failure path is reachable from the PTY harness. No
+    /// production path ever arms it.
+    #[cfg(test)]
+    status_faults: usize,
 }
 
 impl TuiDispatch {
@@ -1310,7 +1410,17 @@ impl TuiDispatch {
         Ok(Self {
             runtime,
             session_id,
+            context_measurement: None,
+            #[cfg(test)]
+            status_faults: 0,
         })
+    }
+
+    /// Arms the injected `status()` failures the dock refresh has to
+    /// survive: the counter is one-shot and consumed call by call.
+    #[cfg(test)]
+    fn fail_status(&mut self, count: usize) {
+        self.status_faults = count;
     }
 
     fn submit(&mut self, goal: &str) -> io::Result<(String, String)> {
@@ -1344,7 +1454,183 @@ impl TuiDispatch {
         Ok((status.to_owned(), task_id.to_owned()))
     }
 
+    /// `view.clear`: the runtime answers that the kind is served; the
+    /// rows it drops are the composer's own projection, so they are
+    /// cleared by the caller and nothing durable is addressed.
+    fn clear_view(&mut self) -> io::Result<()> {
+        dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "command": { "kind": "view.clear" },
+                }
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// `session.new`: a fresh conversation on this connection. The
+    /// dispatch follows the session the runtime minted, so every later
+    /// request — status included — reads the new one, and the session it
+    /// returns stays addressable for resume.
+    fn new_session(&mut self) -> io::Result<String> {
+        let previous = self.session_id.clone();
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "command": { "kind": "session.new" },
+                }
+            }),
+        )?;
+        let session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("tui session.new omitted session_id"))?;
+        self.session_id = session_id.to_string();
+        Ok(previous)
+    }
+
+    /// The dock's projection for one pass: the rows `runtime.status` carries
+    /// plus the near-full warning the assembled context earns. Both reads are
+    /// one projection, so a store that cannot answer one of them leaves the
+    /// previous frame painted instead of half-updating it.
+    fn dock_projection(
+        &mut self,
+        pending: Option<&TaskId>,
+    ) -> io::Result<(Vec<String>, Option<ContextWarning>)> {
+        let status = self.status()?;
+        let warning = self.near_full_warning(&status, pending)?;
+        Ok((task_dock(&status), warning))
+    }
+
+    /// The near-full warning for the conversation the operator is reading
+    /// (AC-072, DEC-013): the task this view submitted while it is still
+    /// pending, else the newest row the status page carries — never the
+    /// oldest, which in a session with more than one task is a conversation
+    /// that may have settled long ago. The measurement is the context's own
+    /// assembled bytes, never a token estimate. `[context] auto_compact =
+    /// true` silences the line, because nothing compacts automatically in
+    /// this build — the key controls the guard and nothing else.
+    ///
+    /// Assembling a context is the expensive half of the beat, and the bytes
+    /// only move when the task's state does, so the measurement is remembered
+    /// under the subject's revision (with its id and the setting) and reused
+    /// until that key moves or [`CONTEXT_MEASURE_INTERVAL`] passes.
+    fn near_full_warning(
+        &mut self,
+        status: &Value,
+        pending: Option<&TaskId>,
+    ) -> io::Result<Option<ContextWarning>> {
+        let auto_compact = self
+            .runtime
+            .effective()
+            .parsed
+            .as_ref()
+            .is_some_and(Config::auto_compact);
+        let items = status
+            .get("todo")
+            .and_then(|todo| todo.get("items"))
+            .and_then(Value::as_array);
+        let newest = items
+            .and_then(|items| items.last())
+            .and_then(|item| item.get("task_id"))
+            .and_then(Value::as_str)
+            .map(|task_id| TaskId(task_id.to_string()));
+        let Some(task_id) = pending.cloned().or(newest) else {
+            return Ok(None);
+        };
+        let revision = items
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("task_id").and_then(Value::as_str) == Some(task_id.0.as_str())
+                })
+            })
+            .and_then(|item| item.get("task_revision"))
+            .and_then(Value::as_u64);
+        let key = ContextMeasureKey {
+            task_id: task_id.clone(),
+            revision,
+            auto_compact,
+        };
+        let now = Instant::now();
+        if let Some(measured) = &self.context_measurement
+            && measured.answers(&key, now)
+        {
+            return Ok(measured.warning.clone());
+        }
+        // `[context] auto_compact = true` silences the line, and nothing
+        // compacts automatically in this build — the key controls the guard
+        // and nothing else, so a silenced projection assembles nothing.
+        let warning = if auto_compact {
+            None
+        } else {
+            let context = self
+                .runtime
+                .store()
+                .assembled_context(&task_id)
+                .map_err(|error| {
+                    io::Error::other(format!("tui context measurement failed: {error}"))
+                })?;
+            nearly_full_warning(&task_id, context.text.len())
+        };
+        self.context_measurement = Some(ContextMeasurement {
+            key,
+            warning: warning.clone(),
+            taken: now,
+        });
+        Ok(warning)
+    }
+
+    /// `context.compact`: the owner's forced compaction of one task's
+    /// episodic history (AC-049) — the continuation the near-full warning
+    /// names, reached from the composer. An accepted fold reports what it
+    /// replaced and what it left; a fold the owner refuses stays the
+    /// caller's to paint, never an exit.
+    fn compact_context(&mut self, task: &TaskId) -> io::Result<(u64, u64, u64)> {
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "command": { "kind": "context.compact" },
+                    "task_id": task.0,
+                }
+            }),
+        )?;
+        let read = |name: &str| -> io::Result<u64> {
+            result
+                .get(name)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| io::Error::other(format!("tui context.compact omitted {name}")))
+        };
+        Ok((
+            read("before_bytes")?,
+            read("after_bytes")?,
+            read("folded_records")?,
+        ))
+    }
+
     fn status(&mut self) -> io::Result<Value> {
+        #[cfg(test)]
+        if self.status_faults > 0 {
+            self.status_faults -= 1;
+            return Err(io::Error::other(STATUS_FAULT_REPORT));
+        }
         // Dock contract: request one PAGE_MAX response; it does not walk cursors.
         dispatch_tui_request(
             &mut self.runtime,
@@ -1864,6 +2150,72 @@ fn note_open_failure(view: &mut LocalView, failure: &TuiOpenError) {
 /// Esc. 64 events covers a realistic paste-tail burst by a wide margin.
 const PRE_PAINT_DRAIN_CAP: usize = 64;
 
+/// The continuation the near-full warning names — the same token the
+/// composer parses, so the printed command and the accepted input cannot
+/// diverge (DEC-014).
+const COMPACT_TOKEN: &str = "/compact";
+/// The share of the admission ceiling at which the assembled context counts
+/// as nearly full (AC-072, DEC-013). The ceiling is
+/// [`crate::contracts::MODEL_WIRE_MAX_BYTES`], the largest request the broker
+/// admits; the context is measured in the bytes `assembled_context` serves,
+/// because the tree has no token counter to measure it with.
+const CONTEXT_NEARLY_FULL_PERCENT: usize = 80;
+
+/// The warning a context of `bytes` bytes earns, or nothing while it still
+/// has room. The task its continuation folds rides along: with more than one
+/// conversation open, the bytes alone do not say whose.
+fn nearly_full_warning(task: &TaskId, bytes: usize) -> Option<ContextWarning> {
+    let percent = bytes.saturating_mul(100) / crate::contracts::MODEL_WIRE_MAX_BYTES;
+    (percent >= CONTEXT_NEARLY_FULL_PERCENT).then(|| ContextWarning {
+        task_id: task.clone(),
+        percent,
+    })
+}
+
+/// The warning's own row of the status band: the condition and the
+/// continuation every width reads, and — only while the row has room for it —
+/// the task that continuation folds. The band's rows are one message each, so
+/// a name the row cannot hold is dropped rather than wrapped into the dock's
+/// fault mark below it.
+fn warning_row(warning: &ContextWarning, width: usize) -> String {
+    let head = format!(
+        "Context {}% full (auto-compact off): {COMPACT_TOKEN}",
+        warning.percent
+    );
+    let named = format!("{head} folds task {}", warning.task_id.0);
+    if named.chars().count() <= width {
+        named
+    } else {
+        head
+    }
+}
+
+/// The band between the transcript and the dock: the near-full warning first,
+/// the dock's own fault mark second, one message per row so a dead refresh
+/// stays visible while a warning is live too. Both sit here rather than after
+/// the transcript, whose tail a long session pushes off the panel. Each
+/// message is written to fit its row at the 60-column acceptance geometry;
+/// the wrap is the backstop for a fault cause that outruns it.
+fn status_band(view: &LocalView, width: usize) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    if let Some(warning) = &view.context_warning {
+        rows.push(sanitize_status_cause(&warning_row(warning, width)));
+    }
+    if let Some(stale) = &view.dock_stale {
+        // The cause is foreign text: a newline in it would take the row the
+        // message below owns, so the row keeps nothing but its own line.
+        rows.push(sanitize_status_cause(stale).replace('\n', " "));
+    }
+    rows.join("\n")
+}
+
+/// The loop's input wait: one pass per interval.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The dock follows `runtime.status` on the loop's own beat, so a
+/// lifecycle change paints on the next pass at the latest — and `render`
+/// never reads the store for it.
+const DOCK_REFRESH_INTERVAL: Duration = POLL_INTERVAL;
+
 /// Runs the minimal fullscreen loop. Esc quits normally, Ctrl-C cancels
 /// (exit 130). The guard guarantees terminal restoration on both paths and on
 /// panic. Once the guard and the runtime are gone, the owner's lock release
@@ -1889,6 +2241,216 @@ where
     F: FnMut(&mut TuiDispatch, Option<&TaskId>) -> io::Result<()>,
 {
     settle_released(tui_loop(data_root, between_passes))
+}
+
+/// Painted for a leading-slash input the vocabulary does not serve: the
+/// operator gets the way back to the vocabulary, not a model call.
+const COMPOSER_USAGE: &str = "Unknown command. /help lists the available commands.";
+
+/// Painted when `/clear` drops the rows: what was read is gone from the
+/// view, and what was stored behind it is not.
+const VIEW_CLEARED_NOTE: &str = "View cleared; the stored conversation is unchanged.";
+
+/// Painted when a `context.compact` is accepted: what the fold replaced and
+/// what it left, so the operator sees the context actually shrank.
+const CONTEXT_COMPACTED: &str = "Context compacted";
+
+/// Painted when `/compact` runs with no conversation to fold: a plain line,
+/// never the wire's own field name.
+const NOTHING_TO_COMPACT: &str = "No conversation to compact yet; submit a task first.";
+
+/// Drops what the operator was reading — transcript rows and streamed
+/// output — and keeps the session and the stored conversation: `/clear` is
+/// a view operation, never a delete.
+fn reset_view_rows(view: &mut LocalView) {
+    let fresh = initial_view();
+    view.transcript = fresh.transcript;
+    // The dock is a projection of `runtime.status`, refreshed by the loop,
+    // so `/clear` does not blank it: live task state is not reading surface.
+    view.output = fresh.output;
+    view.output_scroll = fresh.output_scroll;
+}
+
+/// The runtime's own refusal message, when a dispatch fault is a rejected
+/// frame rather than a transport failure.
+fn rejection_message(error: &io::Error) -> Option<&str> {
+    error
+        .get_ref()?
+        .downcast_ref::<RejectedRequest>()
+        .map(|refusal| refusal.0.as_str())
+}
+
+/// A refused frame is a painted line, and only a transport fault is a
+/// fault: the owner's refusal names the command on the transcript so the
+/// loop keeps serving the session the operator is reading, while the fault
+/// still leaves through the loop's error path.
+fn refusal_or_fault(view: &mut LocalView, command: &str, error: io::Error) -> io::Result<()> {
+    match rejection_message(&error) {
+        Some(cause) => {
+            view.transcript.push(format!("{command} refused: {cause}"));
+            Ok(())
+        }
+        None => Err(error),
+    }
+}
+
+/// The loop's dispatch, opened on the first command that needs it. A
+/// failed open's carried verdicts fold into the propagated error: the
+/// alternate screen owns the terminal, so stderr is a dead channel here.
+fn ensure_dispatch<'a>(
+    tui_dispatch: &'a mut Option<TuiDispatch>,
+    view: &mut LocalView,
+    data_root: &Path,
+) -> io::Result<&'a mut TuiDispatch> {
+    if tui_dispatch.is_none() {
+        let dispatch = TuiDispatch::open(data_root).map_err(TuiOpenError::into_io_error)?;
+        surface_boot_diagnostics(view, &dispatch.runtime);
+        *tui_dispatch = Some(dispatch);
+    }
+    tui_dispatch
+        .as_mut()
+        .ok_or_else(|| io::Error::other("tui dispatch unavailable"))
+}
+
+/// Runs one Enter on a non-empty composer. A command the vocabulary
+/// serves runs; a refusal paints its typed line and the loop keeps
+/// serving, while a transport fault still leaves through the loop's error
+/// path. The draft is consumed on every path: the operator asked once.
+///
+/// Only an exact match is a command: a document that mentions `/clear` on
+/// one line, an argument and a near miss are never one, so none of them can
+/// run, and none of them becomes a paid task either.
+fn run_composer_command(
+    input: &str,
+    view: &mut LocalView,
+    tui_dispatch: &mut Option<TuiDispatch>,
+    data_root: &Path,
+    pending_task: &mut Option<TaskId>,
+) -> io::Result<()> {
+    view.composer.clear();
+    match input {
+        "/help" => {
+            view.transcript.push(HELP_TEXT.to_string());
+            Ok(())
+        }
+        "/new" => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match dispatch.new_session() {
+                Ok(previous) => {
+                    reset_view_rows(view);
+                    // The card poll follows the conversation the operator
+                    // is reading: a question the previous session left
+                    // pending is not this conversation's to answer.
+                    *pending_task = None;
+                    // The warning measured the previous session's task, so
+                    // the continuation it names is not this conversation's
+                    // either: a `/compact` before the next projection beat
+                    // would fold work this view no longer shows.
+                    view.context_warning = None;
+                    // The dock is a projection: the next beat paints it
+                    // from the new session, so no read here can exit the
+                    // TUI for a frame it is about to draw anyway.
+                    view.transcript.push(format!(
+                        "New conversation: {} (previous: {previous})",
+                        dispatch.session_id
+                    ));
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        "/clear" => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match dispatch.clear_view() {
+                Ok(()) => {
+                    reset_view_rows(view);
+                    view.transcript.push(VIEW_CLEARED_NOTE.to_string());
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        COMPACT_TOKEN => {
+            // The task the painted warning measured is the one its
+            // continuation folds; without a warning the composer folds the
+            // task it last submitted. With neither there is no conversation
+            // to fold, and a plain line says so instead of the wire's own
+            // field name.
+            let task = view
+                .context_warning
+                .as_ref()
+                .map(|warning| warning.task_id.clone())
+                .or_else(|| pending_task.clone());
+            let Some(task) = task else {
+                view.transcript.push(NOTHING_TO_COMPACT.to_string());
+                return Ok(());
+            };
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match dispatch.compact_context(&task) {
+                Ok((before, after, folded)) => {
+                    view.transcript.push(format!(
+                        "{CONTEXT_COMPACTED}: {before} → {after} bytes, {folded} records folded."
+                    ));
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        _ if input.starts_with('/') => {
+            view.transcript.push(COMPOSER_USAGE.to_string());
+            Ok(())
+        }
+        _ => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            let (status, task_id) = dispatch.submit(input)?;
+            *pending_task = Some(TaskId(task_id.clone()));
+            view.dock = task_dock(&dispatch.status()?);
+            view.transcript
+                .push(format!("Submitted task: {input} ({status}: {task_id})"));
+            Ok(())
+        }
+    }
+}
+
+/// Re-projects the dock from `runtime.status`: the row an operator
+/// watches is a live view of the store, not the value a submit cached. The
+/// near-full warning rides the same projection, so the line that names the
+/// condition is dropped by the beat that sees it gone (AC-072). A failed
+/// read keeps the rows and the warning already painted — a dead refresh must
+/// never blank a dock that was telling the truth a pass ago — and from the
+/// second consecutive failure on, the status line marks itself, so a dead
+/// refresh cannot pass for a healthy idle dock and a long transcript cannot
+/// clip the mark. The mark holds for the whole run rather than one beat of
+/// it: the fail it names is the run, so every later failing beat writes the
+/// same line again (idempotent) and only a read that succeeds clears it. The
+/// dock is already stale, and a line rewritten per interval would bury the
+/// operator under one fault.
+fn refresh_dock(
+    view: &mut LocalView,
+    dispatch: Option<&mut TuiDispatch>,
+    pending: Option<&TaskId>,
+    failures: &mut u32,
+) {
+    let Some(dispatch) = dispatch else {
+        return;
+    };
+    match dispatch.dock_projection(pending) {
+        Ok((rows, warning)) => {
+            view.dock = rows;
+            view.context_warning = warning;
+            view.dock_stale = None;
+            *failures = 0;
+        }
+        Err(error) => {
+            *failures += 1;
+            if *failures >= 2 {
+                view.dock_stale = Some(format!(
+                    "dock refresh failed: {}",
+                    sanitize_status_cause(&error.to_string())
+                ));
+            }
+        }
+    }
 }
 
 /// The loop body: its terminal guard and runtime are dropped when it
@@ -1929,9 +2491,25 @@ where
     // The last submitted task — the one a material fork can still open a
     // decision card for while its question stays pending.
     let mut pending_task: Option<TaskId> = None;
+    // The dock projection's own state: when it last read the store and
+    // how many reads in a row have failed.
+    let mut dock_refreshed: Option<Instant> = None;
+    let mut dock_failures = 0;
     loop {
         if let Some(dispatch) = tui_dispatch.as_mut() {
             between_passes(dispatch, pending_task.as_ref())?;
+        }
+        // The dock is refreshed here, at the loop top: the pass that sees
+        // a transition also paints it, and no `?` on this path can unwind
+        // the alternate screen for a read that only re-paints a panel.
+        if dock_refreshed.is_none_or(|last| last.elapsed() >= DOCK_REFRESH_INTERVAL) {
+            dock_refreshed = Some(Instant::now());
+            refresh_dock(
+                &mut view,
+                tui_dispatch.as_mut(),
+                pending_task.as_ref(),
+                &mut dock_failures,
+            );
         }
         // A material fork surfaces through the same store seam: the
         // tracked task's pending question opens its card. While a card
@@ -2005,7 +2583,7 @@ where
                 read()?;
             }
         }
-        if poll(Duration::from_millis(250))? {
+        if poll(POLL_INTERVAL)? {
             let event = read()?;
             if let Some(card) = &view.decision {
                 // Until the card has been visible DECISION_CONSENT_DELAY,
@@ -2087,32 +2665,13 @@ where
                     }
                     (KeyCode::Enter, _) if !view.composer.is_empty() => {
                         let input = view.composer.clone();
-                        if input == "/help" {
-                            view.transcript.push(HELP_TEXT.to_string());
-                            view.composer.clear();
-                        } else {
-                            if tui_dispatch.is_none() {
-                                let dispatch = match TuiDispatch::open(data_root) {
-                                    Ok(dispatch) => dispatch,
-                                    // The alternate screen owns the terminal,
-                                    // so stderr is a dead channel: the carried
-                                    // verdicts fold into the propagated error
-                                    // and print after the guard restores.
-                                    Err(failure) => return Err(failure.into_io_error()),
-                                };
-                                surface_boot_diagnostics(&mut view, &dispatch.runtime);
-                                tui_dispatch = Some(dispatch);
-                            }
-                            let dispatch = tui_dispatch
-                                .as_mut()
-                                .ok_or_else(|| io::Error::other("tui dispatch unavailable"))?;
-                            let (status, task_id) = dispatch.submit(&input)?;
-                            pending_task = Some(TaskId(task_id.clone()));
-                            view.dock = task_dock(&dispatch.status()?);
-                            view.transcript
-                                .push(format!("Submitted task: {input} ({status}: {task_id})"));
-                            view.composer.clear();
-                        }
+                        run_composer_command(
+                            &input,
+                            &mut view,
+                            &mut tui_dispatch,
+                            data_root,
+                            &mut pending_task,
+                        )?;
                     }
                     (KeyCode::Enter, _) => {}
                     (KeyCode::Char(ch), m) if types_text(m) => append_composer_char(&mut view, ch),
@@ -2179,15 +2738,16 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECISION_CONSENT_DELAY, DOCK_EMPTY, DecisionPanel, LoopbackProvider, OUTPUT_SCROLL_HINT,
-        OutputStream, TuiDispatch, TuiOpenError, append_composer_char, append_composer_paste,
-        initial_view, note_open_failure, output_status_line, render, surface_boot_diagnostics,
-        task_dock, types_text, types_text_altgr, wrapped_row_count,
+        CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_CONSENT_DELAY,
+        DOCK_EMPTY, DecisionPanel, LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch,
+        TuiOpenError, append_composer_char, append_composer_paste, initial_view, note_open_failure,
+        output_status_line, render, surface_boot_diagnostics, task_dock, types_text,
+        types_text_altgr, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, Question, TEXT_MAX_BYTES, TaskId};
     use crossterm::event::KeyModifiers;
     use serde_json::json;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Mirrors `commands.rs::tests::BASE_CONFIG`: a publication needs a
     /// validating base plus one settable key to reach the journal.
@@ -2200,6 +2760,40 @@ mod tests {
          model = { mode = \"auto\" }\n\
          effort = { mode = \"auto\" }\n\
          fallback = { mode = \"auto\" }\n";
+
+    /// The dock's remembered measurement answers one key only: a moved
+    /// revision, a changed setting, a different task or an aged entry each
+    /// re-measure, which is what keeps the near-full line following the
+    /// context it names instead of the one it was taken from.
+    #[test]
+    fn a_context_measurement_answers_only_its_own_key() {
+        let key = |task: &str, revision: Option<u64>, auto_compact: bool| ContextMeasureKey {
+            task_id: TaskId(task.to_string()),
+            revision,
+            auto_compact,
+        };
+        let taken = Instant::now();
+        let measurement = ContextMeasurement {
+            key: key("task-1", Some(3), false),
+            warning: None,
+            taken,
+        };
+        assert!(measurement.answers(&key("task-1", Some(3), false), taken));
+        assert!(measurement.answers(
+            &key("task-1", Some(3), false),
+            taken + CONTEXT_MEASURE_INTERVAL - Duration::from_millis(1)
+        ));
+        // The backstop: a state change the status payload does not carry is
+        // re-measured once the interval has passed.
+        assert!(!measurement.answers(
+            &key("task-1", Some(3), false),
+            taken + CONTEXT_MEASURE_INTERVAL
+        ));
+        assert!(!measurement.answers(&key("task-1", Some(4), false), taken));
+        assert!(!measurement.answers(&key("task-1", None, false), taken));
+        assert!(!measurement.answers(&key("task-1", Some(3), true), taken));
+        assert!(!measurement.answers(&key("task-2", Some(3), false), taken));
+    }
 
     /// Each expectation names the renderer's own break decisions, not a
     /// character-count guess: the cases below are exactly where a
@@ -3306,13 +3900,15 @@ mod card_pty {
         reconstruct_screen, squashed, wait_for_screen_text,
     };
     use super::{
-        CommandId, DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, TuiDispatch, dispatch_tui_request,
-        drive_tui, failure_report,
+        COMPACT_TOKEN, CONTEXT_COMPACTED, CONTEXT_MEASURE_INTERVAL, CommandId,
+        DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, DOCK_REFRESH_INTERVAL, NOTHING_TO_COMPACT,
+        TuiDispatch, dispatch_tui_request, drive_tui, failure_report,
     };
     use crate::contracts::{AnswerAttemptOutcome, AnswerSelection, Question, SessionId, TaskId};
     use crate::state::TaskStore;
     use serde::Deserialize;
     use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -3323,6 +3919,11 @@ mod card_pty {
     const CARD_DRIVER_MARKER: &str = "RIVECT_CARD_DRIVER_ROOT";
     const DECISION_PTY_ROWS: usize = 20;
     const DECISION_PTY_COLS: usize = 60;
+    /// The dock legs' viewport: wide enough for one
+    /// `task <id>: <lifecycle> (<reason>)` row, so a frame is compared whole
+    /// instead of as a wrap.
+    const DOCK_PTY_ROWS: usize = 24;
+    const DOCK_PTY_COLS: usize = 80;
     const COMMAND_DEADLINE: Duration = Duration::from_secs(10);
     const CHILD_LIFETIME: Duration = Duration::from_secs(60);
     /// The control command that makes the child panic, and the payload it
@@ -3482,6 +4083,144 @@ mod card_pty {
                 .map(|()| Value::Null)
                 .map_err(|error| error.to_string());
         }
+        if verb == "fail-status" {
+            let count: usize = words
+                .next()
+                .ok_or("fail-status needs a count")?
+                .parse()
+                .map_err(|error: std::num::ParseIntError| error.to_string())?;
+            dispatch.fail_status(count);
+            return Ok(Value::Null);
+        }
+        // A durable task this view never submitted: the composer writes no
+        // dock row for it, so only the projection can paint it.
+        if verb == "seed" {
+            let session_id = dispatch.session_id.clone();
+            dispatch_tui_request(
+                &mut dispatch.runtime,
+                json!({
+                    "jsonrpc": "2.0", "id": 93, "method": "task.submit",
+                    "params": {
+                        "schema_version": 1, "command_id": CommandId::generate().0,
+                        "session_id": session_id, "kind": "create",
+                        "goal": "recover the rollout",
+                        "contract": { "criteria": [], "constraints": [] },
+                    }
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+            return dispatch.status().map_err(|error| error.to_string());
+        }
+        if verb == "recover" {
+            // The restart path: the durable stream re-delivered with its own
+            // duplicates and in reverse order, exactly as a resume may see
+            // it. One consistent projection has to come back out.
+            let task_id = TaskId(words.next().ok_or("recover needs a task id")?.to_string());
+            let session = SessionId(dispatch.session_id.clone());
+            let events = dispatch
+                .runtime
+                .store()
+                .events_after(&session, Some(&task_id), 0, 100)
+                .map_err(|error| error.to_string())?;
+            let mut replayed = events.iter().rev().cloned().collect::<Vec<_>>();
+            replayed.extend(events.iter().cloned());
+            dispatch
+                .runtime
+                .store_writer()
+                .recover_events(&session, &replayed)
+                .map_err(|error| error.to_string())?;
+            return dispatch.status().map_err(|error| error.to_string());
+        }
+        if verb == "new-context" {
+            // The second conversation of the two-task legs, before anything
+            // is recorded in it: a fresh task whose context is still small.
+            let task_id = context_task(dispatch)?;
+            return context_reply(dispatch, &task_id);
+        }
+        if verb == "fill-context" {
+            // The near-full legs' fill. Without an argument the child mints
+            // the context task; a named one is a conversation it already
+            // opened. A handful of large observations — 18 records of
+            // ~49 KiB — carries the assembled context past four fifths of
+            // the admission ceiling while the record list a fold keeps stays
+            // small.
+            let task_id = match words.next() {
+                Some(task_id) => TaskId(task_id.to_string()),
+                None => context_task(dispatch)?,
+            };
+            {
+                let mut writer = dispatch.runtime.store_writer();
+                let scope = format!("task:{}", task_id.0);
+                for index in 0..18_u8 {
+                    let observation = format!(
+                        "read the notes {}",
+                        "a scoped line of the file ".repeat(1800)
+                    );
+                    writer
+                        .insert_evidence(
+                            &task_id,
+                            0,
+                            &scope,
+                            &observation,
+                            &format!("{index:02x}").repeat(32),
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            return context_reply(dispatch, &task_id);
+        }
+        if verb == "context-bytes" {
+            let task_id = TaskId(
+                words
+                    .next()
+                    .ok_or("context-bytes needs a task id")?
+                    .to_string(),
+            );
+            return context_reply(dispatch, &task_id);
+        }
+        if verb == "auto-compact" {
+            // The guard the warning is gated on, written through the owner's
+            // own ingress: the document and the reload are the ones a user
+            // edit takes, so the leg observes the production path.
+            let enabled = match words.next() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err("auto-compact needs on or off".to_string()),
+            };
+            let path = dispatch.runtime.config_path.clone();
+            std::fs::write(
+                &path,
+                format!(
+                    "config_version = 1\n[connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:primary\"\n[models.defaults]\nmodel = {{ mode = \"auto\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"auto\" }}\n[context]\nauto_compact = {enabled}\n"
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            // The owner's own reload, with its typed causes in the report: a
+            // document it refuses says which key and why.
+            dispatch.runtime.reload_config().map_err(|error| {
+                match std::error::Error::source(&error) {
+                    Some(cause) => format!("{error}: {cause}"),
+                    None => error.to_string(),
+                }
+            })?;
+            return dispatch.status().map_err(|error| error.to_string());
+        }
+        if verb == "complete" {
+            // The task the composer tracked, or the one the leg names: a
+            // conversation the parent opened through the fill seam belongs
+            // to no composer submit.
+            let subject = match words.next() {
+                Some(task_id) => TaskId(task_id.to_string()),
+                None => task.cloned().ok_or("complete needs a task id")?,
+            };
+            let session_id = SessionId(dispatch.session_id.clone());
+            let snapshot = dispatch
+                .runtime
+                .store_writer()
+                .complete_if_eligible(&session_id, &subject)
+                .map_err(|error| error.to_string())?;
+            return serde_json::to_value(snapshot.lifecycle).map_err(|error| error.to_string());
+        }
         let task = task.ok_or("no tracked task")?;
         let pending = |dispatch: &TuiDispatch| {
             dispatch
@@ -3494,6 +4233,35 @@ mod card_pty {
         };
         let session = SessionId("decision-pty".to_string());
         match verb {
+            "block" => {
+                // The owner's no-ready transition: a ready-set the plan cannot
+                // serve, not a dispatch and not a model call.
+                dispatch
+                    .runtime
+                    .store_writer()
+                    .mark_no_ready(task)
+                    .map(|()| Value::Null)
+                    .map_err(|error| error.to_string())
+            }
+            "cancel" => {
+                let snapshot = dispatch
+                    .runtime
+                    .store()
+                    .snapshot(task)
+                    .map_err(|error| error.to_string())?;
+                let session_id = SessionId(dispatch.session_id.clone());
+                dispatch
+                    .runtime
+                    .store_writer()
+                    .cancel_task(
+                        &session_id,
+                        task,
+                        snapshot.intent_revision,
+                        Some("operator stop"),
+                    )
+                    .map(|result| json!({ "status": result.status }))
+                    .map_err(|error| error.to_string())
+            }
             "publish" => {
                 let revision: u64 = words
                     .next()
@@ -3608,6 +4376,59 @@ mod card_pty {
             }
             other => Err(format!("unknown card-driver verb {other:?}")),
         }
+    }
+
+    /// One conversation for the near-full legs: a task with a criterion the
+    /// parent can fill, its obligations already materialized so a record
+    /// insert has an obligation to land on. The child mints it, because the
+    /// session its runtime opened is the only one its store answers for.
+    fn context_task(dispatch: &mut TuiDispatch) -> Result<TaskId, String> {
+        let session_id = dispatch.session_id.clone();
+        let created = dispatch_tui_request(
+            &mut dispatch.runtime,
+            json!({
+                "jsonrpc": "2.0", "id": 94, "method": "task.submit",
+                "params": {
+                    "schema_version": 1, "command_id": CommandId::generate().0,
+                    "session_id": session_id, "kind": "create",
+                    "goal": "fold the rollout notes",
+                    "contract": {
+                        "criteria": ["read the rollout notes"],
+                        "constraints": [],
+                    },
+                }
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+        let task_id = TaskId(
+            created
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or("the context task.submit omitted task_id")?
+                .to_string(),
+        );
+        dispatch
+            .runtime
+            .store_writer()
+            .materialize_obligations(&task_id)
+            .map_err(|error| error.to_string())?;
+        Ok(task_id)
+    }
+
+    /// The bytes and digest of one task's assembled context as the child's
+    /// own store serves them: the number the warning is measured against,
+    /// and the bytes a paint must leave untouched.
+    fn context_reply(dispatch: &TuiDispatch, task_id: &TaskId) -> Result<Value, String> {
+        let context = dispatch
+            .runtime
+            .store()
+            .assembled_context(task_id)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "task_id": task_id.0,
+            "bytes": context.text.len(),
+            "digest": crate::config::hex(&Sha256::digest(context.text.as_bytes())),
+        }))
     }
 
     #[test]
@@ -5614,6 +6435,996 @@ mod card_pty {
         pause(&mut driver.pty, DECISION_CONSENT_DELAY);
         press(&mut driver.pty, b"\x1b");
         drop(screen(&driver.pty, 24, 80, "unanswered", secs(10)));
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    // ----- the dock as a projection of `runtime.status` -----
+
+    /// Spawns the TUI, submits one task through the composer, and returns
+    /// the driver with the task id its dock row names.
+    fn submitted(goal: &str) -> (CardDriver, String) {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        press(&mut driver.pty, format!("{goal}\r").as_bytes());
+        let visible = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            "Submitted task:",
+            secs(10),
+        );
+        assert!(
+            visible.contains("Submitted task:"),
+            "the task receipt renders: {visible}"
+        );
+        let task_id = dock_task_id(&visible);
+        (driver, task_id)
+    }
+
+    /// The reconstructed frame once the dock row for `task_id` names
+    /// `lifecycle`, whitespace-normalized.
+    fn dock_row(driver: &mut CardDriver, task_id: &str, lifecycle: &str) -> String {
+        let needle = format!("task {task_id}: {lifecycle}");
+        let visible = screen(&driver.pty, DOCK_PTY_ROWS, DOCK_PTY_COLS, &needle, secs(10));
+        squashed(&visible)
+    }
+
+    /// The dock rows a `runtime.status` result projects, spelled from the
+    /// API's own fields rather than through the production renderer: the
+    /// screen and the projection have to agree on their own.
+    fn projected_rows(status: &Value) -> Vec<String> {
+        let Some(items) = status["todo"]["items"].as_array() else {
+            unreachable!("runtime.status carries its todo page: {status}");
+        };
+        items
+            .iter()
+            .map(
+                |item| match (item["task_id"].as_str(), item["lifecycle"].as_str()) {
+                    (Some(task_id), Some(lifecycle)) => format!("task {task_id}: {lifecycle}"),
+                    _ => unreachable!("a todo item names its task and lifecycle: {item}"),
+                },
+            )
+            .collect()
+    }
+
+    /// The frame the terminal has settled on, whitespace-normalized: a
+    /// panel that is still painted reads here, one that was overwritten
+    /// does not.
+    fn settled_frame(driver: &CardDriver) -> String {
+        must(
+            card_text(&driver.pty, DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16),
+            "pty screen",
+        )
+    }
+
+    /// The captured frame at `rows` x `cols` once it paints `needle`, one
+    /// string per row: the terminal model's settled screen, so what a leg
+    /// reads is the frame painted now rather than text an earlier frame left
+    /// in the stream. Rows keep a message's own boundaries, which is what
+    /// lets a leg prove a line fits the row it was written for.
+    fn frame_rows(
+        pty: &mut PtySession,
+        rows: u16,
+        cols: u16,
+        needle: &str,
+        timeout: Duration,
+    ) -> Vec<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let captured = must(
+                replay_at(&must(pty.collected(), "pty read"), rows, cols),
+                "pty screen",
+            )
+            .settled;
+            if captured.iter().any(|row| row.contains(needle)) || Instant::now() >= deadline {
+                return captured;
+            }
+            must(pty.pump_for(Duration::from_millis(25)), "pty pump");
+        }
+    }
+
+    #[test]
+    fn live_dock_follows_the_task_ac004_p1() {
+        let (mut driver, task_id) = submitted("hold the rollout");
+        let running = dock_row(&mut driver, &task_id, "running");
+        assert!(
+            running.contains(&format!("task {task_id}: running")),
+            "the submit leaves its own lifecycle on the row: {running}"
+        );
+
+        // The owner's no-ready transition, driven through the store: the
+        // composer is not asked again, so only a projection can repaint.
+        must(driver.command("block"), "the owner blocks the task");
+        let followed = dock_row(&mut driver, &task_id, "blocked");
+        assert!(
+            followed.contains(&format!("task {task_id}: blocked")),
+            "the same row names the later lifecycle: {followed}"
+        );
+        assert_eq!(
+            followed.matches("Submitted task:").count(),
+            1,
+            "the row moved because the store did, not because a second submit ran: {followed}"
+        );
+        assert_eq!(
+            followed.matches(&format!("task {task_id}:")).count(),
+            1,
+            "one row per task: {followed}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn live_dock_follows_the_task_ac004_p2() {
+        let (mut driver, task_id) = submitted("hold the rollout");
+        dock_row(&mut driver, &task_id, "running");
+        must(driver.command("block"), "the owner blocks the task");
+
+        // The store's own no-ready blocker is the reason the frame carries; a
+        // row without it would tell the operator only that something paused.
+        let blocked = dock_row(&mut driver, &task_id, "blocked (dependency_blocked)");
+        assert!(
+            blocked.contains(&format!("task {task_id}: blocked (dependency_blocked)")),
+            "the blocked frame carries its reason: {blocked}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn failed_dock_refresh_keeps_the_previous_rows_p3() {
+        let (mut driver, task_id) = submitted("hold the rollout");
+        dock_row(&mut driver, &task_id, "running");
+
+        // (i) the refresh is what paints a transition.
+        must(driver.command("block"), "the owner blocks the task");
+        let followed = dock_row(&mut driver, &task_id, "blocked");
+        assert!(
+            followed.contains(&format!("task {task_id}: blocked")),
+            "the refresh paints the transition: {followed}"
+        );
+
+        // (ii) one failed read is silent: the rows survive it and the dock is
+        // not marked for a single miss.
+        must(driver.command("fail-status 1"), "one status read fails");
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let once = settled_frame(&driver);
+        assert!(
+            !once.contains("dock refresh failed"),
+            "one failed read leaves the dock unmarked: {once}"
+        );
+        assert!(
+            once.contains(&format!("task {task_id}: blocked")),
+            "the rows a failed refresh cannot re-read stay painted: {once}"
+        );
+
+        // (iii) two consecutive failures mark the dock, and the mark holds
+        // for the rest of the run: the armed failures outlast the beats the
+        // frame is read across, so what is asserted here is the frame several
+        // failures into the run, not the one beat the mark was first written
+        // on — a dead refresh cannot pass for a healthy idle dock.
+        must(driver.command("fail-status 24"), "the status seam arms");
+        drop(frame_rows(
+            &mut driver.pty,
+            DOCK_PTY_ROWS as u16,
+            DOCK_PTY_COLS as u16,
+            "dock refresh failed:",
+            secs(10),
+        ));
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let marked = settled_frame(&driver);
+        assert!(
+            marked.contains("dock refresh failed:"),
+            "the second consecutive failure marks the dock, and the run keeps it marked: {marked}"
+        );
+        assert!(
+            marked.contains(&format!("task {task_id}: blocked")),
+            "the rows a dead refresh cannot re-read stay painted: {marked}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn live_dock_follows_the_task_ac005_p1() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        let empty = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            super::DOCK_EMPTY,
+            secs(10),
+        );
+        assert!(
+            squashed(&empty).contains(super::DOCK_EMPTY),
+            "a fresh view starts on the empty dock: {empty}"
+        );
+
+        // The durable commit reaches the child's own session through the
+        // runtime, never through this view's composer: nothing has cached a
+        // dock row for it.
+        let seeded = must(driver.command("seed"), "the durable task commits");
+        let rows = projected_rows(&seeded);
+        assert_eq!(rows.len(), 1, "one task is projected: {seeded}");
+        let row = rows[0].clone();
+        let painted = screen(&driver.pty, DOCK_PTY_ROWS, DOCK_PTY_COLS, &row, secs(10));
+        assert!(
+            painted.contains(&row),
+            "the projection paints the recovered row: {painted}"
+        );
+        assert!(
+            !painted.contains(super::DOCK_EMPTY),
+            "the empty dock is replaced by what the API projects: {painted}"
+        );
+
+        // The resume path re-delivers the same stream with its duplicates and
+        // in reverse order; the dock and the API must agree afterwards.
+        let task_id = dock_task_id(&row);
+        let recovered = must(
+            driver.command(&format!("recover {task_id}")),
+            "the owner replays its durable stream",
+        );
+        assert_eq!(
+            projected_rows(&recovered),
+            rows,
+            "recovery returns one consistent projection: {recovered}"
+        );
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let settled = settled_frame(&driver);
+        assert!(
+            settled.contains(&row),
+            "the recovered row survives the timer passes: {settled}"
+        );
+        assert_eq!(
+            settled.matches(&row).count(),
+            1,
+            "the replayed stream duplicates no row: {settled}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn live_dock_follows_the_task_ac063_p1() {
+        let (mut driver, task_id) = submitted("hold the rollout");
+        dock_row(&mut driver, &task_id, "running");
+        must(driver.command("complete"), "the owner completes the task");
+        let completed = dock_row(&mut driver, &task_id, "completed");
+        assert!(
+            completed.contains(&format!("task {task_id}: completed")),
+            "the completed lifecycle lands on the row: {completed}"
+        );
+
+        // The dock is a projection, so the timer passes after the completion
+        // repaint the same row instead of dropping it.
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 3);
+        let after = settled_frame(&driver);
+        assert!(
+            after.contains(&format!("task {task_id}: completed")),
+            "the completed row stays painted after the UI timer: {after}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn live_dock_follows_the_task_ac064_p1() {
+        let (mut driver, task_id) = submitted("hold the rollout");
+        dock_row(&mut driver, &task_id, "running");
+        must(driver.command("cancel"), "the owner cancels the task");
+
+        let cancelled = dock_row(&mut driver, &task_id, "cancelled");
+        assert!(
+            cancelled.contains(&format!("task {task_id}: cancelled")),
+            "a cancelled task renders as itself: {cancelled}"
+        );
+        assert!(
+            !cancelled.contains(&format!("task {task_id}: completed")),
+            "cancelled is never read as done: {cancelled}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    // ----- the near-full warning and the continuation it names -----
+
+    /// The fragment every near-full warning carries: the condition and the
+    /// key that silences it, so a leg can find the row and a cleared frame
+    /// can be shown to lack it.
+    const WARNING_NEEDLE: &str = "% full (auto-compact off)";
+
+    /// What the fill left behind: the task its durable records belong to,
+    /// the bytes its assembled context serves and the digest of those
+    /// bytes.
+    struct Filled {
+        task_id: String,
+        bytes: u64,
+        digest: String,
+    }
+
+    fn filled_from(reply: &Value) -> Filled {
+        let (Some(task_id), Some(bytes), Some(digest)) = (
+            reply["task_id"].as_str(),
+            reply["bytes"].as_u64(),
+            reply["digest"].as_str(),
+        ) else {
+            unreachable!("the measurement names its task, bytes and digest: {reply}");
+        };
+        Filled {
+            task_id: task_id.to_string(),
+            bytes,
+            digest: digest.to_string(),
+        }
+    }
+
+    /// Fills one task's episodic history from inside the child: the runtime
+    /// minted the session the records belong to, so a task the parent seeded
+    /// would be invisible to it and a second runtime on its root would be a
+    /// second writer.
+    fn fill_history(driver: &mut CardDriver) -> Filled {
+        let reply = must(
+            driver.command("fill-context"),
+            "the child fills the context",
+        );
+        filled_from(&reply)
+    }
+
+    /// The bytes and digest the child's own store serves for `task_id`.
+    fn measured_context(driver: &mut CardDriver, task_id: &str) -> (u64, String) {
+        let reply = must(
+            driver.command(&format!("context-bytes {task_id}")),
+            "the child measures its context",
+        );
+        let filled = filled_from(&reply);
+        (filled.bytes, filled.digest)
+    }
+
+    /// The share of the model wire ceiling one assembled context fills, in
+    /// whole percent — the measure the near-full threshold is stated in, so a
+    /// leg can show which of two open conversations a line had to be about.
+    fn wire_percent(bytes: u64) -> u64 {
+        let ceiling = u64::try_from(crate::contracts::MODEL_WIRE_MAX_BYTES).unwrap_or(u64::MAX);
+        bytes.saturating_mul(100) / ceiling
+    }
+
+    /// The painted near-full warning row, once it renders. The row is
+    /// painted at the end of the transcript block, so the operator reads the
+    /// condition and the command that answers it together.
+    fn warning_row(driver: &mut CardDriver) -> String {
+        let visible = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            WARNING_NEEDLE,
+            secs(10),
+        );
+        match visible.lines().find(|line| line.contains(WARNING_NEEDLE)) {
+            Some(row) => row.to_string(),
+            None => unreachable!("the warning is painted: {visible}"),
+        }
+    }
+
+    #[test]
+    fn auto_compact_off_warns_when_the_window_is_nearly_full_p1() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        // A context this small earns nothing: the line speaks only once the
+        // assembled bytes have crossed the threshold.
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let quiet = settled_frame(&driver);
+        assert!(
+            !quiet.contains(WARNING_NEEDLE),
+            "a small context paints no warning: {quiet}"
+        );
+
+        // The fill runs inside the child, so the records belong to the
+        // session its own store answers for.
+        fill_history(&mut driver);
+        let painted = warning_row(&mut driver);
+        assert!(
+            painted.contains(WARNING_NEEDLE),
+            "a nearly full context with auto-compaction off warns: {painted}"
+        );
+
+        // The key is what silences it in this build: the same full context
+        // earns no line once `[context] auto_compact = true`.
+        must(
+            driver.command("auto-compact on"),
+            "the child switches the key on",
+        );
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let silenced = settled_frame(&driver);
+        assert!(
+            !silenced.contains(WARNING_NEEDLE),
+            "auto-compact on silences the warning: {silenced}"
+        );
+        must(
+            driver.command("auto-compact off"),
+            "the child switches the key off",
+        );
+        let returned = warning_row(&mut driver);
+        assert!(
+            returned.contains(WARNING_NEEDLE),
+            "the line follows the key it is gated on: {returned}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn auto_compact_off_warns_when_the_window_is_nearly_full_p2() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        fill_history(&mut driver);
+        let row = warning_row(&mut driver);
+        // The continuation is offered on the row itself, so the printed
+        // spelling and the accepted input are one token.
+        let token = match row.split_whitespace().find(|word| word.starts_with('/')) {
+            Some(token) => token.to_string(),
+            None => unreachable!("the warning names the continuation it offers: {row}"),
+        };
+
+        // Typed back exactly as printed: an accepted fold answers in the
+        // transcript, which a token the composer does not serve could not do.
+        press(&mut driver.pty, format!("{token}\r").as_bytes());
+        let accepted = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            CONTEXT_COMPACTED,
+            secs(10),
+        );
+        let flat = squashed(&accepted);
+        assert!(
+            flat.contains(CONTEXT_COMPACTED),
+            "the token the warning printed reaches the command: {flat}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn auto_compact_off_warns_when_the_window_is_nearly_full_p3() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        let filled = fill_history(&mut driver);
+        let painted = warning_row(&mut driver);
+        assert!(
+            painted.contains(WARNING_NEEDLE),
+            "the warning is painted while the legs below measure: {painted}"
+        );
+
+        // The paint re-measures the context every beat and rewrites nothing:
+        // the bytes the store serves after the line has painted (and after
+        // further beats) are the very bytes the fill left.
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let (bytes, digest) = measured_context(&mut driver, &filled.task_id);
+        assert_eq!(
+            digest, filled.digest,
+            "the served context is the same bytes, not only the same length"
+        );
+        assert_eq!(
+            bytes, filled.bytes,
+            "the warning paints over the context without trimming it"
+        );
+        let still = settled_frame(&driver);
+        assert!(
+            still.contains(WARNING_NEEDLE),
+            "the measured context is still the nearly full one: {still}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    /// The width the two-task legs paint at: the warning names the task its
+    /// fold acts on by id, so the line runs past the 80-column acceptance
+    /// geometry the legs above assert at.
+    const WIDE_PTY_COLS: usize = 120;
+
+    /// The painted copies of the help text: one per transcript row group, so
+    /// the count is the transcript band the panel actually shows.
+    fn help_rows(frame: &str) -> usize {
+        frame.matches("Commands:").count()
+    }
+
+    /// Fills the transcript past the panel and proves it: the band of help
+    /// text stops growing while more rows are still being added, so the
+    /// rows — and anything chained after them — are painted off screen.
+    fn overflowing_transcript(driver: &mut CardDriver) {
+        press(&mut driver.pty, &b"/help\r".repeat(7));
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 4);
+        let band = help_rows(&settled_frame(driver));
+        assert!(
+            band >= 4,
+            "the transcript fills the panel before the fill: {band} row groups"
+        );
+        press(&mut driver.pty, &b"/help\r".repeat(6));
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 4);
+        assert_eq!(
+            help_rows(&settled_frame(driver)),
+            band,
+            "the transcript has outgrown the panel: the rows below it are off screen"
+        );
+    }
+
+    #[test]
+    fn auto_compact_off_warns_when_the_window_is_nearly_full_p9() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+
+        // The shape AC-072 targets is a session already long enough to fill
+        // the panel: a line painted after the transcript is below it.
+        overflowing_transcript(&mut driver);
+        fill_history(&mut driver);
+        let painted = warning_row(&mut driver);
+        assert!(
+            painted.contains(WARNING_NEEDLE),
+            "the warning paints on its own row, not below the transcript: {painted}"
+        );
+        let overfull = help_rows(&settled_frame(&driver));
+
+        // The dock's own fault mark holds the band's other row: with the
+        // warning silenced it is what the band shows, and the overfull
+        // transcript that used to clip it is unchanged.
+        must(
+            driver.command("auto-compact on"),
+            "the child switches the key on",
+        );
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let silenced = settled_frame(&driver);
+        assert!(
+            !silenced.contains(WARNING_NEEDLE),
+            "auto-compact on silences the line: {silenced}"
+        );
+        must(driver.command("fail-status 24"), "the status reads fail");
+        drop(frame_rows(
+            &mut driver.pty,
+            DOCK_PTY_ROWS as u16,
+            DOCK_PTY_COLS as u16,
+            "dock refresh failed:",
+            secs(10),
+        ));
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let marked = settled_frame(&driver);
+        assert!(
+            marked.contains("dock refresh failed:"),
+            "the dock-stale mark paints where the transcript cannot clip it: {marked}"
+        );
+        assert_eq!(
+            help_rows(&marked),
+            overfull,
+            "the mark paints on the same overfull session: {marked}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+
+        // Both messages at the 60-column acceptance geometry the card legs
+        // paint at: a near-full conversation and a dead refresh hold at once,
+        // each on its own row, and the warning's row is whole — its last word
+        // included, so the continuation it names reads instead of clipping.
+        let mut narrow = must(
+            CardDriver::spawn(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut narrow.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        fill_history(&mut narrow);
+        let warned = frame_rows(
+            &mut narrow.pty,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            WARNING_NEEDLE,
+            secs(10),
+        );
+        assert!(
+            warned
+                .iter()
+                .any(|row| row.trim_end().ends_with(COMPACT_TOKEN)),
+            "the warning fits its row at 60 columns, last word included: {warned:?}"
+        );
+        // The failures outlast the beats the frame is read across, so this is
+        // one frame with the warning live: the armed run keeps the mark
+        // painted under it instead of trading one message for the other.
+        must(narrow.command("fail-status 24"), "the status reads fail");
+        drop(frame_rows(
+            &mut narrow.pty,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "dock refresh failed:",
+            secs(10),
+        ));
+        pause(&mut narrow.pty, DOCK_REFRESH_INTERVAL * 2);
+        let both = frame_rows(
+            &mut narrow.pty,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "dock refresh failed:",
+            secs(2),
+        );
+        let warning_at = both
+            .iter()
+            .position(|row| row.contains(WARNING_NEEDLE))
+            .unwrap_or_else(|| unreachable!("the warning is painted: {both:?}"));
+        let mark_at = both
+            .iter()
+            .position(|row| row.contains("dock refresh failed:"))
+            .unwrap_or_else(|| unreachable!("the mark is painted: {both:?}"));
+        assert!(
+            both[warning_at].trim_end().ends_with(COMPACT_TOKEN),
+            "the warning stays whole on its row while the mark is live: {both:?}"
+        );
+        assert_ne!(
+            warning_at, mark_at,
+            "the mark keeps its own row while the warning is live: {both:?}"
+        );
+        press(&mut narrow.pty, b"\x1b");
+        expect_normal_exit(&mut narrow, secs(10));
+        teardown(narrow);
+    }
+
+    #[test]
+    fn auto_compact_off_warns_when_the_window_is_nearly_full_p10() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, WIDE_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+
+        // The older conversation: nearly full and settled, the row a
+        // first-of-the-page subject would warn about.
+        let older = filled_from(&must(
+            driver.command("fill-context"),
+            "the older conversation fills",
+        ));
+        must(
+            driver.command(&format!("complete {}", older.task_id)),
+            "the older conversation settles",
+        );
+        // The conversation the operator is reading: newer and still small.
+        let newer = filled_from(&must(
+            driver.command("new-context"),
+            "the newer conversation opens",
+        ));
+        pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 2);
+        let quiet = must(
+            card_text(&driver.pty, DOCK_PTY_ROWS as u16, WIDE_PTY_COLS as u16),
+            "pty screen",
+        );
+        assert!(
+            !quiet.contains(WARNING_NEEDLE),
+            "a settled older conversation earns no line: {quiet}"
+        );
+
+        // Once the conversation being read fills, the line names it.
+        let filled_newer = filled_from(&must(
+            driver.command(&format!("fill-context {}", newer.task_id)),
+            "the newer conversation fills",
+        ));
+        let wide = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            WIDE_PTY_COLS,
+            WARNING_NEEDLE,
+            secs(10),
+        );
+        let row = wide
+            .lines()
+            .find(|line| line.contains(WARNING_NEEDLE))
+            .unwrap_or_else(|| unreachable!("the warning is painted: {wide}"));
+        assert!(
+            row.contains(&format!("task {}", newer.task_id)),
+            "the line names the conversation the fold acts on: {row}"
+        );
+        assert!(
+            !row.contains(&older.task_id),
+            "and never the settled conversation behind it: {row}"
+        );
+
+        // `/compact` folds that conversation and leaves the other one as it
+        // was.
+        let (older_before, _) = measured_context(&mut driver, &older.task_id);
+        press(&mut driver.pty, b"/compact\r");
+        let accepted = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            WIDE_PTY_COLS,
+            CONTEXT_COMPACTED,
+            secs(10),
+        );
+        assert!(
+            squashed(&accepted).contains(CONTEXT_COMPACTED),
+            "the accepted fold answers in the transcript: {accepted}"
+        );
+        let (newer_after, _) = measured_context(&mut driver, &newer.task_id);
+        let (older_after, _) = measured_context(&mut driver, &older.task_id);
+        assert!(
+            newer_after < filled_newer.bytes,
+            "the fold shortened the conversation the line named: {} → {newer_after}",
+            filled_newer.bytes
+        );
+        assert_eq!(
+            older_after, older_before,
+            "the settled conversation is untouched"
+        );
+
+        // The conversation the operator is reading is now the composer's own:
+        // a submit is the one place the loop's pending task is set, and only
+        // the pending arm can name it. The conversation behind it — the status
+        // page's last row, opened and filled by the child — is one this view
+        // never submitted and still nearly full, so a projection that measured
+        // the last row would warn about that one instead.
+        press(&mut driver.pty, b"ledger\r");
+        let receipt = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            "Submitted task: ledger",
+            secs(10),
+        );
+        let Some(reading) = receipt
+            .lines()
+            .find_map(|line| line.split_once("(accepted: "))
+            .map(|(_, tail)| {
+                tail.chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                    .collect::<String>()
+            })
+            .filter(|task_id| !task_id.is_empty())
+        else {
+            unreachable!("the receipt names the submitted task: {receipt}");
+        };
+        // A composer submit carries no criteria, and an obligation is what a
+        // record lands on, so this conversation is the one open task that
+        // cannot be filled: what it has room for is the point here.
+        let near_full = u64::try_from(super::CONTEXT_NEARLY_FULL_PERCENT).unwrap_or(u64::MAX);
+        let reading_bytes = measured_context(&mut driver, &reading).0;
+        assert!(
+            wire_percent(reading_bytes) < near_full,
+            "the conversation being read still has room: {reading_bytes} bytes"
+        );
+        let last_row = filled_from(&must(
+            driver.command("new-context"),
+            "the newer conversation opens",
+        ));
+        let filled_last_row = filled_from(&must(
+            driver.command(&format!("fill-context {}", last_row.task_id)),
+            "the newer conversation fills",
+        ));
+        assert!(
+            wire_percent(filled_last_row.bytes) >= near_full,
+            "the last row on its own would earn the line: {} bytes",
+            filled_last_row.bytes
+        );
+        pause(
+            &mut driver.pty,
+            CONTEXT_MEASURE_INTERVAL + DOCK_REFRESH_INTERVAL * 2,
+        );
+        let quiet = settled_frame(&driver);
+        assert!(
+            !quiet.contains(WARNING_NEEDLE),
+            "the line measures the conversation being read, never the last row: {quiet}"
+        );
+
+        // The continuation follows the same subject: with no line painted
+        // `/compact` falls back to the pending conversation, whose empty
+        // history the owner refuses to fold — the nearly full conversation
+        // behind it keeps the bytes the fill left.
+        press(&mut driver.pty, b"/compact\r");
+        let refused = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            "compaction would not shorten",
+            secs(10),
+        );
+        assert!(
+            squashed(&refused).contains("compaction would not shorten the history"),
+            "the fold addresses the conversation being read: {refused}"
+        );
+        let (last_row_after, last_row_digest) = measured_context(&mut driver, &last_row.task_id);
+        assert_eq!(
+            last_row_after, filled_last_row.bytes,
+            "the conversation the line never named is untouched"
+        );
+        assert_eq!(
+            last_row_digest, filled_last_row.digest,
+            "and its bytes are the ones the fill left"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn refused_compaction_continuation_is_a_painted_line_p4() {
+        let (mut driver, _task_id) = submitted("hold the rollout");
+        // A task with no episodic history yet: the checkpoint line the fold
+        // would leave is longer than the history it replaces, so the owner
+        // refuses it as not shorter.
+        press(&mut driver.pty, b"/compact\r");
+        let visible = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            "compaction would not shorten",
+            secs(10),
+        );
+        let flat = squashed(&visible);
+        assert!(
+            flat.contains("compaction would not shorten the history"),
+            "the refusal paints the owner's typed message: {flat}"
+        );
+
+        // A refusal is a line, not an exit: the loop still takes passes and
+        // the next command is served.
+        must(driver.command("ping"), "the loop keeps serving passes");
+        press(&mut driver.pty, b"/help\r");
+        let help = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            "Commands: Enter submits a task",
+            secs(10),
+        );
+        assert!(
+            squashed(&help).contains("Commands: Enter submits a task"),
+            "the loop keeps serving input after the refusal: {help}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn compacting_an_empty_session_paints_a_plain_note() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+
+        // No warning and no submitted task: there is no conversation to
+        // fold, so nothing is dispatched and the operator reads a plain
+        // line instead of the wire's own field name.
+        press(&mut driver.pty, b"/compact\r");
+        let visible = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            NOTHING_TO_COMPACT,
+            secs(10),
+        );
+        let flat = squashed(&visible);
+        assert!(
+            flat.contains(NOTHING_TO_COMPACT),
+            "an empty session earns a plain note: {flat}"
+        );
+        assert!(
+            !flat.contains("task_id"),
+            "no wire field name reaches the operator: {flat}"
+        );
+
+        press(&mut driver.pty, b"\x1b");
+        expect_normal_exit(&mut driver, secs(10));
+        teardown(driver);
+    }
+
+    #[test]
+    fn warning_clears_after_an_accepted_compaction_p8() {
+        let mut driver = must(
+            CardDriver::spawn(DOCK_PTY_ROWS as u16, DOCK_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
+            "alternate screen must be entered on start"
+        );
+        let filled = fill_history(&mut driver);
+        let painted = warning_row(&mut driver);
+        assert!(
+            painted.contains(WARNING_NEEDLE),
+            "the warning paints before the fold: {painted}"
+        );
+
+        press(&mut driver.pty, b"/compact\r");
+        let accepted = screen(
+            &driver.pty,
+            DOCK_PTY_ROWS,
+            DOCK_PTY_COLS,
+            CONTEXT_COMPACTED,
+            secs(10),
+        );
+        assert!(
+            squashed(&accepted).contains(CONTEXT_COMPACTED),
+            "the accepted fold answers in the transcript: {accepted}"
+        );
+
+        // The line tracks the condition it names: a fold leaves the task's
+        // revision where it was, so the projection's cached measurement is
+        // what holds the old line until the measurement backstop re-reads it.
+        pause(
+            &mut driver.pty,
+            CONTEXT_MEASURE_INTERVAL + DOCK_REFRESH_INTERVAL * 2,
+        );
+        let settled = settled_frame(&driver);
+        assert!(
+            !settled.contains(WARNING_NEEDLE),
+            "the warning does not outlive the condition it names: {settled}"
+        );
+        assert!(
+            settled.contains(&format!("task {}:", filled.task_id)),
+            "the task the fold kept stays on the dock: {settled}"
+        );
+
         press(&mut driver.pty, b"\x1b");
         expect_normal_exit(&mut driver, secs(10));
         teardown(driver);

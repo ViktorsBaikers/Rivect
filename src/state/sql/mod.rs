@@ -1,6 +1,7 @@
 //! Named SQLite for the state owner. Schema lives in `schema.sql`;
 //! statements are constants so CAS/outbox logic is not mixed with DDL.
-
+//! The one bounded existence read the session switch asks for executes
+//! here beside its statement, so the switch never walks a page.
 pub const SCHEMA: &str = include_str!("schema.sql");
 /// Decision-owned DDL: the append-only answer-attempt journal. Idempotent
 /// at open like `SCHEMA`; statement texts stay named below (P-002).
@@ -573,4 +574,36 @@ pub fn prune_index_generations(keep: usize) -> String {
          DELETE FROM index_generations WHERE generation NOT IN (
              SELECT generation FROM index_generations ORDER BY generation DESC LIMIT {keep})"
     )
+}
+
+/// The session switch's in-flight guard: the oldest task `/new` would leave
+/// without a surface. One bounded existence check, never a page — a session
+/// past the status page cap still answers for the task it runs.
+pub const IN_FLIGHT_TASK: &str = "SELECT task_id FROM tasks WHERE session_id = ?1 AND lifecycle NOT IN ('completed', 'cancelled') ORDER BY rowid LIMIT 1";
+
+impl super::TaskStore {
+    /// The task of `session_id` a new conversation would orphan, if any.
+    /// The read lives beside its statement: P-002 keeps the SQL here, and
+    /// the guard needs the answer without walking pages.
+    ///
+    /// # Errors
+    /// Returns [`super::StoreError::Closed`] when the store is not open and
+    /// [`super::StoreError::Storage`] when the query fails.
+    pub fn in_flight_task(
+        &self,
+        session_id: &crate::contracts::SessionId,
+    ) -> super::Result<Option<crate::contracts::TaskId>> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self
+            .conn()?
+            .prepare(IN_FLIGHT_TASK)
+            .map_err(super::storage)?;
+        let task_id = stmt
+            .query_row(rusqlite::params![session_id.0], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(super::storage)?;
+        Ok(task_id.map(crate::contracts::TaskId))
+    }
 }

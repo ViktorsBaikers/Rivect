@@ -3224,6 +3224,668 @@ fn tui_char_chords_never_type_their_letter_into_the_composer() {
     pty.finish().expect("pty teardown");
 }
 
+// ----- the composer's /new and /clear -----
+
+/// One `command.execute` request for a composer slash command: the same
+/// body the TUI sends, driven in-process.
+fn slash_command_request(session: &rivect::contracts::SessionId, kind: &str, id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0, "command": { "kind": kind } }
+    })
+}
+
+/// The task ids one `runtime.status` answer lists.
+fn listed_tasks(status: &Value) -> Vec<String> {
+    status["result"]["tasks"]["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["task_id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The accepted task id the transcript's receipt line carries.
+fn accepted_task_id(screen: &str) -> String {
+    let line = screen
+        .lines()
+        .find(|line| line.contains("(accepted: "))
+        .unwrap_or_else(|| panic!("the accepted receipt line is on screen: {screen:?}"));
+    line.split("(accepted: ")
+        .nth(1)
+        .expect("the receipt names its id")
+        .split(')')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// The reconstructed frame once `needle` appears at least `count` times:
+/// the composer can paint the same line twice, so `contains` is not enough.
+fn wait_for_repeated_tui_text(
+    pty: &support::PtySession,
+    needle: &str,
+    count: usize,
+    timeout: Duration,
+) -> Result<String, support::PtyIoError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let visible = support::reconstruct_screen(&pty.collected()?, TUI_ROWS, TUI_COLS);
+        if visible.matches(needle).count() >= count || std::time::Instant::now() >= deadline {
+            return Ok(visible);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn new_and_clear_create_an_independent_conversation_p1() {
+    let mut world = open_world("composer-new-independent", None);
+    let session = world.open_session("bootstrap-composer-p1");
+    let first = world.create_task(&session, "cmd-composer-p1-first");
+    // A conversation is left behind once its work is settled: while a
+    // task is in flight the switch is refused, which is its own case.
+    world
+        .runtime
+        .store_writer()
+        .cancel_task(&session, &first, 1, Some("settled before the switch"))
+        .expect("settle the first conversation");
+
+    let created = world.dispatch(&slash_command_request(&session, "session.new", 41));
+    let fresh = rivect::contracts::SessionId(
+        created["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("/new answers the conversation it started: {created}"))
+            .to_owned(),
+    );
+    assert_ne!(
+        fresh.0, session.0,
+        "/new starts a conversation instead of re-entering the old one"
+    );
+    assert_eq!(created["result"]["previous_session_id"], json!(session.0));
+
+    // Independent in both directions: the new conversation starts empty,
+    // and neither conversation's work appears in the other.
+    let empty = world.dispatch(&corpus_status(&fresh));
+    assert!(
+        listed_tasks(&empty).is_empty(),
+        "a new conversation inherits no work: {empty}"
+    );
+    let second = world.create_task(&fresh, "cmd-composer-p1-second");
+    let old = world.dispatch(&corpus_status(&session));
+    assert_eq!(listed_tasks(&old), vec![first.0.clone()], "{old}");
+    let new = world.dispatch(&corpus_status(&fresh));
+    assert_eq!(listed_tasks(&new), vec![second.0.clone()], "{new}");
+}
+
+#[test]
+fn new_and_clear_create_an_independent_conversation_p2() {
+    let mut world = open_world("composer-new-resumable", None);
+    let session = world.open_session("bootstrap-composer-p2");
+    let task = world.create_task(&session, "cmd-composer-p2");
+    // Settled work is what `/new` leaves behind; live work refuses the
+    // switch instead of detaching it.
+    world
+        .runtime
+        .store_writer()
+        .cancel_task(&session, &task, 1, Some("settled before the switch"))
+        .expect("settle the conversation");
+
+    let created = world.dispatch(&slash_command_request(&session, "session.new", 42));
+    assert_eq!(
+        created["result"]["previous_session_id"],
+        json!(session.0),
+        "/new names the conversation it left behind: {created}"
+    );
+
+    // Resume addresses the previous conversation by its own id: the
+    // attach resolves to that session and its work is still readable.
+    let resumed = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 43, "method": "session.attach",
+        "params": { "schema_version": 1, "bootstrap_id": "resume-composer-p2", "session_id": session.0 }
+    }));
+    assert_eq!(
+        resumed["result"]["session_id"],
+        json!(session.0),
+        "{resumed}"
+    );
+    let status = world.dispatch(&corpus_status(&session));
+    assert_eq!(listed_tasks(&status), vec![task.0.clone()], "{status}");
+    let current = world.dispatch(&corpus_question_current(&session, &task, json!(44)));
+    assert_eq!(current["result"]["task_id"], json!(task.0), "{current}");
+}
+
+#[test]
+fn new_and_clear_create_an_independent_conversation_p3() {
+    let mut world = open_world("composer-keeps-data", None);
+    let session = world.open_session("bootstrap-composer-p3");
+    let task = world.create_task(&session, "cmd-composer-p3");
+    world
+        .runtime
+        .store_writer()
+        .cancel_task(&session, &task, 1, Some("settled before the switch"))
+        .expect("settle the conversation");
+    // Code, memory and accounting, each with an owner outside the two
+    // commands: a workspace file, the store's rows, and a budget scope.
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let code = scope.join("kept.txt");
+    std::fs::write(&code, "rivect-kept-marker\n").expect("workspace file");
+    world
+        .runtime
+        .store_writer()
+        .open_budget("composer-accounting", 100)
+        .expect("budget scope");
+    let events_before = world
+        .runtime
+        .store()
+        .events_after(&session, None, 0, 500)
+        .expect("events")
+        .len();
+    let goal_before = world.runtime.store().goal_bytes(&task).expect("goal");
+
+    let created = world.dispatch(&slash_command_request(&session, "session.new", 45));
+    assert!(created.get("result").is_some(), "{created}");
+    let cleared = world.dispatch(&slash_command_request(&session, "view.clear", 46));
+    assert!(cleared.get("result").is_some(), "{cleared}");
+
+    assert_eq!(
+        std::fs::read_to_string(&code).expect("code kept"),
+        "rivect-kept-marker\n",
+        "/new and /clear never touch the workspace"
+    );
+    let budget = world
+        .runtime
+        .store()
+        .budget_status("composer-accounting")
+        .expect("accounting kept");
+    assert_eq!(budget.limit_units, 100);
+    assert_eq!(budget.spent, 0);
+    let events_after = world
+        .runtime
+        .store()
+        .events_after(&session, None, 0, 500)
+        .expect("events")
+        .len();
+    assert!(
+        events_after >= events_before,
+        "memory is kept: {events_after} events after, {events_before} before"
+    );
+    assert_eq!(
+        world.runtime.store().goal_bytes(&task).expect("goal"),
+        goal_before
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .task_lifecycle(&task)
+            .expect("lifecycle"),
+        Lifecycle::Cancelled,
+        "the stored conversation keeps its work, lifecycle included"
+    );
+}
+
+#[test]
+fn new_and_clear_create_an_independent_conversation_p4() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+    pty.send(b"stored conversation\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: stored conversation (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    assert!(
+        visible.contains(": running"),
+        "the stored conversation has live work: {visible:?}"
+    );
+    let running = visible
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")
+                .and_then(|rest| rest.strip_suffix(": running"))
+        })
+        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
+
+    // /clear from the composer: the rows the operator was reading go. The
+    // dock is a projection of live task state, not a row of that reading
+    // surface, so it stays.
+    pty.send(b"/clear\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "View cleared", Duration::from_secs(10))
+        .expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert!(
+        screen.contains("View cleared"),
+        "Enter on /clear runs the command: {screen:?}"
+    );
+    assert!(
+        !screen.contains("Submitted task:"),
+        "/clear drops the transcript rows: {screen:?}"
+    );
+    assert!(
+        screen.contains(&format!("task {running}: running")),
+        "the dock still names the running task: {screen:?}"
+    );
+
+    // The stored conversation survives the view it was read in.
+    let db_path = pty.data_root().join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    let tasks: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .expect("count tasks");
+    assert_eq!(tasks, 1, "/clear never deletes the stored conversation");
+    drop(conn);
+
+    // /help is the one command vocabulary a human reads.
+    pty.send(b"/help\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "/compact", Duration::from_secs(10)).expect("pty screen");
+    let screen = support::squashed(&visible);
+    for token in ["/new", "/clear", "/compact"] {
+        assert!(screen.contains(token), "help names {token}: {screen:?}");
+    }
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn new_and_clear_create_an_independent_conversation_p5() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // A document pasted as one bracketed paste is text, line breaks
+    // included: the /clear inside it is not the command.
+    pty.send("\x1b[200~notes\n/clear\nend\x1b[201~".as_bytes())
+        .expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "> notes /clear end", Duration::from_secs(10))
+        .expect("pty screen");
+    assert!(
+        visible.contains("> notes /clear end"),
+        "the pasted document is composer text: {visible:?}"
+    );
+    assert!(
+        !support::squashed(&visible).contains("View cleared"),
+        "a pasted /clear never runs: {visible:?}"
+    );
+
+    // Enter submits the draft as a task: the document's /clear line stays
+    // part of the goal.
+    pty.send(b"\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: notes /clear end (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    assert_eq!(
+        visible.matches("Submitted task:").count(),
+        1,
+        "the pasted document became one task: {visible:?}"
+    );
+
+    // Only an exactly typed command clears the view.
+    pty.send(b"/clear\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "View cleared", Duration::from_secs(10))
+        .expect("pty screen");
+    assert!(
+        support::squashed(&visible).contains("View cleared"),
+        "a typed /clear runs the command: {visible:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn misused_slash_command_is_a_usage_line_not_a_task_p6() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // An argument is not the command.
+    pty.send(b"/clear now\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Unknown command. /help", Duration::from_secs(10))
+            .expect("pty screen");
+    assert!(
+        support::squashed(&visible).contains("Unknown command. /help"),
+        "an argument is a usage line naming /help: {visible:?}"
+    );
+
+    // A near miss is not the command either.
+    pty.send(b"/cler\r").expect("pty send");
+    let visible =
+        wait_for_repeated_tui_text(&pty, "Unknown command. /help", 2, Duration::from_secs(10))
+            .expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert_eq!(
+        visible.matches("Unknown command. /help").count(),
+        2,
+        "both misuses paint their own usage line: {screen:?}"
+    );
+    assert!(
+        !screen.contains("Submitted task:"),
+        "a misuse never becomes a task: {screen:?}"
+    );
+    assert!(
+        !screen.contains("View cleared"),
+        "neither misuse runs /clear: {screen:?}"
+    );
+
+    // Spending nothing means nothing was submitted and nothing was read.
+    let db_path = pty.data_root().join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    let tasks: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .expect("count tasks");
+    assert_eq!(tasks, 0, "a usage line spends nothing");
+    drop(conn);
+
+    // The loop keeps serving: the next command is read normally.
+    pty.send(b"/help\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains("Commands:"),
+        "a misused command never ends the session: {visible:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn new_requires_an_idle_session_p8() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // Positive control: nothing runs yet, so /new serves.
+    pty.send(b"/new\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "New conversation", Duration::from_secs(10))
+        .expect("pty screen");
+    assert!(
+        visible.contains("New conversation"),
+        "/new serves an idle session: {visible:?}"
+    );
+
+    pty.send(b"probe\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: probe (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    let running = accepted_task_id(&visible);
+    assert!(
+        !running.is_empty(),
+        "the accepted receipt names its task: {visible:?}"
+    );
+
+    // With that task running the switch is refused, and the refusal
+    // names the task it would have left behind.
+    pty.send(b"/new\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
+    let refusal = visible
+        .lines()
+        .find(|line| line.contains("/new refused:"))
+        .unwrap_or_else(|| panic!("the refusal is painted: {visible:?}"));
+    assert!(
+        refusal.contains(&format!("task {running} is running")),
+        "the refusal names the running task: {refusal:?}"
+    );
+    assert!(
+        visible.matches("New conversation").count() == 1,
+        "a refused /new starts no conversation: {visible:?}"
+    );
+    assert_eq!(
+        visible.matches("Submitted task:").count(),
+        1,
+        "a refused /new submits nothing: {visible:?}"
+    );
+
+    // Spending nothing: one task, and no session minted by the refusal.
+    let db_path = pty.data_root().join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    let tasks: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .expect("count tasks");
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    assert_eq!(tasks, 1, "a refused /new spends nothing");
+    assert_eq!(
+        sessions, 2,
+        "the boot session plus the one served /new; the refusal minted none"
+    );
+    drop(conn);
+
+    // Blocked work spends nothing: a task that is not running leaves the
+    // conversation startable, so `/new` serves instead of holding it for a
+    // run that is not happening.
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    conn.busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'blocked' WHERE task_id = ?1",
+        [&running],
+    )
+    .expect("block the accepted task");
+    let previous: String = conn
+        .query_row(
+            "SELECT session_id FROM sessions ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the conversation /new leaves");
+    drop(conn);
+
+    // The painted line is wider than the panel, so the switch is named by
+    // the conversation it left: the head of that id fits on the row.
+    let left_behind = previous.get(..8).unwrap_or(previous.as_str());
+    let served = format!("(previous: {left_behind}");
+    pty.send(b"/new\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, &served, Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains(&served),
+        "a blocked task does not hold the session: {visible:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    let tasks: i64 = conn
+        .query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))
+        .expect("count tasks");
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    drop(conn);
+    assert_eq!(tasks, 1, "a served /new creates no task");
+    assert_eq!(sessions, 3, "the boot session and two served /new");
+
+    // A running task still refuses, in the conversation the switch left:
+    // the rule is about the run, not a blanket admission.
+    pty.send(b"second probe\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: second probe (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    let live = visible
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")
+                .and_then(|rest| rest.strip_suffix(": running"))
+        })
+        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
+    pty.send(b"/new\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        &format!("refused: task {live} is running"),
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    assert!(
+        visible.contains(&format!("refused: task {live} is running")),
+        "a running task still refuses the switch: {visible:?}"
+    );
+    assert!(
+        visible.matches("New conversation:").count() == 1,
+        "the refusal starts no conversation: {visible:?}"
+    );
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    drop(conn);
+    assert_eq!(sessions, 3, "the second refusal mints no conversation");
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn new_requires_an_idle_session_p9() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // One real task names the session the guard reads; the seed below
+    // fills the page the guard used to scan.
+    pty.send(b"probe\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: probe (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    let first = accepted_task_id(&visible);
+    assert!(!first.is_empty(), "the receipt names its task: {visible:?}");
+
+    let db_path = pty.data_root().join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    conn.busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    let session: String = conn
+        .query_row(
+            "SELECT session_id FROM tasks WHERE task_id = ?1",
+            [&first],
+            |row| row.get(0),
+        )
+        .expect("read the task session");
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'completed' WHERE task_id = ?1",
+        [&first],
+    )
+    .expect("settle the submitted task");
+    // A session past the page cap: `PAGE_MAX` settled rows fill the first
+    // page, and the running task behind them is the one the switch would
+    // orphan.
+    let seed = conn
+        .unchecked_transaction()
+        .expect("open the seed transaction");
+    let insert = "INSERT INTO tasks (task_id, session_id, revision, intent_revision, contract_revision, lifecycle, goal_bytes, goal_digest, goal_artifact_id, event_cursor)
+                  VALUES (?1, ?2, 0, 0, 1, ?3, x'', '', '', 0)";
+    for index in 0..=rivect::contracts::PAGE_MAX {
+        seed.execute(
+            insert,
+            rusqlite::params![format!("seed-{index:04}"), &session, "completed"],
+        )
+        .expect("seed a settled task");
+    }
+    let running = "seed-in-flight";
+    seed.execute(insert, rusqlite::params![running, &session, "running"])
+        .expect("seed the running task");
+    seed.commit().expect("commit the seed");
+    drop(conn);
+
+    // The running task is past the first page: the switch is still refused,
+    // and the refusal names it.
+    pty.send(b"/new\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains(&format!("task {running} is running")),
+        "the refusal names the task past the page: {visible:?}"
+    );
+    assert!(
+        !visible.contains("New conversation"),
+        "a refused /new starts no conversation: {visible:?}"
+    );
+
+    // Once that task settles nothing runs, and the switch is admitted.
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    conn.busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'completed' WHERE task_id = ?1",
+        [running],
+    )
+    .expect("settle the running task");
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    drop(conn);
+    assert_eq!(sessions, 1, "the refusal minted no session");
+
+    pty.send(b"/new\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "New conversation", Duration::from_secs(10))
+        .expect("pty screen");
+    assert!(
+        visible.contains("New conversation"),
+        "an idle session still serves /new: {visible:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
 #[test]
 fn tui_data_root_flag_overrides_environment() {
     let root = tempfile::TempDir::with_prefix("rivect-tui-flag-").expect("tui flag root");

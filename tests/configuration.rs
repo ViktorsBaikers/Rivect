@@ -1973,7 +1973,145 @@ fn config_read_unknown_key_names_its_accepted_domain() {
 
     assert_eq!(
         response["error"]["data"]["message"],
-        "unknown key bogus; known keys: workflow.enabled, decisions.mode, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
+        "unknown key bogus; known keys: workflow.enabled, decisions.mode, context.auto_compact, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
+    );
+}
+
+/// AC-072 (DEC-013): `[context] auto_compact` answers on every domain the
+/// read and edit surfaces consult — settable through the shared schema,
+/// readable as a value (never `null`: the shipped document carries its
+/// default), named by the unknown-key hint, and documented in the shipped
+/// document, which is the only in-repo documentation a config key has.
+#[test]
+fn context_auto_compact_joins_the_key_domains_p5() {
+    support::ensure_helper();
+    let shipped = rivect::config::SHIPPED_DEFAULTS_TOML;
+    let lines: Vec<&str> = shipped.lines().collect();
+    let key = lines
+        .iter()
+        .position(|line| *line == "auto_compact = false")
+        .expect("the shipped document carries the key with its default");
+    assert!(
+        lines[key - 1].trim_start().starts_with("# auto_compact"),
+        "the key ships with its one-line comment: {:?}",
+        lines[key - 1]
+    );
+
+    let (mut world, session) = carrier_world("context-auto-compact");
+    // Readable before any override exists: an absent field serves the
+    // shipped default rather than null, so a key with a documented value
+    // never reads as unknown.
+    let read = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7331, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "keys": ["context.auto_compact"] }
+    }));
+    assert!(read["error"].is_null(), "{read}");
+    let entry = &read["result"]["entries"]["items"][0];
+    assert_eq!(entry["key"], "context.auto_compact", "{read}");
+    assert!(
+        !entry["effective"]["value"].is_null(),
+        "a key with a documented default never reads null: {read}"
+    );
+    assert_eq!(
+        entry["effective"]["value"],
+        json!(false),
+        "the shipped default is off, because nothing auto-compacts: {read}"
+    );
+
+    // Settable through the shared schema, and the read follows it.
+    let set = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7332, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "context.auto_compact", "value": true }
+    }));
+    assert!(
+        set["error"].is_null(),
+        "context.auto_compact is editable: {set}"
+    );
+    let after = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7333, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "keys": ["context.auto_compact"] }
+    }));
+    assert_eq!(
+        after["result"]["entries"]["items"][0]["effective"]["value"],
+        json!(true),
+        "the accepted edit is what the read serves: {after}"
+    );
+
+    // The read surface's own hint names the key: a known-keys list that
+    // contradicts the shipped document is the defect this pins.
+    let bogus = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7334, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0, "keys": ["context.bogus"] }
+    }));
+    let message = bogus["error"]["data"]["message"]
+        .as_str()
+        .expect("the unknown key is the typed refusal");
+    assert!(
+        message.contains("context.auto_compact"),
+        "the hint names the key the shipped document defines: {message}"
+    );
+}
+
+/// AC-072 (DEC-013, DEC-019): a non-boolean `[context] auto_compact` is
+/// refused with the key's own boolean cause — never `unknown root key
+/// context`, never the value echoed — on the file and the edit surface,
+/// and the legal boolean is still accepted afterwards.
+#[test]
+fn invalid_context_auto_compact_is_a_typed_refusal_p6() {
+    const EXPECTED: &str = "schema context.auto_compact: context.auto_compact must be a boolean";
+
+    let text = format!(
+        "{}\n[context]\nauto_compact = \"sometimes\"\n",
+        support::base_config()
+    );
+    let file_error = Config::parse_validated(&text).expect_err("a non-boolean is refused");
+    assert_eq!(
+        file_error.to_string(),
+        EXPECTED,
+        "the file surface answers the key's boolean cause, naming the key"
+    );
+
+    let mut document = Config::parse_validated(&support::base_config()).expect("base config");
+    let edit_error = document
+        .set_wire("context.auto_compact", &json!("sometimes"))
+        .expect_err("a non-boolean wire value is refused");
+    assert_eq!(
+        edit_error.to_string(),
+        EXPECTED,
+        "the edit surface answers the same cause for the same value"
+    );
+    assert_eq!(
+        document.read_value("context.auto_compact"),
+        Some(json!(false)),
+        "the refused write left the effective value where it was"
+    );
+
+    // The refusal is about the value's type, not the key: `false` is
+    // accepted afterwards, and the read follows it off `true`.
+    document
+        .set_wire("context.auto_compact", &json!(true))
+        .expect("the boolean is accepted");
+    document
+        .set_wire("context.auto_compact", &json!(false))
+        .expect("the valid false is accepted afterwards");
+    assert_eq!(
+        document.read_value("context.auto_compact"),
+        Some(json!(false)),
+        "the accepted edit is what the read serves"
+    );
+    let from_file = format!(
+        "{}\n[context]\nauto_compact = false\n",
+        support::base_config()
+    );
+    let accepted = Config::parse_validated(&from_file).expect("the file surface accepts it too");
+    assert_eq!(
+        accepted.read_value("context.auto_compact"),
+        Some(json!(false)),
+        "both surfaces land the same value"
     );
 }
 
