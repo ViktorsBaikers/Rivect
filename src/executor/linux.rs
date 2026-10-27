@@ -11,7 +11,8 @@
 //! move the payload on the inherited fd — no ambient path.
 //!
 //! The confinement launcher composes three kernel mechanisms without any
-//! `unsafe` in this crate: `unshare(1)` isolates the network namespace,
+//! `unsafe` in this crate: `unshare(1)` creates a user namespace mapped to
+//! the caller and isolates its network namespace,
 //! `setpriv(1)` applies a Landlock ruleset (handled filesystem accesses
 //! with per-path allowances, deny-by-default) and the seccomp net-deny
 //! filter on every leg that runs a program — pathname AF_UNIX sockets
@@ -19,12 +20,12 @@
 //! egress boundary — and `--nnp` pins `no_new_privs` so the filter
 //! cannot be escaped through privilege grants.
 
-use super::macos::{FileIdentity, ReadObservation, ReadWorker, WorkerError};
+use super::macos::{ReadObservation, ReadWorker, WorkerError, WriteIdentity};
 use super::{
-    confirm_opened_regular, denied_write_candidate, expect_admitted, expect_denied,
-    helper_confined_write, helper_launch_command, helper_launch_init_failed,
-    inspect_regular_target, observe_confined_child, probe_read_conformance_legs,
-    read_observation_from, same_regular_file, sandbox_denied, set_private_mode,
+    confirm_opened_regular, confirm_write_occupant, denied_write_candidate, expect_admitted,
+    expect_denied, helper_confined_write, helper_launch_command, helper_launch_init_failed,
+    helper_path, inspect_regular_target, probe_read_conformance_legs, read_observation_from,
+    sandbox_denied,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -70,7 +71,7 @@ impl ReadWorker for LinuxWorker {
         &mut self,
         scope_root: &Path,
         target: &Path,
-        expected: FileIdentity,
+        expected: WriteIdentity,
         bytes: &[u8],
     ) -> Result<(), WorkerError> {
         write_once(scope_root, target, expected, bytes)
@@ -95,43 +96,27 @@ impl ReadWorker for LinuxWorker {
 /// scope only). That omission is the deny-first: `setpriv` then
 /// `execve`s the control, Landlock returns EACCES, and `errexec` exits
 /// 126. Do not add a path-beneath execute rule for this directory.
-pub fn denied_exec_control() -> Result<PathBuf, WorkerError> {
-    static ARTIFACT: Mutex<Option<PathBuf>> = Mutex::new(None);
-    let mut slot = ARTIFACT.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(path) = slot.as_ref()
-        && path.is_file()
-    {
-        return Ok(path.clone());
-    }
-    let dir = std::env::temp_dir().join(format!("rivect-denied-exec-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|source| WorkerError::SandboxUnavailable {
-        reason: format!("denied-exec control directory unavailable: {source}"),
-    })?;
-    if !set_private_mode(&dir) {
-        return Err(WorkerError::SandboxUnavailable {
-            reason: "denied-exec control directory is not private".to_string(),
-        });
-    }
-    let dest = dir.join("denied-exec");
+pub fn denied_exec_control() -> Result<super::OwnedArtifact, WorkerError> {
+    let artifact = super::OwnedArtifact::create("rivect-denied-exec-", "denied-exec")?;
     let source = if Path::new("/usr/bin/true").is_file() {
         Path::new("/usr/bin/true")
     } else {
         Path::new("/bin/true")
     };
-    std::fs::copy(source, &dest).map_err(|source| WorkerError::SandboxUnavailable {
-        reason: format!("denied-exec control copy unavailable: {source}"),
+    std::fs::copy(source, artifact.path()).map_err(|source| WorkerError::OwnedPreparation {
+        boundary: "owned.prepare.create",
+        source,
     })?;
     // `fs::copy` preserves mode bits on Unix, but umask and a
     // pre-existing dest can drop `+x`. Landlock EACCES is the
     // discriminator; a missing execute bit would be a false deny.
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|source| {
-        WorkerError::SandboxUnavailable {
-            reason: format!("denied-exec control execute bit unavailable: {source}"),
-        }
-    })?;
-    *slot = Some(dest.clone());
-    drop(slot);
-    Ok(dest)
+    std::fs::set_permissions(artifact.path(), std::fs::Permissions::from_mode(0o755)).map_err(
+        |source| WorkerError::OwnedPreparation {
+            boundary: "owned.prepare.create",
+            source,
+        },
+    )?;
+    Ok(artifact)
 }
 
 /// The egress control leg's program (bash): its `/dev/tcp` redirection
@@ -158,12 +143,32 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
     let launcher = SandboxLauncher::default();
     let confinement = exec_confinement(scope_root)?;
     let control_path = denied_exec_control()?;
-    let control = run_confined(&launcher, &confinement, &control_path, &[])?;
+    let positive = exec_confinement(control_path.parent().ok_or_else(|| {
+        WorkerError::SandboxUnavailable {
+            reason: "linux exec control has no private directory".to_string(),
+        }
+    })?)?;
+    let admitted = run_confined_owned(&launcher, &positive, control_path, &[])?;
+    if !admitted.exit_ok {
+        return Err(
+            launcher_userns_failure(admitted.exit_code, &admitted.stderr).unwrap_or_else(|| {
+                WorkerError::SandboxUnavailable {
+                    reason: format!(
+                        "linux exec boundary refused its admitted positive control: {}",
+                        stderr_excerpt(&admitted.stderr)
+                    ),
+                }
+            }),
+        );
+    }
+    let control_path = denied_exec_control()?;
+    let locator = control_path.path().to_path_buf();
+    let control = run_confined_owned(&launcher, &confinement, control_path, &[])?;
     if control.exit_ok {
         return Err(WorkerError::SandboxUnavailable {
             reason: format!(
                 "landlock exec boundary admitted the denied control {}",
-                control_path.display()
+                locator.display()
             ),
         });
     }
@@ -187,6 +192,24 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
 /// [`WorkerError::SandboxDenied`] naming the requested URL — the typed
 /// form of the OS denial every egress effect meets here.
 pub fn egress_once(url: &str) -> Result<(), WorkerError> {
+    let admitted = run_confined(
+        &SandboxLauncher::default(),
+        &egress_confinement(),
+        Path::new("/usr/bin/true"),
+        &[],
+    )?;
+    if !admitted.exit_ok {
+        return Err(
+            launcher_userns_failure(admitted.exit_code, &admitted.stderr).unwrap_or_else(|| {
+                WorkerError::SandboxUnavailable {
+                    reason: format!(
+                        "linux egress boundary refused its admitted positive control: {}",
+                        stderr_excerpt(&admitted.stderr)
+                    ),
+                }
+            }),
+        );
+    }
     let listener = bind_control_listener()?;
     let port = listener
         .local_addr()
@@ -306,7 +329,7 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
 pub fn write_once(
     scope_root: &Path,
     target: &Path,
-    expected: FileIdentity,
+    expected: WriteIdentity,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
     if bytes.len() > WRITE_MAX_BYTES {
@@ -331,19 +354,10 @@ fn write_opened_file(
     target: &Path,
     canonical_meta: &Metadata,
     file: &mut File,
-    expected: FileIdentity,
+    expected: WriteIdentity,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
-    let opened_meta = file
-        .metadata()
-        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
-    if !same_regular_file(canonical_meta, &opened_meta)
-        || FileIdentity::from_metadata(&opened_meta) != expected
-    {
-        return Err(WorkerError::TargetChanged {
-            target: target.to_path_buf(),
-        });
-    }
+    confirm_write_occupant(target, canonical_meta, file, expected)?;
     let clone = file
         .try_clone()
         .map_err(|source| WorkerError::WriteFailed { source })?;
@@ -452,6 +466,227 @@ pub fn egress_confinement() -> Confinement {
     Confinement::Egress
 }
 
+/// The roots one confined check phase runs under (DEC-040/042): the
+/// canonical toolchain, the sealed snapshot, and the fresh attempt rw.
+/// The check profile deliberately does NOT inherit the generic
+/// executor's wide `/usr` read rule — a Docker cargo cache under
+/// `/usr/local/cargo` would otherwise become visible to the child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRules {
+    /// Canonical toolchain `bin` directory (cargo, rustc, rustdoc).
+    pub toolchain: PathBuf,
+    /// The sealed `<attempt>/src` snapshot, canonical.
+    pub snapshot: PathBuf,
+    /// The fresh `<attempt>/rw` staging root, canonical.
+    pub rw: PathBuf,
+    /// Whether the phase executes Cargo-built test binaries.
+    pub test_binaries: bool,
+}
+
+/// The finite linker set the check admits for execution beside the
+/// toolchain: the canonical compiler driver and linker candidates that
+/// exist on this host, each anchored at its resolved path.
+fn check_linker_rules() -> Vec<String> {
+    let mut rules = Vec::new();
+    for candidate in [
+        "/usr/bin/cc",
+        "/usr/bin/ld",
+        "/usr/bin/ld.bfd",
+        "/usr/bin/gold",
+    ] {
+        if let Ok(canonical) = std::fs::canonicalize(candidate) {
+            rules.push(format!(
+                "path-beneath:execute,read-file:{}",
+                canonical.display()
+            ));
+        }
+    }
+    // The compiler driver re-execs its own collect2 from here; the
+    // directory holds only gcc's internal tools.
+    if Path::new("/usr/libexec/gcc").is_dir() {
+        rules.push("path-beneath:execute,read-file,read-dir:/usr/libexec/gcc".to_string());
+    }
+    rules
+}
+
+/// Landlock rules for one check phase: read+execute beneath the
+/// toolchain, read beneath `/lib` and `/usr/lib` (the loader and libc —
+/// never `/usr` at large), the resolved loader trees, read beneath the
+/// sealed snapshot, write beneath the rw root, and — for the test phase —
+/// execute beneath the target directory Cargo builds into. The network
+/// namespace plus the seccomp net-deny (loaded by the launcher) deny the
+/// network; no rule here ever admits a network operation.
+#[must_use = "the rules are a pure builder; an unused one proves nothing"]
+pub fn check_landlock_rules(rules: &CheckRules) -> Vec<String> {
+    let mut all = vec![
+        format!(
+            "path-beneath:read-file,read-dir,execute:{}",
+            rules.toolchain.display()
+        ),
+        "path-beneath:read-file,read-dir:/lib".to_string(),
+        "path-beneath:read-file,read-dir:/usr/lib".to_string(),
+        // /etc narrows to the four entries the offline toolchain reads
+        // (certificates, the loader cache, passwd, nsswitch) — the old
+        // whole-/etc rule exposed every host config file to the child
+        // (CR-Minor /etc breadth; macOS allows only /private/etc/ssl).
+        "path-beneath:read-file:/etc/ssl".to_string(),
+        "path-beneath:read-file:/etc/ld.so.cache".to_string(),
+        "path-beneath:read-file:/etc/passwd".to_string(),
+        "path-beneath:read-file:/etc/nsswitch.conf".to_string(),
+        // Cargo's std::process plumbing opens /dev/null for the stdin of
+        // every captured child (Command::output), so the phase cannot
+        // spawn its compiler without it. Exactly that device, nothing
+        // else under /dev.
+        "path-beneath:read-file,write-file:/dev/null".to_string(),
+    ];
+    all.extend(loader_rules("read-file"));
+    all.extend(loader_rules("execute"));
+    all.extend(check_linker_rules());
+    all.push(format!(
+        "path-beneath:read-file,read-dir:{}",
+        rules.snapshot.display()
+    ));
+    // remove-file/remove-dir: Cargo's vendor sync recreates its output
+    // directory and sqlite deletes its journal inside the private rw;
+    // refer: rustc renames its temp outputs across rw directories, which
+    // Landlock refuses with EXDEV unless the right is granted.
+    all.push(format!(
+        "path-beneath:write-file,make-dir,make-reg,truncate,remove-file,remove-dir,refer:{}",
+        rules.rw.display()
+    ));
+    all.push(format!(
+        "path-beneath:read-file,read-dir:{}",
+        rules.rw.display()
+    ));
+    if rules.test_binaries {
+        all.push(format!("path-beneath:execute:{}", rules.rw.display()));
+    }
+    all
+}
+
+/// The fixed namespace script the check chain runs: it mounts the
+/// bounded tmpfs on `<attempt>/rw` through the helper's check-setup
+/// (inside the fresh user/mount/PID/net namespace), builds the private
+/// layout inside the empty mount, copies the parent-staged cargo-home
+/// into the tmpfs when `$3` is not the `-` sentinel (the parent verified
+/// every byte; the copy only makes them visible inside the mount
+/// namespace, and its bytes count against the rw quota), runs the
+/// remaining argv — waiting rather than exec'ing, so the script can copy
+/// the vendor tree out to the parent-visible `<attempt>/vendor-out`
+/// before this mount namespace dies and takes the tmpfs with it — and
+/// exits with the confined program's status. Every variable path crosses
+/// as a quoted positional, so a path with spaces still arrives whole —
+/// the script text itself never interpolates a path.
+const CHECK_NAMESPACE_SCRIPT: &str = concat!(
+    "\"$1\" check-setup \"$2\" || exit $?\n",
+    "mkdir \"$2/rw/cargo-home\" \"$2/rw/home\" \"$2/rw/tmp\" || exit $?\n",
+    "if [ \"$3\" != - ]; then cp -R \"$3/.\" \"$2/rw/cargo-home/\" || exit $?; fi\n",
+    "attempt=\"$2\"\n",
+    "shift 3\n",
+    "\"$@\"\n",
+    "rc=$?\n",
+    "if [ -d \"$attempt/rw/vendor\" ]; then cp -R \"$attempt/rw/vendor/\" \"$attempt/vendor-out\" || exit $?; fi\n",
+    "exit $rc\n",
+);
+
+/// Builds the Linux confined-check phase command:
+/// `helper launch --resource-profile check -- unshare --user
+/// --map-root-user --mount --pid --net --fork -- /bin/sh -c <script> check
+/// <helper> <attempt> <staged-cargo-home|-> <setpriv chain...>`, where the
+/// setpriv chain applies the Landlock check rules plus the seccomp
+/// net-deny before exec'ing the canonical Cargo. The rlimits the check
+/// profile set survive every exec.
+///
+/// # Errors
+/// Returns [`WorkerError::SandboxUnavailable`] when the roots cannot be
+/// canonicalized and [`WorkerError::SandboxSpawnFailed`] when the seccomp
+/// filter cannot be prepared.
+pub fn check_phase_command(
+    rules: &CheckRules,
+    attempt_root: &Path,
+    staged_cargo_home: Option<&Path>,
+    cargo: &Path,
+    cargo_args: &[std::ffi::OsString],
+) -> Result<super::PreparedLaunch, WorkerError> {
+    let mut command = super::helper_check_launch_command()?;
+    command
+        .arg(UNSHARE)
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--net",
+            "--fork",
+        ])
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(CHECK_NAMESPACE_SCRIPT)
+        .arg("check")
+        .arg(helper_path()?)
+        .arg(attempt_root)
+        .arg(staged_cargo_home.unwrap_or(Path::new("-")))
+        .arg(SETPRIV)
+        .arg("--nnp")
+        .arg("--landlock-access")
+        .arg("fs");
+    for rule in check_landlock_rules(rules) {
+        command.arg("--landlock-rule").arg(&rule);
+    }
+    command
+        .arg("--seccomp-filter")
+        .filter_arg()
+        .arg("--")
+        .arg(cargo)
+        .args(cargo_args);
+    Ok(command)
+}
+
+/// Builds one deny-first control leg for the confined check: the same
+/// user-namespace/landlock/seccomp chain as a real phase, but the confined
+/// program is the control binary (`/bin/cat`, `/bin/sh`, or the compiled
+/// network probe) with the control's own argv, and `exec_paths` adds the
+/// execute allowance exactly those binaries need — the control DATA
+/// directory never gains a read allowance. A control that succeeds means
+/// the boundary does not enforce.
+///
+/// # Errors
+/// Same as [`check_phase_command`].
+pub fn check_control_command(
+    rules: &CheckRules,
+    program: &Path,
+    args: &[std::ffi::OsString],
+    exec_paths: &[PathBuf],
+) -> Result<super::PreparedLaunch, WorkerError> {
+    let mut command = super::helper_check_launch_command()?;
+    command
+        .arg(UNSHARE)
+        .arg("--user")
+        .arg("--map-root-user")
+        .arg("--net")
+        .arg("--")
+        .arg(SETPRIV)
+        .arg("--nnp")
+        .arg("--landlock-access")
+        .arg("fs");
+    for rule in check_landlock_rules(rules) {
+        command.arg("--landlock-rule").arg(&rule);
+    }
+    for path in exec_paths {
+        command
+            .arg("--landlock-rule")
+            .arg(format!("path-beneath:execute,read-file:{}", path.display()));
+    }
+    command
+        .arg("--seccomp-filter")
+        .filter_arg()
+        .arg("--")
+        .arg(program)
+        .args(args);
+    Ok(command)
+}
+
 pub fn landlock_rules(confinement: &Confinement) -> Vec<String> {
     match confinement {
         Confinement::Read { scope } => {
@@ -521,235 +756,21 @@ fn loader_rules(rights: &str) -> Vec<String> {
 
 // ----- seccomp net-deny filter -------------------------------------------
 
-/// `AUDIT_ARCH_AARCH64` — the `seccomp_data` architecture word on 64-bit
-/// arm, verified against the proof container's kernel.
-const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
-
-/// `AUDIT_ARCH_X86_64` for the same guard on amd64 hosts.
-const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-
-/// `SECCOMP_RET_ERRNO | EPERM` — a denied network syscall surfaces as
-/// `EPERM` from the confined program, never as a signal.
-const SECCOMP_RET_ERRNO_EPERM: u32 = 0x0005_0001;
-
-/// `SECCOMP_RET_ERRNO | ENOSYS` — glibc tries `clone3` first and falls
-/// back to `clone` only on ENOSYS. EPERM would break fork in confined
-/// exec; the deny targets confused-deputy (`clone3` as a helper), not spawn.
-const SECCOMP_RET_ERRNO_ENOSYS: u32 = 0x0005_0026;
-
-/// `clone3` — same number on x86_64 and aarch64.
-const SYS_CLONE3: u32 = 435;
-
-/// `clone` — architecture-specific; judged by flags, not denied by number,
-/// so glibc `fork` (SIGCHLD) still works after `clone3` returns ENOSYS.
-fn sys_clone() -> Option<u32> {
-    match std::env::consts::ARCH {
-        "aarch64" => Some(220),
-        "x86_64" => Some(56),
-        _ => None,
-    }
-}
-
-/// Namespace bits `clone` must not be allowed to set: a NEWPID/NEWUSER
-/// child leaves the host's process group and survives `killpg`. SIGCHLD
-/// and thread flags stay allowed so ordinary `fork` works.
-const CLONE_NEWTIME: u32 = 0x0000_0080;
-const CLONE_NEWNS: u32 = 0x0002_0000;
-const CLONE_NEWCGROUP: u32 = 0x0200_0000;
-const CLONE_NEWUTS: u32 = 0x0400_0000;
-const CLONE_NEWIPC: u32 = 0x0800_0000;
-const CLONE_NEWUSER: u32 = 0x1000_0000;
-const CLONE_NEWPID: u32 = 0x2000_0000;
-const CLONE_NEWNET: u32 = 0x4000_0000;
-const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
-    | CLONE_NEWNS
-    | CLONE_NEWCGROUP
-    | CLONE_NEWUTS
-    | CLONE_NEWIPC
-    | CLONE_NEWUSER
-    | CLONE_NEWPID
-    | CLONE_NEWNET;
-
-/// Offset of `seccomp_data.args[0]` (low 32 bits of the first syscall arg).
-const SECCOMP_DATA_ARGS0_OFFSET: u32 = 16;
-
-/// `SECCOMP_RET_ALLOW` — every syscall outside the deny list runs.
-const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
-
-/// Classic-BPF opcodes for the hand-assembled deny-list filter. The
-/// filter loads the architecture word and jumps straight to a deny
-/// verdict for any other architecture (an unjudged architecture fails
-/// closed), loads the syscall number, masks the x32/ILP32 compat band
-/// bit, and returns `ERRNO|EPERM` for the denied numbers except `clone3`
-/// (which returns `ERRNO|ENOSYS` so glibc fork falls back to `clone`),
-/// `ALLOW` for everything else — so the launcher's own `execve` of the
-/// confined program is never blocked, and neither are the Landlock
-/// syscalls `setpriv` itself already applied.
-const BPF_LD_W_ABS: u16 = 0x20;
-const BPF_ALU_AND_K: u16 = 0x54;
-const BPF_JEQ_K: u16 = 0x15;
-const BPF_RET_K: u16 = 0x06;
-const SECCOMP_DATA_NR_OFFSET: u32 = 0;
-const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
-
-/// `!0x4000_0000` — the syscall-number word with the x32/ILP32 compat
-/// band bit cleared: a compat-band number (`nr | 0x4000_0000`) carries
-/// the native audit architecture, so it must be judged by its masked
-/// native number instead of missing every native-equality deny entry.
-const SECCOMP_COMPAT_BAND_MASK: u32 = 0xBFFF_FFFF;
-
 /// The network syscalls the egress boundary denies, per native
 /// architecture. `None` on any other architecture is an honest
 /// capability failure, never an unfiltered leg.
 pub fn seccomp_denied_syscalls() -> Option<&'static [u32]> {
-    native_net_syscalls().map(|(_, numbers)| numbers)
+    rivect_sandbox_helper::seccomp_denied_syscalls()
 }
 
-fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
-    match std::env::consts::ARCH {
-        "aarch64" => {
-            const SYS_BIND: u32 = 200;
-            const SYS_LISTEN: u32 = 201;
-            const SYS_RECVMSG: u32 = 212;
-            const SYS_SETPGID: u32 = 154;
-            const SYS_SETSID: u32 = 157;
-            Some((
-                AUDIT_ARCH_AARCH64,
-                &[
-                    198,
-                    199,
-                    SYS_BIND,
-                    SYS_LISTEN,
-                    202,
-                    203,
-                    206,
-                    207,
-                    211,
-                    SYS_RECVMSG,
-                    242, // socket socketpair bind listen accept connect sendto recvfrom sendmsg recvmsg accept4
-                    243,
-                    269, // recvmmsg sendmmsg
-                    97,
-                    117,
-                    SYS_SETPGID,
-                    SYS_SETSID,
-                    268,
-                    270,
-                    271,
-                    280, // unshare ptrace setpgid setsid setns process_vm_* bpf
-                    425,
-                    426,
-                    427,
-                    434,
-                    438,        // io_uring_* pidfd_open pidfd_getfd
-                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
-                ],
-            ))
-        }
-        "x86_64" => {
-            const SYS_BIND: u32 = 49;
-            const SYS_LISTEN: u32 = 50;
-            const SYS_RECVMSG: u32 = 47;
-            const SYS_SETPGID: u32 = 109;
-            const SYS_SETSID: u32 = 112;
-            Some((
-                AUDIT_ARCH_X86_64,
-                &[
-                    41,
-                    42,
-                    43,
-                    44,
-                    45,
-                    46,
-                    SYS_RECVMSG,
-                    SYS_BIND,
-                    SYS_LISTEN,
-                    53,
-                    288, // socket connect accept sendto recvfrom sendmsg recvmsg bind listen socketpair accept4
-                    299,
-                    307, // recvmmsg sendmmsg
-                    101,
-                    SYS_SETPGID,
-                    SYS_SETSID,
-                    272,
-                    308,
-                    310,
-                    311,
-                    321, // ptrace setpgid setsid unshare setns process_vm_* bpf
-                    425,
-                    426,
-                    427,
-                    434,
-                    438,        // io_uring_* pidfd_open pidfd_getfd
-                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
-                ],
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Renders the net-deny filter as raw `struct sock_filter` instructions —
-/// the exact file format `setpriv --seccomp-filter` loads.
 fn net_deny_filter() -> Result<Vec<u8>, WorkerError> {
-    let Some((arch, denied)) = native_net_syscalls() else {
-        return Err(WorkerError::SandboxUnavailable {
-            reason: format!(
-                "linux seccomp: no net-deny syscall table for architecture {}",
-                std::env::consts::ARCH
-            ),
-        });
-    };
-    let mut program: Vec<(u16, u8, u8, u32)> = vec![
-        (BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARCH_OFFSET),
-        // Any other architecture lands on a deny verdict: an unjudged
-        // architecture fails closed. The constant offset reaches the
-        // first deny pair's ERRNO return from the guard.
-        (BPF_JEQ_K, 0, 3, arch),
-        (BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_NR_OFFSET),
-        // Compat band before every comparison: a `nr | 0x4000_0000`
-        // call is judged by its native number.
-        (BPF_ALU_AND_K, 0, 0, SECCOMP_COMPAT_BAND_MASK),
-    ];
-    for &nr in denied {
-        program.push((BPF_JEQ_K, 0, 1, nr));
-        let ret = if nr == SYS_CLONE3 {
-            SECCOMP_RET_ERRNO_ENOSYS
-        } else {
-            SECCOMP_RET_ERRNO_EPERM
-        };
-        program.push((BPF_RET_K, 0, 0, ret));
-    }
-    // SYS_clone stays allowed by number so glibc fork (SIGCHLD) works.
-    // args[0] carrying any CLONE_NEW* namespace bit is EPERM: that child
-    // would leave the process group and survive killpg.
-    let sys_clone = sys_clone().ok_or_else(|| WorkerError::SandboxUnavailable {
-        reason: format!(
-            "linux seccomp: no clone syscall number for architecture {}",
-            std::env::consts::ARCH
-        ),
-    })?;
-    program.push((BPF_JEQ_K, 0, 4, sys_clone));
-    program.push((BPF_LD_W_ABS, 0, 0, SECCOMP_DATA_ARGS0_OFFSET));
-    program.push((BPF_ALU_AND_K, 0, 0, CLONE_NEW_NAMESPACE_FLAGS));
-    program.push((BPF_JEQ_K, 1, 0, 0));
-    program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO_EPERM));
-    program.push((BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW));
-    let mut bytes = Vec::with_capacity(program.len() * 8);
-    for (code, jt, jf, k) in program {
-        bytes.extend_from_slice(&code.to_le_bytes());
-        bytes.push(jt);
-        bytes.push(jf);
-        bytes.extend_from_slice(&k.to_le_bytes());
-    }
-    Ok(bytes)
+    rivect_sandbox_helper::compile_seccomp(rivect_sandbox_helper::SeccompStage::Final)
+        .map_err(|source| WorkerError::OwnedSeccomp { source })
 }
 
 /// The loaded net-deny filter file for this process, written once under a
 /// private unpredictable directory the same probe discipline uses for its
 /// artifacts.
-static SECCOMP_FILTER_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
-
 /// Returns the path of this process's seccomp net-deny filter file,
 /// writing it on first use.
 ///
@@ -757,37 +778,26 @@ static SECCOMP_FILTER_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Returns [`WorkerError::SandboxUnavailable`] when the filter cannot be
 /// rendered for this architecture, its private directory cannot be created
 /// or secured, or the filter file cannot be written.
-pub fn net_deny_filter_file() -> Result<PathBuf, WorkerError> {
-    let cached = SECCOMP_FILTER_FILE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    if let Some(path) = cached {
-        return Ok(path);
-    }
+pub fn net_deny_filter_file() -> Result<super::OwnedArtifact, WorkerError> {
+    net_deny_filter_file_with_context(std::time::Instant::now() + super::CONFINED_DEADLINE, None)
+}
+
+pub(super) fn net_deny_filter_file_with_context(
+    deadline: std::time::Instant,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Result<super::OwnedArtifact, WorkerError> {
     let filter = net_deny_filter()?;
-    let dir = std::env::temp_dir().join(format!(
-        "rivect-seccomp-filter-{}-{}",
-        std::process::id(),
-        crate::contracts::TaskId::generate().0
-    ));
-    std::fs::create_dir(&dir).map_err(|source| WorkerError::SandboxUnavailable {
-        reason: format!("linux seccomp: the filter directory cannot be created: {source}"),
+    let artifact = super::OwnedArtifact::create_with_context(
+        "rivect-seccomp-filter-",
+        "net-deny.bpf",
+        deadline,
+        cancel,
+    )?;
+    std::fs::write(artifact.path(), &filter).map_err(|source| WorkerError::OwnedPreparation {
+        boundary: "owned.prepare.create",
+        source,
     })?;
-    if !set_private_mode(&dir) {
-        return Err(WorkerError::SandboxUnavailable {
-            reason: "linux seccomp: the filter directory cannot be secured private".to_string(),
-        });
-    }
-    let path = dir.join("net-deny.bpf");
-    std::fs::write(&path, &filter).map_err(|source| WorkerError::SandboxUnavailable {
-        reason: format!("linux seccomp: the filter file cannot be written: {source}"),
-    })?;
-    SECCOMP_FILTER_FILE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .replace(path.clone());
-    Ok(path)
+    Ok(artifact)
 }
 
 // ----- the confined run ---------------------------------------------------
@@ -802,8 +812,9 @@ pub struct ConfinedOutcome {
     pub stderr: String,
 }
 
-/// Runs one program under the confinement: `unshare --net` composes the
-/// network namespace, `setpriv --nnp --landlock-access fs` applies the
+/// Runs one program under the confinement: `unshare --user
+/// --map-current-user --net` composes the user and network namespaces,
+/// `setpriv --nnp --landlock-access fs` applies the
 /// ruleset (deny-by-default) with the confinement's allowances, and every
 /// confined leg loads the seccomp net-deny filter. Helper-init
 /// classification still requires the helper prefix (pre-`execv`): a
@@ -823,18 +834,44 @@ pub fn run_confined(
     program: &Path,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
-    run_confined_inner(launcher, confinement, program, args)
+    run_confined_inner(
+        launcher,
+        confinement,
+        ConfinedProgram::Borrowed(program),
+        args,
+    )
 }
 
+/// Transfers a native program artifact into one bounded confined run.
+///
+/// # Errors
+/// Returns the original launch or resource-release error without detaching custody.
+pub fn run_confined_owned(
+    launcher: &SandboxLauncher,
+    confinement: &Confinement,
+    program: super::OwnedArtifact,
+    args: &[&OsStr],
+) -> Result<ConfinedOutcome, WorkerError> {
+    run_confined_inner(launcher, confinement, ConfinedProgram::Owned(program), args)
+}
+
+enum ConfinedProgram<'a> {
+    Borrowed(&'a Path),
+    Owned(super::OwnedArtifact),
+}
+
+/// Launches in a caller-mapped user namespace and its isolated network namespace.
 fn run_confined_inner(
     launcher: &SandboxLauncher,
     confinement: &Confinement,
-    program: &Path,
+    program: ConfinedProgram<'_>,
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     let mut command = helper_launch_command()?;
     command
         .arg(&launcher.unshare)
+        .arg("--user")
+        .arg("--map-current-user")
         .arg("--net")
         .arg("--")
         .arg(&launcher.setpriv)
@@ -856,16 +893,22 @@ fn run_confined_inner(
     // net-deny (setsid/setpgid/clone NEW*) loads on every confined leg —
     // Read, Write, Exec, and Egress — so the netns is never the egress
     // carrier alone and killpg cannot be escaped from a write gate.
-    command.arg("--seccomp-filter").arg(net_deny_filter_file()?);
-    command.arg("--").arg(program).args(args);
-    let mut child = command
+    command.arg("--seccomp-filter").filter_arg();
+    command.arg("--");
+    match program {
+        ConfinedProgram::Borrowed(program) => {
+            command.arg(program);
+        }
+        ConfinedProgram::Owned(program) => {
+            command.artifact_arg(program);
+        }
+    }
+    command.args(args);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| WorkerError::SandboxSpawnFailed { source })?;
-    let stderr = child.stderr.take();
-    let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
+        .stderr(Stdio::piped());
+    let observed = super::observed_owned(command.run(&[])?);
     if let Some(error) = helper_launch_init_failed(&observed) {
         return Err(error);
     }
@@ -887,6 +930,23 @@ fn stderr_excerpt(stderr: &str) -> String {
         .chars()
         .take(160)
         .collect()
+}
+
+pub(super) const LINUX_USERNS_RECOVERY: &str = "linux recovery: let this user create unprivileged user namespaces (an AppArmor profile granting userns to this program, or kernel.apparmor_restrict_unprivileged_userns=0), keep user.max_user_namespaces above 0 and use util-linux 2.38 or newer; see docs/operations/linux-prerequisites.md";
+
+/// Only trusted worker-owned programs can attribute this prefix to the launcher.
+pub(super) fn launcher_userns_failure(exit_code: Option<i32>, stderr: &str) -> Option<WorkerError> {
+    (exit_code == Some(1)
+        && stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| line.starts_with("unshare: ")))
+    .then(|| WorkerError::SandboxUnavailable {
+        reason: format!(
+            "linux user namespace unavailable (unshare --user): {}; {LINUX_USERNS_RECOVERY}",
+            stderr_excerpt(stderr)
+        ),
+    })
 }
 
 // ----- conformance probes and gates --------------------------------------
@@ -1000,6 +1060,11 @@ pub fn probe_read_conformance(
         |path| {
             let outcome =
                 run_confined(launcher, &confinement, Path::new(CAT), &[path.as_os_str()])?;
+            if path != Path::new(DENIED_PROBE_TARGET)
+                && let Some(error) = launcher_userns_failure(outcome.exit_code, &outcome.stderr)
+            {
+                return Err(error);
+            }
             Ok((outcome.exit_ok, outcome.stderr))
         },
         |stderr| {
@@ -1084,24 +1149,28 @@ pub fn probe_write_conformance(
     ) {
         Ok(outcome) if outcome.exit_ok => Ok(()),
         Ok(outcome) => {
-            // `O_NOFOLLOW` keeps this writability check from ever opening
-            // through a symlink planted on the artifact path — a tampered
-            // artifact surfaces as the same typed write denial as a scope
-            // this process cannot write.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(O_NOFOLLOW)
-                .open(&artifact)
-            {
-                Ok(_) => Err(WorkerError::SandboxUnavailable {
-                    reason: format!(
-                        "linux landlock conformance probe: the boundary denied the in-scope write leg: {}",
-                        stderr_excerpt(&outcome.stderr)
-                    ),
-                }),
-                Err(source) => Err(WorkerError::WriteFailed { source }),
+            if let Some(error) = launcher_userns_failure(outcome.exit_code, &outcome.stderr) {
+                Err(error)
+            } else {
+                // `O_NOFOLLOW` keeps this writability check from ever opening
+                // through a symlink planted on the artifact path — a tampered
+                // artifact surfaces as the same typed write denial as a scope
+                // this process cannot write.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .custom_flags(O_NOFOLLOW)
+                    .open(&artifact)
+                {
+                    Ok(_) => Err(WorkerError::SandboxUnavailable {
+                        reason: format!(
+                            "linux landlock conformance probe: the boundary denied the in-scope write leg: {}",
+                            stderr_excerpt(&outcome.stderr)
+                        ),
+                    }),
+                    Err(source) => Err(WorkerError::WriteFailed { source }),
+                }
             }
         }
         Err(error) => Err(error),
@@ -1115,6 +1184,153 @@ pub fn probe_write_conformance(
         .unwrap_or_else(PoisonError::into_inner)
         .insert(key);
     Ok(())
+}
+
+/// `AUDIT_ARCH_AARCH64` — the `seccomp_data` architecture word on 64-bit
+/// arm, verified against the proof container's kernel.
+#[cfg(test)]
+const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+
+/// `AUDIT_ARCH_X86_64` for the same guard on amd64 hosts.
+#[cfg(test)]
+const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+/// `clone3` — same number on x86_64 and aarch64.
+#[cfg(test)]
+const SYS_CLONE3: u32 = 435;
+
+/// `clone` — architecture-specific; judged by flags, not denied by number,
+/// so glibc `fork` (SIGCHLD) still works after `clone3` returns ENOSYS.
+#[cfg(test)]
+fn sys_clone() -> Option<u32> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(220),
+        "x86_64" => Some(56),
+        _ => None,
+    }
+}
+
+/// Namespace bits `clone` must not be allowed to set: a NEWPID/NEWUSER
+/// child leaves the host's process group and survives `killpg`. SIGCHLD
+/// and thread flags stay allowed so ordinary `fork` works.
+#[cfg(test)]
+const CLONE_NEWTIME: u32 = 0x0000_0080;
+#[cfg(test)]
+const CLONE_NEWNS: u32 = 0x0002_0000;
+#[cfg(test)]
+const CLONE_NEWCGROUP: u32 = 0x0200_0000;
+#[cfg(test)]
+const CLONE_NEWUTS: u32 = 0x0400_0000;
+#[cfg(test)]
+const CLONE_NEWIPC: u32 = 0x0800_0000;
+#[cfg(test)]
+const CLONE_NEWUSER: u32 = 0x1000_0000;
+#[cfg(test)]
+const CLONE_NEWPID: u32 = 0x2000_0000;
+#[cfg(test)]
+const CLONE_NEWNET: u32 = 0x4000_0000;
+#[cfg(test)]
+const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
+    | CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET;
+
+#[cfg(test)]
+fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
+    match std::env::consts::ARCH {
+        "aarch64" => {
+            const SYS_BIND: u32 = 200;
+            const SYS_LISTEN: u32 = 201;
+            const SYS_RECVMSG: u32 = 212;
+            const SYS_SETPGID: u32 = 154;
+            const SYS_SETSID: u32 = 157;
+            Some((
+                AUDIT_ARCH_AARCH64,
+                &[
+                    198,
+                    // `socketpair` (199) and `recvfrom` (207) stay
+                    // allowed: the kernel only supports socketpair for
+                    // AF_UNIX, and with `socket` (198) denied the only
+                    // socket a child can create is such a pair, whose
+                    // peer is the spawning process itself — no egress
+                    // path exists (`connect`/`bind`/`listen` stay
+                    // denied). Rust std's fork-path `Command::spawn`
+                    // bootstrap needs the pair plus a `recvfrom` on it
+                    // for the exec-result handshake, so denying either
+                    // breaks every Rust child (cargo→rustc included).
+                    SYS_BIND,
+                    SYS_LISTEN,
+                    202,
+                    203,
+                    206,
+                    211,
+                    SYS_RECVMSG,
+                    242, // socket bind listen accept connect sendto sendmsg recvmsg accept4
+                    243,
+                    269, // recvmmsg sendmmsg
+                    97,
+                    117,
+                    SYS_SETPGID,
+                    SYS_SETSID,
+                    268,
+                    270,
+                    271,
+                    280, // unshare ptrace setpgid setsid setns process_vm_* bpf
+                    425,
+                    426,
+                    427,
+                    434,
+                    438,        // io_uring_* pidfd_open pidfd_getfd
+                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
+                ],
+            ))
+        }
+        "x86_64" => {
+            const SYS_BIND: u32 = 49;
+            const SYS_LISTEN: u32 = 50;
+            const SYS_RECVMSG: u32 = 47;
+            const SYS_SETPGID: u32 = 109;
+            const SYS_SETSID: u32 = 112;
+            Some((
+                AUDIT_ARCH_X86_64,
+                &[
+                    41,
+                    42,
+                    43,
+                    44,
+                    // 45 (`recvfrom`) and 53 (`socketpair`) stay allowed:
+                    // the std spawn handshake needs both; see the aarch64
+                    // arm for the full rationale.
+                    46,
+                    SYS_RECVMSG,
+                    SYS_BIND,
+                    SYS_LISTEN,
+                    288, // socket connect accept sendto sendmsg recvmsg bind listen accept4
+                    299,
+                    307, // recvmmsg sendmmsg
+                    101,
+                    SYS_SETPGID,
+                    SYS_SETSID,
+                    272,
+                    308,
+                    310,
+                    311,
+                    321, // ptrace setpgid setsid unshare setns process_vm_* bpf
+                    425,
+                    426,
+                    427,
+                    434,
+                    438,        // io_uring_* pidfd_open pidfd_getfd
+                    SYS_CLONE3, // clone3 → ENOSYS so glibc fork falls back to clone
+                ],
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

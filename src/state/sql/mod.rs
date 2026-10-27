@@ -2,6 +2,17 @@
 //! statements are constants so CAS/outbox logic is not mixed with DDL.
 
 pub const SCHEMA: &str = include_str!("schema.sql");
+/// Decision-owned DDL: the append-only answer-attempt journal. Idempotent
+/// at open like `SCHEMA`; statement texts stay named below (P-002).
+pub const DECISIONS_SCHEMA: &str = include_str!("decisions.sql");
+/// Plan-owned DDL: selections, plan obligations, versioned plans, gate
+/// holds and plan-owned block marks. Idempotent at open like `SCHEMA`.
+pub const PLANS_SCHEMA: &str = include_str!("plans.sql");
+/// Index-owned DDL: the versioned snapshot generations and their
+/// derived edges. Idempotent at open like `SCHEMA`.
+pub const INDEX_SCHEMA: &str = include_str!("index.sql");
+/// Assumption-check records with immutable expectations. Idempotent at open.
+pub const ASSUMPTIONS_SCHEMA: &str = include_str!("assumptions.sql");
 
 pub const BOOTSTRAP_RECEIPT_BY_KEY: &str =
     "SELECT result_json FROM bootstrap_receipts WHERE key = ?1";
@@ -41,23 +52,75 @@ pub const INSERT_CRITERION: &str =
 pub const INSERT_CONSTRAINT: &str =
     "INSERT INTO task_constraints (task_id, position, text) VALUES (?1, ?2, ?3)";
 pub const TOUCH_EVENT_CURSOR: &str = "UPDATE tasks SET event_cursor = 1 WHERE task_id = ?1";
-pub const TASK_REVISION_LIFECYCLE: &str =
-    "SELECT revision, lifecycle FROM tasks WHERE task_id = ?1";
 pub const PENDING_QUESTION_EXISTS: &str =
     "SELECT EXISTS(SELECT 1 FROM questions WHERE task_id = ?1 AND state = 'pending')";
 pub const INSERT_QUESTION: &str = "INSERT INTO questions (question_id, task_id, revision, intent_revision, prompt, body_json, state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')";
 pub const TASK_SET_WAITING: &str = "UPDATE tasks SET revision = ?2, lifecycle = 'waiting', event_cursor = event_cursor + 1 WHERE task_id = ?1";
+// The pending read is lifecycle-bound: a terminal task cannot own a live
+// question, so a stale row left pending beside `completed`/`cancelled`
+// (a pre-journal write or a foreign writer) stays invisible instead of
+// resurrecting the task's wait on every question.current poll.
 pub const CURRENT_QUESTION: &str =
     "SELECT q.body_json, t.revision, t.intent_revision FROM questions q
                  JOIN tasks t ON t.task_id = q.task_id
-                 WHERE q.task_id = ?1 AND q.state = 'pending' ORDER BY q.revision DESC LIMIT 1";
+                 WHERE q.task_id = ?1 AND q.state = 'pending'
+                 AND t.lifecycle NOT IN ('completed', 'cancelled')
+                 ORDER BY q.revision DESC LIMIT 1";
 pub const TASK_REVISIONS: &str =
     "SELECT revision, intent_revision, lifecycle FROM tasks WHERE task_id = ?1";
-pub const QUESTION_BY_ID: &str =
-    "SELECT revision, state, body_json FROM questions WHERE question_id = ?1";
+// A question is addressed by its owning task too: an answer that names
+// another task's question id must miss the row, never answer across the
+// task boundary. `intent_revision` rides along so a superseded row's
+// stale pin reports `stale_intent`, not a generic not-pending conflict.
+pub const QUESTION_BY_ID: &str = "SELECT revision, state, body_json, intent_revision FROM questions WHERE question_id = ?1 AND task_id = ?2";
+/// A pending row whose intent pin no longer matches the task's live
+/// intent is dead: `current_question` hides it and `answer_question`
+/// denies it. Superseding keeps the row for audit while freeing the task
+/// to publish the fork its live intent actually asks. RETURNING hands
+/// back each killed row's id, revision and stale pin so the caller can
+/// journal its `question.superseded` event in the same transaction — an
+/// `events.read` replay must see the row die, not stay pending forever.
+pub const SUPERSEDE_PENDING_QUESTIONS: &str = "UPDATE questions SET state = 'superseded'
+                 WHERE task_id = ?1 AND state = 'pending' AND intent_revision != ?2
+                 RETURNING question_id, revision, intent_revision";
+/// A changed selection supersedes only a question its old plan row waits
+/// on; returning the revision lets the caller journal the death atomically.
+pub const SUPERSEDE_PLAN_QUESTION: &str = "UPDATE questions SET state = 'superseded'
+                 WHERE question_id = ?1 AND task_id = ?2 AND revision = ?3 AND state = 'pending'
+                 RETURNING revision";
+/// Terminal transitions kill every pending row regardless of its intent
+/// pin: the task can never publish the fork a still-live pin was waiting
+/// on, so the row dies for the lifecycle, not for a stale pin. The row
+/// is kept for audit and RETURNING hands back each killed row's id and
+/// revision so its `question.superseded` event journals in the same
+/// transaction.
+pub const SUPERSEDE_TERMINAL_QUESTIONS: &str = "UPDATE questions SET state = 'superseded'
+                 WHERE task_id = ?1 AND state = 'pending'
+                 RETURNING question_id, revision";
+/// Superseding a pending question ends the task's wait until its current
+/// intent or plan selection publishes a replacement.
+pub const SUPERSESSION_RESUMES_TASK: &str =
+    "UPDATE tasks SET lifecycle = 'running' WHERE task_id = ?1 AND lifecycle = 'waiting'";
 pub const ANSWER_QUESTION: &str = "UPDATE questions SET state = 'answered', answer_json = ?2, answered_origin = ?3 WHERE question_id = ?1";
 pub const TASK_SET_RUNNING: &str = "UPDATE tasks SET revision = ?2, lifecycle = 'running', event_cursor = event_cursor + 1 WHERE task_id = ?1";
+/// One attempt row: `applied` rows ride the answering transaction, denied
+/// rows commit on their own so the journal never loses a rejection.
+pub const INSERT_ANSWER_ATTEMPT: &str = "INSERT INTO answer_attempts (question_id, task_id, question_revision, selection_json, author, outcome, denial)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+pub const ANSWER_ATTEMPTS_FOR_TASK: &str =
+    "SELECT id, question_id, task_id, question_revision, selection_json, author, outcome, denial
+             FROM answer_attempts WHERE task_id = ?1 ORDER BY id";
+/// The pause-binding read (AC-045): a decision step runs immediately
+/// after its answer commit, so the task's newest applied row names the
+/// question the step resolves — denied rows answer nothing and stay
+/// invisible here.
+pub const LATEST_APPLIED_ANSWER: &str =
+    "SELECT question_id FROM answer_attempts WHERE task_id = ?1 AND outcome = 'applied'
+                 ORDER BY id DESC LIMIT 1";
+pub const EVIDENCE_FOR_TASK: &str =
+    "SELECT evidence_id, task_id, scope, observation, digest, validity, obligation_id
+             FROM evidence WHERE task_id = ?1 ORDER BY rowid";
 pub const UPDATE_INTENT: &str = "UPDATE tasks SET revision = ?2, intent_revision = ?3, event_cursor = event_cursor + 1 WHERE task_id = ?1";
 pub const CANCEL_TASK: &str = "UPDATE tasks SET revision = ?2, lifecycle = 'cancelled', event_cursor = event_cursor + 1 WHERE task_id = ?1";
 pub const TASK_LIFECYCLE: &str = "SELECT lifecycle FROM tasks WHERE task_id = ?1";
@@ -165,14 +228,74 @@ pub const STALE_EVIDENCE_COUNT: &str =
                  WHERE o.task_id = ?1 AND e.validity = 'stale'";
 pub const TASK_REVISION: &str = "SELECT revision FROM tasks WHERE task_id = ?1";
 pub const COMPLETE_TASK: &str = "UPDATE tasks SET revision = ?2, lifecycle = 'completed', event_cursor = event_cursor + 1 WHERE task_id = ?1";
+// Plan obligations count toward completion like criterion obligations:
+// a required stage or check that never closed keeps the task open
+// instead of vanishing from the guard.
 pub const COMPLETION_COUNTS: &str = "SELECT
-                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND execution != 'satisfied'),
-                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved'),
+                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND execution != 'satisfied')
+                      + (SELECT COUNT(*) FROM plan_obligations WHERE task_id = ?1 AND execution != 'satisfied'),
+                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved')
+                      + (SELECT COUNT(*) FROM plan_obligations WHERE task_id = ?1 AND applicability = 'unresolved'),
                     (SELECT COUNT(*) FROM attempts WHERE task_id = ?1 AND state = 'unknown')";
-pub const UPSERT_RETAINED: &str =
-    "INSERT OR REPLACE INTO retained (boundary_id, record_json) VALUES (?1, ?2)";
+pub const ASSUMPTION_TASK_IN_SESSION: &str =
+    "SELECT EXISTS(SELECT 1 FROM tasks WHERE session_id = ?1 AND task_id = ?2)";
+pub const RECORD_ASSUMPTION_CHECK: &str = "INSERT INTO assumption_checks
+                    (session_id, task_id, check_id, expected_result, assertion_digest, record_version, record_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(session_id, task_id, check_id) DO UPDATE SET record_json = excluded.record_json
+                    WHERE assumption_checks.expected_result = excluded.expected_result
+                      AND assumption_checks.assertion_digest = excluded.assertion_digest
+                      AND assumption_checks.record_version = excluded.record_version";
+pub const ASSUMPTION_CHECK_BY_ID: &str = "SELECT record_version, record_json FROM assumption_checks
+                    WHERE session_id = ?1 AND task_id = ?2 AND check_id = ?3";
+pub const INSERT_RETAINED_ONCE: &str = "INSERT INTO retained (boundary_id, record_json) VALUES (?1, ?2) ON CONFLICT(boundary_id) DO NOTHING";
 pub const RETAINED_BY_ID: &str = "SELECT record_json FROM retained WHERE boundary_id = ?1";
+pub const RETAINED_LATEST_BY_ID: &str = "SELECT record_json FROM retained
+                    WHERE boundary_id = ?1 OR boundary_id = ?2
+                    ORDER BY CASE boundary_id WHEN ?1 THEN 0 ELSE 1 END
+                    LIMIT 1";
+/// The dual-key collision read: every row at the direct or the terminal
+/// key, so a conflicting row at either key surfaces instead of hiding
+/// behind an identical row at the other.
+pub const RETAINED_BY_BOTH_KEYS: &str = "SELECT record_json FROM retained
+                    WHERE boundary_id = ?1 OR boundary_id = ?2
+                    ORDER BY boundary_id";
+/// One attempt's own retained check rows in boundary order: the DEC-047
+/// recovery settlement predicate reads the durable rows alone. The
+/// bounds are the attempt's boundary prefix and its successor (';' is
+/// ':' + 1), so the rejection namespace (`ret:check-rejection:…`) and
+/// the terminal namespace never intersect the range.
+pub const CHECK_RETAINED_ROWS: &str = "SELECT boundary_id, record_json FROM retained
+                    WHERE boundary_id BETWEEN ?1 AND ?2
+                    ORDER BY boundary_id";
 pub const EXISTS_RETAINED: &str = "SELECT EXISTS(SELECT 1 FROM retained WHERE boundary_id = ?1)";
+// DEC-048 first-only dispatch claim (#6a): the attempt's task, effect
+// class and state, the task's lifecycle, and the existence of the
+// attempt's `admit.claim` marker — one statement, one owner operation.
+pub const CLAIM_ATTEMPT_READ: &str = "SELECT
+                    a.task_id,
+                    a.effect_class,
+                    a.state,
+                    t.lifecycle,
+                    EXISTS(SELECT 1 FROM retained WHERE boundary_id = ?2)
+                    FROM attempts a JOIN tasks t ON t.task_id = a.task_id
+                    WHERE a.attempt_id = ?1";
+// DEC-048 claim #9: the conditional planned->running transition.
+pub const CLAIM_ATTEMPT_RUNNING: &str = "UPDATE attempts SET state = 'running'
+                    WHERE attempt_id = ?1 AND task_id = ?2 AND effect_class = 'exec' AND state = 'planned'";
+// DEC-047 recovery reconcile: every attempt whose first-only check
+// dispatch claim marker is durable — the whole Runtime-open recovery
+// view in one statement. The boundary prefix is bound, never spliced.
+pub const CHECK_CLAIMED_ATTEMPTS: &str = "SELECT a.attempt_id FROM attempts a
+                    WHERE EXISTS (SELECT 1 FROM retained r
+                                  WHERE r.boundary_id = ?1 || a.attempt_id || ':admit.claim')
+                    ORDER BY a.rowid";
+// DEC-048 claim #1: the actual busy timeout as a typed integer row.
+pub const BUSY_TIMEOUT_READ: &str = "PRAGMA busy_timeout";
+// DEC-051 healthy close: the two named maintenance statements, in the
+// contract order (optimize first, then the truncating checkpoint).
+pub const OPTIMIZE: &str = "PRAGMA optimize";
+pub const WAL_CHECKPOINT_TRUNCATE: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 pub const INSERT_SUPERVISOR_REACTION: &str =
     "INSERT INTO supervisor_reactions (task_id, reaction_json) VALUES (?1, ?2)";
 pub const SUPERVISOR_REACTIONS_PAGE: &str = "SELECT reaction_json FROM supervisor_reactions WHERE task_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3";
@@ -254,3 +377,200 @@ pub const SET_BUDGET_RESERVATION_STATE: &str =
     "UPDATE budget_reservations SET state = ?2, charged = ?3 WHERE reservation_id = ?1";
 pub const BUDGET_RESERVATION_ROW: &str =
     "SELECT state, bound, charged FROM budget_reservations WHERE reservation_id = ?1 LIMIT 1";
+
+// ----- plan selection, plan obligations, plan revisions, gate holds -----
+
+pub const PLAN_SELECTION: &str =
+    "SELECT revision, facts_digest, request_kind FROM plan_selections WHERE task_id = ?1";
+pub const UPSERT_PLAN_SELECTION: &str =
+    "INSERT INTO plan_selections (task_id, revision, facts_digest, request_kind)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (task_id) DO UPDATE SET
+                 revision = excluded.revision,
+                 facts_digest = excluded.facts_digest,
+                 request_kind = excluded.request_kind";
+/// Changed facts rewrite the selection's rows wholesale: a row whose
+/// need derives from the old facts must never stay satisfied under new
+/// ones.
+pub const DELETE_PLAN_OBLIGATIONS: &str = "DELETE FROM plan_obligations WHERE task_id = ?1";
+pub const INSERT_PLAN_OBLIGATION: &str = "INSERT INTO plan_obligations
+                 (task_id, capability, applicability, execution, stage, handler, blocker)
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)";
+pub const PLAN_OBLIGATIONS_FOR_TASK: &str =
+    "SELECT capability, applicability, execution, stage, handler, blocker, outcome_json
+             FROM plan_obligations WHERE task_id = ?1 ORDER BY rowid";
+pub const PLAN_ROW: &str =
+    "SELECT applicability, handler FROM plan_obligations WHERE task_id = ?1 AND capability = ?2";
+/// A close clears the row's blocker: the row no longer waits on it.
+pub const CLOSE_PLAN_ROW: &str =
+    "UPDATE plan_obligations SET execution = ?3, outcome_json = ?4, blocker = NULL
+                 WHERE task_id = ?1 AND capability = ?2";
+pub const BLOCK_PLAN_ROW: &str =
+    "UPDATE plan_obligations SET blocker = ?3 WHERE task_id = ?1 AND capability = ?2";
+/// Keep an applied fork's question pin after a later blocker replaces `Decision`.
+pub const RETAIN_ANSWERED_PLAN_FORK: &str =
+    "UPDATE plan_obligations SET outcome_json = ?3 WHERE task_id = ?1 AND capability = ?2";
+/// A new plan revision reopens every required row its assessor closed —
+/// the verdict on the replaced revision never covers the new one.
+pub const REOPEN_PLAN_ROWS_BY_HANDLER: &str =
+    "UPDATE plan_obligations SET execution = 'pending', outcome_json = NULL, blocker = NULL
+                 WHERE task_id = ?1 AND handler = ?2 AND applicability = 'required'";
+/// The DEC-068 applicability write for every plan row of a task:
+/// applicability only — execution, outcome and the stored blocker stay,
+/// so a verdict, fork or route blocker holds again once the row recovers.
+pub const UNRESOLVE_PLAN_ROWS: &str =
+    "UPDATE plan_obligations SET applicability = 'unresolved' WHERE task_id = ?1";
+/// The PG-4 in-place reset of a row whose applicability recovered under
+/// identical facts: applicability only, everything else as stored.
+pub const RESET_PLAN_ROW_APPLICABILITY: &str = "UPDATE plan_obligations SET applicability = ?3
+                 WHERE task_id = ?1 AND capability = ?2";
+pub const NEXT_PLAN_REVISION: &str =
+    "SELECT COALESCE(MAX(revision), 0) + 1 FROM plans WHERE task_id = ?1";
+pub const INSERT_PLAN_REVISION: &str =
+    "INSERT INTO plans (task_id, revision, selection_revision, body_json) VALUES (?1, ?2, ?3, ?4)";
+pub const PLAN_REVISIONS_FOR_TASK: &str =
+    "SELECT revision, selection_revision, body_json, verdict, assessment_json
+             FROM plans WHERE task_id = ?1 ORDER BY revision";
+/// The gate's revision conjunct reads only revisions recorded under the
+/// current selection: an earlier selection's pass never opens it.
+pub const LATEST_PLAN_VERDICT_FOR_SELECTION: &str =
+    "SELECT verdict FROM plans WHERE task_id = ?1 AND selection_revision = ?2
+                 ORDER BY revision DESC LIMIT 1";
+/// A verdict lands only on the task's latest, still-unjudged revision
+/// of the current selection: an assessment of a superseded plan must
+/// never unblock its replacement.
+pub const ASSESS_PLAN_REVISION: &str = "UPDATE plans SET verdict = ?4, assessment_json = ?5
+                 WHERE task_id = ?1 AND revision = ?2 AND selection_revision = ?3
+                 AND verdict IS NULL
+                 AND revision = (SELECT MAX(revision) FROM plans WHERE task_id = ?1)";
+pub const PLAN_GATE_HOLD: &str = "SELECT kind FROM plan_gate_holds WHERE task_id = ?1";
+pub const UPSERT_PLAN_GATE_HOLD: &str =
+    "INSERT INTO plan_gate_holds (task_id, kind) VALUES (?1, ?2)
+             ON CONFLICT (task_id) DO UPDATE SET kind = excluded.kind";
+pub const DELETE_PLAN_GATE_HOLD: &str = "DELETE FROM plan_gate_holds WHERE task_id = ?1";
+pub const MARK_PLAN_BLOCK: &str = "INSERT OR IGNORE INTO plan_blocks (task_id) VALUES (?1)";
+pub const CLEAR_PLAN_BLOCK: &str = "DELETE FROM plan_blocks WHERE task_id = ?1";
+pub const PLAN_BLOCK_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM plan_blocks WHERE task_id = ?1)";
+pub const PLAN_BLOCK_RUNNING_TASK: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'blocked', event_cursor = event_cursor + 1
+                 WHERE task_id = ?1 AND lifecycle = 'running'";
+pub const PLAN_RELEASE_TASK: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'running', event_cursor = event_cursor + 1
+                 WHERE task_id = ?1 AND lifecycle = 'blocked'";
+/// Every non-plan source that keeps a task from running: an unresolved
+/// criterion obligation, an unknown attempt, a pending question.
+pub const PLAN_RELEASE_BLOCKING_SOURCES: &str = "SELECT
+                    (SELECT COUNT(*) FROM obligations WHERE task_id = ?1 AND applicability = 'unresolved')
+                  + (SELECT COUNT(*) FROM attempts WHERE task_id = ?1 AND state = 'unknown')
+                  + (SELECT COUNT(*) FROM questions WHERE task_id = ?1 AND state = 'pending')";
+
+/// Plan blockers of a page of tasks in one statement — every row that
+/// stores a blocker or waits on its applicability, in selection order,
+/// then the task's gate hold — so the status and todo projections never
+/// issue a query per task.
+pub fn plan_blockers_for_tasks(count: usize) -> String {
+    let tasks = task_placeholders(count);
+    format!(
+        "SELECT task_id, capability, applicability, blocker, kind FROM (
+             SELECT task_id, 0 AS source, rowid AS position, capability, applicability, blocker,
+                    NULL AS kind
+               FROM plan_obligations WHERE task_id IN ({tasks})
+                    AND (blocker IS NOT NULL OR applicability = 'unresolved')
+             UNION ALL
+             SELECT task_id, 1 AS source, 0 AS position, NULL AS capability,
+                    NULL AS applicability, NULL AS blocker, kind
+               FROM plan_gate_holds WHERE task_id IN ({tasks})
+         ) ORDER BY task_id, source, position"
+    )
+}
+
+// ----- index snapshot generations and their derived edges -----
+
+/// The next generation number. A reserved number is monotonic even
+/// after retention prunes the older rows: a `SnapshotId` is never
+/// reissued.
+pub const NEXT_INDEX_GENERATION: &str =
+    "SELECT COALESCE(MAX(generation), 0) + 1 FROM index_generations";
+/// A generation is reserved `stale`/`interrupted` and unsealed: a build
+/// that never reaches its seal leaves exactly this row, which reads as
+/// broken rather than current (INV-007). The stub's coverage is
+/// `Partial`, never `Complete`: a reservation has verified nothing, so
+/// reporting it as full coverage would be a claim no build ever made.
+/// It carries no edges, so its graph is empty — an empty set of rows is
+/// not a claim about the project.
+pub const RESERVE_INDEX_GENERATION: &str =
+    "INSERT INTO index_generations (generation, state, stale_cause, coverage_json, unresolved_json, sealed)
+             VALUES (?1, 'stale', 'interrupted',
+                     '{\"status\":\"partial\",\"reasons\":[{\"reason\":\"entries_failed\",\"count\":1}]}',
+                     '[]', 0)";
+pub const SEAL_INDEX_GENERATION: &str =
+    "UPDATE index_generations SET state = ?2, stale_cause = ?3, coverage_json = ?4,
+             unresolved_json = ?5, sealed = 1
+             WHERE generation = ?1";
+/// The repair trigger: mark one generation stale with its cause. Only
+/// the state columns move — the coverage and unresolved specifiers the
+/// build actually observed are kept, because a generation that failed
+/// for one reason is still the record of what the other documents
+/// showed. A fresh row is marked like any other: observing that the
+/// project moved is exactly the case a fresh generation must be marked
+/// for, so refusing to mark one would leave the stale bytes served as
+/// current. `false` therefore means the number is unknown, nothing
+/// else. The supersession below is the narrower statement.
+pub const MARK_INDEX_GENERATION_STALE: &str =
+    "UPDATE index_generations SET state = ?2, stale_cause = ?3, sealed = 1
+             WHERE generation = ?1";
+/// The supersession a seal performs in its own transaction: a row that
+/// is still fresh stops being current the moment its successor commits.
+/// A row that already carries a cause keeps it — `watcher_missed` says
+/// more than `superseded` — so only a fresh row is touched.
+pub const SUPERSEDE_INDEX_GENERATION: &str =
+    "UPDATE index_generations SET state = 'stale', stale_cause = 'superseded', sealed = 1
+             WHERE generation = ?1 AND state = 'fresh'";
+pub const INDEX_GENERATION_ROW: &str =
+    "SELECT state, stale_cause, coverage_json, unresolved_json, sealed FROM index_generations
+             WHERE generation = ?1";
+pub const LATEST_INDEX_GENERATION: &str =
+    "SELECT generation FROM index_generations ORDER BY generation DESC LIMIT 1";
+/// The generation an incremental cut carries from and supersedes: the
+/// newest one that is not the number being sealed. The number is bound
+/// because a seal runs against a row that is already the newest, so the
+/// max alone would name the generation being written and every carry
+/// would be empty.
+pub const PREVIOUS_INDEX_GENERATION: &str =
+    "SELECT generation FROM index_generations WHERE generation <> ?1
+             ORDER BY generation DESC LIMIT 1";
+/// The newest generation's state in one statement, so a report never
+/// reads two rows that a concurrent cut could have moved apart.
+pub const LATEST_INDEX_STATE: &str =
+    "SELECT generation, state, stale_cause, sealed FROM index_generations
+             ORDER BY generation DESC LIMIT 1";
+/// Rows an incremental cut keeps: the previous generation's edges
+/// whose subject document is not among the replaced paths.
+pub const INDEX_EDGES_TO_CARRY: &str =
+    "SELECT e.from_path, e.from_line, e.from_ignored, e.to_path, e.kind, e.provenance,
+            e.version, e.confidence
+             FROM index_edges e WHERE e.generation = ?1
+               AND e.from_path NOT IN ({})";
+pub const INSERT_INDEX_DOCUMENT: &str =
+    "INSERT OR REPLACE INTO index_documents (generation, path) VALUES (?1, ?2)";
+pub const INDEX_DOCUMENTS_FOR_GENERATION: &str =
+    "SELECT path FROM index_documents WHERE generation = ?1 ORDER BY path";
+pub const INSERT_INDEX_EDGE: &str =
+    "INSERT OR REPLACE INTO index_edges
+             (generation, from_path, from_line, from_ignored, to_path, kind, provenance, version, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+pub const INDEX_EDGES_FOR_GENERATION: &str =
+    "SELECT from_path, from_line, from_ignored, to_path, kind, provenance, version, confidence
+             FROM index_edges WHERE generation = ?1 ORDER BY from_path, from_line, to_path";
+/// Retention: the newest `keep` generations, their edges included.
+/// `keep` is a bound, never a per-event delete.
+pub fn prune_index_generations(keep: usize) -> String {
+    format!(
+        "DELETE FROM index_documents WHERE generation NOT IN (
+             SELECT generation FROM index_generations ORDER BY generation DESC LIMIT {keep})
+             ;
+         DELETE FROM index_edges WHERE generation NOT IN (
+             SELECT generation FROM index_generations ORDER BY generation DESC LIMIT {keep})
+             ;
+         DELETE FROM index_generations WHERE generation NOT IN (
+             SELECT generation FROM index_generations ORDER BY generation DESC LIMIT {keep})"
+    )
+}

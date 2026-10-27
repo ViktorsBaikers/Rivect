@@ -37,7 +37,7 @@
 use rivect::config::{
     Config, ConfigIssue, ConnKind, EffortAssign, EffortLevel, FixedModel, ModelAssign, Stage,
 };
-use rivect::contracts::{MODEL_WIRE_MAX_BYTES, Question};
+use rivect::contracts::{Availability, MODEL_WIRE_MAX_BYTES, OptionId, Question, QuestionOption};
 use rivect::model::{Broker, CandidateRejection, ModelError, RejectionCause, RequestManifest};
 use rivect::providers::{Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::UsageDelta;
@@ -585,12 +585,11 @@ fn ineligible_candidates_are_excluded_before_ranking_and_fail_closed() {
         panic!("wrong rejection: {error}")
     };
     assert_eq!(purpose, "reranker");
-    assert_eq!(
-        rejected.as_slice(),
-        [CandidateRejection {
-            connection: "local".to_string(),
+    assert!(
+        matches!(rejected.as_slice(), [CandidateRejection {
+            connection,
             cause: RejectionCause::NotEntitled,
-        }],
+        }] if connection == "local"),
         "the ranked refusal names the excluded candidate's cause"
     );
     assert!(
@@ -969,7 +968,7 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         "manual-fallback",
         Some(&fallback_config("fallback = { mode = \"manual\" }")),
         Box::new(provider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     // the same scoped world the first-task loop drives
     let scope = world.root.join("scope");
@@ -984,7 +983,7 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
     let question = world.publish(&session, &task);
     // the fixture answer runs the step: the primary send fails, the
     // manual fallback publishes its own question, the task waits
-    let answered = world.dispatch(&support::corpus_answer_option(
+    let answered = world.dispatch(&support::corpus_answer_custom(
         &session,
         "manual-first",
         &task,
@@ -1147,7 +1146,7 @@ fn fallback_manual_choice_recheck_blocks_a_candidate_that_lost_eligibility() {
         "manual-stale-pick",
         Some(&fallback_config("fallback = { mode = \"manual\" }")),
         Box::new(provider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("scope dir");
@@ -1159,7 +1158,7 @@ fn fallback_manual_choice_recheck_blocks_a_candidate_that_lost_eligibility() {
     let session = world.open_session("manual-stale-boot");
     let task = world.create_task(&session, "manual-stale-choice");
     let question = world.publish(&session, &task);
-    let answered = world.dispatch(&support::corpus_answer_option(
+    let answered = world.dispatch(&support::corpus_answer_custom(
         &session,
         "stale-first",
         &task,
@@ -1214,8 +1213,7 @@ fn fallback_manual_choice_recheck_blocks_a_candidate_that_lost_eligibility() {
     // and the surviving pause still tombstones on cancel
     let intent_revision = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("snapshot")
         .intent_revision;
@@ -1263,7 +1261,7 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
         "manual-cancel",
         Some(&fallback_config("fallback = { mode = \"manual\" }")),
         Box::new(provider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("scope dir");
@@ -1275,7 +1273,7 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
     let session = world.open_session("manual-cancel-boot");
     let task = world.create_task(&session, "manual-cancel-choice");
     let question = world.publish(&session, &task);
-    world.dispatch(&support::corpus_answer_option(
+    let answered = world.dispatch(&support::corpus_answer_custom(
         &session,
         "cancel-first",
         &task,
@@ -1283,6 +1281,10 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
         "steps",
         json!(4301),
     ));
+    assert!(
+        answered["error"].is_null(),
+        "the answer commits and the step pauses: {answered}"
+    );
     let manifest = sent.lock().expect("wire log lock")[0].clone();
     assert!(
         world
@@ -1295,8 +1297,7 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
 
     let intent_revision = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("snapshot")
         .intent_revision;
@@ -1348,8 +1349,7 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
     let idle_task = world.create_task(&session, "cancel-idle");
     let idle_revision = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&idle_task)
         .expect("snapshot")
         .intent_revision;
@@ -1395,7 +1395,7 @@ fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
         "manual-steer",
         Some(&fallback_config("fallback = { mode = \"manual\" }")),
         Box::new(provider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("scope dir");
@@ -1407,7 +1407,7 @@ fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
     let session = world.open_session("manual-steer-boot");
     let task = world.create_task(&session, "manual-steer-choice");
     let question = world.publish(&session, &task);
-    let answered = world.dispatch(&support::corpus_answer_option(
+    let answered = world.dispatch(&support::corpus_answer_custom(
         &session,
         "steer-first",
         &task,
@@ -1431,7 +1431,7 @@ fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
 
     // the steer commits under the pre-pause revisions and advances the
     // intent the question and the frozen manifest were pinned under
-    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let snapshot = world.runtime.store().snapshot(&task).expect("snapshot");
     let steered = world.dispatch(&support::corpus_steer(
         &session,
         "steer-mid-choice",
@@ -1513,6 +1513,643 @@ fn steer_while_a_fallback_choice_is_pending_retires_the_pause_and_question() {
         1,
         "no answer dispatched the frozen manifest"
     );
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
+}
+
+/// A dispatch failure under `mode = "off"` leaves a residue pause bound
+/// to no served question — it exists so a cancel can tombstone the
+/// still-live admission, never to be answered into a send. The next
+/// fixed-option answer resolves a different fork: it reads the scoped
+/// file directly and drains the residue with it, so the frozen manifest
+/// can never replay.
+#[test]
+fn option_answer_drains_a_choiceless_residue_pause() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "residue-pause",
+        Some(&fallback_config("fallback = { mode = \"off\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("residue-boot");
+    let task = world.create_task(&session, "residue-choice");
+    let question = world.publish(&session, &task);
+    // `off` reports the provider's own error and substitutes nothing:
+    // the step fails, leaving the failed attempt's admission live as a
+    // residue pause no question served.
+    let failed = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "residue-first",
+        &task,
+        &question,
+        "steps",
+        json!(4501),
+    ));
+    assert_eq!(
+        failed["error"]["data"]["code"].as_str(),
+        Some("denied"),
+        "the failed send surfaces typed: {failed}"
+    );
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+    assert!(
+        world
+            .runtime
+            .paused_attempts
+            .get(&task.0)
+            .is_some_and(|paused| paused.choice.is_none()),
+        "the residue pause carries no served choice"
+    );
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the failed attempt stays admitted while paused"
+    );
+
+    // A fixed option on the next fork answers a different question: it
+    // resolves the scoped read itself — no send — and drains the
+    // residue pause, tombstoning the frozen manifest's admission.
+    let next = world.publish(&session, &task);
+    let settled = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "residue-settle",
+        &task,
+        &next,
+        "steps",
+        json!(4502),
+    ));
+    assert!(
+        settled["error"].is_null(),
+        "the option answer completes the read: {settled}"
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["lifecycle"].as_str(),
+        Some("completed"),
+        "the direct read settles the task: {settled}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the residue pause never dispatched"
+    );
+    assert_eq!(world.runtime.provider_calls, 0);
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the settle tombstoned the residue admission"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause record drained with the settle"
+    );
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
+}
+
+/// A pause answers only to the question that served it. The served
+/// choice survives a refused pick; when a different fork then publishes
+/// and its answer happens to name the same option id as a served
+/// candidate, the frozen manifest must not dispatch — the stale pause
+/// is dead residue and settles tombstoned while the task reads the
+/// scoped file directly.
+#[test]
+fn option_answer_on_a_different_fork_never_spends_a_stale_pause() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![
+                Respond::Fail(ProviderError::UnknownConnection {
+                    connection: "local".to_string(),
+                }),
+                Respond::Delegate,
+            ]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "stale-pause-collision",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("collision-boot");
+    let task = world.create_task(&session, "collision-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "collision-first",
+        &task,
+        &question,
+        "steps",
+        json!(4601),
+    ));
+    assert!(
+        answered["error"].is_null(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4602),
+    ));
+    let served_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the pending choice question");
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+
+    // The pick names a served candidate that lost its account rights —
+    // refused typed, and the pause survives for a re-pick.
+    world.runtime.broker.set_account_rights(&[
+        "local".to_string(),
+        "denied".to_string(),
+        "gone".to_string(),
+        "shadowed".to_string(),
+        "web".to_string(),
+    ]);
+    let refused = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "collision-refused",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4603),
+    ));
+    assert_eq!(
+        refused["error"]["data"]["code"].as_str(),
+        Some("capability_unavailable"),
+        "the rejected pick is a typed capability refusal: {refused}"
+    );
+    assert!(
+        world.runtime.paused_attempts.contains_key(&task.0),
+        "the refused pick keeps the pause for a re-pick"
+    );
+
+    // Rights return, then a different fork publishes carrying an option
+    // id that collides with a served candidate: answering it must not
+    // dispatch the stale pause's frozen manifest.
+    world.runtime.broker.set_account_rights(&[
+        "local".to_string(),
+        "denied".to_string(),
+        "gone".to_string(),
+        "shadowed".to_string(),
+        "web".to_string(),
+        "reserve".to_string(),
+    ]);
+    let mut other = Question::fixture(&task, 1);
+    other.options.push(QuestionOption {
+        option_id: OptionId("reserve".to_string()),
+        label: "reserve".to_string(),
+        consequences: "collides with a served candidate id".to_string(),
+        availability: Availability::Enabled,
+    });
+    world
+        .runtime
+        .store_writer()
+        .publish_question(&session, &other)
+        .expect("the second fork publishes");
+    let settled = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "collision-settle",
+        &task,
+        &other,
+        "reserve",
+        json!(4604),
+    ));
+    assert!(
+        settled["error"].is_null(),
+        "the colliding option answer commits and completes: {settled}"
+    );
+    assert_eq!(
+        settled["result"]["snapshot"]["lifecycle"].as_str(),
+        Some("completed"),
+        "the task read the scoped file directly: {settled}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the frozen manifest never dispatched"
+    );
+    assert_eq!(world.runtime.provider_calls, 0);
+    assert_eq!(
+        world.runtime.broker.accounted_requests(),
+        0,
+        "nothing was accounted to the stale pause"
+    );
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the settle tombstoned the stale admission"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the stale pause drained with the settle"
+    );
+}
+
+/// A free-text answer to the served fallback question spends a fresh
+/// dispatch: the successful send supersedes the pause, whose admission
+/// is tombstoned so neither attempt id can replay.
+#[test]
+fn custom_answer_on_the_served_question_supersedes_the_pause() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![
+                Respond::Fail(ProviderError::UnknownConnection {
+                    connection: "local".to_string(),
+                }),
+                Respond::Delegate,
+            ]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "served-custom",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("served-custom-boot");
+    let task = world.create_task(&session, "served-custom-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "served-first",
+        &task,
+        &question,
+        "steps",
+        json!(4701),
+    ));
+    assert!(
+        answered["error"].is_null(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4702),
+    ));
+    let served_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the pending choice question");
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the choice-pending attempt is admitted"
+    );
+
+    // Free text on the served question pays a fresh dispatch, and the
+    // send supersedes the pause: its admission is tombstoned.
+    let custom = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "served-pick",
+        &task,
+        &served_question,
+        "read the scoped file",
+        json!(4703),
+    ));
+    assert!(
+        custom["error"].is_null(),
+        "the custom answer commits and the step completes: {custom}"
+    );
+    assert_eq!(
+        custom["result"]["snapshot"]["lifecycle"].as_str(),
+        Some("completed"),
+        "the fresh dispatch completed the read: {custom}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        2,
+        "the custom answer dispatched a fresh manifest"
+    );
+    assert_eq!(world.runtime.provider_calls, 1);
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the superseding send tombstoned the paused admission"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause record drained with the settle"
+    );
+}
+
+/// A live pause on a tree that settles unanswered is dead residue: the
+/// late answer to the still-pending served question stays durable but
+/// grows nothing runnable, and the resume tombstones the paused
+/// attempt — its admission cancelled so the frozen manifest can never
+/// dispatch — while the settle journals under the state machine's own
+/// origin, never the operator's.
+#[test]
+fn answer_on_a_settled_tree_tombstones_the_live_pause() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "dead-tree-pause",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("dead-tree-pause-boot");
+    let task = world.create_task(&session, "dead-tree-pause-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "dead-tree-first",
+        &task,
+        &question,
+        "steps",
+        json!(4801),
+    ));
+    assert!(
+        answered["error"].is_null(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4802),
+    ));
+    let served_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the pending choice question");
+    let paused_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_some(),
+        "the choice-pending attempt is admitted"
+    );
+    assert!(
+        world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause binds the served question"
+    );
+
+    // The tree drains while the served question stays pending — the
+    // task row itself is untouched, so the late answer still commits;
+    // only the scheduler refuses to grow runnable work for it.
+    world
+        .runtime
+        .scheduler
+        .cancel_task_tree(&task)
+        .expect("tree cancel drains");
+
+    // The option answer names a served candidate — the pick that would
+    // spend the frozen manifest on a live tree. Here the resume finds
+    // the tree dead: the answer stays durable, the paused attempt is
+    // tombstoned, and the row settles cancelled through the state
+    // machine's own seam.
+    let late = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "dead-tree-answer",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4803),
+    ));
+    assert!(
+        late["error"].is_null(),
+        "the answer on the dead tree still commits: {late}"
+    );
+    assert_eq!(
+        late["result"]["status"], "applied",
+        "the answer stays durable: {late}"
+    );
+    assert_eq!(
+        late["result"]["snapshot"]["lifecycle"], "cancelled",
+        "the wire response reports the terminal snapshot: {late}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the dead tree never dispatched the frozen manifest"
+    );
+    assert_eq!(world.runtime.provider_calls, 0);
+    assert!(
+        world.runtime.broker.admission(&paused_attempt).is_none(),
+        "the settle tombstoned the paused admission"
+    );
+    assert!(
+        !world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause record drained with the settle"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .snapshot(&task)
+            .expect("snapshot")
+            .lifecycle,
+        rivect::contracts::Lifecycle::Cancelled,
+        "durable state agrees the row settled"
+    );
+    // Both commits stay durable in commit order: the answer that paused
+    // the task and the late answer the dead tree could not spend.
+    let attempts = world
+        .runtime
+        .store()
+        .answer_attempts(&task)
+        .expect("attempts");
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.outcome == rivect::contracts::AnswerAttemptOutcome::Applied),
+        "the committed answers stay durable: {attempts:?}"
+    );
+    let feed = world
+        .runtime
+        .store()
+        .events_after(&session, Some(&task), 0, 100)
+        .expect("task feed");
+    let kills: Vec<&rivect::contracts::Event> = feed
+        .iter()
+        .filter(|event| event.event_type == "task.cancelled")
+        .collect();
+    assert_eq!(kills.len(), 1, "{feed:?}");
+    assert!(
+        kills[0].delta["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("settled or cancelled")),
+        "the settle reason names the dead tree: {:?}",
+        kills[0].delta
+    );
+    assert_eq!(
+        kills[0].origin, "state",
+        "a scheduler-driven settle must not impersonate the operator: {feed:?}"
+    );
+}
+
+/// A task that pauses twice keeps only the latest pause: the fresh
+/// pending choice serves its own question, the re-pause replaces the
+/// record, and the superseded manifest's admission is cancelled with
+/// it so the earlier frozen request can never replay beside its
+/// successor.
+#[test]
+fn a_second_pending_fallback_supersedes_the_pause_and_cancels_its_admission() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![
+                Respond::Fail(ProviderError::UnknownConnection {
+                    connection: "local".to_string(),
+                }),
+                Respond::Fail(ProviderError::UnknownConnection {
+                    connection: "local".to_string(),
+                }),
+            ]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "re-pause",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("re-pause-boot");
+    let task = world.create_task(&session, "re-pause-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "re-pause-first",
+        &task,
+        &question,
+        "steps",
+        json!(4901),
+    ));
+    assert!(
+        answered["error"].is_null(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4902),
+    ));
+    let first_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the first pending choice question");
+    let first_attempt = sent.lock().expect("wire log lock")[0].attempt_id.clone();
+    assert!(
+        world.runtime.broker.admission(&first_attempt).is_some(),
+        "the first choice-pending attempt is admitted"
+    );
+
+    // Free text on the served question pays a fresh dispatch that also
+    // fails pending: the second choice publishes and the re-pause
+    // supersedes — the first manifest's admission must die with its
+    // record, never linger spendable beside the successor.
+    let reanswered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "re-pause-second",
+        &task,
+        &first_question,
+        "try the reserve connection instead",
+        json!(4903),
+    ));
+    assert!(
+        reanswered["error"].is_null(),
+        "the second answer commits and pauses again: {reanswered}"
+    );
+    assert_eq!(
+        reanswered["result"]["snapshot"]["lifecycle"].as_str(),
+        Some("waiting"),
+        "the re-pause waits on the second choice: {reanswered}"
+    );
+    let second_attempt = sent.lock().expect("wire log lock")[1].attempt_id.clone();
+    assert_ne!(
+        first_attempt, second_attempt,
+        "each dispatch freezes its own manifest"
+    );
+    assert!(
+        world.runtime.broker.admission(&first_attempt).is_none(),
+        "the superseded manifest's admission was cancelled with its record"
+    );
+    assert!(
+        world.runtime.broker.admission(&second_attempt).is_some(),
+        "the second pause's admission is live for its own pick"
+    );
+
+    // The map holds only the successor pause, bound to the question the
+    // second pending choice served.
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4904),
+    ));
+    let second_question: Question = serde_json::from_value(current["result"]["question"].clone())
+        .expect("the second pending choice question");
+    assert_ne!(
+        first_question.question_id, second_question.question_id,
+        "the second pending choice serves its own question"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the re-pause record survives");
+    assert_eq!(paused.manifest.attempt_id, second_attempt);
+    assert_eq!(paused.served_question_id, Some(second_question.question_id));
+    assert_eq!(world.runtime.provider_calls, 0);
     assert_eq!(world.runtime.broker.accounted_requests(), 0);
 }
 
@@ -1840,30 +2477,30 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         } if attempt_id == &manifest.attempt_id
             && purpose == "relay"
             && attempted == &vec!["reserve".to_string()]
-            && rejected == &vec![
+            && matches!(rejected.as_slice(), [
                 CandidateRejection {
-                    connection: "gone".to_string(),
+                    connection: connection_0,
                     cause: RejectionCause::UnknownConnection,
                 },
                 CandidateRejection {
-                    connection: "web".to_string(),
+                    connection: connection_1,
                     cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
                 },
                 CandidateRejection {
-                    connection: "denied".to_string(),
+                    connection: connection_2,
                     cause: RejectionCause::NotEntitled,
                 },
                 CandidateRejection {
-                    connection: "shadowed".to_string(),
+                    connection: connection_3,
                     cause: RejectionCause::NotPurposeEligible,
                 },
                 CandidateRejection {
-                    connection: "reserve".to_string(),
+                    connection: connection_4,
                     cause: RejectionCause::SendFailed(ProviderError::UnknownConnection {
-                        connection: "reserve".to_string(),
+                        connection: connection_5,
                     }),
                 },
-            ]),
+            ] if connection_0 == "gone" && connection_1 == "web" && connection_2 == "denied" && connection_3 == "shadowed" && connection_4 == "reserve" && connection_5 == "reserve")),
         "wrong rejection: {error}"
     );
     // the display carries the same refusal the typed fields hold:
@@ -1914,6 +2551,675 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         .expect("the paused attempt retries the same manifest");
     assert_eq!(sent.lock().expect("wire log lock").len(), 3);
     assert_eq!(broker.accounted_requests(), 1);
+
+    let request = reqwest::blocking::Client::builder().no_proxy().build().expect("client")
+        .get("ftp://fixture-user:fixture-secret@127.0.0.1/private-path?token=fixture-query#fixture-fragment")
+        .send().expect_err("the unsupported scheme is refused without network access");
+    assert!(request.is_builder());
+    let original = ProviderError::Transport {
+        connection: "local".to_string(),
+        cause: rivect::providers::TransportCause::Request {
+            source: Arc::new(request.without_url()),
+        },
+    };
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(original.clone()),
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "reserve".to_string(),
+            }),
+        ],
+        0,
+    );
+    drop(original);
+    broker.set_account_rights(&[
+        "local".to_string(),
+        "gone".to_string(),
+        "web".to_string(),
+        "shadowed".to_string(),
+        "reserve".to_string(),
+    ]);
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/transport-exhausted",
+            "goal: retained source",
+        )
+        .expect("manifest");
+    let error = broker
+        .dispatch("/world/transport-exhausted", &manifest)
+        .expect_err("the typed transport primary exhausts the same chain");
+    let ModelError::FallbackExhausted {
+        attempt_id,
+        purpose,
+        rejected,
+        attempted,
+        source,
+    } = &error
+    else {
+        panic!("expected exhaustion");
+    };
+    assert_eq!(attempt_id, &manifest.attempt_id);
+    assert_eq!(purpose, "relay");
+    assert_eq!(attempted, &["reserve"]);
+    assert!(matches!(rejected.as_slice(), [
+        CandidateRejection { connection: gone, cause: RejectionCause::UnknownConnection },
+        CandidateRejection { connection: web, cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey } },
+        CandidateRejection { connection: denied, cause: RejectionCause::NotEntitled },
+        CandidateRejection { connection: shadowed, cause: RejectionCause::NotPurposeEligible },
+        CandidateRejection { connection: reserve, cause: RejectionCause::SendFailed(ProviderError::UnknownConnection { connection: failed }) },
+    ] if gone == "gone" && web == "web" && denied == "denied" && shadowed == "shadowed" && reserve == "reserve" && failed == "reserve"));
+    let ProviderError::Transport { connection, cause } = source.as_ref() else {
+        panic!("the primary transport error stays typed");
+    };
+    assert_eq!(connection, "local");
+    assert_eq!(
+        cause.class(),
+        rivect::providers::TransportClass::RequestFailure
+    );
+    let retained = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<Box<ProviderError>>())
+        .expect("the broker retains its primary source");
+    let cause = std::error::Error::source(retained.as_ref())
+        .and_then(|source| source.downcast_ref::<rivect::providers::TransportCause>())
+        .expect("the primary retains the transport cause");
+    let leaf = std::error::Error::source(cause)
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+        .expect("the broker preserves the concrete request error after original drop");
+    assert!(leaf.is_builder());
+    assert!(!leaf.is_timeout());
+    assert!(leaf.url().is_none());
+    assert!(broker.admission(&manifest.attempt_id).is_some());
+    assert!(broker.pending_choice(&manifest.attempt_id).is_none());
+    assert_eq!(broker.accounted_requests(), 0);
+    {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], manifest);
+        assert_eq!(sent[1].inputs, manifest.inputs);
+        assert_eq!(sent[1].instructions, manifest.instructions);
+        assert_eq!(
+            sent[1].model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "reserve-model".to_string()
+            })
+        );
+    }
+    let rejection = RejectionCause::SendFailed(source.as_ref().clone());
+    let controller = rivect::controller::ControllerError::Model(error);
+    assert_eq!(
+        controller.error_code(),
+        rivect::contracts::ErrorCode::Denied
+    );
+    let rivect::controller::ControllerError::Model(model) = &controller else {
+        panic!("expected model error");
+    };
+    for rendered in [
+        format!("{rejection}"),
+        format!("{rejection:?}"),
+        format!("{model}"),
+        format!("{model:?}"),
+        format!("{controller}"),
+        format!("{controller:?}"),
+    ] {
+        for sentinel in [
+            "fixture-user",
+            "fixture-secret",
+            "private-path",
+            "fixture-query",
+            "fixture-fragment",
+        ] {
+            assert!(
+                !rendered.contains(sentinel),
+                "composed diagnostics exposed source material"
+            );
+        }
+    }
+    for (model, expected) in [
+        (
+            ModelError::Config(
+                Config::parse_validated("config_version = 0")
+                    .expect_err("the unsupported configuration version is rejected"),
+            ),
+            rivect::contracts::ErrorCode::CapabilityUnavailable,
+        ),
+        (
+            ModelError::Provider(ProviderError::Transport {
+                connection: "local".to_string(),
+                cause: rivect::providers::TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                },
+            }),
+            rivect::contracts::ErrorCode::Denied,
+        ),
+        (
+            ModelError::ManualFallbackPending {
+                attempt_id: "attempt".to_string(),
+                purpose: "relay".to_string(),
+            },
+            rivect::contracts::ErrorCode::DependencyBlocked,
+        ),
+        (
+            ModelError::ManualChoiceRejected {
+                attempt_id: "attempt".to_string(),
+                connection: "reserve".to_string(),
+                cause: RejectionCause::NotOffered,
+            },
+            rivect::contracts::ErrorCode::CapabilityUnavailable,
+        ),
+        (
+            ModelError::NoEligibleCandidate {
+                purpose: "relay".to_string(),
+                rejected: Vec::new(),
+            },
+            rivect::contracts::ErrorCode::CapabilityUnavailable,
+        ),
+        (
+            ModelError::RequestTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+            rivect::contracts::ErrorCode::ContextOverflow,
+        ),
+    ] {
+        assert_eq!(
+            rivect::controller::ControllerError::Model(model).error_code(),
+            expected
+        );
+    }
+
+    {
+        use rivect::contracts::{AnswerSelection, TaskId};
+        use rivect::controller::{ControllerError, step_error_observation};
+        use rivect::providers::TransportCause;
+        use rivect::scheduler::Scheduler;
+        use rivect::supervisor::{StallCause, Supervisor, SupervisorPolicy};
+        use std::io::{Read, Write};
+        use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+        use std::time::{Duration, Instant};
+
+        #[derive(Clone, Copy)]
+        enum PeerFault {
+            RequestTimeout,
+            RequestFailure,
+            DecodeTimeout,
+            DecodeFailure,
+            BodyFailure,
+        }
+
+        fn capture_peer_error(fault: PeerFault) -> reqwest::Error {
+            let peer_bound = Duration::from_millis(3000);
+            let teardown_bound = Duration::from_millis(5000);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let address = listener.local_addr().expect("address");
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .unwrap_or_else(|_error| panic!("fixture client construction failed"));
+            let (observed_tx, observed_rx) = sync_channel(1);
+            let (release_tx, release_rx) = sync_channel(1);
+            let peer = std::thread::spawn(move || -> std::io::Result<usize> {
+                let started = Instant::now();
+                let remaining = || {
+                    peer_bound.checked_sub(started.elapsed()).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "fixture watchdog expired",
+                        )
+                    })
+                };
+                let mut stream = loop {
+                    remaining()?;
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                let mut headers = Vec::new();
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    stream.set_read_timeout(Some(remaining()?))?;
+                    let mut chunk = [0; 1024];
+                    let count = stream.read(&mut chunk)?;
+                    if count == 0 || headers.len() + count > 64 * 1024 {
+                        return Err(std::io::Error::other(
+                            "fixture request headers incomplete or oversized",
+                        ));
+                    }
+                    headers.extend_from_slice(&chunk[..count]);
+                }
+                observed_tx.send(1).map_err(std::io::Error::other)?;
+                let response: &[u8] = match fault {
+                    PeerFault::RequestTimeout => b"",
+                    PeerFault::RequestFailure => b"invalid-http\r\n\r\n",
+                    PeerFault::DecodeFailure => b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{",
+                    PeerFault::DecodeTimeout | PeerFault::BodyFailure => {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx"
+                    }
+                };
+                stream.set_write_timeout(Some(remaining()?))?;
+                stream.write_all(response)?;
+                let stream =
+                    if matches!(fault, PeerFault::RequestTimeout | PeerFault::DecodeTimeout) {
+                        Some(stream)
+                    } else {
+                        drop(stream);
+                        None
+                    };
+                match release_rx.recv_timeout(remaining()?) {
+                    Ok(()) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "fixture release watchdog expired",
+                        ));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(std::io::Error::other("fixture release disconnected"));
+                    }
+                }
+                drop(stream);
+                let mut requests = 1;
+                loop {
+                    remaining()?;
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            requests += 1;
+                            drop(stream);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(requests)
+            });
+            let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match client
+                .get(format!("http://{address}/fixture"))
+                .send()
+            {
+                Err(error) => error,
+                Ok(response) if matches!(fault, PeerFault::DecodeFailure) => {
+                    match response.json::<serde_json::Value>() {
+                        Err(error) => error,
+                        Ok(_) => panic!("the invalid json response unexpectedly decoded"),
+                    }
+                }
+                Ok(mut response) => {
+                    let mut body = Vec::new();
+                    match response.read_to_end(&mut body) {
+                        Err(error) => match error.into_inner() {
+                            Some(inner) => match inner.downcast::<reqwest::Error>() {
+                                Ok(error) => *error,
+                                Err(_unrecognized_source) => {
+                                    panic!("Response::read retained a different source type")
+                                }
+                            },
+                            None => {
+                                panic!("Response::read did not retain a concrete reqwest error")
+                            }
+                        },
+                        Ok(_) => panic!("the incomplete response unexpectedly completed"),
+                    }
+                }
+            }));
+            drop(client);
+            let observed = observed_rx.recv_timeout(peer_bound);
+            let released = release_tx.try_send(()).is_ok();
+            let teardown_started = Instant::now();
+            while !peer.is_finished() && teardown_started.elapsed() < teardown_bound {
+                std::thread::yield_now();
+            }
+            assert!(peer.is_finished(), "fixture teardown watchdog expired");
+            let completed = peer
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let requests =
+                completed.unwrap_or_else(|_error| panic!("fixture setup or cleanup failed"));
+            assert_eq!(requests, 1, "one physical request reached the fixture");
+            assert_eq!(
+                observed,
+                Ok(1),
+                "the complete request reached the peer before its response"
+            );
+            assert!(released, "fixture received the explicit release");
+            captured.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }
+
+        let builder = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_error| panic!("fixture client construction failed"))
+            .get("ftp://127.0.0.1/fixture")
+            .send();
+        let Err(builder) = builder else {
+            panic!("unsupported scheme unexpectedly succeeded");
+        };
+        assert!(
+            builder.is_builder() && !builder.is_timeout(),
+            "genuine builder error required"
+        );
+        let request_timeout = capture_peer_error(PeerFault::RequestTimeout);
+        assert!(
+            request_timeout.is_request() && request_timeout.is_timeout(),
+            "genuine request timeout required"
+        );
+        let request_failure = capture_peer_error(PeerFault::RequestFailure);
+        assert!(
+            request_failure.is_request() && !request_failure.is_timeout(),
+            "genuine non-timeout request failure required"
+        );
+        let read_request_timeout = capture_peer_error(PeerFault::RequestTimeout);
+        let read_request_failure = capture_peer_error(PeerFault::RequestFailure);
+        let decode_timeout = capture_peer_error(PeerFault::DecodeTimeout);
+        assert!(
+            decode_timeout.is_decode() && decode_timeout.is_timeout(),
+            "genuine blocking read decode timeout required"
+        );
+        let decode_failure = capture_peer_error(PeerFault::DecodeFailure);
+        assert!(
+            decode_failure.is_decode() && !decode_failure.is_timeout(),
+            "genuine non-timeout decode failure required"
+        );
+        let read_decode_timeout = capture_peer_error(PeerFault::DecodeTimeout);
+        let read_decode_failure = capture_peer_error(PeerFault::DecodeFailure);
+        let body_failure = capture_peer_error(PeerFault::BodyFailure);
+        assert!(
+            body_failure.is_body() && !body_failure.is_timeout(),
+            "genuine response body failure required"
+        );
+        let read_body_failure = capture_peer_error(PeerFault::BodyFailure);
+
+        let directory = tempfile::tempdir().expect("private fixture directory");
+        let first_io = std::fs::File::open(directory.path().join("first-absent"));
+        let second_io = std::fs::File::open(directory.path().join("second-absent"));
+        let (Err(first_io), Err(second_io)) = (first_io, second_io) else {
+            panic!("the absent fixture files unexpectedly opened");
+        };
+        assert!(
+            directory.close().is_ok(),
+            "fixture directory cleanup failed"
+        );
+        assert!(
+            first_io.kind() == std::io::ErrorKind::NotFound && first_io.raw_os_error().is_some()
+        );
+        assert!(
+            second_io.kind() == std::io::ErrorKind::NotFound
+                && second_io.raw_os_error() == first_io.raw_os_error()
+        );
+        let io_code = first_io
+            .raw_os_error()
+            .expect("filesystem error retained its os code");
+
+        let request = |source: reqwest::Error| ProviderError::Transport {
+            connection: "local".to_string(),
+            cause: TransportCause::Request {
+                source: Arc::new(source.without_url()),
+            },
+        };
+        let read = |source: reqwest::Error| ProviderError::Transport {
+            connection: "local".to_string(),
+            cause: TransportCause::Read {
+                source: Arc::new(std::io::Error::other(source.without_url())),
+            },
+        };
+        // Literal legacy groups are the oracle; neither class() nor diagnostic text selects a group.
+        let cases = [
+            ("builder", 0, request(builder)),
+            ("request timeout", 1, request(request_timeout)),
+            ("request failure", 1, request(request_failure)),
+            ("read request timeout", 1, read(read_request_timeout)),
+            ("read request failure", 1, read(read_request_failure)),
+            ("request decode timeout", 2, request(decode_timeout)),
+            ("request decode failure", 2, request(decode_failure)),
+            ("read decode timeout", 2, read(read_decode_timeout)),
+            ("read decode failure", 2, read(read_decode_failure)),
+            ("request body failure", 3, request(body_failure)),
+            ("read body failure", 3, read(read_body_failure)),
+            (
+                "deadline 500ms",
+                4,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Deadline {
+                        budget: Duration::from_millis(500),
+                    },
+                },
+            ),
+            (
+                "deadline 1000ms",
+                5,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Deadline {
+                        budget: Duration::from_millis(1000),
+                    },
+                },
+            ),
+            (
+                "status 401",
+                6,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Status {
+                        status: reqwest::StatusCode::UNAUTHORIZED,
+                    },
+                },
+            ),
+            (
+                "status 429",
+                7,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Status {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    },
+                },
+            ),
+            (
+                "status 503",
+                8,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Status {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    },
+                },
+            ),
+            (
+                "first filesystem read",
+                9,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Read {
+                        source: Arc::new(first_io),
+                    },
+                },
+            ),
+            (
+                "second filesystem read",
+                9,
+                ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Read {
+                        source: Arc::new(second_io),
+                    },
+                },
+            ),
+        ];
+        let task = TaskId("transport-fingerprint".to_string());
+        let answer = AnswerSelection::Custom {
+            text: "retry unchanged".to_string(),
+        };
+        let scheduler = Scheduler::new(2, 4);
+        for projection in 0..4 {
+            let observations: Vec<_> = cases
+                .iter()
+                .map(|(_, _, error)| {
+                    let model = match projection {
+                        0 => ModelError::Provider(error.clone()),
+                        1 => ModelError::FallbackExhausted {
+                            attempt_id: "attempt".to_string(),
+                            purpose: "relay".to_string(),
+                            rejected: Vec::new(),
+                            attempted: vec!["reserve".to_string()],
+                            source: Box::new(error.clone()),
+                        },
+                        2 => ModelError::FallbackExhausted {
+                            attempt_id: "attempt".to_string(),
+                            purpose: "relay".to_string(),
+                            rejected: vec![
+                                CandidateRejection {
+                                    connection: "first".to_string(),
+                                    cause: RejectionCause::SendFailed(error.clone()),
+                                },
+                                CandidateRejection {
+                                    connection: "second".to_string(),
+                                    cause: RejectionCause::NotEntitled,
+                                },
+                            ],
+                            attempted: vec!["first".to_string(), "second".to_string()],
+                            source: Box::new(ProviderError::UnknownConnection {
+                                connection: "local".to_string(),
+                            }),
+                        },
+                        3 => ModelError::ManualChoiceRejected {
+                            attempt_id: "attempt".to_string(),
+                            connection: "reserve".to_string(),
+                            cause: RejectionCause::SendFailed(error.clone()),
+                        },
+                        _ => unreachable!(),
+                    };
+                    let controller = ControllerError::Model(model);
+                    assert!(
+                        controller.error_code()
+                            == if projection == 3 {
+                                rivect::contracts::ErrorCode::CapabilityUnavailable
+                            } else {
+                                rivect::contracts::ErrorCode::Denied
+                            }
+                    );
+                    step_error_observation(&task, &answer, &controller)
+                })
+                .collect();
+            for (left, (left_name, left_group, _)) in cases.iter().enumerate() {
+                for (right, (right_name, right_group, _)) in cases.iter().enumerate() {
+                    let equivalent = left_group == right_group;
+                    assert!(
+                        (observations[left].signature.result
+                            == observations[right].signature.result)
+                            == equivalent,
+                        "legacy fingerprint quotient changed: projection {projection}, {left_name} vs {right_name}"
+                    );
+
+                    for sequence in [
+                        vec![left, left, left],
+                        vec![left, right, left],
+                        vec![left, right, left, right],
+                    ] {
+                        let mut supervisor =
+                            Supervisor::new(SupervisorPolicy::default()).expect("valid policy");
+                        let mut fired = 0;
+                        for (index, &case) in sequence.iter().enumerate() {
+                            let reaction =
+                                supervisor.observe(&scheduler, observations[case].clone());
+                            let exact =
+                                index == 2 && (sequence == vec![left, left, left] || equivalent);
+                            let fuzzy = index == 3 && !equivalent;
+                            let expected = match (exact, fuzzy) {
+                                (true, _) => Some(StallCause::ExactRepeat {
+                                    signature: observations[case].signature.clone(),
+                                    repeats: 3,
+                                }),
+                                (_, true) => Some(StallCause::FuzzyRepeat {
+                                    signature: observations[case].signature.clone(),
+                                    repeats: 4,
+                                }),
+                                _ => None,
+                            };
+                            assert!(
+                                reaction.as_ref().map(|reaction| &reaction.cause)
+                                    == expected.as_ref(),
+                                "the sterile sequence fired the wrong cause or count"
+                            );
+                            assert!(
+                                reaction
+                                    .as_ref()
+                                    .is_none_or(|reaction| reaction.task == task),
+                                "the sterile reaction must retain the task"
+                            );
+                            fired += usize::from(reaction.is_some());
+                        }
+                        let expected_count = usize::from(
+                            sequence.len() == 4 || equivalent || sequence == vec![left, left, left],
+                        );
+                        assert_eq!(fired, expected_count);
+                        assert_eq!(supervisor.reactions(&task).len(), fired);
+                    }
+                }
+                let context: &[&str] = match *left_group {
+                    0 => &["builder"],
+                    1 => &["request"],
+                    2 => &["decode"],
+                    3 => &["body"],
+                    4 => &["deadline", "500ms"],
+                    5 => &["deadline", "1s"],
+                    6 => &["status", "401"],
+                    7 => &["status", "429"],
+                    8 => &["status", "503"],
+                    9 => &["read"],
+                    _ => unreachable!(),
+                };
+                for required in context {
+                    assert!(
+                        observations[left].signature.result.contains(required),
+                        "the composed fingerprint lost its safe typed context"
+                    );
+                }
+                if *left_group == 9 {
+                    assert!(
+                        observations[left]
+                            .signature
+                            .result
+                            .contains(&io_code.to_string()),
+                        "the composed read fingerprint lost its os code"
+                    );
+                }
+                for progress in [
+                    observations[left].clone().with_new_inputs(),
+                    observations[left].clone().with_heartbeat(),
+                    observations[left].clone().with_evidence_growth(1),
+                ] {
+                    let mut supervisor =
+                        Supervisor::new(SupervisorPolicy::default()).expect("valid policy");
+                    for observation in [
+                        observations[left].clone(),
+                        observations[left].clone(),
+                        progress,
+                        observations[left].clone(),
+                        observations[left].clone(),
+                    ] {
+                        assert!(
+                            supervisor.observe(&scheduler, observation).is_none(),
+                            "progress must reset the sterile run"
+                        );
+                    }
+                    let reaction = supervisor.observe(&scheduler, observations[left].clone());
+                    assert!(
+                        matches!(reaction.as_ref(), Some(reaction) if matches!(&reaction.cause,
+                    StallCause::ExactRepeat { signature, repeats: 3 } if signature == &observations[left].signature)),
+                        "three fresh sterile outcomes must fire exactly once after progress"
+                    );
+                    assert_eq!(supervisor.reactions(&task).len(), 1);
+                }
+            }
+        }
+    }
 }
 
 /// AC-045: a candidate that passes the re-check but fails its own send
@@ -2033,12 +3339,12 @@ fn failed_send_leaves_no_phantom_epoch() {
         matches!(&error, ModelError::FallbackExhausted {
             rejected, attempted, ..
         } if attempted == &vec!["reserve".to_string()]
-            && rejected == &vec![CandidateRejection {
-                connection: "reserve".to_string(),
+            && matches!(rejected.as_slice(), [CandidateRejection {
+                connection: connection_0,
                 cause: RejectionCause::SendFailed(ProviderError::UnknownConnection {
-                    connection: "reserve".to_string(),
+                    connection: connection_1,
                 }),
-            }]),
+            }] if connection_0 == "reserve" && connection_1 == "reserve")),
         "wrong rejection: {error}"
     );
 
@@ -2220,28 +3526,28 @@ fn manual_fallback_with_no_servable_candidate_exhausts_instead_of_wedging() {
         } if attempt_id == &manifest.attempt_id
             && purpose == "relay"
             && attempted.is_empty()
-            && rejected == &vec![
+            && matches!(rejected.as_slice(), [
                 CandidateRejection {
-                    connection: "denied".to_string(),
+                    connection: connection_0,
                     cause: RejectionCause::NotPurposeEligible,
                 },
                 CandidateRejection {
-                    connection: "gone".to_string(),
+                    connection: connection_1,
                     cause: RejectionCause::NotPurposeEligible,
                 },
                 CandidateRejection {
-                    connection: "reserve".to_string(),
+                    connection: connection_2,
                     cause: RejectionCause::NotPurposeEligible,
                 },
                 CandidateRejection {
-                    connection: "shadowed".to_string(),
+                    connection: connection_3,
                     cause: RejectionCause::NotPurposeEligible,
                 },
                 CandidateRejection {
-                    connection: "web".to_string(),
+                    connection: connection_4,
                     cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
                 },
-            ]),
+            ] if connection_0 == "denied" && connection_1 == "gone" && connection_2 == "reserve" && connection_3 == "shadowed" && connection_4 == "web")),
         "the exhaustion names every evaluated candidate's cause: {error}"
     );
     // no question was ever published — nothing can answer an empty set
@@ -2558,10 +3864,10 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
         .expect_err("a candidate no adapter serves is skipped");
     assert!(
         matches!(&error, ModelError::FallbackExhausted { rejected, .. }
-        if rejected == &vec![CandidateRejection {
-            connection: "probed".to_string(),
+        if matches!(rejected.as_slice(), [CandidateRejection {
+            connection: connection_0,
             cause: RejectionCause::DialectMismatch,
-        }]),
+        }] if connection_0 == "probed")),
         "the profile ref reached eligibility: {error}"
     );
 
@@ -2574,10 +3880,10 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
         .expect_err("the profile-less candidate loses its grant");
     assert!(
         matches!(&error, ModelError::FallbackExhausted { rejected, .. }
-        if rejected == &vec![CandidateRejection {
-            connection: "probed".to_string(),
+        if matches!(rejected.as_slice(), [CandidateRejection {
+            connection: connection_0,
             cause: RejectionCause::LiveGrantRequired { kind: ConnKind::ApiKey },
-        }]),
+        }] if connection_0 == "probed")),
         "without the profile the credential gate denies: {error}"
     );
     assert_eq!(

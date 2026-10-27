@@ -1152,31 +1152,33 @@ fn reset_after_failed_validation_retains_document() {
 
 // ----- crash-safe publication discriminator (AC-093) -----
 
-use rivect::config::{
-    PublicationError, PublicationVerdict, PublishIdentity, recover_publications, stage_publication,
-};
-use rivect::state::{ConflictCause, StoreError, TaskStore};
+use rivect::config::{PublicationError, PublicationVerdict, stage_publication};
+use rivect::executor::FileIdentity;
+use rivect::state::{ConflictCause, StoreError, StoreWriter, TaskStore};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const PUBLICATION_OWNER: &str = "file";
 
-fn publication_root(tag: &str) -> PathBuf {
-    support::temp_dir(&format!("publication-{tag}"))
+fn publication_root(tag: &str) -> tempfile::TempDir {
+    tempfile::TempDir::with_prefix(format!("rivect-publication-{tag}-")).expect("fixture root")
 }
 
-fn staged_publication(tag: &str, old_text: &str) -> (PathBuf, TaskStore, ConfigEdit) {
+fn staged_publication(
+    tag: &str,
+    old_text: &str,
+) -> (tempfile::TempDir, PathBuf, TaskStore, ConfigEdit) {
     let root = publication_root(tag);
-    let target = root.join("config.toml");
+    let target = root.path().join("config.toml");
     std::fs::write(&target, old_text).expect("seed target bytes");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut config = Config::parse_validated(old_text).expect("valid config");
     let edit = config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("workflow edit");
     stage_publication(&mut store, PUBLICATION_OWNER, &target, &edit)
         .expect("stage publication intent");
-    (target, store, edit)
+    (root, target, store, edit)
 }
 
 fn foreign_toml() -> String {
@@ -1190,27 +1192,36 @@ fn replace_target(target: &Path, bytes: &[u8]) {
     std::fs::rename(&swap, target).expect("atomic replace");
 }
 
-fn recovered_verdicts(store: &mut TaskStore) -> Vec<PublicationVerdict> {
-    recover_publications(store)
+fn recovered_verdicts(store: &mut StoreWriter<'_>) -> Vec<PublicationVerdict> {
+    store
+        .recover_publications()
         .expect("recover publications")
         .into_iter()
         .map(|recovery| recovery.verdict)
         .collect()
 }
 
-fn pending_intents(store: &mut TaskStore) -> usize {
-    store.pending_publications().expect("pending intents").len()
+fn pending_intents(store: &mut StoreWriter<'_>) -> usize {
+    store
+        .store()
+        .pending_publications()
+        .expect("pending intents")
+        .len()
 }
 
 #[test]
 fn recovery_classifies_old_when_target_bytes_never_changed() {
-    let (target, mut store, _edit) = staged_publication("old", &support::base_config());
+    let (_fixture, target, mut store, _edit) = staged_publication("old", &support::base_config());
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Old]
     );
-    assert_eq!(pending_intents(&mut store), 1, "old intent stays pending");
+    assert_eq!(
+        pending_intents(&mut store.writer()),
+        1,
+        "old intent stays pending"
+    );
     assert_eq!(
         std::fs::read_to_string(&target).expect("target bytes"),
         support::base_config(),
@@ -1220,16 +1231,17 @@ fn recovery_classifies_old_when_target_bytes_never_changed() {
 
 #[test]
 fn recovery_completes_receipt_when_bytes_match_staged_identity() {
-    let (target, mut store, edit) = staged_publication("exactly-new", &support::base_config());
+    let (_fixture, target, mut store, edit) =
+        staged_publication("exactly-new", &support::base_config());
     // In-place write like the managed publisher: the staged inode survives.
     std::fs::write(&target, &edit.bytes).expect("crash after bytes, before receipt");
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::ExactlyNew]
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         0,
         "attributed write must receive its receipt"
     );
@@ -1237,16 +1249,16 @@ fn recovery_completes_receipt_when_bytes_match_staged_identity() {
 
 #[test]
 fn recovery_keeps_byte_identical_third_unapplied() {
-    let (target, mut store, edit) =
+    let (_fixture, target, mut store, edit) =
         staged_publication("byte-identical-third", &support::base_config());
     replace_target(&target, &edit.bytes);
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::ByteIdenticalThird]
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         1,
         "a third party's identical bytes must never be marked applied"
     );
@@ -1254,15 +1266,20 @@ fn recovery_keeps_byte_identical_third_unapplied() {
 
 #[test]
 fn recovery_keeps_conflicting_foreign_bytes() {
-    let (target, mut store, _edit) = staged_publication("conflicting", &support::base_config());
+    let (_fixture, target, mut store, _edit) =
+        staged_publication("conflicting", &support::base_config());
     let foreign = foreign_toml();
     replace_target(&target, foreign.as_bytes());
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Conflicting]
     );
-    assert_eq!(pending_intents(&mut store), 1, "conflict stays pending");
+    assert_eq!(
+        pending_intents(&mut store.writer()),
+        1,
+        "conflict stays pending"
+    );
     assert_eq!(
         std::fs::read_to_string(&target).expect("target bytes"),
         foreign,
@@ -1272,28 +1289,33 @@ fn recovery_keeps_conflicting_foreign_bytes() {
 
 #[test]
 fn recovery_classifies_torn_bytes_as_unparseable() {
-    let (target, mut store, edit) = staged_publication("torn", &support::base_config());
+    let (_fixture, target, mut store, edit) = staged_publication("torn", &support::base_config());
     let torn = edit.bytes[..edit.bytes.len() / 2].to_vec();
     std::fs::write(&target, torn).expect("tear the write");
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::TornOrUnparseable]
     );
-    assert_eq!(pending_intents(&mut store), 1, "torn write stays pending");
+    assert_eq!(
+        pending_intents(&mut store.writer()),
+        1,
+        "torn write stays pending"
+    );
 }
 
 #[test]
 fn recovery_classifies_absent_target() {
-    let (target, mut store, _edit) = staged_publication("absent", &support::base_config());
+    let (_fixture, target, mut store, _edit) =
+        staged_publication("absent", &support::base_config());
     std::fs::remove_file(&target).expect("remove target");
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Absent]
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         1,
         "absent target stays pending"
     );
@@ -1302,9 +1324,9 @@ fn recovery_classifies_absent_target() {
 #[test]
 fn recovery_leaves_identity_less_identical_bytes_unknown() {
     let root = publication_root("unknown");
-    let target = root.join("config.toml");
+    let target = root.path().join("config.toml");
     std::fs::write(&target, support::base_config()).expect("seed target bytes");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut config = Config::parse_validated(&support::base_config()).expect("valid config");
     let edit = config
         .set("workflow.enabled", ConfigValue::Bool(false))
@@ -1325,21 +1347,123 @@ fn recovery_leaves_identity_less_identical_bytes_unknown() {
     std::fs::write(&target, &edit.bytes).expect("identical bytes appear");
 
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Unknown]
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         1,
         "unknown must never silently map to applied"
+    );
+}
+
+/// The same `(dev, ino)` under a different reuse token: what a later file
+/// reusing the staged occupant's pair looks like to recovery.
+fn reused_token(token: rivect_sandbox_helper::ReuseToken) -> rivect_sandbox_helper::ReuseToken {
+    let mut bytes = token.as_bytes().to_vec();
+    let last = bytes.last_mut().expect("a reuse token carries a payload");
+    *last ^= 0xff;
+    rivect_sandbox_helper::ReuseToken::from_bytes(&bytes).expect("a flipped token keeps its shape")
+}
+
+#[test]
+fn publication_recovery_never_receipts_a_reused_or_unattested_identity() {
+    support::ensure_helper();
+    let (fixture, original, mut store, edit) =
+        staged_publication("reuse-token", &support::base_config());
+    let root = fixture.path();
+    let base_digest = store
+        .pending_publications()
+        .expect("pending intents")
+        .pop()
+        .expect("the original staged intent")
+        .base_digest;
+    // Both siblings sort before config.toml, so the verdict list reads
+    // reused, unattested, original.
+    let reused = root.join("a-reused.toml");
+    let unattested = root.join("b-unattested.toml");
+    let target_identity = |target: &Path| {
+        std::fs::write(target, support::base_config()).expect("seed sibling target");
+        rivect::executor::write_target_identity(root, target).expect("sibling write identity")
+    };
+    let reused_identity = target_identity(&reused);
+    let Ok(token) = reused_identity.reuse() else {
+        panic!("capability: the test filesystem must report a reuse discriminator");
+    };
+    let unattested_identity = target_identity(&unattested);
+    store
+        .append_publication(
+            PUBLICATION_OWNER,
+            reused.to_str().expect("utf-8 target"),
+            &edit.digest,
+            base_digest.as_deref(),
+            Some(rivect::executor::WriteIdentity::new(
+                reused_identity.file(),
+                Ok(reused_token(token)),
+            )),
+        )
+        .expect("journal a reused-token intent");
+    store
+        .append_publication(
+            PUBLICATION_OWNER,
+            unattested.to_str().expect("utf-8 target"),
+            &edit.digest,
+            base_digest.as_deref(),
+            Some(rivect::executor::WriteIdentity::new(
+                unattested_identity.file(),
+                Err(rivect::executor::Unattested::Unrecorded),
+            )),
+        )
+        .expect("journal an unattested intent");
+    // Crash after bytes, before receipt: each target holds the intended
+    // bytes in place, so every staged (dev, ino) still matches.
+    for target in [&reused, &unattested, &original] {
+        std::fs::write(target, &edit.bytes).expect("intended bytes land in place");
+    }
+
+    assert_eq!(
+        recovered_verdicts(&mut store.writer()),
+        vec![
+            PublicationVerdict::ByteIdenticalThird,
+            PublicationVerdict::Unknown,
+            PublicationVerdict::ExactlyNew,
+        ]
+    );
+    let pending = store.pending_publications().expect("pending intents");
+    assert_eq!(
+        pending.len(),
+        2,
+        "a reused or unattested identity must never receive a receipt"
+    );
+    let unattested_intent = pending
+        .iter()
+        .find(|intent| intent.target == unattested.to_str().expect("utf-8 target"))
+        .expect("the unattested intent stays pending");
+
+    let error = rivect::config::publish_intent(&mut store, unattested_intent, &edit.bytes)
+        .expect_err("an unattested identity must refuse the publication write");
+
+    assert!(
+        matches!(
+            error,
+            PublicationError::Write(rivect::executor::WorkerError::WriteIdentityUnattested {
+                cause: rivect::executor::Unattested::Unrecorded
+            })
+        ),
+        "wrong refusal error: {error}"
+    );
+    assert_eq!(
+        pending_intents(&mut store.writer()),
+        2,
+        "the refused write leaves its intent pending"
     );
 }
 
 #[test]
 fn staging_refuses_absent_target_without_journaling() {
     let root = publication_root("stage-absent");
-    let target = root.join("fresh.toml");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let target = root.path().join("fresh.toml");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut config = Config::parse_validated(&support::base_config()).expect("valid config");
     let edit = config
         .set("workflow.enabled", ConfigValue::Bool(false))
@@ -1356,7 +1480,7 @@ fn staging_refuses_absent_target_without_journaling() {
         "wrong refusal error: {error}"
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         0,
         "a refused intent must not leave a journal row"
     );
@@ -1364,11 +1488,15 @@ fn staging_refuses_absent_target_without_journaling() {
 
 #[test]
 fn staging_refuses_fifo_target_without_hanging() -> Result<(), Box<dyn std::error::Error>> {
-    let root = publication_root("stage-fifo");
-    let target = root.join("pipe");
-    let status = std::process::Command::new("mkfifo").arg(&target).status()?;
+    let mut root = publication_root("stage-fifo");
+    let target = root.path().join("pipe");
+    let status = std::process::Command::new("mkfifo").arg(&target).status();
+    if status.is_err() {
+        support::retain_root(&mut root);
+    }
+    let status = status?;
     assert!(status.success(), "mkfifo must create the pipe");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut config = Config::parse_validated(&support::base_config()).expect("valid config");
     let edit = config
         .set("workflow.enabled", ConfigValue::Bool(false))
@@ -1384,7 +1512,7 @@ fn staging_refuses_fifo_target_without_hanging() -> Result<(), Box<dyn std::erro
         "wrong refusal error: {error}"
     );
     assert_eq!(
-        pending_intents(&mut store),
+        pending_intents(&mut store.writer()),
         0,
         "no row for a non-regular target"
     );
@@ -1394,29 +1522,39 @@ fn staging_refuses_fifo_target_without_hanging() -> Result<(), Box<dyn std::erro
 #[test]
 fn recovery_treats_fifo_target_as_unknown_without_hanging() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (target, mut store, _edit) = staged_publication("recover-fifo", &support::base_config());
+    let (mut fixture, target, mut store, _edit) =
+        staged_publication("recover-fifo", &support::base_config());
     std::fs::remove_file(&target)?;
-    let status = std::process::Command::new("mkfifo").arg(&target).status()?;
+    let status = std::process::Command::new("mkfifo").arg(&target).status();
+    if status.is_err() {
+        support::retain_root(&mut fixture);
+    }
+    let status = status?;
     assert!(status.success(), "mkfifo must create the pipe");
 
     // Recovery must classify, never block on the writerless pipe.
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Unknown]
     );
-    assert_eq!(pending_intents(&mut store), 1, "unknown stays pending");
+    assert_eq!(
+        pending_intents(&mut store.writer()),
+        1,
+        "unknown stays pending"
+    );
     Ok(())
 }
 
 #[test]
 fn recovery_reads_target_at_ceiling_and_rejects_one_past_it() {
-    let (target, mut store, _edit) = staged_publication("ceiling", &support::base_config());
+    let (_fixture, target, mut store, _edit) =
+        staged_publication("ceiling", &support::base_config());
     // Exactly PUBLICATION_MAX_BYTES (1 MiB) bytes: still readable and
     // classifiable — zeros are not UTF-8, so the verdict is
     // torn/unparseable, not Unknown.
     std::fs::write(&target, vec![0u8; 1 << 20]).expect("write exactly at the ceiling");
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::TornOrUnparseable],
         "an exactly-ceiling target must still be read"
     );
@@ -1425,7 +1563,7 @@ fn recovery_reads_target_at_ceiling_and_rejects_one_past_it() {
     // unattributable instead of pulling it into memory whole.
     std::fs::write(&target, vec![0u8; (1 << 20) + 1]).expect("write one byte past the ceiling");
     assert_eq!(
-        recovered_verdicts(&mut store),
+        recovered_verdicts(&mut store.writer()),
         vec![PublicationVerdict::Unknown],
         "past the ceiling the target is unattributable"
     );
@@ -1443,11 +1581,11 @@ fn staged_pair_stays_self_consistent_under_concurrent_path_swaps() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let root = publication_root("swap-race");
-    let target = root.join("config.toml");
-    let other = root.join("other.toml");
+    let target = root.path().join("config.toml");
+    let other = root.path().join("other.toml");
     std::fs::write(&target, support::base_config()).expect("seed target");
     std::fs::write(&other, foreign_toml()).expect("seed other");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut config = Config::parse_validated(&support::base_config()).expect("valid config");
     let edit = config
         .set("workflow.enabled", ConfigValue::Bool(false))
@@ -1468,12 +1606,19 @@ fn staged_pair_stays_self_consistent_under_concurrent_path_swaps() {
 
     let mut staged = 0usize;
     let mut attempts = 0usize;
-    while staged < 50 && attempts < 5000 {
+    // The bound is wall-clock, not attempts: under parallel load the
+    // flipper's unthrottled swaps leave the path nameless for long
+    // stretches, so an attempt budget can starve before 50 landings
+    // while the deadline keeps the liveness requirement identical.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while staged < 50 && std::time::Instant::now() < deadline {
         attempts += 1;
         // A refusal (the path is momentarily nameless mid-swap) is a skip,
         // never an inconsistent journal row.
         if stage_publication(&mut store, PUBLICATION_OWNER, &target, &edit).is_ok() {
             staged += 1;
+        } else {
+            std::thread::yield_now();
         }
     }
     assert_eq!(
@@ -1487,14 +1632,10 @@ fn staged_pair_stays_self_consistent_under_concurrent_path_swaps() {
     // the pair it was created with no matter which name it sits under now.
     let sight = |path: &Path| {
         use sha2::Digest;
-        use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(path).expect("sight metadata");
         let bytes = std::fs::read(path).expect("sight bytes");
         (
-            PublishIdentity {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
+            FileIdentity::from_metadata(&metadata),
             rivect::config::hex(&sha2::Sha256::digest(&bytes)),
         )
     };
@@ -1504,7 +1645,7 @@ fn staged_pair_stays_self_consistent_under_concurrent_path_swaps() {
         let identity = intent.publish_identity.expect("staged identity");
         let base = intent.base_digest.expect("staged base digest");
         let consistent = pairs.iter().any(|(sight_identity, sight_digest)| {
-            *sight_identity == identity && *sight_digest == base
+            *sight_identity == identity.file() && *sight_digest == base
         });
         assert!(
             consistent,
@@ -1516,7 +1657,7 @@ fn staged_pair_stays_self_consistent_under_concurrent_path_swaps() {
 #[test]
 fn completing_an_unknown_intent_is_a_typed_conflict() {
     let root = publication_root("complete-miss");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
 
     let error = store
         .complete_publication(PUBLICATION_OWNER, "config.toml", 1)
@@ -1533,7 +1674,8 @@ fn completing_an_unknown_intent_is_a_typed_conflict() {
 
 #[test]
 fn completing_an_already_receipted_intent_is_a_typed_conflict() {
-    let (_target, mut store, _edit) = staged_publication("complete-twice", &support::base_config());
+    let (_fixture, _target, mut store, _edit) =
+        staged_publication("complete-twice", &support::base_config());
     let intent = store
         .pending_publications()
         .expect("pending intents")
@@ -1564,9 +1706,9 @@ fn completing_an_already_receipted_intent_is_a_typed_conflict() {
 #[test]
 fn older_admission_wins_even_when_owner_uuid_order_reverses() {
     let root = publication_root("admission-order");
-    let target = root.join("config.toml");
+    let target = root.path().join("config.toml");
     std::fs::write(&target, support::base_config()).expect("seed target bytes");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
     let mut older = Config::parse_validated(&support::base_config()).expect("valid config");
     let older_edit = older
         .set("workflow.enabled", ConfigValue::Bool(false))
@@ -1613,13 +1755,11 @@ fn recovery_only_completion_emits_no_hooks() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("workflow edit");
-    let intent = stage_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &target,
-        &edit,
-    )
-    .expect("stage publication intent");
+    let intent = world
+        .runtime
+        .store_writer()
+        .stage_publication(PUBLICATION_OWNER, &target, &edit)
+        .expect("stage publication intent");
     // Crash after the managed write, before the receipt: the staged inode
     // survives under the intended bytes.
     std::fs::write(&target, &edit.bytes).expect("crash after bytes, before receipt");
@@ -1627,27 +1767,21 @@ fn recovery_only_completion_emits_no_hooks() {
     // A fresh Runtime::open receipts the ExactlyNew crash window on boot.
     world.reopen();
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "boot recovery receipts the attributed write"
     );
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .applied_publications()
             .expect("applied intents"),
         vec![intent],
         "the crash-window row went terminal unchanged"
     );
     assert_eq!(
-        world
-            .runtime
-            .owner
-            .store
-            .event_count()
-            .expect("event count"),
+        world.runtime.store().event_count().expect("event count"),
         0,
         "recovery-only completion must emit no hooks"
     );
@@ -1656,7 +1790,7 @@ fn recovery_only_completion_emits_no_hooks() {
 #[test]
 fn preapproval_liveness_follows_expiry() {
     let root = publication_root("preapproval");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("open store");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("open store");
 
     store
         .record_preapproval("write-config", "human", 3600)
@@ -1690,6 +1824,7 @@ fn carrier_world(tag: &str) -> (support::World, rivect::contracts::SessionId) {
 
 #[test]
 fn cli_config_set_completes_a_typed_edit() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("cli-set");
 
     let response = world.dispatch(&json!({
@@ -1714,7 +1849,7 @@ fn cli_config_set_completes_a_typed_edit() {
     );
     let parsed = world
         .runtime
-        .effective
+        .effective()
         .parsed
         .as_ref()
         .expect("retained document");
@@ -1733,7 +1868,7 @@ fn cli_config_set_completes_a_typed_edit() {
         "command.execute itself must change config.toml on disk"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the write's receipt completes the journaled intent"
     );
@@ -1838,7 +1973,115 @@ fn config_read_unknown_key_names_its_accepted_domain() {
 
     assert_eq!(
         response["error"]["data"]["message"],
-        "unknown key bogus; known keys: workflow.enabled, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
+        "unknown key bogus; known keys: workflow.enabled, decisions.mode, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
+    );
+}
+
+#[test]
+fn decisions_mode_accepts_the_shipped_set() {
+    for (spelling, expected) in [
+        ("ask", rivect::config::DecisionMode::Ask),
+        ("auto", rivect::config::DecisionMode::Auto),
+        ("inherit", rivect::config::DecisionMode::Ask),
+    ] {
+        let text = format!(
+            "{}\n[decisions]\nmode = \"{spelling}\"\n",
+            support::base_config()
+        );
+        let config = Config::parse_validated(&text).expect("decision mode parses");
+        assert_eq!(config.decisions_mode(), expected, "mode {spelling}");
+    }
+
+    // The absent override lands on the shipped ask — the same place
+    // `inherit` resolves, and a file without the key keeps the default.
+    let config =
+        Config::parse_validated(&support::base_config()).expect("config without decisions");
+    assert_eq!(config.decisions_mode(), rivect::config::DecisionMode::Ask);
+    assert_eq!(
+        config.read_value("decisions.mode"),
+        Some(serde_json::Value::Null),
+        "the absent mode reads null, not an invented spelling"
+    );
+}
+
+#[test]
+fn decisions_mode_rejects_unsupported_and_non_string_values() {
+    // An unknown spelling is a schema rejection naming the value, never
+    // a silent fallback to ask.
+    let text = format!(
+        "{}\n[decisions]\nmode = \"bogus\"\n",
+        support::base_config()
+    );
+    let err = Config::parse(&text)
+        .expect("TOML parse")
+        .validate()
+        .expect_err("an unknown mode must reject");
+    expect_stage(&err, Stage::Schema);
+    assert_eq!(err.key.as_deref(), Some("decisions.mode"));
+    assert!(
+        matches!(&err.issue, ConfigIssue::UnsupportedDecisionMode { mode } if mode == "bogus"),
+        "{err}"
+    );
+
+    // A non-string mode raises the same ExpectedString every other mode
+    // field carries — never coerced.
+    let text = format!("{}\n[decisions]\nmode = 1\n", support::base_config());
+    let err = Config::parse(&text)
+        .expect("TOML parse")
+        .validate()
+        .expect_err("a numeric mode must reject");
+    expect_stage(&err, Stage::Schema);
+    assert_eq!(err.key.as_deref(), Some("decisions.mode"));
+    assert!(
+        matches!(&err.issue, ConfigIssue::ExpectedString { field } if field == "mode"),
+        "{err}"
+    );
+}
+
+#[test]
+fn decisions_mode_wire_set_rejects_out_of_domain_values() {
+    let (mut world, session) = carrier_world("decisions-mode-set");
+
+    let rejected = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7401, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "decisions.mode", "value": "bogus" }
+    }));
+    assert_eq!(
+        rejected["error"]["data"]["message"],
+        "schema decisions.mode: unsupported decisions.mode bogus; known modes: ask, auto, inherit",
+        "the wire rejection names key and value: {rejected}"
+    );
+
+    // The typed file surface rejects the same value — one domain, one
+    // rule.
+    let mut config = Config::parse_validated(&support::base_config()).expect("valid config");
+    let err = config
+        .set_wire("decisions.mode", &json!("bogus"))
+        .expect_err("the typed surface rejects too");
+    expect_stage(&err, Stage::Schema);
+    assert!(
+        matches!(&err.issue, ConfigIssue::UnsupportedDecisionMode { mode } if mode == "bogus"),
+        "{err}"
+    );
+
+    // A non-string wire value is a typed rejection, not a coercion.
+    let non_string = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7402, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "decisions.mode", "value": 1 }
+    }));
+    assert_eq!(
+        non_string["error"]["data"]["code"], "invalid_input",
+        "a non-string mode must reject typed on the wire: {non_string}"
+    );
+    assert!(
+        non_string["error"]["data"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("decisions.mode")),
+        "the rejection names the key: {non_string}"
     );
 }
 
@@ -1895,6 +2138,7 @@ fn describe_lists_config_commands_available_with_write_policy() {
 
 #[test]
 fn cli_config_set_maps_object_values_through_the_typed_schema() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("cli-object");
 
     let response = world.dispatch(&json!({
@@ -1908,7 +2152,7 @@ fn cli_config_set_maps_object_values_through_the_typed_schema() {
     assert!(response["error"].is_null(), "{response}");
     let parsed = world
         .runtime
-        .effective
+        .effective()
         .parsed
         .as_ref()
         .expect("retained document");
@@ -1938,14 +2182,12 @@ fn file_and_cli_singleflight_completes_once_with_one_control_event() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    let file_intent = rivect::config::admit_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &target,
-        &edit,
-    )
-    .expect("file admission")
-    .intent();
+    let file_intent = world
+        .runtime
+        .store_writer()
+        .admit_publication(PUBLICATION_OWNER, &target, &edit)
+        .expect("file admission")
+        .intent();
 
     // CLI surface replays the same command before the write lands.
     let response = world.dispatch(&json!({
@@ -1966,7 +2208,7 @@ fn file_and_cli_singleflight_completes_once_with_one_control_event() {
         json!(file_intent.admission_seq)
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "one control event: the replay must not journal a second intent"
     );
@@ -1974,12 +2216,12 @@ fn file_and_cli_singleflight_completes_once_with_one_control_event() {
     // The managed write lands; recovery completes the command exactly once.
     std::fs::write(&target, &edit.bytes).expect("managed write bytes");
     assert_eq!(
-        recovered_verdicts(&mut world.runtime.owner.store),
+        recovered_verdicts(&mut world.runtime.store_writer()),
         vec![PublicationVerdict::ExactlyNew],
         "exactly one completion"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the single completion receipts the one control event"
     );
@@ -1991,6 +2233,7 @@ fn file_and_cli_singleflight_completes_once_with_one_control_event() {
 /// receipts the same row.
 #[test]
 fn cli_retry_after_failed_write_lands_the_bytes_and_completes_the_row() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("retry-failed-write");
     let target = world.root.join("config.toml");
 
@@ -2002,12 +2245,12 @@ fn cli_retry_after_failed_write_lands_the_bytes_and_completes_the_row() {
                     "command": { "kind": "config.set" },
                     "key": "workflow.enabled", "value": false }
     }));
-    assert!(
-        !first["error"].is_null(),
+    assert_eq!(
+        first["error"]["data"]["code"], "denied",
         "the unwritable target must refuse the first attempt: {first}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "the refused write leaves its staged row pending"
     );
@@ -2040,7 +2283,7 @@ fn cli_retry_after_failed_write_lands_the_bytes_and_completes_the_row() {
         "the retry must land the bytes it reports"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the healed write receipts the staged row"
     );
@@ -2052,6 +2295,7 @@ fn cli_retry_after_failed_write_lands_the_bytes_and_completes_the_row() {
 /// success from the retained document.
 #[test]
 fn cli_retry_after_crash_before_write_heals_the_pending_row() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("retry-crash-before-write");
     let target = world.root.join("config.toml");
 
@@ -2059,10 +2303,13 @@ fn cli_retry_after_crash_before_write_heals_the_pending_row() {
     let edit = staged
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    stage_publication(&mut world.runtime.owner.store, "cli", &target, &edit)
+    world
+        .runtime
+        .store_writer()
+        .stage_publication("cli", &target, &edit)
         .expect("crash left the cli-owned row staged, unwritten");
     assert_eq!(
-        recovered_verdicts(&mut world.runtime.owner.store),
+        recovered_verdicts(&mut world.runtime.store_writer()),
         vec![PublicationVerdict::Old],
         "the crash scenario: base bytes, no write"
     );
@@ -2080,7 +2327,7 @@ fn cli_retry_after_crash_before_write_heals_the_pending_row() {
         "the retry heals the unwritten row by landing its bytes"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the healed row is receipted, never re-journaled"
     );
@@ -2098,11 +2345,14 @@ fn cli_retry_of_an_exactly_new_pending_row_receipts_without_a_second_write() {
     let edit = staged
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    stage_publication(&mut world.runtime.owner.store, "cli", &target, &edit)
+    world
+        .runtime
+        .store_writer()
+        .stage_publication("cli", &target, &edit)
         .expect("staged intent");
     std::fs::write(&target, &edit.bytes).expect("crash landed the bytes unreceipted");
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "the crash scenario: intended bytes on disk, receipt missing"
     );
@@ -2119,7 +2369,7 @@ fn cli_retry_of_an_exactly_new_pending_row_receipts_without_a_second_write() {
     }));
     assert!(response["error"].is_null(), "{response}");
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the retry receipts the crashed row without a new journal row"
     );
@@ -2277,7 +2527,10 @@ fn config_set_on_an_undeclared_connection_is_rejected_and_leaves_the_file_untouc
 
     // the wire path: the refused write never reaches the file, and the
     // document a fresh runtime opens is still the shipped one
-    let (mut world, session) = carrier_world("cli-undeclared-connection");
+    let root =
+        tempfile::TempDir::with_prefix("rivect-cli-undeclared-connection-").expect("fixture root");
+    let mut world = support::open_world_at(root.path(), Some(&support::base_config()));
+    let session = world.open_session("bootstrap-cli-undeclared-connection");
     let target = world.root.join("config.toml");
     let before = std::fs::read(&target).expect("config bytes");
     let response = world.dispatch(&json!({
@@ -2307,9 +2560,8 @@ fn config_set_on_an_undeclared_connection_is_rejected_and_leaves_the_file_untouc
         before,
         "the refused edits never touched the file"
     );
-    let root = world.root.clone();
     drop(world);
-    let mut reopened = support::open_world_at(root, None);
+    let mut reopened = support::open_world_at(root.path(), None);
     let _reopen_session = reopened.open_session("reopen-after-refusal");
 }
 
@@ -2734,14 +2986,12 @@ fn singleflight_keys_the_match_on_file_identity_not_the_path_spelling() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    let winner = rivect::config::admit_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &dotted,
-        &edit,
-    )
-    .expect("file admission through the dotted spelling")
-    .intent();
+    let winner = world
+        .runtime
+        .store_writer()
+        .admit_publication(PUBLICATION_OWNER, &dotted, &edit)
+        .expect("file admission through the dotted spelling")
+        .intent();
 
     // The CLI replays the same command through the clean spelling.
     let response = world.dispatch(&json!({
@@ -2761,7 +3011,7 @@ fn singleflight_keys_the_match_on_file_identity_not_the_path_spelling() {
         "same inode: the replay must not mint a second intent: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "one control event for one file identity"
     );
@@ -2772,6 +3022,7 @@ fn singleflight_keys_the_match_on_file_identity_not_the_path_spelling() {
 /// winner's terminal result and journals nothing new.
 #[test]
 fn replay_after_completion_observes_the_terminal_result_without_a_second_row() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("terminal-replay");
     let target = world.root.join("config.toml");
 
@@ -2779,22 +3030,20 @@ fn replay_after_completion_observes_the_terminal_result_without_a_second_row() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    let winner = rivect::config::admit_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &target,
-        &edit,
-    )
-    .expect("file admission")
-    .intent();
+    let winner = world
+        .runtime
+        .store_writer()
+        .admit_publication(PUBLICATION_OWNER, &target, &edit)
+        .expect("file admission")
+        .intent();
 
     std::fs::write(&target, &edit.bytes).expect("managed write bytes");
     assert_eq!(
-        recovered_verdicts(&mut world.runtime.owner.store),
+        recovered_verdicts(&mut world.runtime.store_writer()),
         vec![PublicationVerdict::ExactlyNew],
         "the winner completes exactly once"
     );
-    assert_eq!(pending_intents(&mut world.runtime.owner.store), 0);
+    assert_eq!(pending_intents(&mut world.runtime.store_writer()), 0);
 
     // The CLI replays the same command after the winner went terminal.
     let response = world.dispatch(&json!({
@@ -2814,7 +3063,7 @@ fn replay_after_completion_observes_the_terminal_result_without_a_second_row() {
         "terminal identity, not a fresh mint: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "an already-applied command journals nothing new"
     );
@@ -2832,7 +3081,7 @@ fn replay_after_completion_observes_the_terminal_result_without_a_second_row() {
         "a new edit keeps its own admission identity: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "a new edit publishes and receipts its own control event"
     );
@@ -2843,6 +3092,7 @@ fn replay_after_completion_observes_the_terminal_result_without_a_second_row() {
 /// instance again.
 #[test]
 fn replay_after_the_target_moved_on_admits_a_fresh_instance() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("moved-on");
     let target = world.root.join("config.toml");
 
@@ -2850,16 +3100,14 @@ fn replay_after_the_target_moved_on_admits_a_fresh_instance() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    rivect::config::admit_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &target,
-        &edit,
-    )
-    .expect("file admission");
+    world
+        .runtime
+        .store_writer()
+        .admit_publication(PUBLICATION_OWNER, &target, &edit)
+        .expect("file admission");
     std::fs::write(&target, &edit.bytes).expect("managed write bytes");
     assert_eq!(
-        recovered_verdicts(&mut world.runtime.owner.store),
+        recovered_verdicts(&mut world.runtime.store_writer()),
         vec![PublicationVerdict::ExactlyNew]
     );
 
@@ -2885,7 +3133,7 @@ fn replay_after_the_target_moved_on_admits_a_fresh_instance() {
         "the fresh instance lands its managed write"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the replay publishes its own control event against the new base"
     );
@@ -2905,18 +3153,16 @@ fn terminal_replay_across_two_spellings_observes_the_row_whose_bytes_hold() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    let winner = rivect::config::admit_publication(
-        &mut world.runtime.owner.store,
-        PUBLICATION_OWNER,
-        &dotted,
-        &edit,
-    )
-    .expect("file admission under the dotted spelling")
-    .intent();
+    let winner = world
+        .runtime
+        .store_writer()
+        .admit_publication(PUBLICATION_OWNER, &dotted, &edit)
+        .expect("file admission under the dotted spelling")
+        .intent();
 
     std::fs::write(&clean, &edit.bytes).expect("managed write bytes");
     assert_eq!(
-        recovered_verdicts(&mut world.runtime.owner.store),
+        recovered_verdicts(&mut world.runtime.store_writer()),
         vec![PublicationVerdict::ExactlyNew],
         "the winner completes exactly once"
     );
@@ -2932,14 +3178,12 @@ fn terminal_replay_across_two_spellings_observes_the_row_whose_bytes_hold() {
     ] {
         let seq = world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .append_publication(PUBLICATION_OWNER, &clean_key, stale_digest, None, identity)
             .expect("append stale applied row");
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .complete_publication(PUBLICATION_OWNER, &clean_key, seq)
             .expect("receipt stale applied row");
     }
@@ -2962,7 +3206,7 @@ fn terminal_replay_across_two_spellings_observes_the_row_whose_bytes_hold() {
         "the winner's own terminal identity, not a fresh mint: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "an already-applied command journals nothing new"
     );
@@ -2974,6 +3218,7 @@ fn terminal_replay_across_two_spellings_observes_the_row_whose_bytes_hold() {
 /// override falls back to the shipped default again.
 #[test]
 fn config_set_then_config_read_answers_the_retained_value() {
+    support::ensure_helper();
     let (mut world, session) = carrier_world("set-then-read");
 
     let set = world.dispatch(&json!({
@@ -3066,14 +3311,14 @@ fn rejected_admission_restores_the_retained_view() {
         "the admission itself is refused: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "nothing was journaled for the refused command"
     );
 
     let parsed = world
         .runtime
-        .effective
+        .effective()
         .parsed
         .as_ref()
         .expect("retained document still present");
@@ -3095,6 +3340,7 @@ fn rejected_admission_restores_the_retained_view() {
 
 #[test]
 fn cli_config_unset_removes_a_purpose_override_and_completes_once() {
+    support::ensure_helper();
     let mut world = support::open_world(
         "cli-unset-override",
         Some(&support::config_fixed_model_auto_effort()),
@@ -3122,7 +3368,7 @@ fn cli_config_unset_removes_a_purpose_override_and_completes_once() {
 
     let parsed = world
         .runtime
-        .effective
+        .effective()
         .parsed
         .as_ref()
         .expect("retained document");
@@ -3144,7 +3390,7 @@ fn cli_config_unset_removes_a_purpose_override_and_completes_once() {
         "command.execute itself must change config.toml on disk"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "the write's receipt completes the one journaled intent"
     );
@@ -3171,7 +3417,7 @@ fn cli_config_set_without_a_retained_document_is_a_typed_rejection() {
         "{response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         0,
         "a rejected edit never journals an intent"
     );
@@ -3223,6 +3469,7 @@ fn cli_config_set_maps_staging_failures_to_their_wire_codes() {
 
 #[test]
 fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
+    support::ensure_helper();
     // A pending own-carrier row replays through `resolve_pending_publication`
     // — the same fail-closed publication_error arm as the fresh write.
     let (mut world, session) = carrier_world("wire-write-denied");
@@ -3231,7 +3478,10 @@ fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
     let edit = file_config
         .set("workflow.enabled", ConfigValue::Bool(false))
         .expect("typed edit");
-    stage_publication(&mut world.runtime.owner.store, "cli", &target, &edit)
+    world
+        .runtime
+        .store_writer()
+        .stage_publication("cli", &target, &edit)
         .expect("stage the carrier's own intent");
     // The managed write must fail: a read-only target refuses the
     // checked-fd write with `denied`, the executor's own wire code.
@@ -3251,7 +3501,7 @@ fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
         "a refused managed write surfaces the executor's denied code: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "the unlanded write leaves its intent pending for recovery"
     );
@@ -3267,8 +3517,7 @@ fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
     let target = world.root.join("config.toml");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .append_publication(
             "cli",
             target.to_str().expect("utf-8 target"),
@@ -3288,7 +3537,7 @@ fn cli_config_set_pending_arm_maps_write_and_identity_failures() {
         "a staged row without publish identity is internal_error: {response}"
     );
     assert_eq!(
-        pending_intents(&mut world.runtime.owner.store),
+        pending_intents(&mut world.runtime.store_writer()),
         1,
         "the row the write never ran for stays pending"
     );
@@ -3318,6 +3567,7 @@ fn profiled_config() -> String {
 /// workflow-off state, and the already-frozen in-flight manifest.
 #[test]
 fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_off() {
+    support::ensure_helper();
     let mut world = support::open_world("profile-switch", Some(&profiled_config()));
     let session = world.open_session("profile-boot");
     // a manual permission the switch must preserve
@@ -3380,7 +3630,7 @@ fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_
     assert_eq!(
         world
             .runtime
-            .effective
+            .effective()
             .parsed
             .as_ref()
             .expect("parsed")
@@ -3390,7 +3640,7 @@ fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_
     );
     // the manual permission survives untouched
     assert!(
-        world.runtime.policy.grant(&grant).is_some(),
+        world.runtime.policy().grant(&grant).is_some(),
         "the scoped grant survives the switch"
     );
     // the in-flight manifest was never rewritten: the wire record is
@@ -3403,6 +3653,7 @@ fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_
 /// the next request and converge once it binds.
 #[test]
 fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface() {
+    support::ensure_helper();
     let mut world = support::open_world("profile-status", Some(&profiled_config()));
     let session = world.open_session("status-boot");
 
@@ -3474,6 +3725,7 @@ fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface(
 /// survive the edit byte-for-byte.
 #[test]
 fn profile_change_does_not_replace_draft_or_task_state() {
+    support::ensure_helper();
     let mut world = support::open_world("profile-draft", Some(&profiled_config()));
     let session = world.open_session("draft-boot");
     let task = world.create_task(&session, "draft-task");
@@ -3490,7 +3742,7 @@ fn profile_change_does_not_replace_draft_or_task_state() {
     };
     // snapshot after the draft exists: the edit — not the publish —
     // is what must leave the record untouched
-    let before = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let before = world.runtime.store().snapshot(&task).expect("snapshot");
 
     let response = world.dispatch(&json!({
         "jsonrpc": "2.0", "id": 9003, "method": "command.execute",
@@ -3500,7 +3752,7 @@ fn profile_change_does_not_replace_draft_or_task_state() {
     }));
     assert!(response["error"].is_null(), "{response}");
 
-    let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let after = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_eq!(after.task_id, before.task_id);
     assert_eq!(
         after.revision, before.revision,
@@ -3510,8 +3762,7 @@ fn profile_change_does_not_replace_draft_or_task_state() {
     assert_eq!(after.lifecycle, before.lifecycle);
     let (served, _) = world
         .runtime
-        .owner
-        .store
+        .store()
         .current_question(&task)
         .expect("question")
         .expect("pending");
@@ -3709,6 +3960,7 @@ fn new_connection_and_profile_keys_are_additive_and_strict_validated() {
 /// edit reported is the revision the entries name.
 #[test]
 fn config_read_serves_the_profile_keys_with_source_attribution() {
+    support::ensure_helper();
     let mut world = support::open_world("read-profile-keys", Some(&profiled_config()));
     let session = world.open_session("read-profile-boot");
 
@@ -3753,4 +4005,100 @@ fn config_read_serves_the_profile_keys_with_source_attribution() {
         profile["source"]["revision"], set["result"]["digest"],
         "{profile}"
     );
+}
+
+/// DEC-056 item 7: the owner's one config ingress is a checked,
+/// nofollow, nonblocking, bounded regular-file open. A writerless FIFO
+/// never blocks the reload, a symlink never redirects it, an oversize or
+/// corrupt document is a typed failure, only a missing file is absence,
+/// and every refusal leaves the previous owner view untouched.
+#[test]
+fn owner_config_reload_refuses_special_and_corrupt_files_and_keeps_the_previous_view()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rivect::owner::{OwnerError, read_user_config};
+    let (mut world, _session) = carrier_world("owner-config-ingress");
+    let config_path = world.root.join("config.toml");
+    let digest = world.runtime.effective().sources_digest.clone();
+    assert!(world.runtime.effective().parsed.is_some());
+
+    // A special file at the config path: no process is spawned while
+    // this runtime holds the owner lock, so a concurrent test's
+    // re-election never races an inherited lock descriptor.
+    std::fs::remove_file(&config_path)?;
+    let _special = std::os::unix::net::UnixListener::bind(&config_path)?;
+    match world.runtime.reload_config() {
+        Err(OwnerError::ConfigRead { .. }) => {}
+        other => unreachable!("a special config file is the typed read failure, got {other:?}"),
+    }
+    match read_user_config(&config_path, rivect::contracts::REQUEST_MAX_BYTES) {
+        Err(OwnerError::ConfigRead { .. }) => {}
+        other => unreachable!("the direct ingress refuses the special file too, got {other:?}"),
+    }
+    assert_eq!(world.runtime.effective().sources_digest, digest);
+    assert!(world.runtime.effective().parsed.is_some());
+    drop(_special);
+
+    // A symlink onto a valid document is never followed.
+    std::fs::remove_file(&config_path)?;
+    let real = world.root.join("real.toml");
+    std::fs::write(&real, support::base_config())?;
+    std::os::unix::fs::symlink(&real, &config_path)?;
+    match world.runtime.reload_config() {
+        Err(OwnerError::ConfigRead { .. }) => {}
+        other => unreachable!("a symlinked config is the typed read failure, got {other:?}"),
+    }
+    assert_eq!(world.runtime.effective().sources_digest, digest);
+
+    // One byte past the ceiling is the typed bound, never read whole.
+    std::fs::remove_file(&config_path)?;
+    std::fs::write(
+        &config_path,
+        vec![b' '; rivect::contracts::REQUEST_MAX_BYTES + 1],
+    )?;
+    match world.runtime.reload_config() {
+        Err(OwnerError::ConfigTooLarge { limit, .. }) => {
+            assert_eq!(limit, rivect::contracts::REQUEST_MAX_BYTES);
+        }
+        other => unreachable!("an oversize config is the typed ceiling, got {other:?}"),
+    }
+    assert_eq!(world.runtime.effective().sources_digest, digest);
+
+    // Corrupt bytes are a typed failure, not absence.
+    std::fs::write(&config_path, [0xffu8, 0xfe, 0x0a])?;
+    match world.runtime.reload_config() {
+        Err(OwnerError::ConfigRead { .. }) => {}
+        other => unreachable!("a non-UTF-8 config is the typed read failure, got {other:?}"),
+    }
+    assert_eq!(world.runtime.effective().sources_digest, digest);
+    assert!(world.runtime.effective().parsed.is_some());
+
+    // Only a missing file is absence: the reload succeeds with no user
+    // document, and that is the one transition that moves the view.
+    std::fs::remove_file(&config_path)?;
+    world.runtime.reload_config()?;
+    assert!(world.runtime.effective().parsed.is_none());
+    assert_ne!(world.runtime.effective().sources_digest, digest);
+    Ok(())
+}
+
+/// DEC-056 item 7, FIFO leg: the direct ingress never blocks on a
+/// writerless FIFO and refuses it typed. No runtime is open here, so the
+/// spawn holds no owner lock.
+#[test]
+fn owner_config_ingress_never_blocks_on_a_writerless_fifo() -> Result<(), Box<dyn std::error::Error>>
+{
+    use rivect::owner::{OwnerError, read_user_config};
+    let mut root =
+        tempfile::TempDir::with_prefix("rivect-owner-config-fifo-").expect("fixture root");
+    let path = root.path().join("config.toml");
+    let status = std::process::Command::new("mkfifo").arg(&path).status();
+    if status.is_err() {
+        support::retain_root(&mut root);
+    }
+    let status = status?;
+    assert!(status.success(), "mkfifo must create the pipe");
+    match read_user_config(&path, rivect::contracts::REQUEST_MAX_BYTES) {
+        Err(OwnerError::ConfigRead { .. }) => Ok(()),
+        other => unreachable!("a FIFO config is the typed read failure, got {other:?}"),
+    }
 }

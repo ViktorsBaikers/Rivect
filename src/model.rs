@@ -170,7 +170,7 @@ pub enum ModelError {
 /// pause served.
 /// `SendFailed` carries `ProviderError` inline so a send failure keeps
 /// its typed cause; the sibling variants stay tag-sized.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum RejectionCause {
     UnknownConnection,
     LiveGrantRequired {
@@ -216,7 +216,7 @@ impl std::fmt::Display for RejectionCause {
 }
 
 /// One skipped fallback chain entry with its typed cause.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CandidateRejection {
     pub connection: String,
     pub cause: RejectionCause,
@@ -379,9 +379,9 @@ impl ModelOutcome {
     }
 }
 
-/// The last frozen model-visible prefix digest of one purpose (AC-061
-/// contribution): an unchanged digest replays the epoch, a changed one
-/// opens a new epoch with the recorded reason.
+/// The last frozen model-visible prefix digest of one purpose: an
+/// unchanged digest replays its epoch, while a changed model, instruction
+/// set or tool surface opens a new epoch with a mutation reason.
 #[derive(Clone)]
 struct EpochState {
     prefix_digest: String,
@@ -399,6 +399,14 @@ const MODEL_SWITCH: &str = "model switch";
 /// surfaces; offline the constants keep the accounting honest.
 const MANDATORY_INSTRUCTIONS: &str = "You are the Rivect decision core. The only permitted action is one scoped file read; request it as `read <path>` on its own line.";
 const DECLARED_TOOLS: &[&str] = &["read_file"];
+/// One caller's wire parts: its system instructions and declared tool
+/// surface, frozen into [`RequestManifest::instructions`] and
+/// [`RequestManifest::tools`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallContract<'a> {
+    pub instructions: &'a str,
+    pub tools: &'a [&'a str],
+}
 
 /// Reply bytes every request must leave room for (AC-013): the
 /// accounted full-request size includes this reserve, so a request
@@ -625,6 +633,105 @@ impl Broker {
         )?;
         let instructions = MANDATORY_INSTRUCTIONS.to_string();
         let tools: Vec<String> = DECLARED_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect();
+        let accounted = wire_composition(
+            &instructions,
+            &resolved.model,
+            &tools,
+            OUTPUT_RESERVE_BYTES,
+            inputs,
+        )
+        .len()
+            + OUTPUT_RESERVE_BYTES;
+        if accounted > crate::contracts::MODEL_WIRE_MAX_BYTES {
+            return Err(ModelError::RequestTooLarge {
+                limit: crate::contracts::MODEL_WIRE_MAX_BYTES,
+                actual: accounted,
+            });
+        }
+        let (epoch_id, mutation_reason) =
+            self.context_epoch(purpose, &resolved.model, &instructions, &tools);
+        let attempt_id = crate::contracts::AttemptId::generate().0;
+        let manifest = RequestManifest {
+            attempt_id,
+            purpose: purpose.to_string(),
+            world: world.to_string(),
+            model: resolved.model,
+            effort: resolved.effort,
+            instructions,
+            tools,
+            output_reserve: OUTPUT_RESERVE_BYTES,
+            inputs: inputs.to_string(),
+            inputs_digest: hex(&Sha256::digest(inputs.as_bytes())),
+            epoch_id,
+            mutation_reason,
+            cost_bound: sent_cost_bound(inputs),
+        };
+        // The re-check view tracks the config this prepare ran under —
+        // the walk at dispatch time never reads a staler document. The
+        // observe rides only a prepare that reached the admission: a
+        // purpose resolution, ranking or size rejection above must not
+        // steer the re-check with its caller-supplied config.
+        self.observe_config(config);
+        self.admissions.insert(
+            manifest.attempt_id.clone(),
+            AdmissionRecord {
+                purpose: purpose.to_string(),
+                connection: connection.clone(),
+                model_id,
+                model_source: resolved.model_source,
+                snapshot_version: self.entitlements.version,
+                manifest: manifest.clone(),
+                fallback: resolved.fallback,
+                fallback_source: resolved.fallback_source,
+            },
+        );
+        // The credential profile the admission binds (AC-047): frozen on
+        // the broker so the status surface can name it `active` — and
+        // only once the admission stands, so a rejected prepare never
+        // moves the pending/active pair.
+        let profile = config
+            .connections
+            .get(&connection)
+            .and_then(|entry| entry.profile.clone());
+        self.bound_profile = Some(ProfileBinding {
+            connection,
+            profile,
+        });
+        Ok(manifest)
+    }
+
+    /// Builds the immutable manifest for one call under `contract`: the
+    /// caller's own instructions and declared tools ride the existing
+    /// manifest fields, so their model-visible prefix opens its own
+    /// context epoch. Every other gate is [`Broker::prepare`]'s.
+    ///
+    /// # Errors
+    ///
+    /// The [`Broker::prepare`] refusals.
+    pub fn prepare_call(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        contract: &CallContract<'_>,
+    ) -> Result<RequestManifest, ModelError> {
+        let resolved = config.resolve_purpose(purpose)?;
+        let purpose_def = config.models.purposes.get(purpose);
+        let (connection, model_id) = rank_connection(
+            purpose,
+            &resolved.model,
+            purpose_def,
+            &config.connections,
+            &config.profiles,
+            &self.entitlements,
+        )?;
+        let instructions = contract.instructions.to_string();
+        let tools: Vec<String> = contract
+            .tools
             .iter()
             .map(|tool| (*tool).to_string())
             .collect();

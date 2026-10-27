@@ -104,6 +104,34 @@ thiserror = "2.0.20"
 uuid = { version = "1.26.0", features = ["v4"] }
 unicode-normalization = "0.1.25"
 focaccia = "2.1.0"
+# SRC-008: the in-process text/path search engines — the ripgrep library
+# crates plus its ignore/glob matching. No subprocess rg/fd anywhere
+# (PROH-006); `grep-matcher` carries the Matcher trait the searcher
+# consumes and its encoding-detection surface.
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.9"
+ignore = "0.4.33"
+globset = "0.4.20"
+# SRC-007: the shared syntax engine — tree-sitter parses each file with
+# the grammar matching its extension, ast-grep-core supplies the
+# meta-variable pattern language and structural matching. Grammar
+# crates build their C parsers at dev/CI build time, never at user
+# install; the admitted set is exactly the languages the corpus proves.
+tree-sitter = "0.27.0"
+ast-grep-core = "0.45.3"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+# SRC-014: the typed symbol index speaks the LSP 3.x data shapes in-process —
+# document identity (uri/version/encoding/root) and ranges come from
+# lsp-types; there is no language-server subprocess (DEC-005). The lockfile
+# holds the admitted 0.97.0.
+lsp-types = "0.97.0"
+# SRC-014: the project's own filesystem watcher — its events coalesce into
+# the bounded channel the single index writer drains, so a snapshot
+# generation is cut per path set rather than per event. Its callbacks are
+# its own thread's; no rusqlite call ever happens there.
+notify = "8.2.0"
 # SRC-010: scoped credential profiles on native secret stores — keyring-core
 # supplies the Entry/CredentialStore seam; the platform store crates are the
 # explicit backends (no `keyring` wrapper crate per its own guidance).
@@ -117,6 +145,7 @@ keyring-core = "1.0.0"
 # graph, which deny.toml rejects; `json` is the wire codec. Redirects
 # stay off — egress is exactly the configured endpoint.
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls"] }
+tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `keychain` feature = the legacy-file keychain store (SRC-010 records the
@@ -129,9 +158,19 @@ zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-c
 
 [dev-dependencies]
 portable-pty = "0.9.0"
+# The PTY harness duplicates the master descriptor as its own writer
+# (tests/support/pty.rs); the crate is already in the tree via portable-pty.
+filedescriptor = "0.8.3"
 vt100 = "0.16.2"
 # Offline provider proof: wiremock serves the recorded Responses/SSE
 # fixtures on localhost; tokio supplies only the test runtime wiremock
 # needs — the product itself stays synchronous.
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
+# DEC-048 (EVID-478 §11 feature review): the `trace` feature only adds
+# rusqlite's additive `pub mod trace` (its `trace = []` gate at
+# rusqlite 0.40.2 lib.rs:150-151); the cfg(test) statement sink in
+# src/state.rs is its single consumer and an untraced connection
+# behaves identically. Resolver 3 keeps it out of non-test builds.
+rusqlite = { version = "0.40.2", features = ["bundled", "trace"] }
 wiremock = "0.6.5"
+tempfile = "3.27.0"

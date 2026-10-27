@@ -12,10 +12,9 @@
 mod support;
 
 use rivect::contracts::EffectClass;
-use rivect::executor::macos::FileIdentity;
+use rivect::executor::macos::WriteIdentity;
 use rivect::executor::{
-    DRY_RUN_REASON, Executor, ExecutorError, MODE_ASK_REASON, ReadObservation, ReadWorker,
-    WorkerError,
+    DRY_RUN_REASON, ExecutorError, MODE_ASK_REASON, ReadObservation, ReadWorker, WorkerError,
 };
 use rivect::policy::{AdmissionContext, ModeDecision, PermissionMode, Policy, preapproval_scope};
 use serde_json::json;
@@ -135,9 +134,9 @@ fn baseline_cell(mode: PermissionMode, fixture: Fixture) -> &'static str {
     }
 }
 
-fn fixture_dir(tag: &str) -> PathBuf {
-    let root = support::temp_dir(tag);
-    std::fs::create_dir_all(&root).expect("fixture dir");
+fn fixture_dir(tag: &str) -> tempfile::TempDir {
+    let root = tempfile::TempDir::with_prefix(format!("rivect-{tag}-")).expect("fixture root");
+    std::fs::create_dir_all(root.path()).expect("fixture dir");
     root
 }
 
@@ -156,7 +155,7 @@ fn observe(policy: &Policy, target: &Path, mode: PermissionMode, fixture: Fixtur
 #[test]
 fn baseline_matrix_matches_spec_table() {
     let root = fixture_dir("baseline-matrix");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let policy = Policy::default();
     for mode in PermissionMode::all() {
         for fixture in BASELINE {
@@ -175,7 +174,7 @@ fn baseline_matrix_matches_spec_table() {
 #[test]
 fn contrast_fixtures_distinguish_colliding_pairs() {
     let root = fixture_dir("contrast-pairs");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let policy = Policy::default();
     // F-write-nocheckpoint: Accept-edits asks where Auto/bounded still allows.
     assert_eq!(
@@ -234,7 +233,7 @@ fn contrast_fixtures_distinguish_colliding_pairs() {
 #[test]
 fn every_mode_pair_differs_on_baseline_or_contrast() {
     let root = fixture_dir("pair-distinguishability");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let policy = Policy::default();
     let modes = PermissionMode::all();
     for (index, left) in modes.iter().enumerate() {
@@ -276,7 +275,7 @@ fn yolo_is_not_the_default_mode() {
 #[test]
 fn explicit_deny_on_target_denies_all_24_cells() {
     let root = fixture_dir("deny-override");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     policy
         .enroll_deny(&target)
@@ -300,7 +299,7 @@ fn explicit_deny_on_target_denies_all_24_cells() {
 #[test]
 fn relative_spelling_of_enrolled_deny_fails_closed_in_every_mode() {
     let root = fixture_dir("deny-override-relative");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     policy
         .enroll_deny(&target)
@@ -363,7 +362,7 @@ fn enrolled_url_deny_matches_lexical_variants() {
 #[test]
 fn filesystem_shaped_egress_target_hits_enrolled_fs_deny() {
     let root = fixture_dir("egress-fs-shape");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     // Filesystem deny set only: no raw deny is enrolled, so an egress
     // target spelled as a filesystem shape must consult the canonical
@@ -498,7 +497,7 @@ fn identifier_deny_stays_byte_exact() {
 #[test]
 fn fs_only_enroll_leaves_url_egress_to_the_mode_matrix() {
     let root = fixture_dir("deny-fs-only");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     policy
         .enroll_deny(&target)
@@ -529,7 +528,7 @@ fn fs_only_enroll_leaves_url_egress_to_the_mode_matrix() {
 #[test]
 fn raw_only_enroll_leaves_fs_classes_to_the_mode_matrix() {
     let root = fixture_dir("deny-raw-only");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     policy.enroll_deny_target("https://evil.example/");
     for mode in PermissionMode::all() {
@@ -562,7 +561,7 @@ fn raw_only_enroll_leaves_fs_classes_to_the_mode_matrix() {
 #[test]
 fn file_url_scheme_spellings_hit_the_enrolled_fs_deny() {
     let root = fixture_dir("egress-file-scheme");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     policy
         .enroll_deny(&target)
@@ -688,7 +687,7 @@ fn schemeless_enrolled_deny_covers_schemeful_requests() {
 #[test]
 fn file_url_local_authorities_fold_into_the_enrolled_deny() {
     let root = fixture_dir("egress-file-authority");
-    let target = fixture_target(&root);
+    let target = fixture_target(root.path());
     let mut policy = Policy::default();
     // RFC 8089: the empty, localhost, and loopback authorities all
     // name the local host, so the enrolled empty-authority spelling
@@ -757,7 +756,7 @@ fn percent_encoded_egress_spellings_hit_the_enrolled_fs_deny() {
     // fails closed on the unobservable result.
     let root = fixture_dir("egress-nul-escape");
     for mode in PermissionMode::all() {
-        let spelling = format!("file://{}/a%00.txt", root.display());
+        let spelling = format!("file://{}/a%00.txt", root.path().display());
         assert_eq!(
             observe(&policy, Path::new(&spelling), mode, Fixture::Egress),
             "deny",
@@ -1977,7 +1976,7 @@ impl ReadWorker for CountingWorker {
         &mut self,
         _scope_root: &Path,
         _target: &Path,
-        _expected: FileIdentity,
+        _expected: WriteIdentity,
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         self.calls += 1;
@@ -2024,11 +2023,7 @@ fn dry_run_submissions_produce_zero_effects_in_every_mode() {
     for mode in PermissionMode::all() {
         for fixture in BASELINE {
             let decision = {
-                let mut executor = Executor::new(
-                    &mut world.runtime.policy,
-                    &mut world.runtime.owner.store,
-                    &mut worker,
-                );
+                let mut executor = world.runtime.executor_with_worker(&mut worker);
                 executor
                     .submit_preview(
                         &task,
@@ -2056,8 +2051,7 @@ fn dry_run_submissions_produce_zero_effects_in_every_mode() {
     // carrying the dry-run reason, not silently dropped.
     let attempts = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("preview ledger readable")
         .attempts
@@ -2070,8 +2064,7 @@ fn dry_run_submissions_produce_zero_effects_in_every_mode() {
     for attempt in &attempts {
         let (_, state, detail) = world
             .runtime
-            .owner
-            .store
+            .store()
             .attempt_record(&attempt.attempt_id.0)
             .expect("preview attempt readable")
             .expect("preview attempt exists");
@@ -2114,11 +2107,7 @@ fn egress_url_verdicts_reach_the_mode_matrix() {
     ];
     for (mode, within_declared_bounds, expected) in cells {
         let decision = {
-            let mut executor = Executor::new(
-                &mut world.runtime.policy,
-                &mut world.runtime.owner.store,
-                &mut worker,
-            );
+            let mut executor = world.runtime.executor_with_worker(&mut worker);
             executor
                 .submit_preview(
                     &task,
@@ -2140,14 +2129,10 @@ fn egress_url_verdicts_reach_the_mode_matrix() {
     assert_eq!(worker.calls, 0);
 
     // Deny-listed URL: the explicit raw-form deny overrides every mode.
-    world.runtime.policy.enroll_deny_target(url);
+    world.runtime.policy_writer().enroll_deny_target(url);
     for mode in PermissionMode::all() {
         let decision = {
-            let mut executor = Executor::new(
-                &mut world.runtime.policy,
-                &mut world.runtime.owner.store,
-                &mut worker,
-            );
+            let mut executor = world.runtime.executor_with_worker(&mut worker);
             executor
                 .submit_preview(
                     &task,
@@ -2184,8 +2169,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
     // namespaced key.
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .record_preapproval(
             &preapproval_scope(EffectClass::Write, grant_id, &scope)
                 .expect("utf-8 preapproval scope"),
@@ -2195,7 +2179,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
         .expect("record write preapproval");
 
     let mut egress_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Egress,
         grant_id,
@@ -2211,14 +2195,14 @@ fn preapproval_consent_is_scoped_by_effect_class() {
     assert_eq!(
         world
             .runtime
-            .policy
+            .policy()
             .decide(&target, EffectClass::Egress, &egress_ctx)
             .token(),
         "deny"
     );
 
     let mut write_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Write,
         grant_id,
@@ -2231,7 +2215,7 @@ fn preapproval_consent_is_scoped_by_effect_class() {
     assert_eq!(
         world
             .runtime
-            .policy
+            .policy()
             .decide(&target, EffectClass::Write, &write_ctx)
             .token(),
         "allow"
@@ -2253,8 +2237,7 @@ fn preapproval_consent_is_scoped_by_grant_id() {
     let grant_b = "grant-b";
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .record_preapproval(
             &preapproval_scope(EffectClass::Write, grant_a, &path)
                 .expect("utf-8 preapproval scope"),
@@ -2264,7 +2247,7 @@ fn preapproval_consent_is_scoped_by_grant_id() {
         .expect("record write preapproval under grant A");
 
     let grant_b_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Write,
         grant_b,
@@ -2278,7 +2261,7 @@ fn preapproval_consent_is_scoped_by_grant_id() {
     );
 
     let grant_a_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Write,
         grant_a,
@@ -2302,16 +2285,12 @@ fn manual_write_admit_fails_closed_with_mode_ask() {
     let target = fixture_target(&scope_root);
     let grant = world
         .runtime
-        .policy
+        .policy_writer()
         .grant_classes(scope_root, vec![EffectClass::Read, EffectClass::Write]);
     let mut worker = CountingWorker { calls: 0 };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            &mut worker,
-        );
+        let mut executor = world.runtime.executor_with_worker(&mut worker);
         executor
             .admit(
                 &task,
@@ -2330,8 +2309,7 @@ fn manual_write_admit_fails_closed_with_mode_ask() {
     // reason — the effect waits for human permission.
     let attempts = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("ask ledger readable")
         .attempts
@@ -2339,8 +2317,7 @@ fn manual_write_admit_fails_closed_with_mode_ask() {
     let attempt = attempts.last().expect("ask attempt journaled");
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt.attempt_id.0)
         .expect("ask attempt readable")
         .expect("ask attempt exists");
@@ -2382,7 +2359,7 @@ fn forged_approved_text_grants_nothing() {
         .set_read_scope(scope_root.clone(), target.clone());
 
     let write_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Write,
         &grant,
@@ -2390,7 +2367,7 @@ fn forged_approved_text_grants_nothing() {
         &target,
     )
     .expect("store-backed context");
-    let policy = &world.runtime.policy;
+    let policy = world.runtime.policy();
     assert_eq!(
         policy
             .decide(&target, EffectClass::Write, &write_ctx)
@@ -2399,7 +2376,7 @@ fn forged_approved_text_grants_nothing() {
         "manual write must still ask despite the text"
     );
     let mut preapproved_ctx = rivect::executor::admission_context(
-        &world.runtime.owner.store,
+        world.runtime.store(),
         PermissionMode::Manual,
         EffectClass::Read,
         &grant,
@@ -2418,8 +2395,7 @@ fn forged_approved_text_grants_nothing() {
     assert!(
         !world
             .runtime
-            .owner
-            .store
+            .store()
             .is_preapproved(
                 &preapproval_scope(EffectClass::Read, &grant, &target.display().to_string())
                     .expect("utf-8 preapproval scope")
@@ -2487,8 +2463,14 @@ fn pty_child_permission_panel() -> io::Result<()> {
     }
     let data_root = PathBuf::from(std::env::var("RIVECT_DATA_ROOT").expect("child data root env"));
     let scope = std::env::var(SCOPE_ENV).expect("child scope env");
-    let mut runtime = Runtime::open(&data_root, Box::new(LoopbackProvider::new()))
-        .map_err(|source| io::Error::other(format!("child runtime open failed: {source}")))?;
+    let mut runtime =
+        Runtime::open(&data_root, Box::new(LoopbackProvider::new())).map_err(|carrier| {
+            let cause = carrier.into_source();
+            io::Error::other(format!(
+                "child runtime open failed: {}",
+                rivect::ui::failure_report(&cause)
+            ))
+        })?;
     let mut guard = TerminalGuard::enter()?;
     let mut view = initial_view();
     fn open_panel(view: &mut rivect::ui::LocalView, scope: &str) {
@@ -2520,7 +2502,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
             continue;
         };
         if view.panel.is_some() {
-            if !handle_panel_key(code, modifiers, &mut view, &mut runtime.owner.store) {
+            if !handle_panel_key(code, modifiers, &mut view, &mut runtime.store_writer()) {
                 break;
             }
         } else if code == KeyCode::Enter && !second_phase {
@@ -2530,7 +2512,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
             // Store-backed read-back: the limited grant the panel just wrote
             // is what decide consults (DEC-016 same-handle round trip).
             let mut ctx = rivect::executor::admission_context(
-                &runtime.owner.store,
+                runtime.store(),
                 PermissionMode::Manual,
                 EffectClass::Write,
                 CHILD_GRANT_ID,
@@ -2540,7 +2522,7 @@ fn pty_child_permission_panel() -> io::Result<()> {
             .map_err(|source| io::Error::other(format!("context assembly failed: {source}")))?;
             ctx.mode = PermissionMode::PreapprovedOnly;
             let verdict = runtime
-                .policy
+                .policy()
                 .decide(Path::new(&scope), EffectClass::Write, &ctx);
             view.transcript
                 .push(format!("preapproved-only write: {}", verdict.token()));
@@ -2554,67 +2536,15 @@ fn pty_child_permission_panel() -> io::Result<()> {
     Ok(())
 }
 
-/// PTY child handle: mirrors the shared corpus harness but stays local so
-/// the spawn is fallible (NOT_RUN marker) and can carry the child marker and
-/// scope envs plus the `--exact` libtest args.
-struct ChildPty {
-    master: Box<dyn io::Write + Send>,
-    child: Box<dyn portable_pty::Child + Send>,
-    stream: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-}
-
-impl ChildPty {
-    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        use io::Write;
-        self.master.write_all(bytes)?;
-        self.master.flush()
-    }
-
-    fn collected(&self) -> Vec<u8> {
-        self.stream.lock().expect("pty lock").clone()
-    }
-
-    fn wait_for(&self, needle: &[u8], timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if support::find_subsequence(&self.collected(), needle).is_some() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        support::find_subsequence(&self.collected(), needle).is_some()
-    }
-
-    fn wait_exit(&mut self, timeout: Duration) -> Option<u32> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return Some(status.exit_code());
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        None
-    }
-}
-
 /// Spawns this test binary as the PTY child (`--exact` so only the harness
-/// test runs); fallible so the AC-090 gate can record an honest NOT_RUN
-/// marker instead of aborting on hosts without an allocatable pty.
-fn spawn_panel_child(data_root: &Path, scope: &str) -> io::Result<ChildPty> {
-    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+/// test runs) on a session that owns `root`; fallible so the AC-090 gate
+/// can record an honest NOT_RUN marker instead of aborting on hosts
+/// without an allocatable pty.
+fn spawn_panel_child(root: tempfile::TempDir, scope: &str) -> io::Result<support::PtySession> {
     let exe = std::env::current_exe()?;
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: PTY_ROWS,
-            cols: PTY_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|source| io::Error::other(format!("pty open failed: {source}")))?;
-    let mut command = CommandBuilder::new(exe);
-    command.env("RIVECT_DATA_ROOT", data_root);
+    let data_root = root.path().to_path_buf();
+    let mut command = support::pty_command(exe);
+    command.env("RIVECT_DATA_ROOT", &data_root);
     command.env(CHILD_ENV, "1");
     command.env(SCOPE_ENV, scope);
     command.arg("--ignored");
@@ -2622,50 +2552,19 @@ fn spawn_panel_child(data_root: &Path, scope: &str) -> io::Result<ChildPty> {
     command.arg("pty_child_permission_panel");
     command.arg("--test-threads=1");
     command.arg("--nocapture");
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|source| io::Error::other(format!("pty child spawn failed: {source}")))?;
-    let master = pair
-        .master
-        .take_writer()
-        .map_err(|source| io::Error::other(format!("pty writer failed: {source}")))?;
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|source| io::Error::other(format!("pty reader failed: {source}")))?;
-    let stream = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = stream.clone();
-    // A continuous drain keeps the child's render loop from filling the pty
-    // buffer while the test is between reads (shared-corpus harness pattern).
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => sink
-                    .lock()
-                    .expect("pty lock")
-                    .extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
-    Ok(ChildPty {
-        master,
-        child,
-        stream,
-    })
+    support::PtySession::spawn(command, PTY_ROWS, PTY_COLS, root, data_root)
+        .map_err(io::Error::other)
 }
 
 struct Screen {
-    session: ChildPty,
+    session: support::PtySession,
     parser: vt100::Parser,
     consumed: usize,
 }
 
 impl Screen {
     fn text(&mut self) -> String {
-        let bytes = self.session.collected();
+        let bytes = self.session.collected().expect("pty read");
         if bytes.len() > self.consumed {
             self.parser.process(&bytes[self.consumed..]);
             self.consumed = bytes.len();
@@ -2710,13 +2609,14 @@ impl Screen {
 
 #[test]
 fn ac090_panel_default_focus_and_unsolicited_enter_never_grant() {
-    let data_root = support::temp_dir("permission-panel-pty");
+    let root = tempfile::TempDir::with_prefix("rivect-permission-panel-pty-").expect("panel root");
+    let data_root = root.path().to_path_buf();
     std::fs::create_dir_all(data_root.join("runtime")).expect("data root runtime dir");
     let scope = format!(
         "{}/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
         data_root.display()
     );
-    let child = match spawn_panel_child(&data_root, &scope) {
+    let child = match spawn_panel_child(root, &scope) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("NOT_RUN(AC-090): pty unavailable on this host: {error:?}");
@@ -2812,11 +2712,16 @@ fn ac090_panel_default_focus_and_unsolicited_enter_never_grant() {
     assert!(
         screen
             .session
-            .wait_for(b"\x1b[?1049l", Duration::from_secs(10)),
+            .wait_for(b"\x1b[?1049l", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be left on exit"
     );
-    let code = screen.session.wait_exit(Duration::from_secs(10));
+    let code = screen
+        .session
+        .wait_exit(Duration::from_secs(10))
+        .expect("pty wait");
     assert_eq!(code, Some(0), "child must exit cleanly");
+    screen.session.finish().expect("pty teardown");
 }
 
 /// AC-090/F-UX-2: the panel is a three-region widget — pinned header,
@@ -2826,14 +2731,16 @@ fn ac090_panel_default_focus_and_unsolicited_enter_never_grant() {
 /// stay on screen.
 #[test]
 fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
-    let data_root = support::temp_dir("permission-panel-scroll");
+    let root =
+        tempfile::TempDir::with_prefix("rivect-permission-panel-scroll-").expect("panel root");
+    let data_root = root.path().to_path_buf();
     std::fs::create_dir_all(data_root.join("runtime")).expect("data root runtime dir");
     let long_segment = "scope-segment-with-a-deliberately-long-name-".repeat(14);
     let scope = format!(
         "{}/workflow-scope/{long_segment}tail-marker-end",
         data_root.display()
     );
-    let child = match spawn_panel_child(&data_root, &scope) {
+    let child = match spawn_panel_child(root, &scope) {
         Ok(child) => child,
         Err(error) => {
             eprintln!("NOT_RUN(AC-090): pty unavailable on this host: {error:?}");
@@ -2900,10 +2807,18 @@ fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
     assert!(
         screen
             .session
-            .wait_for(b"\x1b[?1049l", Duration::from_secs(10)),
+            .wait_for(b"\x1b[?1049l", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be left on exit"
     );
-    assert_eq!(screen.session.wait_exit(Duration::from_secs(10)), Some(0));
+    assert_eq!(
+        screen
+            .session
+            .wait_exit(Duration::from_secs(10))
+            .expect("pty wait"),
+        Some(0)
+    );
+    screen.session.finish().expect("pty teardown");
 }
 
 /// F-UX-4: a limited-grant recording that fails on the store resolves
@@ -2911,8 +2826,8 @@ fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
 /// and focus returns to the non-destructive action.
 #[test]
 fn limited_grant_store_failure_keeps_the_panel_on_deny() {
-    let root = support::temp_dir("panel-grant-failure");
-    let db = root.join("rivect.db");
+    let root = tempfile::TempDir::with_prefix("rivect-panel-grant-failure-").expect("fixture root");
+    let db = root.path().join("rivect.db");
     let mut store = TaskStore::open(&db).expect("open store");
     // Hold the single write slot with a second connection: the next
     // preapproval insert loses it immediately (default busy timeout 0),
@@ -2936,14 +2851,19 @@ fn limited_grant_store_failure_keeps_the_panel_on_deny() {
         KeyCode::Left,
         KeyModifiers::NONE,
         &mut view,
-        &mut store
+        &mut store.writer()
     ));
     assert_eq!(
         view.panel.as_ref().map(PermissionPanel::confirm),
         Some(PanelAction::LimitedGrant)
     );
 
-    let keep_running = handle_panel_key(KeyCode::Enter, KeyModifiers::NONE, &mut view, &mut store);
+    let keep_running = handle_panel_key(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+        &mut view,
+        &mut store.writer(),
+    );
     assert!(keep_running, "a failed recording must not cancel the TUI");
     let panel = view
         .panel
@@ -2967,8 +2887,9 @@ fn limited_grant_store_failure_keeps_the_panel_on_deny() {
 /// grant-id error, not a scope-unicode miss.
 #[test]
 fn limited_grant_invalid_grant_id_keeps_the_panel_on_deny() {
-    let root = support::temp_dir("panel-grant-id-charset");
-    let db = root.join("rivect.db");
+    let root =
+        tempfile::TempDir::with_prefix("rivect-panel-grant-id-charset-").expect("fixture root");
+    let db = root.path().join("rivect.db");
     let mut store = TaskStore::open(&db).expect("open store");
 
     let mut view = initial_view();
@@ -2984,14 +2905,19 @@ fn limited_grant_invalid_grant_id_keeps_the_panel_on_deny() {
         KeyCode::Left,
         KeyModifiers::NONE,
         &mut view,
-        &mut store
+        &mut store.writer()
     ));
     assert_eq!(
         view.panel.as_ref().map(PermissionPanel::confirm),
         Some(PanelAction::LimitedGrant)
     );
 
-    let keep_running = handle_panel_key(KeyCode::Enter, KeyModifiers::NONE, &mut view, &mut store);
+    let keep_running = handle_panel_key(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+        &mut view,
+        &mut store.writer(),
+    );
     assert!(keep_running, "a failed recording must not cancel the TUI");
     let panel = view
         .panel

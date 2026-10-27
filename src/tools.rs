@@ -11,18 +11,24 @@ use std::path::PathBuf;
 pub enum LocalKind {
     ConfigSet,
     ConfigUnset,
+    DecisionsControl,
+    ProjectInit,
     PlannedUnimplemented,
     Unknown,
 }
 
 const BUSY_READ: &str = "READ";
 const BUSY_WRITE: &str = "WRITE";
+const BUSY_READ_CONFIG: &str = "READ/CONFIG";
+const BUSY_READ_INDEX: &str = "READ/INDEX";
 const BUSY_UNAVAILABLE: &str = "UNAVAILABLE";
 const READ_FILE_DESCRIPTION: &str = "One admitted file read in the current scope.";
 const CONFIG_SET_DESCRIPTION: &str =
     "Set one config key through the shared schema and journaled publication.";
 const CONFIG_UNSET_DESCRIPTION: &str =
     "Remove one config override through the shared schema and journaled publication.";
+const DECISIONS_CONTROL_DESCRIPTION: &str = "Inspect or switch the decision mode (ask, auto, inherit); mutations ride the journaled config publication.";
+const PROJECT_INIT_DESCRIPTION: &str = "Build or repair the project index generation for the pinned project root; the parse runs in the capped index worker, never in-process.";
 const PLANNED_COMMAND_DESCRIPTION: &str = "A planned command in this catalog.";
 const UNAVAILABLE_REASON: &str = "known command without a handler in this build";
 
@@ -46,7 +52,6 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
     "effort.view",
     "workflow.control",
     "harness.control",
-    "decisions.control",
     "docs.status",
     "view.clear",
     "config.list",
@@ -55,15 +60,26 @@ const PLANNED_LOCAL_KINDS: &[&str] = &[
     "config.explain",
     "config.validate",
     "config.export",
-    "project.init",
     "doctor",
     "ui.render",
 ];
+
+/// The kinds this build lists as known commands without a handler. The
+/// one set the descriptor page is built from, so a parity check reads
+/// the real list instead of re-spelling it: promoting a kind removes it
+/// here, and every consumer of the page follows in the same commit.
+pub fn planned_local_kinds() -> &'static [&'static str] {
+    PLANNED_LOCAL_KINDS
+}
 
 pub fn local_command_kind(kind: &str) -> LocalKind {
     match kind {
         "config.set" => LocalKind::ConfigSet,
         "config.unset" => LocalKind::ConfigUnset,
+        // The descriptor advertises "decisions" as the alias — it must
+        // resolve here, not only in the describe listing.
+        "decisions.control" | "decisions" => LocalKind::DecisionsControl,
+        "project.init" => LocalKind::ProjectInit,
         _ if PLANNED_LOCAL_KINDS.contains(&kind) => LocalKind::PlannedUnimplemented,
         _ => LocalKind::Unknown,
     }
@@ -108,6 +124,20 @@ pub fn describe() -> Page<CommandDescriptor> {
             CONFIG_UNSET_DESCRIPTION,
             true,
             BUSY_WRITE,
+        ),
+        descriptor(
+            "decisions.control",
+            &["decisions"],
+            DECISIONS_CONTROL_DESCRIPTION,
+            true,
+            BUSY_READ_CONFIG,
+        ),
+        descriptor(
+            "project.init",
+            &[],
+            PROJECT_INIT_DESCRIPTION,
+            true,
+            BUSY_READ_INDEX,
         ),
     ];
     for kind in PLANNED_LOCAL_KINDS {

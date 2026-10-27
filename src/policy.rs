@@ -2,12 +2,14 @@
 //! Revocation takes effect before the next dispatch, without restart.
 
 use crate::contracts::EffectClass;
+use crate::state::TaskStore;
 use focaccia::CaseFold;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Weak};
 use unicode_normalization::UnicodeNormalization;
 
 /// Canonical permission modes (ids pinned by DEC-014). The default of a new
@@ -143,12 +145,75 @@ struct DenyRule {
     identity: CanonicalPath,
 }
 
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CheckIssuerError {
+    #[error("the admission belongs to another policy")]
+    ForeignAdmission,
+    #[error("the admission is spent")]
+    SpentAdmission,
+    #[error("the admission has already claimed its dispatch")]
+    ClaimedAdmission,
+    #[error("the admission already holds a dependency pair")]
+    AlreadyIssued,
+    #[error("the owning admission has ended")]
+    OwnerEnded,
+    #[error("the dependency receipt is not registered here")]
+    UnknownReceipt,
+    #[error("the bound cargo home does not resolve canonical registry roots")]
+    RootUnresolved,
+    #[error("the admission's owning context is stale: {detail}")]
+    StaleAdmission { detail: String },
+}
+
+/// One private check entry of the DEC-048 issuer: the immutable public
+/// [`Grant`] wrapped with the opaque allocation identity of the single
+/// admission it was issued for. The weak link refuses at lookup once
+/// the owning admission is dropped, without a second registry.
+#[derive(Debug)]
+struct CheckEntry {
+    grant: Grant,
+    allocation: Weak<()>,
+}
+
+/// Which half of a check pair a test mutation addresses.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckRootHalf {
+    Cache,
+    Index,
+}
+
+/// The opaque DEC-042 dependency receipt (DEC-048 item 2): the only
+/// proof a confined check may reconsult its cache/index Read pair
+/// with. The fields are private and creation belongs to
+/// [`Policy::issue_check_dependencies`]; one receipt covers exactly one
+/// pair issued for one pending admission.
+pub struct DependencyReceipt {
+    pub(crate) cache_grant_id: String,
+    pub(crate) index_grant_id: String,
+    pub(crate) attempt_id: String,
+    allocation: Arc<()>,
+}
+
+impl std::fmt::Debug for DependencyReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No grant id, root, or allocation identity leaks through Debug.
+        f.debug_struct("DependencyReceipt").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Policy {
     grants: BTreeMap<String, Grant>,
     denies: Vec<DenyRule>,
     raw_denies: Vec<String>,
     next: u64,
+    /// The DEC-048 check entries: invisible to generic admission, keyed
+    /// apart from [`Policy::grants`] so a check-only id can never admit
+    /// a generic Read.
+    check_entries: BTreeMap<String, CheckEntry>,
+    /// Unforgeable instance identity admissions bind to (DEC-048 п.1).
+    identity: Arc<()>,
 }
 
 impl Policy {
@@ -277,6 +342,257 @@ impl Policy {
             });
         }
         Ok(grant)
+    }
+
+    /// The instance identity check admissions bind to (DEC-048 item 1):
+    /// token equality, never a public string.
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
+    /// DEC-048 item 2: issues the one cache/index Read pair of a
+    /// pending admission. Both roots derive from the admission's
+    /// immutable binding — the canonical `registry/cache` and
+    /// `registry/index` under its bound cargo home — never from
+    /// caller-chosen authority. The entries are invisible to generic
+    /// admission; the opaque receipt is the only reconsult proof. A
+    /// foreign, stale, claimed, spent, or already-issued admission
+    /// refuses, and a partial issuance revokes only its own half.
+    ///
+    /// # Errors
+    /// Returns [`CheckIssuerError`] naming the refusal; the admission
+    /// and its allocation are untouched on refusal.
+    pub fn issue_check_dependencies(
+        &mut self,
+        store: &TaskStore,
+        admission: &mut crate::executor::CheckAdmission,
+    ) -> Result<(), CheckIssuerError> {
+        if !Arc::ptr_eq(self.identity(), admission.policy_identity())
+            || !Arc::ptr_eq(store.identity(), admission.store_identity())
+        {
+            return Err(CheckIssuerError::ForeignAdmission);
+        }
+        if !admission.is_pending() {
+            return Err(if admission.is_spent() {
+                CheckIssuerError::SpentAdmission
+            } else {
+                CheckIssuerError::ClaimedAdmission
+            });
+        }
+        if admission.receipt().is_some() {
+            return Err(CheckIssuerError::AlreadyIssued);
+        }
+        Self::reconsult_admission_context(store, admission)?;
+        let cargo_home = admission
+            .bound_cargo_home()
+            .canonicalize()
+            .map_err(|_unresolved| CheckIssuerError::RootUnresolved)?;
+        let allocation = admission.allocation();
+        let attempt_id = admission.attempt_id().to_string();
+        let mut issued: Vec<String> = Vec::new();
+        for (label, root) in [
+            ("cache", cargo_home.join("registry/cache")),
+            ("index", cargo_home.join("registry/index")),
+        ] {
+            self.next += 1;
+            let grant_id = format!("check-{}-{}", label, self.next);
+            self.check_entries.insert(
+                grant_id.clone(),
+                CheckEntry {
+                    grant: Grant {
+                        grant_id: grant_id.clone(),
+                        scope_root: root,
+                        classes: vec![EffectClass::Read],
+                        revoked: false,
+                    },
+                    allocation: Arc::downgrade(allocation),
+                },
+            );
+            issued.push(grant_id);
+        }
+        let [cache_grant_id, index_grant_id] = [issued[0].clone(), issued[1].clone()];
+        self.sweep_dead_check_entries();
+        admission.set_receipt(DependencyReceipt {
+            cache_grant_id,
+            index_grant_id,
+            attempt_id,
+            allocation: Arc::clone(allocation),
+        });
+        Ok(())
+    }
+
+    /// The live owner/store reconsult before either half is minted
+    /// (DEC-048 item 2): a cancelled task, a Native selection that moved
+    /// since the mint, or a stale Custom off-context refuses here — the
+    /// issuer never defers staleness to a later claim — and an
+    /// unreadable context fails closed with zero new entries.
+    fn reconsult_admission_context(
+        store: &TaskStore,
+        admission: &crate::executor::CheckAdmission,
+    ) -> Result<(), CheckIssuerError> {
+        let stale = |detail: String| CheckIssuerError::StaleAdmission { detail };
+        if store
+            .task_cancelled(admission.bound_task_id())
+            .map_err(|source| {
+                stale(format!(
+                    "the task cancellation state is unreadable: {source}"
+                ))
+            })?
+        {
+            return Err(stale("the task is cancelled".to_string()));
+        }
+        match admission.context() {
+            crate::executor::CheckContext::Native {
+                selection_revision,
+                facts_digest,
+                request_kind,
+                ..
+            } => match store.plan_selection(admission.bound_task_id()) {
+                Ok(Some(record))
+                    if record.revision == *selection_revision
+                        && record.facts_digest == *facts_digest
+                        && record.request_kind == *request_kind => {}
+                Ok(_) => {
+                    return Err(stale(
+                        "the recorded selection moved after the admission minted".to_string(),
+                    ));
+                }
+                Err(source) => {
+                    return Err(stale(format!("the task selection is unreadable: {source}")));
+                }
+            },
+            crate::executor::CheckContext::Custom { .. } => {}
+        }
+        // DEC-054: both variants bind the config owner's generation,
+        // mode, and sources digest — the issuer never defers a moved
+        // owner context to a later claim.
+        let (state, generation, sources_digest, explicit_off) = admission.owner_view();
+        if let Err(error) =
+            crate::executor::verify_owner_context(state, generation, sources_digest, explicit_off)
+        {
+            return Err(stale(format!("the owner context moved: {}", error.cause())));
+        }
+        Ok(())
+    }
+
+    /// DEC-048 item 7: the pre-claim release. When the admission
+    /// belongs to this policy and its issuing store is the presenting
+    /// one, every entry of its own allocation is revoked and removed —
+    /// even when its own receipt or binding failed validation — the
+    /// phase becomes Spent, and no other allocation, ordinary grant, or
+    /// pending state is touched. A foreign policy/store presentation
+    /// disposes nothing: the issuing pair's allocation survives it.
+    pub fn release_check_dependencies(
+        &mut self,
+        store: &TaskStore,
+        admission: &mut crate::executor::CheckAdmission,
+    ) {
+        if !Arc::ptr_eq(self.identity(), admission.policy_identity())
+            || !Arc::ptr_eq(store.identity(), admission.store_identity())
+        {
+            return;
+        }
+        self.consume_allocation(admission);
+        admission.mark_spent();
+    }
+
+    /// DEC-048 item 5: the post-claim consume of the owning dispatch —
+    /// the same direct revoke and removal, with the phase left Claimed
+    /// so a re-presentation refuses at the claim as a replay.
+    pub fn consume_check_pair(&mut self, admission: &mut crate::executor::CheckAdmission) {
+        self.consume_allocation(admission);
+    }
+
+    /// Removes this admission's allocation's entries when the admission
+    /// is owned here; a foreign admission's entries are never touched.
+    fn consume_allocation(&mut self, admission: &crate::executor::CheckAdmission) {
+        if !Arc::ptr_eq(self.identity(), admission.policy_identity()) {
+            return;
+        }
+        let allocation = Arc::downgrade(admission.allocation());
+        self.check_entries
+            .retain(|_, entry| !Weak::ptr_eq(&entry.allocation, &allocation));
+    }
+
+    /// Drops entries whose owning admission ended without a release:
+    /// the drop/unwind backstop of DEC-048 item 7, swept at the next
+    /// check-entry operation.
+    fn sweep_dead_check_entries(&mut self) {
+        self.check_entries
+            .retain(|_, entry| entry.allocation.strong_count() > 0);
+    }
+
+    /// Test-only mutation of one live entry's bound root. The aliased
+    /// and wide-root construction legs predate the opaque receipt: the
+    /// shipped API can no longer express an arbitrary-root pair, so the
+    /// inline executor tests mutate the issued entry here and assert
+    /// the refusal at the consumer-visible reconsult seam.
+    #[cfg(test)]
+    pub(crate) fn rebind_check_root_for_test(
+        &mut self,
+        receipt: &DependencyReceipt,
+        half: CheckRootHalf,
+        root: PathBuf,
+    ) {
+        let grant_id = match half {
+            CheckRootHalf::Cache => &receipt.cache_grant_id,
+            CheckRootHalf::Index => &receipt.index_grant_id,
+        };
+        if let Some(entry) = self.check_entries.get_mut(grant_id) {
+            entry.grant.scope_root = root;
+        }
+    }
+
+    /// Test-only revocation of exactly one half of a live pair: the
+    /// per-member revocation discriminator the opaque receipt made
+    /// inexpressible through the public grant map.
+    #[cfg(test)]
+    pub(crate) fn revoke_check_half_for_test(
+        &mut self,
+        receipt: &DependencyReceipt,
+        half: CheckRootHalf,
+    ) {
+        let grant_id = match half {
+            CheckRootHalf::Cache => &receipt.cache_grant_id,
+            CheckRootHalf::Index => &receipt.index_grant_id,
+        };
+        if let Some(entry) = self.check_entries.get_mut(grant_id) {
+            entry.grant.revoked = true;
+        }
+    }
+
+    /// The check reconsult: both entries of the receipt's pair are
+    /// alive, unrevoked Read grants of the same allocation, and the
+    /// owning admission has not been dropped.
+    ///
+    /// # Errors
+    /// Returns [`CheckIssuerError`] when the receipt is foreign, its
+    /// allocation ended, or either entry is gone.
+    pub(crate) fn reconsult_check_pair(
+        &self,
+        receipt: &DependencyReceipt,
+    ) -> Result<(&Grant, &Grant), CheckIssuerError> {
+        if Arc::strong_count(&receipt.allocation) == 0 {
+            return Err(CheckIssuerError::OwnerEnded);
+        }
+        let cache = self
+            .check_entries
+            .get(&receipt.cache_grant_id)
+            .ok_or(CheckIssuerError::UnknownReceipt)?;
+        let index = self
+            .check_entries
+            .get(&receipt.index_grant_id)
+            .ok_or(CheckIssuerError::UnknownReceipt)?;
+        let allocation = Arc::downgrade(&receipt.allocation);
+        if !Weak::ptr_eq(&cache.allocation, &allocation)
+            || !Weak::ptr_eq(&index.allocation, &allocation)
+        {
+            return Err(CheckIssuerError::UnknownReceipt);
+        }
+        if cache.grant.revoked || index.grant.revoked {
+            return Err(CheckIssuerError::OwnerEnded);
+        }
+        Ok((&cache.grant, &index.grant))
     }
 
     /// Mode verdict for one request against the DEC-014 matrix (AC-089).
@@ -1264,5 +1580,356 @@ fn covers_identity(denied: &CanonicalPath, request: &CanonicalPath) -> bool {
         request.components.len() > denied.components.len()
     } else {
         true
+    }
+}
+
+/// The DEC-048 inline owner check: the pair is bound to its one
+/// admission allocation, single-use, and invisible to generic grants.
+#[cfg(test)]
+mod tests {
+    use super::CheckIssuerError;
+    use crate::contracts::EffectClass;
+    use crate::executor::{CheckAdmission, ConfinedCheck, Executor};
+    use crate::state::{PlanSelectionWrite, RequestKind, TaskStore};
+    use std::path::{Path, PathBuf};
+
+    struct NoWorker;
+
+    impl crate::executor::ReadWorker for NoWorker {
+        fn read_once(
+            &mut self,
+            _scope_root: &Path,
+            _target: &Path,
+        ) -> Result<crate::executor::ReadObservation, crate::executor::WorkerError> {
+            Err(crate::executor::WorkerError::SandboxUnavailable {
+                reason: "the issuer tests never read".to_string(),
+            })
+        }
+    }
+
+    /// One temp store root shared by the fixture's admissions.
+    fn issuer_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("policy-issuer-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("home/registry/cache")).expect("cache root");
+        std::fs::create_dir_all(root.join("home/registry/index")).expect("index root");
+        root
+    }
+
+    /// Mints one admission through the sanctioned issuer path — the
+    /// only construction — over the given policy and store, returning
+    /// its bound task for later store mutations.
+    fn mint_on(
+        policy: &mut super::Policy,
+        store: &mut TaskStore,
+        root: &Path,
+        tag: &str,
+    ) -> (CheckAdmission, crate::contracts::TaskId) {
+        let (session, _, _, _) = store
+            .open_session(&format!("session-{tag}"), &format!("conn-{tag}"), None)
+            .expect("session");
+        let task = store
+            .create_task(
+                &session,
+                &format!("command-{tag}"),
+                "unit",
+                "issuer goal",
+                (&[], &[]),
+            )
+            .expect("task")
+            .task_id;
+        let record = store
+            .record_plan_selection(
+                &session,
+                &task,
+                &PlanSelectionWrite {
+                    facts_digest: "issuer-facts",
+                    request_kind: RequestKind::PlanOnly,
+                    rows: &[],
+                },
+            )
+            .expect("selection");
+        let cargo = PathBuf::from("/nonexistent/cargo");
+        let exec_grant = policy.grant_classes(
+            cargo.parent().expect("toolchain dir").to_path_buf(),
+            vec![EffectClass::Exec],
+        );
+        let project_grant_id = policy.grant_read(PathBuf::from("/nonexistent/project"));
+        let check = ConfinedCheck {
+            task_id: task.clone(),
+            expected_selection_revision: record.revision,
+            project_grant_id,
+            project_root: PathBuf::from("/nonexistent/project"),
+            manifest_rel: PathBuf::from("Cargo.toml"),
+            cargo: cargo.clone(),
+            cargo_home: root.join("home"),
+            target: crate::executor::CheckTarget::Integration("check".to_string()),
+            harness_threads: 1,
+            exact_test: "green_passes".to_string(),
+            expected_phase: "candidate-review".to_string(),
+            expected_assertion_identity: "green_passes".to_string(),
+            expected_candidate_digest: "digest".to_string(),
+        };
+        let owner_state = std::sync::Arc::new(crate::executor::WorkflowOffState::new(
+            &crate::config::resolve_effective(None)
+                .unwrap_or_else(|error| unreachable!("default effective config: {error:?}")),
+        ));
+        let handoff = crate::executor::CheckHandoff::from_owner(
+            &owner_state,
+            &task,
+            std::sync::Arc::clone(policy.identity()),
+            std::sync::Arc::clone(store.identity()),
+        );
+        let mut worker = NoWorker;
+        let mut executor = Executor::new(policy, store, &mut worker);
+        let admission = executor
+            .admit_check(
+                &task,
+                crate::executor::EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo,
+                },
+                super::PermissionMode::Yolo,
+                &check,
+                &handoff,
+            )
+            .expect("the admission mints");
+        (admission, task)
+    }
+
+    #[test]
+    fn check_issuer_policy_pair_is_bound_and_single_use() {
+        let root = issuer_root("bound");
+        let mut store = TaskStore::open(&root.join("state.db")).expect("store");
+        let mut policy = super::Policy::default();
+
+        // One issued pair per pending admission; a second issue refuses.
+        let (mut admission_a, _task_a) = mint_on(&mut policy, &mut store, &root, "a");
+        policy
+            .issue_check_dependencies(&store, &mut admission_a)
+            .expect("the first pair issues");
+        assert!(matches!(
+            policy.issue_check_dependencies(&store, &mut admission_a),
+            Err(CheckIssuerError::AlreadyIssued)
+        ));
+        assert_eq!(policy.check_entries.len(), 2, "exactly one pair lives");
+
+        // The issuer reconsults the live owner/store before either
+        // half: a moved selection or a cancelled task refuses with zero
+        // new entries.
+        {
+            let (mut moved, moved_task) = mint_on(&mut policy, &mut store, &root, "moved");
+            let (session, _, _, _) = store
+                .open_session("session-moved", "conn-moved", None)
+                .expect("session");
+            store
+                .record_plan_selection(
+                    &session,
+                    &moved_task,
+                    &PlanSelectionWrite {
+                        facts_digest: "moved-facts",
+                        request_kind: RequestKind::PlanOnly,
+                        rows: &[],
+                    },
+                )
+                .expect("the moved selection records");
+            assert!(matches!(
+                policy.issue_check_dependencies(&store, &mut moved),
+                Err(CheckIssuerError::StaleAdmission { .. })
+            ));
+            assert_eq!(
+                policy.check_entries.len(),
+                2,
+                "a stale issue mints no entry"
+            );
+        }
+        {
+            let (mut cancelled, cancelled_task) =
+                mint_on(&mut policy, &mut store, &root, "cancelled");
+            let (session, _, _, _) = store
+                .open_session("session-cancelled", "conn-cancelled", None)
+                .expect("session");
+            let intent_revision = store
+                .snapshot(&cancelled_task)
+                .expect("snapshot")
+                .intent_revision;
+            store
+                .cancel_task(
+                    &session,
+                    &cancelled_task,
+                    intent_revision,
+                    Some("issuer reconsult fixture"),
+                )
+                .expect("the task cancels");
+            match policy.issue_check_dependencies(&store, &mut cancelled) {
+                Err(CheckIssuerError::StaleAdmission { detail }) => assert!(
+                    detail.contains("cancelled"),
+                    "the refusal names the cancelled task: {detail}"
+                ),
+                other => unreachable!("a cancelled task must refuse the issue, got {other:?}"),
+            }
+            assert_eq!(
+                policy.check_entries.len(),
+                2,
+                "a cancelled issue mints no entry"
+            );
+        }
+
+        // A second allocation on the same policy is never touched by
+        // A's exits.
+        let (mut admission_b, _task_b) = mint_on(&mut policy, &mut store, &root, "b");
+        policy
+            .issue_check_dependencies(&store, &mut admission_b)
+            .expect("the second pair issues");
+        assert_eq!(policy.check_entries.len(), 4);
+
+        // A same-policy/foreign-store presentation holds no issuer
+        // authority: the real holder's pair survives it untouched.
+        {
+            let peer_root = issuer_root("peer");
+            let peer_store = TaskStore::open(&peer_root.join("state.db")).expect("peer store");
+            assert!(matches!(
+                policy.issue_check_dependencies(&peer_store, &mut admission_b),
+                Err(CheckIssuerError::ForeignAdmission)
+            ));
+            assert_eq!(
+                policy.check_entries.len(),
+                4,
+                "the foreign-store issue mints nothing"
+            );
+            policy.release_check_dependencies(&peer_store, &mut admission_b);
+            assert_eq!(
+                policy.check_entries.len(),
+                4,
+                "the foreign-store release disposes nothing"
+            );
+            assert_eq!(
+                admission_b.phase(),
+                crate::executor::CheckPhase::Pending,
+                "the foreign-store release never spends the holder"
+            );
+            drop(std::fs::remove_dir_all(&peer_root));
+        }
+
+        // Guard disposal removes exactly A's own allocation — even when
+        // A's own receipt can no longer validate (its entries are gone).
+        policy.consume_check_pair(&mut admission_a);
+        assert_eq!(
+            policy.check_entries.len(),
+            2,
+            "only B's pair survives the guard disposal"
+        );
+
+        // A foreign policy's release disposes nothing here: B's entries
+        // belong to this policy, and a foreign admission's entries are
+        // never touched.
+        let foreign_root = issuer_root("foreign");
+        let mut foreign_store = TaskStore::open(&foreign_root.join("state.db")).expect("store");
+        let mut foreign_policy = super::Policy::default();
+        let (mut foreign_admission, _foreign_task) = mint_on(
+            &mut foreign_policy,
+            &mut foreign_store,
+            &foreign_root,
+            "foreign",
+        );
+        foreign_policy
+            .issue_check_dependencies(&foreign_store, &mut foreign_admission)
+            .expect("the foreign pair issues");
+        policy.release_check_dependencies(&foreign_store, &mut foreign_admission);
+        assert_eq!(
+            foreign_policy.check_entries.len(),
+            2,
+            "a foreign admission's release disposes nothing in its own policy"
+        );
+        assert_eq!(
+            foreign_admission.phase(),
+            crate::executor::CheckPhase::Pending
+        );
+
+        // Release marks its own admission Spent and removes its entries;
+        // the other allocation survives intact.
+        policy.release_check_dependencies(&store, &mut admission_b);
+        assert_eq!(admission_b.phase(), crate::executor::CheckPhase::Spent);
+        assert!(policy.check_entries.is_empty());
+        // A re-presented spent admission refuses at the issuer.
+        assert!(matches!(
+            policy.issue_check_dependencies(&store, &mut admission_b),
+            Err(CheckIssuerError::SpentAdmission)
+        ));
+
+        // A dropped admission ends its allocation: the entries die with
+        // it and the next check-entry operation sweeps them.
+        let (mut admission_c, _task_c) = mint_on(&mut policy, &mut store, &root, "c");
+        policy
+            .issue_check_dependencies(&store, &mut admission_c)
+            .expect("the dropped admission's pair issues");
+        drop(admission_c);
+        assert!(
+            policy
+                .check_entries
+                .values()
+                .all(|entry| entry.allocation.strong_count() == 0),
+            "the dropped allocation's entries refuse at lookup"
+        );
+        let (mut admission_d, _task_d) = mint_on(&mut policy, &mut store, &root, "d");
+        policy
+            .issue_check_dependencies(&store, &mut admission_d)
+            .expect("the sweeping issue succeeds");
+        assert_eq!(
+            policy.check_entries.len(),
+            2,
+            "the dead entries were swept by the next check-entry operation"
+        );
+        policy.release_check_dependencies(&store, &mut admission_d);
+
+        // N repeated refusals leave zero live entries.
+        for round in 0..3 {
+            let (mut admission, _task_n) =
+                mint_on(&mut policy, &mut store, &root, &format!("n{round}"));
+            policy
+                .issue_check_dependencies(&store, &mut admission)
+                .expect("the round's pair issues");
+            policy.release_check_dependencies(&store, &mut admission);
+        }
+        assert!(
+            policy.check_entries.is_empty(),
+            "three refusal rounds leave zero live check entries"
+        );
+
+        // The issuer's own operations never touch an ordinary grant:
+        // snapshot after the mint (which legitimately adds grants) and
+        // compare across a full issue/release cycle.
+        let (mut admission_e, _task_e) = mint_on(&mut policy, &mut store, &root, "e");
+        let ordinary_before = policy.grants.clone();
+        policy
+            .issue_check_dependencies(&store, &mut admission_e)
+            .expect("the final pair issues");
+        // A check-only id never admits a generic Read: the pair stays
+        // invisible to the ordinary grant map (DEC-048 item 2).
+        if let Some(receipt) = admission_e.receipt() {
+            assert!(
+                policy
+                    .admit(&receipt.cache_grant_id, EffectClass::Read)
+                    .is_err(),
+                "the cache half never admits a generic Read"
+            );
+            assert!(
+                policy
+                    .admit(&receipt.index_grant_id, EffectClass::Read)
+                    .is_err(),
+                "the index half never admits a generic Read"
+            );
+        } else {
+            unreachable!("the issued admission holds its receipt");
+        }
+        policy.release_check_dependencies(&store, &mut admission_e);
+        assert_eq!(
+            policy.grants, ordinary_before,
+            "no issuer exit touched an ordinary grant"
+        );
+
+        drop(store);
+        drop(std::fs::remove_dir_all(&root));
+        drop(foreign_store);
+        drop(std::fs::remove_dir_all(&foreign_root));
     }
 }

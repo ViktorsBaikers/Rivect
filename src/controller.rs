@@ -6,8 +6,8 @@
 
 use crate::commands::{PausedAttempt, Runtime};
 use crate::contracts::{
-    AnswerSelection, Availability, EffectClass, ErrorCode, KNOWN_READY_OPTION, OptionId, Question,
-    QuestionId, QuestionOption, SessionId, TaskId, TaskSnapshot,
+    AnswerSelection, Availability, EffectClass, ErrorCode, OptionId, Question, QuestionId,
+    QuestionOption, SessionId, TaskId, TaskSnapshot,
 };
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::{ModelError, PendingFallback, RequestManifest};
@@ -52,8 +52,22 @@ pub enum StepOutcome {
     },
 }
 
+/// A granted restore that ran through executor admission. The original
+/// check is returned so the caller reruns the same expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedEnvironment {
+    pub attempt_id: String,
+    pub original: crate::verification::AssumptionCheckRecord,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
+    #[error("environment failure retention failed: {secondary}")]
+    EnvironmentRetention {
+        #[source]
+        primary: ExecutorError,
+        secondary: Box<ControllerError>,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -66,6 +80,12 @@ pub enum ControllerError {
     Scheduler(#[from] SchedulerError),
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Action(#[from] crate::actions::ActionError),
+    #[error("environment preparation was denied: {reason}")]
+    EnvironmentDenied { reason: String },
+    #[error("environment preparation returned an unexpected outcome")]
+    UnexpectedEnvironmentOutcome,
     #[error("applicability evaluation could not decide the obligations of this step")]
     ApplicabilityUnknown,
 }
@@ -75,6 +95,7 @@ impl ControllerError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             Self::Store(error) => error.code(),
+            Self::EnvironmentRetention { .. } => ErrorCode::StorageUnavailable,
             Self::Policy(_) => ErrorCode::Denied,
             Self::Model(ModelError::RequestTooLarge { .. }) => ErrorCode::ContextOverflow,
             Self::Model(
@@ -92,6 +113,9 @@ impl ControllerError {
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,
             Self::Scheduler(_) => ErrorCode::Conflict,
             Self::Serialization(_) => ErrorCode::InvalidInput,
+            Self::Action(error) => error.error_code(),
+            Self::EnvironmentDenied { .. } => ErrorCode::Denied,
+            Self::UnexpectedEnvironmentOutcome => ErrorCode::InternalError,
             Self::ApplicabilityUnknown => ErrorCode::OutcomeUnknown,
         }
     }
@@ -179,12 +203,22 @@ pub fn step_error_observation(
     error: &ControllerError,
 ) -> Observation {
     let result = match error {
+        ControllerError::EnvironmentRetention { primary, secondary } => {
+            format!("executor error: {primary}; retention error: {secondary}")
+        }
         ControllerError::Store(source) => format!("store error: {source}"),
         ControllerError::Policy(source) => format!("policy error: {source}"),
         ControllerError::Model(source) => format!("model error: {source}"),
         ControllerError::Executor(source) => format!("executor error: {source}"),
         ControllerError::Scheduler(source) => format!("scheduler error: {source}"),
         ControllerError::Serialization(source) => format!("serialization error: {source}"),
+        ControllerError::Action(source) => format!("action error: {source}"),
+        ControllerError::EnvironmentDenied { reason } => {
+            format!("environment error: preparation denied: {reason}")
+        }
+        ControllerError::UnexpectedEnvironmentOutcome => {
+            "environment error: preparation returned an unexpected outcome".to_string()
+        }
         ControllerError::ApplicabilityUnknown => {
             "applicability error: evaluation could not decide the obligations of this step"
                 .to_string()
@@ -244,13 +278,8 @@ impl Runtime {
         ) {
             self.fail_applicability(task_id)?;
         }
-        let known_ready = matches!(
-            answer,
-            AnswerSelection::Option { option_id }
-                if option_id.0.as_str() == KNOWN_READY_OPTION
-        );
         let (target, retained_attempt_id) =
-            match self.resolve_read_target(session_id, task_id, answer, known_ready)? {
+            match self.resolve_read_target(session_id, task_id, answer)? {
                 Ok(pair) => pair,
                 Err(waiting) => return Ok(waiting),
             };
@@ -269,8 +298,10 @@ impl Runtime {
             executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?
         };
         let effect_attempt = admitted.attempt_id.clone();
-        if known_ready {
-            self.retain_pre_effect(&effect_attempt, "known ready admitted read")?;
+        // No model attempt named the target: the effect attempt carries
+        // the pre-effect retention instead.
+        if retained_attempt_id.is_none() {
+            self.retain_pre_effect(&effect_attempt, "fixed option admitted read")?;
         }
         let mut executor = crate::executor::Executor::new(
             &mut self.policy,
@@ -369,20 +400,17 @@ impl Runtime {
         Ok(None)
     }
 
-    /// Resolves the scoped read target: known-ready uses the fixture file;
-    /// otherwise the broker names it — through a fresh prepare/dispatch,
-    /// or through the manual-fallback candidate a pending answer named.
+    /// Resolves the scoped read target. A manual-fallback pick dispatches
+    /// the paused attempt; any other fixed option already names the one
+    /// permitted read, so no model call is spent on it; only free-text
+    /// answers need the model to interpret them.
     /// `Err(Waiting)` is a step outcome, not a controller failure.
     fn resolve_read_target(
         &mut self,
         session_id: &SessionId,
         task_id: &TaskId,
         answer: &AnswerSelection,
-        known_ready: bool,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
-        if known_ready {
-            return Ok(Ok((self.scoped_file.clone(), None)));
-        }
         // The manifest freezes the execution world (AC-013): the
         // scope root the request's sources and proofs live in,
         // re-checked at dispatch.
@@ -392,17 +420,26 @@ impl Runtime {
         // connection — the broker re-runs the current eligibility check
         // before the send, so a candidate that lost eligibility between
         // the question and the answer is refused typed, never sent.
+        // The pause is bound to the question that served its candidates:
+        // the step runs right after the answer commit, so the task's
+        // latest applied row names the fork this answer resolves, and an
+        // option id colliding with a stale pause's candidate on a
+        // different fork can never spend its frozen manifest.
         let chosen = match answer {
-            AnswerSelection::Option { option_id } => self
-                .paused_attempts
-                .get(&task_id.0)
-                .filter(|paused| {
-                    paused
-                        .choice
-                        .as_ref()
-                        .is_some_and(|choice| choice.candidates.contains(&option_id.0))
-                })
-                .map(|paused| (paused.manifest.attempt_id.clone(), option_id.0.clone())),
+            AnswerSelection::Option { option_id } => {
+                let answered = self.owner.store.latest_applied_answer_question(task_id)?;
+                self.paused_attempts
+                    .get(&task_id.0)
+                    .filter(|paused| {
+                        answered.is_some()
+                            && paused.served_question_id == answered
+                            && paused
+                                .choice
+                                .as_ref()
+                                .is_some_and(|choice| choice.candidates.contains(&option_id.0))
+                    })
+                    .map(|paused| (paused.manifest.attempt_id.clone(), option_id.0.clone()))
+            }
             AnswerSelection::Custom { .. } => None,
         };
         if let Some((attempt_id, connection)) = chosen {
@@ -412,6 +449,16 @@ impl Runtime {
             self.provider_calls += 1;
             self.paused_attempts.remove(&task_id.0);
             return self.read_target_from_reply(task_id, reply, Some(attempt_id));
+        }
+        if matches!(answer, AnswerSelection::Option { .. }) {
+            // The served question's options are exactly the pause's
+            // candidates and the store denies unknown option ids, so an
+            // option answer that missed `chosen` was never aimed at the
+            // surviving pause — it is dead residue, tombstoned like
+            // every sibling settle path so its admission can never
+            // replay under a later fork.
+            self.tombstone_paused(task_id);
+            return Ok(Ok((self.scoped_file.clone(), None)));
         }
         let purpose = self.purpose.clone();
         let inputs = format!(
@@ -438,8 +485,10 @@ impl Runtime {
             }
             Err(source) => {
                 // Every dispatch error leaves the primary's admission
-                // live — the task pauses on a still-retryable attempt.
-                self.record_pause(task_id, manifest, None);
+                // live — the task pauses on a still-retryable attempt
+                // that no question served, so nothing can answer it
+                // into a dispatch.
+                self.record_pause(task_id, manifest, None, None);
                 Err(source.into())
             }
         }
@@ -453,11 +502,16 @@ impl Runtime {
         task_id: &TaskId,
         manifest: RequestManifest,
         choice: Option<PendingFallback>,
+        served_question_id: Option<QuestionId>,
     ) {
-        if let Some(previous) = self
-            .paused_attempts
-            .insert(task_id.0.clone(), PausedAttempt { manifest, choice })
-        {
+        if let Some(previous) = self.paused_attempts.insert(
+            task_id.0.clone(),
+            PausedAttempt {
+                manifest,
+                choice,
+                served_question_id,
+            },
+        ) {
             self.broker.cancel_attempt(&previous.manifest.attempt_id);
         }
     }
@@ -489,7 +543,7 @@ impl Runtime {
             // an empty question would wait forever, so the step fails
             // typed instead. The admission stays live and retryable —
             // record the pause so a cancel still tombstones it.
-            self.record_pause(task_id, manifest, None);
+            self.record_pause(task_id, manifest, None, None);
             return Err(ControllerError::Model(ModelError::NoEligibleCandidate {
                 purpose: choice.purpose,
                 rejected: Vec::new(),
@@ -521,7 +575,9 @@ impl Runtime {
         // again.
         self.owner.store.publish_question(session_id, &question)?;
         self.broker.take_pending_choice(&manifest.attempt_id);
-        self.record_pause(task_id, manifest, Some(choice));
+        // The pause binds the question it just published: only that
+        // question's applied answer may spend the frozen manifest.
+        self.record_pause(task_id, manifest, Some(choice), Some(question.question_id));
         Ok(Err(StepOutcome::Waiting {
             snapshot: self.owner.store.snapshot(task_id)?,
         }))
@@ -573,7 +629,9 @@ impl Runtime {
             digest,
         )?;
         let terminal_attempt_id = retained_attempt_id.unwrap_or(effect_attempt);
-        let terminal_boundary_id = crate::verification::boundary_id(&terminal_attempt_id);
+        let terminal_boundary_id = crate::verification::terminal_boundary_id(
+            &crate::verification::boundary_id(&terminal_attempt_id),
+        );
         let terminal = crate::verification::RetainedAttempt {
             attempt_id: terminal_attempt_id.clone(),
             boundary_id: terminal_boundary_id,
@@ -581,11 +639,9 @@ impl Runtime {
             cause: observation,
             digest: crate::verification::record_digest(&terminal_attempt_id, "terminal"),
             build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+            admitted_attempt_id: None,
         };
-        let terminal_json = serde_json::to_string(&terminal)?;
-        self.owner
-            .store
-            .retain(&terminal_json, &terminal.boundary_id)?;
+        self.owner.store.retain_attempt(&terminal)?;
         let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
         Ok(StepOutcome::Completed { snapshot })
     }
@@ -623,9 +679,124 @@ impl Runtime {
             cause: cause.to_string(),
             digest: crate::verification::record_digest(attempt_id, "pre"),
             build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+            admitted_attempt_id: None,
         };
-        let pre_json = serde_json::to_string(&pre)?;
-        self.owner.store.retain(&pre_json, &pre.boundary_id)?;
+        self.owner.store.retain_attempt(&pre)?;
+        Ok(())
+    }
+
+    /// Runs one granted environment restore for a recorded setup gap.
+    /// Every admission or execution failure is retained before it is
+    /// returned, and success hands back the original unchanged check.
+    ///
+    /// # Errors
+    /// Returns the typed action, executor, or store error that stopped
+    /// preparation after retaining any failure evidence.
+    pub fn prepare_environment(
+        &mut self,
+        session_id: &SessionId,
+        input: crate::actions::PrepareEnvironmentInput,
+        mode: crate::policy::PermissionMode,
+    ) -> Result<PreparedEnvironment, ControllerError> {
+        let config = self.config_for_broker();
+        let task_id = input.task_id.clone();
+        let check_id = input.check_id.clone();
+        let outcome = crate::actions::ActionRegistry::new().execute(
+            crate::actions::ActionInput::PrepareEnvironment(input),
+            &mut self.action_context(session_id, &config),
+        )?;
+        let crate::actions::ActionOutcome::EnvironmentRequested { restore, original } = outcome
+        else {
+            return Err(ControllerError::UnexpectedEnvironmentOutcome);
+        };
+        let pending = crate::verification::assumption_pre_effect(&task_id, &check_id);
+        self.owner.store.retain_attempt(&pending)?;
+        let request = EffectRequest::Write {
+            grant_id: restore.grant_id,
+            path: restore.target,
+            bytes: restore.replacement,
+        };
+        let admission = {
+            let mut executor = crate::executor::Executor::new(
+                &mut self.policy,
+                &mut self.owner.store,
+                self.read_worker.as_mut(),
+            );
+            executor.admit(&task_id, request, mode)
+        };
+        let admitted = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.retain_environment_failure(&pending, error.error_code().as_str(), None)?;
+                return Err(error.into());
+            }
+        };
+        let effect = {
+            let mut executor = crate::executor::Executor::new(
+                &mut self.policy,
+                &mut self.owner.store,
+                self.read_worker.as_mut(),
+            );
+            executor.execute(&admitted)
+        };
+        match effect {
+            Ok(EffectOutcome::Executed { detail }) => {
+                let mut evidence = crate::verification::assumption_restore_outcome(
+                    &pending,
+                    "environment restore completed",
+                    Some(&admitted.attempt_id),
+                );
+                evidence.digest = crate::verification::record_digest(&evidence.attempt_id, &detail);
+                self.owner.store.retain_attempt(&evidence)?;
+                Ok(PreparedEnvironment {
+                    attempt_id: admitted.attempt_id,
+                    original,
+                })
+            }
+            Ok(EffectOutcome::Denied { reason: _ }) => {
+                self.retain_environment_failure(
+                    &pending,
+                    ErrorCode::Denied.as_str(),
+                    Some(&admitted.attempt_id),
+                )?;
+                Err(ControllerError::EnvironmentDenied {
+                    reason: "effect denied".to_string(),
+                })
+            }
+            Ok(EffectOutcome::Read { .. }) => {
+                self.retain_environment_failure(
+                    &pending,
+                    ErrorCode::InternalError.as_str(),
+                    Some(&admitted.attempt_id),
+                )?;
+                Err(ControllerError::UnexpectedEnvironmentOutcome)
+            }
+            Err(error) => {
+                let cause = error.owned_cause();
+                if let Err(secondary) = self.retain_environment_failure(
+                    &pending,
+                    cause.as_deref().unwrap_or(error.error_code().as_str()),
+                    Some(&admitted.attempt_id),
+                ) {
+                    return Err(ControllerError::EnvironmentRetention {
+                        primary: error,
+                        secondary: Box::new(secondary),
+                    });
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn retain_environment_failure(
+        &mut self,
+        pending: &crate::verification::RetainedAttempt,
+        cause: &str,
+        admitted_attempt_id: Option<&str>,
+    ) -> Result<(), ControllerError> {
+        let evidence =
+            crate::verification::assumption_restore_outcome(pending, cause, admitted_attempt_id);
+        self.owner.store.retain_attempt(&evidence)?;
         Ok(())
     }
 
@@ -675,19 +846,19 @@ impl Runtime {
             })?;
         // The marker proves execution; the informational bool can never
         // reject it.
-        let boundary_id = crate::verification::boundary_id(attempt_id);
+        let boundary_id = crate::verification::terminal_boundary_id(
+            &crate::verification::boundary_id(attempt_id),
+        );
         let terminal = crate::verification::RetainedAttempt {
             attempt_id: attempt_id.to_string(),
-            boundary_id: boundary_id.clone(),
+            boundary_id,
             stage: crate::verification::RetainedStage::Terminal,
             cause: format!("attempt {attempt_id} reconciled as executed from sha256={marker}"),
             digest: marker.clone(),
             build_attempt: crate::BUILD_ATTEMPT_ID.to_string(),
+            admitted_attempt_id: None,
         };
-        self.owner.store.retain(
-            &serde_json::to_string(&terminal).unwrap_or_default(),
-            &boundary_id,
-        )?;
+        self.owner.store.retain_attempt(&terminal)?;
         self.owner.store.set_attempt_state(
             attempt_id,
             "confirmed",

@@ -11,10 +11,10 @@
 //! move the payload on the inherited fd — no ambient path.
 
 use super::{
-    confirm_opened_regular, denied_target_spelling, denied_write_candidate, expect_admitted,
-    expect_denied, helper_confined_write, helper_launch_command, helper_launch_init_failed,
-    helper_probe_write, inspect_regular_target, observe_confined_child,
-    probe_read_conformance_legs, read_observation_from, same_regular_file, sandbox_denied,
+    confirm_opened_regular, confirm_write_occupant, denied_target_spelling, denied_write_candidate,
+    expect_admitted, expect_denied, helper_confined_write, helper_launch_command,
+    helper_launch_init_failed, helper_probe_write, inspect_regular_target,
+    probe_read_conformance_legs, read_observation_from, sandbox_denied,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -23,6 +23,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, PoisonError};
+
+use rivect_sandbox_helper::{ReuseToken, ReuseTokenError};
 /// The one injected backend seam: every effect the executor performs —
 /// read, write, exec, egress — crosses a worker leg, so confinement is
 /// intrinsic to the backend implementations. Legs a backend has not
@@ -39,7 +41,7 @@ pub trait ReadWorker: Send {
         &mut self,
         _scope_root: &Path,
         _target: &Path,
-        _expected: FileIdentity,
+        _expected: WriteIdentity,
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         Err(WorkerError::WriteUnavailable)
@@ -74,7 +76,7 @@ impl ReadWorker for MacosReadWorker {
         &mut self,
         scope_root: &Path,
         target: &Path,
-        expected: FileIdentity,
+        expected: WriteIdentity,
         bytes: &[u8],
     ) -> Result<(), WorkerError> {
         write_once(scope_root, target, expected, bytes)
@@ -96,16 +98,65 @@ pub const WRITE_MAX_BYTES: usize = READ_MAX_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
-    pub dev: u64,
-    pub ino: u64,
+    dev: u64,
+    ino: u64,
 }
 
 impl FileIdentity {
-    pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
-        Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        }
+    #[must_use]
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    #[must_use]
+    pub fn from_metadata(metadata: &Metadata) -> Self {
+        Self::new(metadata.dev(), metadata.ino())
+    }
+
+    #[must_use]
+    pub const fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    #[must_use]
+    pub const fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
+/// Why a write identity carries no reuse token: the filesystem offers
+/// none, or the identity was recorded before tokens existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Unattested {
+    #[error("the filesystem reports no reuse discriminator")]
+    Unsupported,
+    #[error("the identity was recorded without a reuse discriminator")]
+    Unrecorded,
+}
+
+/// The admitted occupant of a write target: its `(dev, ino)` plus the
+/// reuse token that tells that file from a later one reusing the pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteIdentity {
+    file: FileIdentity,
+    reuse: Result<ReuseToken, Unattested>,
+}
+
+impl WriteIdentity {
+    /// Pairs one file identity with its reuse token or the reason it has
+    /// none; both halves are already validated by their own types.
+    #[must_use]
+    pub const fn new(file: FileIdentity, reuse: Result<ReuseToken, Unattested>) -> Self {
+        Self { file, reuse }
+    }
+
+    #[must_use]
+    pub const fn file(&self) -> FileIdentity {
+        self.file
+    }
+
+    pub const fn reuse(&self) -> Result<ReuseToken, Unattested> {
+        self.reuse
     }
 }
 
@@ -130,6 +181,29 @@ pub struct ReadObservation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
+    #[error("owned launch failed: {source}")]
+    OwnedLaunch {
+        #[source]
+        source: Box<super::OwnedLaunchError>,
+    },
+    #[error("owned launch preparation failed at {boundary}: {source}")]
+    OwnedPreparation {
+        boundary: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("owned launch parent protection failed: {source}")]
+    OwnedParent {
+        #[source]
+        source: rivect_sandbox_helper::OwnedParentError,
+    },
+    #[error("owned artifact release is unavailable on this platform")]
+    OwnedReleaseUnavailable,
+    #[error("owned launch seccomp preparation failed: {source}")]
+    OwnedSeccomp {
+        #[source]
+        source: rivect_sandbox_helper::SeccompCompileError,
+    },
     #[error("denied: scope root unavailable: {source}")]
     ScopeRootUnavailable { source: std::io::Error },
     #[error("not found: target does not exist: {}", target.display())]
@@ -196,6 +270,17 @@ pub enum WorkerError {
         "capability unavailable: confined run ended before a verdict: {source}; recovery: fix the environment or run on a capable kernel"
     )]
     ConfinedRunKilled { source: std::io::Error },
+    #[error(
+        "capability unavailable: write target identity is unattested: {cause}; recovery: fix the environment or run on a capable kernel"
+    )]
+    WriteIdentityUnattested { cause: Unattested },
+    #[error(
+        "capability unavailable: write target identity could not be taken: {source}; recovery: fix the environment or run on a capable kernel"
+    )]
+    WriteIdentityUnavailable {
+        #[source]
+        source: ReuseTokenError,
+    },
 }
 
 pub(crate) fn target_identity(
@@ -240,7 +325,7 @@ pub fn read_once(scope_root: &Path, target: &Path) -> Result<ReadObservation, Wo
 pub fn write_once(
     scope_root: &Path,
     target: &Path,
-    expected: FileIdentity,
+    expected: WriteIdentity,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
     if bytes.len() > WRITE_MAX_BYTES {
@@ -270,7 +355,7 @@ pub fn write_once_on_opened_file(
     scope_root: &Path,
     target: &Path,
     file: &mut File,
-    expected: FileIdentity,
+    expected: WriteIdentity,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
     if bytes.len() > WRITE_MAX_BYTES {
@@ -285,19 +370,10 @@ fn write_opened_file(
     target: &Path,
     canonical_meta: &Metadata,
     file: &mut File,
-    expected: FileIdentity,
+    expected: WriteIdentity,
     bytes: &[u8],
 ) -> Result<(), WorkerError> {
-    let opened_meta = file
-        .metadata()
-        .map_err(|source| WorkerError::MetadataUnavailable { source })?;
-    if !same_regular_file(canonical_meta, &opened_meta)
-        || FileIdentity::from_metadata(&opened_meta) != expected
-    {
-        return Err(WorkerError::TargetChanged {
-            target: target.to_path_buf(),
-        });
-    }
+    confirm_write_occupant(target, canonical_meta, file, expected)?;
     let profile = write_profile(scope_root)?;
     let clone = file
         .try_clone()
@@ -431,6 +507,198 @@ pub fn exec_profile(scope_root: &Path) -> Result<String, WorkerError> {
     ))
 }
 
+/// The finite linker set the confined check admits for execution beside
+/// the toolchain: the compiler driver and the classic linker, each
+/// canonicalized (a symlinked spelling would never match Seatbelt's
+/// literal filter). An unrelated system binary stays denied.
+pub fn check_linker_literals() -> Vec<String> {
+    let mut literals = Vec::new();
+    for candidate in ["/usr/bin/cc", "/usr/bin/clang", "/usr/bin/ld"] {
+        if let Ok(canonical) = std::fs::canonicalize(candidate)
+            && let Some(text) = canonical.to_str()
+            && !text.contains(char::is_control)
+        {
+            literals.push(text.replace('\\', "\\\\").replace('"', "\\\""));
+        }
+    }
+    literals
+}
+/// The platform linker toolchain the check admits beside the Rust one:
+/// the canonical developer tree (read-only), the real `clang` the
+/// `/usr/bin/cc` shim delegates to, the classic `ld` beside it, the
+/// `dsymutil` rustc invokes when debuginfo is present, and the SDK the
+/// driver resolves system libraries against without `xcrun` — whose
+/// cache writes land outside the attempt rw and are correctly denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckLinker {
+    /// The canonical developer tree (`DEVELOPER_DIR`, Xcode, or CLT).
+    pub developer: PathBuf,
+    /// The canonical real clang driver inside that tree.
+    pub clang: PathBuf,
+    /// The canonical classic linker beside the clang driver.
+    pub ld: PathBuf,
+    /// The canonical dsymutil the Rust toolchain invokes for debug
+    /// symbols; `None` when the tree ships none (a bare shim host).
+    pub dsymutil: Option<PathBuf>,
+    /// The canonical `MacOSX.sdk` root the driver needs.
+    pub sdkroot: PathBuf,
+}
+
+/// Resolves [`CheckLinker`] from the standard developer-dir candidates,
+/// honoring `DEVELOPER_DIR` first. Returns `None` when no candidate
+/// holds both a real clang and the macOS SDK — the profile then keeps
+/// the bare `/usr/bin/cc` literal, which cannot link on such a host.
+#[must_use = "a resolved linker widens the profile, the argv, and the env"]
+pub fn check_linker_toolchain() -> Option<CheckLinker> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = std::env::var_os("DEVELOPER_DIR") {
+        candidates.push(PathBuf::from(dir));
+    }
+    candidates.push(PathBuf::from("/Applications/Xcode.app/Contents/Developer"));
+    candidates.push(PathBuf::from("/Library/Developer/CommandLineTools"));
+    for candidate in candidates {
+        let Ok(developer) = candidate.canonicalize() else {
+            continue;
+        };
+        for clang in [
+            developer.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"),
+            developer.join("usr/bin/clang"),
+        ] {
+            if !clang.is_file() {
+                continue;
+            }
+            let sdkroot = developer.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk");
+            if let (Ok(clang), Ok(sdkroot)) = (clang.canonicalize(), sdkroot.canonicalize())
+                && sdkroot.is_dir()
+            {
+                let bin = clang.parent().map(Path::to_path_buf)?;
+                let ld = bin.join("ld");
+                if !ld.is_file() {
+                    continue;
+                }
+                let dsymutil = bin
+                    .join("dsymutil")
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| path.is_file());
+                return Some(CheckLinker {
+                    developer,
+                    clang,
+                    ld,
+                    dsymutil,
+                    sdkroot,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The allowances one confined check phase runs under (DEC-040/041):
+/// read/execute of the sealed snapshot, the canonical toolchain, the
+/// finite linker set, and the system trees; write only inside the fresh
+/// attempt rw; no network allowance anywhere. `test_binaries` adds the
+/// phase-B execute allowance for the test binaries Cargo builds under
+/// `<rw>/target`. File *metadata* is allowed everywhere: Cargo's
+/// dep-info handling realpaths the canonical ancestors of the attempt
+/// roots (`/private`, `/private/var`, …), which no subpath rule can
+/// cover — stat alone never discloses file bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckProfile {
+    /// Canonical toolchain `bin` directory (cargo, rustc, rustdoc).
+    pub toolchain: PathBuf,
+    /// The sealed `<attempt>/src` snapshot, canonical.
+    pub snapshot: PathBuf,
+    /// The fresh `<attempt>/rw` staging root, canonical.
+    pub rw: PathBuf,
+    /// Whether the phase executes Cargo-built test binaries.
+    pub test_binaries: bool,
+}
+
+/// Renders the check-phase Seatbelt profile.
+///
+/// # Errors
+/// Returns [`WorkerError::ScopeRootUnavailable`] when a root cannot be
+/// canonicalized and [`WorkerError::SandboxUnavailable`] when a root is
+/// not confinable unicode.
+pub fn check_profile(profile: &CheckProfile) -> Result<String, WorkerError> {
+    let toolchain = scheme_literal(&canonical_scope(&profile.toolchain)?)?;
+    let snapshot = scheme_literal(&canonical_scope(&profile.snapshot)?)?;
+    let rw = scheme_literal(&canonical_scope(&profile.rw)?)?;
+    // `rw` is the quoted literal; the target-dir rules need one quoted
+    // literal of their own, not a splice inside the quotes.
+    let rw_target = format!("{}/target", rw.trim_matches('"'));
+    let mut linkers = String::new();
+    for literal in check_linker_literals() {
+        linkers.push_str(&format!(
+            "    (allow process-exec (literal \"{literal}\"))\n"
+        ));
+    }
+    let mut linker_rules = String::new();
+    if let Some(linker) = check_linker_toolchain() {
+        let developer = scheme_literal(&linker.developer)?;
+        // Read-only developer tree (the SDK lives inside it), but EXEC
+        // narrows to the canonical literals only: a whole-tree exec
+        // allowance made every Xcode tool (git, python3, xcrun…)
+        // executable — far beyond the finite linker set the checkpoint
+        // admits (CR-I4).
+        linker_rules.push_str(&format!("    (allow file-read* (subpath {developer}))\n"));
+        let mut literals = vec![&linker.clang, &linker.ld];
+        literals.extend(linker.dsymutil.iter());
+        for literal in literals {
+            let quoted = scheme_literal(literal)?;
+            linker_rules.push_str(&format!("    (allow process-exec (literal {quoted}))\n"));
+        }
+    }
+    let test_exec = if profile.test_binaries {
+        format!(
+            "    (allow process-exec (subpath \"{rw_target}\"))\n    (allow file-read* (subpath \"{rw_target}\"))\n"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "(version 1)\n\
+         \x20   (allow process-fork)\n\
+         \x20   (allow file-read-metadata)\n\
+         \x20   (allow process-exec (subpath {toolchain}))\n{linkers}{linker_rules}{test_exec}\
+         {SYSTEM_READ_RULES}\
+         \x20   (allow file-read* (subpath {toolchain}))\n\
+         \x20   (allow file-read* (subpath {snapshot}))\n\
+         \x20   (allow file-read* (subpath {rw}))\n\
+         \x20   (allow file-read* (subpath \"/private/etc/ssl\"))\n\
+         \x20   (allow file-write* (subpath {rw}))\n\
+         \x20   (allow file-write* (literal \"/dev/null\"))\n\
+         \x20   (allow file-write* (literal \"/dev/dtracehelper\"))\n\
+         \x20   (allow sysctl-read)\n\
+         \x20   (allow file-ioctl (literal \"/dev/null\"))\n"
+    ))
+}
+
+/// Renders the deny-first control profile: the same read/write allowances
+/// as the check phases plus execute of exactly `/bin/cat`, `/bin/sh`,
+/// and the compiled network probe's own `control_bin` directory — never
+/// the toolchain, and never a read of the control DATA directory the
+/// denied targets live in. Every control leg must FAIL under it with its
+/// own cause — a mechanism that admits a control does not enforce.
+///
+/// # Errors
+/// Same as [`check_profile`].
+pub fn check_control_profile(
+    profile: &CheckProfile,
+    control_bin: &Path,
+) -> Result<String, WorkerError> {
+    let base = check_profile(profile)?;
+    let bin = scheme_literal(&canonical_scope(control_bin)?)?;
+    // macOS `sandbox-exec` execs `/bin/bash` "as variant" for `/bin/sh`
+    // after consulting `/private/var/select/sh` — both stay allowed so
+    // the write leg's shell is executable while everything else the
+    // variant mechanism might resolve stays denied.
+    Ok(format!(
+        "{base}    (allow process-exec (literal \"/bin/cat\"))\n    (allow process-exec (literal \"/bin/sh\"))\n    (allow process-exec (literal \"/bin/bash\"))\n    (allow file-read* (subpath \"/bin\"))\n    (allow file-read* (subpath \"/private/var/select\"))\n    (allow process-exec (subpath {bin}))\n    (allow file-read* (subpath {bin}))\n"
+    ))
+}
+
 /// Seatbelt profile for the egress boundary: the helper runs, and no
 /// network operation carries an allowance, so the kernel denies egress.
 #[must_use = "the profile is a pure builder; an unused one proves nothing"]
@@ -490,11 +758,7 @@ fn run_confined_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|source| crate::executor::spawn_failed(&command, source))?;
-    let stderr = child.stderr.take();
-    let observed = observe_confined_child(&mut child, None, &[], None, stderr)?;
+    let observed = super::observed_owned(command.run(&[])?);
     // Helper-init classification is the helper prefix (pre-execv), not a
     // probe-only flag: a confined program that is not the helper stays a
     // confined-run outcome unless stderr was produced before execv.

@@ -42,7 +42,156 @@ pub struct ProviderReply {
     pub usage: UsageDelta,
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+/// A transport failure's programmatic class, independent of diagnostic text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportClass {
+    /// The adapter observed its whole-request budget expire between calls.
+    DeadlineExpired,
+    /// The HTTP client or response reader timed out inside a call.
+    Timeout,
+    /// The HTTP client failed without a timeout.
+    RequestFailure,
+    /// Reading the response failed without a timeout.
+    ReadFailure,
+    /// The peer returned an unsuccessful HTTP status.
+    HttpStatus { code: u16 },
+}
+
+/// Retained transport provenance with diagnostics that never render external source text.
+///
+/// Inspect sources programmatically; a timeout does not authorize retrying an unknown effect.
+///
+/// # Examples
+///
+/// ```
+/// use rivect::providers::{ProviderError, TransportCause, TransportClass};
+/// use std::error::Error;
+/// use std::time::Duration;
+///
+/// fn inspect(error: &ProviderError) {
+///     if let ProviderError::Transport { cause, .. } = error {
+///         match cause.class() {
+///             TransportClass::Timeout => { /* reconcile the external outcome before retrying */ }
+///             TransportClass::DeadlineExpired => {}
+///             TransportClass::RequestFailure | TransportClass::ReadFailure => {}
+///             TransportClass::HttpStatus { code } => assert!((100..1000).contains(&code)),
+///         }
+///         let request = cause.source().and_then(|source| source.downcast_ref::<reqwest::Error>());
+///         if let Some(request) = request {
+///             assert_eq!(cause.class() == TransportClass::Timeout, request.is_timeout());
+///         }
+///         let _safe_diagnostics = (format!("{error}"), format!("{error:?}"));
+///     }
+/// }
+/// let error = ProviderError::Transport {
+///     connection: "local".into(),
+///     cause: TransportCause::Deadline { budget: Duration::from_secs(1) },
+/// };
+/// inspect(&error);
+/// ```
+#[derive(Clone)]
+pub enum TransportCause {
+    /// The adapter's complete request budget, shared by all of its legs.
+    Deadline { budget: Duration },
+    /// The original HTTP client error; adapters remove its outer URL before retaining it.
+    Request { source: Arc<reqwest::Error> },
+    /// The original response read error, including its kind, OS code and inner source.
+    Read { source: Arc<std::io::Error> },
+    /// The unsuccessful response status, without the uncontrolled response body.
+    Status { status: reqwest::StatusCode },
+}
+
+impl TransportCause {
+    /// Classifies the retained source without parsing its diagnostic text.
+    pub fn class(&self) -> TransportClass {
+        match self {
+            Self::Deadline { .. } => TransportClass::DeadlineExpired,
+            Self::Request { source } if source.is_timeout() => TransportClass::Timeout,
+            Self::Request { .. } => TransportClass::RequestFailure,
+            Self::Read { source }
+                if source.kind() == std::io::ErrorKind::TimedOut
+                    || source
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout) =>
+            {
+                TransportClass::Timeout
+            }
+            Self::Read { .. } => TransportClass::ReadFailure,
+            Self::Status { status } => TransportClass::HttpStatus {
+                code: status.as_u16(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for TransportCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline { budget } => write!(f, "request exceeded the {budget:?} send deadline"),
+            Self::Request { source } => format_request_kind(source, f),
+            Self::Read { source } => {
+                if let Some(request) = source
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                {
+                    return format_request_kind(request, f);
+                }
+                write!(f, "response read failed: {}", source.kind())?;
+                if let Some(code) = source.raw_os_error() {
+                    write!(f, " (os code {code})")?;
+                }
+                Ok(())
+            }
+            Self::Status { status } => write!(f, "http status {}", status.as_u16()),
+        }
+    }
+}
+
+fn format_request_kind(
+    error: &reqwest::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    let context = if error.is_builder() {
+        "http builder error"
+    } else if error.is_request() {
+        "http request error"
+    } else if error.is_body() {
+        "http body error"
+    } else if error.is_decode() {
+        "http decode error"
+    } else if error.is_redirect() {
+        "http redirect error"
+    } else if error.is_upgrade() {
+        "http upgrade error"
+    } else if error.is_status() {
+        return match error.status() {
+            Some(status) => write!(f, "http status {}", status.as_u16()),
+            None => f.write_str("http status error"),
+        };
+    } else {
+        "http transport error"
+    };
+    f.write_str(context)
+}
+
+impl std::fmt::Debug for TransportCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for TransportCause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request { source } => Some(source.as_ref()),
+            Self::Read { source } => Some(source.as_ref()),
+            Self::Deadline { .. } | Self::Status { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     /// DEC-014: the model names a connection id the catalogue does not
     /// declare — the denial names the id, like every sibling.
@@ -139,10 +288,13 @@ pub enum ProviderError {
     #[error("connection {connection} region {region} is outside the dialect's endpoint contract")]
     RegionMismatch { connection: String, region: String },
     /// The transport failed before a usable reply — connect, TLS,
-    /// status or read failure. `reason` carries the client's own text;
-    /// it never contains secret material.
-    #[error("connection {connection} transport failed: {reason}")]
-    Transport { connection: String, reason: String },
+    /// status or read failure. The source is retained for programmatic inspection.
+    #[error("connection {connection} transport failed: {cause}")]
+    Transport {
+        connection: String,
+        #[source]
+        cause: TransportCause,
+    },
     /// The provider's own terminal event reported a failed or
     /// incomplete response — a peer verdict, not a parse error.
     #[error("connection {connection} reported failure: {reason}")]
@@ -1170,7 +1322,7 @@ pub(crate) fn check_deadline(
     if started.elapsed() >= deadline {
         return Err(ProviderError::Transport {
             connection: connection.to_string(),
-            reason: format!("request exceeded the {deadline:?} send deadline"),
+            cause: TransportCause::Deadline { budget: deadline },
         });
     }
     Ok(())
@@ -1247,14 +1399,18 @@ pub(crate) fn wire_body(connection: &str, body: &Value) -> Result<Vec<u8>, Provi
 pub(crate) fn transport(connection: &str, err: reqwest::Error) -> ProviderError {
     ProviderError::Transport {
         connection: connection.to_string(),
-        reason: err.without_url().to_string(),
+        cause: TransportCause::Request {
+            source: Arc::new(err.without_url()),
+        },
     }
 }
 
 fn transport_io(connection: &str, err: std::io::Error) -> ProviderError {
     ProviderError::Transport {
         connection: connection.to_string(),
-        reason: err.to_string(),
+        cause: TransportCause::Read {
+            source: Arc::new(err),
+        },
     }
 }
 
@@ -1263,7 +1419,7 @@ fn transport_io(connection: &str, err: std::io::Error) -> ProviderError {
 pub(crate) fn transport_status(connection: &str, status: reqwest::StatusCode) -> ProviderError {
     ProviderError::Transport {
         connection: connection.to_string(),
-        reason: format!("status {}", status.as_u16()),
+        cause: TransportCause::Status { status },
     }
 }
 
@@ -1315,4 +1471,209 @@ pub(crate) fn payload_reason(payload: &Value) -> String {
         }
     }
     "unclassified".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    fn request_error() -> Result<reqwest::Error, Box<dyn Error>> {
+        let client = reqwest::blocking::Client::builder().no_proxy().build()?;
+        match client
+            .get("ftp://fixture-user:fixture-secret@127.0.0.1/private-path?token=fixture-query#fixture-fragment")
+            .send()
+        {
+            Err(error) => Ok(error),
+            Ok(_) => Err(std::io::Error::other("unsupported scheme unexpectedly succeeded").into()),
+        }
+    }
+
+    #[test]
+    fn transport_source_clone_preserves_concrete_leaf() -> Result<(), Box<dyn Error>> {
+        let original = transport("local", request_error()?);
+        let cloned = original.clone();
+        drop(original);
+        let cause = cloned
+            .source()
+            .and_then(|source| source.downcast_ref::<TransportCause>())
+            .ok_or_else(|| std::io::Error::other("transport cause missing"))?;
+        assert_eq!(cause.class(), TransportClass::RequestFailure);
+        let leaf = cause
+            .source()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .ok_or_else(|| std::io::Error::other("concrete request source missing"))?;
+        assert!(!leaf.is_timeout());
+        assert!(leaf.url().is_none());
+
+        let directory = tempfile::tempdir()?;
+        let Err(error) = std::fs::File::open(directory.path().join("absent")) else {
+            return Err(std::io::Error::other("missing file unexpectedly opened").into());
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.raw_os_error().is_some());
+        let os_code = error.raw_os_error();
+        let original = transport_io("local", error);
+        let cloned = original.clone();
+        drop(original);
+        let cause = cloned
+            .source()
+            .and_then(|source| source.downcast_ref::<TransportCause>())
+            .ok_or_else(|| std::io::Error::other("read cause missing"))?;
+        assert_eq!(cause.class(), TransportClass::ReadFailure);
+        let leaf = cause
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .ok_or_else(|| std::io::Error::other("concrete read source missing"))?;
+        assert_eq!(leaf.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(leaf.raw_os_error(), os_code);
+        assert!(leaf.get_ref().is_none());
+
+        let original = transport_io("local", std::io::Error::other(request_error()?));
+        let cloned = original.clone();
+        drop(original);
+        let cause = cloned
+            .source()
+            .ok_or_else(|| std::io::Error::other("cause missing"))?;
+        let leaf = cause
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .ok_or_else(|| std::io::Error::other("wrapped read source missing"))?;
+        assert_eq!(leaf.kind(), std::io::ErrorKind::Other);
+        assert!(leaf.raw_os_error().is_none());
+        assert!(
+            leaf.get_ref()
+                .is_some_and(|inner| inner.is::<reqwest::Error>())
+        );
+
+        let timeout = TransportCause::Read {
+            source: Arc::new(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        };
+        assert_eq!(timeout.class(), TransportClass::Timeout);
+        let budget = Duration::from_millis(500);
+        let deadline = check_deadline("local", budget, Instant::now() - budget);
+        assert!(matches!(deadline, Err(ProviderError::Transport {
+            cause: TransportCause::Deadline { budget: observed }, ..
+        }) if observed == budget));
+        let deadline = TransportCause::Deadline { budget };
+        assert_eq!(deadline.class(), TransportClass::DeadlineExpired);
+        assert!(deadline.source().is_none());
+        for status in [401, 429, 503] {
+            let error = transport_status("local", reqwest::StatusCode::from_u16(status)?);
+            let cause = error
+                .source()
+                .and_then(|source| source.downcast_ref::<TransportCause>())
+                .ok_or_else(|| std::io::Error::other("status cause missing"))?;
+            assert_eq!(cause.class(), TransportClass::HttpStatus { code: status });
+            assert!(cause.source().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transport_diagnostics_are_safe() -> Result<(), Box<dyn Error>> {
+        let request = request_error()?;
+        assert!(
+            request
+                .url()
+                .is_some_and(|url| url.query() == Some("token=fixture-query"))
+        );
+        let read = std::io::Error::other(request_error()?);
+        let nested = read
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .ok_or_else(|| std::io::Error::other("nested request source missing"))?;
+        assert!(
+            nested
+                .url()
+                .is_some_and(|url| url.query() == Some("token=fixture-query"))
+        );
+        let sentinels = [
+            "fixture-user",
+            "fixture-secret",
+            "private-path",
+            "fixture-query",
+            "fixture-fragment",
+            "hostile-peer-body",
+        ];
+        let causes: [(TransportCause, &[&str]); 7] = [
+            (
+                TransportCause::Request {
+                    source: Arc::new(request),
+                },
+                &["builder"],
+            ),
+            (
+                TransportCause::Read {
+                    source: Arc::new(std::io::Error::other(sentinels.join(" "))),
+                },
+                &["read"],
+            ),
+            (
+                TransportCause::Read {
+                    source: Arc::new(read),
+                },
+                &["builder"],
+            ),
+            (
+                TransportCause::Deadline {
+                    budget: Duration::from_millis(500),
+                },
+                &["deadline", "500ms"],
+            ),
+            (
+                TransportCause::Status {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                },
+                &["status", "401"],
+            ),
+            (
+                TransportCause::Status {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                },
+                &["status", "429"],
+            ),
+            (
+                TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                },
+                &["status", "503"],
+            ),
+        ];
+        for (cause, context) in causes {
+            let diagnostics = [format!("{cause}"), format!("{cause:?}")];
+            let owner = ProviderError::Transport {
+                connection: "local".to_string(),
+                cause,
+            };
+            let owner_diagnostics = [format!("{owner}"), format!("{owner:?}")];
+            let model = crate::model::ModelError::Provider(owner);
+            let model_diagnostics = [format!("{model}"), format!("{model:?}")];
+            let controller = crate::controller::ControllerError::Model(model);
+            for diagnostic in diagnostics
+                .into_iter()
+                .chain(owner_diagnostics)
+                .chain(model_diagnostics)
+                .chain([format!("{controller}"), format!("{controller:?}")])
+            {
+                assert!(
+                    !diagnostic.is_empty(),
+                    "transport diagnostics must retain safe context"
+                );
+                for required in context {
+                    assert!(
+                        diagnostic.contains(required),
+                        "transport diagnostics lost typed context"
+                    );
+                }
+                for sentinel in sentinels {
+                    assert!(
+                        !diagnostic.contains(sentinel),
+                        "transport diagnostics exposed source material"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }

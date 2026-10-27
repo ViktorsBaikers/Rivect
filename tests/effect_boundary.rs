@@ -9,23 +9,425 @@ mod support;
 use rivect::contracts::{SessionId, TaskId};
 use rivect::executor::macos::{FileIdentity, WRITE_MAX_BYTES};
 use rivect::executor::{
-    EffectRequest, Executor, ExecutorError, ReadObservation, ReadWorker, WorkerError,
+    EffectRequest, ExecutorError, ReadObservation, ReadWorker, Unattested, WorkerError,
+    WriteIdentity,
 };
 use rivect::policy::{Policy, PolicyError};
 use rivect::state::{ConflictCause, StoreError};
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use support::open_world;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_unproven_borrowed_fixture_survives_scope_exit() {
+    let outer = tempfile::tempdir().expect("inert enclosing owner");
+    let directory = tempfile::Builder::new()
+        .prefix("borrowed-")
+        .tempdir_in(outer.path())
+        .expect("inert fixture");
+    let fixture = support::TempTree::from(directory);
+    let root = fixture.path.clone();
+    std::fs::write(
+        root.join("inert-fifo"),
+        b"inert fixture, never opened by a child",
+    )
+    .expect("sentinel");
+    let expected =
+        FileIdentity::from_metadata(&std::fs::symlink_metadata(&root).expect("identity"));
+    let guard = support::BorrowedNativeRoot::arm(fixture).expect("arm before borrowing");
+    let error = guard
+        .finalize(h022_unproven(0))
+        .expect_err("unproven must refuse cleanup");
+    assert!(matches!(
+        &error,
+        support::BorrowedFinalizeError::UnexpectedResult {
+            primary: Some(WorkerError::OwnedLaunch { .. }),
+            ..
+        }
+    ));
+    drop(error);
+    assert!(
+        root.is_dir(),
+        "unproven borrowed root must survive scope exit"
+    );
+    assert_eq!(
+        FileIdentity::from_metadata(&std::fs::symlink_metadata(&root).expect("retained identity")),
+        expected
+    );
+    assert!(root.join("inert-fifo").is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_borrowed_fixture_survives_unwind() {
+    let outer = tempfile::tempdir().expect("inert enclosing owner");
+    let directory = tempfile::Builder::new()
+        .prefix("unwind-")
+        .tempdir_in(outer.path())
+        .expect("inert fixture");
+    let fixture = support::TempTree::from(directory);
+    let root = fixture.path.clone();
+    let unwound = std::panic::catch_unwind(move || {
+        let _fixture = support::BorrowedNativeRoot::arm(fixture).expect("arm before launch unwind");
+        panic!("inert launch assertion unwind");
+    });
+    assert!(unwound.is_err());
+    assert!(root.is_dir(), "borrowed root must survive launch unwind");
+}
+
+#[cfg(target_os = "linux")]
+fn h022_unproven(cause: u8) -> WorkerError {
+    use rivect::executor::OwnedLaunchError;
+    use std::os::unix::process::ExitStatusExt as _;
+    let primary = match cause {
+        0 => OwnedLaunchError::Protocol {
+            source: rivect_sandbox_helper::OwnedProtocolError::Malformed,
+        },
+        1 => OwnedLaunchError::Waiter {
+            status: std::process::ExitStatus::from_raw(23 << 8),
+        },
+        2 => OwnedLaunchError::Protocol {
+            source: rivect_sandbox_helper::OwnedProtocolError::Oversize,
+        },
+        _ => OwnedLaunchError::Observation {
+            boundary: "owned.protocol.read",
+            source: std::io::Error::from_raw_os_error(104),
+        },
+    };
+    WorkerError::OwnedLaunch {
+        source: Box::new(OwnedLaunchError::Unproven {
+            primary: Box::new(WorkerError::OwnedLaunch {
+                source: Box::new(primary),
+            }),
+            release: Some(Box::new(WorkerError::OwnedLaunch {
+                source: Box::new(OwnedLaunchError::Observation {
+                    boundary: "owned.release.waiter",
+                    source: std::io::Error::from_raw_os_error(5),
+                }),
+            })),
+            locators: vec![PathBuf::from("/inert/native-custody")],
+            expected_identities: vec![FileIdentity::new(3, 9)],
+            stop: Some(rivect_sandbox_helper::OwnedStop::Deadline),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn h022_inert_fixture() -> (tempfile::TempDir, support::TempTree, PathBuf, FileIdentity) {
+    let outer = tempfile::tempdir().expect("inert enclosing owner");
+    let tree = support::TempTree::from(
+        tempfile::Builder::new()
+            .prefix("borrowed-")
+            .tempdir_in(outer.path())
+            .expect("inert fixture"),
+    );
+    let root = tree.path.clone();
+    std::fs::write(root.join("sentinel"), b"inert bytes").expect("sentinel");
+    let expected =
+        FileIdentity::from_metadata(&std::fs::symlink_metadata(&root).expect("fixture identity"));
+    (outer, tree, root, expected)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_all_unproven_causes_preserve_root_primary_and_native_custody() {
+    use rivect::executor::OwnedLaunchError;
+    for cause in 0..4 {
+        let (_outer, tree, root, expected_identity) = h022_inert_fixture();
+        let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+        let error = guard
+            .finalize(h022_unproven(cause))
+            .expect_err("unknown release cannot close");
+        let support::BorrowedFinalizeError::UnexpectedResult {
+            locator,
+            expected,
+            primary: Some(WorkerError::OwnedLaunch { source }),
+        } = error
+        else {
+            panic!("typed original primary required")
+        };
+        assert_eq!(locator, root);
+        assert_eq!(expected, Some(expected_identity));
+        let OwnedLaunchError::Unproven {
+            primary,
+            release,
+            locators,
+            expected_identities,
+            stop,
+        } = *source
+        else {
+            panic!("native custody retained")
+        };
+        assert_eq!(stop, Some(rivect_sandbox_helper::OwnedStop::Deadline));
+        assert_eq!(locators, vec![PathBuf::from("/inert/native-custody")]);
+        assert_eq!(expected_identities, vec![FileIdentity::new(3, 9)]);
+        assert!(
+            matches!(release.as_deref(), Some(WorkerError::OwnedLaunch { source }) if matches!(source.as_ref(), OwnedLaunchError::Observation { boundary: "owned.release.waiter", source } if source.raw_os_error() == Some(5)))
+        );
+        let WorkerError::OwnedLaunch { source } = *primary else {
+            panic!("typed primary retained")
+        };
+        match (cause, *source) {
+            (0, OwnedLaunchError::Protocol { source }) => {
+                assert_eq!(source, rivect_sandbox_helper::OwnedProtocolError::Malformed)
+            }
+            (1, OwnedLaunchError::Waiter { status }) => assert_eq!(status.code(), Some(23)),
+            (2, OwnedLaunchError::Protocol { source }) => {
+                assert_eq!(source, rivect_sandbox_helper::OwnedProtocolError::Oversize)
+            }
+            (3, OwnedLaunchError::Observation { boundary, source }) => {
+                assert_eq!(boundary, "owned.protocol.read");
+                assert_eq!(source.raw_os_error(), Some(104));
+            }
+            other => panic!("original cause changed: {other:?}"),
+        }
+        assert_eq!(
+            FileIdentity::from_metadata(
+                &std::fs::symlink_metadata(&root).expect("retained identity")
+            ),
+            expected_identity
+        );
+        assert_eq!(
+            std::fs::read(root.join("sentinel")).expect("retained bytes"),
+            b"inert bytes"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_verified_timeout_closes_root_explicitly() {
+    let (_outer, tree, root, _) = h022_inert_fixture();
+    let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+    assert!(matches!(
+        guard
+            .finalize(WorkerError::ConfinedRunTimedOut)
+            .expect("checked close"),
+        WorkerError::ConfinedRunTimedOut
+    ));
+    assert!(!root.exists(), "checked close must remove a verified root");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_close_failure_keeps_timeout_io_and_partial_removal_disposition() {
+    let (_outer, tree, root, expected_identity) = h022_inert_fixture();
+    let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
+        .expect("deny fixture removal");
+    let result = guard.finalize(WorkerError::ConfinedRunTimedOut);
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let error = result.expect_err("nonroot real close must report permission denied");
+        let support::BorrowedFinalizeError::Close(failure) = error else {
+            panic!("close must be a separate typed secondary")
+        };
+        let support::BorrowedCloseFailure {
+            locator,
+            expected,
+            primary,
+            disposition,
+            source,
+        } = *failure;
+        assert_eq!(locator, root);
+        assert_eq!(expected, Some(expected_identity));
+        assert!(matches!(primary, Some(WorkerError::ConfinedRunTimedOut)));
+        assert_eq!(disposition, support::BorrowedRemoval::PartialRemovalUnknown);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            source.get_ref().is_some(),
+            "tempfile path-context source remains intact"
+        );
+    }));
+    // The inert enclosing owner can recover its fixture after the actual close result.
+    if root.exists() {
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("restore inert permissions");
+    }
+    checked.expect("close failure assertions precede inert recovery");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_unexpected_result_and_success_unwind_cannot_disarm_guard() {
+    let (_outer, tree, root, _) = h022_inert_fixture();
+    let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+    let error = guard
+        .finalize(WorkerError::NotRegularFile {
+            target: root.join("sentinel"),
+        })
+        .expect_err("other errors refuse cleanup");
+    assert!(matches!(
+        error,
+        support::BorrowedFinalizeError::UnexpectedResult {
+            primary: Some(WorkerError::NotRegularFile { .. }),
+            ..
+        }
+    ));
+    assert!(root.is_dir());
+    let (_outer, tree, root, _) = h022_inert_fixture();
+    let unwound = std::panic::catch_unwind(move || {
+        let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+        let result = std::fs::read(guard.path().join("sentinel"));
+        result.expect_err("unexpected native success");
+    });
+    assert!(unwound.is_err());
+    assert!(root.is_dir());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_changed_symlink_relocated_missing_and_unreadable_identities_refuse_close() {
+    for variant in 0..5 {
+        let (outer, tree, root, original) = h022_inert_fixture();
+        let guard = support::BorrowedNativeRoot::arm(tree).expect("arm");
+        let relocated = outer.path().join("relocated");
+        let victim = outer.path().join("victim");
+        if variant < 3 {
+            std::fs::rename(&root, &relocated).expect("relocate original");
+        }
+        match variant {
+            0 => {
+                std::fs::create_dir(&root).expect("substitute directory");
+                std::fs::write(root.join("substitute"), b"keep substitute")
+                    .expect("substitute bytes");
+            }
+            1 => {
+                std::fs::create_dir(&victim).expect("victim");
+                std::fs::write(victim.join("sentinel"), b"keep victim").expect("victim bytes");
+                symlink(&victim, &root).expect("substitute symlink");
+            }
+            2 => {}
+            3 => {
+                std::fs::remove_file(root.join("sentinel")).expect("remove inert sentinel");
+                std::fs::remove_dir(&root).expect("missing inert root");
+            }
+            4 => std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o000))
+                .expect("deny identity read"),
+            _ => unreachable!(),
+        }
+        let result = guard.finalize(WorkerError::ConfinedRunTimedOut);
+        if variant == 4 {
+            std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restore inert access");
+        }
+        let support::BorrowedFinalizeError::Identity(failure) =
+            result.expect_err("identity uncertainty must refuse cleanup")
+        else {
+            panic!("typed identity refusal required")
+        };
+        let support::BorrowedIdentityFailure {
+            locator,
+            expected,
+            primary,
+            observed,
+            observed_directory,
+            source,
+        } = *failure;
+        assert_eq!(locator, root);
+        assert_eq!(expected, Some(original));
+        assert!(matches!(primary, Some(WorkerError::ConfinedRunTimedOut)));
+        match variant {
+            0 => {
+                assert!(observed.is_some_and(|value| value != original));
+                assert_eq!(observed_directory, Some(true));
+                assert!(source.is_none());
+                assert_eq!(
+                    std::fs::read(root.join("substitute")).expect("substitute remains"),
+                    b"keep substitute"
+                );
+            }
+            1 => {
+                assert!(observed.is_some_and(|value| value != original));
+                assert_eq!(observed_directory, Some(false));
+                assert!(source.is_none());
+                assert_eq!(
+                    std::fs::read(victim.join("sentinel")).expect("victim remains"),
+                    b"keep victim"
+                );
+            }
+            2 | 3 => {
+                assert!(observed.is_none() && observed_directory.is_none());
+                assert_eq!(
+                    source.expect("missing identity cause").kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            4 => {
+                assert!(observed.is_none() && observed_directory.is_none());
+                assert_eq!(
+                    source.expect("read identity cause").kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    std::fs::read(root.join("sentinel")).expect("inert original remains"),
+                    b"inert bytes"
+                );
+            }
+            _ => unreachable!(),
+        }
+        if variant < 3 {
+            assert_eq!(
+                std::fs::read(relocated.join("sentinel")).expect("relocated bytes remain"),
+                b"inert bytes"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn h022_arm_refusal_keeps_locator_and_only_observed_identity() {
+    for symlinked in [false, true] {
+        let (outer, tree, root, _) = h022_inert_fixture();
+        let relocated = outer.path().join("original");
+        std::fs::rename(&root, &relocated).expect("move inert original");
+        if symlinked {
+            symlink(&relocated, &root).expect("arm symlink");
+        }
+        let result = support::BorrowedNativeRoot::arm(tree);
+        let Err(support::BorrowedFinalizeError::ArmIdentity(failure)) = result else {
+            panic!("arm must refuse before launch")
+        };
+        let support::BorrowedIdentityFailure {
+            locator,
+            expected,
+            primary,
+            observed,
+            observed_directory,
+            source,
+        } = *failure;
+        assert_eq!(locator, root);
+        assert!(primary.is_none());
+        if symlinked {
+            let identity = FileIdentity::from_metadata(
+                &std::fs::symlink_metadata(&root).expect("symlink remains"),
+            );
+            assert_eq!(expected, Some(identity));
+            assert_eq!(observed, Some(identity));
+            assert_eq!(observed_directory, Some(false));
+            assert!(source.is_none());
+        } else {
+            assert!(expected.is_none() && observed.is_none() && observed_directory.is_none());
+            assert_eq!(
+                source.expect("arm io cause").kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        assert_eq!(
+            std::fs::read(relocated.join("sentinel")).expect("original remains"),
+            b"inert bytes"
+        );
+    }
+}
+
 fn freeze_brief_answer(world: &mut support::World, session: &SessionId, task: &TaskId) {
     let question = world.publish(session, task);
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .answer_question(
             session,
             task,
@@ -40,14 +442,7 @@ fn freeze_brief_answer(world: &mut support::World, session: &SessionId, task: &T
 }
 
 fn managed_write_fixture(tag: &str) -> (support::World, SessionId, TaskId, PathBuf, String) {
-    static BUILD: Once = Once::new();
-    BUILD.call_once(|| {
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "-p", "rivect-sandbox-helper"])
-            .status()
-            .expect("spawn helper build");
-        assert!(status.success(), "helper build failed: {status}");
-    });
+    support::ensure_helper();
     let mut world = open_world(tag, None);
     let session = world.open_session(&format!("{tag}-session"));
     let task = world.create_task(&session, &format!("{tag}-task"));
@@ -56,7 +451,7 @@ fn managed_write_fixture(tag: &str) -> (support::World, SessionId, TaskId, PathB
     let file = scope.join("target.txt");
     std::fs::write(&file, b"original").expect("create managed-write target");
     let grant = world.runtime.set_read_scope(scope, file.clone());
-    world.runtime.read_worker = Box::new(rivect::executor::macos::MacosReadWorker);
+    world.runtime.read_worker = Box::new(support::PlatformWorker::default());
     (world, session, task, file, grant)
 }
 
@@ -65,15 +460,11 @@ fn read_admit_fails_closed_when_deny_covers_target() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("mode-deny-read-admit");
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrollment on read target");
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -89,8 +480,7 @@ fn read_admit_fails_closed_when_deny_covers_target() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .latest_unresolved_attempt(&task)
             .expect("read unresolved attempts"),
         None,
@@ -108,7 +498,7 @@ fn decision_step_denies_dispatch_when_deny_covers_scoped_file() {
     freeze_brief_answer(&mut world, &session, &task);
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrollment on scoped file");
     let outcome = world
@@ -170,11 +560,7 @@ fn decision_step_fails_closed_when_scope_is_unobservable() {
 fn read_rechecks_mode_verdict_between_admit_and_execute() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("read-redecide-deny");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -188,16 +574,12 @@ fn read_rechecks_mode_verdict_between_admit_and_execute() {
     };
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrolled after admission");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("a deny enrolled after admission must block the read")
@@ -206,8 +588,7 @@ fn read_rechecks_mode_verdict_between_admit_and_execute() {
     assert!(matches!(error, ExecutorError::ModeDenied), "{error}");
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -219,11 +600,7 @@ fn read_rechecks_mode_verdict_between_admit_and_execute() {
 fn execute_settles_rejected_when_context_fails() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("execute-context-fail");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -244,11 +621,7 @@ fn execute_settles_rejected_when_context_fails() {
     symlink(&outside, &file).expect("swap target for out-of-scope symlink");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("an out-of-scope target must fail the re-consult")
@@ -264,8 +637,7 @@ fn execute_settles_rejected_when_context_fails() {
     // reason, never left planned forever.
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -278,11 +650,7 @@ fn execute_unconfirmed_settles_rejected_when_context_fails() {
     let (mut world, _session, task, file, grant) =
         managed_write_fixture("unconfirmed-context-fail");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -300,11 +668,7 @@ fn execute_unconfirmed_settles_rejected_when_context_fails() {
     symlink(&outside, &file).expect("swap target for out-of-scope symlink");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_unconfirmed(&admitted)
             .expect_err("an out-of-scope target must fail the re-consult")
@@ -318,8 +682,7 @@ fn execute_unconfirmed_settles_rejected_when_context_fails() {
     );
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -331,11 +694,7 @@ fn execute_unconfirmed_settles_rejected_when_context_fails() {
 fn execute_settles_rejected_when_grant_revoked() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("execute-grant-revoked");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -347,14 +706,10 @@ fn execute_settles_rejected_when_grant_revoked() {
             )
             .expect("manual scoped read admits")
     };
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("revoked grant must reject the read")
@@ -369,8 +724,7 @@ fn execute_settles_rejected_when_grant_revoked() {
     // rejected with the error's reason, never planned forever.
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -383,11 +737,7 @@ fn execute_unconfirmed_settles_rejected_when_grant_revoked() {
     let (mut world, _session, task, file, grant) =
         managed_write_fixture("unconfirmed-grant-revoked");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -399,14 +749,10 @@ fn execute_unconfirmed_settles_rejected_when_grant_revoked() {
             )
             .expect("manual scoped read admits")
     };
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_unconfirmed(&admitted)
             .expect_err("revoked grant must reject the read")
@@ -421,8 +767,7 @@ fn execute_unconfirmed_settles_rejected_when_grant_revoked() {
     // rejected with the error's reason, never planned forever.
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -434,50 +779,46 @@ fn execute_unconfirmed_settles_rejected_when_grant_revoked() {
 fn execute_settles_rejected_when_grant_unknown() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("execute-grant-unknown");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
                 EffectRequest::Read {
-                    grant_id: grant.clone(),
-                    path: file,
+                    grant_id: grant,
+                    path: file.clone(),
                 },
                 rivect::policy::PermissionMode::Manual,
             )
             .expect("manual scoped read admits")
     };
-    // The grant registry forgets the admission between admission and
-    // execution (an owner restart reopens a fresh policy): the grant
-    // re-check must settle the attempt rejected with the typed
+    // The execute-time grant gate sees a grant id the registry never
+    // minted (what a fresh policy after an owner restart reports): the
+    // grant re-check must settle the attempt rejected with the typed
     // unknown-grant error, never leave it planned forever.
-    world.runtime.policy = Policy::default();
+    let never_minted = "grant-never-minted".to_string();
+    let mut forged = admitted.clone();
+    forged.request = EffectRequest::Read {
+        grant_id: never_minted.clone(),
+        path: file,
+    };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
-            .execute(&admitted)
+            .execute(&forged)
             .expect_err("unknown grant must reject the read")
     };
 
     assert!(matches!(
         &error,
         ExecutorError::Policy(PolicyError::UnknownGrant { grant_id: unknown })
-            if unknown == &grant
+            if unknown == &never_minted
     ));
     // Settled-ness oracle: the failed grant gate settles the attempt
     // rejected with the error's reason, never planned forever.
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt readable")
         .expect("read attempt exists");
@@ -502,7 +843,7 @@ impl ReadWorker for PostMutationFailureWorker {
         &mut self,
         _scope_root: &Path,
         target: &Path,
-        _expected: FileIdentity,
+        _expected: WriteIdentity,
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         let file = std::fs::OpenOptions::new()
@@ -535,7 +876,7 @@ impl ReadWorker for ConfinedTimeoutWorker {
         &mut self,
         _scope_root: &Path,
         _target: &Path,
-        _expected: FileIdentity,
+        _expected: WriteIdentity,
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         Err(WorkerError::ConfinedRunTimedOut)
@@ -562,7 +903,7 @@ impl ReadWorker for ConfinedKilledWorker {
         &mut self,
         _scope_root: &Path,
         _target: &Path,
-        _expected: FileIdentity,
+        _expected: WriteIdentity,
         _bytes: &[u8],
     ) -> Result<(), WorkerError> {
         Err(WorkerError::ConfinedRunKilled {
@@ -575,11 +916,7 @@ impl ReadWorker for ConfinedKilledWorker {
 fn managed_write_rejects_occupant_swap_without_touching_new_file() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-occupant");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -591,15 +928,15 @@ fn managed_write_rejects_occupant_swap_without_touching_new_file() {
             )
             .expect("managed write admission")
     };
+    // Pin the old inode under a sibling name so the recreated occupant
+    // cannot reuse its (dev, ino): the swap stays a different file.
+    std::fs::hard_link(&file, file.with_file_name("admitted-occupant.pinned"))
+        .expect("pin the admitted occupant's inode");
     std::fs::remove_file(&file).expect("remove admitted occupant");
     std::fs::write(&file, b"new occupant").expect("replace admitted occupant");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("occupant swap must deny the write")
@@ -613,8 +950,7 @@ fn managed_write_rejects_occupant_swap_without_touching_new_file() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .latest_unresolved_attempt(&task)
             .expect("read unresolved managed write attempt"),
         None
@@ -629,11 +965,7 @@ fn managed_write_rejects_occupant_swap_without_touching_new_file() {
 fn managed_write_writes_exact_bytes_on_checked_fd() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-control");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -647,11 +979,7 @@ fn managed_write_writes_exact_bytes_on_checked_fd() {
     };
 
     {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect("matching managed write")
@@ -668,11 +996,7 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
     let (mut world, session, task, file, grant) = managed_write_fixture("managed-write-unknown");
     world.runtime.read_worker = Box::new(PostMutationFailureWorker);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -686,11 +1010,7 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("post-mutation failure must surface")
@@ -706,8 +1026,7 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
     );
     let attempt_id = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("read managed write snapshot")
         .attempts
@@ -719,8 +1038,7 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
         .clone();
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt_id)
         .expect("read managed write attempt")
         .expect("managed write attempt exists");
@@ -737,8 +1055,7 @@ fn managed_write_records_unknown_after_post_mutation_failure() {
     // may settle the task while the target's bytes stay unattributed.
     let completion = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("an unknown attempt must block task completion");
     assert!(
@@ -755,11 +1072,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
     let (mut world, session, task, file, grant) = managed_write_fixture("write-timeout-unknown");
     world.runtime.read_worker = Box::new(ConfinedTimeoutWorker);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -773,11 +1086,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("confined timeout must surface")
@@ -792,8 +1101,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
     );
     let attempt_id = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("read managed write snapshot")
         .attempts
@@ -805,8 +1113,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
         .clone();
     let (_, state, _detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt_id)
         .expect("write attempt")
         .expect("managed write attempt exists");
@@ -816,8 +1123,7 @@ fn managed_write_confined_timeout_records_unknown_and_blocks_completion() {
 
     let completion = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("an unknown attempt must block task completion");
     assert!(
@@ -834,11 +1140,7 @@ fn read_confined_timeout_settles_rejected() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("read-timeout-rejected");
     world.runtime.read_worker = Box::new(ConfinedTimeoutWorker);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -852,11 +1154,7 @@ fn read_confined_timeout_settles_rejected() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("confined timeout must surface")
@@ -871,8 +1169,7 @@ fn read_confined_timeout_settles_rejected() {
     );
     let (_, state, _detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt")
         .expect("read attempt exists");
@@ -886,11 +1183,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
     let (mut world, session, task, file, grant) = managed_write_fixture("write-kill-unknown");
     world.runtime.read_worker = Box::new(ConfinedKilledWorker);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -904,11 +1197,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("a killed confined run must surface")
@@ -929,8 +1218,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
     );
     let attempt_id = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("read managed write snapshot")
         .attempts
@@ -942,8 +1230,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
         .clone();
     let (_, state, _detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt_id)
         .expect("write attempt")
         .expect("managed write attempt exists");
@@ -953,8 +1240,7 @@ fn managed_write_confined_kill_records_unknown_and_blocks_completion() {
 
     let completion = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("an unknown attempt must block task completion");
     assert!(
@@ -971,11 +1257,7 @@ fn read_confined_kill_settles_rejected() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("read-kill-rejected");
     world.runtime.read_worker = Box::new(ConfinedKilledWorker);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -989,11 +1271,7 @@ fn read_confined_kill_settles_rejected() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("a killed confined run must surface")
@@ -1008,8 +1286,7 @@ fn read_confined_kill_settles_rejected() {
     );
     let (_, state, _detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("read attempt")
         .expect("read attempt exists");
@@ -1030,14 +1307,10 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
     let scope = file.parent().expect("scope").to_path_buf();
     let write_grant = world
         .runtime
-        .policy
+        .policy_writer()
         .grant_classes(scope, vec![rivect::contracts::EffectClass::Write]);
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -1052,11 +1325,7 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
     };
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("a killed confined run must surface")
@@ -1075,8 +1344,7 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
     );
     let (_, state, _detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted.attempt_id)
         .expect("write attempt")
         .expect("generic write attempt exists");
@@ -1084,8 +1352,7 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
 
     let completion = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("an unknown attempt must block task completion");
     assert!(
@@ -1101,11 +1368,7 @@ fn generic_write_confined_kill_records_unknown_and_blocks_completion() {
 fn managed_write_truncates_longer_occupant_to_exact_bytes() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-shrink");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -1119,11 +1382,7 @@ fn managed_write_truncates_longer_occupant_to_exact_bytes() {
     };
 
     {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect("shrinking managed write")
@@ -1154,10 +1413,9 @@ fn managed_write_rejects_opened_fd_identity_mismatch_after_path_swap() {
         (opened_metadata.dev(), opened_metadata.ino()),
         "path and opened-fd identities must diverge"
     );
-    let expected = FileIdentity {
-        dev: path_metadata.dev(),
-        ino: path_metadata.ino(),
-    };
+    let expected =
+        rivect::executor::write_target_identity(file.parent().expect("managed-write scope"), &file)
+            .expect("take the path occupant's write identity");
     let error = rivect::executor::macos::write_once_on_opened_file(
         file.parent().expect("managed-write scope"),
         &file,
@@ -1186,10 +1444,10 @@ fn managed_write_rejects_opened_fd_identity_mismatch_after_path_swap() {
 fn managed_write_rejects_oversized_payload_without_touching_target() {
     let (_world, _session, _task, file, _grant) = managed_write_fixture("managed-write-too-large");
     let bytes = vec![b'x'; WRITE_MAX_BYTES + 1];
-    let error = rivect::executor::macos::write_once(
+    let error = rivect::executor::write_once(
         file.parent().expect("managed-write scope"),
         &file,
-        FileIdentity { dev: 0, ino: 0 },
+        WriteIdentity::new(FileIdentity::new(0, 0), Err(Unattested::Unrecorded)),
         &bytes,
     )
     .expect_err("oversized managed write must deny");
@@ -1207,27 +1465,29 @@ fn publish_intent_rejects_occupant_swap_after_staging() {
     // checked-fd primitive: a staged identity that no longer occupies the
     // target denies the publication write before any byte lands.
     let (mut world, _session, _task, file, _grant) = managed_write_fixture("publish-occupant");
-    let staged = std::fs::metadata(&file).expect("inspect staged occupant");
+    let staged =
+        rivect::executor::write_target_identity(file.parent().expect("publication scope"), &file)
+            .expect("take the staged occupant's write identity");
     let intent = rivect::config::PublicationIntent {
         owner: "publish-occupant-owner".to_string(),
         target: file.display().to_string(),
         admission_seq: 1,
         intended_digest: String::new(),
         base_digest: None,
-        publish_identity: Some(rivect::config::PublishIdentity {
-            dev: staged.dev(),
-            ino: staged.ino(),
-        }),
+        publish_identity: Some(staged),
     };
+    // Pin the old inode under a sibling name so the recreated occupant
+    // cannot reuse its (dev, ino): the swap stays a different file.
+    std::fs::hard_link(&file, file.with_file_name("staged-occupant.pinned"))
+        .expect("pin the staged occupant's inode");
     std::fs::remove_file(&file).expect("remove staged occupant");
     std::fs::write(&file, b"new occupant").expect("replace staged occupant");
 
-    let error = rivect::config::publish_intent(
-        &mut world.runtime.owner.store,
-        &intent,
-        b"publication bytes",
-    )
-    .expect_err("occupant swap must deny the publication write");
+    let error = world
+        .runtime
+        .store_writer()
+        .publish_intent(&intent, b"publication bytes")
+        .expect_err("occupant swap must deny the publication write");
 
     assert!(matches!(
         error,
@@ -1244,11 +1504,7 @@ fn publish_intent_rejects_occupant_swap_after_staging() {
 fn managed_write_rechecks_revoked_grant_before_writing() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-revoked");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -1260,14 +1516,10 @@ fn managed_write_rechecks_revoked_grant_before_writing() {
             )
             .expect("managed write admission")
     };
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("revoked grant must reject the write")
@@ -1286,8 +1538,7 @@ fn managed_write_rechecks_revoked_grant_before_writing() {
     // rejected with the error's reason, never planned forever.
     let attempt_id = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("read managed write snapshot")
         .attempts
@@ -1299,8 +1550,7 @@ fn managed_write_rechecks_revoked_grant_before_writing() {
         .clone();
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt_id)
         .expect("managed write attempt readable")
         .expect("managed write attempt exists");
@@ -1312,11 +1562,7 @@ fn managed_write_rechecks_revoked_grant_before_writing() {
 fn managed_write_rechecks_cancel_before_writing() {
     let (mut world, session, task, file, grant) = managed_write_fixture("managed-write-cancel");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -1330,17 +1576,12 @@ fn managed_write_rechecks_cancel_before_writing() {
     };
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .cancel_task(&session, &task, 1, Some("cancel before managed write"))
         .expect("cancel managed write task");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("cancelled task must reject the write")
@@ -1357,11 +1598,7 @@ fn managed_write_rechecks_cancel_before_writing() {
 fn managed_write_rechecks_deny_before_writing() {
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-deny");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit_managed_write(
                 &task,
@@ -1375,16 +1612,12 @@ fn managed_write_rechecks_deny_before_writing() {
     };
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("enroll deny between admission and write");
 
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute_managed_write(&admitted)
             .expect_err("mid-flight deny must reject the write")
@@ -1395,32 +1628,6 @@ fn managed_write_rechecks_deny_before_writing() {
         std::fs::read(&file).expect("read denied target"),
         b"original"
     );
-}
-
-struct TempTree {
-    path: PathBuf,
-}
-
-impl TempTree {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "rivect-effect-boundary-{name}-{}",
-            std::process::id()
-        ));
-        if path.exists() {
-            std::fs::remove_dir_all(&path).expect("remove stale fixture");
-        }
-        std::fs::create_dir_all(&path).expect("create fixture");
-        Self { path }
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            drop(std::fs::remove_dir_all(&self.path));
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -1459,7 +1666,7 @@ impl Drop for UnreadableDir {
 
 #[test]
 fn collapsed_tail_reentry_is_denied_without_denial_of_strict_prefix() {
-    let fixture = TempTree::new("collapsed-tail");
+    let fixture = support::TempTree::new("effect-boundary", "collapsed-tail");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
     policy
@@ -1478,7 +1685,7 @@ fn collapsed_tail_reentry_is_denied_without_denial_of_strict_prefix() {
 
 #[test]
 fn existing_cancelled_tail_keeps_strict_prefix_allowed() {
-    let fixture = TempTree::new("existing-tail");
+    let fixture = support::TempTree::new("effect-boundary", "existing-tail");
     std::fs::create_dir_all(fixture.path.join("R/y")).expect("create existing tail");
     let mut policy = Policy::default();
     policy
@@ -1492,7 +1699,7 @@ fn existing_cancelled_tail_keeps_strict_prefix_allowed() {
 #[cfg(unix)]
 #[test]
 fn missing_prefix_reentry_resumes_symlink_resolution() {
-    let fixture = TempTree::new("missing-reentry");
+    let fixture = support::TempTree::new("effect-boundary", "missing-reentry");
     std::fs::create_dir_all(fixture.path.join("allowed")).expect("create allowed");
     std::fs::create_dir_all(fixture.path.join("denied")).expect("create denied");
     std::fs::write(fixture.path.join("denied/kid"), b"denied").expect("create denied target");
@@ -1513,7 +1720,7 @@ fn missing_prefix_reentry_resumes_symlink_resolution() {
 
 #[test]
 fn fold_equivalent_reentry_keeps_missing_suffix() {
-    let fixture = TempTree::new("fold");
+    let fixture = support::TempTree::new("effect-boundary", "fold");
     let mut policy = Policy::default();
     policy
         .enroll_deny(fixture.path.join("other"))
@@ -1527,7 +1734,7 @@ fn fold_equivalent_reentry_keeps_missing_suffix() {
 
 #[test]
 fn nfd_and_nfc_names_share_deny_identity() {
-    let fixture = TempTree::new("unicode");
+    let fixture = support::TempTree::new("effect-boundary", "unicode");
     let mut policy = Policy::default();
     policy
         .enroll_deny(fixture.path.join("caf\u{00e9}"))
@@ -1538,7 +1745,7 @@ fn nfd_and_nfc_names_share_deny_identity() {
 
 #[test]
 fn full_casefold_is_not_ascii_lowercasing() {
-    let fixture = TempTree::new("casefold");
+    let fixture = support::TempTree::new("effect-boundary", "casefold");
     let mut policy = Policy::default();
     policy
         .enroll_deny(fixture.path.join("Maße"))
@@ -1549,7 +1756,7 @@ fn full_casefold_is_not_ascii_lowercasing() {
 
 #[test]
 fn deny_can_be_revoked_without_affecting_other_paths() {
-    let fixture = TempTree::new("revoke");
+    let fixture = support::TempTree::new("effect-boundary", "revoke");
     let mut policy = Policy::default();
     policy
         .enroll_deny(fixture.path.join("other"))
@@ -1569,7 +1776,7 @@ fn deny_can_be_revoked_without_affecting_other_paths() {
 
 #[test]
 fn revoke_matches_components_after_collapsed_enrollment() {
-    let fixture = TempTree::new("revoke-collapsed");
+    let fixture = support::TempTree::new("effect-boundary", "revoke-collapsed");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
     policy
@@ -1585,7 +1792,7 @@ fn revoke_matches_components_after_collapsed_enrollment() {
 
 #[test]
 fn revoke_matches_components_after_widening() {
-    let fixture = TempTree::new("revoke-widened");
+    let fixture = support::TempTree::new("effect-boundary", "revoke-widened");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
     policy
@@ -1618,7 +1825,7 @@ fn revoke_matches_component_set_for_each_tail_flag() {
         policy.covers(request)
     }
 
-    let fixture = TempTree::new("revoke-tail-flags");
+    let fixture = support::TempTree::new("effect-boundary", "revoke-tail-flags");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let strict = fixture.path.join("R/y/..");
     let wide = fixture.path.join("R");
@@ -1649,7 +1856,7 @@ fn revoke_matches_component_set_for_each_tail_flag() {
 
 #[test]
 fn relative_paths_are_rejected_and_covered_fail_closed() {
-    let fixture = TempTree::new("relative");
+    let fixture = support::TempTree::new("effect-boundary", "relative");
     let denied = fixture.path.join("P0/other");
     let mut policy = Policy::default();
     policy.enroll_deny(&denied).expect("deny enrollment");
@@ -1675,7 +1882,7 @@ fn relative_paths_are_rejected_and_covered_fail_closed() {
 
 #[test]
 fn re_enrollment_after_lookup_state_change_matches_fresh_policy() {
-    let fixture = TempTree::new("reenroll");
+    let fixture = support::TempTree::new("effect-boundary", "reenroll");
     let expression = fixture.path.join("R/y/..");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
@@ -1689,7 +1896,7 @@ fn re_enrollment_after_lookup_state_change_matches_fresh_policy() {
 
 #[test]
 fn wider_flagless_identity_replaces_strict_identity() {
-    let fixture = TempTree::new("identity-width");
+    let fixture = support::TempTree::new("effect-boundary", "identity-width");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
     policy
@@ -1704,7 +1911,7 @@ fn wider_flagless_identity_replaces_strict_identity() {
 
 #[test]
 fn wider_flagless_identity_wins_in_reverse_order() {
-    let fixture = TempTree::new("identity-width-reverse");
+    let fixture = support::TempTree::new("effect-boundary", "identity-width-reverse");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create R");
     let mut policy = Policy::default();
     policy
@@ -1720,7 +1927,7 @@ fn wider_flagless_identity_wins_in_reverse_order() {
 #[cfg(unix)]
 #[test]
 fn leaf_symlink_reentry_uses_target_identity() {
-    let fixture = TempTree::new("leaf-symlink");
+    let fixture = support::TempTree::new("effect-boundary", "leaf-symlink");
     std::fs::create_dir_all(fixture.path.join("denied/R")).expect("create denied tree");
     std::fs::write(fixture.path.join("denied/R/kid"), b"denied").expect("create denied leaf");
     symlink(fixture.path.join("denied/R/kid"), fixture.path.join("trap"))
@@ -1737,7 +1944,7 @@ fn leaf_symlink_reentry_uses_target_identity() {
 #[cfg(unix)]
 #[test]
 fn symlink_reentry_uses_target_identity() {
-    let fixture = TempTree::new("directory-symlink");
+    let fixture = support::TempTree::new("effect-boundary", "directory-symlink");
     std::fs::create_dir_all(fixture.path.join("R")).expect("create fixture");
     symlink(fixture.path.join("R"), fixture.path.join("alias")).expect("create symlink");
 
@@ -1753,7 +1960,7 @@ fn symlink_reentry_uses_target_identity() {
 #[cfg(unix)]
 #[test]
 fn observation_failure_fails_closed() {
-    let fixture = TempTree::new("symlink-loop");
+    let fixture = support::TempTree::new("effect-boundary", "symlink-loop");
     let loop_path = fixture.path.join("loop");
     symlink("loop", &loop_path).expect("create symlink loop");
     let policy = Policy::default();
@@ -1768,7 +1975,7 @@ fn observation_failure_fails_closed() {
 #[cfg(unix)]
 #[test]
 fn unreadable_directory_observation_fails_closed() {
-    let fixture = TempTree::new("unreadable-directory");
+    let fixture = support::TempTree::new("effect-boundary", "unreadable-directory");
     let blocked = fixture.path.join("blocked");
     std::fs::create_dir(&blocked).expect("create blocked directory");
     let _permissions = UnreadableDir::new(blocked.clone());
@@ -1921,11 +2128,7 @@ fn allowed_control_still_reaches_the_resource() {
     let payload = b"exact \x1b]52;c;aGVsbG8=\x07 bytes\n\x00\x07";
     std::fs::write(&file, payload).expect("seed hostile content");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -1938,11 +2141,7 @@ fn allowed_control_still_reaches_the_resource() {
             .expect("manual scoped read admits")
     };
     let outcome = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor.execute(&admitted).expect("scoped read executes")
     };
     // The permitted endpoint keeps its exact bytes: sanitization lives
@@ -2203,7 +2402,7 @@ fn typed_error_settlement_marks_the_stream_failed_never_complete() {
     freeze_brief_answer(&mut world, &session, &task);
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrollment on scoped file");
     let outcome = world
@@ -2488,7 +2687,7 @@ fn preapproval_scope_rejects_empty_or_colliding_grant_ids() {
 fn preapproval_scope_skips_non_utf8_canonical_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    let fixture = TempTree::new("preapproval-non-utf8");
+    let fixture = support::TempTree::new("effect-boundary", "preapproval-non-utf8");
     let target = fixture.path.join(OsStr::from_bytes(b"not-\xff-utf8"));
     std::fs::create_dir_all(&target).expect("non-utf8 dir");
     let link = fixture.path.join("link");
@@ -2539,7 +2738,7 @@ fn execute_time_cancel_is_cancelled_error_for_every_effect_class() {
             Class::Write => EffectRequest::Write {
                 grant_id: world
                     .runtime
-                    .policy
+                    .policy_writer()
                     .grant_classes(scope.clone(), vec![Class::Write]),
                 path: file.clone(),
                 bytes: b"must not land".to_vec(),
@@ -2548,41 +2747,35 @@ fn execute_time_cancel_is_cancelled_error_for_every_effect_class() {
                 let program = scope.join("true");
                 std::fs::copy("/usr/bin/true", &program).expect("copy true");
                 EffectRequest::Exec {
-                    grant_id: world.runtime.policy.grant_classes(scope, vec![Class::Exec]),
+                    grant_id: world
+                        .runtime
+                        .policy_writer()
+                        .grant_classes(scope, vec![Class::Exec]),
                     program,
                 }
             }
             Class::Egress => EffectRequest::Egress {
                 grant_id: world
                     .runtime
-                    .policy
+                    .policy_writer()
                     .grant_classes(scope, vec![Class::Egress]),
                 url: "https://example.invalid/cancel".to_string(),
             },
             Class::Model | Class::Control => continue,
         };
         let admitted = {
-            let mut executor = Executor::new(
-                &mut world.runtime.policy,
-                &mut world.runtime.owner.store,
-                world.runtime.read_worker.as_mut(),
-            );
+            let mut executor = world.runtime.executor();
             executor
                 .admit(&task, request, PermissionMode::Yolo)
                 .unwrap_or_else(|error| panic!("{class:?} admit: {error}"))
         };
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .cancel_task(&session, &task, 1, Some("cancel before execute"))
             .expect("cancel");
         let error = {
-            let mut executor = Executor::new(
-                &mut world.runtime.policy,
-                &mut world.runtime.owner.store,
-                world.runtime.read_worker.as_mut(),
-            );
+            let mut executor = world.runtime.executor();
             executor
                 .execute(&admitted)
                 .expect_err("execute-time cancel")
@@ -2607,19 +2800,15 @@ fn execute_time_cancel_is_cancelled_error_for_every_effect_class() {
 /// admitted as a read effect. In-flight kill of a confined child blocked
 /// on I/O is the wall-deadline path (`run_confined_kills_a_hung_fifo_gate`
 /// in the platform sandbox suites): `ConfinedRunTimedOut` after
-/// `terminate_confined_child` SIGKILLs the process group — the child is
-/// dead, not merely denied.
+/// the owning native helper confirms release. An unproven release
+/// keeps the borrowed fixture and fails checked finalization.
 #[cfg(unix)]
 #[test]
 fn execute_entry_cancel_is_cancelled_in_flight_kill_is_hung_fifo_deadline() {
     use rivect::policy::PermissionMode;
     let (mut world, session, task, file, grant) = managed_write_fixture("execute-entry-cancel-pin");
     let admitted = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .admit(
                 &task,
@@ -2633,16 +2822,11 @@ fn execute_entry_cancel_is_cancelled_in_flight_kill_is_hung_fifo_deadline() {
     };
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .cancel_task(&session, &task, 1, Some("execute-entry pin"))
         .expect("cancel");
     let error = {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         executor
             .execute(&admitted)
             .expect_err("execute-entry cancel")
@@ -2652,13 +2836,23 @@ fn execute_entry_cancel_is_cancelled_in_flight_kill_is_hung_fifo_deadline() {
         "execute-entry cancel must be Cancelled, got {error}"
     );
 
-    let fixture = TempTree::new("hung-fifo-deadline");
+    let mut fixture = support::TempTree::new("effect-boundary", "hung-fifo-deadline");
     let fifo = fixture.path.join("hung.fifo");
-    let status = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .expect("mkfifo");
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if status.is_err() {
+        fixture.retain();
+    }
+    let status = status.expect("mkfifo");
     assert!(status.success(), "mkfifo failed: {status}");
+    #[cfg(target_os = "linux")]
+    let error = {
+        let fixture = support::BorrowedNativeRoot::arm(fixture).expect("arm borrowed FIFO root");
+        let error = hung_fifo_confined_timeout(fixture.path(), &fifo);
+        fixture
+            .finalize(error)
+            .expect("verify borrowed FIFO release and close")
+    };
+    #[cfg(not(target_os = "linux"))]
     let error = hung_fifo_confined_timeout(&fixture.path, &fifo);
     assert!(
         matches!(error, WorkerError::ConfinedRunTimedOut),
@@ -2689,4 +2883,68 @@ fn hung_fifo_confined_timeout(scope: &Path, fifo: &Path) -> WorkerError {
         &[fifo.as_os_str()],
     )
     .expect_err("a hung fifo must hit the wall deadline")
+}
+
+#[test]
+fn support_roots_are_removed_only_by_their_owner() {
+    let tree = support::TempTree::new("support-provider", "owned");
+    let tree_root = tree.path.clone();
+    assert!(
+        tree_root.is_dir(),
+        "a tree root exists while its owner lives"
+    );
+    drop(tree);
+    assert!(!tree_root.exists(), "the tree root is gone after its owner");
+
+    let world = open_world("support-provider", None);
+    let world_root = world.root.clone();
+    assert!(world_root.is_dir(), "a world root exists while it lives");
+    drop(world);
+    assert!(!world_root.exists(), "the world root is gone after it");
+
+    let injected = support::open_world_with(
+        "support-provider-with",
+        None,
+        Box::new(rivect::providers::LoopbackProvider::new()),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let injected_root = injected.root.clone();
+    assert!(injected_root.is_dir(), "an injected world root exists");
+    drop(injected);
+    assert!(!injected_root.exists(), "the injected world root is gone");
+
+    let caller =
+        tempfile::TempDir::with_prefix("rivect-support-provider-at-").expect("caller-owned root");
+    let caller_root = caller.path().to_path_buf();
+    let at = support::open_world_at(caller.path(), None);
+    drop(at);
+    assert!(
+        caller_root.is_dir(),
+        "a world over a caller-owned root leaves it in place"
+    );
+    drop(caller);
+    assert!(!caller_root.exists(), "the caller's owner removes it");
+}
+
+#[test]
+fn support_retain_root_keeps_its_root_until_the_enclosing_owner_drops() {
+    let enclosing =
+        tempfile::TempDir::with_prefix("rivect-support-retain-").expect("enclosing root");
+    let mut first = tempfile::TempDir::with_prefix_in("rivect-support-first-", enclosing.path())
+        .expect("first root");
+    let second = tempfile::TempDir::with_prefix_in("rivect-support-second-", enclosing.path())
+        .expect("second root");
+    let first_path = first.path().to_path_buf();
+    let second_path = second.path().to_path_buf();
+    support::retain_root(&mut first);
+    assert_eq!(first.path(), first_path, "retention leaves the path alone");
+    drop(first);
+    assert!(first_path.is_dir(), "a retained root outlives its TempDir");
+    drop(second);
+    assert!(!second_path.exists(), "an unretained root is removed");
+    drop(enclosing);
+    assert!(
+        !first_path.exists(),
+        "the enclosing owner removes the retained root"
+    );
 }

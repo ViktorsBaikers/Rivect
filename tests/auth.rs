@@ -1339,7 +1339,10 @@ fn concurrent_refresh_on_one_profile_serializes_to_a_single_in_flight_operation(
         outcome_variant(&leader_outcome)
     );
     assert!(
-        leader_outcome == joiner_outcome,
+        matches!((&leader_outcome, &joiner_outcome),
+            (Err(ProviderError::StoreUnavailable { store: StoreKind::Keychain, reason: leader_reason }),
+             Err(ProviderError::StoreUnavailable { store: StoreKind::Keychain, reason: joiner_reason }))
+            if leader_reason == "scripted leader failure" && joiner_reason == leader_reason),
         "a joiner receives the leader's outcome verbatim: {} vs {}",
         outcome_variant(&leader_outcome),
         outcome_variant(&joiner_outcome)
@@ -1411,6 +1414,97 @@ fn concurrent_refresh_on_one_profile_serializes_to_a_single_in_flight_operation(
         "the next leader writes normally after a leader panic"
     );
     assert_eq!(inner.calls.load(Ordering::SeqCst), 7);
+
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
+    let request = client
+        .get("ftp://fixture-user:fixture-secret@127.0.0.1/private-path?token=fixture-query#fixture-fragment")
+        .send()
+        .expect_err("the unsupported scheme is refused without network access");
+    assert!(request.is_builder());
+    let original = ProviderError::Transport {
+        connection: "refresh".to_string(),
+        cause: rivect::providers::TransportCause::Request {
+            source: Arc::new(request.without_url()),
+        },
+    };
+    let transport_ref = keychain_ref("race-transport");
+    let leader = {
+        let store = Arc::clone(&store);
+        let credential = transport_ref.clone();
+        std::thread::spawn(move || store.refresh(&credential, b"transport-leader"))
+    };
+    wait_until_eq(|| inner.calls.load(Ordering::SeqCst), 8);
+    let joiner = {
+        let store = Arc::clone(&store);
+        let credential = transport_ref.clone();
+        std::thread::spawn(move || store.refresh(&credential, b"transport-joiner"))
+    };
+    wait_until_eq(|| store.refresh_waiters(), 1);
+    release_tx
+        .send(Release::Fail(original.clone()))
+        .expect("release transport failure");
+    drop(original);
+    let leader = join_bounded(leader).expect("leader thread did not panic");
+    let joiner = join_bounded(joiner).expect("joiner thread did not panic");
+    for outcome in [leader, joiner] {
+        let error = outcome.expect_err("both participants retain the leader failure");
+        let ProviderError::Transport { connection, cause } = &error else {
+            panic!("the refresh failure stays a transport error");
+        };
+        assert_eq!(connection, "refresh");
+        assert_eq!(
+            cause.class(),
+            rivect::providers::TransportClass::RequestFailure
+        );
+        let leaf = std::error::Error::source(cause)
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .expect("each participant retains the concrete reqwest source");
+        assert!(leaf.is_builder());
+        assert!(!leaf.is_timeout());
+        assert!(leaf.url().is_none());
+        for rendered in [
+            format!("{cause}"),
+            format!("{cause:?}"),
+            format!("{error}"),
+            format!("{error:?}"),
+        ] {
+            assert!(
+                rendered.contains("builder"),
+                "refresh diagnostics retain the safe builder context"
+            );
+            for sentinel in [
+                "fixture-user",
+                "fixture-secret",
+                "private-path",
+                "fixture-query",
+                "fixture-fragment",
+            ] {
+                assert!(
+                    !rendered.contains(sentinel),
+                    "refresh diagnostics exposed source material"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        8,
+        "no retry or second physical refresh"
+    );
+    assert_eq!(store.refresh_waiters(), 0);
+    assert!(matches!(
+        inner.resolve(&transport_ref),
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+    assert_eq!(
+        inner
+            .resolve(&keychain_ref("race-other"))
+            .expect("neighbor survives"),
+        b"other-bytes"
+    );
 }
 
 /// A joiner parked behind a wedged leader cannot wait on the leader's

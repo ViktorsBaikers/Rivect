@@ -1,10 +1,14 @@
 //! Rivect runtime library. One executable, one owner, one state store.
 
+pub mod actions;
 pub mod commands;
 pub mod config;
+pub mod context;
 pub mod contracts;
 pub mod controller;
 pub mod executor;
+pub mod index;
+pub mod lsp;
 pub mod model;
 pub mod owner;
 pub mod policy;

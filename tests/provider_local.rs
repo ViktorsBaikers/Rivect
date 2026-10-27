@@ -29,7 +29,7 @@ use rivect::config::{Config, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::{CatalogModel, ChatCompletionsProvider, ModelPrice};
 use rivect::providers::openai::OpenAiProvider;
-use rivect::providers::{Provider, ProviderError, StoreKind};
+use rivect::providers::{Provider, ProviderError, StoreKind, TransportCause, TransportClass};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -565,73 +565,447 @@ async fn catalog_payload_over_the_byte_bound_is_a_typed_violation() {
 /// parks the call inside a per-read window.
 #[tokio::test]
 async fn dribbling_catalog_cannot_park_past_the_deadline() {
+    use std::io::Read;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone)]
+    struct PeerFacts {
+        accepts: usize,
+        responses: usize,
+        valid_requests_before_response: usize,
+        drips: usize,
+        peek_present: usize,
+        peek_unknown: usize,
+        header_poll_unknown: usize,
+        stage: &'static str,
+        io_kind: Option<std::io::ErrorKind>,
+        raw_os_error: Option<i32>,
+    }
+    fn run_catalog_peer(
+        listener: std::net::TcpListener,
+        stop: &AtomicBool,
+        facts: &Mutex<PeerFacts>,
+        sockets: &Mutex<Vec<std::net::TcpStream>>,
+        fixture_started: Instant,
+        multiple_connections: bool,
+    ) -> std::io::Result<()> {
+        while !stop.load(Ordering::SeqCst) && fixture_started.elapsed() < Duration::from_secs(12) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            {
+                let mut trace = facts
+                    .lock()
+                    .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                trace.accepts += 1;
+                trace.stage = "accepted";
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            stream.set_nonblocking(true)?;
+            {
+                let mut registry = sockets
+                    .lock()
+                    .map_err(|_poison| std::io::Error::other("fixture socket registry poisoned"))?;
+                if registry.len() == 16 {
+                    return Err(std::io::Error::other("fixture connection bound exceeded"));
+                }
+                registry.push(stream.try_clone()?);
+            }
+            let mut probe = [0; 1];
+            // One nonblocking peek observes readiness; it never waits for request bytes.
+            let present = matches!(stream.peek(&mut probe), Ok(count) if count > 0);
+            {
+                let mut trace = facts
+                    .lock()
+                    .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                trace.peek_present += usize::from(present);
+                trace.peek_unknown += usize::from(!present);
+                trace.stage = "accepted";
+            }
+
+            let mut headers = Vec::new();
+            let expected_request = b"GET /v1/models HTTP/1.1\r\n";
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "fixture stopped before complete request",
+                    ));
+                }
+                if fixture_started.elapsed() >= Duration::from_secs(12) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fixture request watchdog expired",
+                    ));
+                }
+                let mut chunk = [0; 1024];
+                let count = match stream.read(&mut chunk) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "fixture request headers incomplete",
+                        ));
+                    }
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        facts
+                            .lock()
+                            .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?
+                            .header_poll_unknown += 1;
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if headers.len() + count > 16 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture request header bound exceeded",
+                    ));
+                }
+                headers.extend_from_slice(&chunk[..count]);
+                if headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    if !headers.starts_with(expected_request) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "fixture expected the catalog get target",
+                        ));
+                    }
+                    let mut trace = facts
+                        .lock()
+                        .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                    trace.valid_requests_before_response += 1;
+                    trace.stage = "valid_request_before_response";
+                    drop(trace);
+                    break;
+                }
+            }
+            drop(headers);
+            let emitted =
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n");
+            if let Err(error) = emitted {
+                let mut trace = facts
+                    .lock()
+                    .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                trace.stage = "response_write_failed";
+                trace.io_kind = Some(error.kind());
+                trace.raw_os_error = error.raw_os_error();
+                drop(trace);
+                if multiple_connections {
+                    continue;
+                }
+                return Ok(());
+            }
+            {
+                let mut trace = facts
+                    .lock()
+                    .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                trace.responses += 1;
+                trace.stage = "response_emitted";
+            }
+            while !stop.load(Ordering::SeqCst)
+                && fixture_started.elapsed() < Duration::from_secs(12)
+            {
+                if let Err(error) = stream.write_all(b"x") {
+                    let mut trace = facts
+                        .lock()
+                        .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                    trace.stage = "drip_write_failed";
+                    trace.io_kind = Some(error.kind());
+                    trace.raw_os_error = error.raw_os_error();
+                    drop(trace);
+                    break;
+                }
+                {
+                    let mut trace = facts
+                        .lock()
+                        .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?;
+                    trace.drips += 1;
+                    trace.stage = "dripping";
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            match stream.shutdown(std::net::Shutdown::Both) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+                Err(error) => return Err(error),
+            }
+            if !multiple_connections {
+                return Ok(());
+            }
+        }
+        facts
+            .lock()
+            .map_err(|_poison| std::io::Error::other("fixture trace poisoned"))?
+            .stage = if stop.load(Ordering::SeqCst) {
+            "stopped"
+        } else {
+            "watchdog"
+        };
+        Ok(())
+    }
+    let facts = Arc::new(Mutex::new(PeerFacts {
+        accepts: 0,
+        responses: 0,
+        valid_requests_before_response: 0,
+        drips: 0,
+        peek_present: 0,
+        peek_unknown: 0,
+        header_poll_unknown: 0,
+        stage: "waiting",
+        io_kind: None,
+        raw_os_error: None,
+    }));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sockets = Arc::new(Mutex::new(Vec::<std::net::TcpStream>::new()));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("address");
-    // serve every connection the transport opens — a reset or retried
-    // leg gets the same dribble, never an unanswered socket — until the
-    // test releases the flag and the thread joins; a connect that never
-    // arrives fails the assertions instead of hanging this peer
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = stop.clone();
-    let peer = std::thread::spawn(move || {
-        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n");
-                    while stream.write_all(b"x").is_ok()
-                        && !flag.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        std::thread::sleep(Duration::from_millis(30));
-                    }
-                }
-                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    let endpoint = format!("http://{address}/v1");
-    let config = Config::parse_validated(&local_config(&endpoint)).expect("valid");
+    let config =
+        Config::parse_validated(&local_config(&format!("http://{address}/v1"))).expect("valid");
     let store = Arc::new(support::MapStore::seeded(
         STORE_KIND,
         &[(CREDENTIAL_REF, SECRET)],
     ));
-    let built = config.clone();
-    let provider = std::thread::spawn(move || {
-        ChatCompletionsProvider::with_deadline(
-            &built,
+    let fixture_started = Instant::now();
+    let peer = {
+        let stop = Arc::clone(&stop);
+        let facts = Arc::clone(&facts);
+        let sockets = Arc::clone(&sockets);
+        std::thread::Builder::new()
+            .spawn(move || -> std::io::Result<()> {
+                let multiple_connections = true;
+                let outcome = run_catalog_peer(
+                    listener,
+                    &stop,
+                    &facts,
+                    &sockets,
+                    fixture_started,
+                    multiple_connections,
+                );
+                if let Err(error) = &outcome {
+                    let mut trace = facts.lock().unwrap_or_else(|poison| poison.into_inner());
+                    trace.stage = "fixture_io_failed";
+                    trace.io_kind = Some(error.kind());
+                    trace.raw_os_error = error.raw_os_error();
+                }
+                outcome
+            })
+            .unwrap_or_else(|_error| panic!("cannot_verify: fixture peer could not start"))
+    };
+    let client_spawn = std::thread::Builder::new().spawn(move || {
+        let provider = ChatCompletionsProvider::with_deadline(
+            &config,
             CONNECTION,
             store,
             Duration::from_millis(1500),
-        )
-    })
-    .join()
-    .expect("the provider thread joins")
-    .expect("the adapter builds");
+        )?;
+        let began = Instant::now();
+        let outcome = provider.catalog();
+        Ok::<_, ProviderError>((began.elapsed(), outcome))
+    });
+    let (mut client, spawn_error) = match client_spawn {
+        Ok(worker) => (Some(worker), None),
+        Err(error) => (None, Some(error.kind())),
+    };
+    let client_spawned = client.is_some();
+    while client.as_ref().is_some_and(|worker| !worker.is_finished())
+        && fixture_started.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::yield_now();
+    }
+    let mut returned = if client
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        client.take().map(std::thread::JoinHandle::join)
+    } else {
+        None
+    };
+    // The caller's bound includes worker setup, provider drop and the completed join.
+    let mut caller_elapsed = returned.as_ref().map(|_| fixture_started.elapsed());
+    let observed = match &returned {
+        Some(Ok(Ok((elapsed, outcome)))) => Some((elapsed, outcome)),
+        _ => None,
+    };
+    let error = match &returned {
+        Some(Ok(Ok((_, Err(error))))) | Some(Ok(Err(error))) => Some(error),
+        _ => None,
+    };
+    let variant = match error {
+        Some(ProviderError::UnknownConnection { .. }) => "UnknownConnection",
+        Some(ProviderError::LiveGrantRequired { .. }) => "LiveGrantRequired",
+        Some(ProviderError::StoreUnavailable { .. }) => "StoreUnavailable",
+        Some(ProviderError::StoreAmbiguous { .. }) => "StoreAmbiguous",
+        Some(ProviderError::CredentialUnresolved { .. }) => "CredentialUnresolved",
+        Some(ProviderError::CredentialProfileMismatch { .. }) => "CredentialProfileMismatch",
+        Some(ProviderError::CredentialOutsideNamespace { .. }) => "CredentialOutsideNamespace",
+        Some(ProviderError::CredentialOccupied { .. }) => "CredentialOccupied",
+        Some(ProviderError::CredentialAbsent { .. }) => "CredentialAbsent",
+        Some(ProviderError::CredentialMalformed { .. }) => "CredentialMalformed",
+        Some(ProviderError::CredentialBaseMismatch { .. }) => "CredentialBaseMismatch",
+        Some(ProviderError::DialectMismatch { .. }) => "DialectMismatch",
+        Some(ProviderError::DialectUnserved { .. }) => "DialectUnserved",
+        Some(ProviderError::UnpinnedModel { .. }) => "UnpinnedModel",
+        Some(ProviderError::RegionMismatch { .. }) => "RegionMismatch",
+        Some(ProviderError::Transport { .. }) => "Transport",
+        Some(ProviderError::ProviderFailed { .. }) => "ProviderFailed",
+        Some(ProviderError::UnknownTerminal { .. }) => "UnknownTerminal",
+        Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
+        Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
+        Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        None => "none",
+    };
+    let (class, request, io) = match error {
+        Some(ProviderError::Transport { cause, .. }) => {
+            let (request, io) = match cause {
+                TransportCause::Request { source } => (Some(source.as_ref()), None),
+                TransportCause::Read { source } => (
+                    source
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>()),
+                    Some(source.as_ref()),
+                ),
+                TransportCause::Deadline { .. } | TransportCause::Status { .. } => (None, None),
+            };
+            (Some(cause.class()), request, io)
+        }
+        _ => (None, None, None),
+    };
+    let class = match class {
+        Some(TransportClass::DeadlineExpired) => json!({"kind": "deadline_expired"}),
+        Some(TransportClass::Timeout) => json!({"kind": "timeout"}),
+        Some(TransportClass::RequestFailure) => json!({"kind": "request_failure"}),
+        Some(TransportClass::ReadFailure) => json!({"kind": "read_failure"}),
+        Some(TransportClass::HttpStatus { code }) => json!({"kind": "http_status", "code": code}),
+        None => Value::Null,
+    };
+    let snapshot = facts
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let record = json!({
+        "adapter": CONNECTION,
+        "variant": variant, "class": class,
+        "reqwest": request.map(|error| json!({
+            "builder": error.is_builder(), "request": error.is_request(), "body": error.is_body(),
+            "decode": error.is_decode(), "redirect": error.is_redirect(), "status": error.is_status(),
+            "upgrade": error.is_upgrade(), "timeout": error.is_timeout(), "connect": error.is_connect(),
+        })),
+        "io": io.map(|error| json!({"kind": format!("{:?}", error.kind()), "raw_os_error": error.raw_os_error()})),
+        "elapsed_ms": caller_elapsed.map(|elapsed| elapsed.as_millis()),
+        "method_elapsed_ms": observed.map(|(elapsed, _)| elapsed.as_millis()),
+        "client_return": usize::from(observed.is_some()),
+        "worker_completed": usize::from(returned.is_some()),
+        "client_spawn_kind": spawn_error.map(|kind| format!("{kind:?}")),
+        "client_stage": match &returned { Some(Ok(Ok(_))) => "returned", Some(Ok(Err(_))) => "setup_failed", Some(Err(_)) => "panicked", None if !client_spawned => "spawn_failed", None => "pending" },
+        "request_at_first_peek": if snapshot.peek_present > 0 { "present" } else { "unknown" },
+        "peer": {
+            "accepts": snapshot.accepts, "response_emits": snapshot.responses,
+            "valid_requests_before_response": snapshot.valid_requests_before_response, "drips": snapshot.drips,
+            "peek_present": snapshot.peek_present, "peek_unknown": snapshot.peek_unknown,
+            "header_poll_unknown": snapshot.header_poll_unknown,
+            "stage": snapshot.stage, "completed": peer.is_finished(),
+            "io_kind": snapshot.io_kind.map(|kind| format!("{kind:?}")),
+            "raw_os_error": snapshot.raw_os_error,
+        },
+        "teardown": "pending",
+    }).to_string();
+    let record_bounded = record.len() + "RIVECT_CATALOG_DIAG ".len() < 2048;
+    let record_written = if record_bounded {
+        let mut sink = std::io::stderr().lock();
+        sink.write_all(format!("RIVECT_CATALOG_DIAG {record}\n").as_bytes())
+            .and_then(|()| sink.flush())
+            .is_ok()
+    } else {
+        false
+    };
 
-    let began = Instant::now();
-    let outcome = std::thread::spawn(move || provider.catalog())
-        .join()
-        .expect("the catalog thread joins");
-    let elapsed = began.elapsed();
+    fn shutdown_owned(sockets: &Mutex<Vec<std::net::TcpStream>>) -> bool {
+        let mut clean = !sockets.is_poisoned();
+        let mut sockets = sockets.lock().unwrap_or_else(|poison| poison.into_inner());
+        for stream in sockets.iter() {
+            clean &= match stream.shutdown(std::net::Shutdown::Both) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotConnected,
+            };
+        }
+        sockets.clear();
+        clean
+    }
+    stop.store(true, Ordering::SeqCst);
+    let mut sockets_closed = shutdown_owned(&sockets);
+    while (!peer.is_finished() || client.as_ref().is_some_and(|worker| !worker.is_finished()))
+        && fixture_started.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::yield_now();
+    }
+    let peer_return = if peer.is_finished() {
+        Some(peer.join())
+    } else {
+        None
+    };
+    if client
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        returned = client.take().map(std::thread::JoinHandle::join);
+        caller_elapsed = returned.as_ref().map(|_| fixture_started.elapsed());
+    }
+    sockets_closed &= shutdown_owned(&sockets);
+    assert!(
+        peer_return.is_some() && client.is_none(),
+        "cannot_verify: fixture teardown watchdog expired"
+    );
+    assert!(
+        matches!(peer_return, Some(Ok(Ok(())))),
+        "cannot_verify: fixture setup or cleanup failed"
+    );
+    assert!(
+        sockets_closed && !facts.is_poisoned(),
+        "cannot_verify: fixture resources were not cleanly released"
+    );
+    assert!(
+        record_written,
+        "cannot_verify: bounded diagnostic record could not be retained"
+    );
+    let Some(Ok(Ok((_method_elapsed, outcome)))) = returned else {
+        panic!("cannot_verify: catalog setup or worker failed");
+    };
     match outcome {
-        Err(ProviderError::Transport { reason, .. }) => {
+        Err(ProviderError::Transport { cause, .. }) => {
             assert!(
-                reason.contains("deadline"),
-                "the total deadline is the named cause: {reason}"
+                cause.class() == TransportClass::DeadlineExpired,
+                "the total deadline is the named cause: {cause}"
             );
         }
         other => panic!("a dribbling peer is a typed transport denial: {other:?}"),
     }
+    let elapsed = caller_elapsed.expect("the complete caller lifecycle was observed");
     assert!(
         elapsed < Duration::from_secs(10),
         "the listing ended near its deadline, not the 120s per-read bound: {elapsed:?}"
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    peer.join().expect("the drip thread joins");
+    assert!(
+        snapshot.accepts > 0
+            && snapshot.valid_requests_before_response > 0
+            && snapshot.responses > 0
+            && snapshot.drips > 0,
+        "a deadline success requires a real request, response and drip observed before stop"
+    );
 }
 
 /// AC-046 fail-closed: eligibility says the `custom-chat-completions`
@@ -853,80 +1227,1470 @@ async fn auto_ranked_primary_send_resolves_via_catalog() {
     drop_blocking(broker);
 }
 
+/// Real transport failures retain their concrete sources without changing timeout policy.
+#[test]
+fn transport_timeout_keeps_the_original_source() {
+    use std::io::Read;
+    use std::sync::mpsc::{RecvTimeoutError, TrySendError, sync_channel};
+
+    let exercise = |response: &'static [u8], hold: bool| {
+        let peer_watchdog = Duration::from_millis(3000);
+        let teardown_watchdog = Duration::from_millis(5000);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let address = listener.local_addr().expect("address");
+        let config =
+            Config::parse_validated(&local_config(&format!("http://{address}/v1"))).expect("valid");
+        let manifest = prepared_manifest(&config);
+        let store = Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(CREDENTIAL_REF, SECRET)],
+        ));
+        let (observed_tx, observed_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let peer = std::thread::spawn(move || -> std::io::Result<usize> {
+            let started = Instant::now();
+            let remaining = || {
+                peer_watchdog.checked_sub(started.elapsed()).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture watchdog expired")
+                })
+            };
+            let mut stream = loop {
+                remaining()?;
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let mut request = Vec::new();
+            let mut request_len = None;
+            loop {
+                stream.set_read_timeout(Some(remaining()?))?;
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk)?;
+                if count == 0 || request.len() + count > 1024 * 1024 {
+                    return Err(std::io::Error::other(
+                        "fixture request incomplete or oversized",
+                    ));
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request_len.is_none()
+                    && let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .map_err(std::io::Error::other)?;
+                    let body_len = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        .filter(|length| *length <= 1024 * 1024 - header_end - 4)
+                        .ok_or_else(|| std::io::Error::other("fixture content length invalid"))?;
+                    request_len = Some(header_end + 4 + body_len);
+                }
+                if request_len == Some(request.len()) {
+                    break;
+                }
+            }
+            observed_tx
+                .send(request)
+                .map_err(|_request_with_credentials| {
+                    std::io::Error::other("fixture observer disconnected")
+                })?;
+            stream.set_write_timeout(Some(remaining()?))?;
+            stream.write_all(response)?;
+            let stream = if hold {
+                Some(stream)
+            } else {
+                drop(stream);
+                None
+            };
+            // The response's open socket distinguishes request and read stalls from early EOF.
+            match release_rx.recv_timeout(remaining()?) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fixture release watchdog expired",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("fixture release disconnected"));
+                }
+            }
+            drop(stream);
+            let mut requests = 1;
+            loop {
+                remaining()?;
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        requests += 1;
+                        drop(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(requests)
+        });
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut provider = ChatCompletionsProvider::with_deadline(
+                &config,
+                CONNECTION,
+                store,
+                Duration::from_millis(500),
+            )
+            .expect("the adapter builds");
+            provider.send(&manifest)
+        }));
+        let observed = observed_rx.recv_timeout(peer_watchdog);
+        let released = match release_tx.try_send(()) {
+            Ok(()) => true,
+            Err(TrySendError::Disconnected(())) => false,
+            Err(TrySendError::Full(())) => false,
+        };
+        let teardown_started = Instant::now();
+        while !peer.is_finished() && teardown_started.elapsed() < teardown_watchdog {
+            std::thread::yield_now();
+        }
+        assert!(peer.is_finished(), "fixture teardown watchdog expired");
+        let requests = peer.join().expect("the fixture thread joins");
+
+        let requests = requests.expect("fixture completed within its watchdog");
+        assert!(released, "fixture received the explicit release");
+        assert_eq!(requests, 1, "one physical request reached the fixture");
+        let observed = observed.expect("the fixture observed the complete request");
+        assert!(
+            observed.starts_with(String::from("POST /v1/chat/completions HTTP/1.1\r\n").as_bytes())
+        );
+        let outcome = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let error = outcome.expect_err("the peer returns a transport denial");
+        assert!(
+            matches!(&error, ProviderError::Transport { connection, .. } if connection == CONNECTION)
+        );
+
+        error
+    };
+    let original = exercise(b"", true);
+    let error = original.clone();
+    drop(original);
+    let mut source = std::error::Error::source(&error);
+    let mut timeout_preserved = false;
+    while let Some(cause) = source {
+        if let Some(cause) = cause.downcast_ref::<reqwest::Error>() {
+            timeout_preserved = cause.is_timeout();
+            break;
+        }
+        source = cause.source();
+    }
+    assert!(
+        timeout_preserved,
+        "the standard error chain retains the concrete reqwest timeout"
+    );
+
+    assert_eq!(
+        match &error {
+            ProviderError::Transport { cause, .. } => cause.class(),
+            _ => panic!("expected transport denial"),
+        },
+        TransportClass::Timeout,
+    );
+    let ProviderError::Transport {
+        cause: TransportCause::Request { source },
+        ..
+    } = &error
+    else {
+        panic!("a stalled header is a request failure");
+    };
+    assert!(source.is_timeout());
+    assert!(source.url().is_none());
+    let cause = std::error::Error::source(&error).expect("the transport cause is retained");
+    let model = ModelError::Provider(error.clone());
+    let controller =
+        rivect::controller::ControllerError::Model(ModelError::Provider(error.clone()));
+    for rendered in [
+        format!("{cause}"),
+        format!("{cause:?}"),
+        format!("{error}"),
+        format!("{error:?}"),
+        format!("{model}"),
+        format!("{model:?}"),
+        format!("{controller}"),
+        format!("{controller:?}"),
+    ] {
+        assert!(
+            rendered.contains("request"),
+            "a request timeout retains its safe request context"
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "credential material stays out of diagnostics"
+        );
+    }
+
+    for (response, hold, expected, read) in [
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\n\r\nx"
+                [..],
+            true,
+            TransportClass::Timeout,
+            true,
+        ),
+        (
+            &b"invalid-http\r\n\r\n"[..],
+            false,
+            TransportClass::RequestFailure,
+            false,
+        ),
+        (
+            &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\n\r\nx"
+                [..],
+            false,
+            TransportClass::ReadFailure,
+            true,
+        ),
+        (
+            &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 17\r\n\r\nhostile-peer-body"[..],
+            false,
+            TransportClass::HttpStatus { code: 401 },
+            false,
+        ),
+        (
+            &b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 17\r\n\r\nhostile-peer-body"[..],
+            false,
+            TransportClass::HttpStatus { code: 429 },
+            false,
+        ),
+        (
+            &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nhostile-peer-body"[..],
+            false,
+            TransportClass::HttpStatus { code: 503 },
+            false,
+        ),
+    ] {
+        let original = exercise(response, hold);
+        let error = original.clone();
+        drop(original);
+        let ProviderError::Transport { cause, .. } = &error else {
+            panic!("expected transport denial");
+        };
+        assert_eq!(cause.class(), expected);
+        use std::error::Error;
+        match cause {
+            TransportCause::Read { source } => {
+                assert!(read);
+                let leaf = cause
+                    .source()
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .expect("the immediate read source is concrete io::Error");
+                assert_eq!(leaf.kind(), source.kind());
+                assert_eq!(leaf.raw_os_error(), source.raw_os_error());
+                let inner = leaf
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                    .expect("the real Response::read retained its reqwest error");
+                assert_eq!(inner.is_timeout(), expected == TransportClass::Timeout);
+            }
+            TransportCause::Request { source } => {
+                assert!(!read);
+                let leaf = cause
+                    .source()
+                    .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                    .expect("the immediate request source is concrete reqwest::Error");
+                assert!(!leaf.is_timeout());
+                assert!(!source.is_timeout());
+                assert!(leaf.url().is_none());
+            }
+            TransportCause::Status { status } => {
+                assert_eq!(
+                    expected,
+                    TransportClass::HttpStatus {
+                        code: status.as_u16()
+                    }
+                );
+                assert!(cause.source().is_none());
+            }
+            TransportCause::Deadline { .. } => {
+                panic!("the peer failure is not an adapter deadline")
+            }
+        }
+        let model = ModelError::Provider(error.clone());
+        let controller =
+            rivect::controller::ControllerError::Model(ModelError::Provider(error.clone()));
+        for rendered in [
+            format!("{cause}"),
+            format!("{cause:?}"),
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{model}"),
+            format!("{model:?}"),
+            format!("{controller}"),
+            format!("{controller:?}"),
+        ] {
+            let context = if read {
+                if hold { "decode" } else { "body" }
+            } else if matches!(expected, TransportClass::HttpStatus { .. }) {
+                "status"
+            } else {
+                "request"
+            };
+            assert!(
+                rendered.contains(context),
+                "transport diagnostics lost their safe kind context"
+            );
+            if let TransportClass::HttpStatus { code } = expected {
+                assert!(
+                    rendered.contains(&code.to_string()),
+                    "status diagnostics lost the exact numeric code"
+                );
+            }
+            assert!(
+                !rendered.contains(SECRET),
+                "credential material stays out of diagnostics"
+            );
+            assert!(
+                !rendered.contains("hostile-peer-body"),
+                "peer bodies stay out of diagnostics"
+            );
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let config = Config::parse_validated(&local_config(&format!(
+        "http://{}/v1",
+        listener.local_addr().expect("address")
+    )))
+    .expect("valid");
+    // An empty store would return CredentialAbsent if the expired-budget guard called it.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let mut provider =
+        ChatCompletionsProvider::with_deadline(&config, CONNECTION, store, Duration::ZERO)
+            .expect("the adapter builds");
+    let outcome = provider.send(&prepared_manifest(&config));
+    drop(provider);
+    let accepted = listener.accept();
+    drop(listener);
+    assert!(matches!(
+        outcome,
+        Err(ProviderError::Transport {
+            cause: TransportCause::Deadline {
+                budget: Duration::ZERO
+            },
+            ..
+        })
+    ));
+    assert!(
+        matches!(accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "an expired budget never sends or resolves the empty credential store"
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let config = Config::parse_validated(&local_config(&format!(
+        "http://{}/v1",
+        listener.local_addr().expect("address")
+    )))
+    .expect("valid");
+    let store = Arc::new(SlowStore {
+        inner: support::MapStore::seeded(STORE_KIND, &[(CREDENTIAL_REF, SECRET)]),
+        delay: Duration::from_millis(600),
+    });
+    let mut provider = ChatCompletionsProvider::with_deadline(
+        &config,
+        CONNECTION,
+        store,
+        Duration::from_millis(500),
+    )
+    .expect("the adapter builds");
+    let outcome = provider.send(&prepared_manifest(&config));
+    drop(provider);
+    let accepted = listener.accept();
+    drop(listener);
+    assert!(
+        matches!(accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "credential latency exhausted the budget before any wire leg"
+    );
+    let error = outcome.expect_err("the exhausted whole-request budget is a typed denial");
+    let ProviderError::Transport {
+        cause: TransportCause::Deadline { budget },
+        ..
+    } = &error
+    else {
+        panic!("the exhausted credential leg retains the whole-request deadline");
+    };
+    assert_eq!(*budget, Duration::from_millis(500));
+    let cause = std::error::Error::source(&error).expect("the deadline cause is retained");
+    assert!(cause.source().is_none());
+    let model = ModelError::Provider(error.clone());
+    let controller =
+        rivect::controller::ControllerError::Model(ModelError::Provider(error.clone()));
+    for rendered in [
+        format!("{cause}"),
+        format!("{cause:?}"),
+        format!("{error}"),
+        format!("{error:?}"),
+        format!("{model}"),
+        format!("{model:?}"),
+        format!("{controller}"),
+        format!("{controller:?}"),
+    ] {
+        assert!(
+            rendered.contains("deadline") && rendered.contains("500ms"),
+            "deadline diagnostics retain the complete adapter budget"
+        );
+        assert!(
+            !rendered.contains(SECRET),
+            "credential material stays out of diagnostics"
+        );
+    }
+}
+
 /// DEC-014: the whole-request deadline is one budget over connect,
 /// request send and every stream read — a peer that dribbles a byte
 /// inside each per-read window can never park a dispatch: only the
 /// total elapsed trips the bound, not any single read.
 #[tokio::test]
 async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let address = listener.local_addr().expect("address");
-    // serve every connection the transport opens — a reset or retried
-    // leg gets the same dribble, never an unanswered socket — until the
-    // test releases the flag and the thread joins
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = stop.clone();
-    let peer = std::thread::spawn(move || {
-        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
-                    // one byte per tick — every individual read answers
-                    // inside its own window, so only a total deadline
-                    // can end this
-                    while stream.write_all(b"x").is_ok()
-                        && !flag.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        std::thread::sleep(Duration::from_millis(30));
-                    }
+    use std::io::{ErrorKind, Read};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::mpsc::{SyncSender, sync_channel};
+
+    const ADAPTER: &str = "local";
+    const GUARD: &str = "RIVECT_H009_SEND_CHILD";
+    const CHILD_PREFIX: &str = "RIVECT_SEND_CHILD ";
+    const CLEAN: &str = "RIVECT_SEND_TEARDOWN clean";
+    const TEST: &str = "dribbling_peer_cannot_park_the_send_past_the_deadline";
+    const LIMIT: usize = 4;
+
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Facts {
+        accepts: u32,
+        complete_post: u32,
+        headers: u32,
+        body_bytes: u32,
+        response_emits: u32,
+        drips: u32,
+        first_peek: Option<bool>,
+        complete_before_response: Option<bool>,
+        first_response_before_body: Option<bool>,
+        io_kind: Option<IoKind>,
+        raw_os_error: Option<i32>,
+        fixture_error: bool,
+    }
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    enum ProviderVariant {
+        UnknownConnection,
+        LiveGrantRequired,
+        StoreUnavailable,
+        StoreAmbiguous,
+        CredentialUnresolved,
+        CredentialProfileMismatch,
+        CredentialOutsideNamespace,
+        CredentialOccupied,
+        CredentialAbsent,
+        CredentialMalformed,
+        CredentialBaseMismatch,
+        DialectMismatch,
+        DialectUnserved,
+        UnpinnedModel,
+        RegionMismatch,
+        Transport,
+        ProviderFailed,
+        UnknownTerminal,
+        StreamViolation,
+        IncompatibleOutput,
+        ReasoningProvenance,
+    }
+    fn provider_variant(error: &ProviderError) -> ProviderVariant {
+        match error {
+            ProviderError::UnknownConnection { .. } => ProviderVariant::UnknownConnection,
+            ProviderError::LiveGrantRequired { .. } => ProviderVariant::LiveGrantRequired,
+            ProviderError::StoreUnavailable { .. } => ProviderVariant::StoreUnavailable,
+            ProviderError::StoreAmbiguous { .. } => ProviderVariant::StoreAmbiguous,
+            ProviderError::CredentialUnresolved { .. } => ProviderVariant::CredentialUnresolved,
+            ProviderError::CredentialProfileMismatch { .. } => {
+                ProviderVariant::CredentialProfileMismatch
+            }
+            ProviderError::CredentialOutsideNamespace { .. } => {
+                ProviderVariant::CredentialOutsideNamespace
+            }
+            ProviderError::CredentialOccupied { .. } => ProviderVariant::CredentialOccupied,
+            ProviderError::CredentialAbsent { .. } => ProviderVariant::CredentialAbsent,
+            ProviderError::CredentialMalformed { .. } => ProviderVariant::CredentialMalformed,
+            ProviderError::CredentialBaseMismatch { .. } => ProviderVariant::CredentialBaseMismatch,
+            ProviderError::DialectMismatch { .. } => ProviderVariant::DialectMismatch,
+            ProviderError::DialectUnserved { .. } => ProviderVariant::DialectUnserved,
+            ProviderError::UnpinnedModel { .. } => ProviderVariant::UnpinnedModel,
+            ProviderError::RegionMismatch { .. } => ProviderVariant::RegionMismatch,
+            ProviderError::Transport { .. } => ProviderVariant::Transport,
+            ProviderError::ProviderFailed { .. } => ProviderVariant::ProviderFailed,
+            ProviderError::UnknownTerminal { .. } => ProviderVariant::UnknownTerminal,
+            ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
+            ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
+            ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+        }
+    }
+    #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+    enum IoKind {
+        WouldBlock,
+        Interrupted,
+        TimedOut,
+        UnexpectedEof,
+        InvalidData,
+        ConnectionReset,
+        ConnectionAborted,
+        BrokenPipe,
+        NotConnected,
+        Other,
+    }
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Predicate {
+        Builder,
+        Request,
+        Body,
+        Decode,
+        Redirect,
+        Status,
+        Upgrade,
+        Timeout,
+        Connect,
+    }
+    type RequestFlags = std::collections::BTreeMap<Predicate, bool>;
+    #[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Variant {
+        #[default]
+        Pending,
+        Setup,
+        Transport,
+        Other,
+    }
+    #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Class {
+        DeadlineExpired,
+        Timeout,
+        RequestFailure,
+        ReadFailure,
+        HttpStatus,
+    }
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Primary {
+        variant: Variant,
+        provider_variant: Option<ProviderVariant>,
+        class: Option<Class>,
+        status: Option<u16>,
+        reqwest: Option<RequestFlags>,
+        read_kind: Option<IoKind>,
+        raw_os_error: Option<i32>,
+        method_ms: Option<u64>,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    enum ClientStage {
+        Pending,
+        Construction,
+        Send,
+        Drop,
+        Joined,
+    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Snapshot {
+        facts: Facts,
+        primary: Primary,
+        client_stage: ClientStage,
+        caller_ms: Option<u64>,
+    }
+    fn kind(error: &std::io::Error) -> IoKind {
+        match error.kind() {
+            ErrorKind::WouldBlock => IoKind::WouldBlock,
+            ErrorKind::Interrupted => IoKind::Interrupted,
+            ErrorKind::TimedOut => IoKind::TimedOut,
+            ErrorKind::UnexpectedEof => IoKind::UnexpectedEof,
+            ErrorKind::InvalidData => IoKind::InvalidData,
+            ErrorKind::ConnectionReset => IoKind::ConnectionReset,
+            ErrorKind::ConnectionAborted => IoKind::ConnectionAborted,
+            ErrorKind::BrokenPipe => IoKind::BrokenPipe,
+            ErrorKind::NotConnected => IoKind::NotConnected,
+            _ => IoKind::Other,
+        }
+    }
+    fn flags(error: &reqwest::Error) -> RequestFlags {
+        std::collections::BTreeMap::from([
+            (Predicate::Builder, error.is_builder()),
+            (Predicate::Request, error.is_request()),
+            (Predicate::Body, error.is_body()),
+            (Predicate::Decode, error.is_decode()),
+            (Predicate::Redirect, error.is_redirect()),
+            (Predicate::Status, error.is_status()),
+            (Predicate::Upgrade, error.is_upgrade()),
+            (Predicate::Timeout, error.is_timeout()),
+            (Predicate::Connect, error.is_connect()),
+        ])
+    }
+    fn primary(outcome: Result<rivect::providers::ProviderReply, ProviderError>) -> Primary {
+        let mut observed = Primary {
+            variant: Variant::Other,
+            ..Primary::default()
+        };
+        observed.provider_variant = outcome.as_ref().err().map(provider_variant);
+        if let Err(ProviderError::Transport { cause, .. }) = outcome {
+            observed.variant = Variant::Transport;
+            observed.class = Some(match cause.class() {
+                TransportClass::DeadlineExpired => Class::DeadlineExpired,
+                TransportClass::Timeout => Class::Timeout,
+                TransportClass::RequestFailure => Class::RequestFailure,
+                TransportClass::ReadFailure => Class::ReadFailure,
+                TransportClass::HttpStatus { code } => {
+                    observed.status = Some(code);
+                    Class::HttpStatus
                 }
-                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
+            });
+            match cause {
+                TransportCause::Request { source } => observed.reqwest = Some(flags(&source)),
+                TransportCause::Read { source } => {
+                    observed.read_kind = Some(kind(&source));
+                    observed.raw_os_error = source.raw_os_error();
+                    observed.reqwest = source
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .map(flags);
                 }
-                Err(_) => break,
+                TransportCause::Deadline { .. } | TransportCause::Status { .. } => {}
             }
         }
-    });
+        observed
+    }
+    fn capture_pipe(
+        mut pipe: impl Read,
+        sender: SyncSender<(Vec<u8>, bool, bool)>,
+        overflow: Arc<AtomicBool>,
+    ) -> bool {
+        let mut bytes = Vec::with_capacity(8193);
+        let mut eof = false;
+        let mut failed = false;
+        while bytes.len() < 8193 {
+            let mut chunk = [0; 1024];
+            let remaining = (8193 - bytes.len()).min(chunk.len());
+            match pipe.read(&mut chunk[..remaining]) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if bytes.len() > 8192 {
+            overflow.store(true, Ordering::Release);
+        }
+        // One terminal result per reader; capacity one never waits on another producer.
+        sender.send((bytes, eof, failed)).is_ok()
+    }
+
+    match std::env::var_os(GUARD) {
+        None => {
+            let executable = std::env::current_exe()
+                .and_then(std::fs::canonicalize)
+                .expect("the test executable is canonical");
+            let mut command = Command::new(executable);
+            command
+                .args([
+                    TEST,
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--color",
+                    "never",
+                ])
+                .env_clear()
+                .env(GUARD, ADAPTER)
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .env("RUST_BACKTRACE", "0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let began = Instant::now();
+            let spawned = command.spawn();
+            let mut terminal = "normal";
+            let mut status = None;
+            let mut kill_attempted = false;
+            let mut kill_ok = None;
+            let mut exit_race_reconciled = false;
+            let mut stdout = None;
+            let mut stderr = None;
+            let mut stdout_joined = false;
+            let mut stderr_joined = false;
+            let overflow = Arc::new(AtomicBool::new(false));
+            let (out_tx, out_rx) = sync_channel(1);
+            let (err_tx, err_rx) = sync_channel(1);
+            if let Ok(mut child) = spawned {
+                let out_reader = child.stdout.take().map(|pipe| {
+                    let overflow = overflow.clone();
+                    std::thread::Builder::new().spawn(move || capture_pipe(pipe, out_tx, overflow))
+                });
+                let err_reader = child.stderr.take().map(|pipe| {
+                    let overflow = overflow.clone();
+                    std::thread::Builder::new().spawn(move || capture_pipe(pipe, err_tx, overflow))
+                });
+                let mut out_reader = match out_reader {
+                    Some(Ok(reader)) => Some(reader),
+                    Some(Err(_)) | None => {
+                        terminal = "reader_spawn";
+                        None
+                    }
+                };
+                let mut err_reader = match err_reader {
+                    Some(Ok(reader)) => Some(reader),
+                    Some(Err(_)) | None => {
+                        terminal = "reader_spawn";
+                        None
+                    }
+                };
+                if out_reader.is_none() || err_reader.is_none() {
+                    terminal = "reader_spawn";
+                }
+                loop {
+                    if status.is_none() {
+                        match child.try_wait() {
+                            Ok(observed) => status = observed,
+                            Err(_) => terminal = "poll",
+                        }
+                    }
+                    if overflow.load(Ordering::Acquire) {
+                        terminal = "overflow";
+                    }
+                    if began.elapsed() >= Duration::from_secs(25)
+                        && status.is_none()
+                        && terminal == "normal"
+                    {
+                        terminal = "watchdog";
+                    }
+                    if terminal != "normal" && status.is_none() && !kill_attempted {
+                        kill_attempted = true;
+                        match child.kill() {
+                            Ok(()) => kill_ok = Some(true),
+                            Err(_) => match child.try_wait() {
+                                Ok(Some(observed)) => {
+                                    status = Some(observed);
+                                    kill_ok = Some(false);
+                                    exit_race_reconciled = true;
+                                }
+                                Ok(None) => {
+                                    kill_ok = Some(false);
+                                    terminal = "kill_pending";
+                                }
+                                Err(_) => {
+                                    kill_ok = Some(false);
+                                    terminal = "kill_poll";
+                                }
+                            },
+                        }
+                    }
+                    if out_reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                    {
+                        stdout_joined = out_reader
+                            .take()
+                            .expect("owned output reader")
+                            .join()
+                            .is_ok_and(|sent| sent);
+                        stdout = out_rx.try_recv().ok();
+                        if stdout.as_ref().is_none_or(|(_, _, failed)| *failed) {
+                            terminal = "stdout_read";
+                        }
+                    }
+                    if err_reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                    {
+                        stderr_joined = err_reader
+                            .take()
+                            .expect("owned error reader")
+                            .join()
+                            .is_ok_and(|sent| sent);
+                        stderr = err_rx.try_recv().ok();
+                        if stderr.as_ref().is_none_or(|(_, _, failed)| *failed) {
+                            terminal = "stderr_read";
+                        }
+                    }
+                    if status.is_some() && out_reader.is_none() && err_reader.is_none() {
+                        break;
+                    }
+                    if began.elapsed() >= Duration::from_secs(30) {
+                        terminal = "cleanup_pending";
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            } else {
+                terminal = "spawn";
+            }
+            let stdout_eof = stdout
+                .as_ref()
+                .is_some_and(|(_, eof, failed)| *eof && !failed);
+            let stderr_eof = stderr
+                .as_ref()
+                .is_some_and(|(_, eof, failed)| *eof && !failed);
+            let output_text = stdout
+                .as_ref()
+                .and_then(|(bytes, _, _)| std::str::from_utf8(bytes).ok());
+            let error_text = stderr
+                .as_ref()
+                .and_then(|(bytes, _, _)| std::str::from_utf8(bytes).ok());
+            let executed_one = output_text.is_some_and(|text| {
+                let results: Vec<_> = text
+                    .lines()
+                    .filter(|line| line.starts_with("test result: "))
+                    .collect();
+                results.len() == 1
+                    && (results[0].starts_with(
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ",
+                    ) || results[0].starts_with(
+                        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; ",
+                    ))
+            });
+            let records: Vec<_> = error_text
+                .into_iter()
+                .flat_map(str::lines)
+                .filter_map(|line| line.strip_prefix(CHILD_PREFIX))
+                .collect();
+            let snapshot = if records.len() == 1 && records[0].len() + CHILD_PREFIX.len() < 2048 {
+                serde_json::from_str::<Snapshot>(records[0])
+                    .ok()
+                    .filter(|record| {
+                        let f = &record.facts;
+                        f.accepts <= 5
+                            && f.complete_post <= 4
+                            && f.headers <= 4
+                            && f.body_bytes <= 327680
+                            && f.response_emits <= 4
+                            && f.drips <= 4000
+                            && record
+                                .primary
+                                .status
+                                .is_none_or(|s| (100..1000).contains(&s))
+                            && record
+                                .primary
+                                .reqwest
+                                .as_ref()
+                                .is_none_or(|flags| flags.len() == 9)
+                            && record.primary.method_ms.is_none_or(|ms| ms <= 30000)
+                            && record.caller_ms.is_none_or(|ms| ms <= 30000)
+                    })
+            } else {
+                None
+            };
+            let peer_clean = error_text
+                .is_some_and(|text| text.lines().filter(|line| *line == CLEAN).count() == 1);
+            let cleanup =
+                status.is_some() && stdout_joined && stderr_joined && stdout_eof && stderr_eof;
+            if snapshot.is_none() && terminal == "normal" {
+                terminal = "diagnostic_invalid";
+            }
+            if !executed_one && terminal == "normal" {
+                terminal = "execution_count";
+            }
+            if !peer_clean && terminal == "normal" {
+                terminal = "peer_cleanup";
+            }
+            let outcome_reason = snapshot.as_ref().map_or("cannot_verify", |snapshot| {
+                if snapshot.primary.variant == Variant::Setup {
+                    "setup"
+                } else if snapshot.primary.variant != Variant::Transport
+                    || snapshot.primary.class != Some(Class::DeadlineExpired)
+                {
+                    "strict_class"
+                } else if !snapshot.caller_ms.is_some_and(|elapsed| elapsed < 20000) {
+                    "strict_elapsed"
+                } else if snapshot.facts.fixture_error
+                    || snapshot.facts.complete_post != 1
+                    || snapshot.facts.body_bytes == 0
+                    || snapshot.facts.response_emits != 1
+                    || snapshot.facts.drips == 0
+                    || snapshot.facts.complete_before_response != Some(true)
+                    || snapshot.facts.first_response_before_body != Some(false)
+                {
+                    "fixture"
+                } else {
+                    "strict_pass"
+                }
+            });
+            let record = json!({
+                "adapter": ADAPTER, "phase": "fixed", "snapshot": snapshot,
+                "child": { "exit": status.and_then(|s| s.code()), "success": status.map(|s| s.success()),
+                    "kill_attempted": kill_attempted, "kill_observed": kill_ok,
+                    "exit_race_reconciled": exit_race_reconciled, "reaped": status.is_some(),
+                    "stdout_join": stdout_joined, "stderr_join": stderr_joined,
+                    "stdout_eof": stdout_eof, "stderr_eof": stderr_eof, "executed_one": executed_one },
+                "peer": { "stop": if peer_clean { Some(true) } else { None },
+                    "shutdown": if peer_clean { Some(true) } else { None },
+                    "join": if peer_clean { Some(true) } else { None } },
+                "terminal": terminal, "outcome": outcome_reason
+            });
+            let line = format!("RIVECT_SEND_DIAG {record}\n");
+            assert!(line.len() <= 2048, "the safe send diagnostic is bounded");
+            let mut sink = std::io::stderr().lock();
+            sink.write_all(line.as_bytes())
+                .and_then(|()| sink.flush())
+                .expect("the safe send diagnostic reaches the parent sink");
+            assert!(
+                cleanup && terminal == "normal" && peer_clean && executed_one,
+                "the isolated send scenario cannot be verified"
+            );
+            assert!(
+                status.is_some_and(|s| s.success()) && outcome_reason == "strict_pass",
+                "the isolated send scenario failed its strict oracle"
+            );
+            return;
+        }
+        Some(value) => assert!(value == ADAPTER, "the send child guard is adapter-specific"),
+    }
+
+    struct PeerState {
+        stop: bool,
+        sockets: Vec<TcpStream>,
+        facts: Facts,
+    }
+    struct Connection {
+        stream: TcpStream,
+        request: Vec<u8>,
+        header_end: Option<usize>,
+        length: Option<usize>,
+        complete: bool,
+        observed_body: usize,
+        response_offset: usize,
+        next_drip: Instant,
+        closed: bool,
+    }
+    fn observe_request(
+        connection: &mut Connection,
+        state: &Arc<Mutex<PeerState>>,
+    ) -> std::io::Result<()> {
+        let mut chunk = [0; 1024];
+        match connection.stream.read(&mut chunk) {
+            Ok(0) => {
+                connection.closed = true;
+                if !connection.request.is_empty() && !connection.complete {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "incomplete fixture post",
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(count) => {
+                if connection.complete || connection.request.len() + count > 81920 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "extra or oversized fixture post",
+                    ));
+                }
+                connection.request.extend_from_slice(&chunk[..count]);
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if connection.header_end.is_none() {
+            if let Some(end) = connection
+                .request
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+            {
+                let end = end + 4;
+                if end > 16384 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "oversized fixture headers",
+                    ));
+                }
+                let header = std::str::from_utf8(&connection.request[..end])
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                let mut lines = header.split("\r\n");
+                if lines.next() != Some("POST /v1/chat/completions HTTP/1.1") {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected fixture post target",
+                    ));
+                }
+                let mut lengths = Vec::new();
+                let mut content_types = 0;
+                for line in lines.filter(|line| !line.is_empty()) {
+                    let (name, value) = line.split_once(':').ok_or_else(|| {
+                        std::io::Error::new(ErrorKind::InvalidData, "invalid fixture header")
+                    })?;
+                    if name.eq_ignore_ascii_case("transfer-encoding") {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "ambiguous fixture framing",
+                        ));
+                    }
+                    if name.eq_ignore_ascii_case("content-length") {
+                        let value = value.trim();
+                        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "invalid fixture length",
+                            ));
+                        }
+                        lengths.push(
+                            value.parse::<usize>().map_err(|error| {
+                                std::io::Error::new(ErrorKind::InvalidData, error)
+                            })?,
+                        );
+                    }
+                    if name.eq_ignore_ascii_case("content-type") {
+                        if value.trim() != "application/json" {
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "invalid fixture content type",
+                            ));
+                        }
+                        content_types += 1;
+                    }
+                }
+                if lengths.len() != 1 || lengths[0] == 0 || lengths[0] > 65536 || content_types != 1
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid fixture framing",
+                    ));
+                }
+                connection.header_end = Some(end);
+                connection.length = Some(lengths[0]);
+                state.lock().expect("peer state").facts.headers += 1;
+            } else if connection.request.len() > 16384 {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "oversized fixture headers",
+                ));
+            }
+        }
+        if let (Some(end), Some(length)) = (connection.header_end, connection.length) {
+            let count = connection.request.len() - end;
+            let newly_observed = count.saturating_sub(connection.observed_body);
+            state.lock().expect("peer state").facts.body_bytes +=
+                u32::try_from(newly_observed).expect("bounded fixture body");
+            connection.observed_body = count;
+            if count > length {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "extra fixture body",
+                ));
+            }
+            if count == length {
+                let body: Value = serde_json::from_slice(&connection.request[end..])
+                    .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                if !(body["model"] == "fixture-chat-model"
+                    && body["stream"] == true
+                    && body["messages"].as_array().is_some_and(|messages| {
+                        messages.last() == Some(&json!({"role":"user","content":"goal: auth leg"}))
+                    }))
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected fixture json shape",
+                    ));
+                }
+                connection.complete = true;
+                let mut state = state.lock().expect("peer state");
+                state.facts.complete_post += 1;
+                if state.facts.complete_post != 1 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "duplicate fixture post",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn run_peer(listener: TcpListener, state: Arc<Mutex<PeerState>>, began: Instant) {
+        let mut connections: Vec<Connection> = Vec::new();
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+        while began.elapsed() < Duration::from_secs(24) {
+            if state.lock().expect("peer state").stop {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut observed = state.lock().expect("peer state");
+                    observed.facts.accepts += 1;
+                    if observed.stop || connections.len() == LIMIT {
+                        if let Err(error) = stream.shutdown(Shutdown::Both) {
+                            observed.facts.io_kind = Some(kind(&error));
+                            observed.facts.raw_os_error = error.raw_os_error();
+                        }
+                        observed.facts.fixture_error |= !observed.stop;
+                        return;
+                    } else {
+                        let registered = stream
+                            .set_nonblocking(true)
+                            .and_then(|()| stream.try_clone());
+                        match registered {
+                            Ok(owned) => {
+                                observed.sockets.push(owned);
+                                let mut byte = [0];
+                                let present = match stream.peek(&mut byte) {
+                                    Ok(count) if count > 0 => Some(true),
+                                    Ok(_) => None,
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            ErrorKind::WouldBlock | ErrorKind::Interrupted
+                                        ) =>
+                                    {
+                                        None
+                                    }
+                                    Err(error) => {
+                                        observed.facts.io_kind = Some(kind(&error));
+                                        observed.facts.raw_os_error = error.raw_os_error();
+                                        None
+                                    }
+                                };
+                                if connections.is_empty() {
+                                    observed.facts.first_peek = present;
+                                }
+                                connections.push(Connection {
+                                    stream,
+                                    request: Vec::new(),
+                                    header_end: None,
+                                    length: None,
+                                    complete: false,
+                                    observed_body: 0,
+                                    response_offset: 0,
+                                    next_drip: Instant::now(),
+                                    closed: false,
+                                });
+                            }
+                            Err(error) => {
+                                observed.facts.fixture_error = true;
+                                observed.facts.io_kind = Some(kind(&error));
+                                observed.facts.raw_os_error = error.raw_os_error();
+                            }
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(error) => {
+                    let mut observed = state.lock().expect("peer state");
+                    observed.facts.fixture_error = true;
+                    observed.facts.io_kind = Some(kind(&error));
+                    observed.facts.raw_os_error = error.raw_os_error();
+                    drop(observed);
+                    return;
+                }
+            }
+            for connection in &mut connections {
+                if state.lock().expect("peer state").stop {
+                    return;
+                }
+                if connection.closed {
+                    continue;
+                }
+                let io = (|| -> std::io::Result<()> {
+                    observe_request(connection, &state)?;
+                    if !connection.complete || connection.closed {
+                        return Ok(());
+                    }
+                    if connection.response_offset < RESPONSE.len() {
+                        match connection
+                            .stream
+                            .write(&RESPONSE[connection.response_offset..])
+                        {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    ErrorKind::WriteZero,
+                                    "fixture response write stopped",
+                                ));
+                            }
+                            Ok(count) => {
+                                let mut observed = state.lock().expect("peer state");
+                                if connection.response_offset == 0
+                                    && observed.facts.complete_before_response.is_none()
+                                {
+                                    observed.facts.complete_before_response =
+                                        Some(connection.complete);
+                                    observed.facts.first_response_before_body =
+                                        Some(!connection.complete);
+                                }
+                                connection.response_offset += count;
+                                if connection.response_offset == RESPONSE.len() {
+                                    observed.facts.response_emits += 1;
+                                }
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    ErrorKind::WouldBlock | ErrorKind::Interrupted
+                                ) =>
+                            {
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        if connection.response_offset < RESPONSE.len() {
+                            return Ok(());
+                        }
+                    }
+                    if connection.next_drip <= Instant::now() {
+                        match connection.stream.write(b"x") {
+                            Ok(1) => {
+                                state.lock().expect("peer state").facts.drips += 1;
+                                connection.next_drip = Instant::now() + Duration::from_millis(30);
+                            }
+                            Ok(_) => {
+                                return Err(std::io::Error::new(
+                                    ErrorKind::WriteZero,
+                                    "fixture drip stopped",
+                                ));
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    ErrorKind::WouldBlock | ErrorKind::Interrupted
+                                ) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = io {
+                    connection.closed = true;
+                    let mut observed = state.lock().expect("peer state");
+                    observed.facts.io_kind = Some(kind(&error));
+                    observed.facts.raw_os_error = error.raw_os_error();
+                    observed.facts.fixture_error |= !matches!(
+                        error.kind(),
+                        ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                    );
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+    fn shutdown_owned(state: &Arc<Mutex<PeerState>>) -> bool {
+        let mut state = state.lock().expect("peer state");
+        state.stop = true;
+        let mut clean = true;
+        for stream in &state.sockets {
+            if let Err(error) = stream.shutdown(Shutdown::Both) {
+                clean &= error.kind() == ErrorKind::NotConnected;
+            }
+        }
+        drop(state);
+        clean
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the fixture binds");
+    listener
+        .set_nonblocking(true)
+        .expect("the fixture is nonblocking");
+    let address = listener.local_addr().expect("the fixture address is local");
     let endpoint = format!("http://{address}/v1");
-    let config = Config::parse_validated(&local_config(&endpoint)).expect("valid");
+    let config =
+        Config::parse_validated(&local_config(&endpoint)).expect("the fixture config is valid");
+    let manifest = prepared_manifest(&config);
     let store = Arc::new(support::MapStore::seeded(
         STORE_KIND,
         &[(CREDENTIAL_REF, SECRET)],
     ));
-    let built = config.clone();
-    let provider = std::thread::spawn(move || {
-        ChatCompletionsProvider::with_deadline(
-            &built,
-            CONNECTION,
-            store,
-            Duration::from_millis(1500),
-        )
-    })
-    .join()
-    .expect("the provider thread joins")
-    .expect("the adapter builds");
-
+    let state = Arc::new(Mutex::new(PeerState {
+        stop: false,
+        sockets: Vec::new(),
+        facts: Facts::default(),
+    }));
+    let stage = Arc::new(AtomicU8::new(0));
+    let captured = Arc::new(Mutex::new(Primary::default()));
     let began = Instant::now();
-    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
-    let elapsed = began.elapsed();
-    match outcome {
-        Err(ProviderError::Transport { reason, .. }) => {
-            assert!(
-                reason.contains("deadline"),
-                "the total deadline is the named cause: {reason}"
-            );
+    let peer_state = state.clone();
+    let mut peer =
+        match std::thread::Builder::new().spawn(move || run_peer(listener, peer_state, began)) {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                state.lock().expect("peer state").facts.fixture_error = true;
+                None
+            }
+        };
+    let client_stage = stage.clone();
+    let client_primary = captured.clone();
+    let mut client = if peer.is_some() {
+        std::thread::Builder::new()
+            .spawn(move || {
+                client_stage.store(1, Ordering::Release);
+                let built = ChatCompletionsProvider::with_deadline(
+                    &config,
+                    CONNECTION,
+                    store,
+                    Duration::from_millis(4000),
+                );
+                let observed = match built {
+                    Ok(mut provider) => {
+                        client_stage.store(2, Ordering::Release);
+                        let method = Instant::now();
+                        let outcome = provider.send(&manifest);
+                        let mut observed = primary(outcome);
+                        observed.method_ms = Some(
+                            u64::try_from(method.elapsed().as_millis())
+                                .unwrap_or(30000)
+                                .min(30000),
+                        );
+                        *client_primary.lock().expect("captured primary") = observed.clone();
+                        client_stage.store(3, Ordering::Release);
+                        drop(provider);
+                        observed
+                    }
+                    Err(error) => {
+                        let mut observed = primary(Err(error));
+                        observed.variant = Variant::Setup;
+                        observed
+                    }
+                };
+                *client_primary.lock().expect("captured primary") = observed.clone();
+                observed
+            })
+            .map(Some)
+            .unwrap_or_else(|_| {
+                state.lock().expect("peer state").facts.fixture_error = true;
+                None
+            })
+    } else {
+        None
+    };
+    while client.as_ref().is_some_and(|worker| !worker.is_finished())
+        && began.elapsed() < Duration::from_secs(20)
+    {
+        std::thread::yield_now();
+    }
+    let mut observed = captured.lock().expect("captured primary").clone();
+    let mut caller_ms = None;
+    let mut client_joined = false;
+    if client
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+        && let Ok(returned) = client.take().expect("owned client").join()
+    {
+        observed = returned;
+        caller_ms = Some(
+            u64::try_from(began.elapsed().as_millis())
+                .unwrap_or(30000)
+                .min(30000),
+        );
+        stage.store(4, Ordering::Release);
+        client_joined = true;
+    }
+    let snapshot = Snapshot {
+        facts: state.lock().expect("peer state").facts.clone(),
+        primary: observed,
+        client_stage: match stage.load(Ordering::Acquire) {
+            1 => ClientStage::Construction,
+            2 => ClientStage::Send,
+            3 => ClientStage::Drop,
+            4 => ClientStage::Joined,
+            _ => ClientStage::Pending,
+        },
+        caller_ms,
+    };
+    let line = format!(
+        "{CHILD_PREFIX}{}\n",
+        serde_json::to_string(&snapshot).expect("typed snapshot serializes")
+    );
+    let mut sink = std::io::stderr().lock();
+    let snapshot_written = line.len() <= 2048
+        && sink
+            .write_all(line.as_bytes())
+            .and_then(|()| sink.flush())
+            .is_ok();
+    drop(sink);
+    let mut shutdown = shutdown_owned(&state);
+    while began.elapsed() < Duration::from_secs(24)
+        && (peer.as_ref().is_some_and(|worker| !worker.is_finished())
+            || client.as_ref().is_some_and(|worker| !worker.is_finished()))
+    {
+        std::thread::yield_now();
+    }
+    let mut peer_joined = false;
+    if peer
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        peer_joined = peer.take().expect("owned peer").join().is_ok();
+    }
+    if client
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        client_joined = client.take().expect("owned client").join().is_ok();
+    }
+    shutdown &= shutdown_owned(&state);
+    if peer.is_some() || client.is_some() {
+        // Keep ownership until the parent observes process containment.
+        loop {
+            std::thread::park_timeout(Duration::from_secs(1));
         }
-        other => panic!("a dribbling peer is a typed transport denial: {other:?}"),
+    }
+    if shutdown && peer_joined && client_joined {
+        let mut sink = std::io::stderr().lock();
+        sink.write_all(format!("{CLEAN}\n").as_bytes())
+            .and_then(|()| sink.flush())
+            .expect("the cleanup token reaches the private parent pipe");
     }
     assert!(
-        elapsed < Duration::from_secs(10),
-        "the send ended near its deadline, not the 120s per-read bound: {elapsed:?}"
+        snapshot_written,
+        "the provisional send snapshot is bounded and written"
     );
-    drop_blocking(provider);
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    peer.join().expect("the drip thread joins");
+    assert!(
+        snapshot.primary.variant == Variant::Transport,
+        "a dribbling peer is a typed transport denial"
+    );
+    assert!(
+        snapshot.primary.class == Some(Class::DeadlineExpired),
+        "the total deadline is the named cause"
+    );
+    assert!(
+        snapshot.caller_ms.is_some_and(|elapsed| elapsed < 20000),
+        "the send ended near its deadline, including construction drop and join"
+    );
+    assert!(
+        shutdown && peer_joined && client_joined,
+        "the send fixture cleanup is observed"
+    );
+    assert!(
+        !snapshot.facts.fixture_error,
+        "the physical post fixture is valid"
+    );
+    assert!(
+        snapshot.facts.complete_post == 1
+            && snapshot.facts.body_bytes > 0
+            && snapshot.facts.response_emits == 1
+            && snapshot.facts.drips > 0
+            && snapshot.facts.complete_before_response == Some(true)
+            && snapshot.facts.first_response_before_body == Some(false),
+        "the send exercised exactly one complete physical post and a dribbling response"
+    );
 }
 
 /// DEC-014: the deadline check stands between the legs that spend the
@@ -954,10 +2718,10 @@ async fn expired_budget_denies_the_send_before_any_wire_leg() {
 
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     match outcome {
-        Err(ProviderError::Transport { reason, .. }) => {
+        Err(ProviderError::Transport { cause, .. }) => {
             assert!(
-                reason.contains("deadline"),
-                "the total deadline is the named cause: {reason}"
+                cause.class() == TransportClass::DeadlineExpired,
+                "the total deadline is the named cause: {cause}"
             );
         }
         other => panic!("an expired budget is a typed transport denial: {other:?}"),
@@ -996,10 +2760,10 @@ async fn spent_budget_denies_the_credential_call_before_the_store() {
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let elapsed = started.elapsed();
     match outcome {
-        Err(ProviderError::Transport { reason, .. }) => {
+        Err(ProviderError::Transport { cause, .. }) => {
             assert!(
-                reason.contains("deadline"),
-                "the spent budget is the named cause: {reason}"
+                cause.class() == TransportClass::DeadlineExpired,
+                "the spent budget is the named cause: {cause}"
             );
         }
         other => panic!("a spent budget is a typed transport denial: {other:?}"),
@@ -1106,20 +2870,20 @@ async fn custom_chat_completions_egress_is_bound_to_the_configured_origin() {
 
     let (provider, catalog) = catalog_on_thread(provider);
     match catalog {
-        Err(ProviderError::Transport { reason, .. }) => {
+        Err(ProviderError::Transport { cause, .. }) => {
             assert!(
-                reason.contains("307"),
-                "the refused redirect's own status names the denial: {reason}"
+                cause.class() == TransportClass::HttpStatus { code: 307 },
+                "the refused redirect's own status names the denial: {cause}"
             );
         }
         other => panic!("a redirect answer is a typed transport denial, never a follow: {other:?}"),
     }
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     match outcome {
-        Err(ProviderError::Transport { reason, .. }) => {
+        Err(ProviderError::Transport { cause, .. }) => {
             assert!(
-                reason.contains("307"),
-                "the refused redirect's own status names the denial: {reason}"
+                cause.class() == TransportClass::HttpStatus { code: 307 },
+                "the refused redirect's own status names the denial: {cause}"
             );
         }
         other => panic!("a redirect answer is a typed transport denial, never a follow: {other:?}"),
@@ -1269,13 +3033,13 @@ async fn wrong_credential_profile_or_region_denies_with_typed_context_without_se
     let provider = provider_result(config.clone(), CONNECTION.to_string(), store).expect("builds");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, CONNECTION);
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, SECRET.as_bytes());
     drop_blocking(provider);
@@ -3496,13 +5260,13 @@ async fn abliteration_wrong_credential_profile_or_region_denies_with_typed_conte
         .expect("builds");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, "abliteration");
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, SECRET.as_bytes());
     drop_blocking(provider);
@@ -4630,13 +6394,13 @@ async fn aiand_wrong_credential_profile_or_region_denies_with_typed_context_with
         aiand_provider_result(config.clone(), "aiand".to_string(), store).expect("builds");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, "aiand");
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, SECRET.as_bytes());
     drop_blocking(provider);
@@ -5439,13 +7203,13 @@ async fn aimlapi_wrong_credential_profile_or_region_denies_with_typed_context_wi
     let provider = provider_result(config.clone(), "aimlapi".to_string(), store).expect("builds");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, "aimlapi");
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, SECRET.as_bytes());
     drop_blocking(provider);
@@ -6286,13 +8050,13 @@ async fn alibaba_coding_plan_wrong_credential_profile_or_region_denies_with_type
         alibaba_cp_provider(&config, &plan_credential(PLAN_KEY, &server_uri_v1(&server)));
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, "alibaba-coding-plan");
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, PLAN_KEY.as_bytes());
     drop_blocking(provider);
@@ -7537,13 +9301,13 @@ async fn alibaba_token_plan_wrong_credential_profile_or_region_denies_with_typed
     );
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
-    let ProviderError::Transport { connection, reason } = &err else {
+    let ProviderError::Transport { connection, cause } = &err else {
         panic!("a refused token is transport: {err}")
     };
     assert_eq!(connection, "alibaba-token-plan");
     assert!(
-        reason.contains("401"),
-        "the status code is the context: {reason}"
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
     );
     assert_no_secret_or_body(&err, TOKEN_PLAN_KEY.as_bytes());
     drop_blocking(provider);

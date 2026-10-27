@@ -4,6 +4,7 @@
 //! edits; `parse` is syntax-only (duplicate keys are parser errors), every
 //! typed/semantic rejection happens in `validate` and fails closed.
 
+use crate::executor::{FileIdentity, Unattested, WriteIdentity};
 use crate::providers::{SecretRef, SecretRefError};
 use crate::state::{StoreError, TaskStore};
 use serde::Serialize;
@@ -11,19 +12,20 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlError};
 
 pub const WORKFLOW_KEY: &str = "workflow.enabled";
+pub const DECISIONS_MODE_KEY: &str = "decisions.mode";
 
 /// The keys `config.read` serves, named once for the read surface's
-/// unknown-key hint (DEC-013): the workflow flag plus the additive
-/// profile keys. Name-bearing keys print their pattern form — a
-/// connection or profile name is never itself a known key.
-pub const READ_KEY_HINT: &str = "workflow.enabled, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
+/// unknown-key hint (DEC-013): the workflow flag, the decision mode plus
+/// the additive profile keys. Name-bearing keys print their pattern form —
+/// a connection or profile name is never itself a known key.
+pub const READ_KEY_HINT: &str = "workflow.enabled, decisions.mode, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
 
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -117,6 +119,8 @@ pub enum ConfigIssue {
     UnsupportedFallbackMode { mode: String },
     #[error("workflow.enabled must be a boolean")]
     WorkflowEnabledNotBoolean,
+    #[error("unsupported decisions.mode {mode}; known modes: ask, auto, inherit")]
+    UnsupportedDecisionMode { mode: String },
     #[error("{key} is required, not an override; reset removes overrides only")]
     RequiredNotResettable { key: String },
     #[error("no configuration document is retained; parse one before editing")]
@@ -329,10 +333,65 @@ pub struct Workflow {
     pub enabled: Option<bool>,
 }
 
+/// The wire spelling of `decisions.mode`: `ask` and `auto` resolve
+/// directly; `inherit` names the absent override — the layer below
+/// (today the shipped `ask`) answers instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionModeValue {
+    Ask,
+    Auto,
+    Inherit,
+}
+
+impl DecisionModeValue {
+    /// The TOML/JSON spelling; `None` for anything else — the closed set
+    /// is the same the file and wire surfaces reject against.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "ask" => Some(Self::Ask),
+            "auto" => Some(Self::Auto),
+            "inherit" => Some(Self::Inherit),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Inherit => "inherit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Decisions {
+    pub mode: Option<DecisionModeValue>,
+}
+
+/// The decision mode a material fork observes — `inherit` and the absent
+/// override both land on the shipped `ask`; only an explicit `auto`
+/// admits delegated machine resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionMode {
+    Ask,
+    Auto,
+}
+
+impl DecisionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub version: u64,
     pub workflow: Workflow,
+    pub decisions: Decisions,
     pub connections: BTreeMap<String, Connection>,
     /// Declared credential profiles (DEC-013): `connections.<id>.profile`
     /// references must resolve here — a dangling profile is the same
@@ -345,6 +404,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigValue {
     Bool(bool),
+    DecisionMode(DecisionModeValue),
     Model(ModelAssign),
     Effort(EffortAssign),
     Fallback(FallbackAssign),
@@ -387,13 +447,25 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return Ok(());
         };
-        let (version, workflow, connections, profiles, models) = validated_document(doc)?;
+        let (version, workflow, decisions, connections, profiles, models) =
+            validated_document(doc)?;
         self.version = version;
         self.workflow = workflow;
+        self.decisions = decisions;
         self.connections = connections;
         self.profiles = profiles;
         self.models = models;
         Ok(())
+    }
+
+    /// The mode a material fork observes: `inherit` resolves through to
+    /// the shipped `ask`, an absent override stays `ask`; only an
+    /// explicit `auto` admits delegated machine resolution.
+    pub fn decisions_mode(&self) -> DecisionMode {
+        match self.decisions.mode {
+            Some(DecisionModeValue::Auto) => DecisionMode::Auto,
+            _ => DecisionMode::Ask,
+        }
     }
 
     pub fn parse_validated(text: &str) -> Result<Self, ConfigError> {
@@ -481,6 +553,12 @@ impl Config {
                     return Err(type_mismatch(key));
                 }
                 toml_edit::value(enabled)
+            }
+            ConfigValue::DecisionMode(mode) => {
+                if !matches!(&target, EditTarget::DecisionsMode) {
+                    return Err(type_mismatch(key));
+                }
+                toml_edit::value(mode.as_str())
             }
             ConfigValue::Model(model) => {
                 if !matches!(
@@ -603,13 +681,16 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return;
         };
-        let Ok((version, workflow, connections, profiles, models)) = validated_document(doc) else {
+        let Ok((version, workflow, decisions, connections, profiles, models)) =
+            validated_document(doc)
+        else {
             // Targeted edits intentionally remain usable while another path
             // still carries a rejected value; that value is never rewritten.
             return;
         };
         self.version = version;
         self.workflow = workflow;
+        self.decisions = decisions;
         self.connections = connections;
         self.profiles = profiles;
         self.models = models;
@@ -647,6 +728,11 @@ impl Config {
         }
         let segments: Vec<&str> = key.split('.').collect();
         match segments.as_slice() {
+            ["decisions", "mode"] => Some(
+                self.decisions
+                    .mode
+                    .map_or(Value::Null, |mode| Value::String(mode.as_str().to_string())),
+            ),
             ["connections", name, "region"] => Some(
                 self.connections
                     .get(*name)
@@ -682,7 +768,7 @@ impl Config {
 /// segment is never itself a known key, and an empty segment reads as
 /// unknown.
 pub fn is_readable_key(key: &str) -> bool {
-    if key == WORKFLOW_KEY {
+    if key == WORKFLOW_KEY || key == DECISIONS_MODE_KEY {
         return true;
     }
     let segments: Vec<&str> = key.split('.').collect();
@@ -711,11 +797,12 @@ fn credential_ref_admitted(raw: &str, key: &str) -> Result<(), ConfigIssue> {
 }
 
 /// The typed view `validated_document` extracts from the raw TOML:
-/// version, workflow table, connections, credential profiles and the
-/// models section, all schema-checked.
+/// version, workflow table, decisions table, connections, credential
+/// profiles and the models section, all schema-checked.
 type ParsedDocument = (
     u64,
     Workflow,
+    Decisions,
     BTreeMap<String, Connection>,
     BTreeMap<String, Profile>,
     Models,
@@ -724,6 +811,7 @@ type ParsedDocument = (
 fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
     let mut version = None;
     let mut workflow = Workflow::default();
+    let mut decisions = Decisions::default();
     let mut connections = BTreeMap::new();
     let mut profiles = BTreeMap::new();
     let mut models = Models::default();
@@ -759,6 +847,41 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
                                 ConfigIssue::UnknownKey {
                                     key: other.to_string(),
                                     known: WORKFLOW_KEYS,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            "decisions" => {
+                let table = table_like(key, item)?;
+                for (field, value) in table.iter() {
+                    match field {
+                        "mode" => {
+                            let raw = value.as_str().ok_or_else(|| {
+                                ConfigError::schema(
+                                    "decisions.mode",
+                                    ConfigIssue::ExpectedString {
+                                        field: "mode".to_string(),
+                                    },
+                                )
+                            })?;
+                            decisions.mode =
+                                Some(DecisionModeValue::parse(raw).ok_or_else(|| {
+                                    ConfigError::schema(
+                                        "decisions.mode",
+                                        ConfigIssue::UnsupportedDecisionMode {
+                                            mode: raw.to_string(),
+                                        },
+                                    )
+                                })?);
+                        }
+                        other => {
+                            return Err(ConfigError::schema(
+                                format!("decisions.{other}"),
+                                ConfigIssue::UnknownKey {
+                                    key: other.to_string(),
+                                    known: DECISIONS_KEYS,
                                 },
                             ));
                         }
@@ -892,12 +1015,13 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             check_chain_refs(&connections, fallback, &format!("{key}.fallback.chain"))?;
         }
     }
-    Ok((version, workflow, connections, profiles, models))
+    Ok((version, workflow, decisions, connections, profiles, models))
 }
 
 #[derive(Debug)]
 enum EditTarget {
     WorkflowEnabled,
+    DecisionsMode,
     DefaultsModel,
     DefaultsEffort,
     DefaultsFallback,
@@ -930,6 +1054,7 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
     }
     match segments.as_slice() {
         ["workflow", "enabled"] => Ok(EditTarget::WorkflowEnabled),
+        ["decisions", "mode"] => Ok(EditTarget::DecisionsMode),
         ["models", "defaults", "model"] => Ok(EditTarget::DefaultsModel),
         ["models", "defaults", "effort"] => Ok(EditTarget::DefaultsEffort),
         ["models", "defaults", "fallback"] => Ok(EditTarget::DefaultsFallback),
@@ -960,6 +1085,7 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
 /// one key earns one hint on both carriers (DEC-017) — never a second,
 /// divergent schema.
 const WORKFLOW_KEYS: &[&str] = &["enabled"];
+const DECISIONS_KEYS: &[&str] = &["mode"];
 const CONNECTION_KEYS: &[&str] = &["kind", "endpoint", "credential_ref", "region", "profile"];
 const PROFILE_KEYS: &[&str] = &["credential_ref"];
 const MODELS_KEYS: &[&str] = &["defaults", "groups", "purposes"];
@@ -1002,6 +1128,10 @@ fn unknown_edit_key(key: &str) -> ConfigError {
         "workflow" => match rest {
             [] => not_editable_key(key),
             _ => unknown_scope_key(key, WORKFLOW_KEYS),
+        },
+        "decisions" => match rest {
+            [] => not_editable_key(key),
+            _ => unknown_scope_key(key, DECISIONS_KEYS),
         },
         "connections" => match rest {
             [] | [_] => not_editable_key(key),
@@ -1102,6 +1232,7 @@ fn type_mismatch(key: &str) -> ConfigError {
 fn target_path(target: &EditTarget) -> (Vec<&str>, &str) {
     match target {
         EditTarget::WorkflowEnabled => (vec!["workflow"], "enabled"),
+        EditTarget::DecisionsMode => (vec!["decisions"], "mode"),
         EditTarget::DefaultsModel => (vec!["models", "defaults"], "model"),
         EditTarget::DefaultsEffort => (vec!["models", "defaults"], "effort"),
         EditTarget::DefaultsFallback => (vec!["models", "defaults"], "fallback"),
@@ -1393,6 +1524,14 @@ fn wire_value(key: &str, value: &Value) -> Result<ConfigValue, ConfigError> {
     let target = edit_target(key)?;
     match (&target, value) {
         (EditTarget::WorkflowEnabled, Value::Bool(enabled)) => Ok(ConfigValue::Bool(*enabled)),
+        (EditTarget::DecisionsMode, Value::String(mode)) => Ok(ConfigValue::DecisionMode(
+            DecisionModeValue::parse(mode).ok_or_else(|| {
+                ConfigError::schema(
+                    key,
+                    ConfigIssue::UnsupportedDecisionMode { mode: mode.clone() },
+                )
+            })?,
+        )),
         (
             EditTarget::DefaultsModel | EditTarget::GroupModel(_) | EditTarget::PurposeModel(_),
             Value::Object(fields),
@@ -1647,6 +1786,24 @@ fn validate_target(
                 return Err(ConfigError::schema(
                     key,
                     ConfigIssue::WorkflowEnabledNotBoolean,
+                ));
+            }
+        }
+        EditTarget::DecisionsMode => {
+            let Some(raw) = item.as_str() else {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::ExpectedString {
+                        field: "mode".to_string(),
+                    },
+                ));
+            };
+            if DecisionModeValue::parse(raw).is_none() {
+                return Err(ConfigError::schema(
+                    key,
+                    ConfigIssue::UnsupportedDecisionMode {
+                        mode: raw.to_string(),
+                    },
                 ));
             }
         }
@@ -2387,32 +2544,41 @@ pub struct EffectiveConfig {
     pub sources_digest: String,
     pub parsed: Option<Config>,
     pub workflow_entry: ConfigEntry,
+    pub decisions_entry: ConfigEntry,
+}
+
+/// The digest naming both configuration sources in order — the revision a
+/// `config.read` result and a `decisions.control` mutation precondition
+/// quote. Recomputed after every landed edit, so a stale precondition
+/// always conflicts instead of overwriting a concurrent write.
+pub fn sources_digest(user_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SHIPPED_DEFAULTS_TOML.as_bytes());
+    hasher.update(user_bytes);
+    hex(&hasher.finalize())
 }
 
 pub fn resolve_effective(user_toml: Option<&str>) -> Result<EffectiveConfig, ConfigError> {
     if let Some(text) = user_toml {
         Config::parse_validated(text)?;
     }
-    let mut hasher = Sha256::new();
-    hasher.update(SHIPPED_DEFAULTS_TOML.as_bytes());
-    hasher.update(user_toml.unwrap_or("").as_bytes());
-    let sources_digest = hex(&hasher.finalize());
     let mut effective = EffectiveConfig {
-        sources_digest,
+        sources_digest: sources_digest(user_toml.unwrap_or("").as_bytes()),
         parsed: user_toml.and_then(|text| Config::parse_validated(text).ok()),
         workflow_entry: shipped_workflow_entry(),
+        decisions_entry: shipped_decisions_entry(),
     };
-    effective.refresh_workflow_entry(&hex(&Sha256::digest(user_toml.unwrap_or("").as_bytes())));
+    effective.refresh_mode_entries(&hex(&Sha256::digest(user_toml.unwrap_or("").as_bytes())));
     Ok(effective)
 }
 
 impl EffectiveConfig {
-    /// Rebuilds the workflow entry the read surface serves from the
-    /// retained document — pre-publication the retained doc is the
-    /// effective view, so an accepted edit must move this entry with the
-    /// doc. `revision` names the retained doc's byte digest; an absent
-    /// `workflow.enabled` override keeps the shipped default.
-    pub fn refresh_workflow_entry(&mut self, revision: &str) {
+    /// Rebuilds the entries the read surface serves from the retained
+    /// document — pre-publication the retained doc is the effective view,
+    /// so an accepted edit must move these entries with the doc.
+    /// `revision` names the retained doc's byte digest; an absent
+    /// override keeps the shipped default.
+    pub fn refresh_mode_entries(&mut self, revision: &str) {
         self.workflow_entry = match self
             .parsed
             .as_ref()
@@ -2421,6 +2587,22 @@ impl EffectiveConfig {
             Some(value) => user_workflow_entry(value, revision),
             None => shipped_workflow_entry(),
         };
+        self.decisions_entry = match self
+            .parsed
+            .as_ref()
+            .and_then(|config| config.decisions.mode)
+        {
+            Some(value) => user_decisions_entry(value, revision),
+            None => shipped_decisions_entry(),
+        };
+    }
+
+    /// The mode a material fork observes — the retained document's
+    /// `decisions_mode`, or the shipped `ask` when no user file exists.
+    pub fn decisions_mode(&self) -> DecisionMode {
+        self.parsed
+            .as_ref()
+            .map_or(DecisionMode::Ask, Config::decisions_mode)
     }
 }
 
@@ -2458,30 +2640,81 @@ fn shipped_workflow_entry() -> ConfigEntry {
     }
 }
 
+fn user_decisions_entry(value: DecisionModeValue, revision: &str) -> ConfigEntry {
+    ConfigEntry {
+        key: DECISIONS_MODE_KEY.to_string(),
+        effective: ConfigViewValue::Visible {
+            value: Value::String(value.as_str().to_string()),
+        },
+        source: ConfigSource {
+            kind: "user".to_string(),
+            revision: revision.to_string(),
+            target: None,
+        },
+    }
+}
+
+fn shipped_decisions_entry() -> ConfigEntry {
+    ConfigEntry {
+        key: DECISIONS_MODE_KEY.to_string(),
+        effective: ConfigViewValue::Visible {
+            value: Value::String("ask".to_string()),
+        },
+        source: ConfigSource {
+            kind: "shipped".to_string(),
+            revision: shipped_revision(),
+            target: None,
+        },
+    }
+}
+
+/// What `decisions.control` op `status` reports: the key's served entry
+/// plus the mode a fork would actually observe — an `inherit` override
+/// reads "inherit" in the entry but resolves "ask" here.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigExplainResult {
+    pub key: String,
+    pub entry: ConfigEntry,
+    pub effective: String,
+    pub source_digest: String,
+}
+
+/// What a `decisions.control` mutation reports once the journaled
+/// publication lands: the key, the edit's digest and the journal row's
+/// owner/admission identity — the same facts `config.set` reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigMutationResult {
+    pub key: String,
+    pub digest: String,
+    pub owner: String,
+    pub admission_seq: u64,
+}
+
 // ----- crash-safe publication -----
 
 /// Ceiling for reading a publication target; a larger path is treated as
 /// unattributable instead of being pulled into memory whole.
 const PUBLICATION_MAX_BYTES: usize = 1 << 20;
 
-/// Darwin `O_NONBLOCK` (same value the executor read backend carries): a
-/// FIFO swapped onto the target path must not block the open itself. The
-/// regular-file check on the opened handle rejects it right after; regular
-/// files ignore the flag.
+/// `O_NONBLOCK` for the checked publication open, per platform
+/// (asm-generic fcntl.h: Linux `1 << 11` = 0o4000; Darwin fcntl.h
+/// 0x0004 — the same values the executor read backends carry): a FIFO
+/// swapped onto the target path must not block the open itself. The
+/// regular-file check on the opened handle rejects it right after;
+/// regular files ignore the flag.
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(target_os = "macos")]
 const O_NONBLOCK: i32 = 0x0004;
 
-/// `(dev, ino)` of a publication target. The managed write is in-place, so
-/// a staged identity that still matches after a crash attributes the bytes
-/// to our own write; a replaced inode never does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PublishIdentity {
-    pub dev: u64,
-    pub ino: u64,
-}
-
 /// One journaled publication intent: the bytes we intended to publish, what
-/// was at the target when the intent was staged, and the journal's
-/// admission order key.
+/// was at the target when the intent was staged — its digest and its write
+/// identity, `(dev, ino)` plus the reuse token — and the journal's
+/// admission order key. The managed write is in-place, so a staged
+/// identity whose `(dev, ino)` and reuse token both still match after a
+/// crash attributes the bytes to our own write; a replaced inode, a
+/// reused pair under another token, or an identity without a token never
+/// does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationIntent {
     pub owner: String,
@@ -2489,7 +2722,7 @@ pub struct PublicationIntent {
     pub admission_seq: u64,
     pub intended_digest: String,
     pub base_digest: Option<String>,
-    pub publish_identity: Option<PublishIdentity>,
+    pub publish_identity: Option<WriteIdentity>,
 }
 
 /// Which singleflight arm one admission landed on: a fresh row the
@@ -2575,8 +2808,9 @@ fn target_not_regular() -> std::io::Error {
 }
 
 /// Stages one publication intent: journals the intended digest together
-/// with the target's current bytes digest and `(dev, ino)` identity, so a
-/// crash between bytes and receipt stays classifiable.
+/// with the target's current bytes digest and write identity (`(dev, ino)`
+/// plus the reuse token), so a crash between bytes and receipt stays
+/// classifiable.
 ///
 /// # Errors
 /// Returns [`PublicationError::TargetAbsent`] when the target does not
@@ -2625,8 +2859,8 @@ pub fn stage_publication(
 }
 
 /// Singleflight admission for one config command (AC-095): the file and
-/// CLI carriers both admit here, keyed on the target's file identity and
-/// the intended digest. A command that is still pending is never
+/// CLI carriers both admit here, keyed on the target's file identity —
+/// `(dev, ino)` plus its reuse token — and the intended digest. A command that is still pending is never
 /// journaled twice — the replay observes the pending intent (one control
 /// event), so the command can later complete exactly once. A replay of a
 /// command whose intent already went terminal returns that terminal
@@ -2635,7 +2869,9 @@ pub fn stage_publication(
 /// never a max over `admission_seq` — the counter is per target *string*,
 /// so one file journaled under two spellings carries two counters and
 /// cross-spelling seq order is not chronology. Anything else admits as a
-/// fresh instance.
+/// fresh instance. A pending row whose match no reuse token confirms is
+/// still the answer; a terminal one is refused rather than replayed or
+/// restaged.
 ///
 /// The returned row may carry a different target spelling than the one
 /// this admission named: `(owner, admission_seq)` is an informational
@@ -2643,8 +2879,11 @@ pub fn stage_publication(
 ///
 /// # Errors
 /// Returns the [`PublicationError`] `stage_publication` returns for a
-/// fresh admission, or [`PublicationError::Journal`] when the journal
-/// cannot be read.
+/// fresh admission, [`PublicationError::Journal`] when the journal
+/// cannot be read, and [`PublicationError::Write`] carrying
+/// [`crate::executor::WorkerError::WriteIdentityUnattested`] when a
+/// terminal row may own the current bytes but no reuse token can confirm
+/// it.
 pub fn admit_publication(
     store: &mut TaskStore,
     owner: &str,
@@ -2655,24 +2894,45 @@ pub fn admit_publication(
         .to_str()
         .ok_or(PublicationError::TargetNotUtf8)?
         .to_string();
-    // One observation keys every match on the file's `(dev, ino)` — two
-    // spellings of one file are one target — and later confirms whether a
-    // terminal row's bytes still hold.
+    // One observation keys every match on the file's `(dev, ino)` and
+    // reuse token — two spellings of one file are one target — and later
+    // confirms whether a terminal row's bytes still hold.
     let sight = observe_target(&target_key);
     let pending = store.pending_publications().map_err(journal_error)?;
     for intent in pending {
-        if intent.intended_digest == edit.digest && same_target_file(&intent, &sight, &target_key) {
+        // A pending row whose file match no reuse token can confirm is
+        // still returned instead of staging a second row: its owning
+        // publish or recovery refuses the unattested write itself.
+        if intent.intended_digest == edit.digest
+            && same_target_file(&intent, &sight, &target_key) != FileAttribution::Different
+        {
             return Ok(PublicationAdmission::Pending(intent));
         }
     }
     let applied = store.applied_publications().map_err(journal_error)?;
     if let TargetSight::Present { digest, .. } = &sight
         && digest == &edit.digest
-        && let Some(applied) = applied.iter().find(|intent| {
-            intent.intended_digest == edit.digest && same_target_file(intent, &sight, &target_key)
-        })
     {
-        return Ok(PublicationAdmission::Applied(applied.clone()));
+        let mut unverifiable = None;
+        for intent in applied
+            .iter()
+            .filter(|intent| intent.intended_digest == edit.digest)
+        {
+            match same_target_file(intent, &sight, &target_key) {
+                FileAttribution::Same => return Ok(PublicationAdmission::Applied(intent.clone())),
+                FileAttribution::Unverifiable(cause) => {
+                    unverifiable.get_or_insert(cause);
+                }
+                FileAttribution::Different => {}
+            }
+        }
+        // A terminal row that may own these bytes but cannot be confirmed
+        // is neither the historical answer nor room for a fresh row.
+        if let Some(cause) = unverifiable {
+            return Err(PublicationError::Write(
+                crate::executor::WorkerError::WriteIdentityUnattested { cause },
+            ));
+        }
     }
     stage_publication(store, owner, target, edit).map(PublicationAdmission::Staged)
 }
@@ -2701,16 +2961,8 @@ pub fn publish_intent(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    crate::executor::write_once(
-        &scope_root,
-        Path::new(target),
-        crate::executor::FileIdentity {
-            dev: identity.dev,
-            ino: identity.ino,
-        },
-        bytes,
-    )
-    .map_err(PublicationError::Write)?;
+    crate::executor::write_once(&scope_root, Path::new(target), identity, bytes)
+        .map_err(PublicationError::Write)?;
     store
         .complete_publication(&intent.owner, target, intent.admission_seq)
         .map_err(journal_error)
@@ -2750,20 +3002,58 @@ pub fn resolve_pending_publication(
     publish_intent(store, intent, bytes).map(|()| intent.clone())
 }
 
+/// How one staged write identity relates to the identity now at a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAttribution {
+    /// Another file: a different `(dev, ino)`, or the same pair under a
+    /// different reuse token — a later file reusing the pair.
+    Different,
+    /// The staged file itself: the same `(dev, ino)` and the same reuse
+    /// token on both sides.
+    Same,
+    /// The same `(dev, ino)` (or, with no staged identity, the same
+    /// spelling) that no reuse token can confirm.
+    Unverifiable(Unattested),
+}
+
+/// Same-file attribution between a staged and a current identity: only an
+/// equal `(dev, ino)` with equal reuse tokens on both sides proves it.
+fn attribute(staged: WriteIdentity, current: WriteIdentity) -> FileAttribution {
+    if staged.file() != current.file() {
+        return FileAttribution::Different;
+    }
+    match (staged.reuse(), current.reuse()) {
+        (Ok(staged), Ok(current)) if staged == current => FileAttribution::Same,
+        (Ok(_), Ok(_)) => FileAttribution::Different,
+        (Err(cause), _) | (_, Err(cause)) => FileAttribution::Unverifiable(cause),
+    }
+}
+
 /// Whether one journaled intent targets the same file this admission
-/// names: the opened `(dev, ino)` identity decides; path spellings decide
-/// only when that identity cannot be observed (the file is gone or
-/// unreadable) or was never journaled.
-fn same_target_file(intent: &PublicationIntent, sight: &TargetSight, target_key: &str) -> bool {
+/// names: the opened `(dev, ino)` identity plus its reuse token decides,
+/// and a side without a token leaves the match unverifiable; a row that
+/// journaled no identity matches by spelling, unverifiably. Path
+/// spellings decide alone only when the target cannot be observed (the
+/// file is gone or unreadable) — such a sight never reaches a terminal
+/// answer.
+fn same_target_file(
+    intent: &PublicationIntent,
+    sight: &TargetSight,
+    target_key: &str,
+) -> FileAttribution {
     match sight {
         TargetSight::Present {
             identity: Some(current),
             ..
         } => match intent.publish_identity {
-            Some(staged) => staged == *current,
-            None => intent.target == target_key,
+            Some(staged) => attribute(staged, *current),
+            None if intent.target == target_key => {
+                FileAttribution::Unverifiable(Unattested::Unrecorded)
+            }
+            None => FileAttribution::Different,
         },
-        _ => spelled_same_file(&intent.target, target_key),
+        _ if spelled_same_file(&intent.target, target_key) => FileAttribution::Same,
+        _ => FileAttribution::Different,
     }
 }
 
@@ -2776,11 +3066,12 @@ fn spelled_same_file(a: &str, b: &str) -> bool {
     }
 }
 
-/// One consistent snapshot of the target: the identity and the digested
-/// bytes were taken through the same opened handle.
+/// One consistent snapshot of the target: the write identity, its reuse
+/// token included, and the digested bytes were taken through the same
+/// opened handle.
 struct TargetObservation {
     digest: String,
-    identity: PublishIdentity,
+    identity: WriteIdentity,
     bytes: Vec<u8>,
 }
 
@@ -2790,7 +3081,9 @@ struct TargetObservation {
 /// path can neither hang the open nor slip past the fd-level check), and
 /// the read stops one byte past the ceiling so a file that grows past the
 /// limit between `fstat` and the read is caught by the length re-check
-/// instead of being read unbounded.
+/// instead of being read unbounded. The reuse token comes from that same
+/// handle: a filesystem without one leaves the identity explicitly
+/// unattested, and any other token failure fails the observation.
 fn read_target_once(path: &str) -> std::io::Result<TargetObservation> {
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -2803,6 +3096,11 @@ fn read_target_once(path: &str) -> std::io::Result<TargetObservation> {
     if metadata.len() > PUBLICATION_MAX_BYTES as u64 {
         return Err(target_too_large());
     }
+    let reuse = match rivect_sandbox_helper::reuse_token(&file) {
+        Ok(token) => Ok(token),
+        Err(rivect_sandbox_helper::ReuseTokenError::Unsupported) => Err(Unattested::Unsupported),
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(PUBLICATION_MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
@@ -2811,10 +3109,7 @@ fn read_target_once(path: &str) -> std::io::Result<TargetObservation> {
     }
     Ok(TargetObservation {
         digest: hex(&Sha256::digest(&bytes)),
-        identity: PublishIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        },
+        identity: WriteIdentity::new(FileIdentity::from_metadata(&metadata), reuse),
         bytes,
     })
 }
@@ -2823,7 +3118,7 @@ enum TargetSight {
     Absent,
     Present {
         digest: String,
-        identity: Option<PublishIdentity>,
+        identity: Option<WriteIdentity>,
         bytes: Vec<u8>,
     },
     Unknown,
@@ -2845,7 +3140,9 @@ fn observe_target(target: &str) -> TargetSight {
     }
 }
 
-/// Classifies one journaled intent against the bytes now at its target.
+/// Classifies one journaled intent against the bytes now at its target:
+/// intended bytes are our own write only under the staged `(dev, ino)`
+/// and reuse token.
 fn classify_intent(intent: &PublicationIntent) -> PublicationVerdict {
     match observe_target(&intent.target) {
         TargetSight::Absent => PublicationVerdict::Absent,
@@ -2857,10 +3154,13 @@ fn classify_intent(intent: &PublicationIntent) -> PublicationVerdict {
         } => {
             if digest == intent.intended_digest {
                 return match (intent.publish_identity, identity) {
-                    (Some(staged), Some(current)) if staged == current => {
-                        PublicationVerdict::ExactlyNew
-                    }
-                    (Some(_), Some(_)) => PublicationVerdict::ByteIdenticalThird,
+                    (Some(staged), Some(current)) => match attribute(staged, current) {
+                        FileAttribution::Same => PublicationVerdict::ExactlyNew,
+                        FileAttribution::Different => PublicationVerdict::ByteIdenticalThird,
+                        // The same `(dev, ino)` without a reuse token on
+                        // both sides may be a later file reusing the pair.
+                        FileAttribution::Unverifiable(_) => PublicationVerdict::Unknown,
+                    },
                     // Identical bytes with no comparable identity stay
                     // unattributed, never a receipt.
                     _ => PublicationVerdict::Unknown,

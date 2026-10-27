@@ -4,8 +4,10 @@
 //! owns config types. Wire forms follow the JSON-RPC shapes in architecture;
 //! all IDs are nominal UUIDv4 strings.
 
+use crate::index::{GenerationState, ProjectGraph, SnapshotId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const TEXT_MAX_BYTES: usize = 65_536;
@@ -211,6 +213,62 @@ pub struct Obligation {
 pub struct Criterion {
     pub id: CriterionId,
     pub text: String,
+}
+
+/// One durable evidence record (the recorded D5 split): an observation
+/// bound to its task and obligation, with the content digest and the
+/// validity state the store last assigned. Rows are append-only — a
+/// superseded observation is marked stale, never rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Evidence {
+    pub evidence_id: EvidenceId,
+    pub task_id: TaskId,
+    pub scope: String,
+    pub observation: String,
+    pub digest: String,
+    pub validity: EvidenceValidity,
+    pub obligation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceValidity {
+    Current,
+    Stale,
+}
+
+/// One row of the append-only answer-attempt journal: the selection a
+/// caller tried against a question revision, its declared origin, and
+/// whether it applied or was denied — denied rows carry the typed denial
+/// class in `denial`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnswerAttempt {
+    pub id: u64,
+    pub question_id: QuestionId,
+    pub task_id: TaskId,
+    pub question_revision: u64,
+    pub selection: AnswerSelection,
+    pub author: String,
+    pub outcome: AnswerAttemptOutcome,
+    pub denial: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerAttemptOutcome {
+    Applied,
+    Denied,
+}
+
+impl AnswerAttemptOutcome {
+    /// Column spelling in `answer_attempts.outcome`; `None` for anything else.
+    #[must_use]
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "applied" => Some(Self::Applied),
+            "denied" => Some(Self::Denied),
+            _ => None,
+        }
+    }
 }
 
 /// Bounded page of a snapshot collection. The CLI starts at `page_size` 20
@@ -518,6 +576,72 @@ pub struct CommandDescriptor {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailability_reason: Option<String>,
+}
+
+/// One `command.execute` local command's typed carrier. The dispatcher
+/// parses the wire params into this shape before it routes, so a kind
+/// runs only on the arguments it declares and a malformed one is a typed
+/// refusal instead of a handler's guess (DEC-010).
+///
+/// `deny_unknown_fields` is the guarantee, not a parser's diligence: a
+/// name the carrier does not declare — a caller-supplied `root` above
+/// all — is refused by the type itself, so every ingress that decodes
+/// this shape refuses it and no surface can carry the opposite of the
+/// rule the contract names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LocalCommand {
+    /// Build or repair the project index generation for the pinned
+    /// project root. `budget_ms` is the caller's index budget,
+    /// `task_id` the task whose cancellation reaches the worker, and
+    /// `changed` the project-relative paths a coalesced watcher batch
+    /// reported — an empty list is a full build or a repair. None of
+    /// them is required, and none can widen the clamp the isolated run
+    /// applies.
+    #[serde(rename = "project.init")]
+    ProjectInit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_ms: Option<u64>,
+        #[serde(default)]
+        changed: Vec<PathBuf>,
+    },
+}
+
+impl LocalCommand {
+    /// The wire params of one `command.execute` local command, decoded
+    /// by this type. An undeclared name, a wrong type or a missing
+    /// `kind` is a serde refusal the caller maps onto its own typed
+    /// error — the shape never reaches a handler half-parsed.
+    pub fn from_value(params: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(params.clone())
+    }
+}
+
+/// What a local command answered: the kind it ran under and that kind's
+/// own typed payload. A kind with no payload this build serves has no
+/// variant here, so an absent payload can never read as empty success.
+///
+/// The variant spells its kind exactly as the carrier does, so the
+/// rendered answer is a round-trip of the carrier's own tag rather than
+/// a `snake_case` transliteration of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LocalCommandResult {
+    #[serde(rename = "project.init")]
+    ProjectInit(Box<ProjectInitResult>),
+}
+
+/// `project.init`'s typed answer: the versioned generation it cut, the
+/// state that generation is in, and the derived graph it carries. A
+/// `Stale` state or a `Partial` graph is what a failed or incomplete
+/// build reports — never a `Fresh` generation over unverified bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInitResult {
+    pub snapshot: SnapshotId,
+    pub state: GenerationState,
+    pub graph: ProjectGraph,
 }
 
 /// JSON-RPC envelope for the corpus-driven ingress tests.

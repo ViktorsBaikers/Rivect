@@ -28,9 +28,7 @@ use rivect::contracts::{
 use rivect::controller::{
     ControllerError, SchedulerStep, StepOutcome, step_error_observation, step_outcome_observation,
 };
-use rivect::executor::{
-    EffectOutcome, EffectRequest, Executor, ExecutorError, ReadWorker, WorkerError,
-};
+use rivect::executor::{EffectOutcome, EffectRequest, ExecutorError, ReadWorker, WorkerError};
 use rivect::model::{ModelError, RequestManifest};
 use rivect::policy::{PermissionMode, PolicyError};
 use rivect::providers::{Provider, ProviderError, ProviderReply, ToolCall};
@@ -142,8 +140,7 @@ fn answer_task(
     };
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .answer_question(
             session,
             task,
@@ -165,8 +162,7 @@ fn answer_task(
 fn cancel_task_via_ingress(world: &mut World, session: &SessionId, task: &TaskId) {
     let intent_revision = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(task)
         .expect("snapshot")
         .intent_revision;
@@ -256,15 +252,13 @@ fn one_slot_parent_child_completes_via_ingress_driven_wait() {
     assert_eq!(world.provider_calls.load(Ordering::SeqCst), 2);
     let child_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&child_task)
         .expect("child snapshot");
     assert_eq!(child_snapshot.lifecycle, Lifecycle::Completed);
     let parent_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&parent_task)
         .expect("parent snapshot");
     assert_eq!(parent_snapshot.lifecycle, Lifecycle::Completed);
@@ -381,8 +375,7 @@ fn reanswer_through_ingress_never_stalls_the_waiting_parent() {
     assert_eq!(world.provider_calls.load(Ordering::SeqCst), 3);
     let parent_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&parent_task)
         .expect("parent snapshot");
     assert_eq!(parent_snapshot.lifecycle, Lifecycle::Completed);
@@ -450,8 +443,7 @@ fn replayed_create_cannot_reparent_the_original_task() {
     assert_eq!(world.provider_calls.load(Ordering::SeqCst), 0);
     let child_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&child_task)
         .expect("child snapshot");
     assert_ne!(child_snapshot.lifecycle, Lifecycle::Completed);
@@ -618,7 +610,7 @@ fn decision_step_error_settles_node_and_tree_recovers() {
 
     // Both runnable nodes froze the now-revoked grant: their decision
     // steps fail at mutable admission, before any provider effect.
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
     assert!(world.runtime.scheduler_step(&session).is_err());
     assert_eq!(world.runtime.scheduler.running_count(), 0);
     assert_eq!(world.runtime.scheduler.held_units(), 0);
@@ -744,22 +736,19 @@ fn cancel_ingress_drains_tree_remaining_children_never_dispatch() {
     // Spent cost and completed effects survive the cancellation.
     let first_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&first_child)
         .expect("first child snapshot");
     assert_eq!(first_snapshot.lifecycle, Lifecycle::Completed);
     let parent_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&parent_task)
         .expect("parent snapshot");
     assert_eq!(parent_snapshot.lifecycle, Lifecycle::Cancelled);
     let second_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&second_child)
         .expect("second child snapshot");
     assert_ne!(second_snapshot.lifecycle, Lifecycle::Completed);
@@ -846,8 +835,7 @@ fn cancel_of_unanswered_parent_drains_root_attached_descendants() {
     assert_eq!(world.provider_calls.load(Ordering::SeqCst), 0);
     let child_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&child_task)
         .expect("child snapshot");
     assert_ne!(child_snapshot.lifecycle, Lifecycle::Completed);
@@ -2016,16 +2004,14 @@ fn reaction_records_are_durable_and_pageable_in_task_state() {
     for reaction in &fired {
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .record_supervisor_reaction(reaction)
             .expect("reaction recorded");
     }
 
     let (first_page, has_more) = world
         .runtime
-        .owner
-        .store
+        .store()
         .supervisor_reactions(&task, 2, 0)
         .expect("first page");
     assert!(has_more);
@@ -2037,8 +2023,7 @@ fn reaction_records_are_durable_and_pageable_in_task_state() {
 
     let (last_page, has_more) = world
         .runtime
-        .owner
-        .store
+        .store()
         .supervisor_reactions(&task, 2, 2)
         .expect("second page");
     assert!(!has_more);
@@ -2059,15 +2044,14 @@ fn runtime_supervisor_journals_reactions_from_real_denied_outcomes() {
     let task = world.create_task(&session, "cmd-supervisor-loop");
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrolled on the scoped file");
 
     let journal = |world: &World| {
         world
             .runtime
-            .owner
-            .store
+            .store()
             .supervisor_reactions(&task, 8, 0)
             .expect("journal read")
     };
@@ -2226,8 +2210,7 @@ fn drive_step(
 fn journal(world: &World, task: &TaskId) -> Vec<Reaction> {
     world
         .runtime
-        .owner
-        .store
+        .store()
         .supervisor_reactions(task, 8, 0)
         .expect("journal read")
         .0
@@ -2245,7 +2228,7 @@ fn every_outcome_and_error_class_maps_to_a_distinct_typed_observation() {
     let (mut world, _file, _grant) = scoped_world("observation-map");
     let session = world.open_session("bootstrap-observation-map");
     let task = world.create_task(&session, "cmd-observation-map");
-    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let snapshot = world.runtime.store().snapshot(&task).expect("snapshot");
     let answer = AnswerSelection::Custom {
         text: "read /scope/f".to_string(),
     };
@@ -2391,7 +2374,7 @@ fn applicability_evaluation_error_marks_obligation_unresolved_not_stale_and_bloc
         "{error:?}"
     );
 
-    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let snapshot = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_eq!(snapshot.lifecycle, Lifecycle::Blocked);
     let obligations = &snapshot.obligations.items;
     assert_eq!(obligations.len(), 1);
@@ -2405,8 +2388,7 @@ fn applicability_evaluation_error_marks_obligation_unresolved_not_stale_and_bloc
     // applicability alone — no stale execution — rejects completion.
     let err = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("unresolved applicability rejects completion");
     assert!(
@@ -2417,7 +2399,7 @@ fn applicability_evaluation_error_marks_obligation_unresolved_not_stale_and_bloc
         ),
         "{err}"
     );
-    let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let after = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_ne!(after.lifecycle, Lifecycle::Completed);
     assert!(
         after
@@ -2438,7 +2420,7 @@ fn revoked_grant_errors_feed_a_typed_policy_observation() {
     let (mut world, file, grant) = scoped_world("feed-policy");
     let session = world.open_session("bootstrap-feed-policy");
     let task = world.create_task(&session, "cmd-feed-policy");
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
 
     for _ in 0..3 {
         let error = drive_step(&mut world, &session, &task, &grant, &node_answer(&file))
@@ -2475,7 +2457,7 @@ fn outside_scope_admission_errors_feed_a_typed_executor_observation() {
         Box::new(OutsideScopeProvider {
             target: "/etc/hosts".to_string(),
         }),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let session = world.open_session("bootstrap-feed-executor");
     let task = world.create_task(&session, "cmd-feed-executor");
@@ -2513,7 +2495,7 @@ fn provider_errors_feed_a_typed_model_observation() {
     let (mut world, file, grant) = scoped_world_with(
         "feed-model",
         Box::new(FailingProvider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let session = world.open_session("bootstrap-feed-model");
     let task = world.create_task(&session, "cmd-feed-model");
@@ -2575,7 +2557,7 @@ fn waiting_outcomes_feed_a_typed_observation() {
     let (mut world, file, grant) = scoped_world_with(
         "feed-waiting",
         Box::new(NoReadProvider),
-        Box::new(rivect::executor::macos::MacosReadWorker),
+        Box::new(support::PlatformWorker::default()),
     );
     let session = world.open_session("bootstrap-feed-waiting");
     let task = world.create_task(&session, "cmd-feed-waiting");
@@ -2715,8 +2697,9 @@ fn terminal_no_action_outcomes_feed_a_typed_observation() {
 /// reopen, so `ORDER BY id` paging works under either shape.
 #[test]
 fn idless_supervisor_reactions_journal_migrates_in_place() {
-    let root = support::temp_dir("supervisor-migration");
-    let path = root.join("state.db");
+    let root =
+        tempfile::TempDir::with_prefix("rivect-supervisor-migration-").expect("fixture root");
+    let path = root.path().join("state.db");
     let task = stub_task("migration");
     let reaction = |suffix: usize| Reaction {
         task: task.clone(),
@@ -2785,8 +2768,8 @@ fn idless_supervisor_reactions_journal_migrates_in_place() {
 /// over-reserve is a typed denial — never a double-spend.
 #[test]
 fn last_budget_reserve_admits_one_child_and_the_other_waits() {
-    let root = support::temp_dir("budget-last-reserve");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    let root = tempfile::TempDir::with_prefix("rivect-budget-last-reserve-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
     let mut scheduler = Scheduler::new(4, 16);
 
     let parent = stub_task("budget-parent");
@@ -2943,8 +2926,8 @@ fn last_budget_reserve_admits_one_child_and_the_other_waits() {
 /// level after every transition.
 #[test]
 fn budget_reserve_checks_every_applicable_level_atomically() {
-    let root = support::temp_dir("budget-levels");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    let root = tempfile::TempDir::with_prefix("rivect-budget-levels-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
     store.open_budget("root", 8).expect("root opens");
     store.open_budget("branch", 4).expect("branch opens");
 
@@ -3079,8 +3062,8 @@ fn unknown_sent_cost_is_retained_not_released_as_zero() {
     let sent_cost = broker.sent_cost_explain(&manifest);
     assert_eq!(sent_cost.bound, manifest.cost_bound);
 
-    let root = support::temp_dir("budget-unknown-cost");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    let root = tempfile::TempDir::with_prefix("rivect-budget-unknown-cost-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
     store
         .open_budget("task-budget", manifest.cost_bound)
         .expect("budget opens at the bound");
@@ -3119,8 +3102,8 @@ fn unknown_sent_cost_is_retained_not_released_as_zero() {
 /// conflict, so the same units can never be spent twice.
 #[test]
 fn budget_reservation_resolves_exactly_once() {
-    let root = support::temp_dir("budget-once");
-    let mut store = TaskStore::open(&root.join("state.db")).expect("store opens");
+    let root = tempfile::TempDir::with_prefix("rivect-budget-once-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
     store.open_budget("once", 10).expect("budget opens");
     store
         .budget_reserve("res-1", &["once"], 4)
@@ -3241,12 +3224,7 @@ fn admit_flight_read(
     file: &Path,
     mode: PermissionMode,
 ) -> (rivect::executor::AdmittedEffect, Option<FlightRole>) {
-    let mut executor = Executor::with_flights(
-        &mut world.runtime.policy,
-        &mut world.runtime.owner.store,
-        world.runtime.read_worker.as_mut(),
-        flights,
-    );
+    let mut executor = world.runtime.executor_with_flights(flights);
     let admitted = executor
         .admit(
             task,
@@ -3267,12 +3245,7 @@ fn execute_flight_read(
     flights: &mut ReadFlights,
     admitted: &rivect::executor::AdmittedEffect,
 ) -> Result<EffectOutcome, ExecutorError> {
-    let mut executor = Executor::with_flights(
-        &mut world.runtime.policy,
-        &mut world.runtime.owner.store,
-        world.runtime.read_worker.as_mut(),
-        flights,
-    );
+    let mut executor = world.runtime.executor_with_flights(flights);
     executor.execute(admitted)
 }
 
@@ -3339,8 +3312,7 @@ fn identical_permitted_reads_merge_into_one_physical_charge() {
     for admitted in [&admitted_a, &admitted_b] {
         let (owner, state, detail) = world
             .runtime
-            .owner
-            .store
+            .store()
             .attempt_record(&admitted.attempt_id)
             .expect("attempt record")
             .expect("attempt exists");
@@ -3367,7 +3339,7 @@ fn differing_scope_snapshot_or_mode_never_merges_reads() {
 
     // Differing access scope: a wider grant over the same file is a
     // different right, so it leads its own flight.
-    let wide_grant = world.runtime.policy.grant_read(world.root.clone());
+    let wide_grant = world.runtime.policy_writer().grant_read(world.root.clone());
     let (admitted_a, role_a) = admit_flight_read(
         &mut world,
         &mut flights,
@@ -3525,8 +3497,7 @@ fn cancelled_subscriber_leaves_other_flight_members_running() {
     );
     let (_, state_b, _) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&admitted_b.attempt_id)
         .expect("attempt record")
         .expect("attempt exists");
@@ -3564,7 +3535,7 @@ fn deny_enrolled_after_admit_denies_each_flight_member_independently() {
 
     world
         .runtime
-        .policy
+        .policy_writer()
         .enroll_deny(&file)
         .expect("deny enrolls on the target");
 
@@ -3591,7 +3562,7 @@ fn non_read_effects_never_enter_or_split_a_read_flight() {
     let task_a = flight_task(&mut world, &session, "cmd-flight-read-a");
     let task_b = flight_task(&mut world, &session, "cmd-flight-read-b");
     let task_w = flight_task(&mut world, &session, "cmd-flight-write");
-    let write_grant = world.runtime.policy.grant_classes(
+    let write_grant = world.runtime.policy_writer().grant_classes(
         world.root.join("scope"),
         vec![rivect::contracts::EffectClass::Write],
     );
@@ -3606,12 +3577,7 @@ fn non_read_effects_never_enter_or_split_a_read_flight() {
         PermissionMode::Manual,
     );
     let admitted_w = {
-        let mut executor = Executor::with_flights(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-            &mut flights,
-        );
+        let mut executor = world.runtime.executor_with_flights(&mut flights);
         executor
             .admit(
                 &task_w,
@@ -3708,8 +3674,9 @@ fn answer_through_dispatch_runtime_request_drives_a_decision_step_without_a_dire
 
 #[test]
 fn budget_charge_rejects_confirmed_above_bound_and_charge_sql_requires_reserved_ge_bound() {
-    let root = support::temp_dir("budget-charge-guards");
-    let path = root.join("state.db");
+    let root =
+        tempfile::TempDir::with_prefix("rivect-budget-charge-guards-").expect("fixture root");
+    let path = root.path().join("state.db");
     {
         let mut store = TaskStore::open(&path).expect("store opens");
         store.open_budget("root", 8).expect("root opens");
@@ -3772,5 +3739,96 @@ fn budget_charge_rejects_confirmed_above_bound_and_charge_sql_requires_reserved_
             }) if scope == "root"
         ),
         "{under}"
+    );
+}
+
+/// The refusal is typed and readable through the public API alone.
+fn assert_writer_refused(error: &StoreError) {
+    assert!(
+        matches!(error, StoreError::Storage(_))
+            && error.to_string().contains("already has a writer"),
+        "a second writer is refused: {error}"
+    );
+}
+
+#[test]
+fn second_task_store_through_hard_link_alias_is_refused() {
+    let world = open_world("writer-alias", None);
+    let db = world.runtime.owner().runtime_dir().join("rivect.db");
+    let alias = db.with_file_name("alias.db");
+    std::fs::hard_link(&db, &alias).expect("hard link the owner database");
+    for name in [&db, &alias] {
+        let Err(refused) = TaskStore::open(name) else {
+            panic!("the runtime owns this inode");
+        };
+        assert_writer_refused(&refused);
+    }
+    std::fs::remove_file(&alias).expect("remove the alias");
+}
+
+/// Child entry of the cross-process writer leg: opens the database the
+/// marker names and reports the outcome on stdout.
+#[test]
+#[ignore = "child entry: spawned by cross_process_second_writer_is_refused_before_sql"]
+fn cross_process_writer_open_child() {
+    use std::io::Write as _;
+    let db = std::env::var_os("RIVECT_WRITER_DB").expect("the writer marker names the database");
+    let line = match TaskStore::open(Path::new(&db)) {
+        Ok(_store) => "WRITER_OPEN admitted\n".to_string(),
+        Err(error) => format!("WRITER_OPEN refused {error}\n"),
+    };
+    std::io::stdout()
+        .lock()
+        .write_all(line.as_bytes())
+        .expect("report the outcome");
+}
+
+/// One child opener over `db`; every custody step stays a value until the
+/// reap and a failed step retains the root before failing.
+fn child_open(db: &Path, root: &mut support::TempTree) -> String {
+    let spawned = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "cross_process_writer_open_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("RIVECT_WRITER_DB", db)
+        .output();
+    if spawned.is_err() {
+        root.retain();
+    }
+    let output = spawned.expect("run the child opener");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.starts_with("WRITER_OPEN "))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("the child reported its outcome: {output:?}"))
+}
+
+#[test]
+fn cross_process_second_writer_is_refused_before_sql() {
+    let mut root = support::TempTree::new("concurrency", "writer-cross");
+    let db = root.path.join("state.db");
+    let holder = TaskStore::open(&db).expect("holder opens");
+    let snapshot = |path: &Path| std::fs::read(path).ok();
+    let wal = db.with_file_name("state.db-wal");
+    let (main_before, wal_before) = (snapshot(&db), snapshot(&wal));
+    let refused = child_open(&db, &mut root);
+    assert!(
+        refused.starts_with("WRITER_OPEN refused ") && refused.contains("already has a writer"),
+        "a second process is refused by the held lock: {refused}"
+    );
+    // The refusal precedes every statement, so the holder's files are
+    // byte-for-byte what they were.
+    assert_eq!(snapshot(&db), main_before);
+    assert_eq!(snapshot(&wal), wal_before);
+    drop(holder);
+    assert_eq!(
+        child_open(&db, &mut root),
+        "WRITER_OPEN admitted",
+        "the lock is released when the holder drops"
     );
 }

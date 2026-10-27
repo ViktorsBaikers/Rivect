@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS retained (
     boundary_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS retained_rows_immutable
+BEFORE UPDATE ON retained
+BEGIN
+    SELECT RAISE(ABORT, 'retained rows are immutable');
+END;
 
 -- Supervisor reaction journal (INV-027): one append-only row per
 -- detector firing; the JSON carries the stall cause and the class
@@ -152,9 +157,11 @@ CREATE INDEX IF NOT EXISTS idx_supervisor_reactions_task
     ON supervisor_reactions (task_id);
 -- Config publication journal: append-only intents, receipted by
 -- the state transition pending -> applied. `identity` is the target's
--- `dev:ino` at staging: the managed write is in-place, so a surviving
--- inode attributes intended bytes to our own crashed write; a replaced
--- inode never does.
+-- write identity at staging, lowercase hex: `v2:dev:ino:token` with the
+-- reuse token when attested, the legacy `dev:ino` (read as unattested)
+-- when not. The managed write is in-place, so a surviving inode
+-- attributes intended bytes to our own crashed write; a replaced inode
+-- never does.
 CREATE TABLE IF NOT EXISTS config_publications (
     owner TEXT NOT NULL,
     target TEXT NOT NULL,

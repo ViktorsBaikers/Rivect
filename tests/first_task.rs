@@ -17,8 +17,9 @@
 mod support;
 
 use rivect::commands::Ingress;
-use rivect::contracts::{AnswerSelection, Lifecycle, OptionId};
-use rivect::executor::{EffectRequest, Executor};
+use rivect::contracts::{AnswerSelection, Lifecycle, OptionId, ProjectInitResult};
+use rivect::executor::EffectRequest;
+use rivect::index::SnapshotId;
 use rivect::model::RequestManifest;
 use rivect::providers::{Provider, ProviderError, ProviderReply};
 use rivect::resources::{Delivery, NotificationQueue, UsageDelta};
@@ -30,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use support::{
     World, answer_custom, corpus_answer_custom, corpus_answer_option, corpus_config_read,
-    corpus_create, corpus_question_current, corpus_status, corpus_steer, open_world, rivect_binary,
-    spawn_pty, spawn_pty_with_args,
+    corpus_create, corpus_question_current, corpus_status, corpus_steer, ensure_helper, open_world,
+    rivect_binary, spawn_pty,
 };
 
 fn scoped_world(tag: &str, config: Option<&str>) -> (World, PathBuf, PathBuf, String) {
@@ -58,8 +59,7 @@ fn freeze_answered(
 ) {
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .answer_question(
             session,
             task,
@@ -128,7 +128,7 @@ fn typed_errors_preserve_source_chains() {
     );
 
     let world = open_world("typed-error-source", None);
-    let worker_error = rivect::executor::macos::read_once(
+    let worker_error = support::platform_read_once(
         &world.root.join("missing-scope"),
         &world.root.join("missing-target"),
     )
@@ -232,8 +232,7 @@ fn events_read_rejects_invalid_after_cursor() {
 
     let state_error = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, None, u64::MAX, 20)
         .expect_err("state API must reject an out-of-range cursor");
     assert!(matches!(
@@ -274,8 +273,7 @@ fn task_collection_pages_attempts_with_next_cursor() {
     for index in 0..5 {
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .plan_attempt(
                 &task,
                 rivect::contracts::EffectClass::Read,
@@ -285,8 +283,7 @@ fn task_collection_pages_attempts_with_next_cursor() {
     }
     let generation = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("task snapshot")
         .revision;
@@ -346,15 +343,15 @@ fn read_once_enforces_byte_boundary() {
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope).expect("scope dir");
     let exact = scope.join("exact.bin");
-    let exact_bytes = vec![b'x'; rivect::executor::macos::READ_MAX_BYTES];
+    let exact_bytes = vec![b'x'; support::PLATFORM_READ_MAX_BYTES];
     std::fs::write(&exact, &exact_bytes).expect("exact file");
-    let observation = rivect::executor::macos::read_once(&scope, &exact).expect("exact size");
+    let observation = support::platform_read_once(&scope, &exact).expect("exact size");
     assert_eq!(observation.bytes, exact_bytes);
     assert_eq!(observation.digest, support::sha256_hex(&observation.bytes));
 
     let hardlink = scope.join("hardlink.bin");
     std::fs::hard_link(&exact, &hardlink).expect("hardlink");
-    let linked = rivect::executor::macos::read_once(&scope, &hardlink).expect("hardlink read");
+    let linked = support::platform_read_once(&scope, &hardlink).expect("hardlink read");
     assert_eq!(linked.bytes, exact_bytes);
 
     let outside = world.root.join("outside-secret.txt");
@@ -362,48 +359,46 @@ fn read_once_enforces_byte_boundary() {
     let escape = scope.join("escape");
     std::os::unix::fs::symlink(&outside, &escape).expect("escape symlink");
     assert!(matches!(
-        rivect::executor::macos::read_once(&scope, &escape),
+        support::platform_read_once(&scope, &escape),
         Err(rivect::executor::WorkerError::OutsideScope { .. })
     ));
 
     let oversized = scope.join("oversized.bin");
-    std::fs::write(
-        &oversized,
-        vec![b'x'; rivect::executor::macos::READ_MAX_BYTES + 1],
-    )
-    .expect("oversized file");
+    std::fs::write(&oversized, vec![b'x'; support::PLATFORM_READ_MAX_BYTES + 1])
+        .expect("oversized file");
     assert!(matches!(
-        rivect::executor::macos::read_once(&scope, &oversized),
+        support::platform_read_once(&scope, &oversized),
         Err(rivect::executor::WorkerError::TooLarge)
     ));
 
     let denied = scope.join("oversized-denied.bin");
-    std::fs::write(
-        &denied,
-        vec![b'x'; rivect::executor::macos::READ_MAX_BYTES + 1],
-    )
-    .expect("oversized denied file");
+    std::fs::write(&denied, vec![b'x'; support::PLATFORM_READ_MAX_BYTES + 1])
+        .expect("oversized denied file");
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
         .expect("deny oversized file");
     assert!(matches!(
-        rivect::executor::macos::read_once(&scope, &denied),
+        support::platform_read_once(&scope, &denied),
         Err(rivect::executor::WorkerError::TooLarge)
     ));
 }
 
 #[test]
 fn read_once_denies_fifo_without_writer() -> Result<(), Box<dyn std::error::Error>> {
-    let world = open_world("read-fifo-denied", None);
+    let mut world = open_world("read-fifo-denied", None);
     let scope = world.root.join("scope");
     std::fs::create_dir_all(&scope)?;
     let fifo = scope.join("pipe");
-    let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if status.is_err() {
+        world.retain();
+    }
+    let status = status?;
     assert!(status.success(), "mkfifo must create the pipe");
     // No writer holds the other end: a static FIFO is denied by the
     // pre-open regular-file check, and a swap into the open window cannot
     // block the O_NONBLOCK opened handle before the same fd-level check.
     assert!(matches!(
-        rivect::executor::macos::read_once(&scope, &fifo),
+        support::platform_read_once(&scope, &fifo),
         Err(rivect::executor::WorkerError::NotRegularFile { .. })
     ));
     Ok(())
@@ -513,11 +508,7 @@ fn boot_confinement_before_dispatch() {
             url: "http://127.0.0.1:1/probe".to_string(),
         },
     ] {
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         let admitted = executor
             .admit(&task, request, rivect::policy::PermissionMode::Manual)
             .expect_err("the read grant rejects non-read classes");
@@ -559,7 +550,7 @@ fn boot_confinement_before_dispatch() {
     let egress_addr = listener.local_addr().expect("egress oracle addr");
     let scoped_before = std::fs::read(&file).expect("scoped bytes");
     let outside_before = std::fs::read(&outside).expect("outside bytes");
-    let all_classes = world.runtime.policy.grant_classes(
+    let all_classes = world.runtime.policy_writer().grant_classes(
         _scope.clone(),
         vec![
             rivect::contracts::EffectClass::Read,
@@ -586,8 +577,7 @@ fn boot_confinement_before_dispatch() {
         let class = request.class();
         let attempt_id = world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .plan_attempt(&task, class, &request.describe())
             .expect("plan forced attempt");
         let admitted = rivect::executor::AdmittedEffect {
@@ -598,11 +588,7 @@ fn boot_confinement_before_dispatch() {
             expected_identity: None,
             scope_root: _scope.clone(),
         };
-        let mut executor = Executor::new(
-            &mut world.runtime.policy,
-            &mut world.runtime.owner.store,
-            world.runtime.read_worker.as_mut(),
-        );
+        let mut executor = world.runtime.executor();
         let error = executor
             .execute(&admitted)
             .expect_err("a forged manual-mode non-read effect must ask at the mode gate");
@@ -643,7 +629,7 @@ fn boot_confinement_before_dispatch() {
     );
     // Revoke: the next dispatch of the same scope is denied before any
     // provider effect.
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
     let revoked = rivect::tools::invoke_read(&mut world.runtime, &task, &grant, file.clone())
         .expect_err("revoked grant denies");
     assert!(
@@ -808,8 +794,10 @@ fn provider_public_ingress() {
     assert_eq!(result["snapshot"]["revision"], 1);
 
     // Answer via the trusted adapter: applied, one task; the production
-    // drain runs the loopback useful path to completion.
-    let answer = world.dispatch(&corpus_answer_option(
+    // drain runs the loopback useful path to completion, so the response
+    // reports the settled row — revision 4, the completion commit — not
+    // the answer-commit snapshot the drain moved past.
+    let answer = world.dispatch(&corpus_answer_custom(
         &session,
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa6",
         &task,
@@ -819,7 +807,9 @@ fn provider_public_ingress() {
     ));
     assert!(answer["error"].is_null(), "{answer}");
     assert_eq!(answer["result"]["status"], "applied");
-    assert_eq!(answer["result"]["task_revision"], 3);
+    assert_eq!(answer["result"]["task_revision"], 4);
+    assert_eq!(answer["result"]["snapshot"]["revision"], 4);
+    assert_eq!(answer["result"]["snapshot"]["lifecycle"], "completed");
     let status = world.dispatch(&corpus_status(&session));
     assert_eq!(
         status["result"]["tasks"]["items"].as_array().map(Vec::len),
@@ -843,8 +833,7 @@ fn provider_public_ingress() {
     );
     let (answer_json, author) = world
         .runtime
-        .owner
-        .store
+        .store()
         .answered_question(&task)
         .expect("durable answer")
         .expect("answer recorded");
@@ -894,8 +883,7 @@ fn provider_public_ingress() {
     // Answer origin is visible in the durable event log.
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     let answered = events
@@ -972,8 +960,7 @@ fn provider_public_ingress() {
     assert!(custom["error"].is_null(), "{custom}");
     let (custom_json, _) = world
         .runtime
-        .owner
-        .store
+        .store()
         .answered_question(&fresh_task)
         .expect("durable custom answer")
         .expect("recorded");
@@ -986,8 +973,7 @@ fn provider_public_ingress() {
     // exact multi-line bytes stay durable.
     let custom_snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&fresh_task)
         .expect("custom snapshot");
     assert_eq!(custom_snapshot.lifecycle, Lifecycle::Completed);
@@ -1047,8 +1033,8 @@ fn known_ready_action_starts_without_provider_dispatch() {
         &session,
         &planned_task,
         &planned_question,
-        AnswerSelection::Option {
-            option_id: OptionId("steps".to_string()),
+        AnswerSelection::Custom {
+            text: "steps".to_string(),
         },
     );
     let planned = world
@@ -1056,8 +1042,8 @@ fn known_ready_action_starts_without_provider_dispatch() {
         .run_decision_step(
             &session,
             &planned_task,
-            &AnswerSelection::Option {
-                option_id: OptionId("steps".to_string()),
+            &AnswerSelection::Custom {
+                text: "steps".to_string(),
             },
             &grant,
             false,
@@ -1081,19 +1067,22 @@ fn known_ready_action_starts_without_provider_dispatch() {
 
 #[test]
 fn no_ready_provider_blocks_and_reaches_dock_projection() {
-    let root = support::temp_dir("no-ready-provider");
-    std::fs::write(root.join("config.toml"), support::config_distinct_pools()).expect("config");
-    let mut runtime =
-        rivect::commands::Runtime::open(&root, Box::new(NoToolProvider)).expect("owner elected");
+    let root = tempfile::TempDir::with_prefix("rivect-no-ready-provider-").expect("fixture root");
+    std::fs::write(
+        root.path().join("config.toml"),
+        support::config_distinct_pools(),
+    )
+    .expect("config");
+    let mut runtime = rivect::commands::Runtime::open(root.path(), Box::new(NoToolProvider))
+        .expect("owner elected");
     runtime.purpose = "backend_task".to_string();
-    let scope = root.join("scope");
+    let scope = root.path().join("scope");
     std::fs::create_dir_all(&scope).expect("scope dir");
     let file = scope.join("allowed.txt");
     std::fs::write(&file, "no-ready-marker\n").expect("scoped file");
     let grant = runtime.set_read_scope(scope, file.clone());
     let (session, _, _, _) = runtime
-        .owner
-        .store
+        .store_writer()
         .open_session("bootstrap-no-ready", support::CONNECTION_ID, None)
         .expect("session");
     let create_response = rivect::commands::dispatch_runtime_request(
@@ -1111,14 +1100,12 @@ fn no_ready_provider_blocks_and_reaches_dock_projection() {
     );
     let question = rivect::contracts::Question::fixture(&task, 1);
     runtime
-        .owner
-        .store
+        .store_writer()
         .publish_question(&session, &question)
         .expect("question");
     let answer = answer_custom("request provider judgment");
     runtime
-        .owner
-        .store
+        .store_writer()
         .answer_question(
             &session,
             &task,
@@ -1189,13 +1176,15 @@ fn recover_events_rejects_foreign_session() {
     let task = world.create_task(&session, "cmd-recover-foreign");
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     let foreign = rivect::contracts::SessionId("foreign-session".to_string());
     assert!(matches!(
-        world.runtime.owner.store.recover_events(&foreign, &events),
+        world
+            .runtime
+            .store_writer()
+            .recover_events(&foreign, &events),
         Err(rivect::state::StoreError::Conflict(
             rivect::state::ConflictCause::EventSessionMismatch { .. }
         ))
@@ -1209,8 +1198,7 @@ fn recover_events_rejects_unknown_aggregate() {
     let task = world.create_task(&session, "cmd-recover-unknown");
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     let mut unknown = events.into_iter().next().expect("event");
@@ -1218,8 +1206,7 @@ fn recover_events_rejects_unknown_aggregate() {
     assert!(matches!(
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .recover_events(&session, &[unknown]),
         Err(rivect::state::StoreError::Conflict(
             rivect::state::ConflictCause::EventNotFound { .. }
@@ -1234,8 +1221,7 @@ fn recover_events_rejects_malformed_delta_without_commit() {
     let task = world.create_task(&session, "cmd-recover-malformed-delta");
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     let canonical_event = events.first().expect("event").clone();
@@ -1261,8 +1247,7 @@ fn recover_events_rejects_malformed_delta_without_commit() {
     replay.delta = Value::Null;
     let error = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .recover_events(&session, &[replay])
         .expect_err("malformed durable delta must abort recovery");
     assert!(
@@ -1498,7 +1483,7 @@ fn runtime_status_page_cursor_boundary_and_rejects_invalid_offsets() {
         .as_u64()
         .expect("generation");
     assert!(over["result"]["tasks"]["next_cursor"].is_string());
-    let next_cursor_guard = world.runtime.owner.store.task_status_page(
+    let next_cursor_guard = world.runtime.store().task_status_page(
         &session,
         2,
         Some((generation, i64::MAX as u64 - 1)),
@@ -1551,7 +1536,7 @@ fn runtime_status_blockers_match_task_snapshots_across_lifecycles() {
 
     let blocked_with_question = world.create_task(&session, "cmd-blocked-pending-question");
     world.publish(&session, &blocked_with_question);
-    let db_path = world.runtime.owner.runtime_dir().join("rivect.db");
+    let db_path = world.runtime.owner().runtime_dir().join("rivect.db");
     let connection = rusqlite::Connection::open(&db_path).expect("open owner db");
     connection
         .execute(
@@ -1564,8 +1549,7 @@ fn runtime_status_blockers_match_task_snapshots_across_lifecycles() {
     let running_with_unknown = world.create_task(&session, "cmd-running-unknown-attempt");
     let attempt = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .plan_attempt(
             &running_with_unknown,
             rivect::contracts::EffectClass::Read,
@@ -1574,8 +1558,7 @@ fn runtime_status_blockers_match_task_snapshots_across_lifecycles() {
         .expect("plan attempt");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .attempt_unknown(&attempt, "unknown running outcome")
         .expect("mark attempt unknown");
 
@@ -1602,8 +1585,7 @@ fn runtime_status_blockers_match_task_snapshots_across_lifecycles() {
     );
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .materialize_obligations(&waiting_with_obligation)
         .expect("materialize obligation");
     let connection = rusqlite::Connection::open(&db_path).expect("open owner db");
@@ -1631,8 +1613,7 @@ fn runtime_status_blockers_match_task_snapshots_across_lifecycles() {
             serde_json::from_value(item.clone()).expect("task status");
         let snapshot = world
             .runtime
-            .owner
-            .store
+            .store()
             .snapshot(&task_status.task_id)
             .expect("task snapshot");
         assert_eq!(
@@ -1669,15 +1650,13 @@ fn consumer_public_ingress() {
     // event ids.
     let first = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     assert!(!first.is_empty());
     let again = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 50)
         .expect("events");
     assert_eq!(first.len(), again.len());
@@ -1709,14 +1688,23 @@ fn consumer_public_ingress() {
     }));
     assert_eq!(spoof["error"]["code"], -32601);
 
-    // Known-but-unavailable command kinds never fake success.
+    // Known-but-unavailable command kinds never fake success. `doctor`
+    // is the kind that still carries the invariant: it is recorded to
+    // `PLANNED_LOCAL_KINDS` and stays unavailable until its own owner
+    // (SLICE-076), so a dispatch of it must answer the typed refusal and
+    // no result at all. `project.init` no longer carries it — that kind
+    // was promoted, so it now has a handler and a real descriptor.
     let unavailable = world.dispatch(&json!({
         "jsonrpc": "2.0", "id": 23, "method": "command.execute",
-        "params": { "schema_version": 1, "session_id": session.0, "command": { "kind": "project.init", "root": "/tmp" } }
+        "params": { "schema_version": 1, "session_id": session.0, "command": { "kind": "doctor" } }
     }));
     assert_eq!(
         unavailable["error"]["data"]["code"],
         "capability_unavailable"
+    );
+    assert!(
+        unavailable.get("result").is_none(),
+        "a known-but-unavailable kind fakes nothing: {unavailable}"
     );
     let describe = world.dispatch(&json!({
         "jsonrpc": "2.0", "id": 24, "method": "command.describe",
@@ -1728,10 +1716,34 @@ fn consumer_public_ingress() {
             .iter()
             .any(|d| d["canonical_id"] == "read_file" && d["available"] == true)
     );
+    // The catalog half of the same invariant: the promoted kind reports
+    // itself available with a real description and no unavailability
+    // reason, while a still-planned kind keeps `available: false` and
+    // names why.
+    let project_init = items
+        .iter()
+        .find(|d| d["canonical_id"] == "project.init")
+        .expect("the promoted kind stays in the catalog");
+    assert_eq!(project_init["available"], true, "{project_init}");
     assert!(
-        items
-            .iter()
-            .any(|d| d["canonical_id"] == "project.init" && d["available"] == false)
+        project_init["unavailability_reason"].is_null()
+            && !project_init["description"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+        "an available kind advertises itself: {project_init}"
+    );
+    let planned = items
+        .iter()
+        .find(|d| d["canonical_id"] == "doctor")
+        .expect("a still-planned kind stays in the catalog");
+    assert_eq!(planned["available"], false, "{planned}");
+    assert!(
+        !planned["unavailability_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "an unbuilt kind names why: {planned}"
     );
 
     let _ = question;
@@ -1841,8 +1853,7 @@ fn crash_restart_no_repeat_effect() {
     let grant = world.runtime.set_read_scope(_scope.clone(), file.clone());
     let snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("snapshot after restart");
     assert_eq!(
@@ -1853,8 +1864,7 @@ fn crash_restart_no_repeat_effect() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .attempt_state(&attempt_id)
             .expect("state"),
         Some("unknown".to_string())
@@ -1876,8 +1886,7 @@ fn crash_restart_no_repeat_effect() {
     // Recovery re-delivers the durable stream through the owner after restart.
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 100)
         .expect("events after restart");
     assert!(!events.is_empty(), "the crash stream must be durable");
@@ -1903,7 +1912,7 @@ fn crash_restart_no_repeat_effect() {
     );
     {
         let connection =
-            rusqlite::Connection::open(world.runtime.owner.runtime_dir().join("rivect.db"))
+            rusqlite::Connection::open(world.runtime.owner().runtime_dir().join("rivect.db"))
                 .expect("open owner db");
         connection
             .execute(
@@ -1931,12 +1940,11 @@ fn crash_restart_no_repeat_effect() {
     );
     let before_replay = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("snapshot before recovery");
     let durable_counts = |world: &World| {
-        rusqlite::Connection::open(world.runtime.owner.runtime_dir().join("rivect.db"))
+        rusqlite::Connection::open(world.runtime.owner().runtime_dir().join("rivect.db"))
             .expect("open owner db")
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM attempts)",
@@ -1950,8 +1958,7 @@ fn crash_restart_no_repeat_effect() {
     replayed.extend(events.iter().cloned());
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .recover_events(&session, &replayed)
         .expect("owner recovers duplicate and permuted events");
     let status_after_replay = world.dispatch(&corpus_status(&session));
@@ -1973,8 +1980,7 @@ fn crash_restart_no_repeat_effect() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .snapshot(&task)
             .expect("snapshot after recovery"),
         before_replay,
@@ -1991,8 +1997,7 @@ fn crash_restart_no_repeat_effect() {
     assert!(matches!(
         world
             .runtime
-            .owner
-            .store
+            .store_writer()
             .recover_events(&session, &[conflicting]),
         Err(rivect::state::StoreError::Conflict(
             rivect::state::ConflictCause::EventConflict { .. }
@@ -2027,8 +2032,7 @@ fn crash_restart_no_repeat_effect() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .attempt_state(&attempt_id)
             .ok()
             .flatten(),
@@ -2037,8 +2041,7 @@ fn crash_restart_no_repeat_effect() {
     );
     let snapshot = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&task)
         .expect("snapshot after reconcile");
     assert!(
@@ -2051,8 +2054,7 @@ fn crash_restart_no_repeat_effect() {
     );
     let retained = world
         .runtime
-        .owner
-        .store
+        .store()
         .retained(&rivect::verification::boundary_id(&attempt_id))
         .expect("retained")
         .expect("retained record exists");
@@ -2293,8 +2295,7 @@ fn unknown_without_safe_read_stays_blocked() {
     );
     let (_, state, detail) = world
         .runtime
-        .owner
-        .store
+        .store()
         .attempt_record(&attempt_id)
         .expect("attempt record")
         .expect("unconfirmed attempt");
@@ -2310,8 +2311,7 @@ fn unknown_without_safe_read_stays_blocked() {
     // cannot establish whether the read completed.
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .attempt_unknown(&attempt_id, "receipt lost before safe read")
         .expect("corrupt read marker");
     let before_reads = world.worker_reads();
@@ -2328,7 +2328,7 @@ fn unknown_without_safe_read_stays_blocked() {
             rivect::state::InvalidCause::MissingReadMarker { .. }
         )
     ));
-    let snapshot = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let snapshot = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_eq!(snapshot.lifecycle, Lifecycle::Blocked);
     assert!(
         snapshot
@@ -2367,6 +2367,66 @@ fn unknown_without_safe_read_stays_blocked() {
     );
 }
 
+/// A fixed-option answer names the one permitted read itself — no model
+/// attempt exists to carry retention, so the effect attempt owns the
+/// pre-effect record. A crash between dispatch and confirmation leaves
+/// that record parseable at `PreEffect`, never silently absent.
+#[test]
+fn option_answer_crash_retains_the_effect_attempts_pre_effect_record() {
+    let (mut world, _scope, file, grant) = scoped_world(
+        "option-crash-pre-effect",
+        Some(&support::config_distinct_pools()),
+    );
+    let session = world.open_session("bootstrap-option-crash");
+    let task = world.create_task(&session, "cmd-option-crash");
+    let question = world.publish(&session, &task);
+    let option = AnswerSelection::Option {
+        option_id: OptionId("brief".to_string()),
+    };
+    freeze_answered(&mut world, &session, &task, &question, option.clone());
+
+    let outcome = world
+        .runtime
+        .run_decision_step(&session, &task, &option, &grant, true)
+        .expect("crash step");
+    let rivect::controller::StepOutcome::OutcomeUnknown {
+        attempt_id,
+        snapshot,
+    } = outcome
+    else {
+        panic!("expected unknown outcome");
+    };
+    assert_eq!(snapshot.lifecycle, Lifecycle::Blocked);
+    assert_eq!(
+        world.worker_reads(),
+        1,
+        "the crash path performs exactly one real worker read"
+    );
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a fixed option never reaches the provider"
+    );
+    let retained = world
+        .runtime
+        .store()
+        .retained(&rivect::verification::boundary_id(&attempt_id))
+        .expect("retained")
+        .expect("the effect attempt's retained record exists");
+    let parsed_retained: rivect::verification::RetainedAttempt =
+        serde_json::from_str(&retained).expect("retained record parses");
+    assert_eq!(parsed_retained.attempt_id, attempt_id);
+    assert_eq!(
+        parsed_retained.stage,
+        rivect::verification::RetainedStage::PreEffect,
+        "the option-admitted effect attempt retains its pre-effect record"
+    );
+    assert_eq!(parsed_retained.cause, "fixed option admitted read");
+    assert!(file.exists());
+}
+
 #[test]
 fn blocked_task_stays_blocked_after_neighbor_completes() {
     let (mut world, _scope, _file, _grant) =
@@ -2375,14 +2435,12 @@ fn blocked_task_stays_blocked_after_neighbor_completes() {
     let blocked = world.create_task(&session, "cmd-blocked-neighbor");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .materialize_obligations(&blocked)
         .expect("materialize blocked obligation");
     let attempt = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .plan_attempt(
             &blocked,
             rivect::contracts::EffectClass::Read,
@@ -2391,14 +2449,12 @@ fn blocked_task_stays_blocked_after_neighbor_completes() {
         .expect("plan unknown attempt");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .attempt_unknown(&attempt, "receipt lost")
         .expect("persist unknown attempt");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .mark_outcome_unknown(&blocked)
         .expect("block unknown task");
 
@@ -2422,8 +2478,7 @@ fn blocked_task_stays_blocked_after_neighbor_completes() {
 
     let second_attempt = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .plan_attempt(
             &blocked,
             rivect::contracts::EffectClass::Read,
@@ -2432,8 +2487,7 @@ fn blocked_task_stays_blocked_after_neighbor_completes() {
         .expect("plan sibling attempt on the same obligation");
     world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .attempt_confirmed(&second_attempt)
         .expect("complete sibling attempt");
 
@@ -2567,7 +2621,7 @@ fn revoke_and_cancel_block_dispatch() {
         &question2,
         answer_custom(&format!("read {}", file.display())),
     );
-    world.runtime.policy.revoke(&grant);
+    world.runtime.policy_writer().revoke(&grant);
     let err = world
         .runtime
         .run_decision_step(
@@ -2648,8 +2702,7 @@ fn slow_reader_overflow_resync() {
     let _ = world.publish(&session, &task);
     let events = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, Some(&task), 0, 100)
         .expect("events");
     let mut projection = Projection::new(0);
@@ -2732,8 +2785,7 @@ fn request_limits_and_manifest_immutability() {
     let bounded_question = world.publish(&session, &bounded_task);
     let snapshot_before_answer = world
         .runtime
-        .owner
-        .store
+        .store()
         .snapshot(&bounded_task)
         .expect("snapshot before oversized answer");
     let oversized_answer = world.dispatch(&corpus_answer_custom(
@@ -2755,8 +2807,7 @@ fn request_limits_and_manifest_immutability() {
     assert_eq!(
         world
             .runtime
-            .owner
-            .store
+            .store()
             .snapshot(&bounded_task)
             .expect("snapshot after oversized answer"),
         snapshot_before_answer
@@ -2799,12 +2850,25 @@ fn request_limits_and_manifest_immutability() {
     // The user now switches the config to a subscription pin without grant.
     std::fs::write(
         world.root.join("config.toml"),
-        support::config_manual_subscription(),
+        support::config_distinct_pools_with_manual_subscription(),
     )
     .expect("config change");
-    world.runtime.effective =
-        rivect::config::resolve_effective(Some(&support::config_manual_subscription()))
-            .expect("effective");
+    world
+        .runtime
+        .reload_config()
+        .expect("the owner reloads the changed config");
+    assert!(
+        world
+            .runtime
+            .effective()
+            .parsed
+            .as_ref()
+            .is_some_and(|config| {
+                config.connections.contains_key("subscription")
+                    && config.connections.contains_key("local")
+            }),
+        "the owner observes both the new pin and the frozen connection"
+    );
     // Dispatch still sends exactly the frozen manifest; the provider records
     // it verbatim, purpose and every field included.
     let reply = world
@@ -2889,12 +2953,11 @@ fn evidence_invalidation_blocks_completion() {
     // unaffected evidence keeps its provenance.
     let evidence = world
         .runtime
-        .owner
-        .store
+        .store()
         .events_after(&session, None, 0, 0)
         .is_ok();
     assert!(evidence);
-    let snapshot_before = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let snapshot_before = world.runtime.store().snapshot(&task).expect("snapshot");
     let obligations = &snapshot_before.obligations.items;
     assert_eq!(obligations.len(), 2);
     assert!(
@@ -2904,18 +2967,16 @@ fn evidence_invalidation_blocks_completion() {
     );
     let second_evidence = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .insert_evidence(&task, 1, "task:probe", "extra basis", "probe-digest")
         .expect("second evidence");
     let blocked_task = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .invalidate_evidence(&second_evidence)
         .expect("invalidate");
     assert_eq!(blocked_task, task.0);
-    let blocked = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let blocked = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_eq!(blocked.lifecycle, Lifecycle::Blocked);
     assert_eq!(blocked.revision, snapshot_before.revision + 1);
     let obligations = &blocked.obligations.items;
@@ -2935,8 +2996,7 @@ fn evidence_invalidation_blocks_completion() {
     // EDGE-001: unresolved obligation + empty ready queue rejects completion.
     let err = world
         .runtime
-        .owner
-        .store
+        .store_writer()
         .complete_if_eligible(&session, &task)
         .expect_err("completion must be rejected");
     assert!(
@@ -2948,7 +3008,7 @@ fn evidence_invalidation_blocks_completion() {
         ),
         "{err}"
     );
-    let after = world.runtime.owner.store.snapshot(&task).expect("snapshot");
+    let after = world.runtime.store().snapshot(&task).expect("snapshot");
     assert_ne!(after.lifecycle, Lifecycle::Completed);
     assert!(
         after
@@ -2964,152 +3024,25 @@ fn evidence_invalidation_blocks_completion() {
 const TUI_ROWS: usize = 24;
 const TUI_COLS: usize = 80;
 
-fn reconstruct_tui_screen(bytes: &[u8]) -> String {
-    let mut cells = vec![vec![b' '; TUI_COLS]; TUI_ROWS];
-    let mut row = 0;
-    let mut col = 0;
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\x1b' => {
-                index += 1;
-                if index >= bytes.len() {
-                    break;
-                }
-                if bytes[index] != b'[' {
-                    index += 1;
-                    continue;
-                }
-                index += 1;
-                let params_start = index;
-                while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
-                    index += 1;
-                }
-                if index == bytes.len() {
-                    break;
-                }
-                let final_byte = bytes[index];
-                let params = &bytes[params_start..index];
-                index += 1;
-                if params.first() == Some(&b'?') {
-                    continue;
-                }
-                let parameters = params
-                    .split(|byte| *byte == b';')
-                    .map(|parameter| {
-                        if parameter.is_empty() {
-                            None
-                        } else {
-                            std::str::from_utf8(parameter)
-                                .ok()
-                                .and_then(|value| value.parse::<usize>().ok())
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let parameter = |position: usize, default: usize| {
-                    parameters
-                        .get(position)
-                        .and_then(|value| *value)
-                        .unwrap_or(default)
-                };
-                match final_byte {
-                    b'H' | b'f' => {
-                        row = parameter(0, 1).max(1).saturating_sub(1).min(TUI_ROWS - 1);
-                        col = parameter(1, 1).max(1).saturating_sub(1).min(TUI_COLS - 1);
-                    }
-                    b'A' => row = row.saturating_sub(parameter(0, 1).max(1)),
-                    b'B' => row = row.saturating_add(parameter(0, 1).max(1)).min(TUI_ROWS - 1),
-                    b'C' | b'a' => {
-                        col = col.saturating_add(parameter(0, 1).max(1)).min(TUI_COLS - 1)
-                    }
-                    b'D' => col = col.saturating_sub(parameter(0, 1).max(1)),
-                    b'G' => col = parameter(0, 1).max(1).saturating_sub(1).min(TUI_COLS - 1),
-                    b'd' => row = parameter(0, 1).max(1).saturating_sub(1).min(TUI_ROWS - 1),
-                    b'E' => {
-                        row = row.saturating_add(parameter(0, 1).max(1)).min(TUI_ROWS - 1);
-                        col = 0;
-                    }
-                    b'F' => {
-                        row = row.saturating_sub(parameter(0, 1).max(1));
-                        col = 0;
-                    }
-                    b'J' => match parameter(0, 0) {
-                        0 => {
-                            for cell in &mut cells[row][col..] {
-                                *cell = b' ';
-                            }
-                            for line in cells.iter_mut().skip(row + 1) {
-                                line.fill(b' ');
-                            }
-                        }
-                        1 => {
-                            for line in cells.iter_mut().take(row) {
-                                line.fill(b' ');
-                            }
-                            for cell in &mut cells[row][..=col] {
-                                *cell = b' ';
-                            }
-                        }
-                        2 | 3 => {
-                            for line in &mut cells {
-                                line.fill(b' ');
-                            }
-                        }
-                        _ => {}
-                    },
-                    b'K' => match parameter(0, 0) {
-                        0 => cells[row][col..].fill(b' '),
-                        1 => cells[row][..=col].fill(b' '),
-                        2 => cells[row].fill(b' '),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                continue;
-            }
-            b'\r' => col = 0,
-            b'\n' => row = (row + 1).min(TUI_ROWS - 1),
-            b'\x08' => col = col.saturating_sub(1),
-            byte if (0x20..=0x7e).contains(&byte) => {
-                cells[row][col] = byte;
-                col = (col + 1).min(TUI_COLS - 1);
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-
-    cells
-        .iter()
-        .map(|line| {
-            String::from_utf8_lossy(line)
-                .trim_end_matches(' ')
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn wait_for_visible_tui_text(pty: &support::PtySession, needle: &str, timeout: Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut visible = reconstruct_tui_screen(&pty.collected());
-    while !visible.contains(needle) && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-        visible = reconstruct_tui_screen(&pty.collected());
-    }
-    visible
+fn wait_for_visible_tui_text(
+    pty: &support::PtySession,
+    needle: &str,
+    timeout: Duration,
+) -> Result<String, support::PtyIoError> {
+    support::wait_for_screen_text(pty, TUI_ROWS, TUI_COLS, needle, timeout)
 }
 
 #[test]
 fn tui_enter_dispatches_tasks_and_help() {
     let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be entered on start"
     );
-    pty.send(b"\r/help\r");
-    let visible = wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10));
+    pty.send(b"\r/help\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
     assert!(
         visible.contains("Commands:"),
         "Enter on /help must show help through the fullscreen entry path: {visible:?}"
@@ -3123,12 +3056,13 @@ fn tui_enter_dispatches_tasks_and_help() {
         "empty Enter and /help must not create a task: {visible:?}"
     );
 
-    pty.send(b"task from q\r");
+    pty.send(b"task from q\r").expect("pty send");
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: task from q (accepted: ",
         Duration::from_secs(10),
-    );
+    )
+    .expect("pty screen");
     assert!(
         visible.contains("Submitted task: task from q (accepted: "),
         "non-empty Enter must show the accepted task receipt: {visible:?}"
@@ -3137,38 +3071,48 @@ fn tui_enter_dispatches_tasks_and_help() {
         visible.contains(": running"),
         "task dock must show accepted work: {visible:?}"
     );
-    pty.send(b"\x1b");
-    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_lowercase_q_starts_composer_and_dispatches_exact_goal() {
     let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be entered on start"
     );
 
-    pty.send(b"q");
-    let visible = wait_for_visible_tui_text(&pty, "> q", Duration::from_secs(10));
+    pty.send(b"q").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "> q", Duration::from_secs(10)).expect("pty screen");
     assert!(
         visible.contains("> q"),
         "first lowercase q must remain in composer while TUI runs: {visible:?}"
     );
 
-    pty.send(b"uery the root\r");
+    pty.send(b"uery the root\r").expect("pty send");
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: query the root (accepted: ",
         Duration::from_secs(10),
-    );
+    )
+    .expect("pty screen");
     assert!(
         visible.contains("Submitted task: query the root (accepted: "),
         "TUI must dispatch exact goal after q-first input: {visible:?}"
     );
 
-    pty.send(b"\x1b");
-    assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(0));
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
 
     let db_path = pty.data_root().join("runtime").join("rivect.db");
     let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
@@ -3184,29 +3128,128 @@ fn tui_lowercase_q_starts_composer_and_dispatches_exact_goal() {
         b"query the root",
         "TUI dispatch must persist exact goal bytes"
     );
+    drop(conn);
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn tui_bracketed_paste_fills_the_composer_without_submitting() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // One atomic paste event: the pasted newline joins the draft as a
+    // space — it must not submit the way the raw byte stream's `\n`
+    // did before bracketed paste.
+    pty.send("\x1b[200~multi line\npaste goal\x1b[201~".as_bytes())
+        .expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "> multi line paste goal", Duration::from_secs(10))
+            .expect("pty screen");
+    assert!(
+        visible.contains("> multi line paste goal"),
+        "the pasted text reaches the composer draft: {visible:?}"
+    );
+    assert!(
+        !visible.contains("Submitted task:"),
+        "a pasted newline never submits: {visible:?}"
+    );
+
+    // Only a real Enter submits — and it submits the joined draft
+    // verbatim.
+    pty.send(b"\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        "Submitted task: multi line paste goal (accepted: ",
+        Duration::from_secs(10),
+    )
+    .expect("pty screen");
+    assert!(
+        visible.contains("Submitted task: multi line paste goal"),
+        "the joined draft is the submitted goal: {visible:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn tui_char_chords_never_type_their_letter_into_the_composer() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // A Ctrl or Alt chord is a command the composer does not bind:
+    // its letter must never land in the draft (Ctrl+W is not "w").
+    // `\x17` is the Ctrl+W byte; `ESC`+`v` in one write merges into a
+    // single Alt+V event, the same merge `\x1b\r` makes.
+    pty.send(b"\x17").expect("pty send");
+    pty.send(b"\x1bv").expect("pty send");
+    pty.send(b"x").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "> x", Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains("> x"),
+        "the bare char lands and neither chord typed its letter: {visible:?}"
+    );
+    assert!(
+        !visible.contains("wvx"),
+        "a chord must not type its letter: {visible:?}"
+    );
+
+    // The draft is exactly the bare char — Enter submits it verbatim.
+    pty.send(b"\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "Submitted task: x (", Duration::from_secs(10))
+        .expect("pty screen");
+    assert!(
+        visible.contains("Submitted task: x ("),
+        "the composer held exactly the typed char: {visible:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_data_root_flag_overrides_environment() {
-    let flag_root = support::temp_dir("tui-flag-root");
-    let env_root = support::temp_dir("tui-env-root");
+    let root = tempfile::TempDir::with_prefix("rivect-tui-flag-").expect("tui flag root");
+    let flag_root = root.path().join("flag");
+    let env_root = root.path().join("env");
+    std::fs::create_dir_all(&flag_root).expect("flag root");
+    std::fs::create_dir_all(&env_root).expect("env root");
     let flag_text = flag_root.to_string_lossy().to_string();
-    let mut pty = spawn_pty_with_args(
+    let mut pty = support::spawn_pty_with_args(
         &rivect_binary(),
         24,
         80,
+        root,
         &flag_root,
         &env_root,
         &["--data-root", &flag_text],
     );
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "TUI must start"
     );
-    pty.send(b"p\r");
-    std::thread::sleep(Duration::from_secs(2));
-    pty.send(b"\x1b");
-    let exit = pty.wait_exit(Duration::from_secs(10));
+    pty.send(b"p\r").expect("pty send");
+    pty.pump_for(Duration::from_secs(2)).expect("pty pump");
+    pty.send(b"\x1b").expect("pty send");
+    let exit = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(exit, Some(0), "TUI must exit cleanly");
     assert!(
         flag_root.join("runtime").join("rivect.db").exists(),
@@ -3216,42 +3259,55 @@ fn tui_data_root_flag_overrides_environment() {
         !env_root.join("runtime").exists(),
         "TUI must not use RIVECT_DATA_ROOT when flag is present"
     );
+    pty.finish().expect("pty teardown");
 
-    let env_only_root = support::temp_dir("tui-env-only-root");
-    let mut env_only = spawn_pty_with_args(
+    let env_only_root =
+        tempfile::TempDir::with_prefix("rivect-tui-env-only-").expect("tui env-only root");
+    let env_only_path = env_only_root.path().to_path_buf();
+    let mut env_only = support::spawn_pty_with_args(
         &rivect_binary(),
         24,
         80,
-        &env_only_root,
-        &env_only_root,
+        env_only_root,
+        &env_only_path,
+        &env_only_path,
         &[],
     );
     assert!(
-        env_only.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        env_only
+            .wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "TUI must start without --data-root"
     );
-    env_only.send(b"p\r");
-    std::thread::sleep(Duration::from_secs(2));
-    env_only.send(b"\x1b");
-    assert_eq!(env_only.wait_exit(Duration::from_secs(10)), Some(0));
+    env_only.send(b"p\r").expect("pty send");
+    env_only.pump_for(Duration::from_secs(2)).expect("pty pump");
+    env_only.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        env_only
+            .wait_exit(Duration::from_secs(10))
+            .expect("pty wait"),
+        Some(0)
+    );
     assert!(
-        env_only_root.join("runtime").join("rivect.db").exists(),
+        env_only_path.join("runtime").join("rivect.db").exists(),
         "TUI without flag must use RIVECT_DATA_ROOT"
     );
+    env_only.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_fullscreen_restore() {
     let mut pty = spawn_pty(&rivect_binary(), 24, 80);
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be entered on start; got {:?}",
-        String::from_utf8_lossy(&pty.collected())
+        String::from_utf8_lossy(&pty.collected().expect("pty read"))
     );
-    pty.send(b"\x1b");
-    let code = pty.wait_exit(Duration::from_secs(10));
+    pty.send(b"\x1b").expect("pty send");
+    let code = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(code, Some(0), "normal quit exits 0");
-    let stream = pty.collected();
+    let stream = pty.collected().expect("pty read");
     assert!(
         support::find_subsequence(&stream, b"\x1b[?1049l").is_some(),
         "alt screen must be left"
@@ -3260,78 +3316,32 @@ fn tui_fullscreen_restore() {
         support::find_subsequence(&stream, b"\x1b[?25h").is_some(),
         "cursor must be visible again"
     );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_error_restores_terminal() {
-    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-    use std::io::{Read, Write};
-
-    let data_root = support::temp_dir("pty-error").join("root-file");
+    let root = tempfile::TempDir::with_prefix("rivect-pty-error-").expect("pty error root");
+    let data_root = root.path().join("root-file");
     std::fs::write(&data_root, b"not a directory").expect("root file");
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-    let mut command = CommandBuilder::new(rivect_binary());
-    command.env("RIVECT_DATA_ROOT", &data_root);
-    let mut child = pair.slave.spawn_command(command).expect("spawn");
-    let mut writer = pair.master.take_writer().expect("writer");
-    let mut reader = pair.master.try_clone_reader().expect("reader");
-    let stream = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = stream.clone();
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => sink
-                    .lock()
-                    .expect("pty lock")
-                    .extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
+    let mut pty =
+        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
 
-    let started_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < started_deadline
-        && support::find_subsequence(&stream.lock().expect("pty lock"), b"\x1b[?1049h").is_none()
-    {
-        std::thread::sleep(Duration::from_millis(25));
-    }
     assert!(
-        support::find_subsequence(&stream.lock().expect("pty lock"), b"\x1b[?1049h").is_some(),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be entered on start"
     );
-    writer.write_all(b"a\r").expect("input");
-    writer.flush().expect("flush");
-
-    let exit_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut exit_code = None;
-    while std::time::Instant::now() < exit_deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            exit_code = Some(status.exit_code());
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if exit_code.is_none() {
-        let _ = child.kill();
-    }
-    assert_eq!(exit_code, Some(1));
-
-    let restore_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < restore_deadline
-        && support::find_subsequence(&stream.lock().expect("pty lock"), b"\x1b[?1049l").is_none()
-    {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let stream = stream.lock().expect("pty lock");
+    pty.send(b"a\r").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(1)
+    );
+    std::hint::black_box(
+        pty.wait_for(b"\x1b[?1049l", Duration::from_secs(2))
+            .expect("pty read"),
+    );
+    let stream = pty.collected().expect("pty read");
     assert!(
         support::find_subsequence(&stream, b"\x1b[?1049l").is_some(),
         "open error must leave alternate screen"
@@ -3340,16 +3350,18 @@ fn tui_error_restores_terminal() {
         support::find_subsequence(&stream, b"\x1b[?25h").is_some(),
         "open error must show cursor"
     );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_mouse_off_default() {
     let mut pty = spawn_pty(&rivect_binary(), 24, 80);
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10)),
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
         "alternate screen must be entered on start"
     );
-    let stream = pty.collected();
+    let stream = pty.collected().expect("pty read");
     for mouse_enable in [
         &b"\x1b[?1000h"[..],
         b"\x1b[?1002h",
@@ -3363,37 +3375,139 @@ fn tui_mouse_off_default() {
         );
     }
     // Ctrl-C cancels and still restores the terminal.
-    pty.send(&[0x03]);
-    let code = pty.wait_exit(Duration::from_secs(10));
+    pty.send(&[0x03]).expect("pty send");
+    let code = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(code, Some(130), "cancel exits 130");
-    let stream = pty.collected();
+    let stream = pty.collected().expect("pty read");
     assert!(support::find_subsequence(&stream, b"\x1b[?1049l").is_some());
     assert!(support::find_subsequence(&stream, b"\x1b[?25h").is_some());
+    pty.finish().expect("pty teardown");
+}
+
+/// An obviously fake provider key: it exists only so the allowlist proof
+/// below has a credential-shaped variable to keep out of PTY children.
+const FAKE_PROVIDER_KEY: &str = "rivect-fake-provider-key-not-a-credential";
+
+#[test]
+fn pty_wrappers_pass_only_the_allowlist_and_fixture_input() {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("current exe"));
+    command
+        .args([
+            "pty_env_probe_child",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "--color",
+            "never",
+        ])
+        .env_clear();
+    for key in support::PTY_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.env("OPENAI_API_KEY", FAKE_PROVIDER_KEY);
+    let result = command.output();
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => panic!("the pty env probe intermediate did not run: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "the pty env probe intermediate failed: {}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "test pty_env_probe_child ... ok"),
+        "the probe did not report ok ({})",
+        output.status
+    );
+    let results: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("test result: "))
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "the probe run must print exactly one result line"
+    );
+    assert!(
+        results[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "),
+        "the probe result line is not the single success ({})",
+        output.status
+    );
+}
+
+#[test]
+#[ignore = "pty env probe child: its parent spawns it with the fake key"]
+fn pty_env_probe_child() {
+    assert!(
+        std::env::var_os("OPENAI_API_KEY").is_some_and(|value| value == FAKE_PROVIDER_KEY),
+        "the probe needs the fixture OPENAI_API_KEY from its parent"
+    );
+    let root = tempfile::TempDir::with_prefix("rivect-pty-env-").expect("pty env root");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    let mut pty = support::spawn_pty_with_args(
+        "/usr/bin/env",
+        TUI_ROWS as u16,
+        TUI_COLS as u16,
+        root,
+        &data,
+        &data,
+        &[],
+    );
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    let stream = pty.collected().expect("pty read");
+    let expected = format!("RIVECT_DATA_ROOT={}", data.display());
+    assert!(
+        support::find_subsequence(&stream, expected.as_bytes()).is_some(),
+        "the pty child must see RIVECT_DATA_ROOT"
+    );
+    assert!(
+        support::find_subsequence(&stream, b"OPENAI_API_KEY").is_none(),
+        "the pty child must not inherit OPENAI_API_KEY"
+    );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn headless_non_tty_machine_surface() {
     use std::io::Write;
-    let data_root = support::temp_dir("headless");
-    let mut child = std::process::Command::new(rivect_binary())
+    let mut data_root = tempfile::TempDir::with_prefix("rivect-headless-").expect("fixture root");
+    let spawned = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
+        .arg(data_root.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn headless");
+        .spawn();
+    if spawned.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let mut child = spawned.expect("spawn headless");
     let request = json!({
         "jsonrpc": "2.0", "id": 1, "method": "session.open",
         "params": { "schema_version": 1, "bootstrap_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1" }
     });
-    {
-        let mut stdin = child.stdin.take().expect("stdin");
-        writeln!(stdin, "{request}").expect("write request");
-        stdin.flush().expect("flush");
+    let wrote = child.stdin.take().map(|mut stdin| {
+        writeln!(stdin, "{request}")?;
+        stdin.flush()
+    });
+    let waited = child.wait_with_output();
+    if !matches!(wrote, Some(Ok(()))) || waited.is_err() {
+        support::retain_root(&mut data_root);
     }
-    let output = child.wait_with_output().expect("wait");
+    wrote.expect("stdin").expect("write request");
+    let output = waited.expect("wait");
     assert_eq!(output.status.code(), Some(0), "headless exits 0 on EOF");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
@@ -3410,17 +3524,25 @@ fn headless_non_tty_machine_surface() {
 
 #[test]
 fn headless_config_error_names_path_and_stage() {
-    let data_root = support::temp_dir("config-error-path");
-    std::fs::write(data_root.join("config.toml"), "[workflow\n").expect("invalid config");
+    let mut data_root =
+        tempfile::TempDir::with_prefix("rivect-config-error-path-").expect("fixture root");
+    std::fs::write(data_root.path().join("config.toml"), "[workflow\n").expect("invalid config");
     let output = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
-        .output()
-        .expect("run headless");
+        .arg(data_root.path())
+        .output();
+    if output.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let output = output.expect("run headless");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let path_text = data_root.join("config.toml").to_string_lossy().to_string();
+    let path_text = data_root
+        .path()
+        .join("config.toml")
+        .to_string_lossy()
+        .to_string();
     let expected_prefix =
         format!("runtime open failed: owner configuration failed: {path_text}: parse: ");
     assert!(
@@ -3431,18 +3553,22 @@ fn headless_config_error_names_path_and_stage() {
 
 #[test]
 fn headless_rejects_oversized_config() {
-    let data_root = support::temp_dir("config-oversized");
+    let mut data_root =
+        tempfile::TempDir::with_prefix("rivect-config-oversized-").expect("fixture root");
     std::fs::write(
-        data_root.join("config.toml"),
+        data_root.path().join("config.toml"),
         vec![b'x'; rivect::contracts::REQUEST_MAX_BYTES + 1],
     )
     .expect("oversized config");
     let output = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
-        .output()
-        .expect("run headless");
+        .arg(data_root.path())
+        .output();
+    if output.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let output = output.expect("run headless");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -3457,25 +3583,29 @@ fn headless_rejects_oversized_config() {
 #[test]
 fn headless_rejects_oversized_stdin_frame() {
     use std::io::Write;
-    let data_root = support::temp_dir("headless-oversized");
-    let mut child = std::process::Command::new(rivect_binary())
+    let mut data_root =
+        tempfile::TempDir::with_prefix("rivect-headless-oversized-").expect("fixture root");
+    let spawned = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
+        .arg(data_root.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn headless");
+        .spawn();
+    if spawned.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let mut child = spawned.expect("spawn headless");
     let mut input = vec![b'x'; rivect::contracts::REQUEST_MAX_BYTES + 1];
     input.push(b'\n');
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(&input)
-        .expect("write oversized request");
-    let output = child.wait_with_output().expect("wait headless");
+    let wrote = child.stdin.take().map(|mut stdin| stdin.write_all(&input));
+    let waited = child.wait_with_output();
+    if !matches!(wrote, Some(Ok(()))) || waited.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    wrote.expect("stdin").expect("write oversized request");
+    let output = waited.expect("wait headless");
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -3491,25 +3621,31 @@ fn headless_rejects_oversized_stdin_frame() {
 #[test]
 fn headless_classifies_oversized_non_utf8_frame_as_limit() {
     use std::io::Write;
-    let data_root = support::temp_dir("headless-oversized-non-utf8");
-    let mut child = std::process::Command::new(rivect_binary())
+    let mut data_root = tempfile::TempDir::with_prefix("rivect-headless-oversized-non-utf8-")
+        .expect("fixture root");
+    let spawned = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
+        .arg(data_root.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn headless");
+        .spawn();
+    if spawned.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let mut child = spawned.expect("spawn headless");
     let mut input = vec![0xff; rivect::contracts::REQUEST_MAX_BYTES + 1];
     input.push(b'\n');
-    child
-        .stdin
-        .take()
+    let wrote = child.stdin.take().map(|mut stdin| stdin.write_all(&input));
+    let waited = child.wait_with_output();
+    if !matches!(wrote, Some(Ok(()))) || waited.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    wrote
         .expect("stdin")
-        .write_all(&input)
         .expect("write oversized non-utf8 request");
-    let output = child.wait_with_output().expect("wait headless");
+    let output = waited.expect("wait headless");
     assert_ne!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -3548,15 +3684,19 @@ fn stage_pending_verdict_then_broken_config(root: &Path) {
 
 #[test]
 fn headless_failed_open_reports_verdict_before_error() {
-    let data_root = support::temp_dir("headless-open-verdict");
-    stage_pending_verdict_then_broken_config(&data_root);
+    let mut data_root =
+        tempfile::TempDir::with_prefix("rivect-headless-open-verdict-").expect("fixture root");
+    stage_pending_verdict_then_broken_config(data_root.path());
     let output = std::process::Command::new(rivect_binary())
         .arg("--headless")
         .arg("--data-root")
-        .arg(&data_root)
+        .arg(data_root.path())
         .env_clear()
-        .output()
-        .expect("run headless");
+        .output();
+    if output.is_err() {
+        support::retain_root(&mut data_root);
+    }
+    let output = output.expect("run headless");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     let verdict = stderr.find("publication recovery");
@@ -3569,13 +3709,16 @@ fn headless_failed_open_reports_verdict_before_error() {
 
 #[test]
 fn tui_failed_open_reports_verdict_before_alternate_screen() {
-    let data_root = support::temp_dir("pty-open-verdict");
+    let root = tempfile::TempDir::with_prefix("rivect-pty-open-verdict-").expect("pty root");
+    let data_root = root.path().to_path_buf();
     stage_pending_verdict_then_broken_config(&data_root);
-    let mut pty = spawn_pty_with_args(&rivect_binary(), 24, 80, &data_root, &data_root, &[]);
+    let mut pty =
+        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
     // The degraded session still enters the alternate screen and renders
     // the open failure on its transcript — asserted on the reconstructed
     // screen, since the renderer emits positioned words, not raw lines.
-    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10));
+    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10))
+        .expect("pty screen");
     assert!(
         visible.contains("session open failed"),
         "the transcript records the open failure inside the session: {visible:?}"
@@ -3584,7 +3727,7 @@ fn tui_failed_open_reports_verdict_before_alternate_screen() {
         visible.contains("publication recovery"),
         "the carried verdict reaches the transcript inside the session: {visible:?}"
     );
-    let stream = pty.collected();
+    let stream = pty.collected().expect("pty read");
     let verdict = support::find_subsequence(&stream, b"publication recovery");
     let entered = support::find_subsequence(&stream, b"\x1b[?1049h");
     assert!(
@@ -3592,38 +3735,41 @@ fn tui_failed_open_reports_verdict_before_alternate_screen() {
         "the pending verdict must reach the terminal before the alternate screen takes it: {:?}",
         String::from_utf8_lossy(&stream)
     );
-    pty.send(&[0x1b]);
+    pty.send(&[0x1b]).expect("pty send");
     assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)),
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(0),
         "Esc leaves the degraded session normally"
     );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
 fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
-    let data_root = support::temp_dir("pty-lazy-open-verdict");
+    let root = tempfile::TempDir::with_prefix("rivect-pty-lazy-open-verdict-").expect("pty root");
+    let data_root = root.path().to_path_buf();
     stage_pending_verdict_then_broken_config(&data_root);
-    let mut pty = spawn_pty_with_args(&rivect_binary(), 24, 80, &data_root, &data_root, &[]);
+    let mut pty =
+        support::spawn_pty_with_args(&rivect_binary(), 24, 80, root, &data_root, &data_root, &[]);
     // The degraded session leaves the dispatch slot empty, so a submitted
     // task drives the lazy-retry open: it fails the same way and its
     // propagated error is the only channel left once the guard restores
     // the primary screen.
-    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10));
+    let visible = wait_for_visible_tui_text(&pty, "session open failed", Duration::from_secs(10))
+        .expect("pty screen");
     assert!(
         visible.contains("session open failed"),
         "the degraded session records the eager open failure: {visible:?}"
     );
-    pty.send(b"retry the open\r");
+    pty.send(b"retry the open\r").expect("pty send");
     assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)),
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
         Some(1),
         "the failed lazy retry must propagate out of the loop"
     );
-    // The drain thread keeps appending past the observed exit, so the
-    // post-restore slice is polled to a deadline rather than read once.
+    // The post-restore slice is polled to a deadline rather than read once.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut stream = pty.collected();
+    let mut stream = pty.collected().expect("pty read");
     loop {
         let tail = support::find_subsequence(&stream, b"\x1b[?1049l")
             .map(|leave| &stream[leave + b"\x1b[?1049l".len()..]);
@@ -3633,8 +3779,8 @@ fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
         {
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
-        stream = pty.collected();
+        pty.pump_for(Duration::from_millis(25)).expect("pty pump");
+        stream = pty.collected().expect("pty read");
     }
     let leave = support::find_subsequence(&stream, b"\x1b[?1049l");
     assert!(
@@ -3648,6 +3794,29 @@ fn tui_lazy_retry_failed_open_reports_verdict_after_restore() {
         "the carried verdict must reach the restored primary screen: {:?}",
         String::from_utf8_lossy(restored)
     );
+    let restored_text = String::from_utf8_lossy(restored);
+    let failure_prefix = "tui failed: tui runtime open failed: owner configuration failed";
+    assert_eq!(
+        restored_text.matches(failure_prefix).count(),
+        1,
+        "the restored screen names the CLI, context and cause exactly once: {restored_text:?}"
+    );
+    assert_eq!(
+        restored_text.matches("publication recovery").count(),
+        1,
+        "the restored screen holds exactly one verdict: {restored_text:?}"
+    );
+    assert!(
+        matches!(
+            (
+                restored_text.find(failure_prefix),
+                restored_text.find("publication recovery")
+            ),
+            (Some(failure), Some(verdict)) if failure < verdict
+        ),
+        "the failure prefix precedes the carried verdict: {restored_text:?}"
+    );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]
@@ -3658,4 +3827,129 @@ fn live_first_useful_provider_task() {
     );
     assert!(!grant.is_empty());
     panic!("live wiring arrives with the granted provider slice; refusing to fake a live result");
+}
+
+/// The headless loop's real surface (D-101 / FP-098-D, I-B).
+///
+/// `src/main.rs` was rewritten as one loop over one bounded channel with
+/// two producers, and its in-process coverage drives `Runtime` directly.
+/// This leg drives the *process*: one `project.init` frame on stdin, the
+/// owed answer on stdout with no second frame written, and exit 0 when
+/// stdin closes. A coherent revert of the loop — back to one blocking
+/// read per turn with the run inline — would drop the answer or hang, and
+/// this is what says so.
+///
+/// The project root is pinned server-side, so a headless index can only
+/// read the data root. The fixture therefore *is* the data root: a small
+/// Cargo project, with the runtime's own state beside it.
+#[test]
+fn headless_loop_writes_the_deferred_index_answer_and_exits_on_close() {
+    ensure_helper();
+    let mut root =
+        tempfile::TempDir::with_prefix("rivect-headless-deferred-index-").expect("fixture root");
+    std::fs::create_dir_all(root.path().join("src")).expect("fixture dir");
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"headless\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        root.path().join("src/lib.rs"),
+        "pub mod helper;\npub fn root_fn() {}\n",
+    )
+    .expect("lib");
+    std::fs::write(root.path().join("src/helper.rs"), "pub fn helper_fn() {}\n").expect("helper");
+
+    let spawned = std::process::Command::new(rivect_binary())
+        .args(["--headless", "--data-root"])
+        .arg(root.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    if spawned.is_err() {
+        support::retain_root(&mut root);
+    }
+    let mut child = spawned.expect("spawn headless");
+
+    // The session, then exactly one project.init frame. Nothing else is
+    // written, so every response after the session.open is the owed one.
+    // Every step stays a value until the child is reaped; a failed step
+    // retains the root before any panic site consumes it.
+    let stdin_pipe = child.stdin.take();
+    let stdout_pipe = child.stdout.take();
+    if stdin_pipe.is_none() || stdout_pipe.is_none() {
+        support::retain_root(&mut root);
+    }
+    let mut stdin = stdin_pipe.expect("stdin");
+    let mut stdout = std::io::BufReader::new(stdout_pipe.expect("stdout"));
+    let mut send = |value: Value| -> std::io::Result<()> {
+        use std::io::Write as _;
+        writeln!(stdin, "{value}")?;
+        stdin.flush()
+    };
+    let sent_open = send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.open",
+        "params": { "schema_version": 1, "bootstrap_id": "b-headless" },
+    }));
+    let sent_init = send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "command.execute",
+        "params": {
+            "schema_version": 1, "session_id": "m1",
+            "command": { "kind": "project.init", "budget_ms": 60_000 },
+        },
+    }));
+    // Closing stdin is the loop's exit: the owed answer is written on the
+    // way out, so the drain has to read it before the process ends.
+    drop(stdin);
+
+    let mut first = String::new();
+    let first_read = std::io::BufRead::read_line(&mut stdout, &mut first);
+    let mut second = String::new();
+    let second_read = std::io::BufRead::read_line(&mut stdout, &mut second);
+    // Nothing else: the loop wrote no placeholder for the deferred id.
+    let mut extra = String::new();
+    let extra_read = std::io::BufRead::read_line(&mut stdout, &mut extra);
+    let status = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let _read = pipe.read_to_string(&mut stderr);
+    }
+    if sent_open.is_err()
+        || sent_init.is_err()
+        || first_read.is_err()
+        || second_read.is_err()
+        || extra_read.is_err()
+        || status.is_err()
+    {
+        support::retain_root(&mut root);
+    }
+    sent_open.expect("write frame");
+    sent_init.expect("write frame");
+    first_read.expect("read the first response");
+    let opened: Value = serde_json::from_str(&first).expect("a session.open answer");
+    assert_eq!(opened["id"], 1, "the session opened: {opened}");
+
+    second_read.expect("the owed answer arrives on its own");
+    let owed: Value = serde_json::from_str(&second).expect("a project-init answer");
+    assert_eq!(owed["id"], 2, "the owed answer carries its own id: {owed}");
+    let result: ProjectInitResult =
+        serde_json::from_value(owed["result"].clone()).expect("a typed answer");
+    assert!(
+        matches!(result.snapshot, SnapshotId::Generation(_)),
+        "the deferred answer is a cut generation, not a synthesised \\
+         acceptance: {result:?}"
+    );
+    assert_eq!(result.graph.narrowed_to, Vec::<PathBuf>::new());
+
+    let read = extra_read.expect("drain");
+    assert_eq!(read, 0, "no further response is written: {extra:?}");
+
+    let status = status.expect("the loop exits on stdin close");
+    assert_eq!(status.code(), Some(0), "and it exits cleanly: {status:?}");
+    assert!(
+        stderr.is_empty(),
+        "machine stderr carries no diagnostics for a clean run: {stderr}"
+    );
 }
