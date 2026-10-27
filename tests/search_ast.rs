@@ -400,11 +400,11 @@ fn ast_bound_and_include_semantics_match_other_legs() {
 
 #[test]
 fn ast_backend_joins_the_mechanical_table() {
-    // Dispatch stays a fixed table — Ast and Symbol are admitted now,
-    // the deferred graph leg still refuses typed.
+    // Dispatch stays a fixed table — Ast, Symbol and the graph leg are
+    // all admitted now.
     assert_eq!(backend_for(QueryKind::Ast), Some(SearchBackend::Ast));
     assert_eq!(backend_for(QueryKind::Symbol), Some(SearchBackend::Symbol));
-    assert_eq!(backend_for(QueryKind::Graph), None);
+    assert_eq!(backend_for(QueryKind::Graph), Some(SearchBackend::Graph));
     assert_eq!(QueryKind::Ast.as_str(), "search.structure");
 }
 

@@ -558,10 +558,10 @@ fn unresolved_path_stays_unknown_not_absent_dependency() {
 
 #[test]
 fn symbol_backend_joins_the_mechanical_table() {
-    // The fixed dispatch table grows exactly one row — the deferred
-    // graph leg still refuses typed.
+    // The fixed dispatch table grows exactly one row — the graph leg is
+    // admitted beside it.
     assert_eq!(backend_for(QueryKind::Symbol), Some(SearchBackend::Symbol));
-    assert_eq!(backend_for(QueryKind::Graph), None);
+    assert_eq!(backend_for(QueryKind::Graph), Some(SearchBackend::Graph));
     assert_eq!(QueryKind::Symbol.as_str(), "code.symbol");
     // The recorded vocabulary is unchanged — both names classify onto
     // the symbol leg and no new interface name appeared.

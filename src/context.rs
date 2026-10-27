@@ -11,7 +11,8 @@ use crate::executor::{
 };
 use crate::index::{
     Completeness, DerivationInputs, IndexedSource, MatchKind, PartialReason, ProjectGraph,
-    QueryResult, SearchBackend, SearchMatch, SnapshotId, SourceRef, derive_edges,
+    QueryResult, SearchBackend, SearchMatch, SnapshotId, SourceRef, TraversalLimits, derive_edges,
+    impact_traversal,
 };
 use crate::lsp::{
     CandidateFile, DocumentPin, MAX_INDEX_PARSE_TIME, MAX_SYMBOL_FILE_BYTES, MAX_SYMBOL_ROWS,
@@ -485,7 +486,7 @@ pub fn backend_for(kind: QueryKind) -> Option<SearchBackend> {
         QueryKind::Source => Some(SearchBackend::Source),
         QueryKind::Ast => Some(SearchBackend::Ast),
         QueryKind::Symbol => Some(SearchBackend::Symbol),
-        QueryKind::Graph => None,
+        QueryKind::Graph => Some(SearchBackend::Graph),
     }
 }
 
@@ -515,6 +516,7 @@ pub fn query_until(request: &Query, deadline: Instant) -> Result<QueryResult, Co
         Some(SearchBackend::Source) => source_query(request, &root),
         Some(SearchBackend::Ast) => ast_query(request, &root),
         Some(SearchBackend::Symbol) => symbol_query(request, &root, deadline),
+        Some(SearchBackend::Graph) => graph_query(request, &root, deadline),
         None => Err(ContextError::UnsupportedKind {
             kind: request.kind.as_str(),
         }),
@@ -1409,13 +1411,28 @@ fn without_unencodable_graph(mut graph: ProjectGraph) -> ProjectGraph {
 /// Unresolved paths come from the UTF-8 request, so they always encode.
 fn without_unencodable_paths(mut result: QueryResult) -> QueryResult {
     let mut dropped: BTreeSet<PathBuf> = BTreeSet::new();
-    result.matches.retain(|hit| {
-        let encodable = hit.source.path.to_str().is_some();
-        if !encodable {
-            dropped.insert(hit.source.path.clone());
+    let mut encodable = |path: &Path| -> bool {
+        let spelled = path.to_str().is_some();
+        if !spelled {
+            dropped.insert(path.to_path_buf());
         }
-        encodable
-    });
+        spelled
+    };
+    result.matches.retain(|hit| encodable(&hit.source.path));
+    if let Some(impact) = result.impact.as_mut() {
+        impact.edges.retain(|edge| {
+            let subject = encodable(&edge.from.path);
+            let target = encodable(&edge.to.path);
+            subject && target
+        });
+        impact.nodes.retain(|node| encodable(&node.document.path));
+        if let Some(cursor) = impact.continuation.as_mut() {
+            cursor
+                .frontier
+                .retain(|node| encodable(&node.document.path));
+            cursor.visited.retain(|path| encodable(path));
+        }
+    }
     if dropped.is_empty() {
         return result;
     }
@@ -1435,7 +1452,13 @@ fn without_unencodable_paths(mut result: QueryResult) -> QueryResult {
         Some(count) => *count = count.saturating_add(dropped),
         None => reasons.push(PartialReason::EntriesFailed { count: dropped }),
     }
-    result.completeness = Completeness::from_reasons(reasons);
+    let completeness = Completeness::from_reasons(reasons);
+    result.completeness = completeness.clone();
+    if let Some(impact) = result.impact.as_mut() {
+        // The slice and the envelope state one completeness; a dropped row
+        // moves both, never one of them.
+        impact.completeness = completeness;
+    }
     result
 }
 
@@ -1519,6 +1542,7 @@ fn live_result(backend: SearchBackend) -> QueryResult {
         completeness: Completeness::Complete,
         matches: Vec::new(),
         unresolved: Vec::new(),
+        impact: None,
     }
 }
 
@@ -1972,6 +1996,79 @@ fn source_query(request: &Query, root: &Path) -> Result<QueryResult, ContextErro
         kind: MatchKind::Source { bytes },
     });
     result.completeness = Completeness::from_reasons(reasons);
+    Ok(result)
+}
+
+/// Graph leg (AC-034): the impact traversal of one named document over
+/// the project's derived rows. The answer is the documents that depend on
+/// the named one, the real directed rows that reached them, its own
+/// incompleteness and the cursor that resumes it.
+///
+/// The rows are the project index's own derivation, so a caller traverses
+/// what a stored generation records. A document the graph does not hold
+/// stays named in `unresolved` rather than being reported as a document
+/// nothing depends on. The walk's wall allowance is the ceiling every
+/// index leg runs under, and the request's deadline bounds the derivation
+/// that feeds it.
+fn graph_query(
+    request: &Query,
+    root: &Path,
+    deadline: Instant,
+) -> Result<QueryResult, ContextError> {
+    let relative = Path::new(&request.pattern);
+    let mut result = live_result(SearchBackend::Graph);
+    // The seed resolves like `source.slice`: what cannot be resolved stays
+    // named in `unresolved`, and a path that resolves outside the root is
+    // denied.
+    let Ok(target) = root.join(relative).canonicalize() else {
+        mark_unresolved(&mut result, relative);
+        return Ok(result);
+    };
+    if !target.starts_with(root) {
+        return Err(ContextError::EscapedRoot {
+            path: request.pattern.clone(),
+        });
+    }
+    let document = target
+        .strip_prefix(root)
+        .map_or_else(|_| target.clone(), Path::to_path_buf);
+    let graph = project_index(
+        &ProjectRequest {
+            root: root.to_path_buf(),
+            changed: Vec::new(),
+            file_set_moved: false,
+            previous_documents: Vec::new(),
+            limit: request.limit,
+        },
+        deadline,
+    )?;
+    if !graph.documents.contains(&document) {
+        mark_unresolved(&mut result, &document);
+        return Ok(result);
+    }
+    result.unresolved = graph.unresolved.clone();
+    let slice = impact_traversal(
+        &graph,
+        &[SourceRef {
+            path: document,
+            line: None,
+            // The graph indexes under the standard filters, so a document
+            // it holds surfaced through them: the seed's flag is that
+            // fact, not a second walk of the tree.
+            ignored: false,
+        }],
+        TraversalLimits {
+            // A walk cannot be deeper than the documents that bound it, so
+            // the caller's own bound is the depth bound too.
+            depth: request.limit,
+            nodes: request.limit,
+            time: MAX_INDEX_PARSE_TIME,
+        },
+    );
+    // The envelope states the slice's own completeness, so a reader that
+    // never opens `impact` still sees that the answer stopped short.
+    result.completeness = slice.completeness.clone();
+    result.impact = Some(Box::new(slice));
     Ok(result)
 }
 

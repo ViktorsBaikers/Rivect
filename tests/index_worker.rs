@@ -20,11 +20,15 @@ use rivect::context::{
 };
 use rivect::contracts::ErrorCode;
 use rivect::executor::{ExecutorError, INDEX_WORKER_FLAG, Unattested, WorkerError};
-use rivect::index::{Completeness, PartialReason, QueryResult};
+use rivect::index::{
+    Completeness, DerivationInputs, EdgeConfidence, ImpactSlice, IndexedSource, PartialReason,
+    ProjectGraph, QueryResult, SearchBackend, SourceRef, TraversalLimit, TraversalLimits,
+    TraversalNode, TraversalSpend, derive_edges, impact_traversal, resume_impact_traversal,
+};
 use rivect::lsp::{DocumentPin, MAX_INDEX_PARSE_TIME, MAX_SYMBOL_ROWS, SymbolOp};
 use rivect_sandbox_helper::{INDEX_WORKER_MEMORY_BUDGET, MEMORY_BUDGET_FLAG, ReuseTokenError};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::fd::AsRawFd as _;
@@ -34,8 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use support::{
-    TempTree, ast_corpus, ensure_helper, rivect_binary, search_corpus, search_query, symbol_corpus,
-    symbol_query, tree_of,
+    TempTree, ast_corpus, ensure_helper, project_corpus, rivect_binary, search_corpus,
+    search_query, symbol_corpus, symbol_query, tree_of,
 };
 
 const SIGABRT: i32 = 6;
@@ -2609,7 +2613,12 @@ fn benign_corpus_isolated_equals_in_process() {
         }
     }
     println!("EVID-474 benign equivalence: {answers} answers, {errors} refusals equal");
-    assert!(answers >= 15 && errors >= 3);
+    // The graph kind answers on both paths now, so the spread is one
+    // answer wider and one refusal narrower than when it was refused.
+    assert!(
+        answers >= 16 && errors >= 2,
+        "the isolation covers {answers} answers and {errors} refusals"
+    );
 }
 
 /// A non-UTF-8 entry name (Linux allows one; APFS does not) has no JSON
@@ -2752,4 +2761,1048 @@ fn isolated_query_cost_is_recorded() {
         cpu.as_secs_f64() <= wall.as_secs_f64() * 0.10,
         "the parent idles while the worker runs: {cpu:?} of {wall:?}"
     );
+}
+
+/// The corpus every impact case walks: a Cargo package root, a module
+/// declaration, an import, a qualified call, a test target, a TypeScript
+/// import, a dynamic import, an unresolved specifier, a dependent chain and
+/// a document nothing depends on.
+fn impact_corpus(name: &str) -> TempTree {
+    tree_of(
+        name,
+        &[
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("src/lib.rs", "pub mod helper;\n"),
+            ("src/helper.rs", "pub fn helper_fn() {}\n"),
+            (
+                "src/uses.rs",
+                "use crate::helper::helper_fn;\nfn call_it() {\n    crate::helper::helper_fn();\n}\n",
+            ),
+            (
+                "tests/case.rs",
+                "use crate::helper::helper_fn;\nfn case() { helper_fn(); }\n",
+            ),
+            (
+                "app/main.ts",
+                "import { helper } from \"./helper\";\nexport function run() { helper(); }\n",
+            ),
+            ("app/helper.ts", "export function helper() {}\n"),
+            (
+                "app/lazy.ts",
+                "export const lazy = () => import(\"./helper\");\n",
+            ),
+            ("src/l0.rs", "pub fn base() {}\n"),
+            ("src/l1.rs", "use crate::l0::base;\n"),
+            ("src/l2.rs", "use crate::l1::base;\n"),
+            ("src/l3.rs", "use crate::l2::base;\n"),
+            ("src/dangling.rs", "use crate::gone::thing;\n"),
+            ("src/lonely.rs", "pub fn lonely() {}\n"),
+        ],
+    )
+}
+
+/// The fixture's documents, one per path the traversal may name.
+const IMPACT_DOCUMENTS: &[&str] = &[
+    "app/helper.ts",
+    "app/lazy.ts",
+    "app/main.ts",
+    "src/dangling.rs",
+    "src/helper.rs",
+    "src/l0.rs",
+    "src/l1.rs",
+    "src/l2.rs",
+    "src/l3.rs",
+    "src/lib.rs",
+    "src/lonely.rs",
+    "src/uses.rs",
+    "tests/case.rs",
+];
+
+/// The graph over the fixture, derived by the one producer the index uses:
+/// the traversal is proved against real rows, never a hand-built edge list.
+fn impact_graph(root: &Path) -> ProjectGraph {
+    derived_graph(root, IMPACT_DOCUMENTS)
+}
+
+/// The graph over any fixture's documents, derived the same way: the caller
+/// names the file set, `derive_edges` produces the rows.
+fn derived_graph(root: &Path, documents: &[&str]) -> ProjectGraph {
+    let documents: BTreeSet<PathBuf> = documents.iter().map(PathBuf::from).collect();
+    let packages: BTreeSet<PathBuf> = [PathBuf::new()].into_iter().collect();
+    let inputs = DerivationInputs {
+        files: &documents,
+        packages: &packages,
+    };
+    let mut edges = Vec::new();
+    let mut unresolved = Vec::new();
+    for relative in &documents {
+        let bytes = std::fs::read(root.join(relative)).expect("fixture document");
+        let derived = derive_edges(
+            &IndexedSource {
+                relative: relative.clone(),
+                bytes,
+                version: 1,
+                ignored: false,
+            },
+            &inputs,
+        );
+        edges.extend(derived.edges);
+        unresolved.extend(derived.unresolved);
+    }
+    edges.sort();
+    ProjectGraph {
+        edges,
+        completeness: Completeness::Complete,
+        unresolved,
+        narrowed_to: Vec::new(),
+        documents: documents.into_iter().collect(),
+    }
+}
+
+/// A chain of documents, each depending on the one below it — deeper than
+/// the grants the depth cases use, so a bounded walk stops inside the
+/// fixture instead of at its end.
+fn impact_chain(name: &str) -> TempTree {
+    tree_of(
+        name,
+        &[
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("src/l0.rs", "pub fn base() {}\n"),
+            ("src/l1.rs", "use crate::l0::base;\n"),
+            ("src/l2.rs", "use crate::l1::base;\n"),
+            ("src/l3.rs", "use crate::l2::base;\n"),
+            ("src/l4.rs", "use crate::l3::base;\n"),
+            ("src/l5.rs", "use crate::l4::base;\n"),
+            ("src/l6.rs", "use crate::l5::base;\n"),
+        ],
+    )
+}
+
+/// The chain's documents, one per level.
+const IMPACT_CHAIN_DOCUMENTS: &[&str] = &[
+    "src/l0.rs",
+    "src/l1.rs",
+    "src/l2.rs",
+    "src/l3.rs",
+    "src/l4.rs",
+    "src/l5.rs",
+    "src/l6.rs",
+];
+
+/// One named document as a traversal seed.
+fn seed(path: &str) -> SourceRef {
+    SourceRef {
+        path: PathBuf::from(path),
+        line: None,
+        ignored: false,
+    }
+}
+
+/// The documents one slice reached, sorted.
+fn reached(slice: &ImpactSlice) -> Vec<&Path> {
+    let mut paths: Vec<&Path> = slice
+        .nodes
+        .iter()
+        .map(|node| node.document.path.as_path())
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// The depth a slice reports for one document, `None` when it did not
+/// reach it.
+fn depth_of(slice: &ImpactSlice, path: &Path) -> Option<usize> {
+    slice
+        .nodes
+        .iter()
+        .find(|node| node.document.path.as_path() == path)
+        .map(|node| node.depth)
+}
+
+/// The depth each document one slice reached was reported at.
+fn depths(slice: &ImpactSlice) -> BTreeMap<PathBuf, usize> {
+    slice
+        .nodes
+        .iter()
+        .map(|node| (node.document.path.clone(), node.depth))
+        .collect()
+}
+
+/// The documents one slice reported, as a set.
+fn walked(slice: &ImpactSlice) -> BTreeSet<PathBuf> {
+    slice
+        .nodes
+        .iter()
+        .map(|node| node.document.path.clone())
+        .collect()
+}
+
+/// The documents a walk must reach from its seeds, computed here rather than
+/// by the traversal: the closure of the graph's placed rows taken backwards,
+/// each row read from the document it names to the dependent that names it.
+/// A walk that ran the rows forwards, followed an unresolved specifier, or
+/// invented a document reaches a different set.
+fn placed_closure(graph: &ProjectGraph, seeds: &[&str]) -> BTreeSet<PathBuf> {
+    let mut reached: BTreeSet<PathBuf> = seeds.iter().map(PathBuf::from).collect();
+    loop {
+        let mut grew = false;
+        for edge in &graph.edges {
+            if edge.confidence == EdgeConfidence::Certain
+                && reached.contains(&edge.to.path)
+                && reached.insert(edge.from.path.clone())
+            {
+                grew = true;
+            }
+        }
+        if !grew {
+            return reached;
+        }
+    }
+}
+
+/// Every row one slice reports is one of the graph's own placed rows, read
+/// from the document it names to the dependent that names it: the dependent
+/// sits exactly one level below the target, never above it and never beside
+/// it. A fabricated row is not the graph's, a reversed one is not a path.
+fn assert_placed_paths(graph: &ProjectGraph, slice: &ImpactSlice) {
+    for edge in &slice.edges {
+        assert!(
+            graph.edges.contains(edge),
+            "a fabricated or reversed row is not one of the graph's: {edge:?}"
+        );
+        assert_eq!(
+            edge.confidence,
+            EdgeConfidence::Certain,
+            "only a placed row is a path: {edge:?}"
+        );
+        let target =
+            depth_of(slice, edge.to.path.as_path()).expect("the expanded document was reached");
+        let dependent =
+            depth_of(slice, edge.from.path.as_path()).expect("the dependent was reached");
+        assert_eq!(
+            dependent,
+            target + 1,
+            "the row points from the dependent to the document it names: {edge:?}"
+        );
+    }
+}
+
+/// The budget one slice stopped on, when nothing else made it partial.
+fn stopped_by(slice: &ImpactSlice) -> Option<TraversalLimit> {
+    let Completeness::Partial { reasons } = &slice.completeness else {
+        return None;
+    };
+    reasons.iter().find_map(|reason| match reason {
+        PartialReason::TraversalLimit { limit } => Some(*limit),
+        _ => None,
+    })
+}
+
+/// A caller's renewal of the leg that stopped the walk — the one move a
+/// stopped traversal cannot make for itself — leaving every other grant as
+/// it was. The wall allowance is not banked, so renewing it hands the next
+/// slice another allowance rather than a leftover.
+fn renewed(limits: TraversalLimits, stop: TraversalLimit) -> TraversalLimits {
+    match stop {
+        TraversalLimit::Depth => TraversalLimits {
+            depth: limits.depth.saturating_add(1),
+            ..limits
+        },
+        TraversalLimit::Nodes => TraversalLimits {
+            nodes: limits.nodes.saturating_add(1),
+            ..limits
+        },
+        TraversalLimit::Time => TraversalLimits {
+            time: Duration::from_secs(60),
+            ..limits
+        },
+    }
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p1() {
+    // A node budget smaller than the impact stops the walk: the answer is
+    // marked incomplete instead of serving the rows it happened to reach as
+    // if they were the whole impact.
+    let tree = impact_corpus("iw-impact-truncated");
+    let graph = impact_graph(&tree.path);
+    let unbounded = TraversalLimits {
+        depth: 5,
+        nodes: 64,
+        time: Duration::from_secs(60),
+    };
+    let whole = impact_traversal(&graph, &[seed("src/l0.rs")], unbounded);
+    assert!(
+        whole.completeness.is_complete(),
+        "the unbounded walk covers its whole impact: {whole:?}"
+    );
+    assert_eq!(
+        reached(&whole),
+        vec![
+            Path::new("src/l0.rs"),
+            Path::new("src/l1.rs"),
+            Path::new("src/l2.rs"),
+            Path::new("src/l3.rs"),
+        ],
+        "each document depends on the one below it: {whole:?}"
+    );
+    assert_eq!(
+        whole.edges.len(),
+        3,
+        "every row into an expanded document is served: {whole:?}"
+    );
+
+    let stopped = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 2,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(
+        stopped.completeness,
+        Completeness::Partial {
+            reasons: vec![PartialReason::TraversalLimit {
+                limit: TraversalLimit::Nodes
+            }],
+        },
+        "a stopped walk reports the budget that stopped it: {stopped:?}"
+    );
+    assert!(
+        stopped.edges.len() < whole.edges.len(),
+        "the stopped slice really served less: {stopped:?}"
+    );
+    assert!(
+        stopped.continuation.is_some(),
+        "the rest is named by a cursor, never silently dropped: {stopped:?}"
+    );
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p2() {
+    // The stop leaves a resumable cursor: the document whose expansion was
+    // cut off, and the budgets the stopped slice did not spend — carried,
+    // not read back from the caller.
+    let tree = impact_corpus("iw-impact-cursor");
+    let graph = impact_graph(&tree.path);
+    let slice = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 2,
+            time: Duration::from_secs(60),
+        },
+    );
+    let cursor = slice
+        .continuation
+        .as_ref()
+        .expect("a stopped walk leaves a cursor");
+    assert_eq!(
+        cursor.frontier,
+        vec![TraversalNode {
+            document: seed("src/l2.rs"),
+            depth: 2
+        }],
+        "the expansion the budget cut off is named, not lost: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.limits,
+        TraversalLimits {
+            depth: 5,
+            nodes: 2,
+            time: Duration::from_secs(60),
+        },
+        "the carried grant is the grant itself, not a leftover a resumed slice would read as a bound: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.spent,
+        TraversalSpend { depth: 2, nodes: 2 },
+        "the cursor states what the slice spent, so a resume credits exactly what is left: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.visited,
+        vec![
+            PathBuf::from("src/l0.rs"),
+            PathBuf::from("src/l1.rs"),
+            PathBuf::from("src/l2.rs"),
+        ],
+        "the cursor carries every document the walk already holds: {cursor:?}"
+    );
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p3() {
+    // Resuming yields the next slice — the documents the stop left
+    // unexpanded and no row the first slice already served — and every row
+    // still points from the dependent to the document it names.
+    let tree = impact_corpus("iw-impact-resume");
+    let graph = impact_graph(&tree.path);
+    let first = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 2,
+            time: Duration::from_secs(60),
+        },
+    );
+    let cursor = first
+        .continuation
+        .clone()
+        .expect("a stopped walk leaves a cursor");
+    let second = resume_impact_traversal(
+        &graph,
+        &cursor,
+        TraversalLimits {
+            depth: 5,
+            nodes: 4,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert!(
+        second.completeness.is_complete(),
+        "the resumed slice finishes the walk: {second:?}"
+    );
+    assert!(
+        second.continuation.is_none(),
+        "nothing is left to resume: {second:?}"
+    );
+
+    let (first_nodes, second_nodes) = (reached(&first), reached(&second));
+    assert!(
+        first_nodes.iter().all(|path| !second_nodes.contains(path)),
+        "a resume re-visits nothing it already reported: {first_nodes:?} {second_nodes:?}"
+    );
+    let mut both: Vec<&Path> = first_nodes.clone();
+    both.extend(second_nodes.iter().copied());
+    both.sort_unstable();
+    assert_eq!(
+        both,
+        vec![
+            Path::new("src/l0.rs"),
+            Path::new("src/l1.rs"),
+            Path::new("src/l2.rs"),
+            Path::new("src/l3.rs"),
+        ],
+        "the two slices together are the whole impact"
+    );
+
+    for edge in first.edges.iter().chain(second.edges.iter()) {
+        assert!(
+            graph.edges.contains(edge),
+            "a reported row is one of the graph's own rows: {edge:?}"
+        );
+        let parent = [&first, &second]
+            .iter()
+            .find_map(|slice| {
+                slice
+                    .nodes
+                    .iter()
+                    .find(|node| node.document.path.as_path() == edge.to.path.as_path())
+                    .map(|node| node.depth)
+            })
+            .expect("the expanded document was reached");
+        let child = [&first, &second]
+            .iter()
+            .find_map(|slice| {
+                slice
+                    .nodes
+                    .iter()
+                    .find(|node| node.document.path.as_path() == edge.from.path.as_path())
+                    .map(|node| node.depth)
+            })
+            .expect("the dependent was reached");
+        assert_eq!(
+            child,
+            parent + 1,
+            "the row points from the dependent to the document it names: {edge:?}"
+        );
+    }
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p4() {
+    // E1: the depth bound is reached exactly — the document one level below
+    // the seed is reached, the next one is not expanded — and the answer is
+    // still marked incomplete rather than staying silent because the
+    // boundary was hit exactly.
+    let tree = impact_corpus("iw-impact-boundary");
+    let graph = impact_graph(&tree.path);
+    let boundary = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits {
+            depth: 1,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(
+        reached(&boundary),
+        vec![Path::new("src/l0.rs"), Path::new("src/l1.rs")],
+        "the walk reached the level the bound allows and no further"
+    );
+    assert_eq!(
+        boundary.completeness,
+        Completeness::Partial {
+            reasons: vec![PartialReason::TraversalLimit {
+                limit: TraversalLimit::Depth
+            }],
+        },
+        "a bound reached exactly still reports incompleteness: {boundary:?}"
+    );
+    let cursor = boundary
+        .continuation
+        .as_ref()
+        .expect("the boundary leaves the rest resumable");
+    assert_eq!(
+        cursor.limits.depth, 1,
+        "the carried depth grant is absolute — the same bound the walk read: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.spent.depth, 1,
+        "the walk reached the bound exactly: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.frontier,
+        vec![TraversalNode {
+            document: seed("src/l1.rs"),
+            depth: 1
+        }],
+        "the unexpanded document is named: {cursor:?}"
+    );
+
+    // The boundary really hid work: one more level reaches the next
+    // dependent, and still reports the document beyond it.
+    let deeper = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits {
+            depth: 2,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(depth_of(&deeper, Path::new("src/l2.rs")), Some(2));
+    assert_eq!(depth_of(&deeper, Path::new("src/l3.rs")), None);
+    assert!(
+        !deeper.completeness.is_complete(),
+        "the deeper bound still stops short of l3: {deeper:?}"
+    );
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p5() {
+    // E2: a walk that spent its work with nothing left reports that no
+    // continuation is available — never an empty frontier standing in for
+    // "nothing further is needed". And the surface itself answers now:
+    // `code.impact` resolves to the graph backend.
+    let tree = impact_corpus("iw-impact-exhausted");
+    let graph = impact_graph(&tree.path);
+    let whole = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert!(whole.completeness.is_complete(), "{whole:?}");
+    assert!(whole.continuation.is_none(), "{whole:?}");
+    assert_eq!(whole.continuation_status(), "no continuation available");
+
+    let stopped = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 1,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(
+        stopped.continuation_status(),
+        "continuation available",
+        "the status discriminates, so the exhausted case is not a constant"
+    );
+
+    let project = project_corpus("iw-impact-query");
+    let answer = query(&search_query(
+        QueryKind::Graph,
+        &project.path,
+        "src/helper.rs",
+    ))
+    .expect("code.impact answers instead of refusing");
+    assert_eq!(answer.backend, SearchBackend::Graph);
+    let impact = answer
+        .impact
+        .as_ref()
+        .expect("the graph leg answers with the traversal it ran");
+    assert_eq!(
+        reached(impact),
+        vec![
+            Path::new("src/helper.rs"),
+            Path::new("src/lib.rs"),
+            Path::new("src/uses.rs"),
+            Path::new("tests/case.rs"),
+        ],
+        "the surface serves the same impact the traversal found: {answer:?}"
+    );
+    assert!(answer.matches.is_empty(), "an impact row is not a match");
+    assert_eq!(
+        answer.completeness, impact.completeness,
+        "the envelope and the slice state one completeness"
+    );
+    assert!(answer.completeness.is_complete(), "{answer:?}");
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p6() {
+    // Only real directed rows are reported: each one is a row of the graph,
+    // read from the document it names to the dependent that names it. Three
+    // walks check that against an independent closure over the graph's own
+    // placed rows — a branching impact, a chain whose levels are distances
+    // along real hops, and a document an unplaced row names, which the walk
+    // must not follow.
+    let tree = impact_corpus("iw-impact-paths");
+    let graph = impact_graph(&tree.path);
+    let grant = TraversalLimits {
+        depth: 5,
+        nodes: 64,
+        time: Duration::from_secs(60),
+    };
+    let branching = impact_traversal(&graph, &[seed("src/helper.rs")], grant);
+    let chain = impact_traversal(&graph, &[seed("src/l0.rs")], grant);
+    let dynamic = impact_traversal(&graph, &[seed("app/helper.ts")], grant);
+
+    assert_eq!(
+        walked(&branching),
+        placed_closure(&graph, &["src/helper.rs"]),
+        "the walk covers exactly the dependents: a forward walk would cover none of them"
+    );
+    assert!(
+        !walked(&branching).contains(Path::new("src/dangling.rs")),
+        "an unresolved specifier is never turned into a path: {branching:?}"
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| edge.from.path == Path::new("src/dangling.rs")
+                && edge.confidence == EdgeConfidence::Unknown),
+        "the dangling document really holds an unresolved row, so the check above is not vacuous"
+    );
+    assert_eq!(
+        depths(&chain),
+        [
+            (PathBuf::from("src/l0.rs"), 0),
+            (PathBuf::from("src/l1.rs"), 1),
+            (PathBuf::from("src/l2.rs"), 2),
+            (PathBuf::from("src/l3.rs"), 3),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<PathBuf, usize>>(),
+        "each hop is one level: a chain read the wrong way is not this map"
+    );
+
+    // The fixture's dynamic import is a row the graph holds — the file it
+    // happens to equal is an observation, not a path — so a walk that read
+    // every row instead of the placed ones would report `app/lazy.ts` as a
+    // dependent of the seed.
+    let mut into_seed: Vec<(&Path, EdgeConfidence)> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.to.path == Path::new("app/helper.ts"))
+        .map(|edge| (edge.from.path.as_path(), edge.confidence))
+        .collect();
+    into_seed.sort_by_key(|(path, _)| *path);
+    assert_eq!(
+        into_seed,
+        vec![
+            (Path::new("app/lazy.ts"), EdgeConfidence::Unknown),
+            (Path::new("app/main.ts"), EdgeConfidence::Certain),
+        ],
+        "the fixture really holds an unplaced row into the seed, so the walk below had one to fabricate from"
+    );
+    assert_eq!(
+        walked(&dynamic),
+        placed_closure(&graph, &["app/helper.ts"]),
+        "the walk reports the document that imports the seed, never the one that names it dynamically"
+    );
+
+    for slice in [&branching, &chain, &dynamic] {
+        assert_placed_paths(&graph, slice);
+    }
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p7() {
+    // An empty list of tests never makes the check unnecessary, and it says
+    // "no tests found" only when the walk covered the whole impact: a stop
+    // is unknown coverage, not an absence.
+    let tree = impact_corpus("iw-impact-tests");
+    let graph = impact_graph(&tree.path);
+    let untested = impact_traversal(
+        &graph,
+        &[seed("app/helper.ts")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(
+        reached(&untested),
+        vec![Path::new("app/helper.ts"), Path::new("app/main.ts")],
+        "the walk really served a dependent path"
+    );
+    assert_eq!(
+        untested.edges.len(),
+        1,
+        "the impact is a real row, so the empty list below is about tests: {untested:?}"
+    );
+    assert!(
+        untested.tests().is_empty(),
+        "no test target depends on the module: {untested:?}"
+    );
+    assert_eq!(untested.tests_status(), "no tests found");
+
+    // The same corpus does hold a test for the module its test target
+    // imports, so the status is a fact about the walk, not a constant.
+    let covered = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert_eq!(covered.tests(), vec![seed("tests/case.rs")]);
+    assert_eq!(covered.tests_status(), "tests found");
+
+    // A walk a budget stopped has not seen every dependent, so its empty
+    // list is not a fact about the project: the leg reports unknown
+    // coverage and the incompleteness marker stays authoritative, rather
+    // than answering "no tests found" from a truncated slice.
+    let stopped = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 1,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert!(
+        !stopped.completeness.is_complete(),
+        "the node budget stops the walk: {stopped:?}"
+    );
+    assert!(
+        stopped.tests().is_empty(),
+        "the stop happens before the test row is reached: {stopped:?}"
+    );
+    assert_eq!(
+        stopped.tests_status(),
+        "tests unknown: traversal incomplete",
+        "an incomplete walk cannot say no tests were found"
+    );
+
+    // Found tests are not a complete answer either: the same walk stops one
+    // level in, having reached the test row, so the leg names the partial
+    // coverage and the incompleteness marker keeps the bound.
+    let partial = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 1,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert!(!partial.completeness.is_complete(), "{partial:?}");
+    assert_eq!(partial.tests(), vec![seed("tests/case.rs")], "{partial:?}");
+    assert_eq!(
+        partial.tests_status(),
+        "tests found, coverage incomplete",
+        "a stopped walk reports what it found plus what it did not cover"
+    );
+}
+
+#[test]
+fn impact_traversal_reports_incompleteness_and_continuation_p8() {
+    // E5: the wall allowance stops the walk on its own — not the depth and
+    // not the node budget — and the cursor it leaves still resumes it.
+    let tree = impact_corpus("iw-impact-time");
+    let graph = impact_graph(&tree.path);
+    let slice = impact_traversal(
+        &graph,
+        &[seed("src/helper.rs")],
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::ZERO,
+        },
+    );
+    assert_eq!(
+        slice.completeness,
+        Completeness::Partial {
+            reasons: vec![PartialReason::TraversalLimit {
+                limit: TraversalLimit::Time
+            }],
+        },
+        "the wall allowance is its own stop: {slice:?}"
+    );
+    let cursor = slice
+        .continuation
+        .as_ref()
+        .expect("a spent allowance still names the work left");
+    assert_eq!(
+        cursor.limits,
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::ZERO,
+        },
+        "the grant is carried as it was handed over: {cursor:?}"
+    );
+    assert_eq!(
+        cursor.spent,
+        TraversalSpend { depth: 0, nodes: 0 },
+        "depth and nodes were untouched, so the stop was the clock: {cursor:?}"
+    );
+    assert!(
+        slice.edges.is_empty(),
+        "the allowance was spent before the first expansion: {slice:?}"
+    );
+    assert_eq!(
+        reached(&slice),
+        vec![Path::new("src/helper.rs")],
+        "the seed is reported and nothing it was not walked to"
+    );
+
+    let resumed = resume_impact_traversal(
+        &graph,
+        cursor,
+        TraversalLimits {
+            depth: 5,
+            nodes: 64,
+            time: Duration::from_secs(60),
+        },
+    );
+    assert!(
+        resumed.completeness.is_complete(),
+        "a renewed allowance finishes the walk: {resumed:?}"
+    );
+    assert_eq!(resumed.edges.len(), 4, "{resumed:?}");
+}
+
+#[test]
+fn impact_traversal_resume_credits_remaining_depth() {
+    // The depth grant is absolute. A walk stopped on another budget and
+    // resumed from its cursor reaches the depth an uninterrupted walk with
+    // that grant reaches; a leftover measured from where the stop happened
+    // would credit `grant - reached` instead and stop inside the chain.
+    let tree = impact_chain("iw-impact-depth-credit");
+    let graph = derived_graph(&tree.path, IMPACT_CHAIN_DOCUMENTS);
+    let grant = TraversalLimits {
+        depth: 5,
+        nodes: 64,
+        time: Duration::from_secs(60),
+    };
+    let uninterrupted = impact_traversal(&graph, &[seed("src/l0.rs")], grant);
+    assert_eq!(
+        depth_of(&uninterrupted, Path::new("src/l5.rs")),
+        Some(5),
+        "the grant really reaches five levels: {uninterrupted:?}"
+    );
+    assert_eq!(
+        depth_of(&uninterrupted, Path::new("src/l6.rs")),
+        None,
+        "the grant really bounds the walk: {uninterrupted:?}"
+    );
+
+    let stopped = impact_traversal(
+        &graph,
+        &[seed("src/l0.rs")],
+        TraversalLimits { nodes: 2, ..grant },
+    );
+    assert_eq!(
+        stopped.completeness,
+        Completeness::Partial {
+            reasons: vec![PartialReason::TraversalLimit {
+                limit: TraversalLimit::Nodes
+            }],
+        },
+        "the node budget, not the depth, stopped it: {stopped:?}"
+    );
+    let cursor = stopped
+        .continuation
+        .clone()
+        .expect("a stopped walk leaves a cursor");
+
+    // The caller renews the leg the stop named — the node budget — and
+    // leaves the depth grant as the cursor carries it.
+    let resumed = resume_impact_traversal(
+        &graph,
+        &cursor,
+        TraversalLimits {
+            nodes: 64,
+            ..cursor.limits
+        },
+    );
+
+    let mut walked = depths(&stopped);
+    for (path, depth) in depths(&resumed) {
+        assert!(
+            walked.insert(path, depth).is_none(),
+            "the resumed slice re-reports nothing the stopped one served: {resumed:?}"
+        );
+    }
+    assert_eq!(
+        walked,
+        depths(&uninterrupted),
+        "the resumed walk covers what an uninterrupted one covers, at the same depths"
+    );
+}
+
+#[test]
+fn impact_traversal_resume_always_progresses() {
+    // Resuming must move the walk, or say there is no continuation. A
+    // cursor handed back unchanged turns a `while let Some(cursor) =
+    // slice.continuation` loop into an endless one, and each budget can
+    // leave one: a depth stop has no depth left, a node stop no nodes, and
+    // a spent wall allowance no time.
+    let tree = impact_chain("iw-impact-progress");
+    let graph = derived_graph(&tree.path, IMPACT_CHAIN_DOCUMENTS);
+    let full = TraversalLimits {
+        depth: 64,
+        nodes: 64,
+        time: Duration::from_secs(60),
+    };
+    let seeds = [seed("src/l0.rs")];
+    let expected: Vec<&Path> = IMPACT_CHAIN_DOCUMENTS.iter().map(Path::new).collect();
+    for (stopped_on, start) in [
+        (TraversalLimit::Depth, TraversalLimits { depth: 1, ..full }),
+        (TraversalLimit::Nodes, TraversalLimits { nodes: 1, ..full }),
+        (
+            TraversalLimit::Time,
+            TraversalLimits {
+                time: Duration::ZERO,
+                ..full
+            },
+        ),
+    ] {
+        let first = impact_traversal(&graph, &seeds, start);
+        assert_eq!(
+            stopped_by(&first),
+            Some(stopped_on),
+            "the {stopped_on:?} budget stops this walk: {first:?}"
+        );
+        let held = first
+            .continuation
+            .clone()
+            .expect("a stopped walk leaves a cursor");
+
+        // The cursor carries its own grant: resumed with it the walk cannot
+        // advance, so it reports no continuation instead of handing the same
+        // cursor back.
+        let stuck = resume_impact_traversal(&graph, &held, held.limits);
+        assert!(
+            stuck.continuation.is_none(),
+            "a resume that cannot advance reports no continuation, not the cursor it was given: {stuck:?}"
+        );
+        assert_eq!(
+            stopped_by(&stuck),
+            Some(stopped_on),
+            "the budget that stopped the walk is still disclosed: {stuck:?}"
+        );
+
+        // Renewing that budget moves the walk on every slice, and the loop on
+        // the cursor terminates having served each document once.
+        let mut slices = vec![first];
+        let mut grant = start;
+        while let Some(cursor) = slices.last().and_then(|slice| slice.continuation.clone()) {
+            assert!(slices.len() <= 16, "resuming a walk terminates: {cursor:?}");
+            grant = renewed(grant, stopped_on);
+            let next = resume_impact_traversal(&graph, &cursor, grant);
+            if let Some(ahead) = next.continuation.as_ref() {
+                assert!(
+                    ahead.spent.depth > cursor.spent.depth
+                        || ahead.spent.nodes > cursor.spent.nodes
+                        || ahead.frontier.len() < cursor.frontier.len(),
+                    "a resumed slice always moves the walk, never hands back the cursor it was given: {cursor:?} -> {ahead:?}"
+                );
+            }
+            slices.push(next);
+        }
+        let served: Vec<&Path> = slices
+            .iter()
+            .flat_map(|slice| slice.nodes.iter())
+            .map(|node| node.document.path.as_path())
+            .collect();
+        assert_eq!(
+            served, expected,
+            "each slice of the walk serves documents the earlier ones did not"
+        );
+        assert!(
+            slices
+                .last()
+                .is_some_and(|slice| slice.completeness.is_complete()),
+            "the renewed walk finishes: {:?}",
+            slices.last()
+        );
+    }
+}
+
+/// A non-UTF-8 entry name (Linux allows one; APFS does not) has no JSON
+/// spelling: a graph answer drops that row and counts the entry failed,
+/// rather than losing the whole answer to an unencodable path.
+#[cfg(target_os = "linux")]
+#[test]
+fn graph_answer_drops_an_unencodable_path_and_counts_the_entry_failed() {
+    let tree = tree_of(
+        "iw-graph-non-utf8",
+        &[
+            ("Cargo.toml", "[package]\nname = \"fixture\"\n"),
+            ("src/helper.rs", "pub fn helper_fn() {}\n"),
+        ],
+    );
+    let bad = tree.path.join("src").join(OsStr::from_bytes(b"bad\xff.rs"));
+    std::fs::write(&bad, "use crate::helper::helper_fn;\n").expect("write the non-UTF-8 name");
+    let request = search_query(QueryKind::Graph, &tree.path, "src/helper.rs");
+
+    let in_process = query(&request).expect("the graph leg answers in process");
+    let walked = in_process.impact.as_ref().expect("a walk ran");
+    assert_eq!(
+        walked.edges.len(),
+        1,
+        "the non-UTF-8 document really depends on the seed: {in_process:?}"
+    );
+
+    let separated = isolated(&request, &worker(), &helper(), None)
+        .unwrap_or_else(|error| panic!("the worker answers, got {error:?}"));
+    let impact = separated.impact.as_ref().expect("a walk ran");
+    assert!(
+        impact.edges.is_empty(),
+        "the row whose path has no JSON spelling cannot cross: {separated:?}"
+    );
+    assert_eq!(
+        separated.completeness, impact.completeness,
+        "the envelope and the slice state one completeness"
+    );
+    let Completeness::Partial { reasons } = &separated.completeness else {
+        panic!("a dropped entry is disclosed, never a clean answer: {separated:?}");
+    };
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| matches!(reason, PartialReason::EntriesFailed { count } if *count >= 1)),
+        "the dropped entry is counted: {reasons:?}"
+    );
+    assert_eq!(separated.unresolved, in_process.unresolved);
 }

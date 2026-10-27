@@ -88,6 +88,8 @@ pub enum ConflictCause {
     },
     #[error("completion rejected: {stale} stale evidence")]
     CompletionStale { stale: u64 },
+    #[error("compaction would not shorten the history: folded {folded} bytes replace {before}")]
+    CompactionNotShorter { before: usize, folded: usize },
     #[error("attempt {attempt_id} is {state}, not reconcile-able")]
     AttemptNotReconcileable { attempt_id: String, state: String },
     #[error("publication intent {owner}/{target}#{admission_seq} is not pending")]
@@ -6231,6 +6233,501 @@ impl TaskStore {
     }
 }
 
+/// The latest recorded compaction checkpoint of one task. The event's
+/// aggregate is the checkpoint itself, which is why no task revision
+/// moves; the task column is the feed a resume reads by. Statement texts
+/// are named beside their only reader, like every statement in the shared
+/// catalogue (P-002).
+const LATEST_COMPACTION: &str = "SELECT delta_json FROM events WHERE task_id = ?1 AND event_type = 'task.compacted' ORDER BY cursor DESC LIMIT 1";
+
+/// The one line a folded history assembles to — the checkpoint the next
+/// request reads instead of the records it replaced. One spelling, so the
+/// line `force_compaction` measures against the history it folds is the
+/// very line `assembled_context` serves afterwards.
+fn compacted_history_line(checkpoint: &ContinuationCheckpoint) -> String {
+    format!(
+        "history: compacted {} {} records digest {}\n",
+        checkpoint.checkpoint_id, checkpoint.folded_records, checkpoint.history_digest
+    )
+}
+
+/// The obligation one scoped record supports, read before the record is
+/// deleted so the row that stops being supported is reopened in the same
+/// transaction.
+const SCOPED_RECORD_OBLIGATION: &str =
+    "SELECT obligation_id FROM evidence WHERE evidence_id = ?1 AND task_id = ?2";
+
+/// How many records still support one obligation after a deletion.
+const OBLIGATION_SUPPORT_COUNT: &str = "SELECT COUNT(*) FROM evidence WHERE obligation_id = ?1";
+
+/// Reopens an obligation no record supports any more: a satisfied row
+/// without evidence would claim proof that is gone.
+const REOPEN_OBLIGATION: &str =
+    "UPDATE obligations SET execution = 'pending' WHERE obligation_id = ?1";
+
+/// Deletes one authoritative scoped record of a task. A derived view is
+/// filtered against this table, never against its own copy, so a deleted
+/// record cannot come back from a checkpoint.
+const DELETE_SCOPED_RECORD: &str = "DELETE FROM evidence WHERE evidence_id = ?1 AND task_id = ?2";
+
+/// One spend ledger entry the continuation carries: the scope it was
+/// recorded under (the model that spent it) and the units it spent. The
+/// scope travels with the checkpoint, so a later model switch appends a
+/// new entry instead of rewriting the recorded one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpendEntry {
+    pub scope: String,
+    pub spent: u64,
+}
+
+/// One scoped record as a checkpoint recorded it: the identity, the
+/// validity it had and the digest of what it observed. The observation
+/// text itself is part of the episodic history, so the recorded index
+/// stays small while the availability of the record is preserved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopedIndexEntry {
+    pub evidence_id: String,
+    pub validity: String,
+    pub digest: String,
+}
+
+/// The checkpoint a forced compaction leaves behind: the working state the
+/// next request is rebuilt from, plus the digests a resume re-checks
+/// before it replays anything.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContinuationCheckpoint {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub intent_revision: u64,
+    pub question_id: Option<String>,
+    pub question_revision: Option<u64>,
+    /// The pinned inputs of the task at compaction: what the resume
+    /// compares its live digests with, never guessing staleness.
+    pub goal_digest: String,
+    pub answer_digest: String,
+    pub evidence_digest: String,
+    /// The scoped records the history was folded with, with their
+    /// recorded validity.
+    pub evidence: Vec<ScopedIndexEntry>,
+    /// The spend ledger at compaction, per scope.
+    pub spend: Vec<SpendEntry>,
+    /// How many episodic records the history line replaced.
+    pub folded_records: u64,
+    /// The digest of the folded history: what it said, not only that it
+    /// was folded.
+    pub history_digest: String,
+}
+
+impl ContinuationCheckpoint {
+    /// The first pinned input the live state no longer matches, or `None`
+    /// when every pin still holds. The name is the field, never a prose
+    /// sentence, so a refusal names what moved.
+    #[must_use]
+    pub fn stale_pin(&self, live: &PinnedInputs) -> Option<&'static str> {
+        if self.intent_revision != live.intent_revision {
+            return Some("intent");
+        }
+        if self.goal_digest != live.goal_digest {
+            return Some("goal");
+        }
+        if self.answer_digest != live.answer_digest {
+            return Some("answer");
+        }
+        if self.evidence_digest != live.evidence_digest {
+            return Some("evidence");
+        }
+        None
+    }
+}
+
+/// The pinned inputs of one task as they are now: the digests a resume
+/// compares a checkpoint's recorded pins with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedInputs {
+    pub intent_revision: u64,
+    pub goal_digest: String,
+    pub answer_digest: String,
+    pub evidence_digest: String,
+}
+
+/// One task's working context: what its next request carries. Every part
+/// is a section of [`AssembledContext::text`]; a forced compaction may
+/// only shorten the history part, so the decision, the remainder and the
+/// spend come back byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledContext {
+    pub text: String,
+    pub intent: String,
+    pub decision: String,
+    pub evidence: String,
+    pub remainder: String,
+    pub spend: String,
+    pub history: String,
+}
+
+/// What one forced compaction changed: the checkpoint it wrote and the
+/// assembled context before and after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub checkpoint_id: String,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+    pub folded_records: u64,
+}
+
+/// One digest of a byte slice, hex encoded: the pin shape every checkpoint
+/// field uses.
+fn digest_of(bytes: &[u8]) -> String {
+    crate::config::hex(&sha2::Sha256::digest(bytes))
+}
+
+impl TaskStore {
+    /// The context one request of this task carries, assembled from the
+    /// authoritative rows: goal and intent, the decision, the scoped
+    /// records, what remains, the spend ledger and the episodic history.
+    /// The history is the only part a checkpoint folds; every other part
+    /// is read from its owner, so compaction can never rewrite it.
+    pub fn assembled_context(&self, task_id: &TaskId) -> Result<AssembledContext> {
+        let snapshot = self.snapshot(task_id)?;
+        let goal = String::from_utf8_lossy(&self.goal_bytes(task_id)?).into_owned();
+        let question = self.current_question(task_id)?;
+        let answer = self.answered_question(task_id)?;
+        let records = self.evidence_for_task(task_id)?;
+        let checkpoint = self.continuation_checkpoint(task_id)?;
+        let intent = format!("goal: {goal}\nintent: {}\n", snapshot.intent_revision);
+        let mut decision = String::from("decision:\n");
+        match &question {
+            Some((question, revision)) => decision.push_str(&format!(
+                "question: {} r{revision} pending\n",
+                question.question_id.0
+            )),
+            None => decision.push_str("question: none\n"),
+        }
+        match &answer {
+            Some((answer, origin)) => decision.push_str(&format!("answer: {origin} {answer}\n")),
+            None => decision.push_str("answer: none\n"),
+        }
+        let mut evidence = format!("records: {}\n", records.len());
+        for record in &records {
+            evidence.push_str(&format!(
+                "{} {} {}\n",
+                record.evidence_id.0,
+                validity_text(record.validity),
+                record.digest
+            ));
+        }
+        let mut remainder = String::from("remainder:\n");
+        let mut outstanding = 0_u64;
+        for obligation in &snapshot.obligations.items {
+            if obligation.execution == ObligationExecution::Satisfied {
+                continue;
+            }
+            outstanding += 1;
+            remainder.push_str(&format!(
+                "{} {:?} {:?}\n",
+                obligation.id, obligation.applicability, obligation.execution
+            ));
+        }
+        remainder = format!("{remainder}outstanding: {outstanding}\n");
+        let spend = self.spend_part(task_id)?;
+        let history = match &checkpoint {
+            Some(checkpoint) => compacted_history_line(checkpoint),
+            None => {
+                let mut history = String::from("history:\n");
+                for record in &records {
+                    history.push_str(&format!(
+                        "record {} {}\n",
+                        record.evidence_id.0, record.observation
+                    ));
+                }
+                for attempt in &snapshot.attempts.items {
+                    history.push_str(&format!(
+                        "attempt {} {} {:?} {:?}\n",
+                        attempt.attempt_id.0,
+                        attempt.action_id.0,
+                        attempt.effect_class,
+                        attempt.state
+                    ));
+                }
+                history
+            }
+        };
+        let text = format!("{intent}{decision}{evidence}{remainder}{spend}{history}");
+        Ok(AssembledContext {
+            text,
+            intent,
+            decision,
+            evidence,
+            remainder,
+            spend,
+            history,
+        })
+    }
+
+    /// The spend part of one assembled context: every scope this task has
+    /// spent under, read from the live ledger. The scope name carries the
+    /// model that spent it, so a switch appends its own scope and never
+    /// rewrites an earlier one.
+    fn spend_part(&self, task_id: &TaskId) -> Result<String> {
+        let mut scopes = self
+            .conn()?
+            .prepare(SPEND_SCOPES)
+            .map_err(storage)?
+            .query_map(params![task_scope_prefix(task_id)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        scopes.sort();
+        if scopes.is_empty() {
+            return Ok(String::from("spend: none\n"));
+        }
+        let mut spend = String::from("spend:\n");
+        for (scope, spent) in scopes {
+            spend.push_str(&format!("{scope} {}\n", unsigned(spent)?));
+        }
+        Ok(spend)
+    }
+
+    /// The digests of the task's pinned inputs as they are now: what a
+    /// resume compares a checkpoint against before it replays a step.
+    pub fn pinned_inputs(&self, task_id: &TaskId) -> Result<PinnedInputs> {
+        let snapshot = self.snapshot(task_id)?;
+        let goal = digest_of(&self.goal_bytes(task_id)?);
+        let answer = digest_of(
+            self.answered_question(task_id)?
+                .as_ref()
+                .map_or(b"", |(answer, _)| answer.as_bytes()),
+        );
+        Ok(PinnedInputs {
+            intent_revision: snapshot.intent_revision,
+            goal_digest: goal,
+            answer_digest: answer,
+            evidence_digest: digest_of(&evidence_index_bytes(&self.evidence_for_task(task_id)?)),
+        })
+    }
+
+    /// The latest checkpoint recorded for a task, if a forced compaction
+    /// ever ran on it.
+    pub fn continuation_checkpoint(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<ContinuationCheckpoint>> {
+        let delta: Option<String> = self
+            .conn()?
+            .query_row(LATEST_COMPACTION, params![task_id.0], |row| row.get(0))
+            .optional()
+            .map_err(storage)?;
+        match delta {
+            None => Ok(None),
+            Some(delta) => serde_json::from_str(&delta)
+                .map(Some)
+                .map_err(|error| StoreError::Storage(error.into())),
+        }
+    }
+
+    /// The derived index of a task's scoped records: the checkpoint's
+    /// recorded entries, filtered against the authoritative rows, so a
+    /// record deleted after compaction is never served from the derived
+    /// copy while a surviving one keeps its recorded validity.
+    pub fn scoped_index(&self, task_id: &TaskId) -> Result<Vec<ScopedIndexEntry>> {
+        let Some(checkpoint) = self.continuation_checkpoint(task_id)? else {
+            return Ok(Vec::new());
+        };
+        let live: BTreeSet<String> = self
+            .evidence_for_task(task_id)?
+            .into_iter()
+            .map(|record| record.evidence_id.0)
+            .collect();
+        Ok(checkpoint
+            .evidence
+            .into_iter()
+            .filter(|record| live.contains(&record.evidence_id))
+            .collect())
+    }
+
+    /// One forced runtime compaction (AC-049): folds the episodic history
+    /// into a checkpoint — goal and intent, the decision, the scoped
+    /// records with their validity, the spend ledger and what remains —
+    /// and appends it as its own aggregate, so the task row, its question,
+    /// its answer, its obligations and its spend are never rewritten and
+    /// the next assembled context is only shorter. The fold is refused
+    /// typed when the line it would leave is not strictly smaller than the
+    /// history it replaces: a compaction that only appends a record leaves
+    /// the assembled size unchanged, so it would claim work it did not do.
+    pub fn force_compaction(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<CompactionReport> {
+        let before = self.assembled_context(task_id)?;
+        let pins = self.pinned_inputs(task_id)?;
+        let records = self.evidence_for_task(task_id)?;
+        let snapshot = self.snapshot(task_id)?;
+        let question = self.current_question(task_id)?;
+        let checkpoint = ContinuationCheckpoint {
+            checkpoint_id: EventId::generate().0,
+            task_id: task_id.0.clone(),
+            intent_revision: pins.intent_revision,
+            question_id: question
+                .as_ref()
+                .map(|(question, _)| question.question_id.0.clone()),
+            question_revision: question.as_ref().map(|(_, revision)| *revision),
+            goal_digest: pins.goal_digest,
+            answer_digest: pins.answer_digest,
+            evidence_digest: pins.evidence_digest,
+            evidence: records
+                .iter()
+                .map(|record| ScopedIndexEntry {
+                    evidence_id: record.evidence_id.0.clone(),
+                    validity: validity_text(record.validity).to_string(),
+                    digest: record.digest.clone(),
+                })
+                .collect(),
+            spend: self.recorded_spend(task_id)?,
+            folded_records: records.len() as u64 + snapshot.attempts.items.len() as u64,
+            history_digest: digest_of(before.history.as_bytes()),
+        };
+        // The prospective fold is measured before anything is written: the
+        // next context may only be shorter, so a line that is not strictly
+        // smaller than the history it replaces is refused typed instead of
+        // journaled as a compaction that shrank nothing.
+        let folded = compacted_history_line(&checkpoint);
+        if folded.len() >= before.history.len() {
+            return Err(StoreError::Conflict(ConflictCause::CompactionNotShorter {
+                before: before.history.len(),
+                folded: folded.len(),
+            }));
+        }
+        let delta =
+            serde_json::to_value(&checkpoint).map_err(|error| StoreError::Storage(error.into()))?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        Self::append_event(
+            &tx,
+            session_id,
+            Some(task_id),
+            (&checkpoint.checkpoint_id, 1),
+            "task.compacted",
+            delta,
+            "runtime",
+        )?;
+        tx.commit().map_err(storage)?;
+        let after = self.assembled_context(task_id)?;
+        Ok(CompactionReport {
+            checkpoint_id: checkpoint.checkpoint_id,
+            before_bytes: before.text.len(),
+            after_bytes: after.text.len(),
+            folded_records: checkpoint.folded_records,
+        })
+    }
+
+    /// The spend ledger at compaction: one entry per scope already spent
+    /// under. The scope name is the model that spent it, so a later switch
+    /// appends its own entry instead of relabelling this one.
+    fn recorded_spend(&self, task_id: &TaskId) -> Result<Vec<SpendEntry>> {
+        let mut scopes = self
+            .conn()?
+            .prepare(SPEND_SCOPES)
+            .map_err(storage)?
+            .query_map(params![task_scope_prefix(task_id)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        scopes.sort();
+        scopes
+            .into_iter()
+            .map(|(scope, spent)| {
+                Ok(SpendEntry {
+                    scope,
+                    spent: unsigned(spent)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Deletes one scoped record of a task. Every derived view is filtered
+    /// against this table, so the continuation and its recorded index stop
+    /// returning the record the moment it is gone — the checkpoint's own
+    /// copy stays what it recorded, and the filter is what withholds it.
+    /// The obligation the record supported is reopened in the same
+    /// transaction once no record supports it: a satisfied row without
+    /// evidence would claim proof that no longer exists.
+    pub fn delete_scoped_record(&mut self, task_id: &TaskId, evidence_id: &str) -> Result<()> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let obligation: Option<String> = tx
+            .query_row(
+                SCOPED_RECORD_OBLIGATION,
+                params![evidence_id, task_id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(obligation_id) = obligation else {
+            return Err(StoreError::NotFound(Missing::Evidence(
+                evidence_id.to_string(),
+            )));
+        };
+        tx.execute(DELETE_SCOPED_RECORD, params![evidence_id, task_id.0])
+            .map_err(storage)?;
+        let support: u64 = tx
+            .query_row(OBLIGATION_SUPPORT_COUNT, params![obligation_id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(storage)? as u64;
+        if support == 0 {
+            tx.execute(REOPEN_OBLIGATION, params![obligation_id])
+                .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+}
+
+/// The ledger scopes one task has already spent under, matched by the
+/// task-scoped name prefix, ordered by name.
+const SPEND_SCOPES: &str =
+    "SELECT scope, spent FROM budget_scopes WHERE scope LIKE ?1 || '%' ORDER BY scope";
+
+/// The name prefix every task-scoped ledger row carries: `task:<id>` for
+/// the task's own row, and `task:<id>/<label>` when the label names who
+/// spent it (the model, for a spend ledger). The same prefix scopes the
+/// task's evidence rows, so one task is one namespace.
+fn task_scope_prefix(task_id: &TaskId) -> String {
+    format!("task:{}", task_id.0)
+}
+
+/// One recorded validity as the store spells it.
+fn validity_text(validity: EvidenceValidity) -> &'static str {
+    match validity {
+        EvidenceValidity::Current => "current",
+        EvidenceValidity::Stale => "stale",
+    }
+}
+
+/// The canonical bytes of an evidence set: what the freshness pin digests,
+/// so an added, removed or invalidated record moves the pin.
+fn evidence_index_bytes(records: &[Evidence]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend_from_slice(record.evidence_id.0.as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(validity_text(record.validity).as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(record.digest.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
 impl TaskStore {
     /// Lends the one write surface of a standalone store. A runtime-bound
     /// store is reached only through `Runtime::store_writer`.
@@ -6445,6 +6942,39 @@ impl StoreWriter<'_> {
     /// See [`TaskStore::open_budget`].
     pub fn open_budget(&mut self, scope: &str, limit_units: u64) -> Result<()> {
         self.store.open_budget(scope, limit_units)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::budget_reserve`].
+    pub fn budget_reserve(
+        &mut self,
+        reservation_id: &str,
+        scopes: &[&str],
+        bound: u64,
+    ) -> Result<()> {
+        self.store.budget_reserve(reservation_id, scopes, bound)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::budget_charge`].
+    pub fn budget_charge(&mut self, reservation_id: &str, confirmed: Option<u64>) -> Result<()> {
+        self.store.budget_charge(reservation_id, confirmed)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::force_compaction`].
+    pub fn force_compaction(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<CompactionReport> {
+        self.store.force_compaction(session_id, task_id)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::delete_scoped_record`].
+    pub fn delete_scoped_record(&mut self, task_id: &TaskId, evidence_id: &str) -> Result<()> {
+        self.store.delete_scoped_record(task_id, evidence_id)
     }
 
     /// # Errors

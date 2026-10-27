@@ -15,17 +15,23 @@
 //! read at, and how certain that target is — an unresolvable specifier
 //! stays an `Unknown`-confidence row whose raw specifier is reported as
 //! unresolved, never a missing edge.
+//!
+//! The impact traversal a graph query runs over that graph lives here too
+//! (AC-034): the documents that depend on a seed, the budgets that stopped
+//! the walk, and the cursor that resumes it — so a bounded answer is
+//! reported as bounded and as resumable, never as the whole impact.
 
 use crate::commands::LoopEvent;
 use lsp_types::{PositionEncodingKind, Range, Uri};
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher as _};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The snapshot a result was computed over. `Live` states — honestly —
 /// that no persisted generation exists in this build: the result was
@@ -60,6 +66,11 @@ pub enum SearchBackend {
     /// grammars extract definition/use rows; `lsp-types` shapes carry
     /// the document identity. No language-server subprocess runs.
     Symbol,
+    /// The derived project graph (AC-034): the directed relation rows one
+    /// generation was cut from, walked as an impact traversal. The rows
+    /// are lexical observations of the admitted documents — no parser of
+    /// their syntax is consulted.
+    Graph,
 }
 
 impl SearchBackend {
@@ -72,6 +83,7 @@ impl SearchBackend {
             Self::Source => "std::fs",
             Self::Ast => "tree-sitter+ast-grep-core",
             Self::Symbol => "tree-sitter+lsp-types",
+            Self::Graph => "ignore+derive_edges",
         }
     }
 }
@@ -117,6 +129,11 @@ pub enum PartialReason {
     /// not tell whether they match, so their rows were withheld rather
     /// than claimed absent (DEC-029).
     UnknownModulePaths { count: u64 },
+    /// An impact traversal stopped on one of its budgets with work left
+    /// unexpanded. The marker names the budget, so a caller renews the
+    /// one that stopped it; the cursor travelling beside it names what
+    /// remains (AC-034).
+    TraversalLimit { limit: TraversalLimit },
 }
 
 /// Completeness of one query result — `Complete` only when nothing was
@@ -272,6 +289,14 @@ pub struct QueryResult {
     pub completeness: Completeness,
     pub matches: Vec<SearchMatch>,
     pub unresolved: Vec<PathBuf>,
+    /// The graph leg's answer, when the query ran one: the slice the
+    /// impact traversal produced, with its incompleteness marker and its
+    /// cursor. A graph answer fills this instead of `matches` — an impact
+    /// row is a project-graph edge, not a content match — and it is the
+    /// one payload whose absence needs no wire spelling, so the kinds
+    /// that never traverse leave it off the envelope entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<Box<ImpactSlice>>,
 }
 
 /// What relation one directed edge reports — the three kinds the
@@ -1101,6 +1126,373 @@ fn quoted_literal(text: &str) -> Option<&str> {
     let rest = &text[open + quote.len_utf8()..];
     let end = rest.find(quote)?;
     Some(&rest[..end])
+}
+
+// ----- impact traversal (AC-034) -----
+
+/// The budget an impact traversal ran out of. The incompleteness marker
+/// names the leg rather than reporting a bare "bounded", so a caller knows
+/// which budget to renew before it resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraversalLimit {
+    /// The walk reached the depth bound with dependents still unexpanded.
+    Depth,
+    /// The walk reached as many dependent documents as its node budget
+    /// allows.
+    Nodes,
+    /// The walk spent the wall allowance it was given.
+    Time,
+}
+
+/// The budgets one impact traversal consumes, read absolute rather than per
+/// slice: `depth` bounds how far below a seed the walk may reach, so every
+/// slice of one walk reads the same bound instead of a leftover measured
+/// from wherever the previous slice stopped; `nodes` bounds how many
+/// dependent documents the walk may reach altogether, which is why the
+/// cursor carries what it already reached beside the grant; `time` is one
+/// slice's wall allowance — a paused walk was not running, so the allowance
+/// is handed to the slice, never banked (DEC-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalLimits {
+    pub depth: usize,
+    pub nodes: usize,
+    pub time: Duration,
+}
+
+/// What one walk had spent when it stopped, in the same axes as
+/// [`TraversalLimits`] and absolute for the same reason: `depth` is the
+/// deepest document it reached below its seeds, `nodes` the dependent
+/// documents it reached, seeds excluded. A resumed slice starts from this
+/// record, so the grant it is handed is measured against the walk's own
+/// spend instead of being spent again from zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalSpend {
+    pub depth: usize,
+    pub nodes: usize,
+}
+
+/// One document an impact traversal reached, with the depth it was first
+/// reached at — `0` for a seed. A document is reported by the one slice
+/// that discovered it, so two slices never name it twice and a resumed
+/// walk never re-reports what an earlier slice already served.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TraversalNode {
+    pub document: SourceRef,
+    pub depth: usize,
+}
+
+/// What a stopped traversal leaves behind so it can be resumed: the
+/// documents it reached, the grant it ran under, what it had spent, and the
+/// documents still waiting to be expanded — carried rather than re-derived,
+/// so resuming continues the same walk instead of walking the same paths
+/// again (DEC-003).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalContinuation {
+    /// The documents discovered but not yet expanded, in expansion order.
+    pub frontier: Vec<TraversalNode>,
+    /// The grant the walk ran under, absolute: a resumed slice reads its
+    /// bound from here, so it reaches exactly as deep as an uninterrupted
+    /// walk with the same grant rather than as deep as a leftover the
+    /// stopped slice subtracted. A caller renews a leg here.
+    pub limits: TraversalLimits,
+    /// What the walk had spent when it stopped, so a resumed slice credits
+    /// this grant with it instead of spending the whole of it again.
+    pub spent: TraversalSpend,
+    /// Every document the walk already holds — its seeds included — so a
+    /// resumed slice expands the frontier without rediscovering rows an
+    /// earlier slice already reported.
+    pub visited: Vec<PathBuf>,
+}
+
+/// One slice of an impact traversal: the documents it reached, the real
+/// directed edges that reached them, whether it covers the whole impact,
+/// and the cursor for the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactSlice {
+    /// The documents this slice reached, each once, with the depth it was
+    /// first reached at.
+    pub nodes: Vec<TraversalNode>,
+    /// Every real row into a document this slice expanded — the walk's
+    /// whole evidence, never a sample of it.
+    pub edges: Vec<IndexEdge>,
+    pub completeness: Completeness,
+    pub continuation: Option<TraversalContinuation>,
+}
+
+impl ImpactSlice {
+    /// The reached documents a test target depends on, sorted. A
+    /// `Test`-kind row is read from a document under a package's `tests/`
+    /// directory, so every such row in the slice names a test the walk
+    /// reached.
+    pub fn tests(&self) -> Vec<SourceRef> {
+        let mut tests: Vec<SourceRef> = self
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Test)
+            .map(|edge| SourceRef {
+                path: edge.from.path.clone(),
+                line: None,
+                ignored: edge.from.ignored,
+            })
+            .collect();
+        tests.sort();
+        tests.dedup();
+        tests
+    }
+
+    /// What the tests leg says. An empty list is "no tests found" only
+    /// when the walk covered the whole impact: a traversal a budget stopped
+    /// has not seen every dependent, so its empty list is unknown rather
+    /// than a fact — never a claim that verification is unnecessary
+    /// (AC-034). The incompleteness marker stays authoritative either way.
+    pub fn tests_status(&self) -> &'static str {
+        match (self.tests().is_empty(), self.completeness.is_complete()) {
+            (false, true) => "tests found",
+            (false, false) => "tests found, coverage incomplete",
+            (true, true) => "no tests found",
+            (true, false) => "tests unknown: traversal incomplete",
+        }
+    }
+
+    /// What the cursor says, derived from the continuation and never the
+    /// other way round (DEC-003). A finished walk reports that no
+    /// continuation is available rather than leaving an empty frontier to
+    /// be read as "nothing further is needed"; so does a resumed slice the
+    /// grant it was handed could not move, and its incompleteness marker
+    /// still names the budget that stopped it.
+    pub fn continuation_status(&self) -> &'static str {
+        if self.continuation.is_some() {
+            "continuation available"
+        } else {
+            "no continuation available"
+        }
+    }
+}
+
+/// Walk the impact of `seeds`: the documents that depend on a seed,
+/// transitively, are the ones a change to it can affect.
+///
+/// The walk reads the graph's own direction — a row is read from the
+/// document that declares the relation to the document it names, so a
+/// dependent is a row's `from` and a document the walk expands is its
+/// `to` — and it follows `Certain` rows only: an `Unknown` row names a
+/// specifier that could not be placed, and following it would report a
+/// path the project does not have.
+///
+/// A seed is the walk's input, not its discovery, so the seeds are
+/// reported at depth `0` and never spend the node budget.
+pub fn impact_traversal(
+    graph: &ProjectGraph,
+    seeds: &[SourceRef],
+    limits: TraversalLimits,
+) -> ImpactSlice {
+    let mut walk = ImpactWalk::begin(graph, limits);
+    for seed in seeds {
+        walk.seed(SourceRef {
+            path: seed.path.clone(),
+            line: None,
+            ignored: seed.ignored,
+        });
+    }
+    walk.run()
+}
+
+/// Continue a stopped traversal from its cursor: the frontier, the
+/// documents already reached and the spend so far come from the
+/// continuation, so the resumed slice credits exactly what the grant leaves
+/// and reports the rows the stopped slice did not reach — never the ones it
+/// already served.
+///
+/// A resume always moves the walk: a slice that cannot expand a single
+/// frontier document under the grant it is handed reports no continuation
+/// instead of handing back the cursor it was given, so a caller looping on
+/// `continuation` terminates. Renewing the leg the stop named — the
+/// `TraversalLimit` the completeness marker carries — is what lets the walk
+/// move past it.
+pub fn resume_impact_traversal(
+    graph: &ProjectGraph,
+    continuation: &TraversalContinuation,
+    limits: TraversalLimits,
+) -> ImpactSlice {
+    let mut walk = ImpactWalk::begin(graph, limits);
+    walk.frontier = continuation.frontier.iter().cloned().collect();
+    walk.visited = continuation.visited.iter().cloned().collect();
+    walk.reached = continuation.spent.nodes;
+    walk.reached_depth = continuation.spent.depth;
+    walk.resumed = true;
+    walk.run()
+}
+
+/// What one impact walk holds while it runs: the reverse adjacency it
+/// reads its rows from, the documents it reached and reported, the budgets
+/// it was given, and the deadline those budgets become.
+struct ImpactWalk<'g> {
+    /// The rows naming each document as their target, in the graph's own
+    /// sorted order, so two runs of the same graph discover the same
+    /// documents in the same order. Only `Certain` rows are here.
+    incoming: BTreeMap<&'g Path, Vec<&'g IndexEdge>>,
+    frontier: VecDeque<TraversalNode>,
+    visited: BTreeSet<PathBuf>,
+    nodes: Vec<TraversalNode>,
+    edges: Vec<IndexEdge>,
+    /// Dependent documents the walk reached so far, seeds excluded — what
+    /// its node grant bounds, across every slice that ran before this one.
+    reached: usize,
+    /// The deepest document this walk holds.
+    reached_depth: usize,
+    /// Whether this slice continues an earlier one. A first slice reports
+    /// the cursor it leaves whatever its grant managed, because the caller
+    /// chose that grant; a resumed slice reports one only when it advanced.
+    resumed: bool,
+    limits: TraversalLimits,
+    deadline: Instant,
+    /// The graph's own coverage: the rows a slice serves are rows of this
+    /// generation, so its gaps bound what the slice can claim.
+    coverage: Completeness,
+}
+
+impl<'g> ImpactWalk<'g> {
+    fn begin(graph: &'g ProjectGraph, limits: TraversalLimits) -> Self {
+        let mut incoming: BTreeMap<&'g Path, Vec<&'g IndexEdge>> = BTreeMap::new();
+        for edge in &graph.edges {
+            if edge.confidence == EdgeConfidence::Certain {
+                incoming
+                    .entry(edge.to.path.as_path())
+                    .or_default()
+                    .push(edge);
+            }
+        }
+        Self {
+            incoming,
+            frontier: VecDeque::new(),
+            visited: BTreeSet::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            reached: 0,
+            reached_depth: 0,
+            resumed: false,
+            limits,
+            deadline: Instant::now()
+                .checked_add(limits.time)
+                .unwrap_or_else(Instant::now),
+            coverage: graph.completeness.clone(),
+        }
+    }
+
+    /// Report one document at `depth` and queue it for expansion. A
+    /// document the walk already holds is left as it is: the row that
+    /// reached it a second time is not a second path.
+    fn discover(&mut self, document: SourceRef, depth: usize) {
+        if !self.visited.insert(document.path.clone()) {
+            return;
+        }
+        self.reached_depth = self.reached_depth.max(depth);
+        self.nodes.push(TraversalNode {
+            document: document.clone(),
+            depth,
+        });
+        self.frontier.push_back(TraversalNode { document, depth });
+    }
+
+    /// Reach a seed: the caller's own document, so it spends no node
+    /// budget and is reported whatever else the walk covers.
+    fn seed(&mut self, document: SourceRef) {
+        self.discover(document, 0);
+    }
+
+    /// Expand one frontier document: every certain row that names it as a
+    /// target is one real path into it, and every dependent the walk does
+    /// not hold yet is one document it reaches.
+    ///
+    /// An expansion is spent whole or not at all: a document is expanded
+    /// exactly once across every slice, which is what lets the slice report
+    /// *all* the rows into it and still never report a row twice.
+    fn expand(&mut self, node: &TraversalNode) -> Option<TraversalLimit> {
+        let rows: Vec<&'g IndexEdge> = self.incoming.get(node.document.path.as_path())?.clone();
+        let fresh = rows
+            .iter()
+            .filter(|edge| !self.visited.contains(&edge.from.path))
+            .map(|edge| &edge.from.path)
+            .collect::<BTreeSet<&PathBuf>>()
+            .len();
+        if self.reached.saturating_add(fresh) > self.limits.nodes {
+            return Some(TraversalLimit::Nodes);
+        }
+        let depth = node.depth.saturating_add(1);
+        for edge in rows {
+            if !self.visited.contains(&edge.from.path) {
+                self.reached = self.reached.saturating_add(1);
+            }
+            self.edges.push(edge.clone());
+            self.discover(
+                SourceRef {
+                    path: edge.from.path.clone(),
+                    line: None,
+                    ignored: edge.from.ignored,
+                },
+                depth,
+            );
+        }
+        None
+    }
+
+    fn run(mut self) -> ImpactSlice {
+        // How many frontier documents this slice expanded: the measure of
+        // whether resuming it moved the walk at all.
+        let mut expanded = 0usize;
+        let stop = loop {
+            let Some(node) = self.frontier.pop_front() else {
+                break None;
+            };
+            if Instant::now() >= self.deadline {
+                self.frontier.push_front(node);
+                break Some(TraversalLimit::Time);
+            }
+            if node.depth >= self.limits.depth {
+                self.frontier.push_front(node);
+                break Some(TraversalLimit::Depth);
+            }
+            if let Some(stop) = self.expand(&node) {
+                self.frontier.push_front(node);
+                break Some(stop);
+            }
+            expanded = expanded.saturating_add(1);
+        };
+        self.finish(stop, expanded)
+    }
+
+    fn finish(self, stop: Option<TraversalLimit>, expanded: usize) -> ImpactSlice {
+        let mut reasons = match self.coverage {
+            Completeness::Complete => Vec::new(),
+            Completeness::Partial { reasons } => reasons,
+        };
+        if let Some(limit) = stop {
+            reasons.push(PartialReason::TraversalLimit { limit });
+        }
+        // A resumed slice that expanded nothing did not move the walk — its
+        // grant cannot reach the frontier — so it reports no continuation
+        // rather than the cursor it was handed, which a caller looping on
+        // the cursor would resume forever. The limit marker above still says
+        // why it stopped, so the bound stays disclosed.
+        let continuation =
+            stop.filter(|_| !self.resumed || expanded > 0)
+                .map(|_| TraversalContinuation {
+                    frontier: self.frontier.into_iter().collect(),
+                    limits: self.limits,
+                    spent: TraversalSpend {
+                        depth: self.reached_depth,
+                        nodes: self.reached,
+                    },
+                    visited: self.visited.into_iter().collect(),
+                });
+        ImpactSlice {
+            nodes: self.nodes,
+            edges: self.edges,
+            completeness: Completeness::from_reasons(reasons),
+            continuation,
+        }
+    }
 }
 
 // ----- the project's own watcher -----

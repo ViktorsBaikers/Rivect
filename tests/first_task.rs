@@ -3953,3 +3953,882 @@ fn headless_loop_writes_the_deferred_index_answer_and_exits_on_close() {
         "machine stderr carries no diagnostics for a clean run: {stderr}"
     );
 }
+
+// ----- AC-049: a forced runtime compaction keeps the continuation -----
+
+/// The scope one model's spend is recorded under: the model is part of the
+/// name, so a switch appends its own scope instead of relabelling an
+/// earlier one.
+fn model_spend_scope(task: &rivect::contracts::TaskId, model: &str) -> String {
+    format!("task:{}/model:{model}", task.0)
+}
+
+/// Creates the fixture task with two criteria: the recorded read proves the
+/// first and leaves the second outstanding, which is the work a continuation
+/// has to carry across a compaction.
+fn create_two_criteria_task(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    command_id: &str,
+) -> rivect::contracts::TaskId {
+    let created = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": command_id, "session_id": session.0,
+            "kind": "create",
+            "goal": "Объяснить тему в выбранной форме.",
+            "contract": {
+                "criteria": [
+                    "Дать объяснение в выбранной форме.",
+                    "Проверить объяснение по файлу.",
+                ],
+                "constraints": ["Не изменять файлы."],
+            },
+            "attachments": [],
+        },
+    }));
+    let task_id = created["result"]["task_id"].as_str();
+    assert!(task_id.is_some(), "create failed: {created}");
+    rivect::contracts::TaskId(task_id.expect("task id").to_string())
+}
+
+/// A task carrying an open question, real tool results, spend and a scoped
+/// read: the working state a forced compaction has to carry across.
+struct Continuation {
+    world: World,
+    session: rivect::contracts::SessionId,
+    task: rivect::contracts::TaskId,
+    question: rivect::contracts::Question,
+    file: PathBuf,
+}
+
+fn continuation_task(tag: &str) -> Continuation {
+    let (mut world, _scope, file, _grant) =
+        scoped_world(tag, Some(&support::config_distinct_pools()));
+    let session = world.open_session(&format!("bootstrap-{tag}"));
+    let task = create_two_criteria_task(&mut world, &session, &format!("cmd-{tag}"));
+    let question = world.publish(&session, &task);
+    // The obligations are the rows evidence is recorded against, so they
+    // exist before the first result lands.
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&task)
+        .expect("obligations");
+    // The episodic history is what a compaction folds: real tool results far
+    // longer than the one checkpoint line that replaces them. They prove the
+    // first criterion and leave the second outstanding, so the remainder the
+    // continuation carries is real work rather than a constant zero.
+    for index in 0..4_u8 {
+        let observation = format!(
+            "read {} and reported {}",
+            file.display(),
+            "a scoped line of the file ".repeat(30)
+        );
+        world
+            .runtime
+            .store_writer()
+            .insert_evidence(
+                &task,
+                0,
+                &format!("task:{}", task.0),
+                &observation,
+                &format!("{index:02x}").repeat(32),
+            )
+            .expect("evidence row");
+    }
+    let obligations = world
+        .runtime
+        .store()
+        .snapshot(&task)
+        .expect("snapshot")
+        .obligations
+        .items;
+    assert_eq!(
+        obligations.len(),
+        2,
+        "the fixture task carries two criteria: {obligations:?}"
+    );
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.execution != rivect::contracts::ObligationExecution::Satisfied
+            })
+            .count(),
+        1,
+        "one criterion stays unproven, so the remainder has work to name: {obligations:?}"
+    );
+    let scope = model_spend_scope(&task, "alpha");
+    let mut writer = world.runtime.store_writer();
+    writer.open_budget(&scope, 10_000).expect("budget scope");
+    writer
+        .budget_reserve("reserve-alpha", &[&scope], 400)
+        .expect("reserve");
+    writer
+        .budget_charge("reserve-alpha", Some(320))
+        .expect("charge");
+    Continuation {
+        world,
+        session,
+        task,
+        question,
+        file,
+    }
+}
+
+fn compact(c: &mut Continuation) -> rivect::state::CompactionReport {
+    c.world
+        .runtime
+        .store_writer()
+        .force_compaction(&c.session, &c.task)
+        .expect("forced compaction")
+}
+
+fn assembled(c: &Continuation) -> rivect::state::AssembledContext {
+    c.world
+        .runtime
+        .store()
+        .assembled_context(&c.task)
+        .expect("assembled context")
+}
+
+fn resume(c: &mut Continuation) -> rivect::controller::ContinuationOutcome {
+    c.world
+        .runtime
+        .resume_continuation(&c.session, &c.task)
+        .expect("resume")
+}
+
+/// How many read effects this task recorded: the count a compaction must
+/// leave at exactly one.
+fn recorded_effects(c: &Continuation) -> usize {
+    c.world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .attempts
+        .items
+        .iter()
+        .filter(|attempt| attempt.effect_class == rivect::contracts::EffectClass::Read)
+        .count()
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p1() {
+    let mut c = continuation_task("compaction-p1");
+    let open = c
+        .world
+        .runtime
+        .store()
+        .current_question(&c.task)
+        .expect("question read")
+        .expect("an open question");
+    let intent = c
+        .world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .intent_revision;
+    let report = compact(&mut c);
+    let after = c
+        .world
+        .runtime
+        .store()
+        .current_question(&c.task)
+        .expect("question read")
+        .expect("the open question survives the compaction");
+    assert_eq!(
+        after.0, open.0,
+        "a forced compaction must not replace the open question"
+    );
+    assert_eq!(after.1, open.1, "nor its revision");
+    let checkpoint = c
+        .world
+        .runtime
+        .store()
+        .continuation_checkpoint(&c.task)
+        .expect("checkpoint read")
+        .expect("the compaction recorded a checkpoint");
+    assert_eq!(checkpoint.checkpoint_id, report.checkpoint_id);
+    assert_eq!(
+        checkpoint.intent_revision, intent,
+        "the checkpoint keeps the intent revision the question was pinned to"
+    );
+    assert_eq!(
+        checkpoint.question_id.as_deref(),
+        Some(open.0.question_id.0.as_str()),
+        "the checkpoint names the question it carried"
+    );
+    let context = assembled(&c);
+    assert!(
+        context.decision.contains(&open.0.question_id.0),
+        "the next request still carries the question: {context:?}"
+    );
+    assert!(
+        context.intent.contains(&format!("intent: {intent}")),
+        "and its intent: {context:?}"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p2() {
+    let mut c = continuation_task("compaction-p2");
+    let question = c.question.clone();
+    freeze_answered(
+        &mut c.world,
+        &c.session,
+        &c.task,
+        &question,
+        answer_custom(&format!("read {}", c.file.display())),
+    );
+    let given = c
+        .world
+        .runtime
+        .store()
+        .answered_question(&c.task)
+        .expect("answer read")
+        .expect("the answer is durable before the compaction");
+    compact(&mut c);
+    let kept = c
+        .world
+        .runtime
+        .store()
+        .answered_question(&c.task)
+        .expect("answer read")
+        .expect("the answer survives the compaction");
+    assert_eq!(
+        kept, given,
+        "a forced compaction must not replace the answer already given"
+    );
+    // The remainder is real work before the resume and none of it after:
+    // the continuation is what carries it across, so the two states have to
+    // differ rather than repeat a constant.
+    let before_resume = assembled(&c).remainder;
+    assert!(
+        before_resume.contains("outstanding: 1\n"),
+        "the outstanding criterion is still open after the compaction: {before_resume:?}"
+    );
+    let outcome = resume(&mut c);
+    let rivect::controller::ContinuationOutcome::Resumed { snapshot, .. } = outcome else {
+        panic!("the remainder must run after the compaction, got {outcome:?}");
+    };
+    assert_eq!(
+        snapshot.lifecycle,
+        Lifecycle::Completed,
+        "the remainder still runs to completion: {snapshot:?}"
+    );
+    let after_resume = assembled(&c).remainder;
+    assert_ne!(
+        after_resume, before_resume,
+        "the resumed step closes what remained, so the remainder is not a constant"
+    );
+    assert!(
+        after_resume.contains("outstanding: 0\n"),
+        "the outstanding work is what the resumed step closed: {after_resume:?}"
+    );
+    assert_eq!(c.world.worker_reads(), 1, "the remainder read exactly once");
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p3() {
+    let mut c = continuation_task("compaction-p3");
+    let scope = model_spend_scope(&c.task, "alpha");
+    let before = c
+        .world
+        .runtime
+        .store()
+        .budget_status(&scope)
+        .expect("budget status")
+        .spent;
+    assert_eq!(before, 320, "the spend recorded before the compaction");
+    compact(&mut c);
+    let after = c
+        .world
+        .runtime
+        .store()
+        .budget_status(&scope)
+        .expect("budget status")
+        .spent;
+    assert_eq!(
+        after, before,
+        "a forced compaction leaves recorded spend unchanged"
+    );
+    let context = assembled(&c);
+    assert!(
+        context.spend.contains(&format!("{scope} {before}")),
+        "the continuation reports the recorded spend: {context:?}"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p4() {
+    let mut c = continuation_task("compaction-p4");
+    let before = assembled(&c);
+    let report = compact(&mut c);
+    let after = assembled(&c);
+    assert!(
+        report.after_bytes < report.before_bytes,
+        "a forced runtime compaction must shrink the assembled context, got {report:?}"
+    );
+    assert!(
+        report.after_bytes + 512 < report.before_bytes,
+        "a compaction that only appended a record leaves the size unchanged: {report:?}"
+    );
+    assert_eq!(after.text.len(), report.after_bytes, "{report:?}");
+    assert!(
+        before.history.contains("read "),
+        "the raw history is assembled before the compaction: {before:?}"
+    );
+    assert!(
+        !after.history.contains("read "),
+        "the folded history must not keep the raw text: {after:?}"
+    );
+    assert_eq!(
+        after.decision, before.decision,
+        "the question and the answer stay byte-identical"
+    );
+    assert_eq!(
+        after.remainder, before.remainder,
+        "what remains stays byte-identical"
+    );
+    // The carried remainder is the fixture's unproven criterion, so the
+    // byte-identical check above compares real work rather than a constant
+    // "outstanding: 0".
+    let pending = c
+        .world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .obligations
+        .items
+        .into_iter()
+        .find(|obligation| {
+            obligation.execution != rivect::contracts::ObligationExecution::Satisfied
+        })
+        .expect("the fixture leaves one criterion outstanding");
+    assert!(
+        before.remainder.contains(&pending.id) && before.remainder.contains("outstanding: 1\n"),
+        "the remainder names the outstanding work and its count: {before:?}"
+    );
+    assert_eq!(after.spend, before.spend, "the spend stays byte-identical");
+    assert_eq!(
+        after.intent, before.intent,
+        "the intent stays byte-identical"
+    );
+    assert_eq!(
+        after.evidence, before.evidence,
+        "the records the continuation carries stay byte-identical"
+    );
+    let checkpoint = c
+        .world
+        .runtime
+        .store()
+        .continuation_checkpoint(&c.task)
+        .expect("checkpoint read")
+        .expect("checkpoint");
+    assert!(
+        checkpoint.folded_records >= 4,
+        "the checkpoint names how many episodic records it folded: {checkpoint:?}"
+    );
+    // Folding again would replace the one folded line with another of the
+    // same size, so the fold is refused typed: a compaction that cannot
+    // shorten the context never reports one.
+    let refused = c
+        .world
+        .runtime
+        .store_writer()
+        .force_compaction(&c.session, &c.task);
+    assert!(
+        matches!(
+            refused,
+            Err(rivect::state::StoreError::Conflict(
+                rivect::state::ConflictCause::CompactionNotShorter { .. }
+            ))
+        ),
+        "a fold that would not shorten the history is refused: {refused:?}"
+    );
+    let unchanged = c
+        .world
+        .runtime
+        .store()
+        .continuation_checkpoint(&c.task)
+        .expect("checkpoint read")
+        .expect("checkpoint");
+    assert_eq!(
+        unchanged.checkpoint_id, checkpoint.checkpoint_id,
+        "the refused fold wrote no second checkpoint"
+    );
+    assert_eq!(
+        assembled(&c).text.len(),
+        report.after_bytes,
+        "and the context is exactly what the accepted fold left"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p5() {
+    // E4: a model switch inside the continuation spends under its own scope
+    // and never relabels the spend recorded before it.
+    let mut c = continuation_task("compaction-p5");
+    let scope = model_spend_scope(&c.task, "alpha");
+    compact(&mut c);
+    let recorded = c
+        .world
+        .runtime
+        .store()
+        .continuation_checkpoint(&c.task)
+        .expect("checkpoint read")
+        .expect("checkpoint")
+        .spend;
+    assert_eq!(
+        recorded,
+        vec![rivect::state::SpendEntry {
+            scope: scope.clone(),
+            spent: 320,
+        }],
+        "the checkpoint records the spend per scope"
+    );
+    let before_spend = assembled(&c).spend;
+    assert!(
+        before_spend.contains(&format!("{scope} 320")),
+        "the live ledger names the model that spent it: {before_spend:?}"
+    );
+    // The test switches the model inside the continuation: a pinned
+    // backend_task model replaces the auto pool.
+    let world_id = c.world.runtime.scope_root.display().to_string();
+    let before_model = c
+        .world
+        .runtime
+        .broker
+        .prepare(
+            "backend_task",
+            &c.world.runtime.config_for_broker(),
+            &world_id,
+            "goal: probe",
+        )
+        .expect("manifest before the switch")
+        .model;
+    let switched = format!(
+        "{}\n[models.purposes.backend_task]\nmodel = {{ mode = \"fixed\", connection = \"primary\", model_id = \"fixture-model\" }}\neffort = {{ mode = \"auto\" }}\n",
+        support::base_config()
+    );
+    std::fs::write(c.world.root.join("config.toml"), switched).expect("config change");
+    c.world.runtime.reload_config().expect("the owner reloads");
+    let after_model = c
+        .world
+        .runtime
+        .broker
+        .prepare(
+            "backend_task",
+            &c.world.runtime.config_for_broker(),
+            &world_id,
+            "goal: probe",
+        )
+        .expect("manifest after the switch")
+        .model;
+    assert_ne!(
+        after_model, before_model,
+        "the switch must change the model the task runs under"
+    );
+    // The new model spends under its own scope: the live ledger really
+    // moves, which is what makes the unchanged record below a claim instead
+    // of a second read of the same value.
+    let beta = model_spend_scope(&c.task, "beta");
+    let mut writer = c.world.runtime.store_writer();
+    writer.open_budget(&beta, 10_000).expect("beta scope");
+    writer
+        .budget_reserve("reserve-beta", &[&beta], 200)
+        .expect("beta reserve");
+    writer
+        .budget_charge("reserve-beta", Some(120))
+        .expect("beta charge");
+    let after_spend = assembled(&c).spend;
+    assert_ne!(
+        after_spend, before_spend,
+        "the switched model's spend reaches the live ledger: {after_spend:?}"
+    );
+    assert!(
+        after_spend.contains(&format!("{beta} 120")),
+        "the new model's spend is a row of its own: {after_spend:?}"
+    );
+    assert!(
+        after_spend.contains(&format!("{scope} 320")),
+        "the row the previous model spent stays as it was: {after_spend:?}"
+    );
+    // The recorded spend is still exactly what the compaction wrote: the
+    // switch appended a scope, it did not relabel the recorded one.
+    let kept = c
+        .world
+        .runtime
+        .store()
+        .continuation_checkpoint(&c.task)
+        .expect("checkpoint read")
+        .expect("checkpoint")
+        .spend;
+    assert_eq!(
+        kept,
+        vec![rivect::state::SpendEntry {
+            scope: scope.clone(),
+            spent: 320,
+        }],
+        "the spend recorded under the previous model is unchanged by the switch: {kept:?}"
+    );
+    assert!(
+        kept.iter().all(|entry| entry.scope != beta),
+        "and the checkpoint recorded before the switch does not gain its scope: {kept:?}"
+    );
+    assert_eq!(
+        c.world
+            .runtime
+            .store()
+            .budget_status(&scope)
+            .expect("alpha status")
+            .spent,
+        320,
+        "the previous model's ledger row is untouched"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p6() {
+    let mut c = continuation_task("compaction-p6");
+    let question = c.question.clone();
+    freeze_answered(
+        &mut c.world,
+        &c.session,
+        &c.task,
+        &question,
+        answer_custom(&format!("read {}", c.file.display())),
+    );
+    compact(&mut c);
+    // A pinned input moves between the compaction and the resume: the
+    // intent the checkpoint pinned is no longer the task's intent.
+    let snapshot = c.world.runtime.store().snapshot(&c.task).expect("snapshot");
+    c.world
+        .runtime
+        .store_writer()
+        .steer_task(
+            &c.session,
+            &c.task,
+            snapshot.intent_revision,
+            snapshot.revision,
+            "a different instruction",
+        )
+        .expect("steer");
+    let outcome = resume(&mut c);
+    let rivect::controller::ContinuationOutcome::Stale { pin } = &outcome else {
+        panic!("a mutated pin must report staleness, got {outcome:?}");
+    };
+    assert_eq!(*pin, "intent", "the refusal names the input that moved");
+    let summary = outcome.summary();
+    assert!(summary.contains("stale"), "{summary}");
+    assert!(
+        summary.contains("replay refused"),
+        "the continuation refuses to replay: {summary}"
+    );
+    assert_eq!(
+        c.world.worker_reads(),
+        0,
+        "a stale continuation performs no effect"
+    );
+    assert_eq!(
+        c.world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and dispatches nothing"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p7() {
+    // The effect runs before the compaction and the resume afterwards runs
+    // the task's own step, so the count below is checked after a real
+    // resume rather than after one that found nothing to do.
+    let mut c = continuation_task("compaction-p7");
+    let question = c.question.clone();
+    let answer = answer_custom(&format!("read {}", c.file.display()));
+    freeze_answered(&mut c.world, &c.session, &c.task, &question, answer.clone());
+    // The answered node stays queued: the one step driver performs the
+    // effect here, so the node the resume admits is still this task's.
+    let grant = c.world.runtime.scoped_grant.clone();
+    let step = c
+        .world
+        .runtime
+        .run_decision_step(&c.session, &c.task, &answer, &grant, false)
+        .expect("the answered step runs");
+    assert!(
+        matches!(step, rivect::controller::StepOutcome::Completed { .. }),
+        "the effect ran once before the compaction: {step:?}"
+    );
+    assert_eq!(recorded_effects(&c), 1, "one recorded read effect");
+    assert_eq!(c.world.worker_reads(), 1, "and one real worker read");
+    let dispatched = c
+        .world
+        .provider_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    compact(&mut c);
+    let resumed = resume(&mut c);
+    let rivect::controller::ContinuationOutcome::Resumed { snapshot, .. } = resumed else {
+        panic!("the resume runs this task's queued step, got {resumed:?}");
+    };
+    assert_eq!(
+        snapshot.lifecycle,
+        Lifecycle::Completed,
+        "the resumed step finds the work already done: {snapshot:?}"
+    );
+    assert_eq!(
+        recorded_effects(&c),
+        1,
+        "the recorded effect count stays exactly one across compaction and the resumed step"
+    );
+    assert_eq!(
+        c.world.worker_reads(),
+        1,
+        "the resumed step repeats no effect"
+    );
+    assert_eq!(
+        c.world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        dispatched,
+        "and dispatches no model call of its own"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p8() {
+    let mut c = continuation_task("compaction-p8");
+    let records = c
+        .world
+        .runtime
+        .store()
+        .evidence_for_task(&c.task)
+        .expect("records");
+    assert_eq!(
+        records.len(),
+        4,
+        "the fixture's recorded reads: {records:?}"
+    );
+    let target = records
+        .first()
+        .expect("a scoped record")
+        .evidence_id
+        .0
+        .clone();
+    // The one criterion the recorded read proved: the deletion below is
+    // about this row's support, not a count that could name either.
+    let supported_id = c
+        .world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .obligations
+        .items
+        .into_iter()
+        .find(|obligation| {
+            obligation.execution == rivect::contracts::ObligationExecution::Satisfied
+        })
+        .expect("the recorded read proves one criterion")
+        .id;
+    compact(&mut c);
+    let index = c
+        .world
+        .runtime
+        .store()
+        .scoped_index(&c.task)
+        .expect("derived index");
+    assert!(
+        index.iter().any(|record| record.evidence_id == target),
+        "the checkpoint recorded the scoped record: {index:?}"
+    );
+    assert!(
+        assembled(&c).text.contains(&target),
+        "and the continuation carries it before the deletion"
+    );
+    c.world
+        .runtime
+        .store_writer()
+        .delete_scoped_record(&c.task, &target)
+        .expect("delete the scoped record");
+    let remaining = c
+        .world
+        .runtime
+        .store()
+        .evidence_for_task(&c.task)
+        .expect("records");
+    assert!(
+        !remaining
+            .iter()
+            .any(|record| record.evidence_id.0 == target),
+        "the authoritative row is gone"
+    );
+    let index = c
+        .world
+        .runtime
+        .store()
+        .scoped_index(&c.task)
+        .expect("derived index");
+    assert!(
+        !index.iter().any(|record| record.evidence_id == target),
+        "a deleted scoped record is not served from the derived index: {index:?}"
+    );
+    let context = assembled(&c);
+    assert!(
+        !context.text.contains(&target),
+        "and the continuation does not return it: {context:?}"
+    );
+    // The obligation the record supported is still proven by the three rows
+    // that remain, so the deletion must not reopen it.
+    let supported = c
+        .world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .obligations
+        .items;
+    assert!(
+        supported.iter().any(|obligation| {
+            obligation.id == supported_id
+                && obligation.execution == rivect::contracts::ObligationExecution::Satisfied
+        }),
+        "three records still support the criterion the deletion touched: {supported:?}"
+    );
+    // Deleting the last supporting record reopens the obligation in the
+    // same transaction: a satisfied row without evidence would claim proof
+    // that is gone, and the continuation would report work already done.
+    for record in &records[1..] {
+        c.world
+            .runtime
+            .store_writer()
+            .delete_scoped_record(&c.task, &record.evidence_id.0)
+            .expect("delete the last supporting records");
+    }
+    let reopened = c
+        .world
+        .runtime
+        .store()
+        .snapshot(&c.task)
+        .expect("snapshot")
+        .obligations
+        .items;
+    assert!(
+        !reopened.iter().any(|obligation| {
+            obligation.id == supported_id
+                && obligation.execution == rivect::contracts::ObligationExecution::Satisfied
+        }),
+        "the criterion no record supports is reopened: {reopened:?}"
+    );
+    assert!(
+        c.world
+            .runtime
+            .store()
+            .evidence_for_task(&c.task)
+            .expect("records")
+            .is_empty(),
+        "every authoritative row is gone"
+    );
+    assert!(
+        c.world
+            .runtime
+            .store()
+            .scoped_index(&c.task)
+            .expect("derived index")
+            .is_empty(),
+        "and the derived index serves none of them"
+    );
+    let context = assembled(&c);
+    assert!(
+        !context.text.contains(&target),
+        "the continuation returns no deleted record: {context:?}"
+    );
+    assert!(
+        context.remainder.contains("outstanding: 2\n"),
+        "both criteria are outstanding again, so the reopened row is carried: {context:?}"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p9() {
+    let mut c = continuation_task("compaction-p9");
+    let target = c
+        .world
+        .runtime
+        .store()
+        .evidence_for_task(&c.task)
+        .expect("records")
+        .into_iter()
+        .next()
+        .expect("a scoped record");
+    c.world
+        .runtime
+        .store_writer()
+        .invalidate_evidence(&target.evidence_id.0)
+        .expect("invalidate");
+    compact(&mut c);
+    let index = c
+        .world
+        .runtime
+        .store()
+        .scoped_index(&c.task)
+        .expect("derived index");
+    let recorded = index
+        .iter()
+        .find(|record| record.evidence_id == target.evidence_id.0)
+        .expect("the record survives the compaction");
+    assert_eq!(
+        recorded.validity, "stale",
+        "the recorded validity travels with the record: {recorded:?}"
+    );
+    assert_eq!(recorded.digest, target.digest, "and so does its digest");
+    let context = assembled(&c);
+    assert!(
+        context
+            .evidence
+            .contains(&format!("{} stale {}", target.evidence_id.0, target.digest)),
+        "the continuation returns the evidence with its recorded validity: {context:?}"
+    );
+}
+
+#[test]
+fn forced_compaction_preserves_intent_answer_remainder_and_spend_p10() {
+    let mut c = continuation_task("compaction-p10");
+    let question = c.question.clone();
+    freeze_answered(
+        &mut c.world,
+        &c.session,
+        &c.task,
+        &question,
+        answer_custom(&format!("read {}", c.file.display())),
+    );
+    let step = c
+        .world
+        .runtime
+        .scheduler_step(&c.session)
+        .expect("the answered node runs");
+    assert!(
+        matches!(step, rivect::controller::SchedulerStep::Ran { .. }),
+        "{step:?}"
+    );
+    compact(&mut c);
+    let resumed = resume(&mut c);
+    assert!(
+        matches!(
+            resumed,
+            rivect::controller::ContinuationOutcome::NoContinuation
+        ),
+        "an empty result after resume is no continuation: {resumed:?}"
+    );
+    let summary = resumed.summary();
+    assert_eq!(summary, "no continuation", "the reported line");
+    assert!(
+        !summary.contains("nothing further is needed"),
+        "an empty step is not a verdict that nothing further is needed: {summary}"
+    );
+}

@@ -52,6 +52,53 @@ pub enum StepOutcome {
     },
 }
 
+/// What resuming one task's continuation did (AC-049). The four
+/// outcomes are the four honest answers of a resume: the remainder ran,
+/// nothing of this task remained, a pinned input moved so replay is
+/// refused, or the task never had a checkpoint to resume from. An empty
+/// step is never reported as a verdict that nothing further is needed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContinuationOutcome {
+    /// The step ran against the pinned state: the context the next
+    /// request carries is `context_bytes` long.
+    Resumed {
+        snapshot: Box<TaskSnapshot>,
+        context_bytes: usize,
+    },
+    /// Nothing of this task remained to run.
+    NoContinuation,
+    /// A pinned input moved between the compaction and this resume: the
+    /// recorded step is refused instead of replayed against stale state.
+    Stale { pin: String },
+}
+
+impl ContinuationOutcome {
+    /// The one lowercase line a surface shows for this outcome.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Resumed { context_bytes, .. } => {
+                format!("continuation resumed: {context_bytes} bytes of context")
+            }
+            Self::NoContinuation => "no continuation".to_string(),
+            Self::Stale { pin } => {
+                format!("continuation is stale: {pin} changed since the compaction; replay refused")
+            }
+        }
+    }
+}
+
+/// The snapshot one settled step reports, whichever outcome it reached.
+fn step_snapshot(outcome: &StepOutcome) -> TaskSnapshot {
+    match outcome {
+        StepOutcome::Completed { snapshot }
+        | StepOutcome::EffectDenied { snapshot, .. }
+        | StepOutcome::OutcomeUnknown { snapshot, .. }
+        | StepOutcome::Waiting { snapshot }
+        | StepOutcome::NoAction { snapshot } => snapshot.clone(),
+    }
+}
+
 /// A granted restore that ran through executor admission. The original
 /// check is returned so the caller reruns the same expectation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +384,47 @@ impl Runtime {
                 unreachable!("internal error: the dispatch only admits reads")
             }
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Resumes one task's continuation after a forced compaction
+    /// (AC-049): the checkpoint's pinned inputs are re-checked against
+    /// the live state first, so a moved input refuses the replay instead
+    /// of running a stale step, and the step itself is one scheduler step
+    /// — resuming is a decision, never a second loop. The assembled
+    /// context is read before the step because that is what the next
+    /// request carries; a compaction that changed nothing but a record
+    /// would leave it the same size.
+    pub fn resume_continuation(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<ContinuationOutcome, ControllerError> {
+        let Some(checkpoint) = self.owner.store.continuation_checkpoint(task_id)? else {
+            return Ok(ContinuationOutcome::NoContinuation);
+        };
+        let live = self.owner.store.pinned_inputs(task_id)?;
+        if let Some(pin) = checkpoint.stale_pin(&live) {
+            return Ok(ContinuationOutcome::Stale {
+                pin: pin.to_string(),
+            });
+        }
+        let context = self.owner.store.assembled_context(task_id)?;
+        let Some(node) = self.scheduler.node_of_task(task_id) else {
+            return Ok(ContinuationOutcome::NoContinuation);
+        };
+        match self.scheduler_step(session_id)? {
+            SchedulerStep::Ran { node: ran, outcome } if ran == node => {
+                Ok(ContinuationOutcome::Resumed {
+                    snapshot: Box::new(step_snapshot(&outcome)),
+                    context_bytes: context.text.len(),
+                })
+            }
+            // Another node took the slot, or the tree was already idle:
+            // this task's remainder is not what the step resumed.
+            SchedulerStep::Ran { .. } | SchedulerStep::Idle => {
+                Ok(ContinuationOutcome::NoContinuation)
+            }
         }
     }
 

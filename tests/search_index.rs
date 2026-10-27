@@ -965,8 +965,8 @@ fn inspect_system_leg_dispatches_through_action_registry() {
     };
 
     // Every kind the mechanical table knows is declared, in its fixed
-    // order, and a kind with no admitted backend is declared as the
-    // refusal that interface gives — never as satisfied.
+    // order, and every one of them names an admitted backend — none is
+    // declared as a refusal this build would give.
     let declared: Vec<QueryKind> = report.systems.iter().map(|system| system.kind).collect();
     assert_eq!(
         declared,
@@ -985,13 +985,11 @@ fn inspect_system_leg_dispatches_through_action_registry() {
         .iter()
         .find(|system| system.kind == QueryKind::Graph)
         .expect("every kind is reported");
-    assert_eq!(graph.backend, None);
+    assert_eq!(graph.backend, Some(SearchBackend::Graph));
     assert_eq!(
         graph.outcome,
-        rivect::actions::ProbeOutcome::Unanswered {
-            code: ErrorCode::CapabilityUnavailable,
-            cause: String::from("unsupported_kind"),
-        }
+        rivect::actions::ProbeOutcome::Answered,
+        "the graph leg rides the same worker the probe answered through: {graph:?}"
     );
 
     // Freshness is the stored generation's own state — the boundary never

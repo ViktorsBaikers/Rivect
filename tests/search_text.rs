@@ -448,13 +448,14 @@ fn unopenable_file_counts_as_partial_never_dropped() {
 #[test]
 fn backend_selection_is_mechanical_and_never_calls_llm() {
     // The dispatch table is fixed: each kind resolves to its admitted
-    // backend or stays an honest None — never a model's pick.
+    // backend — never a model's pick, and never an honest `None` left
+    // where a backend exists.
     assert_eq!(backend_for(QueryKind::Text), Some(SearchBackend::Text));
     assert_eq!(backend_for(QueryKind::Path), Some(SearchBackend::Path));
     assert_eq!(backend_for(QueryKind::Source), Some(SearchBackend::Source));
     assert_eq!(backend_for(QueryKind::Ast), Some(SearchBackend::Ast));
     assert_eq!(backend_for(QueryKind::Symbol), Some(SearchBackend::Symbol));
-    assert_eq!(backend_for(QueryKind::Graph), None);
+    assert_eq!(backend_for(QueryKind::Graph), Some(SearchBackend::Graph));
     // The recorded interface names classify exactly onto their kinds —
     // reference queries are the typed-symbol-index leg, not the impact
     // graph.
@@ -528,7 +529,7 @@ fn backend_selection_is_mechanical_and_never_calls_llm() {
 }
 
 #[test]
-fn symbol_names_dispatch_and_impact_stays_a_typed_refusal() {
+fn symbol_names_dispatch_and_impact_answers_through_the_graph_backend() {
     let corpus = search_corpus("unsupported");
     // `code.symbol`/`code.references` dispatch to the admitted typed
     // index — both route to one kind, and each name's op carries its
@@ -565,19 +566,48 @@ fn symbol_names_dispatch_and_impact_stays_a_typed_refusal() {
             .collect();
         assert_eq!(typed, vec![role; rows], "{name}");
     }
-    // The one unwired name left lands on its kind's stable refusal
-    // string — a swapped `as_str` mapping moves the pin.
+    // The one kind left joins the table now: `code.impact` answers with
+    // the derived graph instead of refusing. The corpus carries no package
+    // root, so the derivation places no relation row — the named document
+    // is still the walk's own node, and the answer discloses exactly that
+    // rather than refusing the surface.
     assert_eq!(
         QueryKind::from_name("code.impact").expect("recorded name"),
         QueryKind::Graph
     );
-    let err = query(&search_query(QueryKind::Graph, &corpus.path, "anything"))
-        .expect_err("a kind without an admitted backend refuses");
-    let ContextError::UnsupportedKind { kind: reported } = &err else {
-        panic!("code.impact refused typed, got {err:?}");
-    };
-    assert_eq!(*reported, "code.impact");
-    assert_eq!(err.error_code(), ErrorCode::CapabilityUnavailable);
+    let answered = query(&search_query(QueryKind::Graph, &corpus.path, "src/lib.rs"))
+        .expect("a kind with an admitted backend answers");
+    assert_eq!(answered.backend, SearchBackend::Graph);
+    assert_eq!(answered.backend.engine(), "ignore+derive_edges");
+    assert!(answered.matches.is_empty(), "an impact row is not a match");
+    let impact = answered
+        .impact
+        .as_ref()
+        .expect("the graph leg answers with the traversal it ran");
+    assert_eq!(
+        impact
+            .nodes
+            .iter()
+            .map(|node| node.document.path.as_path())
+            .collect::<Vec<_>>(),
+        vec![Path::new("src/lib.rs")],
+        "the named document is the walk's own node: {impact:?}"
+    );
+    assert!(
+        impact.edges.is_empty(),
+        "no package root means no relation row was placed: {impact:?}"
+    );
+    assert!(answered.unresolved.is_empty(), "{answered:?}");
+    // A path that resolves outside the root is a boundary denial, exactly
+    // as the source leg denies it — the graph leg walks no document the
+    // caller could not name.
+    let err = query(&search_query(QueryKind::Graph, &corpus.path, ".."))
+        .expect_err("a path outside the root is denied at the boundary");
+    assert!(
+        matches!(err, ContextError::EscapedRoot { .. }),
+        "the graph leg keeps the root boundary: {err:?}"
+    );
+    assert_eq!(err.error_code(), ErrorCode::Denied);
     // An unknown interface name is a caller error, not a best guess.
     let err = QueryKind::from_name("search.magic").expect_err("unknown names refuse");
     assert_eq!(err.error_code(), ErrorCode::InvalidInput);
@@ -729,11 +759,12 @@ fn inspect_system_leg_dispatches_through_action_registry() {
         IndexFreshness::Live,
         "no generation was ever cut"
     );
-    for system in report
-        .systems
-        .iter()
-        .filter(|system| matches!(system.kind, QueryKind::Ast | QueryKind::Symbol))
-    {
+    for system in report.systems.iter().filter(|system| {
+        matches!(
+            system.kind,
+            QueryKind::Ast | QueryKind::Symbol | QueryKind::Graph
+        )
+    }) {
         assert_eq!(
             system.outcome,
             ProbeOutcome::Unanswered {
@@ -743,19 +774,20 @@ fn inspect_system_leg_dispatches_through_action_registry() {
             "a parse leg the worker could not run is named, not served: {system:?}"
         );
     }
-    // A kind with no admitted backend is reported with the refusal that
-    // interface gives, whatever the probe did.
+    // The graph leg declares its own backend now: the boundary reports the
+    // surface as admitted and never as the "no backend" row that belonged
+    // to a refused kind.
     let graph = report
         .systems
         .iter()
         .find(|system| system.kind == QueryKind::Graph)
         .expect("every kind is reported");
-    assert_eq!(graph.backend, None);
+    assert_eq!(graph.backend, Some(SearchBackend::Graph));
     assert_eq!(
         graph.outcome,
         ProbeOutcome::Unanswered {
             code: ErrorCode::CapabilityUnavailable,
-            cause: String::from("unsupported_kind"),
+            cause: String::from("helper_unavailable"),
         }
     );
 
@@ -773,11 +805,12 @@ fn inspect_system_leg_dispatches_through_action_registry() {
     else {
         panic!("inspect_system answers its own report");
     };
-    for system in report
-        .systems
-        .iter()
-        .filter(|system| matches!(system.kind, QueryKind::Ast | QueryKind::Symbol))
-    {
+    for system in report.systems.iter().filter(|system| {
+        matches!(
+            system.kind,
+            QueryKind::Ast | QueryKind::Symbol | QueryKind::Graph
+        )
+    }) {
         assert_eq!(
             system.outcome,
             ProbeOutcome::Answered,
@@ -815,6 +848,7 @@ fn no_external_rg_or_fd_invoked() {
         (QueryKind::Text, "shared_marker", SearchBackend::Text),
         (QueryKind::Path, "*.rs", SearchBackend::Path),
         (QueryKind::Source, "src/lib.rs", SearchBackend::Source),
+        (QueryKind::Graph, "src/lib.rs", SearchBackend::Graph),
     ] {
         let result = query(&search_query(kind, &corpus.path, pattern)).expect("query resolves");
         assert_eq!(result.backend, backend);
@@ -826,6 +860,7 @@ fn no_external_rg_or_fd_invoked() {
                 SearchBackend::Source => "std::fs",
                 SearchBackend::Ast => "tree-sitter+ast-grep-core",
                 SearchBackend::Symbol => "tree-sitter+lsp-types",
+                SearchBackend::Graph => "ignore+derive_edges",
             },
             "provenance names the in-process engine, never a subprocess"
         );
