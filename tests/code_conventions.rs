@@ -31,6 +31,7 @@ const PROCESS_BOUNDARY: &[&str] = &[
     "executor.rs",
     "executor/linux.rs",
     "executor/macos.rs",
+    "mcp.rs",
     "tools.rs",
 ];
 
@@ -360,6 +361,26 @@ fn ui_production_scan_includes_run_tui() {
     );
 }
 
+/// AC-076: the entry hand is the only way a working directory enters the
+/// runtime, and it is what makes instruction discovery reachable at all — a
+/// run handed no root discovers nothing. Both product entries make that hand
+/// with the directory they were started in; an entry that stops passing one
+/// leaves discovery unreachable again. The scan is whitespace-free, so a
+/// rustfmt wrap of the call is not a false failure.
+#[test]
+fn both_entries_hand_a_root_p9() {
+    for entry in ["main.rs", "ui.rs"] {
+        let source = fs::read_to_string(source_root().join(entry)).expect("read entry source");
+        let production: String = production_lines(&source)
+            .flat_map(|(_, line)| line.split_whitespace())
+            .collect();
+        assert!(
+            production.contains("set_instructions_root(std::env::current_dir().ok())"),
+            "{entry} must hand its working directory to the runtime"
+        );
+    }
+}
+
 #[test]
 fn no_panic_family_in_src() {
     let mut violations = Vec::new();
@@ -580,6 +601,13 @@ const TRACKED_SPAWNS: &[(&str, &str)] = &[
         "main.rs",
         "main.rs::run_headless — the headless stdin reader; the handle is \
          joined by `run_headless` before it returns",
+    ),
+    (
+        "mcp.rs",
+        "mcp.rs::Session::open — the stdio reader thread of one mcp session; the \
+         handle lives in `Session::reader` and `Session::shutdown` (also from \
+         `Drop for Session`) signals it to stop and joins it, so a peer that \
+         keeps its pipe open cannot leave the thread behind",
     ),
 ];
 
@@ -1449,5 +1477,86 @@ fn registry_poison_is_never_cleared() {
     assert_eq!(
         clear_poison_lines("fn f() {\n    REGISTRY.clear_poison();\n}\n"),
         [2]
+    );
+}
+
+/// The files that own the MCP one-shot artifact (standards §15): the module
+/// that opens and appends it, and the dispatcher that names the destination it
+/// is admitted against. Evidence a terminal path can delete or rewrite proves
+/// nothing, so neither file may hold a removal or a truncating write — the
+/// artifact is only ever opened to append. The behavioural half of the claim
+/// (the artifact resolves under the operator's data root, outside every
+/// disposable child tree) is asserted in `tests/mcp.rs`.
+const MCP_EVIDENCE_OWNERS: &[&str] = &["mcp.rs", "commands.rs"];
+
+/// Deletion of a path, whatever it names. Longer spellings first, so a line is
+/// reported once, by the most specific call it makes.
+const REMOVAL_FAMILY: &[&str] = &["remove_dir_all", "remove_file", "remove_dir"];
+
+/// A write that discards what is already there.
+const TRUNCATING_FAMILY: &[&str] = &["truncate(true)", "set_len(", "File::create(", "fs::write("];
+
+/// Every production line of `source` naming one of `needles`, once per line.
+fn forbidden_lines(source: &str, needles: &[&'static str]) -> Vec<(usize, &'static str)> {
+    let mut found = Vec::new();
+    for (line_no, line) in production_lines(source) {
+        if let Some(needle) = needles.iter().find(|needle| line.contains(*needle)) {
+            found.push((line_no, *needle));
+        }
+    }
+    found
+}
+
+#[test]
+fn mcp_evidence_is_never_deleted_or_overwritten() {
+    let root = source_root();
+    let mut violations = Vec::new();
+    for owner in MCP_EVIDENCE_OWNERS {
+        let path = root.join(owner);
+        let source = fs::read_to_string(&path).expect("read an mcp evidence owner");
+        for (line_no, needle) in forbidden_lines(&source, REMOVAL_FAMILY) {
+            violations.push(format!("{owner}:{line_no}: `{needle}`"));
+        }
+        for (line_no, needle) in forbidden_lines(&source, TRUNCATING_FAMILY) {
+            violations.push(format!("{owner}:{line_no}: `{needle}`"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "the retained mcp artifact is never deleted or overwritten (one-shot contract §15):\n{}",
+        violations.join("\n")
+    );
+    // Only the artifact's owner resolves a path into the directory it is
+    // retained in, so no other module can address the evidence by name.
+    let mut spelling = Vec::new();
+    for (file, rel) in source_files() {
+        let source = fs::read_to_string(&file).expect("read source file");
+        if production_lines(&source).any(|(_, line)| line.contains("MCP_REPORTS_DIR")) {
+            spelling.push(rel.display().to_string());
+        }
+    }
+    assert_eq!(
+        spelling,
+        ["mcp.rs"],
+        "the reports directory is spelled only by the module that appends to it"
+    );
+    // The scan can disagree: it reads the shapes it forbids.
+    let removal = "fn cleanup(root: &Path) {\n    drop(std::fs::remove_dir_all(root));\n}\n";
+    assert_eq!(
+        forbidden_lines(removal, REMOVAL_FAMILY),
+        [(2, "remove_dir_all")],
+        "the ratchet reads a removal path"
+    );
+    let rewrite = "fn reopen(path: &Path) {\n    File::create(path).expect(\"reopen\");\n}\n";
+    assert_eq!(
+        forbidden_lines(rewrite, TRUNCATING_FAMILY),
+        [(2, "File::create(")],
+        "the ratchet reads a truncating write"
+    );
+    // A skipped test item is not production: a fixture may remove its own root.
+    let fixture = "#[cfg(test)]\nmod tests {\n    fn write() {\n        std::fs::remove_file(\"/tmp/x\");\n    }\n}\n";
+    assert!(
+        forbidden_lines(fixture, REMOVAL_FAMILY).is_empty(),
+        "test fixtures are outside the production scan"
     );
 }

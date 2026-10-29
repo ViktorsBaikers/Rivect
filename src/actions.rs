@@ -39,6 +39,7 @@ use crate::contracts::{
 };
 use crate::index::SearchBackend;
 use crate::index::{Completeness, GenerationState, MatchKind, PartialReason, QueryResult};
+use crate::learning::{ConditionFacts, LearningDefinition, PredicateEffect};
 use crate::lsp::SymbolOp;
 use crate::model::{Broker, CallContract, ModelError};
 use crate::providers::ProviderReply;
@@ -1116,7 +1117,8 @@ impl ActionRegistry {
         shortlist: &[&str],
         ctx: &mut ActionContext<'_>,
     ) -> Result<Selection, ActionError> {
-        let needs = needs(request);
+        let learned = ctx.store.learning_definition()?;
+        let needs = needs(request, &learned);
         let obligations: Vec<SelectedObligation> = needs
             .iter()
             .filter_map(|&(capability, need, equivalent)| {
@@ -1521,7 +1523,16 @@ enum Need {
 
 /// Every capability the selection weighs, with its need and allowed
 /// equivalent: the plan stages first, then the checks.
-fn needs(request: &PlanRequest) -> Vec<(&'static str, Need, Option<&'static str>)> {
+///
+/// A learned applicability condition is evaluated here (INV-009): it can open
+/// a capability the request facts alone declined, or decline one they required
+/// — a decided need, never an unresolved one — and nothing else about the row
+/// moves: the catalog definition stays `&'static` and the route decision below
+/// is unchanged.
+fn needs(
+    request: &PlanRequest,
+    learned: &LearningDefinition,
+) -> Vec<(&'static str, Need, Option<&'static str>)> {
     let decided = request.surfaces.decided();
     let approved = request.contract == ContractBasis::Approved;
     let risky = decided.map(|surfaces| surfaces.iter().any(|surface| surface.is_risk()));
@@ -1567,7 +1578,7 @@ fn needs(request: &PlanRequest) -> Vec<(&'static str, Need, Option<&'static str>
     // Readiness of a plan artifact is exactly what the plan assessment
     // checks; readiness of code or a report is not.
     let readiness_equivalent = (kind == RequestKind::PlanOnly).then_some(ASSESS_PLAN);
-    vec![
+    let mut rows = vec![
         (FRAME_GOAL, frame, None),
         (CHALLENGE_DIRECTION, risk, None),
         (DESIGN_CONTRACTS, risk, None),
@@ -1581,7 +1592,56 @@ fn needs(request: &PlanRequest) -> Vec<(&'static str, Need, Option<&'static str>
         (REVIEW_CHANGE, when(kind == RequestKind::Audit), None),
         (DIAGNOSE_ISSUE, when(kind == RequestKind::Diagnose), None),
         (ASSESS_READINESS, Need::Required, readiness_equivalent),
-    ]
+    ];
+    let facts = ConditionFacts::for_selection(kind, decided.cloned());
+    for (capability, need, _) in &mut rows {
+        // Only a decided need is overridable: an undecided capability keeps its
+        // unresolved row, so no learned condition — least of all a `Decline` —
+        // closes an obligation on a fact the request has not decided (INV-009,
+        // AGENTS §11A: an unknown guard never closes an obligation).
+        if *need == Need::Unresolved {
+            continue;
+        }
+        match learned.applicability(capability, &facts) {
+            Some(PredicateEffect::Require) => *need = Need::Required,
+            Some(PredicateEffect::Decline) => *need = Need::Skip(SkipReason::NotNeeded),
+            None => {}
+        }
+    }
+    debug_assert_eq!(
+        rows.iter()
+            .map(|(capability, ..)| *capability)
+            .collect::<Vec<_>>(),
+        SELECTION_CAPABILITIES.to_vec(),
+        "the weighed rows are exactly the declared capabilities, in order"
+    );
+    rows
+}
+
+/// Every capability the selection weighs, in selection order. A learned
+/// applicability condition names one of these: the selection is the only code
+/// that evaluates a learned condition, so a condition on any other id would be
+/// a silent no-op and is refused at ingest instead.
+const SELECTION_CAPABILITIES: [&str; 13] = [
+    FRAME_GOAL,
+    CHALLENGE_DIRECTION,
+    DESIGN_CONTRACTS,
+    PLAN_WORK,
+    ASSESS_PLAN,
+    INSPECT_SYSTEM,
+    ASSESS_SECURITY,
+    AUDIT_TESTS,
+    IMPLEMENT_CHANGE,
+    DELIVER_CHANGE,
+    REVIEW_CHANGE,
+    DIAGNOSE_ISSUE,
+    ASSESS_READINESS,
+];
+
+/// Whether the selection weighs `capability` at all.
+#[must_use]
+pub fn weighed_capability(capability: &str) -> bool {
+    SELECTION_CAPABILITIES.contains(&capability)
 }
 
 /// The row a selected obligation records: its phase, its handler and —
@@ -1675,7 +1735,10 @@ fn row_state(
         .find(|row| row.capability == capability);
     Ok(match row {
         None => RowState::Absent(
-            match needs(request).iter().find(|(id, ..)| *id == capability) {
+            match needs(request, &ctx.store.learning_definition()?)
+                .iter()
+                .find(|(id, ..)| *id == capability)
+            {
                 Some((_, Need::Skip(reason), _)) => *reason,
                 _ => SkipReason::NotNeeded,
             },
@@ -2195,6 +2258,22 @@ struct ForkOption {
 const CHALLENGE_INSTRUCTIONS: &str = "You are the Rivect challenge_direction purpose. From the task, its criteria and its selected surfaces in the inputs, reply with exactly one JSON object {\"risks\":[{\"surface\":<selected surface>,\"text\":<risk>}]} naming every selected risky surface. A material choice the user must make adds \"fork\":{\"prompt\",\"options\":[five {\"id\",\"label\",\"consequences\",\"disabled_reason\"?}],\"recommended\",\"basis\"}. No other field and no tool call.";
 const DESIGN_INSTRUCTIONS: &str = "You are the Rivect design_contracts purpose. From the task, its criteria and its selected surfaces in the inputs, reply with exactly one JSON object {\"contracts\":[{\"surface\":<selected surface>,\"text\":<boundary contract>}]} covering every selected risky surface. A material choice the user must make adds \"fork\":{\"prompt\",\"options\":[five {\"id\",\"label\",\"consequences\",\"disabled_reason\"?}],\"recommended\",\"basis\"}. An applied fork answer arrives as fork_answer. No other field and no tool call.";
 const ASSESS_INSTRUCTIONS: &str = "You are the Rivect assess_plan purpose. Judge the stored plan revision in the inputs for feasibility, test design and risk against the task criteria and reply with exactly one JSON object {\"verdict\":\"pass\"|\"fail\",\"findings\":[<text>]}. No other field and no tool call.";
+
+/// The longest instruction base the semantic stages hand the assembled part:
+/// the base [`CallContract`] carries for `challenge_direction` or
+/// `design_contracts`. The composed-size bound is certified beside the longest
+/// base the assembly sites assemble onto, so a definition an activation accepts
+/// fits the stage request that ships (AC-051).
+pub(crate) const LONGEST_STAGE_INSTRUCTIONS: &str = {
+    let mut longest = CHALLENGE_INSTRUCTIONS;
+    if DESIGN_INSTRUCTIONS.len() > longest.len() {
+        longest = DESIGN_INSTRUCTIONS;
+    }
+    if ASSESS_INSTRUCTIONS.len() > longest.len() {
+        longest = ASSESS_INSTRUCTIONS;
+    }
+    longest
+};
 
 /// The plan row a semantic stage's fork waits on, bound to the selection
 /// the stage ran on.

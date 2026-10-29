@@ -15,21 +15,23 @@ use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, canonical_egress_target,
     preapproval_scope,
 };
-use crate::resources::{ReadFlightKey, ReadFlights, ReadRights, SnapshotBinding};
+use crate::resources::{
+    ReadFlightKey, ReadFlights, ReadRights, ResourceError, ResourceHolder, SnapshotBinding,
+    capability_generations,
+};
 use crate::state::{StoreError, TaskStore};
 use sha2::Digest as _;
 use std::convert::Infallible;
 use std::fs::{File, Metadata};
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
-#[cfg(any(test, target_os = "macos"))]
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 #[cfg(any(test, target_os = "macos"))]
-use std::process::{Child, ChildStderr, ChildStdout};
-use std::process::{ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 pub use macos::{
@@ -236,6 +238,15 @@ fn owned_observation(boundary: &'static str, source: std::io::Error) -> WorkerEr
     owned_error(OwnedLaunchError::Observation { boundary, source })
 }
 
+/// The refusal for a capability transition the launch cannot complete: no
+/// child starts under a generation that never became current (AC-015).
+fn capability_error(boundary: &'static str, source: ResourceError) -> WorkerError {
+    WorkerError::OwnedPreparation {
+        boundary,
+        source: std::io::Error::other(source),
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the five grace predicate facts are one reviewed launch state"
@@ -283,6 +294,21 @@ fn owned_helper_fault(
         secondary,
         source,
     })
+}
+
+/// The executor name every launch registers its capability generation under.
+pub const LAUNCH_EXECUTOR: &str = "rivect-executor";
+
+/// The one-segment resource scope every launch's generation root is named by:
+/// one unpredictable name per process, so a root a dead process left behind
+/// can never refuse a launch here, and a number is never reissued.
+static LAUNCH_RESOURCE_SCOPE: LazyLock<String> =
+    LazyLock::new(|| format!("rivect-launch-{}", TaskId::generate().0));
+
+/// The resource scope this process's launches acquire their generations under.
+#[must_use]
+pub fn launch_resource_scope() -> &'static str {
+    &LAUNCH_RESOURCE_SCOPE
 }
 
 /// A payload and its native artifacts, consumed by exactly one bounded run.
@@ -344,6 +370,44 @@ pub struct PreparedLaunch {
     filters: Vec<usize>,
     deadline: Instant,
     profile: rivect_sandbox_helper::OwnedProfile,
+    capability: Option<CapabilityHold>,
+}
+
+/// One launch's capability generation: prepared before the launch creates its
+/// first owned artifact and published once its child starts.
+///
+/// Publishing empties the hold. Every other end of the launch — a refused
+/// prepare, a failed artifact, a spawn that never happened — releases the
+/// generation through the process-wide registry, so such a launch publishes
+/// nothing and leaves no owned root behind (AC-015).
+#[derive(Debug)]
+struct CapabilityHold {
+    prepared: Option<ResourceHolder>,
+}
+
+impl CapabilityHold {
+    /// Publishes the held generation now that the child started. A generation
+    /// a newer launch already published is not this child's to replace: the
+    /// registry keeps that registration current and the refused draft releases
+    /// the roots it acquired.
+    fn publish(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        capability_generations().publish_started(prepared);
+    }
+}
+
+impl Drop for CapabilityHold {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        // The launch never published: the registry retires the number and
+        // releases every root the prepare acquired. A release it could not
+        // prove is not reportable from a drop — the launch has already ended.
+        let _ = capability_generations().abandon(prepared);
+    }
 }
 
 impl PreparedLaunch {
@@ -372,6 +436,40 @@ impl PreparedLaunch {
             filters: Vec::new(),
             deadline: Instant::now() + duration,
             profile,
+            capability: None,
+        }
+    }
+
+    /// Prepares this launch's capability generation through the process-wide
+    /// registry, before the launch acquires its first owned artifact. A launch
+    /// that already prepared one keeps it, so one launch publishes exactly one
+    /// generation.
+    ///
+    /// # Errors
+    /// Returns [`WorkerError::OwnedPreparation`] when the generation root
+    /// cannot be acquired; the launch then starts no child.
+    fn prepare_capability(&mut self) -> Result<(), WorkerError> {
+        if self.capability.is_some() {
+            return Ok(());
+        }
+        let prepared = capability_generations()
+            .prepare(
+                &std::env::temp_dir(),
+                LAUNCH_EXECUTOR,
+                launch_resource_scope(),
+                &[],
+            )
+            .map_err(|error| capability_error("capability.prepare", error))?;
+        self.capability = Some(CapabilityHold {
+            prepared: Some(prepared),
+        });
+        Ok(())
+    }
+
+    /// Publishes this launch's prepared generation now that its child started.
+    fn publish_capability(&mut self) {
+        if let Some(hold) = self.capability.as_mut() {
+            hold.publish();
         }
     }
 
@@ -499,20 +597,26 @@ impl PreparedLaunch {
         if let Some(value) = self.stderr.take() {
             self.payload.stderr(value);
         }
-        self.payload
+        let child = self
+            .payload
             .spawn()
-            .map_err(|source| spawn_failed(&self.payload, source))
+            .map_err(|source| spawn_failed(&self.payload, source))?;
+        // The child is running: the generation this launch prepared becomes the
+        // published one, and a refused spawn never reaches here.
+        self.publish_capability();
+        Ok(child)
     }
 
     #[cfg(target_os = "macos")]
     fn run_owned<S>(
-        self,
+        mut self,
         payload: &[u8],
         _cancel: Option<&dyn Fn() -> bool>,
         mut bounds: ObserveBounds<impl FnMut(usize) -> Option<S>>,
         _stop_kind: &dyn Fn(&S) -> rivect_sandbox_helper::OwnedStop,
     ) -> Result<OwnedObserve<S>, WorkerError> {
         bounds.deadline = bounds.deadline.min(self.deadline);
+        self.prepare_capability()?;
         let mut child = self.spawn_legacy()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -556,6 +660,9 @@ impl PreparedLaunch {
             .map_err(|source| WorkerError::OwnedParent { source })
         };
         protect()?;
+        // The generation is prepared before the first owned artifact, under the
+        // parent protection the artifacts themselves need.
+        self.prepare_capability()?;
         // Deferred native allocation sees the original cancellation and deadline.
         let mut args: Vec<std::ffi::OsString> = self
             .payload
@@ -680,6 +787,9 @@ impl PreparedLaunch {
                 return Err(parent_spawn_error(source));
             }
         };
+        // The child is running: the generation this launch prepared becomes the
+        // published one, and a launch that never reached here published nothing.
+        self.publish_capability();
         // Acquisition precedes every potentially blocking startup observation.
         let pidfd = rivect_sandbox_helper::owned_waiter_pidfd(child.id());
         let mut primary = None;
@@ -1226,6 +1336,302 @@ impl EffectRequest {
             Self::Egress { url, .. } => PathBuf::from(url),
         }
     }
+
+    /// The one path field this class carries — the argument the
+    /// `effect.request` hook may rewrite (I6). Egress names a URL rather
+    /// than a path, so it carries none and no hook rewrites it.
+    fn path_field(&mut self) -> Option<&mut PathBuf> {
+        match self {
+            Self::Read { path, .. } | Self::Write { path, .. } => Some(path),
+            Self::Exec { program, .. } => Some(program),
+            Self::Egress { .. } => None,
+        }
+    }
+}
+
+/// The hook caps (AC-076, I6): one bounded run, one bounded answer, and no
+/// recursion — an answer is never fed back into another hook.
+pub const HOOK_TIMEOUT_MS: u64 = 200;
+pub const HOOK_STDOUT_MAX_BYTES: usize = 64 * 1024;
+pub const HOOK_MAX_DEPTH: usize = 1;
+
+/// The environment a hook inherits: the minimum a program needs to run.
+/// Credentials, provider keys and the assistant's own session state stay
+/// out of a user program's environment (AGENTS §11G).
+const HOOK_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME"];
+
+/// What one answer's `decision` may say (I6). `deny` and `stop` both refuse
+/// the request — one hook run has nothing further to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookDecision {
+    Allow,
+    Deny,
+    Stop,
+}
+
+impl HookDecision {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// The answer one hook returned: its decision and, when it rewrote them, the
+/// request's arguments. Data only — admission re-reads the rewritten path at
+/// the same site before any effect happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookAnswer {
+    decision: HookDecision,
+    path: Option<PathBuf>,
+}
+
+/// Failures of one bounded hook run. Every arm is a refusal of the request
+/// the hook was asked about: a hook that cannot answer opaquely cannot be
+/// taken as consent.
+#[derive(Debug, thiserror::Error)]
+pub enum HookError {
+    #[error("hook {hook} could not start: {source}")]
+    Spawn {
+        hook: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("hook {hook} could not be observed: {source}")]
+    Observe {
+        hook: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("hook {hook} did not answer within {millis} ms")]
+    TimedOut { hook: String, millis: u64 },
+    #[error("hook {hook} answered more than {limit} bytes")]
+    OutputTooLarge { hook: String, limit: usize },
+    #[error("hook {hook} answered malformed json: {detail}")]
+    Malformed { hook: String, detail: String },
+    #[error("hook {hook} answered an unknown decision {decision}")]
+    UnknownDecision { hook: String, decision: String },
+}
+
+impl HookError {
+    /// The wire code this failure reports (P-001): a program that cannot
+    /// run or cannot answer in time is a capability failure, while a
+    /// well-formed run that answers outside the contract is a denial.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Spawn { .. } | Self::Observe { .. } | Self::TimedOut { .. } => {
+                ErrorCode::CapabilityUnavailable
+            }
+            Self::OutputTooLarge { .. } | Self::Malformed { .. } | Self::UnknownDecision { .. } => {
+                ErrorCode::Denied
+            }
+        }
+    }
+}
+
+/// The admitted request as the hook left it: which hook answered, the path it
+/// saw, and the path it returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookRewrite {
+    hook: String,
+    original: PathBuf,
+    transformed: PathBuf,
+}
+
+/// Runs one declared hook over one request path and reads its answer: a
+/// separate process, a cleared environment plus an explicit allowlist, the
+/// program kept apart from its arguments, one bounded stdout read, and one
+/// wall deadline. The request goes to stdin as `{event, scope, args:{path}}`;
+/// the answer comes back as `{decision, args:{path}}`.
+fn run_hook(entry: &crate::config::HookEntry, path: &Path) -> Result<HookAnswer, HookError> {
+    let hook = entry.id();
+    let payload = serde_json::json!({
+        "event": entry.event,
+        "scope": entry.scope,
+        "args": { "path": path.to_string_lossy() },
+    })
+    .to_string()
+    .into_bytes();
+    let mut command = Command::new(&entry.command);
+    command
+        .args(&entry.args)
+        .env_clear()
+        // Its own process group, like every confined child: [`end_hook`]
+        // kills the group, so a forked descendant does not outlive the run.
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for name in HOOK_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command.spawn().map_err(|source| HookError::Spawn {
+        hook: hook.clone(),
+        source,
+    })?;
+    let answer = exchange_with_hook(&mut child, &payload, &hook);
+    end_hook(&mut child);
+    answer
+}
+
+/// The one exchange with a started hook: the payload, the deadline, and the
+/// capped answer. The request is a few hundred bytes — far below a pipe's
+/// capacity — so writing it before the first read cannot deadlock, and the
+/// deadline bounds a program that never reads it. The answer is read under
+/// that same deadline: a descendant that keeps the write end open is a run
+/// past its bound, never a read the parent waits out.
+fn exchange_with_hook(
+    child: &mut Child,
+    payload: &[u8],
+    hook: &str,
+) -> Result<HookAnswer, HookError> {
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(source) = stdin.write_all(payload)
+    {
+        return Err(HookError::Observe {
+            hook: hook.to_string(),
+            source,
+        });
+    }
+    let mut pipe = child.stdout.take();
+    if let Some(stdout) = pipe.as_ref() {
+        rivect_sandbox_helper::set_nonblocking(stdout.as_fd()).map_err(|source| {
+            HookError::Observe {
+                hook: hook.to_string(),
+                source,
+            }
+        })?;
+    }
+    let deadline = Instant::now() + Duration::from_millis(HOOK_TIMEOUT_MS);
+    let mut raw = Vec::new();
+    let mut scratch = [0u8; 8192];
+    let mut exited = false;
+    loop {
+        if let Some(stdout) = pipe.as_mut() {
+            // Never one byte past the cap: the refusal below is the cap's
+            // verdict, not the buffer's.
+            let room = (HOOK_STDOUT_MAX_BYTES + 1 - raw.len()).min(scratch.len());
+            match stdout.read(&mut scratch[..room]) {
+                Ok(0) => pipe = None,
+                Ok(read) => raw.extend_from_slice(&scratch[..read]),
+                Err(source)
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+                        || source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) => {
+                    return Err(HookError::Observe {
+                        hook: hook.to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        if raw.len() > HOOK_STDOUT_MAX_BYTES {
+            return Err(HookError::OutputTooLarge {
+                hook: hook.to_string(),
+                limit: HOOK_STDOUT_MAX_BYTES,
+            });
+        }
+        if !exited {
+            match child.try_wait() {
+                Ok(Some(_)) => exited = true,
+                Ok(None) => {}
+                Err(source) => {
+                    return Err(HookError::Observe {
+                        hook: hook.to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        // The run is over only when the program exited and its answer pipe
+        // reached EOF; either half alone is what a descendant can fake.
+        if exited && pipe.is_none() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            // [`run_hook`] ends the run after this returns, so the process
+            // group is killed and reaped before the refusal is reported:
+            // `Child::drop` does neither.
+            return Err(HookError::TimedOut {
+                hook: hook.to_string(),
+                millis: HOOK_TIMEOUT_MS,
+            });
+        }
+        // The idle wait the confined pipeline already uses, on the pipes that
+        // can still move: the wait itself is the park, so no thread and no
+        // spin. A drained pipe is already `None`.
+        let readable: Vec<BorrowedFd<'_>> = pipe.as_ref().map(AsFd::as_fd).into_iter().collect();
+        if let Err(source) = rivect_sandbox_helper::wait_ready(
+            &readable,
+            &[],
+            OBSERVE_POLL_SLICE.min(deadline - now),
+        ) {
+            return Err(HookError::Observe {
+                hook: hook.to_string(),
+                source,
+            });
+        }
+    }
+    parse_hook_answer(hook, &raw)
+}
+
+/// The answer one hook's stdout carries, read as data: the contract's two
+/// fields are read, everything else the program printed is ignored, so no
+/// returned text ever becomes authority.
+fn parse_hook_answer(hook: &str, raw: &[u8]) -> Result<HookAnswer, HookError> {
+    let text = std::str::from_utf8(raw).map_err(|source| HookError::Malformed {
+        hook: hook.to_string(),
+        detail: source.to_string(),
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|source| HookError::Malformed {
+            hook: hook.to_string(),
+            detail: source.to_string(),
+        })?;
+    let Some(decision) = value.get("decision").and_then(serde_json::Value::as_str) else {
+        return Err(HookError::Malformed {
+            hook: hook.to_string(),
+            detail: "missing decision".to_string(),
+        });
+    };
+    let decision = HookDecision::parse(decision).ok_or_else(|| HookError::UnknownDecision {
+        hook: hook.to_string(),
+        decision: decision.to_string(),
+    })?;
+    let path = value
+        .get("args")
+        .and_then(|args| args.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    Ok(HookAnswer { decision, path })
+}
+
+/// Ends one hook run: `Child::drop` neither kills nor reaps, so a program
+/// past its bound or past a failed exchange would still be running when the
+/// caller hears about the failure. The hook is spawned as its own process
+/// group's leader, so the group kill reaches a forked descendant that
+/// `Child::kill` cannot. A kill or wait error means the process is already
+/// gone, and the caller already reports the cause that ended the run — the
+/// same choice [`terminate_confined_child`] records.
+fn end_hook(child: &mut Child) {
+    drop(rivect_sandbox_helper::kill_process_group(child.id()));
+    drop(child.kill());
+    drop(child.wait());
 }
 
 /// Ledger/UI spelling of an egress URL: userinfo and query are stripped so
@@ -1332,8 +1738,32 @@ pub enum ExecutorError {
     ModeDenied,
     #[error("effect denied: {}", readonly_rejection(*class))]
     Readonly { class: EffectClass },
+    /// A run hook could not answer: its program failed to start, overran its
+    /// bound, or answered outside the contract. The request is refused,
+    /// never taken as if the hook had allowed it.
+    #[error("effect denied: {0}")]
+    Hook(#[from] HookError),
+    /// The hook itself refused the request: `deny` and `stop` both end it
+    /// before any admission is planned.
+    #[error("effect denied: hook {hook} answered {decision}")]
+    HookDenied {
+        hook: String,
+        decision: &'static str,
+    },
+    /// The hook rewrote the request's arguments and the admission of the
+    /// rewritten request refused it: the re-check runs at the same site the
+    /// hook fired before, so a permitted path cannot be steered into a
+    /// denied one.
+    #[error("effect denied: hook {hook} rewrote {original} to {transformed}")]
+    HookTransform {
+        hook: String,
+        original: String,
+        transformed: String,
+    },
     #[error("effect store: {0}")]
     Store(#[from] StoreError),
+    #[error("effect procedure: {0}")]
+    Procedure(#[from] crate::procedure::ProcedureError),
     #[error("confined check failed: {0}")]
     Check(#[from] CheckError),
 }
@@ -1429,9 +1859,13 @@ impl ExecutorError {
             | Self::PolicyDenied
             | Self::ModeAsk
             | Self::ModeDenied
-            | Self::Readonly { .. } => ErrorCode::Denied,
+            | Self::Readonly { .. }
+            | Self::HookDenied { .. }
+            | Self::HookTransform { .. } => ErrorCode::Denied,
+            Self::Hook(error) => error.code(),
             Self::Cancelled => ErrorCode::Cancelled,
             Self::Store(_) | Self::WorkerSettlement { .. } => ErrorCode::StorageUnavailable,
+            Self::Procedure(error) => error.code(),
             Self::Check(error) => check_error_code(error),
         }
     }
@@ -2823,6 +3257,9 @@ pub struct Executor<'a> {
     /// attempt's settle never cleans an earlier attempt's preserved
     /// root.
     check_attempt_root: Option<AttemptRoot>,
+    /// The document's hook declarations (DEC-010). Absent, admission takes
+    /// the caller's request as it stands — the pre-hook behavior.
+    hooks: Option<&'a crate::config::Hooks>,
 }
 /// Assembles the DEC-014 decision inputs at an admit call site under the
 /// caller's permission mode (DEC-016); call sites without a Settings
@@ -2949,7 +3386,16 @@ impl<'a> Executor<'a> {
             worker,
             flights: None,
             check_attempt_root: None,
+            hooks: None,
         }
+    }
+
+    /// Binds the document's hook declarations: admission consults them at
+    /// its one instrumented event, before the request is judged.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Option<&'a crate::config::Hooks>) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// The single-flight seam: identical permitted reads admitted
@@ -2969,6 +3415,7 @@ impl<'a> Executor<'a> {
             worker,
             flights: Some(flights),
             check_attempt_root: None,
+            hooks: None,
         }
     }
 
@@ -2984,6 +3431,10 @@ impl<'a> Executor<'a> {
         request: EffectRequest,
         mode: PermissionMode,
     ) -> Result<AdmittedEffect, ExecutorError> {
+        // The one instrumented event (I6): the hook answers before the
+        // request is judged, and whatever it leaves behind is judged at
+        // this same site — never at a second, weaker one.
+        let (request, rewrite) = self.hook_transform(request)?;
         let grant_id = request.grant_id();
         let grant = self.policy.admit(grant_id, request.class())?;
         let target = request.target_path();
@@ -3009,6 +3460,24 @@ impl<'a> Executor<'a> {
             .store
             .plan_attempt(task_id, request.class(), &request.describe())?;
         if decision != ModeDecision::Allow {
+            // A rewritten request that the admission refuses is refused
+            // *for its rewritten target*: the reason names the hook and
+            // both paths, so a steering attempt is visible rather than
+            // looking like the caller's own denial.
+            if let Some(rewrite) = rewrite {
+                let detail = format!(
+                    "hook {} rewrote {} to {}",
+                    rewrite.hook,
+                    rewrite.original.display(),
+                    rewrite.transformed.display()
+                );
+                self.store.attempt_rejected(&attempt_id, &detail)?;
+                return Err(ExecutorError::HookTransform {
+                    hook: rewrite.hook,
+                    original: rewrite.original.display().to_string(),
+                    transformed: rewrite.transformed.display().to_string(),
+                });
+            }
             self.reject_mode(&attempt_id, decision)?;
         }
         // Single-flight (INV-023): a permitted read joins its identical
@@ -3199,6 +3668,58 @@ impl<'a> Executor<'a> {
                 Err(error)
             }
         }
+    }
+
+    /// The `effect.request` consult (AC-076, I6): the one instrumented event,
+    /// before admission judges the request. The answer is data — a `deny` or
+    /// `stop` refuses the request, and a rewritten path replaces the request's
+    /// own before the same admission reads it. At most [`HOOK_MAX_DEPTH`]
+    /// runs answer, so an answer is never fed back into another hook.
+    fn hook_transform(
+        &self,
+        mut request: EffectRequest,
+    ) -> Result<(EffectRequest, Option<HookRewrite>), ExecutorError> {
+        let Some(hooks) = self.hooks else {
+            return Ok((request, None));
+        };
+        if request.path_field().is_none() {
+            return Ok((request, None));
+        }
+        let Some(entry) = hooks.for_event(crate::config::HOOK_EVENT_EFFECT_REQUEST) else {
+            return Ok((request, None));
+        };
+        let original = request.target_path();
+        let mut current = original.clone();
+        for _ in 0..HOOK_MAX_DEPTH {
+            let answer = run_hook(entry, &current)?;
+            match answer.decision {
+                HookDecision::Allow => {}
+                refused => {
+                    return Err(ExecutorError::HookDenied {
+                        hook: entry.id(),
+                        decision: refused.as_str(),
+                    });
+                }
+            }
+            let Some(rewritten) = answer.path else {
+                break;
+            };
+            current = rewritten;
+        }
+        if current == original {
+            return Ok((request, None));
+        }
+        if let Some(field) = request.path_field() {
+            *field = current.clone();
+        }
+        Ok((
+            request,
+            Some(HookRewrite {
+                hook: entry.id(),
+                original,
+                transformed: current,
+            }),
+        ))
     }
 
     /// Reject tail shared by the mode gates: the ledger reason is
@@ -3406,6 +3927,116 @@ impl<'a> Executor<'a> {
                 unreachable!("internal error: worker error commit always errors")
             }
         }
+    }
+
+    /// One step of a saved segment through this executor's own admission and
+    /// settlement (INV-002): the step enters the same gates a first-time effect
+    /// enters — the hook transform, the grant re-check at admission and again
+    /// immediately before the effect, the mode consult, and the attempt ledger
+    /// — and no second effect path exists for it. The run's cursor names the
+    /// step, so a resumed run continues after the last settled one and never
+    /// re-issues it (PROH-003).
+    ///
+    /// The step is prepared between its admission and its effect, stamped with
+    /// the attempt that performs it: an interrupted step is then readable
+    /// through that attempt's own state rather than through how this call
+    /// happened to return.
+    ///
+    /// The effect's own settlement decides the answer: an unresolved attempt and
+    /// a revoked right come back as [`crate::procedure::StepOutcome::Stopped`]
+    /// because the segment must not run its remainder past them (EDGE-003,
+    /// EDGE-004); any other refusal keeps its typed error and settles the
+    /// attempt as the effect path already did.
+    ///
+    /// # Errors
+    /// Returns [`ExecutorError::Procedure`] for a step the run cannot reach — a
+    /// cursor past the segment's steps or an unbound parameter — and the
+    /// effect's own typed refusal for anything that is not a stop condition.
+    pub fn run_segment_step(
+        &mut self,
+        task_id: &TaskId,
+        segment: &crate::procedure::SegmentTemplate,
+        run: &crate::procedure::ProcedureRun,
+        binding: &crate::procedure::SegmentBinding,
+        mode: PermissionMode,
+    ) -> Result<crate::procedure::StepOutcome, ExecutorError> {
+        use crate::procedure::{
+            ProcedureError, StepOutcome, StepStanding, StopCause, settled_result,
+        };
+        let position = run.cursor + 1;
+        let step = segment
+            .step(position)
+            .ok_or_else(|| ProcedureError::CursorPastSteps {
+                procedure_id: segment.procedure_id.clone(),
+                cursor: run.cursor,
+                steps: u64::try_from(segment.steps.len()).unwrap_or(u64::MAX),
+            })?;
+        let request = binding
+            .request(position)
+            .ok_or(ProcedureError::UnboundParameter { position })?
+            .clone();
+        let admitted = match self.admit(task_id, request, mode) {
+            Ok(admitted) => admitted,
+            // The effect-time re-check is the admission's own: a right revoked
+            // before this step refuses here exactly as it would on a first run.
+            Err(ExecutorError::Policy(PolicyError::Revoked { grant_id })) => {
+                return Ok(StepOutcome::Stopped(StopCause::RevokedRight { grant_id }));
+            }
+            Err(error) => return Err(error),
+        };
+        let attempt_id = admitted.attempt_id.clone();
+        // The prepared row is the run's durable record of this step, and it
+        // names the attempt that performs it: the step's own effect is then
+        // answered by the ledger, never by how this call returned (PROH-003).
+        self.store
+            .prepare_procedure_step(run, position, &step.tool, &attempt_id)?;
+        let effect = self.execute(&admitted);
+        // The durable settlement, not the returned value, is what the segment
+        // continues on: the same column the task's blocker projection reads.
+        let (_, state, detail) = self
+            .store
+            .attempt_record(&attempt_id)?
+            .ok_or_else(|| StoreError::missing_attempt(&attempt_id))?;
+        match StepStanding::parse(Some(&state)) {
+            // The effect may have landed and the ledger holds no settled
+            // answer: the remainder does not run past it, whatever the call
+            // returned.
+            Some(StepStanding::Unresolved) => {
+                return Ok(StepOutcome::Stopped(StopCause::UnknownEffect {
+                    attempt_id,
+                }));
+            }
+            // The attempt never reached the worker: the call's own refusal is
+            // the answer to keep.
+            Some(StepStanding::NotStarted) => {
+                return match effect {
+                    Err(ExecutorError::Policy(PolicyError::Revoked { grant_id })) => {
+                        Ok(StepOutcome::Stopped(StopCause::RevokedRight { grant_id }))
+                    }
+                    Err(other) => Err(other),
+                    // A value the ledger does not back is not a settled step:
+                    // reporting it as one would claim what the record cannot
+                    // prove.
+                    Ok(_unbacked) => Ok(StepOutcome::Stopped(StopCause::UnknownEffect {
+                        attempt_id,
+                    })),
+                };
+            }
+            // The effect landed and its settlement is durable.
+            Some(StepStanding::Landed) => {
+                effect?;
+            }
+            // A state this build does not write is not a landed step.
+            None => {
+                return Ok(StepOutcome::Stopped(StopCause::UnknownEffect {
+                    attempt_id,
+                }));
+            }
+        }
+        Ok(StepOutcome::Settled {
+            result: settled_result(&step.tool, detail.as_deref()),
+            attempt_id,
+        })
     }
 
     /// Performs the admitted read effect and deliberately loses the
@@ -5033,6 +5664,13 @@ impl WorkflowOffState {
         snapshot.generation = snapshot.generation.saturating_add(1);
         snapshot.mode = mode;
         snapshot.sources_digest = config.sources_digest.clone();
+    }
+
+    /// Whether the owner's current snapshot still lets a native dispatch
+    /// start (AC-024): only an explicit user off closes it. Read from the
+    /// owner itself at every entry, never from a copy a caller kept.
+    pub(crate) fn native_dispatch_open(&self) -> bool {
+        self.current().1 == WorkflowOwnerMode::Enabled
     }
 
     /// The current owner snapshot: (generation, mode, sources digest).

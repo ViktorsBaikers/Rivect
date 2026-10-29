@@ -14,6 +14,9 @@ pub const PLANS_SCHEMA: &str = include_str!("plans.sql");
 pub const INDEX_SCHEMA: &str = include_str!("index.sql");
 /// Assumption-check records with immutable expectations. Idempotent at open.
 pub const ASSUMPTIONS_SCHEMA: &str = include_str!("assumptions.sql");
+/// Learning-owned DDL: candidate deltas, their corpus verdicts and the
+/// generation its ledger names (AC-051). Idempotent at open like `SCHEMA`.
+pub const LEARNING_SCHEMA: &str = include_str!("learning.sql");
 
 pub const BOOTSTRAP_RECEIPT_BY_KEY: &str =
     "SELECT result_json FROM bootstrap_receipts WHERE key = ?1";
@@ -482,6 +485,290 @@ pub fn plan_blockers_for_tasks(count: usize) -> String {
          ) ORDER BY task_id, source, position"
     )
 }
+
+// ----- schema ledger, learned deltas, their corpus verdicts -----
+
+/// The store's schema generation (DEC-008): the one ledger a newer build
+/// reads before it runs any generation's DDL.
+pub const SCHEMA_GENERATION: &str = "PRAGMA user_version";
+/// The ledger write. `PRAGMA` cannot bind a parameter, so the generation is
+/// named by one builder instead of a literal that could drift from the Rust
+/// constant it mirrors (P-002).
+pub fn set_schema_generation(generation: u64) -> String {
+    format!("PRAGMA user_version = {generation}")
+}
+/// A delta lands `inactive` at version 1: only a corpus verdict can move it,
+/// and the state/version pair is what every later transition is pinned to.
+/// `OR IGNORE` keeps the id stable — the caller learns of a duplicate through
+/// the zero-row result rather than by rewriting a recorded delta.
+pub const INSERT_LEARNING_DELTA: &str = "INSERT OR IGNORE INTO learning_deltas
+             (delta_id, base_version, scope, instruction, capability, effect, condition_json, evidence, state, version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'inactive', 1)";
+pub const LEARNING_DELTA_ROW: &str = "SELECT base_version, scope, instruction, capability, effect, condition_json, evidence, state, version
+             FROM learning_deltas WHERE delta_id = ?1";
+/// The effective definition in record order: one deterministic sequence for
+/// both seams, so the assembled instruction part and a later override never
+/// depend on how a map happened to iterate.
+pub const ACTIVE_LEARNING_DELTAS: &str =
+    "SELECT delta_id, version, instruction, capability, effect, condition_json
+             FROM learning_deltas WHERE state = 'active' ORDER BY rowid";
+/// Activation, rollback and generation visibility in one read (DEC-011):
+/// every delta that left `inactive`, in record order.
+pub const LEARNING_STATUS_ROWS: &str = "SELECT delta_id, state, scope, version FROM learning_deltas
+             WHERE state != 'inactive' ORDER BY rowid";
+/// Activation (EDGE-002) is this one conditional statement: the state and the
+/// caller's version pin both sit in the WHERE clause, so a second actor's
+/// activation matches no row instead of overwriting the winner. A loser reads
+/// the surviving row and refuses typed; it never retries blind.
+pub const ACTIVATE_LEARNING_DELTA: &str =
+    "UPDATE learning_deltas SET state = 'active', version = version + 1
+             WHERE delta_id = ?1 AND state = 'inactive' AND version = ?2
+             RETURNING version";
+pub const ROLL_BACK_LEARNING_DELTA: &str =
+    "UPDATE learning_deltas SET state = 'rolled_back', version = version + 1
+             WHERE delta_id = ?1 AND state = 'active' AND version = ?2
+             RETURNING version";
+pub const INSERT_LEARNING_CORPUS: &str = "INSERT OR REPLACE INTO learning_corpus
+             (delta_id, delta_version, case_kind, expected, observed, verdict)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+pub const LEARNING_CORPUS_ROWS: &str =
+    "SELECT delta_version, case_kind, expected, observed, verdict
+             FROM learning_corpus WHERE delta_id = ?1 ORDER BY case_kind";
+/// Retention (INV-010): the candidates beyond the newest `keep` leave and
+/// their verdict rows leave with them. The statements only ever see
+/// `inactive` rows, so an activated delta and its rollback tombstone are
+/// outside their reach by construction.
+pub fn prune_learning_candidates(keep: usize) -> String {
+    format!(
+        "DELETE FROM learning_corpus WHERE delta_id IN (
+             SELECT delta_id FROM learning_deltas WHERE state = 'inactive'
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep});
+         DELETE FROM learning_deltas WHERE delta_id IN (
+             SELECT delta_id FROM learning_deltas WHERE state = 'inactive'
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep})"
+    )
+}
+
+// ----- the product base ledger and its update receipt (AC-054) -----
+
+/// The base one state holds: at most one row per state serves or waits, so a
+/// cutover's staged row and the row still serving are read by name.
+pub const BASE_BY_STATE: &str = "SELECT base_version, digest FROM base_state WHERE state = ?1";
+/// One base by version, with the state its cutover reached.
+pub const BASE_BY_VERSION: &str =
+    "SELECT base_version, digest, state FROM base_state WHERE base_version = ?1";
+/// The newest base the ledger holds: the receipt a status read serves when a
+/// cutover is waiting and the staged base is the newer one.
+pub const NEWEST_BASE_VERSION: &str =
+    "SELECT base_version FROM base_state ORDER BY base_version DESC LIMIT 1";
+/// A base lands under its version. The first document a version was staged with
+/// stays: the bytes that differ under a recorded or staged version are refused
+/// before this statement, so `OR IGNORE` only resumes the same document's
+/// checkpoint instead of rewriting the bytes its receipt names.
+pub const INSERT_BASE: &str = "INSERT OR IGNORE INTO base_state
+             (base_version, digest, state) VALUES (?1, ?2, ?3)";
+/// The cutover (PROH-004): the staged row becomes the serving one only when it
+/// is still staged, so a second cutover matches nothing.
+pub const ACTIVATE_BASE: &str = "UPDATE base_state SET state = 'active'
+             WHERE base_version = ?1 AND state = 'staged'";
+/// The base that stops serving once its successor commits. It keeps its row
+/// and its receipt as the previous base that served, so the commit is not a
+/// rewrite of what was there.
+pub const RETIRE_ACTIVE_BASE: &str = "UPDATE base_state SET state = 'retired'
+             WHERE state = 'active' AND base_version <> ?1";
+/// One classified asset of a receipt. The upsert re-classifies the row it already
+/// has, so a resumed run names the locations and policies of the installation it
+/// resumes in while the row keeps its place: `(base_version, asset)` is the
+/// identity and the rowid the classification's order.
+pub const INSERT_RECEIPT_ASSET: &str = "INSERT INTO update_receipts
+             (base_version, asset, location, policy) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (base_version, asset) DO UPDATE
+             SET location = excluded.location, policy = excluded.policy";
+/// The receipt's assets in the order the classification wrote them.
+pub const RECEIPT_ASSETS: &str = "SELECT asset, location, policy FROM update_receipts
+             WHERE base_version = ?1 ORDER BY rowid";
+/// The checkpoint a stopped cutover staged leaves with its receipt: an
+/// abandoned checkpoint installs nothing, so nothing may still name its assets.
+pub const DELETE_BASE_RECEIPT: &str = "DELETE FROM update_receipts WHERE base_version = ?1";
+/// The rules a discarded checkpoint was released with leave with it: a rule
+/// names the base it migrates, so one that outlived its base would place stored
+/// bindings by a document no cutover ever committed.
+pub const DELETE_BASE_IDENTITY_MIGRATIONS: &str =
+    "DELETE FROM identity_migrations WHERE base_version = ?1";
+/// The staged row itself leaves — only a staged row, so abandoning a checkpoint
+/// can never retire the base that serves.
+pub const DELETE_STAGED_BASE: &str = "DELETE FROM base_state
+             WHERE base_version = ?1 AND state = 'staged'";
+/// Retention (INV-010) for the retired bases: the newest `keep` bases keep
+/// their rows, their receipts and the identity rules they were released with; a
+/// retired base beyond the window leaves with them. A serving or staged base is
+/// outside the statements' reach, so the evidence an update reads back is never
+/// pruned — and a rule set never outlives the base it names, which is what keeps
+/// an old mapping from accumulating beside rows a newer base already moved.
+pub fn prune_base_versions(keep: usize) -> String {
+    format!(
+        "DELETE FROM update_receipts WHERE base_version IN (
+             SELECT base_version FROM base_state WHERE state = 'retired'
+             ORDER BY base_version DESC LIMIT -1 OFFSET {keep});
+         DELETE FROM identity_migrations WHERE base_version IN (
+             SELECT base_version FROM base_state WHERE state = 'retired'
+             ORDER BY base_version DESC LIMIT -1 OFFSET {keep});
+         DELETE FROM base_state WHERE base_version IN (
+             SELECT base_version FROM base_state WHERE state = 'retired'
+             ORDER BY base_version DESC LIMIT -1 OFFSET {keep})"
+    )
+}
+
+// ----- verified procedure segments and their runs (AC-053) -----
+
+/// A derived segment lands once: `OR IGNORE` keeps its id stable, so
+/// deriving the same plan revision again returns the saved record instead of
+/// rewriting the steps a run may already be following.
+pub const INSERT_PROCEDURE_SEGMENT: &str = "INSERT OR IGNORE INTO procedure_segments
+             (procedure_id, version, task_id, selection_revision, plan_revision, schema_version, tool_version, stop_conditions, steps)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+pub const PROCEDURE_SEGMENT_ROW: &str = "SELECT version, task_id, selection_revision, plan_revision, schema_version, tool_version, stop_conditions, steps
+             FROM procedure_segments WHERE procedure_id = ?1";
+/// The run a start resumes: the newest run of this procedure version that has
+/// not completed. A stopped run is resumed from its own cursor, so a settled
+/// effect is never re-issued (PROH-003).
+pub const RESUMABLE_PROCEDURE_RUN: &str =
+    "SELECT run_id, task_id, snapshot_json, cursor, state, stop_condition, stop_detail
+             FROM procedure_runs WHERE procedure_id = ?1 AND procedure_version = ?2
+             AND state != 'completed' ORDER BY rowid DESC LIMIT 1";
+/// The run a completed segment already finished: a plain resume refuses to
+/// start it again, so the refusal covers only that path — an explicit
+/// [`crate::procedure::RunStart::Fresh`] request re-runs the segment on purpose,
+/// and [`prune_procedure_runs`] evicts this row with the other terminal ones,
+/// leaving nothing to refuse; both replays do re-issue the effects that ran.
+pub const COMPLETED_PROCEDURE_RUN: &str = "SELECT run_id FROM procedure_runs
+             WHERE procedure_id = ?1 AND procedure_version = ?2 AND state = 'completed'
+             ORDER BY rowid DESC LIMIT 1";
+pub const INSERT_PROCEDURE_RUN: &str = "INSERT INTO procedure_runs
+             (run_id, procedure_id, procedure_version, task_id, snapshot_json, cursor, step_count, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 'running')";
+pub const PROCEDURE_RUN_ROW: &str = "SELECT procedure_id, procedure_version, task_id, snapshot_json, cursor, state, stop_condition, stop_detail
+             FROM procedure_runs WHERE run_id = ?1";
+/// One step row is written ahead of its effect (PROH-003), stamped with the
+/// attempt that is about to perform it: a prepared row then says, through that
+/// attempt's own state, whether the effect could have landed. `OR IGNORE` keeps
+/// a second prepare of the same position from rewriting what the first one
+/// recorded, so a row never changes the attempt it belongs to.
+pub const PREPARE_PROCEDURE_STEP: &str = "INSERT OR IGNORE INTO procedure_run_steps
+             (run_id, position, tool, state, attempt_id, result)
+             VALUES (?1, ?2, ?3, 'prepared', ?4, '')";
+/// The settlement moves the prepared row and the run's cursor in one
+/// transaction, bound to the cursor the caller just settled: a step that would
+/// skip ahead, or a second settle of the same position, matches no row.
+pub const SETTLE_PROCEDURE_STEP: &str = "UPDATE procedure_run_steps
+             SET state = 'settled', attempt_id = ?3, result = ?4
+             WHERE run_id = ?1 AND position = ?2 AND state = 'prepared'";
+pub const ADVANCE_PROCEDURE_CURSOR: &str = "UPDATE procedure_runs SET cursor = ?3
+             WHERE run_id = ?1 AND cursor = ?2 AND state = 'running'";
+/// The step a run prepared and never settled, with the state its own attempt
+/// reached: the only durable answer to whether the effect could have landed.
+pub const PREPARED_PROCEDURE_STEP: &str =
+    "SELECT s.position, s.tool, s.attempt_id, a.state, a.detail
+             FROM procedure_run_steps s LEFT JOIN attempts a ON a.attempt_id = s.attempt_id
+             WHERE s.run_id = ?1 AND s.state = 'prepared' ORDER BY s.position LIMIT 1";
+pub const RELEASE_PROCEDURE_STEP: &str = "DELETE FROM procedure_run_steps
+             WHERE run_id = ?1 AND position = ?2 AND state = 'prepared'";
+pub const PROCEDURE_RUN_STEPS: &str = "SELECT position, tool, attempt_id, result
+             FROM procedure_run_steps WHERE run_id = ?1 AND state = 'settled' ORDER BY position";
+/// A completion needs the cursor to have reached the segment's last step, and
+/// a stop only moves a run that has not completed: both are conditional
+/// statements, so a lost race writes nothing rather than overwriting. A stop
+/// records the trigger and the detail it names; the blocker a caller acts on is
+/// the task's own projection, so no second action identity is stored here.
+pub const COMPLETE_PROCEDURE_RUN: &str = "UPDATE procedure_runs SET state = 'completed'
+             WHERE run_id = ?1 AND state = 'running' AND cursor = step_count";
+pub const STOP_PROCEDURE_RUN: &str = "UPDATE procedure_runs
+             SET state = 'stopped', stop_condition = ?2, stop_detail = ?3
+             WHERE run_id = ?1 AND state != 'completed'";
+/// A resume re-opens a stopped run: the run is running while it runs, and the
+/// stop it cleared was the previous attempt's, not a fact the next attempt
+/// inherits.
+pub const RESUME_PROCEDURE_RUN: &str = "UPDATE procedure_runs
+             SET state = 'running', stop_condition = NULL, stop_detail = NULL
+             WHERE run_id = ?1 AND state = 'stopped'";
+/// Retention (INV-010): runs are derived records, so the terminal ones beyond
+/// the newest `keep` leave with their step rows; the runs that are still
+/// running — the ones a resume can continue — are never pruned.
+///
+/// What this eviction can and cannot preserve: inside the window every terminal
+/// run keeps its cursor, its stop and its step rows, so a resume can neither
+/// re-issue a settled effect nor take a stop for a fresh start. Beyond it the
+/// completed record itself is gone, and that record is the only thing that says
+/// a segment already finished: a start then finds nothing to resume and nothing
+/// to refuse, so it opens a new run at the first step and its effects are issued
+/// again. Eviction therefore bounds how long the record is remembered; it never
+/// preserves the refusal itself, and it never touches a run that is still
+/// running.
+pub fn prune_procedure_runs(keep: usize) -> String {
+    format!(
+        "DELETE FROM procedure_run_steps WHERE run_id IN (
+             SELECT run_id FROM procedure_runs WHERE state != 'running'
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep});
+         DELETE FROM procedure_runs WHERE run_id IN (
+             SELECT run_id FROM procedure_runs WHERE state != 'running'
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep})"
+    )
+}
+/// Retention (INV-010) for the saved segments themselves: beyond the newest
+/// `keep`, a segment leaves with its runs and their step rows.
+pub fn prune_procedure_segments(keep: usize) -> String {
+    format!(
+        "DELETE FROM procedure_run_steps WHERE run_id IN (
+             SELECT run_id FROM procedure_runs WHERE procedure_id IN (
+                 SELECT procedure_id FROM procedure_segments
+                 ORDER BY rowid DESC LIMIT -1 OFFSET {keep}));
+         DELETE FROM procedure_runs WHERE procedure_id IN (
+             SELECT procedure_id FROM procedure_segments
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep});
+         DELETE FROM procedure_segments WHERE procedure_id IN (
+             SELECT procedure_id FROM procedure_segments
+             ORDER BY rowid DESC LIMIT -1 OFFSET {keep})"
+    )
+}
+
+// ----- semantic identity (AC-056) -----
+
+/// One versioned `old_id → new_id` rule of one base (REQ-046). The primary key
+/// is the rule's identity, so recording the same rule twice replays it instead
+/// of growing the map; the statement is not what refuses a changed meaning — the
+/// rule set is validated before this write, and the caller compares the stored
+/// row with the offered one afterwards.
+pub const INSERT_IDENTITY_MIGRATION: &str = "INSERT OR IGNORE INTO identity_migrations
+             (base_version, old_id, new_id, kind, rule, subject)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+/// The rule set one base was released with, in record order so a placement is
+/// deterministic and a replay of the same document reads the same map.
+pub const IDENTITY_MIGRATIONS_FOR_BASE: &str =
+    "SELECT base_version, old_id, new_id, kind, rule, subject
+             FROM identity_migrations WHERE base_version = ?1 ORDER BY rowid";
+/// Every stored binding a rebinding pass has to place: the delta, its scope and
+/// the two columns a subject is read from — the capability an applicability
+/// delta overrides and the condition an instruction delta carries. The effect
+/// is read beside the capability because a pass that moves two of them onto one
+/// capability has to see whether they still agree, and the state because only an
+/// active delta composes the definition those conclusions are judged against
+/// (AC-056). Rows are read in record order, so the report a pass returns is
+/// stable.
+pub const LEARNING_DELTA_BINDINGS: &str =
+    "SELECT delta_id, scope, capability, effect, condition_json, state
+             FROM learning_deltas ORDER BY rowid";
+/// One instruction binding moves to its migrated purpose. The version moves
+/// with it, so an activation pinned to the payload it judged conflicts instead
+/// of activating a body the corpus did not see (EDGE-002); the condition is
+/// part of the `WHERE`, so a row another writer already rebound matches nothing.
+pub const REBIND_DELTA_PURPOSE: &str = "UPDATE learning_deltas
+             SET condition_json = ?2, version = version + 1
+             WHERE delta_id = ?1 AND condition_json = ?3";
+/// One selection binding moves to its migrated capability, under the same
+/// version and match discipline the purpose statement carries.
+pub const REBIND_DELTA_CAPABILITY: &str = "UPDATE learning_deltas
+             SET capability = ?2, version = version + 1
+             WHERE delta_id = ?1 AND capability = ?3";
 
 // ----- index snapshot generations and their derived edges -----
 

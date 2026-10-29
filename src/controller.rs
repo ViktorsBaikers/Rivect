@@ -5,6 +5,7 @@
 //! effect.
 
 use crate::commands::{PausedAttempt, Runtime};
+use crate::contracts::Lifecycle;
 use crate::contracts::{
     AnswerSelection, Availability, EffectClass, ErrorCode, OptionId, Question, QuestionId,
     QuestionOption, SessionId, TaskId, TaskSnapshot,
@@ -50,6 +51,37 @@ pub enum StepOutcome {
     NoAction {
         snapshot: TaskSnapshot,
     },
+    /// The native workflow is off or the task carries an off pause nothing
+    /// has displaced yet, so this step never dispatched (AC-024).
+    Paused {
+        snapshot: TaskSnapshot,
+    },
+}
+
+/// What one bounded step of a saved procedure segment did (AC-053).
+///
+/// The segment's next step runs through the executor's own admission and its
+/// settlement is kept; one of the three conditions ends the remainder and
+/// returns control, so a stopped run never grows its executed-step count.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SegmentStepOutcome {
+    /// One step settled and the segment has more ahead of it.
+    Stepped {
+        run: crate::procedure::ProcedureRun,
+        step: crate::procedure::SettledStep,
+    },
+    /// The remainder did not run: control returns with the task's snapshot and
+    /// the condition that ended it.
+    Stopped {
+        run: crate::procedure::ProcedureRun,
+        snapshot: TaskSnapshot,
+        cause: crate::procedure::StopCause,
+    },
+    /// The last step settled.
+    Completed {
+        run: crate::procedure::ProcedureRun,
+        snapshot: TaskSnapshot,
+    },
 }
 
 /// What resuming one task's continuation did (AC-049). The four
@@ -70,6 +102,10 @@ pub enum ContinuationOutcome {
     /// A pinned input moved between the compaction and this resume: the
     /// recorded step is refused instead of replayed against stale state.
     Stale { pin: String },
+    /// The resume is a native dispatch and the workflow did not let one
+    /// start: the task stays paused until a new intent displaces the
+    /// pause (AC-024).
+    Paused,
 }
 
 impl ContinuationOutcome {
@@ -81,6 +117,10 @@ impl ContinuationOutcome {
                 format!("continuation resumed: {context_bytes} bytes of context")
             }
             Self::NoContinuation => "no continuation".to_string(),
+            Self::Paused => {
+                "continuation paused: the native workflow is not running; steer the task to resume it"
+                    .to_string()
+            }
             Self::Stale { pin } => {
                 format!("continuation is stale: {pin} changed since the compaction; replay refused")
             }
@@ -95,7 +135,34 @@ fn step_snapshot(outcome: &StepOutcome) -> TaskSnapshot {
         | StepOutcome::EffectDenied { snapshot, .. }
         | StepOutcome::OutcomeUnknown { snapshot, .. }
         | StepOutcome::Waiting { snapshot }
-        | StepOutcome::NoAction { snapshot } => snapshot.clone(),
+        | StepOutcome::NoAction { snapshot }
+        | StepOutcome::Paused { snapshot } => snapshot.clone(),
+    }
+}
+
+/// The control path's answer for a segment whose remainder stopped (AC-053):
+/// the condition that fired names the state, and the outcome is the one the
+/// ordinary path already answers that state with, so a stop invents no
+/// vocabulary of its own.
+fn stopped_outcome(cause: crate::procedure::StopCause, snapshot: TaskSnapshot) -> StepOutcome {
+    use crate::procedure::StopCause;
+    let stop = crate::procedure::stop_decision(&cause);
+    match cause {
+        StopCause::UnknownEffect { attempt_id } | StopCause::PreparedStep { attempt_id, .. } => {
+            StepOutcome::OutcomeUnknown {
+                attempt_id,
+                snapshot,
+            }
+        }
+        // The effect-time re-check refused the step, so nothing ran and the
+        // control path's own denial is the answer.
+        StopCause::RevokedRight { .. } => StepOutcome::EffectDenied {
+            reason: stop.detail,
+            snapshot,
+        },
+        // The snapshot moved to a fork: the path that already waits on it
+        // continues from here.
+        StopCause::NewMaterialChoice { .. } => StepOutcome::Waiting { snapshot },
     }
 }
 
@@ -117,6 +184,8 @@ pub enum ControllerError {
     },
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Procedure(#[from] crate::procedure::ProcedureError),
     #[error(transparent)]
     Policy(#[from] PolicyError),
     #[error(transparent)]
@@ -142,6 +211,7 @@ impl ControllerError {
     pub fn error_code(&self) -> ErrorCode {
         match self {
             Self::Store(error) => error.code(),
+            Self::Procedure(error) => error.code(),
             Self::EnvironmentRetention { .. } => ErrorCode::StorageUnavailable,
             Self::Policy(_) => ErrorCode::Denied,
             Self::Model(ModelError::RequestTooLarge { .. }) => ErrorCode::ContextOverflow,
@@ -183,7 +253,9 @@ pub fn output_settlement(outcome: &StepOutcome) -> Option<OutputSettlement> {
         StepOutcome::EffectDenied { reason, .. } => Some(OutputSettlement::Failed {
             cause: reason.clone(),
         }),
-        StepOutcome::Waiting { .. } | StepOutcome::NoAction { .. } => None,
+        StepOutcome::Waiting { .. } | StepOutcome::NoAction { .. } | StepOutcome::Paused { .. } => {
+            None
+        }
     }
 }
 
@@ -207,6 +279,7 @@ pub fn step_outcome_observation(
         }
         StepOutcome::Waiting { .. } => "waiting".to_string(),
         StepOutcome::NoAction { .. } => "no action".to_string(),
+        StepOutcome::Paused { .. } => "paused".to_string(),
     };
     Observation::failure(
         task.clone(),
@@ -254,6 +327,7 @@ pub fn step_error_observation(
             format!("executor error: {primary}; retention error: {secondary}")
         }
         ControllerError::Store(source) => format!("store error: {source}"),
+        ControllerError::Procedure(source) => format!("procedure error: {source}"),
         ControllerError::Policy(source) => format!("policy error: {source}"),
         ControllerError::Model(source) => format!("model error: {source}"),
         ControllerError::Executor(source) => format!("executor error: {source}"),
@@ -305,7 +379,9 @@ impl Runtime {
     /// One decision step for a task whose pending question has been
     /// answered: the broker dispatches the frozen manifest once, the only
     /// permitted action is a scoped read, evidence and the completion guard
-    /// close the loop. `crash_after_dispatch` emulates process death after
+    /// close the loop. A task whose executed plan saved a procedure segment
+    /// runs that segment instead, on this same path and behind the same gates
+    /// (AC-053). `crash_after_dispatch` emulates process death after
     /// the durable dispatched record, before effect confirmation.
     pub fn run_decision_step(
         &mut self,
@@ -315,7 +391,7 @@ impl Runtime {
         grant_id: &str,
         crash_after_dispatch: bool,
     ) -> Result<StepOutcome, ControllerError> {
-        if let Some(gated) = self.gate_decision_dispatch(task_id, grant_id)? {
+        if let Some(gated) = self.gate_decision_dispatch(session_id, task_id, grant_id)? {
             return Ok(gated);
         }
         if matches!(
@@ -324,6 +400,13 @@ impl Runtime {
                 if option_id.0.as_str() == APPLICABILITY_UNKNOWN_OPTION
         ) {
             self.fail_applicability(task_id)?;
+        }
+        // A saved procedure segment starts here, before the single-step path
+        // (AC-053): the steps the plan already executed run again through the
+        // executor's own admission and settlement, so a shipped run reaches the
+        // segment's stop decision instead of stepping on blindly.
+        if let Some(segment) = self.saved_segment(task_id)? {
+            return self.run_saved_segment(session_id, task_id, grant_id, &segment);
         }
         let (target, retained_attempt_id) =
             match self.resolve_read_target(session_id, task_id, answer)? {
@@ -335,11 +418,7 @@ impl Runtime {
             path: target,
         };
         let admitted = {
-            let mut executor = crate::executor::Executor::new(
-                &mut self.policy,
-                &mut self.owner.store,
-                self.read_worker.as_mut(),
-            );
+            let mut executor = self.executor();
             // The production step driver still inlines the interim `manual`
             // default (DEC-015) until the Settings surface lands.
             executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?
@@ -350,11 +429,7 @@ impl Runtime {
         if retained_attempt_id.is_none() {
             self.retain_pre_effect(&effect_attempt, "fixed option admitted read")?;
         }
-        let mut executor = crate::executor::Executor::new(
-            &mut self.policy,
-            &mut self.owner.store,
-            self.read_worker.as_mut(),
-        );
+        let mut executor = self.executor();
         if crash_after_dispatch {
             executor.execute_unconfirmed(&admitted)?;
             self.owner.store.mark_outcome_unknown(task_id)?;
@@ -414,12 +489,15 @@ impl Runtime {
             return Ok(ContinuationOutcome::NoContinuation);
         };
         match self.scheduler_step(session_id)? {
-            SchedulerStep::Ran { node: ran, outcome } if ran == node => {
-                Ok(ContinuationOutcome::Resumed {
-                    snapshot: Box::new(step_snapshot(&outcome)),
+            SchedulerStep::Ran { node: ran, outcome } if ran == node => match *outcome {
+                // The step never dispatched, so this task's remainder is
+                // exactly where the compaction left it (AC-024).
+                StepOutcome::Paused { .. } => Ok(ContinuationOutcome::Paused),
+                settled => Ok(ContinuationOutcome::Resumed {
+                    snapshot: Box::new(step_snapshot(&settled)),
                     context_bytes: context.text.len(),
-                })
-            }
+                }),
+            },
             // Another node took the slot, or the tree was already idle:
             // this task's remainder is not what the step resumed.
             SchedulerStep::Ran { .. } | SchedulerStep::Idle => {
@@ -433,12 +511,16 @@ impl Runtime {
     /// `Some` outcome is the step's answer; `None` continues the dispatch.
     fn gate_decision_dispatch(
         &mut self,
+        session_id: &SessionId,
         task_id: &TaskId,
         grant_id: &str,
     ) -> Result<Option<StepOutcome>, ControllerError> {
         if self.owner.store.task_lifecycle(task_id)?.is_terminal() {
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(Some(StepOutcome::NoAction { snapshot }));
+        }
+        if let Some(paused) = self.off_gate(session_id, task_id)? {
+            return Ok(Some(paused));
         }
         // No-repeat guard: any unresolved running/unknown attempt of this
         // task blocks the next decision before a single provider call or
@@ -486,6 +568,32 @@ impl Runtime {
         }
         self.owner.store.materialize_obligations(task_id)?;
         Ok(None)
+    }
+
+    /// The one off gate of the native path (AC-024/REQ-017): an explicit
+    /// user `workflow.enabled = false` — or the pause that transition
+    /// recorded on this task — refuses the step before its first provider
+    /// call, and records the pause once so the interruption is a durable
+    /// fact rather than a silent drop. Nothing is disposed and no settled
+    /// effect is touched. Only this path is gated: the custom/tool path
+    /// never reaches it, so `context.compact`, memory and every tool the
+    /// user invokes stay available at off (DEC-011/S-1).
+    fn off_gate(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<Option<StepOutcome>, ControllerError> {
+        let off = !self.off_state.native_dispatch_open();
+        if !off && self.owner.store.task_lifecycle(task_id)? != Lifecycle::Paused {
+            return Ok(None);
+        }
+        if off {
+            self.owner
+                .store
+                .pause_for_workflow_off(session_id, task_id)?;
+        }
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        Ok(Some(StepOutcome::Paused { snapshot }))
     }
 
     /// Resolves the scoped read target. A manual-fallback pick dispatches
@@ -555,9 +663,18 @@ impl Runtime {
             answer_text(answer),
             self.scoped_file.display()
         );
-        let manifest = self
-            .broker
-            .prepare(&purpose, &self.config_for_broker(), &world, &inputs)?;
+        // The authorship of the bytes this dispatch carries (AC-009): a
+        // tool output, an observation or a model-authored answer freezes
+        // as such, so the wire's user channel never reads as a human
+        // turn that could move consent.
+        let origin = self.owner.store.answer_input_origin(task_id)?;
+        let manifest = self.broker.prepare_authored(
+            &purpose,
+            &self.config_for_broker(),
+            &world,
+            &inputs,
+            origin,
+        )?;
         self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
         match self.broker.dispatch(&world, &manifest) {
             Ok(reply) => {
@@ -805,11 +922,7 @@ impl Runtime {
             bytes: restore.replacement,
         };
         let admission = {
-            let mut executor = crate::executor::Executor::new(
-                &mut self.policy,
-                &mut self.owner.store,
-                self.read_worker.as_mut(),
-            );
+            let mut executor = self.executor();
             executor.admit(&task_id, request, mode)
         };
         let admitted = match admission {
@@ -820,11 +933,7 @@ impl Runtime {
             }
         };
         let effect = {
-            let mut executor = crate::executor::Executor::new(
-                &mut self.policy,
-                &mut self.owner.store,
-                self.read_worker.as_mut(),
-            );
+            let mut executor = self.executor();
             executor.execute(&admitted)
         };
         match effect {
@@ -1048,6 +1157,319 @@ impl Runtime {
         Ok(SchedulerStep::Ran {
             node,
             outcome: Box::new(outcome),
+        })
+    }
+
+    /// Derives the task's procedure segment from the plan that already ran and
+    /// saves it (AC-053). The segment is never authored here: the plan owner's
+    /// revision and the rows its handlers closed are the only inputs.
+    ///
+    /// # Errors
+    /// The [`crate::procedure::ProcedureError`] refusals of a plan that never
+    /// ran, a superseded plan or an empty executed plan.
+    pub fn record_procedure_segment(
+        &mut self,
+        task_id: &TaskId,
+    ) -> Result<crate::procedure::SegmentTemplate, ControllerError> {
+        Ok(self.owner.store.record_procedure_segment(task_id)?)
+    }
+
+    /// One bounded step of a saved segment (AC-053).
+    ///
+    /// The segment's next step runs through the executor's own admission and
+    /// settlement, its result is kept, and the run continues only while the new
+    /// snapshot still holds: a fork outside the snapshot, an unresolved effect
+    /// or a revoked right stops the remainder, keeps the steps that settled, and
+    /// returns the task's snapshot to the normal control path.
+    ///
+    /// `open` is the caller's answer for a segment that already completed a run:
+    /// [`crate::procedure::RunStart::Resume`] refuses it, because every step of a
+    /// completed run is an effect that already landed, and only an explicit
+    /// [`crate::procedure::RunStart::Fresh`] request runs the segment again.
+    ///
+    /// # Errors
+    /// The store's and the executor's non-stop refusals, and the segment's own
+    /// [`crate::procedure::ProcedureError`] (a moved snapshot, an unbound
+    /// parameter).
+    pub fn run_procedure_step(
+        &mut self,
+        task_id: &TaskId,
+        procedure_id: &str,
+        binding: &crate::procedure::SegmentBinding,
+        mode: crate::policy::PermissionMode,
+        open: crate::procedure::RunStart,
+    ) -> Result<SegmentStepOutcome, ControllerError> {
+        use crate::procedure::{ProcedureError, SettledStep, StepOutcome, StepStanding, StopCause};
+        let segment = self.owner.store.procedure_segment(procedure_id)?;
+        let live = self.live_segment_snapshot(task_id)?;
+        let mut run = self
+            .owner
+            .store
+            .start_procedure_run(&segment, &live, open)?;
+        // The step a previous call prepared and did not settle is answered by
+        // its own attempt, never by running it again: a step that provably
+        // never started is released for its next attempt, one whose effect
+        // landed is settled from the ledger, and one that may have landed stops
+        // the remainder (PROH-003).
+        if let Some(prepared) = self.owner.store.prepared_procedure_step(&run.run_id)? {
+            match prepared.standing {
+                StepStanding::NotStarted => {
+                    self.owner
+                        .store
+                        .release_unstarted_procedure_step(&run.run_id, prepared.position)?;
+                }
+                StepStanding::Landed => {
+                    run = self
+                        .owner
+                        .store
+                        .settle_procedure_step(&run.run_id, &prepared.settlement())?;
+                }
+                StepStanding::Unresolved => {
+                    return self.stop_segment(
+                        task_id,
+                        &run,
+                        StopCause::PreparedStep {
+                            position: prepared.position,
+                            attempt_id: prepared.attempt_id,
+                        },
+                    );
+                }
+            }
+        }
+        // The new snapshot is re-checked before the step (AC-053): a fork the
+        // run's snapshot never held is a material choice the saved segment
+        // cannot take on its own, and control returns to the path that already
+        // waits on it.
+        if live.pending != run.snapshot.pending {
+            return self.stop_segment(
+                task_id,
+                &run,
+                StopCause::NewMaterialChoice {
+                    pending: live.pending,
+                },
+            );
+        }
+        // No-repeat guard, the same one the dispatch decision takes: the newest
+        // attempt of this task whose outcome is still unresolved is the durable
+        // proof that an effect may have landed, so nothing issues the next one
+        // (PROH-003, INV-004).
+        if let Some(attempt_id) = self.owner.store.latest_unresolved_attempt(task_id)? {
+            return self.stop_segment(task_id, &run, StopCause::UnknownEffect { attempt_id });
+        }
+        if run.remainder(&segment).is_empty() {
+            let run = self.owner.store.complete_procedure_run(&run.run_id)?;
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(SegmentStepOutcome::Completed { run, snapshot });
+        }
+        let step = segment.step(run.cursor + 1).cloned().ok_or({
+            ProcedureError::CursorPastSteps {
+                procedure_id: segment.procedure_id.clone(),
+                cursor: run.cursor,
+                steps: u64::try_from(segment.steps.len()).unwrap_or(u64::MAX),
+            }
+        })?;
+        let outcome = {
+            let mut executor = self.executor();
+            executor.run_segment_step(task_id, &segment, &run, binding, mode)
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // A failed call proves nothing about the effect: the prepared
+                // row's own attempt does, and only a step that provably never
+                // started is released for a later attempt (PROH-003).
+                self.owner
+                    .store
+                    .release_unstarted_procedure_step(&run.run_id, step.position)?;
+                return Err(error.into());
+            }
+        };
+        let (attempt_id, result) = match outcome {
+            StepOutcome::Settled { attempt_id, result } => (attempt_id, result),
+            StepOutcome::Stopped(cause) => {
+                // A step whose effect was refused ran nothing, so its row is
+                // released; a step whose attempt ran keeps its safety record.
+                self.owner
+                    .store
+                    .release_unstarted_procedure_step(&run.run_id, step.position)?;
+                return self.stop_segment(task_id, &run, cause);
+            }
+        };
+        let settled = SettledStep {
+            position: step.position,
+            tool: step.tool,
+            attempt_id,
+            result,
+        };
+        let run = self
+            .owner
+            .store
+            .settle_procedure_step(&run.run_id, &settled)?;
+        if run.remainder(&segment).is_empty() {
+            let run = self.owner.store.complete_procedure_run(&run.run_id)?;
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(SegmentStepOutcome::Completed { run, snapshot });
+        }
+        Ok(SegmentStepOutcome::Stepped { run, step: settled })
+    }
+
+    /// The saved segment a task's executed plan names, when this run can start
+    /// one (AC-053). The plan revision the task's action resolved is the
+    /// segment's key, so a task that never executed a plan — or whose segment
+    /// was never saved — keeps the single-step path unchanged. A segment saved
+    /// against state this run has moved past is not that segment:
+    /// [`crate::procedure::SegmentTemplate::prepare`] refuses it before any
+    /// effect (master §12.9), and the task's own step continues instead.
+    fn saved_segment(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<crate::procedure::SegmentTemplate>, ControllerError> {
+        let Some(plan_revision) = self
+            .owner
+            .store
+            .plan_revisions(task_id)?
+            .last()
+            .map(|revision| revision.revision)
+        else {
+            return Ok(None);
+        };
+        let procedure_id =
+            crate::procedure::SegmentTemplate::procedure_id_for(task_id, plan_revision);
+        let segment = match self.owner.store.procedure_segment(&procedure_id) {
+            Ok(segment) => segment,
+            Err(crate::procedure::ProcedureError::SegmentMissing { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match segment.prepare(&self.live_segment_snapshot(task_id)?) {
+            Ok(()) => Ok(Some(segment)),
+            Err(_refused) => Ok(None),
+        }
+    }
+
+    /// The parameters one run binds into the saved segment come from this run's
+    /// own snapshot — the node's scoped read grant and the task's permitted read
+    /// target — never from the recording: the saved steps name what ran, the
+    /// binding names what this run may do now, and the executor admits every
+    /// step again (AC-053, INV-002).
+    fn segment_binding(
+        &self,
+        segment: &crate::procedure::SegmentTemplate,
+        grant_id: &str,
+    ) -> crate::procedure::SegmentBinding {
+        segment
+            .steps
+            .iter()
+            .fold(crate::procedure::SegmentBinding::new(), |binding, step| {
+                binding.bind(
+                    step.position,
+                    EffectRequest::Read {
+                        grant_id: grant_id.to_string(),
+                        path: self.scoped_file.clone(),
+                    },
+                )
+            })
+    }
+
+    /// Runs the remaining steps of a saved segment on this step path (AC-053):
+    /// every step enters the executor's own admission and settlement, and the
+    /// remainder ends on the first condition the segment honours, so the
+    /// completed steps stay stored for the ordinary control path.
+    fn run_saved_segment(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        grant_id: &str,
+        segment: &crate::procedure::SegmentTemplate,
+    ) -> Result<StepOutcome, ControllerError> {
+        use crate::procedure::{ProcedureError, RunStart};
+        let binding = self.segment_binding(segment, grant_id);
+        loop {
+            // The production step driver still inlines the interim `manual`
+            // default (DEC-015) until the Settings surface lands.
+            let step = self.run_procedure_step(
+                task_id,
+                &segment.procedure_id,
+                &binding,
+                crate::policy::PermissionMode::Manual,
+                RunStart::Resume,
+            );
+            match step {
+                Ok(SegmentStepOutcome::Stepped { .. }) => {}
+                Ok(SegmentStepOutcome::Stopped {
+                    cause, snapshot, ..
+                }) => return Ok(stopped_outcome(cause, snapshot)),
+                // Nothing of the segment is left to run — whether this pass
+                // settled its last step or an earlier one did — so the task's
+                // own completion guard decides what that ends (PROH-003: the
+                // steps of a completed run are never issued again).
+                Ok(SegmentStepOutcome::Completed { .. })
+                | Err(ControllerError::Procedure(ProcedureError::AlreadyCompleted { .. })) => {
+                    return Ok(StepOutcome::Completed {
+                        snapshot: self.owner.store.complete_if_eligible(session_id, task_id)?,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Records the stop, marks the task exactly as the normal path does for that
+    /// state, and returns its snapshot.
+    fn stop_segment(
+        &mut self,
+        task_id: &TaskId,
+        run: &crate::procedure::ProcedureRun,
+        cause: crate::procedure::StopCause,
+    ) -> Result<SegmentStepOutcome, ControllerError> {
+        let stop = crate::procedure::stop_decision(&cause);
+        if matches!(
+            cause,
+            crate::procedure::StopCause::UnknownEffect { .. }
+                | crate::procedure::StopCause::PreparedStep { .. }
+        ) {
+            // The task's own blocked state and its blocker projection: the same
+            // write the unknown-outcome step path already makes.
+            self.owner.store.mark_outcome_unknown(task_id)?;
+        }
+        let run = self.owner.store.stop_procedure_run(&run.run_id, &stop)?;
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        Ok(SegmentStepOutcome::Stopped {
+            run,
+            snapshot,
+            cause,
+        })
+    }
+
+    /// The state one saved segment must hold to run now: the live selection and
+    /// plan revision, this build's effect tool, and the fork the task waits on.
+    fn live_segment_snapshot(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<crate::procedure::SegmentSnapshot, ControllerError> {
+        let selection = self.owner.store.plan_selection(task_id)?.ok_or_else(|| {
+            crate::procedure::ProcedureError::PlanMissing {
+                task_id: task_id.0.clone(),
+            }
+        })?;
+        let plan_revision = self
+            .owner
+            .store
+            .plan_revisions(task_id)?
+            .last()
+            .map_or(0, |revision| revision.revision);
+        let pending = self
+            .owner
+            .store
+            .current_question(task_id)?
+            .map(|(question, _)| crate::procedure::PendingFork {
+                question_id: question.question_id,
+                revision: question.question_revision,
+            });
+        Ok(crate::procedure::SegmentSnapshot {
+            selection_revision: selection.revision,
+            plan_revision,
+            tool_version: crate::executor::backend().to_string(),
+            pending,
         })
     }
 }

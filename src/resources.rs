@@ -1,26 +1,365 @@
-//! Resource holders, the bounded notification queue, and the safe
-//! external-data flow. Overflow never drops obligations silently: the
-//! backlog is replaced by one resync marker.
+//! Capability generations, the bounded notification queue, and the safe
+//! external-data flow. A capability generation is published whole or
+//! releases the resources it prepared (AC-015). Overflow never drops
+//! obligations silently: the backlog is replaced by one resync marker.
 
-use crate::contracts::Event;
+use crate::contracts::{ErrorCode, Event};
 use crate::executor::{FileIdentity, ReadObservation};
 use crate::policy::PermissionMode;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
+/// How many retired generation numbers the registry keeps. A generation
+/// number is never reissued, so a number past this window reports
+/// [`ResourceError::Unknown`] rather than borrowing a newer generation's
+/// answer — the same bound the index's superseded generations are pruned by.
+pub const CAPABILITY_GENERATION_RETENTION: usize = 8;
+
+/// What the owning observer proved about one holder's resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceHolderStatus {
+    /// The holder owns live resources.
     Active,
+    /// The release ran and could not be proven: some root may still exist.
     TerminationUnknown,
+    /// Every root the holder acquired is gone.
     Terminated,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Failures of the capability generation lifecycle.
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceError {
+    /// A scope or dependency name would address something outside the
+    /// generation root.
+    #[error("the {field} {value} is not one path segment")]
+    NotOneSegment { field: &'static str, value: String },
+    /// A root could not be created. `disposition` records what releasing
+    /// what had already been acquired proved, so an unproven cleanup is not
+    /// reported as a clean failure.
+    #[error("capability acquisition failed at {boundary}: {source}")]
+    Acquire {
+        boundary: &'static str,
+        #[source]
+        source: std::io::Error,
+        disposition: ResourceHolderStatus,
+    },
+    /// A prepared generation is not newer than the current one: a late
+    /// prepare never retires a live registration.
+    #[error("generation {carried} cannot replace the current generation {current}")]
+    Superseded { carried: u64, current: u64 },
+    /// The carried generation is already retired — its own retirement, and
+    /// the newer registration's resources and rights, stand unchanged.
+    #[error("generation {generation} was already retired")]
+    AlreadyRetired { generation: u64 },
+    /// This registry never made the carried generation current, or
+    /// retention has dropped its number.
+    #[error("generation {carried} was never current")]
+    Unknown { carried: u64 },
+}
+
+impl ResourceError {
+    /// The wire code this failure reports (P-001): callers match the code,
+    /// never the message.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::NotOneSegment { .. } => ErrorCode::InvalidInput,
+            Self::Acquire { .. } => ErrorCode::DependencyBlocked,
+            Self::Superseded { .. } => ErrorCode::StaleIntent,
+            Self::AlreadyRetired { .. } => ErrorCode::AlreadyTerminal,
+            Self::Unknown { .. } => ErrorCode::NotFound,
+        }
+    }
+}
+
+/// One capability generation: the resources it acquired during prepare and
+/// still owns.
+///
+/// A generation is prepared as a draft and becomes current only through
+/// [`CapabilityGenerations::publish`]. The holder owns its root, so a draft
+/// that is dropped — a failed prepare, a refused publish, a cancelled task —
+/// releases everything it acquired instead of leaving a half-equipped
+/// executor behind (AC-015).
+#[derive(Debug, PartialEq)]
 pub struct ResourceHolder {
     pub resource_scope: String,
     pub executor_id: String,
     pub owner_generation: u64,
     pub status: ResourceHolderStatus,
+    /// Taken by the first release, so a second release is a no-op.
+    root: Option<PathBuf>,
+    acquired: Vec<PathBuf>,
+}
+
+impl ResourceHolder {
+    /// The dependency roots this generation acquired; [`Self::status`]
+    /// reports whether they are still live.
+    #[must_use]
+    pub fn acquired(&self) -> &[PathBuf] {
+        &self.acquired
+    }
+
+    /// Releases the generation's own root and records what that proved.
+    /// [`CapabilityGenerations::dispose`] calls it to return the disposition;
+    /// [`Drop`] calls it as the backstop, so it is idempotent.
+    fn release(&mut self) -> ResourceHolderStatus {
+        let Some(root) = self.root.take() else {
+            return self.status;
+        };
+        self.status = release_root(&root);
+        self.status
+    }
+}
+
+impl Drop for ResourceHolder {
+    fn drop(&mut self) {
+        self.status = self.release();
+    }
+}
+
+/// Removes one generation root and reports what that proved. A root that is
+/// already absent counts as released; any other failure leaves the
+/// disposition unproven rather than claiming a release nobody observed.
+fn release_root(root: &Path) -> ResourceHolderStatus {
+    match std::fs::remove_dir_all(root) {
+        Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => {
+            ResourceHolderStatus::TerminationUnknown
+        }
+        _ => ResourceHolderStatus::Terminated,
+    }
+}
+
+/// Whether `value` names exactly one ordinary path segment, so a scope or
+/// dependency name can never address anything outside its generation root.
+fn is_one_segment(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// The refusal for a name that would escape the generation root.
+fn not_one_segment(field: &'static str, value: &str) -> ResourceError {
+    ResourceError::NotOneSegment {
+        field,
+        value: value.to_string(),
+    }
+}
+
+/// The one owner of the current capability generation.
+///
+/// Publishing is a single transition: the prepared generation becomes
+/// current and the generation it replaces stops owning its resources in the
+/// same step, so a reader never sees two current generations and never sees
+/// a generation whose root is half-written. A disposer carries the
+/// generation it was minted for and is compared before anything is touched,
+/// so an older generation cannot retire a newer registration of the same
+/// name (AC-015).
+#[derive(Debug, Default)]
+pub struct CapabilityGenerations {
+    next_generation: u64,
+    current: Option<ResourceHolder>,
+    retired: VecDeque<u64>,
+}
+
+impl CapabilityGenerations {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The root one generation owns for one scope name. Generations never
+    /// share a root, so a failed or retired generation cannot release
+    /// another generation's resources.
+    #[must_use]
+    pub fn generation_root(parent: &Path, resource_scope: &str, generation: u64) -> PathBuf {
+        parent.join(format!("{resource_scope}-{generation}"))
+    }
+
+    /// Prepares the next capability generation: its number is reserved, then
+    /// one directory per dependency is acquired under the generation root.
+    /// Nothing is current until [`Self::publish`]; a failure releases every
+    /// root this prepare created and leaves the current generation untouched.
+    ///
+    /// # Errors
+    /// Returns [`ResourceError::NotOneSegment`] for a scope or dependency
+    /// name that is not exactly one path segment, and
+    /// [`ResourceError::Acquire`] when a root cannot be created — including
+    /// the repeated dependency that would otherwise acquire one root twice.
+    pub fn prepare(
+        &mut self,
+        parent: &Path,
+        executor_id: &str,
+        resource_scope: &str,
+        dependencies: &[&str],
+    ) -> Result<ResourceHolder, ResourceError> {
+        if !is_one_segment(resource_scope) {
+            return Err(not_one_segment("resource scope", resource_scope));
+        }
+        for dependency in dependencies {
+            if !is_one_segment(dependency) {
+                return Err(not_one_segment("dependency", dependency));
+            }
+        }
+        // A number is reserved even when the acquire fails: a reissued
+        // generation would let a new registration inherit an old number's
+        // record. The non-idempotent create of the root is the compare-and-set
+        // that catches a reused number.
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let root = Self::generation_root(parent, resource_scope, generation);
+        std::fs::create_dir(&root).map_err(|source| ResourceError::Acquire {
+            boundary: "capability.prepare.root",
+            source,
+            disposition: ResourceHolderStatus::Terminated,
+        })?;
+        let mut acquired = Vec::with_capacity(dependencies.len());
+        for dependency in dependencies {
+            let path = root.join(dependency);
+            if let Err(source) = std::fs::create_dir(&path) {
+                let disposition = release_root(&root);
+                return Err(ResourceError::Acquire {
+                    boundary: "capability.prepare.dependency",
+                    source,
+                    disposition,
+                });
+            }
+            acquired.push(path);
+        }
+        Ok(ResourceHolder {
+            resource_scope: resource_scope.to_string(),
+            executor_id: executor_id.to_string(),
+            owner_generation: generation,
+            status: ResourceHolderStatus::Active,
+            root: Some(root),
+            acquired,
+        })
+    }
+
+    /// Publishes one prepared generation as current in a single step: the
+    /// generation it replaces stops being current and releases its owned
+    /// resources in the same transition.
+    ///
+    /// # Errors
+    /// Returns [`ResourceError::Superseded`] when `prepared` is not newer
+    /// than the current generation; the refused draft releases what it
+    /// acquired and publishes nothing.
+    pub fn publish(&mut self, prepared: ResourceHolder) -> Result<(), ResourceError> {
+        if let Some(current) = self.current.as_ref()
+            && prepared.owner_generation <= current.owner_generation
+        {
+            return Err(ResourceError::Superseded {
+                carried: prepared.owner_generation,
+                current: current.owner_generation,
+            });
+        }
+        if let Some(retired) = self.current.replace(prepared) {
+            self.retire(retired.owner_generation);
+        }
+        Ok(())
+    }
+
+    /// Publishes one prepared generation when a launch's child starts.
+    ///
+    /// This moment cannot refuse: the child is already running, so a
+    /// generation a newer launch published first is not a failure — the newer
+    /// registration stays current, and the refused draft releases the roots it
+    /// acquired. That superseded refusal is the one [`Self::publish`]
+    /// produces.
+    pub fn publish_started(&mut self, prepared: ResourceHolder) {
+        if let Err(refused) = self.publish(prepared) {
+            // The refused draft released its own roots on the way out; the
+            // newer registration keeps its resources and its rights.
+            drop(refused);
+        }
+    }
+
+    /// Releases one prepared generation that never became current: every root
+    /// it acquired is released and its number is retired, so no later publish
+    /// can reach it and a disposer carrying it reports a retired generation
+    /// rather than an unknown one. The current generation keeps its resources
+    /// and its rights.
+    pub fn abandon(&mut self, mut prepared: ResourceHolder) -> ResourceHolderStatus {
+        let disposition = prepared.release();
+        self.retire(prepared.owner_generation);
+        disposition
+    }
+
+    /// Disposes one generation by its number. The number must still be the
+    /// current one: a disposer carrying an older or already-retired
+    /// generation is refused before anything is touched, so it can never
+    /// retire a newer registration or reach that registration's resources.
+    ///
+    /// # Errors
+    /// Returns [`ResourceError::AlreadyRetired`] when the number was already
+    /// retired, and [`ResourceError::Unknown`] when this registry never made
+    /// it current or retention has dropped its number.
+    pub fn dispose(&mut self, generation: u64) -> Result<ResourceHolderStatus, ResourceError> {
+        // `take_if` is the whole transition: the generation is removed only
+        // when the registry still carries exactly that number.
+        let Some(mut current) = self
+            .current
+            .take_if(|holder| holder.owner_generation == generation)
+        else {
+            return Err(self.stale_refusal(generation));
+        };
+        let disposition = current.release();
+        self.retire(generation);
+        Ok(disposition)
+    }
+
+    /// The current registration of one executor name, when the published
+    /// generation answers to it. A retired generation's registration is
+    /// gone; a stale disposer cannot answer for it.
+    #[must_use]
+    pub fn registered(&self, executor_id: &str) -> Option<&ResourceHolder> {
+        self.current
+            .as_ref()
+            .filter(|holder| holder.executor_id == executor_id)
+    }
+
+    /// The published generation number, or `None` when nothing is current.
+    #[must_use]
+    pub fn current_generation(&self) -> Option<u64> {
+        self.current.as_ref().map(|holder| holder.owner_generation)
+    }
+
+    /// The refusal for a number that cannot dispose the current generation.
+    fn stale_refusal(&self, generation: u64) -> ResourceError {
+        if self.retired.contains(&generation) {
+            ResourceError::AlreadyRetired { generation }
+        } else {
+            ResourceError::Unknown {
+                carried: generation,
+            }
+        }
+    }
+
+    /// Records one retired number. The window is bounded so the registry
+    /// cannot grow with every publish; a number past it reports unknown,
+    /// never another generation's answer.
+    fn retire(&mut self, generation: u64) {
+        self.retired.push_back(generation);
+        while self.retired.len() > CAPABILITY_GENERATION_RETENTION {
+            self.retired.pop_front();
+        }
+    }
+}
+
+/// The one capability registry this process owns: every launch prepares,
+/// publishes and releases its generation through it, so a generation is
+/// current in exactly one place however many launches this binary runs.
+static CAPABILITY_GENERATIONS: LazyLock<Mutex<CapabilityGenerations>> =
+    LazyLock::new(|| Mutex::new(CapabilityGenerations::new()));
+
+/// The process-wide capability registry.
+///
+/// A lock a panicking launch poisoned is recovered rather than propagated: the
+/// registry still owns the current generation's resources, and refusing every
+/// later launch would leak the registration it holds.
+pub fn capability_generations() -> MutexGuard<'static, CapabilityGenerations> {
+    CAPABILITY_GENERATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Debug, Clone, PartialEq)]

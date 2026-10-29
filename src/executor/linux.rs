@@ -868,6 +868,10 @@ fn run_confined_inner(
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     let mut command = helper_launch_command()?;
+    // The launch owns its capability generation before the program artifact is
+    // transferred into it, so no confined run reaches a partially equipped
+    // generation (AC-015).
+    command.prepare_capability()?;
     command
         .arg(&launcher.unshare)
         .arg("--user")

@@ -2294,6 +2294,19 @@ fn refusal_or_fault(view: &mut LocalView, command: &str, error: io::Error) -> io
     }
 }
 
+/// The loop's dispatch, handed the directory the TUI was started in: that
+/// root is the instruction scope discovery walks (AC-076), the same hand the
+/// headless entry makes, so both entries discover the same files. A working
+/// directory that cannot be read hands no root and discovers nothing — never
+/// a failed open.
+fn open_dispatch(data_root: &Path) -> Result<TuiDispatch, TuiOpenError> {
+    let mut dispatch = TuiDispatch::open(data_root)?;
+    dispatch
+        .runtime
+        .set_instructions_root(std::env::current_dir().ok());
+    Ok(dispatch)
+}
+
 /// The loop's dispatch, opened on the first command that needs it. A
 /// failed open's carried verdicts fold into the propagated error: the
 /// alternate screen owns the terminal, so stderr is a dead channel here.
@@ -2303,7 +2316,7 @@ fn ensure_dispatch<'a>(
     data_root: &Path,
 ) -> io::Result<&'a mut TuiDispatch> {
     if tui_dispatch.is_none() {
-        let dispatch = TuiDispatch::open(data_root).map_err(TuiOpenError::into_io_error)?;
+        let dispatch = open_dispatch(data_root).map_err(TuiOpenError::into_io_error)?;
         surface_boot_diagnostics(view, &dispatch.runtime);
         *tui_dispatch = Some(dispatch);
     }
@@ -2464,7 +2477,7 @@ where
     // tty I/O, so a failed open's stderr verdicts stay on the primary
     // screen — and the transcript records them for the operator who
     // watches the degraded session that follows.
-    let mut tui_dispatch = match TuiDispatch::open(data_root) {
+    let mut tui_dispatch = match open_dispatch(data_root) {
         Ok(dispatch) => {
             surface_boot_diagnostics(&mut view, &dispatch.runtime);
             Some(dispatch)

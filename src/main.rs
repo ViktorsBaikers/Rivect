@@ -206,6 +206,11 @@ fn run_headless(data_root: &Path) -> i32 {
             return 1;
         }
     };
+    // The run's instruction scope is the directory it was started in (AC-076):
+    // discovery walks that root's ancestors, so the project's own instruction
+    // files reach the assembled request. A working directory that cannot be
+    // read hands no root and discovers nothing — never a failed boot.
+    runtime.set_instructions_root(std::env::current_dir().ok());
     // Boot recovery verdicts a human must resolve report on stderr —
     // machine stdout stays pure JSON.
     for diagnostic in &runtime.boot_diagnostics {

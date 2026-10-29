@@ -38,7 +38,10 @@ use rivect::config::{
     Config, ConfigIssue, ConnKind, EffortAssign, EffortLevel, FixedModel, ModelAssign, Stage,
 };
 use rivect::contracts::{Availability, MODEL_WIRE_MAX_BYTES, OptionId, Question, QuestionOption};
-use rivect::model::{Broker, CandidateRejection, ModelError, RejectionCause, RequestManifest};
+use rivect::model::{
+    Broker, CallContract, CandidateRejection, EpochMutationReason, ModelError, RejectionCause,
+    RequestManifest,
+};
 use rivect::providers::{Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::UsageDelta;
 use serde_json::json;
@@ -410,6 +413,450 @@ fn epoch_replays_bytewise_and_opens_on_model_switch() {
         .expect("manifest");
     assert_eq!(restored.epoch_id, first.epoch_id);
     assert_eq!(restored.mutation_reason.as_deref(), Some("model switch"));
+}
+
+#[test]
+fn epoch_is_bytewise_stable_for_an_irrelevant_tick_p1() {
+    let config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+
+    // topic and counter churn ride the user channel, after the separator
+    let first = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/epoch",
+            "topic: alpha\ngoal: counter 1",
+        )
+        .expect("manifest");
+    let ticked = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/epoch",
+            "topic: beta\ngoal: counter 2",
+        )
+        .expect("manifest");
+    assert_ne!(
+        first.wire_bytes(),
+        ticked.wire_bytes(),
+        "the tick really moved the request bytes"
+    );
+    assert_eq!(
+        wire_prefix(&first.wire_bytes()),
+        wire_prefix(&ticked.wire_bytes()),
+        "an irrelevant tick never rewrites the model-visible envelope"
+    );
+    assert_eq!(
+        first.epoch_id, ticked.epoch_id,
+        "an unchanged envelope replays the epoch instead of re-keying it"
+    );
+    assert_eq!(ticked.mutation_reason, None);
+    assert_eq!(
+        ticked.epoch_cost, None,
+        "an irrelevant tick records no expected rewrite cost"
+    );
+}
+
+#[test]
+fn system_change_opens_its_own_epoch_p2() {
+    let config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let baseline = CallContract {
+        instructions: "decision core v1",
+        tools: &[],
+    };
+    // the learned instruction delta of INV-009a: same tools, same model,
+    // one more system line
+    let learned = CallContract {
+        instructions: "decision core v1\nprefer the smallest diff",
+        tools: &[],
+    };
+
+    let first = broker
+        .prepare_call("main", &config, "/world/epoch", "goal: fixture", &baseline)
+        .expect("manifest");
+    assert_eq!(first.mutation_reason, None);
+    let changed = broker
+        .prepare_call("main", &config, "/world/epoch", "goal: fixture", &learned)
+        .expect("manifest");
+
+    assert_eq!(
+        first.instructions, "decision core v1",
+        "the retired request keeps its own frozen instructions"
+    );
+    assert_ne!(changed.epoch_id, first.epoch_id);
+    assert_eq!(
+        changed.mutation_reason.as_deref(),
+        Some("system change"),
+        "a changed instruction set is a system change, never a model switch"
+    );
+    let cost = changed
+        .epoch_cost
+        .expect("a prefix mutation records its expected rewrite cost");
+    assert_eq!(cost.reason, EpochMutationReason::SystemChange);
+    assert_eq!(
+        cost.replaced_part, "instructions",
+        "the record names the part the mutation replaces"
+    );
+    assert_eq!(
+        cost.expected_rewrite_bytes,
+        wire_prefix(&changed.wire_bytes()).len(),
+        "the rewritten cache tail starts at the first envelope part"
+    );
+}
+
+#[test]
+fn tools_change_opens_its_own_epoch_p3() {
+    let config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let narrow = CallContract {
+        instructions: "decision core v1",
+        tools: &[],
+    };
+    let widened = CallContract {
+        instructions: "decision core v1",
+        tools: &["read_file"],
+    };
+
+    let first = broker
+        .prepare_call("main", &config, "/world/epoch", "goal: fixture", &narrow)
+        .expect("manifest");
+    assert_eq!(first.mutation_reason, None);
+    let changed = broker
+        .prepare_call("main", &config, "/world/epoch", "goal: fixture", &widened)
+        .expect("manifest");
+
+    assert_eq!(changed.instructions, first.instructions);
+    assert_ne!(changed.tools, first.tools);
+    assert_ne!(changed.epoch_id, first.epoch_id);
+    assert_eq!(
+        changed.mutation_reason.as_deref(),
+        Some("tools change"),
+        "a changed tool surface is a tools change, never a model switch"
+    );
+    let cost = changed
+        .epoch_cost
+        .expect("a prefix mutation records its expected rewrite cost");
+    assert_eq!(cost.reason, EpochMutationReason::ToolsChange);
+    assert_eq!(cost.replaced_part, "tools");
+    assert_eq!(
+        cost.expected_rewrite_bytes,
+        format!(
+            "tools: read_file\noutput-reserve: {}",
+            changed.output_reserve
+        )
+        .len(),
+        "only the envelope tail from the tool surface is rewritten"
+    );
+}
+
+#[test]
+fn model_switch_opens_its_own_epoch_p4() {
+    let first_config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let switched_config = Config::parse_validated(&local_config(
+        "model-b",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let base = CallContract {
+        instructions: "decision core v1",
+        tools: &[],
+    };
+    let widened = CallContract {
+        instructions: "decision core v1",
+        tools: &["read_file"],
+    };
+
+    // one part moves at a time, so each epoch names only its own cause
+    let opened = broker
+        .prepare_call(
+            "main",
+            &first_config,
+            "/world/epoch",
+            "goal: fixture",
+            &base,
+        )
+        .expect("manifest");
+    assert_eq!(opened.mutation_reason, None);
+    let tools = broker
+        .prepare_call(
+            "main",
+            &first_config,
+            "/world/epoch",
+            "goal: fixture",
+            &widened,
+        )
+        .expect("manifest");
+    let system = broker
+        .prepare("main", &first_config, "/world/epoch", "goal: fixture")
+        .expect("manifest");
+    let switched = broker
+        .prepare("main", &switched_config, "/world/epoch", "goal: fixture")
+        .expect("manifest");
+
+    assert_eq!(tools.mutation_reason.as_deref(), Some("tools change"));
+    assert_eq!(system.mutation_reason.as_deref(), Some("system change"));
+    assert_eq!(
+        switched.mutation_reason.as_deref(),
+        Some("model switch"),
+        "only a resolved model change is a model switch"
+    );
+    let costs = [
+        system.epoch_cost.expect("system change cost"),
+        tools.epoch_cost.expect("tools change cost"),
+        switched.epoch_cost.expect("model switch cost"),
+    ];
+    let cost = costs[2];
+    assert_eq!(cost.reason, EpochMutationReason::ModelSwitch);
+    assert_eq!(cost.replaced_part, "model");
+    assert!(
+        cost.expected_rewrite_bytes > 0
+            && cost.expected_rewrite_bytes < wire_prefix(&switched.wire_bytes()).len(),
+        "the rewrite starts at the model line, behind the unchanged instructions: {cost:?}"
+    );
+    // the three causes are distinct records, each naming its own part
+    let mut parts: Vec<&str> = costs.iter().map(|cost| cost.replaced_part).collect();
+    parts.sort_unstable();
+    assert_eq!(parts, vec!["instructions", "model", "tools"]);
+    let mut reasons: Vec<String> = costs.iter().map(|cost| cost.reason.to_string()).collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec!["model switch", "system change", "tools change"]
+    );
+}
+
+#[test]
+fn compaction_is_not_a_prefix_mutation_p5() {
+    // Compaction lives in the store and never sees the broker, so this is
+    // the guard: the folded history rides the request body while the
+    // envelope and its epoch stay byte-identical. A future change that
+    // put the history into the envelope turns this case red.
+    let mut world =
+        support::open_world("epoch-compaction", Some(&support::config_distinct_pools()));
+    let session = world.open_session("epoch-compaction");
+    let task = world.create_task(&session, "cmd-epoch-compaction");
+    // the obligations are the rows evidence is recorded against
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&task)
+        .expect("obligations");
+    let scope = format!("task:{}", task.0);
+    for index in 0..4_u8 {
+        world
+            .runtime
+            .store_writer()
+            .insert_evidence(
+                &task,
+                0,
+                &scope,
+                &format!(
+                    "read the scope and reported {}",
+                    "a scoped line of the file ".repeat(30)
+                ),
+                &format!("{index:02x}").repeat(32),
+            )
+            .expect("evidence row");
+    }
+    let config = world.runtime.config_for_broker();
+    let before = world
+        .runtime
+        .store()
+        .assembled_context(&task)
+        .expect("assembled context");
+    let first = world
+        .runtime
+        .broker
+        .prepare("backend_task", &config, "/world/epoch", &before.text)
+        .expect("manifest");
+
+    let report = world
+        .runtime
+        .store_writer()
+        .force_compaction(&session, &task)
+        .expect("forced compaction");
+    let after = world
+        .runtime
+        .store()
+        .assembled_context(&task)
+        .expect("assembled context");
+
+    assert!(report.folded_records >= 4, "the fold took the records");
+    assert!(
+        after.history.len() < before.history.len(),
+        "the fold really shortened the history: {} -> {}",
+        before.history.len(),
+        after.history.len()
+    );
+    assert!(before.text.contains(&before.history));
+    let next = world
+        .runtime
+        .broker
+        .prepare("backend_task", &config, "/world/epoch", &after.text)
+        .expect("manifest");
+
+    assert_eq!(
+        wire_prefix(&first.wire_bytes()),
+        wire_prefix(&next.wire_bytes()),
+        "a compaction is not a prefix mutation"
+    );
+    assert_eq!(
+        first.epoch_id, next.epoch_id,
+        "the replay lineage is never re-keyed by a compaction"
+    );
+    assert_eq!(next.mutation_reason, None);
+    assert_eq!(next.epoch_cost, None, "a non-prefix event costs no rewrite");
+    let next_wire = next.wire_bytes();
+    let envelope = wire_prefix(&next_wire);
+    assert!(
+        !envelope.contains(before.history.trim()) && !envelope.contains(after.history.trim()),
+        "neither the assembled nor the folded history enters the envelope"
+    );
+    let first_wire = first.wire_bytes();
+    assert!(
+        first_wire.contains(before.history.trim()) && next_wire.contains(after.history.trim()),
+        "the history rides the request body, which is why the envelope stays stable"
+    );
+}
+
+#[test]
+fn revoked_instruction_is_applied_in_the_next_request_p6() {
+    // An applicable instruction is withdrawn between two prepares: the
+    // next request carries the instruction set without it even though
+    // the provider cache loses the prefix. The retired request keeps its
+    // own frozen bytes — the correction applies forward, never backwards.
+    let config = Config::parse_validated(&local_config(
+        "model-a",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let (mut broker, sent) = recording_broker();
+    let mut applicable = vec!["decision core v1", "prefer the smallest diff"];
+    let original = applicable.join("\n");
+    let before = broker
+        .prepare_call(
+            "main",
+            &config,
+            "/world/epoch",
+            "goal: fixture",
+            &CallContract {
+                instructions: &original,
+                tools: &[],
+            },
+        )
+        .expect("manifest");
+
+    applicable.retain(|line| !line.contains("smallest diff"));
+    let revoked = applicable.join("\n");
+    let next = broker
+        .prepare_call(
+            "main",
+            &config,
+            "/world/epoch",
+            "goal: fixture",
+            &CallContract {
+                instructions: &revoked,
+                tools: &[],
+            },
+        )
+        .expect("manifest");
+
+    assert!(before.instructions.contains("prefer the smallest diff"));
+    assert!(
+        !next.instructions.contains("prefer the smallest diff"),
+        "the revoked instruction is gone from the next request: {}",
+        next.instructions
+    );
+    assert_eq!(
+        before.instructions, original,
+        "the retired request is never rewritten in place"
+    );
+    assert_ne!(
+        wire_prefix(&before.wire_bytes()),
+        wire_prefix(&next.wire_bytes()),
+        "the changed instruction bytes open a new envelope"
+    );
+    assert_ne!(
+        next.epoch_id, before.epoch_id,
+        "no cached prefix is reused for a revoked instruction"
+    );
+    assert_eq!(next.mutation_reason.as_deref(), Some("system change"));
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "no stale prefix was re-sent"
+    );
+}
+
+#[test]
+fn revoked_right_blocks_the_next_dispatch_p7() {
+    let config = Config::parse_validated(&pools_config()).expect("valid");
+    let (mut broker, sent) = recording_broker();
+    broker.set_account_rights(&["local".to_string()]);
+    let frozen = broker
+        .prepare("main", &config, "/world/rights", "goal: fixture")
+        .expect("the entitled candidate ranks");
+
+    // the grant is revoked between two prepares: no next request is
+    // prepared for it, so no reused prefix can carry it forward
+    broker.set_account_rights(&[]);
+    let refused = broker
+        .prepare("main", &config, "/world/rights", "goal: fixture")
+        .expect_err("a revoked grant admits no next request");
+    assert!(
+        matches!(
+            &refused,
+            ModelError::NoEligibleCandidate { rejected, .. }
+                if rejected
+                    .iter()
+                    .any(|entry| matches!(entry.cause, RejectionCause::NotEntitled))
+        ),
+        "wrong refusal: {refused}"
+    );
+
+    // the frozen prefix is never re-sent either: the dispatch refuses
+    // typed instead of replaying bytes the revoked grant authorized
+    let blocked = broker
+        .dispatch("/world/rights", &frozen)
+        .expect_err("a revoked grant never ships the frozen prefix");
+    assert!(
+        matches!(
+            &blocked,
+            ModelError::EligibilityStale {
+                attempt_id,
+                connection,
+                frozen: 1,
+                current: 2,
+            } if attempt_id == &frozen.attempt_id && connection == "local"
+        ),
+        "wrong rejection: {blocked}"
+    );
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "the revoked dispatch never reached the provider"
+    );
+    assert!(
+        broker.accounting_record(&frozen.attempt_id).is_none(),
+        "a blocked send is never accounted"
+    );
 }
 
 #[test]

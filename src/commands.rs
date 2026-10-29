@@ -5,7 +5,7 @@
 use crate::config::{self, EffectiveConfig};
 use crate::context::{ContextError, IsolatedCause};
 use crate::contracts::{
-    AnswerSelection, CommandId, CommandResult, ErrorCode, Lifecycle, LocalCommand,
+    AnswerSelection, CommandId, CommandResult, EffectClass, ErrorCode, Lifecycle, LocalCommand,
     LocalCommandResult, OptionId, PAGE_DEFAULT, PAGE_MAX, Page, ProjectInitResult, QuestionId,
     QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId, TaskId,
     WireError,
@@ -14,6 +14,7 @@ use crate::index::{
     CarryPolicy, Completeness, GenerationState, IndexWatcher, PartialReason, ProjectGraph,
     SnapshotId, StaleCause,
 };
+use crate::learning::{LearningDefinition, LearningStatus};
 use crate::lsp::MAX_INDEX_PARSE_TIME;
 use crate::model::{Broker, PendingFallback, RequestManifest};
 use crate::owner::{Owner, OwnerError};
@@ -101,6 +102,10 @@ pub struct Runtime {
     pub purpose: String,
     pub scope_root: PathBuf,
     pub scoped_file: PathBuf,
+    /// The data root this runtime serves. Operator-controlled retained
+    /// artifacts live under it, outside every disposable child tree, so a
+    /// cleanup cannot take the evidence with it.
+    pub data_root: PathBuf,
     /// Grant id matching the scoped read pair; scheduler nodes freeze it
     /// at answer time and their decision steps re-check it.
     pub scoped_grant: String,
@@ -110,11 +115,24 @@ pub struct Runtime {
     /// The one injected backend seam; defaults to the platform worker
     /// (Linux Landlock/seccomp/netns on Linux, Seatbelt elsewhere).
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
+    /// The credential seam an MCP server binding resolves its declared
+    /// reference through (INV-011). A surface that owns real material
+    /// injects its store; while none is bound a declared reference is
+    /// refused instead of resolved from nowhere.
+    pub mcp_credentials: Option<Box<dyn crate::providers::CredentialStore>>,
     /// Boot-time publication-recovery verdicts a human must resolve:
     /// collected, sanitized lines with their resolution. Each surface
     /// reports them its own way — headless stderr, TUI transcript — and
     /// receipted rows stay silent.
     pub boot_diagnostics: Vec<String>,
+    /// The checkpoint this open's cutover had to abandon (EDGE-006): a
+    /// stopped cutover's document that this build cannot resume is
+    /// replaced, never a wedge, and the discard is reported instead of
+    /// happening silently. `None` when nothing was discarded. Served on
+    /// `runtime.status` beside the boot line that names it, because
+    /// `doctor` is unbuilt and the base ledger has no command of its own
+    /// (DX-I2).
+    pub base_recovery: Option<config::BaseDocument>,
     /// Tasks paused on a manual-fallback choice (AC-045): the broker
     /// attempt stays admitted while the served question waits for its
     /// answer — cancellation tombstones the attempt through this map,
@@ -515,6 +533,45 @@ impl Runtime {
         self.owner.store.writer()
     }
 
+    /// Activates one learned delta and installs the definition the store now
+    /// composes on this runtime's broker, so the request seam and the selection
+    /// seam read one definition inside one process: an activation takes effect
+    /// on the next prepare without a restart.
+    ///
+    /// # Errors
+    /// See [`crate::state::TaskStore::activate_learning_delta`].
+    pub fn activate_learning_delta(
+        &mut self,
+        delta_id: &str,
+        expected_version: u64,
+    ) -> Result<LearningDefinition, StoreError> {
+        let definition = self
+            .owner
+            .store
+            .activate_learning_delta(delta_id, expected_version)?;
+        self.broker.set_learning_definition(definition.clone());
+        Ok(definition)
+    }
+
+    /// Withdraws one active learned delta and installs the definition the store
+    /// now composes, so a rolled-back body stops riding the very next request
+    /// instead of the one after a restart.
+    ///
+    /// # Errors
+    /// See [`crate::state::TaskStore::roll_back_learning_delta`].
+    pub fn roll_back_learning_delta(
+        &mut self,
+        delta_id: &str,
+        expected_version: u64,
+    ) -> Result<LearningDefinition, StoreError> {
+        let definition = self
+            .owner
+            .store
+            .roll_back_learning_delta(delta_id, expected_version)?;
+        self.broker.set_learning_definition(definition.clone());
+        Ok(definition)
+    }
+
     /// The policy mutators, bound to this runtime's own store.
     pub fn policy_writer(&mut self) -> PolicyWriter<'_> {
         PolicyWriter {
@@ -523,23 +580,29 @@ impl Runtime {
         }
     }
 
-    /// An executor over this runtime's own policy, store and read worker.
+    /// An executor over this runtime's own policy, store and read worker,
+    /// carrying the document's hook declarations so admission consults them at
+    /// its one instrumented event.
     pub fn executor(&mut self) -> crate::executor::Executor<'_> {
+        let hooks = self.effective.parsed.as_ref().map(|config| &config.hooks);
         crate::executor::Executor::new(
             &mut self.policy,
             &mut self.owner.store,
             self.read_worker.as_mut(),
         )
+        .with_hooks(hooks)
     }
 
     /// An executor over this runtime's policy and store with a caller's
     /// worker: the worker is the public injection seam, never part of
-    /// the policy/store binding.
+    /// the policy/store binding. The document's hooks still apply.
     pub fn executor_with_worker<'a>(
         &'a mut self,
         worker: &'a mut dyn crate::executor::ReadWorker,
     ) -> crate::executor::Executor<'a> {
+        let hooks = self.effective.parsed.as_ref().map(|config| &config.hooks);
         crate::executor::Executor::new(&mut self.policy, &mut self.owner.store, worker)
+            .with_hooks(hooks)
     }
 
     /// An executor that merges identical permitted reads in `flights`.
@@ -547,12 +610,14 @@ impl Runtime {
         &'a mut self,
         flights: &'a mut crate::resources::ReadFlights,
     ) -> crate::executor::Executor<'a> {
+        let hooks = self.effective.parsed.as_ref().map(|config| &config.hooks);
         crate::executor::Executor::with_flights(
             &mut self.policy,
             &mut self.owner.store,
             self.read_worker.as_mut(),
             flights,
         )
+        .with_hooks(hooks)
     }
 
     /// The borrowed surfaces an action handler reads, over this runtime's
@@ -607,11 +672,7 @@ impl PolicyWriter<'_> {
     }
 
     /// Grants `classes` on `scope_root` and returns the grant id.
-    pub fn grant_classes(
-        &mut self,
-        scope_root: PathBuf,
-        classes: Vec<crate::contracts::EffectClass>,
-    ) -> String {
+    pub fn grant_classes(&mut self, scope_root: PathBuf, classes: Vec<EffectClass>) -> String {
         self.policy.grant_classes(scope_root, classes)
     }
 
@@ -772,20 +833,56 @@ impl Runtime {
             Ok(lines) => boot_diagnostics.extend(lines),
             Err(error) => return Err(OpenError::new(error, boot_diagnostics)),
         }
-        let fail_open =
-            |error: OwnerError| -> OpenError { OpenError::new(error, boot_diagnostics.clone()) };
         let config_path = data_root.join("config.toml");
-        let user_toml =
-            crate::owner::read_user_config(&config_path, CONFIG_MAX_BYTES).map_err(&fail_open)?;
+        let user_toml = crate::owner::read_user_config(&config_path, CONFIG_MAX_BYTES)
+            .map_err(|error| open_failure(error, &boot_diagnostics))?;
         let effective = config::resolve_effective(user_toml.as_deref()).map_err(|source| {
-            fail_open(OwnerError::Config {
-                path: config_path.clone(),
-                source,
-            })
+            open_failure(
+                OwnerError::Config {
+                    path: config_path.clone(),
+                    source,
+                },
+                &boot_diagnostics,
+            )
         })?;
+        // The base the effective view was composed from is the base the ledger
+        // records (AC-054): the write surface resolves and installs it in the
+        // same call, so a receipt can never name a base this open did not read
+        // — and a store whose recorded base this build cannot step from fails
+        // the open instead of serving a base it did not install. A checkpoint
+        // the cutover had to clear (EDGE-006) is reported, not swallowed.
+        let served = owner
+            .store
+            .serve_base(&config::BaseInstall::new(
+                config::BaseSource::SHIPPED,
+                config_path.clone(),
+                data_root.to_path_buf(),
+            ))
+            .map_err(|error| open_failure(base_open_failure(error), &boot_diagnostics))?;
+        let base_recovery = served.abandoned;
+        // Every verdict a human must resolve reaches the boot channel — the
+        // publication recoveries collected above and the checkpoint this
+        // cutover cleared alike — so a surface that only prints boot lines
+        // still names the recovery and its resolution, and a failure after this
+        // step still carries the line into the failed open (DX-I2).
+        if let Some(abandoned) = &base_recovery {
+            boot_diagnostics.push(base_recovery_diagnostic(
+                abandoned,
+                served.receipt.base_version,
+            ));
+        }
         let supervisor = Supervisor::new(SupervisorPolicy::default())
-            .map_err(|source| fail_open(source.into()))?;
+            .map_err(|source| open_failure(source.into(), &boot_diagnostics))?;
         let off_state = Arc::new(crate::executor::WorkflowOffState::new(&effective));
+        // The learned definition the next request composes comes from the
+        // store (AC-051). Installing it on the broker is what makes an
+        // activated delta take effect without a per-request call and without
+        // a model call; a store that cannot be read this way fails the open,
+        // so no runtime serves a request with a definition it did not read.
+        let learned = owner
+            .store
+            .learning_definition()
+            .map_err(|error| open_failure(OwnerError::from(error), &boot_diagnostics))?;
         let mut runtime = Self {
             owner,
             policy: Policy::default(),
@@ -798,11 +895,14 @@ impl Runtime {
             purpose: String::new(),
             scope_root: PathBuf::new(),
             scoped_file: PathBuf::new(),
+            data_root: data_root.to_path_buf(),
             scoped_grant: String::new(),
             config_path,
             provider_calls: 0,
             read_worker,
+            mcp_credentials: None,
             boot_diagnostics,
+            base_recovery,
             paused_attempts: BTreeMap::new(),
             index: IndexSeam {
                 root: data_root.to_path_buf(),
@@ -831,6 +931,7 @@ impl Runtime {
         // config from boot (AC-045b); every admitted config edit
         // re-pushes it through the same seam.
         runtime.broker.set_config(&runtime.config_for_broker());
+        runtime.broker.set_learning_definition(learned);
         Ok(runtime)
     }
 
@@ -858,8 +959,17 @@ impl Runtime {
         grant
     }
 
+    /// Pins the root the next assembly discovers instruction files under
+    /// (AC-076): the CLI entry hands the directory the run was started in, so
+    /// discovery walks that root's ancestors and a file in a scope above it
+    /// still contributes. A run handed none discovers nothing, and a working
+    /// directory that cannot be read hands none rather than failing the boot.
+    pub fn set_instructions_root(&mut self, root: Option<PathBuf>) {
+        self.broker.set_instructions_root(root);
+    }
+
     pub fn config_for_broker(&self) -> config::Config {
-        self.effective.parsed.clone().unwrap_or_default()
+        self.effective.composed()
     }
 
     /// The applied effective config snapshot: a borrowed read of what
@@ -1014,6 +1124,22 @@ impl OpenError {
         &self.diagnostics
     }
 
+    /// The base-ledger refusal this open failed on, when it failed on one
+    /// (P-001). [`OwnerError`] has no base variant, so the verdict rides the
+    /// store's storage slot; the refusal stays typed inside it, so a caller
+    /// reads the class the base domain gives it — `conflict` for a recorded
+    /// document whose bytes changed — instead of the slot's
+    /// `storage_unavailable`, which would report a document conflict as an
+    /// unavailable backend.
+    pub fn base_refusal(&self) -> Option<&config::BaseError> {
+        match &self.cause {
+            OwnerError::Store(StoreError::Storage(source)) => {
+                source.downcast_ref::<config::BaseError>()
+            }
+            _ => None,
+        }
+    }
+
     /// The underlying open failure, for callers owning an
     /// [`OwnerError`]-typed surface.
     pub fn into_source(self) -> OwnerError {
@@ -1046,12 +1172,69 @@ pub struct StatusResult {
     pub tasks: Page<crate::contracts::TaskStatus>,
     pub todo: Page<crate::contracts::TodoItem>,
     pub scheduler: Page<crate::contracts::SchedulerItem>,
+    /// The learned definition's own visibility (DEC-011): the deltas
+    /// composing it now, the ones rolled back, and the schema generation the
+    /// store reports. Activation and rollback are observable here — there is
+    /// no separate command for them.
+    pub learning: LearningStatus,
+    /// The instruction files' own visibility (AC-076): the typed conflicts the
+    /// latest assembly found under the run's instruction root, each naming its
+    /// slot, its scope and every source that declared it. A conflict is
+    /// observable here — there is no separate command for it — because
+    /// instruction files are data the request carries, not a surface of their
+    /// own.
+    pub instruction_conflicts: Vec<InstructionConflictStatus>,
+    /// The base the store serves and the receipt its update wrote (AC-054,
+    /// DEC-011). `doctor` is `PlannedUnimplemented` and no settings search
+    /// exists yet, so this is the one surface that names the base version and
+    /// classifies every persistent asset — the recorded known limit (DX-I2).
+    pub update: config::UpdateStatus,
+    /// The checkpoint this open's cutover had to abandon (EDGE-006): the
+    /// stopped install's document, which this build cannot resume and which no
+    /// surface could otherwise clear. Served here beside the boot line that
+    /// says the same thing, so a client reading `runtime.status` alone still
+    /// sees the recovery. `None` when this open discarded nothing. The one base
+    /// refusal this build cannot repair — a recorded base whose bytes changed
+    /// under its own version — names its own recovery in its message ("ship the
+    /// changed document under a new base version") and closes with the ship
+    /// path, not with a command here; the settings-search carrier
+    /// (`settings.open`/`config.search`) is still `PlannedUnimplemented`
+    /// (DX-I2).
+    pub base_recovery: Option<config::BaseDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProfileStatus {
     pub pending: Option<String>,
     pub active: Option<String>,
+}
+
+/// One typed instruction conflict as the status surface serves it (AC-076):
+/// the slot, the scope it was declared in, and every distinct source that
+/// declared it — canonical first, so neither source is named as the loser.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InstructionConflictStatus {
+    pub slot: String,
+    pub scope: String,
+    pub sources: Vec<String>,
+}
+
+/// The conflicts of the latest assembly (AC-076): recorded where discovery
+/// ran, so a status read reports them instead of re-walking a filesystem.
+fn instruction_conflicts(rt: &Runtime) -> Vec<InstructionConflictStatus> {
+    rt.broker
+        .instruction_conflicts()
+        .iter()
+        .map(|conflict| InstructionConflictStatus {
+            slot: conflict.slot.as_str().to_string(),
+            scope: conflict.scope.display().to_string(),
+            sources: conflict
+                .sources
+                .iter()
+                .map(|source| source.display().to_string())
+                .collect(),
+        })
+        .collect()
 }
 
 /// The pending/active profile pair for the status surface (AC-047):
@@ -1151,8 +1334,17 @@ enum RequestError {
     KeysNotStrings,
     #[error("duplicate key {key}")]
     DuplicateKey { key: String },
-    #[error("unknown key {key}; known keys: {}", crate::config::READ_KEY_HINT)]
+    #[error("unknown key {key}; known keys: {}", crate::config::read_key_hint())]
     InvalidKey { key: String },
+    /// A declaration the document owns (DEC-010): `[hooks]` and
+    /// `[mcp.servers.<name>]` answer the file's own status rather than the
+    /// unknown-key frame's carrier list.
+    #[error("{}", crate::config::document_only_message(key))]
+    DocumentOnlyKey { key: String },
+    #[error(
+        "machine ingress cannot install hook {key}: a hook entry is a program the executor runs"
+    )]
+    MachineHookDenied { key: String },
     #[error("unknown local command {command}")]
     UnknownLocalCommand { command: String },
     #[error("task {task_id} is running")]
@@ -1179,6 +1371,10 @@ enum RequestError {
         "machine answer without an explicit delegation is denied; the pending question is preserved"
     )]
     MachineAnswerDenied,
+    #[error(
+        "machine steer without a trusted human ingress is denied; the intent revision is preserved"
+    )]
+    MachineSteerDenied,
     #[error("revision fields are required")]
     MissingRevisionFields,
     #[error(transparent)]
@@ -1199,7 +1395,9 @@ impl RequestError {
             Self::KnownCommandUnavailable { .. }
             | Self::ArtifactReadUnavailable
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
-            Self::MachineAnswerDenied => ErrorCode::Denied,
+            Self::MachineAnswerDenied
+            | Self::MachineSteerDenied
+            | Self::MachineHookDenied { .. } => ErrorCode::Denied,
             Self::SessionInFlight { .. } => ErrorCode::Conflict,
             Self::SourceDigestMismatch => ErrorCode::Conflict,
             Self::Serialization => ErrorCode::InternalError,
@@ -1222,6 +1420,8 @@ impl RequestError {
             | Self::SessionInFlight { .. }
             | Self::ArtifactReadUnavailable
             | Self::MachineAnswerDenied
+            | Self::MachineSteerDenied
+            | Self::MachineHookDenied { .. }
             | Self::SourceDigestMismatch
             | Self::MethodUnavailable { .. }
             | Self::ProjectIndex(_)
@@ -1396,6 +1596,9 @@ const RECOVERY_CONFLICT: &str = "; re-read the current snapshot before retrying"
 const RECOVERY_STALE_INTENT: &str = "; read task.snapshot for current revisions";
 const RECOVERY_ALREADY_TERMINAL: &str = "; the historical outcome is preserved";
 const RECOVERY_STORAGE: &str = "; retry after checking local storage";
+const RECOVERY_UNSUPPORTED_GENERATION: &str =
+    "; a newer build wrote this store, open it with that build";
+const RECOVERY_LEARNING: &str = "; read runtime.status for the learned definition";
 
 fn envelope_error(id: Value, code: ErrorCode, rpc_code: i64, message: &str) -> RpcResponse {
     RpcResponse {
@@ -1439,6 +1642,33 @@ fn store_error(id: Value, err: &StoreError) -> RpcResponse {
     )
 }
 
+/// A base refusal at open is the store's to report: `OwnerError` carries store
+/// refusals whole, and a base-ledger verdict rides as that refusal's own cause
+/// so the message still names the version that was refused. The verdict stays
+/// typed inside the slot, so [`OpenError::base_refusal`] still reads the class
+/// the base domain gives it rather than the wrap's.
+fn base_open_failure(error: config::BaseError) -> OwnerError {
+    match error {
+        config::BaseError::Store(source) => OwnerError::from(source),
+        other => OwnerError::from(StoreError::Storage(Box::new(other))),
+    }
+}
+
+/// One failed open, carrying the boot verdicts collected so far. The verdicts
+/// are cloned at the failure rather than borrowed by a closure, so a step after
+/// them can still add its own line — a recovery an earlier step performed is
+/// never hidden by a later failure.
+fn open_failure(error: OwnerError, diagnostics: &[String]) -> OpenError {
+    OpenError::new(error, diagnostics.to_vec())
+}
+
+fn base_error(id: Value, err: &config::BaseError) -> RpcResponse {
+    match err {
+        config::BaseError::Store(source) => store_error(id, source),
+        other => envelope_error(id, other.code(), -32000, &other.to_string()),
+    }
+}
+
 /// The recovery sentence for one store error. A journal-failed denial
 /// keeps its own message — the audit gap is named — while the guidance
 /// is the denial's, since the denial is what the caller acts on.
@@ -1450,6 +1680,8 @@ fn recovery_hint(err: &StoreError) -> &'static str {
         StoreError::AlreadyTerminal => RECOVERY_ALREADY_TERMINAL,
         StoreError::InvalidInput(_) => "",
         StoreError::ReopenIdentity { .. } => "",
+        StoreError::UnsupportedGeneration { .. } => RECOVERY_UNSUPPORTED_GENERATION,
+        StoreError::Delta(_) => RECOVERY_LEARNING,
         StoreError::Storage(_) => RECOVERY_STORAGE,
         StoreError::Closed => RECOVERY_STORAGE,
         StoreError::DenialJournalFailed { denial, .. } => recovery_hint(denial),
@@ -1462,6 +1694,7 @@ struct RetainedView {
     parsed: Option<config::Config>,
     workflow_entry: config::ConfigEntry,
     decisions_entry: config::ConfigEntry,
+    context_entry: config::ConfigEntry,
 }
 
 fn retained_view(rt: &Runtime) -> RetainedView {
@@ -1469,6 +1702,7 @@ fn retained_view(rt: &Runtime) -> RetainedView {
         parsed: rt.effective.parsed.clone(),
         workflow_entry: rt.effective.workflow_entry.clone(),
         decisions_entry: rt.effective.decisions_entry.clone(),
+        context_entry: rt.effective.context_entry.clone(),
     }
 }
 
@@ -1480,6 +1714,7 @@ fn restore_retained_view(rt: &mut Runtime, before: &RetainedView) {
     rt.effective.parsed = before.parsed.clone();
     rt.effective.workflow_entry = before.workflow_entry.clone();
     rt.effective.decisions_entry = before.decisions_entry.clone();
+    rt.effective.context_entry = before.context_entry.clone();
     rt.off_state.advance(&rt.effective);
 }
 
@@ -1924,6 +2159,19 @@ fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String>
     ))
 }
 
+/// One diagnostic line for the checkpoint a cutover had to abandon (EDGE-006):
+/// the version and bytes that left, then what is left to resolve. The cutover
+/// is the recovery itself — the base it installed serves — so the line reports
+/// the discard instead of leaving a stopped run's checkpoint as an unexplained
+/// disappearance.
+fn base_recovery_diagnostic(abandoned: &config::BaseDocument, installed: u64) -> String {
+    format!(
+        "base recovery: abandoned the checkpoint of base {} with document {}; \
+         resolution: the base {installed} now serves, so the stopped cutover has nothing left to resume",
+        abandoned.version, abandoned.digest
+    )
+}
+
 /// Shared tail of the config.set/unset arms: capture the retained view,
 /// apply one typed edit, answer a rejection with the typed ConfigError,
 /// and admit an accepted edit through the singleflight journal.
@@ -2043,6 +2291,262 @@ fn context_compact(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
             }),
         ),
         Err(err) => store_error(id, &err),
+    }
+}
+
+/// The permission mode every `mcp.call` is admitted and re-consulted under.
+/// This build has no Settings permission-mode carrier yet (DEC-015), so the
+/// documented interim shape is used at both sites: with the mode at
+/// `auto`, a `tools/call` is allowed only when the destination is inside its
+/// declared bounds — a recorded preapproval — and an unapproved destination
+/// lands on `ask`, never on an allow (DEC-014).
+const MCP_CALL_MODE: crate::policy::PermissionMode = crate::policy::PermissionMode::Auto;
+
+/// The first-byte re-consult of one `mcp.call`: the executor's own admission
+/// inputs, read again immediately before the frame leaves. A grant revoked, an
+/// enrolled deny added or a stricter mode landed between the plan and the send
+/// refuses here, so a consumptive call never rides an admission that no longer
+/// holds. Cancellation has its own owner — the frame write watches the task —
+/// so this consult answers only the admission.
+struct EgressReconsult<'a> {
+    policy: &'a mut Policy,
+    grant_id: &'a str,
+}
+
+impl crate::mcp::FirstByteGate for EgressReconsult<'_> {
+    fn reconsult(
+        &mut self,
+        store: &TaskStore,
+        server: &crate::mcp::McpServer,
+    ) -> Result<(), crate::mcp::McpError> {
+        let withdrawn = |cause: String| crate::mcp::McpError::AdmissionWithdrawn {
+            server: server.name.clone(),
+            cause,
+        };
+        let target = PathBuf::from(&server.origin);
+        let grant = self
+            .policy
+            .admit(self.grant_id, EffectClass::Egress)
+            .map_err(|error| withdrawn(error.to_string()))?;
+        let ctx = crate::executor::admission_context(
+            store,
+            MCP_CALL_MODE,
+            EffectClass::Egress,
+            self.grant_id,
+            &grant.scope_root,
+            &target,
+        )
+        .map_err(|error| withdrawn(error.to_string()))?;
+        let decision = self.policy.decide(&target, EffectClass::Egress, &ctx);
+        if decision != crate::policy::ModeDecision::Allow {
+            return Err(withdrawn(format!(
+                "the permission mode verdict is {}",
+                decision.token()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `mcp.call`: one admitted `tools/call` against a declared server.
+///
+/// The request names a server and nothing else: the program, its environment
+/// and the origin are the operator's `[mcp.servers.<name>]` declaration, so the
+/// origin the egress is admitted against is operator data rather than a string
+/// the request carried. The executor's egress admission is the gate between the
+/// typed call and the first byte — under the delegated mode the destination must
+/// be preapproved for this grant — and the same inputs are re-consulted inside
+/// [`crate::mcp::run`] immediately before that byte. The logical operation is
+/// the attempt ledger's own attempt (INV-004), so a resume continues it instead
+/// of creating a second one.
+fn mcp_call(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let Some(grant_id) = params.get("grant_id").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "grant_id" });
+    };
+    let request = match crate::mcp::McpRequest::from_value(params) {
+        Ok(request) => request,
+        Err(error) => return mcp_refusal(id, &error),
+    };
+    // The declaration is the only place a program, an environment or an origin
+    // comes from, so a name this installation does not declare is refused
+    // before anything is planned (AC-075 credential origin).
+    let composed = rt.effective().composed();
+    let Some(declaration) = composed.mcp.get(&request.server) else {
+        return mcp_refusal(
+            id,
+            &crate::mcp::McpError::UndeclaredServer {
+                server: request.server,
+            },
+        );
+    };
+    let call = crate::mcp::McpCall::declared(&request, declaration);
+    if let Err(error) = call.validate() {
+        return mcp_refusal(id, &error);
+    }
+    let reports_root = rt.data_root.clone();
+    if let Some(operation) = call.operation.as_deref() {
+        match crate::mcp::recorded(&rt.owner.store, operation) {
+            Ok(Some(settled)) => return mcp_outcome(id, &call, &settled),
+            Ok(None) => {}
+            Err(error) => return mcp_refusal(id, &error),
+        }
+    }
+    // Cancellation outranks every new byte: a cancelled task starts no
+    // effect, and an operation already in flight stays honestly unknown
+    // instead of being forgotten.
+    match rt.owner.store.task_cancelled(&task) {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Some(settled) = settle_opened(rt, &id, &call, crate::mcp::McpReason::Cancelled) {
+                return settled;
+            }
+            return envelope_error(
+                id,
+                ErrorCode::Cancelled,
+                -32000,
+                "task is cancelled; no mcp call is sent",
+            );
+        }
+        Err(error) => return store_error(id, &error),
+    }
+    let admitted = {
+        let mut executor = rt.executor();
+        executor.admit(
+            &task,
+            crate::executor::EffectRequest::Egress {
+                grant_id: grant_id.to_string(),
+                url: call.server.origin.clone(),
+            },
+            MCP_CALL_MODE,
+        )
+    };
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            let code = error.error_code();
+            // An `ask` verdict on this egress has one cause under the
+            // delegated mode: the declared origin has no recorded
+            // preapproval for the grant. The executor's own text stays what
+            // every other consumer matches, and this surface adds the step
+            // the caller is missing.
+            let message = if matches!(&error, crate::executor::ExecutorError::ModeAsk) {
+                format!(
+                    "effect denied: declared origin {} has no recorded preapproval for grant \
+                     {grant_id}; {}",
+                    call.server.origin,
+                    crate::executor::MODE_ASK_REASON
+                )
+            } else {
+                error.to_string()
+            };
+            if let Some(settled) =
+                settle_opened(rt, &id, &call, crate::mcp::McpReason::DestinationRefused)
+            {
+                return settled;
+            }
+            return envelope_error(id, code, -32000, &message);
+        }
+    };
+    let ran = {
+        let mut gate = EgressReconsult {
+            policy: &mut rt.policy,
+            grant_id,
+        };
+        crate::mcp::run(
+            &mut rt.owner.store,
+            rt.mcp_credentials.as_deref(),
+            &reports_root,
+            &call,
+            &task,
+            &admitted.attempt_id,
+            &mut gate,
+        )
+    };
+    match ran {
+        Ok(outcome) => mcp_outcome(id, &call, &outcome),
+        Err(error) => mcp_refusal(id, &error),
+    }
+}
+
+/// Whether this store opened the operation a request names. Only a claimed
+/// operation may be settled, so a caller-chosen id never lands a terminal row;
+/// an unreadable claim proves nothing and leaves the settlement off.
+fn mcp_opened(rt: &Runtime, operation: &str) -> bool {
+    crate::mcp::opened(&rt.owner.store, operation).unwrap_or(false)
+}
+
+/// Settles the operation a refused call names and answers with it, when this
+/// store opened that operation. A call that names none, or one this store
+/// never claimed, falls through to the refusal its own cause spells: a
+/// caller-chosen id never lands a terminal row.
+fn settle_opened(
+    rt: &mut Runtime,
+    id: &Value,
+    call: &crate::mcp::McpCall,
+    reason: crate::mcp::McpReason,
+) -> Option<RpcResponse> {
+    let operation = call.operation.as_deref()?;
+    if !mcp_opened(rt, operation) {
+        return None;
+    }
+    Some(settle_mcp_unresolved(
+        rt,
+        id.clone(),
+        call,
+        operation,
+        reason,
+    ))
+}
+
+fn settle_mcp_unresolved(
+    rt: &mut Runtime,
+    id: Value,
+    call: &crate::mcp::McpCall,
+    operation: &str,
+    reason: crate::mcp::McpReason,
+) -> RpcResponse {
+    let reports_root = rt.data_root.clone();
+    match crate::mcp::settle_unresolved(
+        &mut rt.owner.store,
+        &reports_root,
+        operation,
+        &call.server.name,
+        reason,
+    ) {
+        Ok(outcome) => mcp_outcome(id, call, &outcome),
+        Err(error) => mcp_refusal(id, &error),
+    }
+}
+
+fn mcp_outcome(
+    id: Value,
+    call: &crate::mcp::McpCall,
+    outcome: &crate::mcp::McpOutcome,
+) -> RpcResponse {
+    RpcResponse::ok(id, outcome.wire(&call.server.name))
+}
+
+fn mcp_refusal(id: Value, error: &crate::mcp::McpError) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(RpcErrorBody {
+            code: -32000,
+            message: error.code().as_str().to_string(),
+            data: WireError {
+                code: error.code(),
+                message: error.to_string(),
+                boundary_id: error.boundary_id().map(str::to_string),
+                retry_class: RetryClass::None,
+            },
+        }),
     }
 }
 
@@ -2309,6 +2813,14 @@ fn handle_method(
                 Ok(scheduler) => scheduler,
                 Err(err) => return store_error(id, &err),
             };
+            let learning = match rt.owner.store.learning_status() {
+                Ok(learning) => learning,
+                Err(err) => return store_error(id, &err),
+            };
+            let update = match rt.owner.store.update_status() {
+                Ok(update) => update,
+                Err(err) => return base_error(id, &err),
+            };
             let result = StatusResult {
                 schema_version: SCHEMA_VERSION,
                 session_id: session,
@@ -2319,6 +2831,10 @@ fn handle_method(
                 tasks,
                 todo,
                 scheduler,
+                learning,
+                instruction_conflicts: instruction_conflicts(rt),
+                update,
+                base_recovery: rt.base_recovery.clone(),
             };
             let Ok(payload) = serde_json::to_value(&result) else {
                 return request_error(id, RequestError::Serialization);
@@ -2350,6 +2866,17 @@ fn handle_method(
                     );
                 }
                 if !config::is_readable_key(key) {
+                    // A section the document owns answers its own status:
+                    // "unknown key" frames a spelling the schema does not
+                    // know, and neither declared section is that.
+                    if config::is_document_only_key(key) {
+                        return request_error(
+                            id,
+                            RequestError::DocumentOnlyKey {
+                                key: key.to_string(),
+                            },
+                        );
+                    }
                     return request_error(
                         id,
                         RequestError::InvalidKey {
@@ -2359,13 +2886,13 @@ fn handle_method(
                 }
                 validated.push(key);
             }
-            // One entry per requested key, in request order: the
-            // workflow flag keeps its established entry; the additive
-            // profile keys read from the retained document — an absent
-            // field serves null rather than disappearing. `parsed` is
-            // `None` exactly when no user config file exists, and the
-            // shipped defaults answer those reads.
-            let view = rt.config_for_broker();
+            // One entry per requested key, in request order. The keys a base
+            // may supply — the workflow flag, the decision mode and the context
+            // guard — serve the entry their layer recorded, so a base value is
+            // never reported as the user's; the additive profile keys read from
+            // the retained document, where an absent field serves null rather
+            // than disappearing (AC-054).
+            let view = rt.effective.retained();
             let revision = rt
                 .effective
                 .parsed
@@ -2384,6 +2911,10 @@ fn handle_method(
                 }
                 if key == config::DECISIONS_MODE_KEY {
                     entries.push(rt.effective.decisions_entry.clone());
+                    continue;
+                }
+                if key == config::CONTEXT_AUTO_COMPACT_KEY {
+                    entries.push(rt.effective.context_entry.clone());
                     continue;
                 }
                 entries.push(config::ConfigEntry {
@@ -2539,6 +3070,18 @@ fn handle_method(
                     let Some(key) = params.get("key").and_then(Value::as_str) else {
                         return request_error(id, RequestError::Required { field: "key" });
                     };
+                    // A hook entry is a program the executor runs, so the
+                    // machine channel never installs one (I7). The refusal is
+                    // typed and names the key before the edit domain is
+                    // consulted, so the cause is the guard, not a schema miss.
+                    if matches!(ingress, Ingress::Machine) && config::is_hook_key(key) {
+                        return request_error(
+                            id,
+                            RequestError::MachineHookDenied {
+                                key: key.to_string(),
+                            },
+                        );
+                    }
                     let Some(value) = params.get("value") else {
                         return request_error(id, RequestError::Required { field: "value" });
                     };
@@ -2561,6 +3104,7 @@ fn handle_method(
                 crate::tools::LocalKind::ProjectInit => project_init(rt, id, &params),
                 crate::tools::LocalKind::SessionNew => session_new(rt, id, &params, connection_id),
                 crate::tools::LocalKind::ContextCompact => context_compact(rt, id, &params),
+                crate::tools::LocalKind::McpCall => mcp_call(rt, id, &params),
                 // The rows belong to the TUI's own projection, so the
                 // handler answers the kind it served and no durable
                 // effect: the composer clears them on the same answer.
@@ -3879,6 +4423,13 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
             let Some(task) = task_param(&params) else {
                 return request_error(id, RequestError::Required { field: "task_id" });
             };
+            if matches!(ingress, Ingress::Machine) {
+                // Fail closed before any row moves: an SDK steer never
+                // proves human intent, so the intent revision, the pending
+                // question and the task revision stay exactly where the
+                // caller found them (AC-009, INV-003).
+                return request_error(id, RequestError::MachineSteerDenied);
+            }
             let (Some(expected_intent), Some(expected_task)) = (
                 params
                     .get("expected_intent_revision")

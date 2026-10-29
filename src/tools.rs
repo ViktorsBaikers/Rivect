@@ -5,7 +5,7 @@
 
 use crate::commands::Runtime;
 use crate::contracts::{CommandDescriptor, Page, TaskId};
-use crate::executor::{EffectOutcome, EffectRequest, Executor, ExecutorError};
+use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use std::path::PathBuf;
 
 pub enum LocalKind {
@@ -16,6 +16,7 @@ pub enum LocalKind {
     SessionNew,
     ViewClear,
     ContextCompact,
+    McpCall,
     PlannedUnimplemented,
     Unknown,
 }
@@ -24,6 +25,7 @@ const BUSY_READ: &str = "READ";
 const BUSY_WRITE: &str = "WRITE";
 const BUSY_READ_CONFIG: &str = "READ/CONFIG";
 const BUSY_READ_INDEX: &str = "READ/INDEX";
+const BUSY_EGRESS: &str = "EGRESS";
 const BUSY_UNAVAILABLE: &str = "UNAVAILABLE";
 const READ_FILE_DESCRIPTION: &str = "One admitted file read in the current scope.";
 const CONFIG_SET_DESCRIPTION: &str =
@@ -36,6 +38,7 @@ const SESSION_NEW_DESCRIPTION: &str = "Start an independent conversation on this
 const VIEW_CLEAR_DESCRIPTION: &str =
     "Clear the transcript and streamed output; the stored conversation is kept.";
 const CONTEXT_COMPACT_DESCRIPTION: &str = "Fold one task's episodic history into its continuation checkpoint; a fold that would not shorten the context is refused typed.";
+const MCP_CALL_DESCRIPTION: &str = "One admitted tools/call against a declared MCP server; the logical operation, its continuation and its honest outcome are retained.";
 const PLANNED_COMMAND_DESCRIPTION: &str = "A planned command in this catalog.";
 const UNAVAILABLE_REASON: &str = "known command without a handler in this build";
 
@@ -87,6 +90,7 @@ pub fn local_command_kind(kind: &str) -> LocalKind {
         "session.new" => LocalKind::SessionNew,
         "view.clear" => LocalKind::ViewClear,
         "context.compact" => LocalKind::ContextCompact,
+        "mcp.call" => LocalKind::McpCall,
         _ if PLANNED_LOCAL_KINDS.contains(&kind) => LocalKind::PlannedUnimplemented,
         _ => LocalKind::Unknown,
     }
@@ -161,6 +165,7 @@ pub fn describe() -> Page<CommandDescriptor> {
             true,
             BUSY_WRITE,
         ),
+        descriptor("mcp.call", &[], MCP_CALL_DESCRIPTION, true, BUSY_EGRESS),
     ];
     for kind in PLANNED_LOCAL_KINDS {
         items.push(descriptor(
@@ -186,7 +191,7 @@ pub fn invoke_read(
         grant_id: grant_id.to_string(),
         path,
     };
-    let mut executor = Executor::new(&mut rt.policy, &mut rt.owner.store, rt.read_worker.as_mut());
+    let mut executor = rt.executor();
     // Interim manual mode at this boundary (DEC-015) until the Settings
     // mode carrier arrives (DEC-016).
     let admitted = executor.admit(task_id, request, crate::policy::PermissionMode::Manual)?;

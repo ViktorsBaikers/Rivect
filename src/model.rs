@@ -8,10 +8,13 @@ use crate::config::{
     Config, ConfigError, ConnKind, Connection, EffortAssign, EffortLevel, FallbackAssign,
     FixedModel, ModelAssign, Profile, PurposeDef,
 };
+use crate::instructions::{InstructionConflict, InstructionError, InstructionSet};
+use crate::learning::LearningDefinition;
 use crate::providers::{self, Dialect, Provider, ProviderError, ProviderReply};
 use crate::resources::UsageDelta;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestManifest {
@@ -38,10 +41,35 @@ pub struct RequestManifest {
     /// recorded reason.
     pub epoch_id: String,
     pub mutation_reason: Option<String>,
+    /// What the epoch mutation is expected to cost at the provider cache
+    /// (AC-061): which envelope part it replaced and how many envelope
+    /// bytes the next request rewrites instead of replaying. `None` while
+    /// the epoch replays, and for a non-prefix event like a compaction.
+    pub epoch_cost: Option<EpochCost>,
+    /// Who authored the bytes this request carries in the wire's user
+    /// channel (AC-009, INV-003). The marker is client-side: no provider
+    /// protocol carries an author, so it never enters
+    /// [`RequestManifest::wire_bytes`] — it exists so a consent path asks
+    /// the frozen request for its author instead of reading the text.
+    pub input_origin: InputOrigin,
     /// The frozen admission bound of this request (INV-022): the
     /// `bound(next)` a budget level must fit beside its spent and
     /// reserved units before the dispatch may send.
     pub cost_bound: u64,
+}
+
+/// The author of the bytes a request carries as its user channel
+/// (AC-009): text that arrived as a tool output, an effect observation, a
+/// folded summary or a model-authored turn is data the platform carried,
+/// never a human turn — it can move no intent, policy or grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// A trusted CLI/TUI operator turn: the only origin consent may read
+    /// as human authorship.
+    Human,
+    /// Platform text — a tool output, an observation, a summary or a
+    /// model-authored answer. Data, never authorship.
+    Tool,
 }
 
 impl RequestManifest {
@@ -92,6 +120,8 @@ pub enum ModelError {
     Config(#[from] ConfigError),
     #[error("model provider: {0}")]
     Provider(#[from] ProviderError),
+    #[error("instruction discovery: {0}")]
+    Instructions(#[from] InstructionError),
     #[error(
         "model request exceeds wire limit: accounted {actual} bytes with mandatory instructions, tools and output reserve exceeds {limit}"
     )]
@@ -379,25 +409,87 @@ impl ModelOutcome {
     }
 }
 
-/// The last frozen model-visible prefix digest of one purpose: an
-/// unchanged digest replays its epoch, while a changed model, instruction
-/// set or tool surface opens a new epoch with a mutation reason.
+/// The last frozen model-visible prefix of one purpose: an unchanged
+/// digest replays its epoch, while a changed model, instruction set or
+/// tool surface opens a new epoch with a mutation reason. The whole
+/// prefix digest decides the replay and names the epoch id; the per-part
+/// digests beside it decide which part moved, because one digest can
+/// only say that something did.
 #[derive(Clone)]
 struct EpochState {
     prefix_digest: String,
+    model_digest: String,
+    instructions_digest: String,
+    tools_digest: String,
 }
 
-/// Recorded reason for an epoch mutation. Offline only the resolved
-/// model assignment can change between prepares — the instructions and
-/// tools are broker constants — so every mutation is a model switch;
-/// masking/compaction/system-change reasons arrive with the live
-/// provider dialects.
-const MODEL_SWITCH: &str = "model switch";
+/// Recorded reason a context epoch opened (AC-061, INV-009a): the closed
+/// vocabulary names which part of the model-visible prefix moved. A
+/// learned instruction delta is a system change; compaction and masking
+/// are not prefix mutations and never appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochMutationReason {
+    /// The system instructions changed — a new instruction set or a
+    /// learned instruction delta.
+    SystemChange,
+    /// The declared tool surface changed.
+    ToolsChange,
+    /// The resolved model assignment changed.
+    ModelSwitch,
+}
+
+impl EpochMutationReason {
+    /// The recorded name — the closed vocabulary of INV-009a.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SystemChange => "system change",
+            Self::ToolsChange => "tools change",
+            Self::ModelSwitch => "model switch",
+        }
+    }
+}
+
+impl std::fmt::Display for EpochMutationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The expected provider-cache cost of one prefix mutation (AC-061): the
+/// envelope part the mutation replaced and the envelope bytes the next
+/// request rewrites instead of replaying. A cached prefix is shared
+/// forwards only, so the rewrite starts at the replaced part and covers
+/// every part the request re-sends after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochCost {
+    pub reason: EpochMutationReason,
+    /// The envelope part the mutation replaced: `instructions`, `tools`
+    /// or `model`.
+    pub replaced_part: &'static str,
+    /// Envelope bytes the next request rewrites instead of replaying.
+    pub expected_rewrite_bytes: usize,
+}
 
 /// Mandatory wire parts every offline request carries (AC-013). Live
 /// provider dialects replace these with their real instruction and tool
 /// surfaces; offline the constants keep the accounting honest.
-const MANDATORY_INSTRUCTIONS: &str = "You are the Rivect decision core. The only permitted action is one scoped file read; request it as `read <path>` on its own line.";
+pub(crate) const MANDATORY_INSTRUCTIONS: &str = "You are the Rivect decision core. The only permitted action is one scoped file read; request it as `read <path>` on its own line.";
+
+/// The longest instruction base any assembly site composes the learned
+/// definition onto: [`MANDATORY_INSTRUCTIONS`] for [`Broker::prepare`], or the
+/// caller's own base for [`Broker::prepare_call`] — today the semantic stage
+/// contracts in [`crate::actions`]. The learning store measures its composed
+/// definition beside this base, so an activation certifies the size of the
+/// request part those seams assemble (AC-051).
+pub(crate) const LARGEST_INSTRUCTION_BASE: &str = {
+    let stage = crate::actions::LONGEST_STAGE_INSTRUCTIONS;
+    if stage.len() > MANDATORY_INSTRUCTIONS.len() {
+        stage
+    } else {
+        MANDATORY_INSTRUCTIONS
+    }
+};
 const DECLARED_TOOLS: &[&str] = &["read_file"];
 /// One caller's wire parts: its system instructions and declared tool
 /// surface, frozen into [`RequestManifest::instructions`] and
@@ -459,6 +551,23 @@ pub struct Broker {
     paused: BTreeMap<String, BTreeSet<String>>,
     /// The profile the latest prepared manifest bound (AC-047).
     bound_profile: Option<ProfileBinding>,
+    /// The learned definition the next request composes (AC-051): the store's
+    /// active deltas, installed by the owner that can read them. Assembly
+    /// overlays the *assembled* instruction part with this value, so a
+    /// learned delta changes the model-visible prefix and therefore opens a
+    /// new context epoch with `system change` — never a second planner and
+    /// never an extra model call (INV-009).
+    learning: LearningDefinition,
+    /// The explicit instruction root whose ancestor chain the next assembly
+    /// walks (AC-076). `None` is no discovery, so a caller that pins no root
+    /// assembles exactly the bytes the learning seam composed before
+    /// instruction files existed.
+    instructions_root: Option<PathBuf>,
+    /// The typed conflicts the latest assembly found under that root
+    /// (AC-076): recorded where discovery ran and read by
+    /// [`crate::commands::StatusResult`], so a conflict between two sources
+    /// stays visible instead of one of them silently winning.
+    instruction_conflicts: Vec<InstructionConflict>,
 }
 
 impl std::fmt::Debug for Broker {
@@ -489,11 +598,61 @@ impl Broker {
             pending: BTreeMap::new(),
             paused: BTreeMap::new(),
             bound_profile: None,
+            learning: LearningDefinition::default(),
+            instructions_root: None,
+            instruction_conflicts: Vec::new(),
         }
     }
 
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
+    }
+
+    /// Installs the learned definition the next request composes (AC-051).
+    /// The owner that holds the store installs it, so activation needs no
+    /// per-request call and no model call: assembly reads this value.
+    pub fn set_learning_definition(&mut self, definition: LearningDefinition) {
+        self.learning = definition;
+    }
+
+    /// Pins the instruction root the next assembly walks (AC-076): the root's
+    /// own ancestors are the scope chain, outermost first, so a file in a
+    /// scope above the root still contributes. The root is an explicit
+    /// parameter — a caller that pins none discovers nothing, and no working
+    /// directory is ever implied.
+    pub fn set_instructions_root(&mut self, root: Option<PathBuf>) {
+        self.instructions_root = root;
+    }
+
+    /// The typed conflicts the latest assembly found (AC-076): the status
+    /// surface serves them, so a status read never re-walks a filesystem.
+    #[must_use]
+    pub fn instruction_conflicts(&self) -> &[InstructionConflict] {
+        &self.instruction_conflicts
+    }
+
+    /// The assembled instruction part one request carries (AC-076): the
+    /// learning seam over the base, with every instruction file discovered
+    /// under the pinned root in front of the learned deltas. Instruction
+    /// files are data — they add text to the part and nothing else — and no
+    /// root means no discovery, so the bytes are the seam's own.
+    ///
+    /// # Errors
+    ///
+    /// The typed failure of a candidate that exists but cannot be observed,
+    /// read or bounded: a discovered file is never skipped silently.
+    fn assemble_instructions(&mut self, purpose: &str, base: &str) -> Result<String, ModelError> {
+        let found = match self.instructions_root.clone() {
+            Some(root) => InstructionSet::discover(&instruction_scopes(&root))?,
+            None => InstructionSet::default(),
+        };
+        let mut assembled = base.to_string();
+        for entry in &found.entries {
+            assembled.push('\n');
+            assembled.push_str(&entry.text);
+        }
+        self.instruction_conflicts = found.conflicts;
+        Ok(self.learning.instruction_part(purpose, &assembled))
     }
 
     /// Refreshes the candidate view the dispatch-time re-check reads
@@ -607,19 +766,45 @@ impl Broker {
     /// parts and the context epoch; a request that does not fit
     /// together with its mandatory parts is rejected, never truncated.
     ///
+    /// This is the operator-class entry: the caller asserts that a human
+    /// turn authored `inputs`. A dispatch that reads the authorship from
+    /// its carrier calls [`Broker::prepare_authored`] with the origin it
+    /// found.
+    ///
     /// # Errors
     ///
     /// Returns [`ModelError::Config`] when the purpose cannot resolve,
     /// [`ModelError::Provider`] when a fixed pin is offline ineligible,
     /// [`ModelError::NoEligibleCandidate`] when no candidate survives
-    /// eligibility, and [`ModelError::RequestTooLarge`] when the
-    /// accounted full request exceeds the wire limit.
+    /// eligibility, [`ModelError::Instructions`] when an instruction file
+    /// under the pinned root cannot be loaded, and
+    /// [`ModelError::RequestTooLarge`] when the accounted full request
+    /// exceeds the wire limit.
     pub fn prepare(
         &mut self,
         purpose: &str,
         config: &Config,
         world: &str,
         inputs: &str,
+    ) -> Result<RequestManifest, ModelError> {
+        self.prepare_authored(purpose, config, world, inputs, InputOrigin::Human)
+    }
+
+    /// [`Broker::prepare`] with the input's authoring origin spelled by
+    /// the caller (AC-009): the dispatch site reads who authored the
+    /// bytes it carries, so a tool output or a model-authored turn never
+    /// freezes as a human request.
+    ///
+    /// # Errors
+    ///
+    /// The [`Broker::prepare`] refusals.
+    pub fn prepare_authored(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        origin: InputOrigin,
     ) -> Result<RequestManifest, ModelError> {
         let resolved = config.resolve_purpose(purpose)?;
         let purpose_def = config.models.purposes.get(purpose);
@@ -631,7 +816,7 @@ impl Broker {
             &config.profiles,
             &self.entitlements,
         )?;
-        let instructions = MANDATORY_INSTRUCTIONS.to_string();
+        let instructions = self.assemble_instructions(purpose, MANDATORY_INSTRUCTIONS)?;
         let tools: Vec<String> = DECLARED_TOOLS
             .iter()
             .map(|tool| (*tool).to_string())
@@ -651,7 +836,7 @@ impl Broker {
                 actual: accounted,
             });
         }
-        let (epoch_id, mutation_reason) =
+        let (epoch_id, epoch_cost) =
             self.context_epoch(purpose, &resolved.model, &instructions, &tools);
         let attempt_id = crate::contracts::AttemptId::generate().0;
         let manifest = RequestManifest {
@@ -666,7 +851,9 @@ impl Broker {
             inputs: inputs.to_string(),
             inputs_digest: hex(&Sha256::digest(inputs.as_bytes())),
             epoch_id,
-            mutation_reason,
+            mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
+            epoch_cost,
+            input_origin: origin,
             cost_bound: sent_cost_bound(inputs),
         };
         // The re-check view tracks the config this prepare ran under —
@@ -729,7 +916,7 @@ impl Broker {
             &config.profiles,
             &self.entitlements,
         )?;
-        let instructions = contract.instructions.to_string();
+        let instructions = self.assemble_instructions(purpose, contract.instructions)?;
         let tools: Vec<String> = contract
             .tools
             .iter()
@@ -750,7 +937,7 @@ impl Broker {
                 actual: accounted,
             });
         }
-        let (epoch_id, mutation_reason) =
+        let (epoch_id, epoch_cost) =
             self.context_epoch(purpose, &resolved.model, &instructions, &tools);
         let attempt_id = crate::contracts::AttemptId::generate().0;
         let manifest = RequestManifest {
@@ -765,7 +952,11 @@ impl Broker {
             inputs: inputs.to_string(),
             inputs_digest: hex(&Sha256::digest(inputs.as_bytes())),
             epoch_id,
-            mutation_reason,
+            mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
+            epoch_cost,
+            // A per-call contract's parts are catalogue and action text:
+            // platform bytes, never an operator turn (AC-009).
+            input_origin: InputOrigin::Tool,
             cost_bound: sent_cost_bound(inputs),
         };
         // The re-check view tracks the config this prepare ran under —
@@ -1229,7 +1420,7 @@ impl Broker {
         leg: &str,
     ) -> (RequestManifest, Option<EpochState>) {
         let displaced = self.epochs.get(&admission.purpose).cloned();
-        let (epoch_id, mutation_reason) = self.context_epoch(
+        let (epoch_id, epoch_cost) = self.context_epoch(
             &admission.purpose,
             &model,
             &admission.manifest.instructions,
@@ -1243,7 +1434,8 @@ impl Broker {
             attempt_id: crate::contracts::AttemptId::generate().0,
             model,
             epoch_id,
-            mutation_reason,
+            mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
+            epoch_cost,
             ..admission.manifest.clone()
         };
         self.admissions.insert(
@@ -1375,14 +1567,15 @@ impl Broker {
     /// contribution): the model-visible prefix — purpose, model
     /// assignment, instructions and tools — hashes to the epoch id; an
     /// unchanged prefix replays the previous epoch, a changed one opens
-    /// a new epoch with the recorded mutation reason.
+    /// a new epoch whose per-part digests name the reason the mutation
+    /// happened and what it is expected to cost.
     fn context_epoch(
         &mut self,
         purpose: &str,
         model: &ModelAssign,
         instructions: &str,
         tools: &[String],
-    ) -> (String, Option<String>) {
+    ) -> (String, Option<EpochCost>) {
         let prefix = format!(
             "purpose:{purpose}\nmodel:{}\ninstructions:{instructions}\ntools:{}",
             model_wire_id(model),
@@ -1390,14 +1583,66 @@ impl Broker {
         );
         let prefix_digest = hex(&Sha256::digest(prefix.as_bytes()));
         let epoch_id = format!("epoch-{}", &prefix_digest[..16]);
-        let mutation_reason = match self.epochs.get(purpose) {
+        let parts = EpochState {
+            prefix_digest: prefix_digest.clone(),
+            model_digest: hex(&Sha256::digest(model_wire_id(model).as_bytes())),
+            instructions_digest: hex(&Sha256::digest(instructions.as_bytes())),
+            tools_digest: hex(&Sha256::digest(tools.join(", ").as_bytes())),
+        };
+        let epoch_cost = match self.epochs.get(purpose) {
             Some(previous) if previous.prefix_digest == prefix_digest => None,
-            Some(_) => Some(MODEL_SWITCH.to_string()),
+            Some(previous) => changed_part(previous, &parts)
+                .map(|reason| epoch_cost(reason, instructions, model, tools)),
             None => None,
         };
-        self.epochs
-            .insert(purpose.to_string(), EpochState { prefix_digest });
-        (epoch_id, mutation_reason)
+        self.epochs.insert(purpose.to_string(), parts);
+        (epoch_id, epoch_cost)
+    }
+}
+
+/// Which envelope part a mutation replaced (AC-061): classified in wire
+/// order, so the earliest changed part names the cause — a system change
+/// stays a system change even when the model moved with it.
+fn changed_part(previous: &EpochState, current: &EpochState) -> Option<EpochMutationReason> {
+    if previous.instructions_digest != current.instructions_digest {
+        return Some(EpochMutationReason::SystemChange);
+    }
+    if previous.model_digest != current.model_digest {
+        return Some(EpochMutationReason::ModelSwitch);
+    }
+    if previous.tools_digest != current.tools_digest {
+        return Some(EpochMutationReason::ToolsChange);
+    }
+    None
+}
+
+/// The recorded cost of one mutation (AC-061): the replaced part and the
+/// envelope bytes rewritten from it on. A provider caches
+/// [`wire_composition`]'s envelope as a prefix, so the replaced part and
+/// every part the request re-sends after it are a cache miss while the
+/// parts ahead of it still replay.
+fn epoch_cost(
+    reason: EpochMutationReason,
+    instructions: &str,
+    model: &ModelAssign,
+    tools: &[String],
+) -> EpochCost {
+    let instructions_line = instructions.len() + 1;
+    let model_line = format!("model: {}\n", model_wire_id(model)).len();
+    let tools_line = format!("tools: {}\n", tools.join(", ")).len();
+    let reserve = format!("output-reserve: {OUTPUT_RESERVE_BYTES}").len();
+    let (replaced_part, expected_rewrite_bytes) = match reason {
+        EpochMutationReason::SystemChange => (
+            "instructions",
+            instructions_line + model_line + tools_line + reserve,
+        ),
+        EpochMutationReason::ModelSwitch => ("model", model_line + tools_line + reserve),
+        EpochMutationReason::ToolsChange => ("tools", tools_line + reserve),
+    };
+    EpochCost {
+        reason,
+        replaced_part,
+        expected_rewrite_bytes,
     }
 }
 
@@ -1525,6 +1770,16 @@ fn purpose_entitled(purpose_def: Option<&PurposeDef>, connection: &str) -> bool 
     purpose_def
         .and_then(|def| def.eligible.as_deref())
         .is_none_or(|list| list.iter().any(|name| name == connection))
+}
+
+/// The scope chain one instruction root is discovered over (AC-076): the
+/// root's own ancestors, outermost first — the order
+/// [`InstructionSet::discover`] takes, so an inner scope still wins its slot
+/// over an outer one.
+fn instruction_scopes(root: &Path) -> Vec<PathBuf> {
+    let mut scopes: Vec<PathBuf> = root.ancestors().map(Path::to_path_buf).collect();
+    scopes.reverse();
+    scopes
 }
 
 /// The single wire composition shared by freeze and dispatch (AC-013):

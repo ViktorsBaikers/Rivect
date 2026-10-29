@@ -4,7 +4,9 @@
 //! edits; `parse` is syntax-only (duplicate keys are parser errors), every
 //! typed/semantic rejection happens in `validate` and fails closed.
 
+use crate::contracts::ErrorCode;
 use crate::executor::{FileIdentity, Unattested, WriteIdentity};
+use crate::identity::{IdentityError, IdentityKind, IdentityMigration, IdentityRebind};
 use crate::providers::{SecretRef, SecretRefError};
 use crate::state::{StoreError, TaskStore};
 use serde::Serialize;
@@ -13,21 +15,598 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, TomlError};
 
 pub const WORKFLOW_KEY: &str = "workflow.enabled";
 pub const DECISIONS_MODE_KEY: &str = "decisions.mode";
 pub const CONTEXT_AUTO_COMPACT_KEY: &str = "context.auto_compact";
 
-/// The keys `config.read` serves, named once for the read surface's
-/// unknown-key hint (DEC-013): the workflow flag, the decision mode, the
-/// context guard plus the additive profile keys. Name-bearing keys print
-/// their pattern form — a connection or profile name is never itself a
-/// known key.
-pub const READ_KEY_HINT: &str = "workflow.enabled, decisions.mode, context.auto_compact, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref";
+/// The document's legal root keys, named once (DX-I4): the file parser's
+/// acceptance, the edit surface's root walk and the `unknown root key`
+/// refusal all read this table, so a root one surface accepts is never
+/// reported unknown by another.
+pub const CONFIG_ROOTS: &[&str] = &[
+    "config_version",
+    "workflow",
+    "decisions",
+    "context",
+    "connections",
+    "profiles",
+    "models",
+    "hooks",
+    "mcp",
+];
 
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n";
+/// How far a misspelled root may sit from a legal one and still earn the
+/// nearest-key hint: a plausible slip gets the suggestion, an unrelated
+/// spelling gets no invented answer.
+const ROOT_KEY_HINT_DISTANCE: usize = 3;
+
+/// The one instrumented hook event (AC-076, I6): the request is inspected
+/// before admission, and a rewrite is re-checked at that same admission.
+pub const HOOK_EVENT_EFFECT_REQUEST: &str = "effect.request";
+
+/// The closed event vocabulary a `[hooks]` entry may declare. Widening it
+/// is a product decision, not a config option.
+pub const HOOK_EVENTS: &[&str] = &[HOOK_EVENT_EFFECT_REQUEST];
+
+/// The fields one `[hooks.<event>@<scope>]` entry may carry (A5).
+const HOOK_KEYS: &[&str] = &["command", "args"];
+
+/// The fields one `[mcp.servers.<name>]` row may carry: the operator's own
+/// declaration of a program, its arguments and its environment.
+const MCP_SERVER_KEYS: &[&str] = &["origin", "program", "args", "env", "credential"];
+
+/// The fields one `[mcp.servers.<name>.credential]` row may carry.
+const MCP_CREDENTIAL_KEYS: &[&str] = &["reference", "origin", "variable"];
+
+/// The base version this build compiles in (AC-054, INV-010a): the product
+/// base's own identity. It is neither the store's schema generation
+/// (`PRAGMA user_version`) nor `config_version`, and the base ledger records
+/// it beside the digest it belongs to.
+pub const SHIPPED_BASE_VERSION: u64 = 2;
+
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n# A hook is a user-declared program the executor runs at one\n# instrumented event. It answers allow, deny or stop and may rewrite the\n# request's path; the rewritten request is re-checked by the same\n# admission before any effect, and only the file installs one:\n# [hooks.\"effect.request@project\"]\n# command = \"/usr/local/bin/rivect-hook\"\n# args = []\n# A declared MCP server is operator-owned too: the program, its args, its\n# environment and the origin its egress is admitted against come from this\n# file only, so a request names a server but never supplies one:\n# [mcp.servers.fixture]\n# origin = \"mcp+stdio://fixture\"\n# program = \"/usr/local/bin/rivect-mcp-fixture\"\n# args = []\n# [mcp.servers.fixture.credential]\n# reference = \"keyring:rivect/mcp-fixture\"\n# origin = \"mcp+stdio://fixture\"\n# variable = \"RIVECT_MCP_TOKEN\"\n";
+
+// ----- the versioned base and the update its ledger records -----
+
+/// A versioned product base document (AC-054, DEC-009): the first precedence
+/// layer the effective config composes over. Its text is the document every
+/// base value is read from; its version is the typed identity the store's base
+/// ledger records (INV-010a), never the schema generation and never
+/// `config_version`.
+///
+/// Production supplies [`SHIPPED_DEFAULTS_TOML`] through [`BaseSource::SHIPPED`],
+/// a test supplies the next base; both are read by the same section schema as
+/// the user's document, so a base cannot state a field the file schema rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseSource<'a> {
+    version: u64,
+    text: &'a str,
+}
+
+impl<'a> BaseSource<'a> {
+    /// The base this build serves: the shipped defaults document and the base
+    /// version compiled in beside it, so the two cannot state different
+    /// values.
+    pub const SHIPPED: BaseSource<'static> = BaseSource {
+        version: SHIPPED_BASE_VERSION,
+        text: SHIPPED_DEFAULTS_TOML,
+    };
+
+    /// A base document a caller supplies — the seam an update moves the base
+    /// through.
+    #[must_use]
+    pub const fn new(version: u64, text: &'a str) -> Self {
+        Self { version, text }
+    }
+
+    /// The base version this document carries.
+    #[must_use]
+    pub const fn version(self) -> u64 {
+        self.version
+    }
+
+    /// The document's bytes — the layer values are read from this text and the
+    /// sources digest names it.
+    #[must_use]
+    pub const fn text(self) -> &'a str {
+        self.text
+    }
+
+    /// The document's byte digest — the revision a base-sourced entry names
+    /// and the identity the ledger records beside the version.
+    #[must_use]
+    pub fn digest(self) -> String {
+        hex(&Sha256::digest(self.text.as_bytes()))
+    }
+
+    /// The typed layer, read through the shared section schema.
+    fn layer(self) -> Result<BaseLayer, ConfigError> {
+        let doc: DocumentMut = self.text.parse().map_err(ConfigError::parse)?;
+        let (workflow, decisions, context, models) = validated_base(&doc)?;
+        Ok(BaseLayer {
+            version: self.version,
+            digest: self.digest(),
+            workflow: workflow.enabled,
+            decisions: decisions.mode,
+            context,
+            models,
+        })
+    }
+}
+
+/// The base layer's typed values (AC-054): what the base supplies, kept apart
+/// from the user document so the layer that answered a read is never derived
+/// from a comparison of values.
+///
+/// A base owns no connection, profile or hook. Of the default-bearing sections
+/// it states, `[models.defaults]` merges slot by slot — a base default answers
+/// where the user's document defers the slot or has no document at all — while
+/// a purpose row the user writes stays the user's whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseLayer {
+    /// The base version this layer was read from (INV-010a).
+    pub version: u64,
+    /// The base document's byte digest.
+    pub digest: String,
+    pub workflow: Option<bool>,
+    pub decisions: Option<DecisionModeValue>,
+    pub context: Context,
+    pub models: Models,
+}
+
+/// One base an update run offers the ledger: the version, the digest of the
+/// document it was read from, and the two locations this build's other
+/// persistent assets live at, so the receipt can name them (REQ-044).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseInstall {
+    pub version: u64,
+    pub digest: String,
+    pub config_path: PathBuf,
+    pub workspace_root: PathBuf,
+}
+
+impl BaseInstall {
+    /// The install of one base document. The digest is taken from the source
+    /// itself, so the receipt can never name bytes the layer was not read
+    /// from.
+    #[must_use]
+    pub fn new(
+        source: BaseSource<'_>,
+        config_path: impl Into<PathBuf>,
+        workspace_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            version: source.version(),
+            digest: source.digest(),
+            config_path: config_path.into(),
+            workspace_root: workspace_root.into(),
+        }
+    }
+}
+
+/// One persistent asset this build writes (REQ-044, DEC-009). The installer's
+/// artifact list and the full §12A.8 inventory belong to the release position,
+/// so exactly the kinds that exist here are classified — nothing is named that
+/// this build does not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateAsset {
+    /// The user's `config.toml`: explicit settings are merged over the new
+    /// base by meaning, never replaced by it.
+    ConfigFile,
+    /// The SQLite rows this store owns: tasks, attempts, deltas and their
+    /// tombstones are preserved as they are.
+    SqliteRows,
+    /// The directory tree the runtime writes: preserved, because an update
+    /// replaces a document and never a directory.
+    WorkspaceDirectories,
+    /// The index generations and their edges: derived data, rebuilt from the
+    /// documents they describe instead of carried blindly.
+    IndexRows,
+}
+
+impl UpdateAsset {
+    /// The asset's stable name in the receipt and its rows.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "config_file",
+            Self::SqliteRows => "sqlite_rows",
+            Self::WorkspaceDirectories => "workspace_directories",
+            Self::IndexRows => "index_rows",
+        }
+    }
+
+    /// The asset one stored name spells; `None` for a name this build does not
+    /// write.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "config_file" => Some(Self::ConfigFile),
+            "sqlite_rows" => Some(Self::SqliteRows),
+            "workspace_directories" => Some(Self::WorkspaceDirectories),
+            "index_rows" => Some(Self::IndexRows),
+            _ => None,
+        }
+    }
+
+    /// The policy an update follows for this asset.
+    #[must_use]
+    pub fn policy(self) -> UpdatePolicy {
+        match self {
+            Self::ConfigFile => UpdatePolicy::MergeByMeaning,
+            Self::SqliteRows | Self::WorkspaceDirectories => UpdatePolicy::Preserve,
+            Self::IndexRows => UpdatePolicy::Rebuild,
+        }
+    }
+}
+
+/// The persistent assets this build writes, in the receipt's order (DEC-009).
+/// One table, so the classification a reader sees and the classification an
+/// update writes cannot disagree.
+pub const UPDATE_ASSETS: &[UpdateAsset] = &[
+    UpdateAsset::ConfigFile,
+    UpdateAsset::SqliteRows,
+    UpdateAsset::WorkspaceDirectories,
+    UpdateAsset::IndexRows,
+];
+
+/// What an update does with one persistent asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePolicy {
+    /// Keep the asset's rows or bytes as they are.
+    Preserve,
+    /// Keep the user's explicit values over the new base's, by meaning.
+    MergeByMeaning,
+    /// Discard the derived content and re-derive it from its sources.
+    Rebuild,
+}
+
+impl UpdatePolicy {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::MergeByMeaning => "merge_by_meaning",
+            Self::Rebuild => "rebuild",
+        }
+    }
+
+    /// The policy one stored name spells.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "preserve" => Some(Self::Preserve),
+            "merge_by_meaning" => Some(Self::MergeByMeaning),
+            "rebuild" => Some(Self::Rebuild),
+            _ => None,
+        }
+    }
+}
+
+/// Where one base stands in its cutover (PROH-004): a staged base has arrived
+/// but has not committed, so the previous base keeps serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateState {
+    /// Written ahead of the cutover: the resumable checkpoint of an update
+    /// that stopped between staging and commit.
+    Staged,
+    /// Serving the runtime now.
+    Active,
+    /// Replaced by a committed successor; its receipt stays readable.
+    Retired,
+}
+
+impl UpdateState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Active => "active",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// The state one stored name spells; `None` for a name this build does not
+    /// write.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "staged" => Some(Self::Staged),
+            "active" => Some(Self::Active),
+            "retired" => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
+/// One classified asset of the update receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReceiptAsset {
+    pub asset: UpdateAsset,
+    /// Where the asset lives in this installation, as the write surface saw
+    /// it.
+    pub location: String,
+    pub policy: UpdatePolicy,
+}
+
+/// The receipt one base's update wrote (REQ-044, DEC-009): the base it belongs
+/// to, the state its cutover reached, every persistent asset this build
+/// writes with the policy the update followed for it, and the identity rules the
+/// base was released with (AC-056) — what the cutover placed, so the receipt
+/// names what moved by meaning as well as what it classified.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpdateReceipt {
+    pub base_version: u64,
+    /// The base document's byte digest: the receipt belongs to these bytes.
+    pub digest: String,
+    pub state: UpdateState,
+    pub assets: Vec<ReceiptAsset>,
+    pub identity: IdentityRebind,
+}
+
+/// One base the ledger records.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BaseDocument {
+    pub version: u64,
+    pub digest: String,
+}
+
+/// What the shipped write surface did to reach the base it serves: the receipt
+/// of the base installed now, and the checkpoint a cutover had to abandon first
+/// (EDGE-006) because it held a document this build cannot resume. The abandoned
+/// checkpoint is reported, never made up: a resume discards nothing and answers
+/// `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseServed {
+    pub receipt: UpdateReceipt,
+    pub abandoned: Option<BaseDocument>,
+}
+
+/// What one base cutover did (AC-054, AC-056): the base installed now — its
+/// receipt names the rules the release carried and the bindings the transition
+/// placed — the checkpoint a stopped cutover left behind, and the user document
+/// once its pins moved with the base. `edit` is `None` when no binding moved, so
+/// a second run over an installed base answers a document it did not touch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseCutover {
+    pub served: BaseServed,
+    pub edit: Option<ConfigEdit>,
+}
+
+/// The base ledger's served projection (AC-054, DEC-011): the base serving now
+/// and the receipt of the newest base the ledger holds — staged while a cutover
+/// waits, active when it serves. The receipt's own state names which.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpdateStatus {
+    pub base_version: Option<u64>,
+    pub receipt: Option<UpdateReceipt>,
+}
+
+/// The base ledger's typed refusals (P-001, EDGE-005). A refusal never leaves
+/// a half-applied cutover: the previous base keeps serving and the ledger row
+/// the run tried to write is absent.
+#[derive(Debug, thiserror::Error)]
+pub enum BaseError {
+    #[error("storage: {0}")]
+    Store(#[from] StoreError),
+    /// EDGE-005: the offered base's predecessor is not the recorded base, so a
+    /// supported step is missing and nothing is applied.
+    #[error("base version {offered} skips the recorded base {recorded}")]
+    SkippedVersion { offered: u64, recorded: u64 },
+    /// I-6: an older build must not write over a base a newer one recorded.
+    #[error("base version {offered} is older than the recorded base {recorded}")]
+    NewerRecorded { offered: u64, recorded: u64 },
+    /// The recorded version arrived with other bytes: the ledger answers no
+    /// receipt for a document this open did not compose, because the receipt
+    /// names the bytes it was read from. Nothing an open can rewrite clears it,
+    /// so the refusal names the recovery: the document that changed must arrive
+    /// under a version that names it.
+    #[error(
+        "base version {version} is recorded with another document; recovery: ship the changed document under a new base version"
+    )]
+    DocumentChanged { version: u64 },
+    /// Another document is already staged: a checkpoint belongs to the document
+    /// that staged it and is never rewritten in place, so the run that wants
+    /// other bytes abandons it first — the cutover does that for a checkpoint it
+    /// cannot resume, and never for one a newer build staged.
+    #[error(
+        "base version {version} is already staged with another document; recovery: resume the staged document, or abandon the checkpoint before staging another"
+    )]
+    AlreadyStaged { version: u64 },
+    /// The cutover names a base the ledger never staged.
+    #[error("base version {version} is not staged for cutover")]
+    NotStaged { version: u64 },
+    /// The ledger holds the base but no receipt for it: the classification was
+    /// never written, so it is not invented on read.
+    #[error("base version {version} has no update receipt")]
+    ReceiptMissing { version: u64 },
+    /// The identity rules do not place as written: the cutover is refused before
+    /// any row moves and the previous base keeps serving (AC-056).
+    #[error("base cutover identity: {0}")]
+    Identity(#[from] IdentityError),
+    /// The user document cannot carry the pins its rules move — the row conflict
+    /// [`Config::merge_purposes`] refuses. The cutover is refused before the
+    /// ledger moves, so the previous base keeps serving.
+    #[error("base cutover document: {0}")]
+    Document(#[from] ConfigError),
+}
+
+impl BaseError {
+    /// The refusal's wire code. Every base-ledger refusal carries the base
+    /// version domain's own code — never the store's schema-generation code —
+    /// so a refusal names which version domain it belongs to.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Store(error) => error.code(),
+            Self::Document(error) => match error.stage {
+                Stage::Parse | Stage::Schema => ErrorCode::InvalidInput,
+                Stage::Resolve => ErrorCode::Conflict,
+            },
+            Self::NewerRecorded { .. }
+            | Self::SkippedVersion { .. }
+            | Self::AlreadyStaged { .. }
+            | Self::DocumentChanged { .. }
+            | Self::NotStaged { .. }
+            | Self::ReceiptMissing { .. }
+            | Self::Identity { .. } => ErrorCode::Conflict,
+        }
+    }
+}
+
+/// One wire-addressable config carrier (DX-I3, DEC-014): the pattern the
+/// read hint prints, one representative key, and the resolvers the wire
+/// surfaces use. The read domain, the unknown-key hint and the wire edit
+/// target all descend from this table, so a carrier cannot answer on one
+/// surface while a second, hand-written list answers on another.
+///
+/// A document-only section — `[hooks]` (DEC-010), `models.purposes.<id>.pool`
+/// — is deliberately absent: it is parsed and validated, never addressed
+/// through `config.set`.
+pub struct ConfigCarrier {
+    /// The pattern spelling the unknown-key hint prints.
+    pub pattern: &'static str,
+    /// One concrete key this carrier addresses: the proof that every
+    /// surface answers the same shape.
+    pub sample: &'static str,
+    /// The served value of one address, from the name captures.
+    read: fn(&Config, &[&str]) -> Option<Value>,
+    /// The edit target one address resolves to.
+    target: fn(&[&str]) -> EditTarget,
+}
+
+impl ConfigCarrier {
+    /// The name captures this address yields, or `None` when the key does
+    /// not spell this carrier. A `<...>` segment captures exactly one
+    /// non-empty key segment; every other segment is literal.
+    fn names<'key>(&self, key: &'key str) -> Option<Vec<&'key str>> {
+        let pattern: Vec<&str> = self.pattern.split('.').collect();
+        let segments: Vec<&str> = key.split('.').collect();
+        if pattern.len() != segments.len() {
+            return None;
+        }
+        let mut names = Vec::new();
+        for (expected, actual) in pattern.iter().zip(&segments) {
+            if expected.starts_with('<') {
+                if actual.is_empty() {
+                    return None;
+                }
+                names.push(*actual);
+            } else if expected != actual {
+                return None;
+            }
+        }
+        Some(names)
+    }
+}
+
+/// Every config key the wire surfaces address, in the order the read hint
+/// prints them.
+pub const CONFIG_CARRIERS: &[ConfigCarrier] = &[
+    ConfigCarrier {
+        pattern: "workflow.enabled",
+        sample: "workflow.enabled",
+        read: |config, _| Some(Value::Bool(config.workflow.enabled.unwrap_or(true))),
+        target: |_| EditTarget::WorkflowEnabled,
+    },
+    ConfigCarrier {
+        pattern: "decisions.mode",
+        sample: "decisions.mode",
+        read: |config, _| {
+            Some(
+                config
+                    .decisions
+                    .mode
+                    .map_or(Value::Null, |mode| Value::String(mode.as_str().to_string())),
+            )
+        },
+        target: |_| EditTarget::DecisionsMode,
+    },
+    ConfigCarrier {
+        pattern: "context.auto_compact",
+        sample: "context.auto_compact",
+        read: |config, _| Some(Value::Bool(config.auto_compact())),
+        target: |_| EditTarget::ContextAutoCompact,
+    },
+    ConfigCarrier {
+        pattern: "connections.<id>.region",
+        sample: "connections.openai.region",
+        read: |config, names| {
+            Some(
+                config
+                    .connections
+                    .get(first_name(names))
+                    .and_then(|connection| connection.region.clone())
+                    .map_or(Value::Null, Value::String),
+            )
+        },
+        target: |names| EditTarget::ConnectionRegion(first_name(names).to_string()),
+    },
+    ConfigCarrier {
+        pattern: "connections.<id>.profile",
+        sample: "connections.openai.profile",
+        read: |config, names| {
+            Some(
+                config
+                    .connections
+                    .get(first_name(names))
+                    .and_then(|connection| connection.profile.clone())
+                    .map_or(Value::Null, Value::String),
+            )
+        },
+        target: |names| EditTarget::ConnectionProfile(first_name(names).to_string()),
+    },
+    ConfigCarrier {
+        pattern: "profiles.<name>.credential_ref",
+        sample: "profiles.default.credential_ref",
+        read: |config, names| {
+            Some(
+                config
+                    .profiles
+                    .get(first_name(names))
+                    .and_then(|profile| profile.credential_ref.clone())
+                    .map_or(Value::Null, Value::String),
+            )
+        },
+        target: |names| EditTarget::ProfileCredentialRef(first_name(names).to_string()),
+    },
+];
+
+/// The two declared sections no wire surface addresses, in the shape both
+/// carriers name them: a hook entry and a declared MCP server are the
+/// document's own (DEC-010), so neither is a carrier.
+const DOCUMENT_ONLY_SHAPES: &str = "hooks.<event>@<scope>, mcp.servers.<name>";
+
+/// The name a name-bearing carrier captured. A pattern without a capture
+/// never calls this, so the empty answer is unreachable rather than a
+/// silent substitution.
+fn first_name<'name>(names: &[&'name str]) -> &'name str {
+    names.first().copied().unwrap_or_default()
+}
+
+/// The keys `config.read` serves, named once for the read surface's
+/// unknown-key hint: the pattern of every carrier, in table order, then the
+/// document-only sections. A name-bearing key prints its pattern form — a
+/// connection or profile name is never itself a known key.
+#[must_use]
+pub fn read_key_hint() -> String {
+    let carriers = CONFIG_CARRIERS
+        .iter()
+        .map(|carrier| carrier.pattern)
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The two declared sections follow the carriers (DEC-010): a `[hooks]` or
+    // `[mcp.servers.<name>]` key is never addressable, so the hint names them
+    // as the document's own and the file that can write them, instead of
+    // leaving the asker with a list of unrelated carriers.
+    format!("{carriers}; document-only, declare in the config file: {DOCUMENT_ONLY_SHAPES}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -54,9 +633,17 @@ pub enum ConfigIssue {
     ConfigVersionNotNonNegativeInteger,
     #[error("key {key} is not editable")]
     KeyNotEditable { key: String },
+    /// A declaration the document owns and the wire surfaces never write
+    /// (DEC-010): `[hooks]` and `[mcp.servers.<name>]`. The answer names the
+    /// file that can write it instead of refusing with no why and no next
+    /// action.
+    #[error(
+        "{key} is document-only; declare it in the config file; not editable through config.set"
+    )]
+    DocumentOnlyKey { key: String },
     #[error("malformed key {key}: empty segment")]
     EmptyKeySegment { key: String },
-    #[error("unknown root key {key}")]
+    #[error("{}", unknown_root_message(key))]
     UnknownRootKey { key: String },
     #[error("{field} is required")]
     Required { field: String },
@@ -74,6 +661,8 @@ pub enum ConfigIssue {
     UnknownConnectionReference { connection: String },
     #[error("conflicting definitions for one purpose")]
     ConflictingPurposeDefinitions,
+    #[error("base may not claim id {id} of the reserved personal namespace")]
+    PersonalNamespaceClaimed { id: String },
     #[error("{key} must be a table")]
     ExpectedTable { key: String },
     #[error("{field} must be a string")]
@@ -123,6 +712,29 @@ pub enum ConfigIssue {
     WorkflowEnabledNotBoolean,
     #[error("context.auto_compact must be a boolean")]
     ContextAutoCompactNotBoolean,
+    #[error("hook entry {key} must be named <event>@<scope>")]
+    HookEntryNotAddressable { key: String },
+    #[error("unsupported hook event {event}; known events: {}", HOOK_EVENTS.join(", "))]
+    UnsupportedHookEvent { event: String },
+    #[error("hook command must be an absolute program path")]
+    HookCommandNotAbsolutePath { key: String },
+    #[error("hook args must be an array of strings")]
+    HookArgsInvalid { key: String },
+    #[error("mcp server name {name} is not a bounded identifier")]
+    McpServerNameInvalid { name: String },
+    #[error("mcp server program must be an absolute program path")]
+    McpProgramNotAbsolutePath { key: String },
+    /// A declared origin is the destination the executor's egress admission
+    /// binds, so it carries the runtime's own grammar at the parse site: the
+    /// accepted form is named here instead of surfacing at the first call.
+    #[error(
+        "mcp server origin must be <scheme>://<host> over ASCII letters, digits or . _ - : / +, at most 128 characters"
+    )]
+    McpOriginInvalid { key: String },
+    #[error("mcp server args must be an array of strings")]
+    McpArgsInvalid { key: String },
+    #[error("mcp server env must be a table of strings")]
+    McpEnvInvalid { key: String },
     #[error("unsupported decisions.mode {mode}; known modes: ask, auto, inherit")]
     UnsupportedDecisionMode { mode: String },
     #[error("{key} is required, not an override; reset removes overrides only")]
@@ -344,6 +956,90 @@ pub struct Context {
     pub auto_compact: Option<bool>,
 }
 
+/// One declared hook (AC-076, DEC-010): a user-owned program the executor
+/// runs at its one instrumented event. Its identity is event + scope +
+/// command (DX-I1), addressed by the document key `hooks.<event>@<scope>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookEntry {
+    pub event: String,
+    pub scope: String,
+    /// The program, as an absolute path: a hook is executed, never looked
+    /// up through `PATH`.
+    pub command: PathBuf,
+    pub args: Vec<String>,
+}
+
+impl HookEntry {
+    /// The record identity the document key and every refusal spell.
+    #[must_use]
+    pub fn id(&self) -> String {
+        format!("{}@{}", self.event, self.scope)
+    }
+}
+
+/// The `[hooks]` section: document-only (DEC-010, I7 option a). A hook is
+/// a program the executor runs, so no wire channel — human or machine —
+/// installs one; the file is the only writer, and an invalid entry is a
+/// typed refusal naming its key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hooks {
+    entries: BTreeMap<String, HookEntry>,
+}
+
+impl Hooks {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The entry one identity addresses.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&HookEntry> {
+        self.entries.get(id)
+    }
+
+    /// The one entry declared for an event, in identity order so the
+    /// choice never depends on document order: the executor runs at most
+    /// one hook per event.
+    #[must_use]
+    pub fn for_event(&self, event: &str) -> Option<&HookEntry> {
+        self.entries.values().find(|entry| entry.event == event)
+    }
+}
+
+/// One declared MCP server (AC-075): `[mcp.servers.<name>]`. The row is the
+/// operator's, never the caller's — a `tools/call` request names the server
+/// and nothing else, so the program it launches, its arguments, its
+/// environment and the origin its egress is admitted against come from this
+/// document alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerDeclaration {
+    /// The destination identity the executor's egress admission binds and the
+    /// origin a credential reference must be enrolled for.
+    pub origin: String,
+    /// The program, as an absolute path: a declared server is executed, never
+    /// looked up through `PATH`.
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// The declaration's own environment entries; the process is started with
+    /// a cleared environment, so nothing is inherited but the base allowlist.
+    pub env: BTreeMap<String, String>,
+    pub credential: Option<McpCredentialDeclaration>,
+}
+
+/// The credential one declared server resolves for itself. The reference names
+/// where material lives; `origin` is the origin the reference was *enrolled*
+/// for, so a row copied from another server keeps its enrolled origin and the
+/// mismatch is refused instead of resolving a foreign credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCredentialDeclaration {
+    pub reference: String,
+    pub origin: String,
+    /// The environment variable the material reaches the child under — never
+    /// a frame field.
+    pub variable: String,
+}
+
 /// The wire spelling of `decisions.mode`: `ask` and `auto` resolve
 /// directly; `inherit` names the absent override — the layer below
 /// (today the shipped `ask`) answers instead.
@@ -410,6 +1106,13 @@ pub struct Config {
     /// schema violation a dangling connection reference is.
     pub profiles: BTreeMap<String, Profile>,
     pub models: Models,
+    /// The `[hooks]` declarations (DEC-010): user-owned programs the
+    /// executor runs at its one instrumented event.
+    pub hooks: Hooks,
+    /// The `[mcp.servers.<name>]` declarations (AC-075): operator-owned MCP
+    /// programs a `tools/call` request may name. Document-only, like a hook:
+    /// the program a child runs is never wire-supplied.
+    pub mcp: BTreeMap<String, McpServerDeclaration>,
     raw: Option<DocumentMut>,
 }
 
@@ -441,6 +1144,17 @@ pub struct ResolvedPurpose {
     pub fallback_source: String,
 }
 
+/// The purpose moves a release's rules make: one identity is both the config row
+/// that binds a purpose and the purpose a learned condition names, so a role rule
+/// moves the document binding and the stored experience together (AC-056). An
+/// action rule names a capability and moves no document row.
+fn purpose_moves(rules: &[IdentityMigration]) -> impl Iterator<Item = (String, String)> + '_ {
+    rules
+        .iter()
+        .filter(|rule| rule.kind == IdentityKind::Role)
+        .map(|rule| (rule.old_id.clone(), rule.new_id.clone()))
+}
+
 impl Config {
     /// Syntax stage only: `toml_edit` rejects malformed TOML and duplicate
     /// keys here. Typed and semantic rejections wait for `validate`.
@@ -459,15 +1173,16 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return Ok(());
         };
-        let (version, workflow, decisions, context, connections, profiles, models) =
-            validated_document(doc)?;
-        self.version = version;
-        self.workflow = workflow;
-        self.decisions = decisions;
-        self.context = context;
-        self.connections = connections;
-        self.profiles = profiles;
-        self.models = models;
+        let parsed = validated_document(doc)?;
+        self.version = parsed.version;
+        self.workflow = parsed.workflow;
+        self.decisions = parsed.decisions;
+        self.context = parsed.context;
+        self.connections = parsed.connections;
+        self.profiles = parsed.profiles;
+        self.models = parsed.models;
+        self.hooks = parsed.hooks;
+        self.mcp = parsed.mcp;
         Ok(())
     }
 
@@ -487,6 +1202,150 @@ impl Config {
             Some(DecisionModeValue::Auto) => DecisionMode::Auto,
             _ => DecisionMode::Ask,
         }
+    }
+
+    /// Rebinds one purpose's binding to its migrated name (AC-056, REQ-046):
+    /// the row moves by meaning, so a rename keeps the pin it carried. The
+    /// source document key leaves with it — a moved value is never readable
+    /// under the old name — and a target the document already binds differently
+    /// is refused by [`Config::merge_purposes`] instead of collapsing two rows
+    /// into one. An absent source row moves nothing and answers `None`.
+    ///
+    /// The row is read from the retained document by the same purpose schema the
+    /// file surface uses, one row at a time, so a document holding a field the
+    /// schema rejects elsewhere — a sibling purpose row, a connection, any
+    /// other table — still moves its own binding instead of leaving it behind;
+    /// those bytes are never rewritten, the targeted-edit discipline
+    /// `Config::set` already keeps (DEC-013).
+    ///
+    /// A config with no retained document binds no purpose row at all, so a role
+    /// rule has no pin to move and nothing to refuse: the answer is `None`, and
+    /// the cutover that offers the rule still installs the base it serves.
+    ///
+    /// # Errors
+    /// Returns the conflict [`Config::merge_purposes`] reports for two
+    /// different bindings under one name, and the schema refusals the two rows
+    /// this move reads carry.
+    pub fn rebind_purpose(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<ConfigEdit>, ConfigError> {
+        let key = format!("models.purposes.{to}");
+        {
+            let Some(document) = self.raw.as_mut() else {
+                return Ok(None);
+            };
+            let purposes = document
+                .get("models")
+                .and_then(Item::as_table_like)
+                .and_then(|models| models.get("purposes"))
+                .and_then(Item::as_table_like);
+            let Some(purposes) = purposes else {
+                return Ok(None);
+            };
+            let source_key = format!("models.purposes.{from}");
+            let Some(binding) = purposes
+                .get(from)
+                .map(|entry| purpose_def(&source_key, from, entry))
+                .transpose()?
+            else {
+                return Ok(None);
+            };
+            // The merge rule the two-document case already runs, applied to the
+            // two rows this move touches: an identical binding replays, a
+            // different one conflicts, and neither row is overwritten by the
+            // other. No third row is judged, so an unknown field a sibling holds
+            // keeps its bytes and does not refuse this move.
+            let mut moved = Config::default();
+            moved.models.purposes.insert(to.to_string(), binding);
+            let mut held = Config::default();
+            if let Some(target) = purposes
+                .get(to)
+                .map(|entry| purpose_def(&key, to, entry))
+                .transpose()?
+            {
+                held.models.purposes.insert(to.to_string(), target);
+            }
+            held.merge_purposes(&moved)?;
+        }
+        if from != to {
+            self.move_purpose_table(from, to)?;
+        }
+        self.refresh_view_if_valid();
+        Ok(Some(self.finish_edit()))
+    }
+
+    /// The purpose moves a base release's role rules make, proven against a copy
+    /// of this document (AC-056): a rule names one identity, so its config row
+    /// moves where the stored experience moves, and a row the document does not
+    /// bind is no move at all. The proof runs before the ledger moves — a
+    /// document that cannot carry a pin refuses the cutover with the previous
+    /// base still serving — and what it answers is what
+    /// [`Config::move_purpose_bindings`] then applies.
+    ///
+    /// # Errors
+    /// Returns the refusals [`Config::rebind_purpose`] reports for the moves this
+    /// document cannot carry.
+    pub(crate) fn planned_purpose_moves(
+        &self,
+        rules: &[IdentityMigration],
+    ) -> Result<Vec<(String, String)>, ConfigError> {
+        let mut proven = self.clone();
+        let mut moves = Vec::new();
+        for (from, to) in purpose_moves(rules) {
+            if proven.rebind_purpose(&from, &to)?.is_some() {
+                moves.push((from, to));
+            }
+        }
+        Ok(moves)
+    }
+
+    /// Applies the moves [`Config::planned_purpose_moves`] proved, after the base
+    /// they belong to committed: the document the cutover serves moves with the
+    /// base it serves, and the last edit is the document to write back.
+    ///
+    /// # Errors
+    /// Returns the refusals [`Config::rebind_purpose`] reports; a move the proof
+    /// already passed cannot add one.
+    pub(crate) fn move_purpose_bindings(
+        &mut self,
+        moves: &[(String, String)],
+    ) -> Result<Option<ConfigEdit>, ConfigError> {
+        let mut edit = None;
+        for (from, to) in moves {
+            if let Some(moved) = self.rebind_purpose(from, to)? {
+                edit = Some(moved);
+            }
+        }
+        Ok(edit)
+    }
+
+    /// Moves the retained document's `models.purposes.<from>` table onto `<to>`.
+    /// The bytes move as one item, so the row's own comments and layout travel
+    /// with the binding; a target the document already declares keeps its own
+    /// row (the merge above proved the two bindings identical) and only the
+    /// source key leaves.
+    fn move_purpose_table(&mut self, from: &str, to: &str) -> Result<(), ConfigError> {
+        let key = format!("models.purposes.{to}");
+        let document = self.require_document(&key)?;
+        let Some(purposes) = document
+            .get_mut("models")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|models| models.get_mut("purposes"))
+            .and_then(Item::as_table_like_mut)
+        else {
+            return Ok(());
+        };
+        if purposes.contains_key(to) {
+            purposes.remove(from);
+            return Ok(());
+        }
+        let Some(binding) = purposes.remove(from) else {
+            return Ok(());
+        };
+        purposes.insert(to, binding);
+        Ok(())
     }
 
     pub fn parse_validated(text: &str) -> Result<Self, ConfigError> {
@@ -705,20 +1564,20 @@ impl Config {
         let Some(doc) = self.raw.as_ref() else {
             return;
         };
-        let Ok((version, workflow, decisions, context, connections, profiles, models)) =
-            validated_document(doc)
-        else {
+        let Ok(parsed) = validated_document(doc) else {
             // Targeted edits intentionally remain usable while another path
             // still carries a rejected value; that value is never rewritten.
             return;
         };
-        self.version = version;
-        self.workflow = workflow;
-        self.decisions = decisions;
-        self.context = context;
-        self.connections = connections;
-        self.profiles = profiles;
-        self.models = models;
+        self.version = parsed.version;
+        self.workflow = parsed.workflow;
+        self.decisions = parsed.decisions;
+        self.context = parsed.context;
+        self.connections = parsed.connections;
+        self.profiles = parsed.profiles;
+        self.models = parsed.models;
+        self.hooks = parsed.hooks;
+        self.mcp = parsed.mcp;
     }
 
     fn finish_edit(&self) -> ConfigEdit {
@@ -748,39 +1607,9 @@ impl Config {
     /// [`is_readable_key`] the wire surface gates on, so a rejected key
     /// can never read as an empty-name null here.
     pub fn read_value(&self, key: &str) -> Option<Value> {
-        if !is_readable_key(key) {
-            return None;
-        }
-        let segments: Vec<&str> = key.split('.').collect();
-        match segments.as_slice() {
-            // A key with a documented default serves the effective value,
-            // never null: the shipped document already answers it.
-            ["context", "auto_compact"] => Some(Value::Bool(self.auto_compact())),
-            ["decisions", "mode"] => Some(
-                self.decisions
-                    .mode
-                    .map_or(Value::Null, |mode| Value::String(mode.as_str().to_string())),
-            ),
-            ["connections", name, "region"] => Some(
-                self.connections
-                    .get(*name)
-                    .and_then(|connection| connection.region.clone())
-                    .map_or(Value::Null, Value::String),
-            ),
-            ["connections", name, "profile"] => Some(
-                self.connections
-                    .get(*name)
-                    .and_then(|connection| connection.profile.clone())
-                    .map_or(Value::Null, Value::String),
-            ),
-            ["profiles", name, "credential_ref"] => Some(
-                self.profiles
-                    .get(*name)
-                    .and_then(|profile| profile.credential_ref.clone())
-                    .map_or(Value::Null, Value::String),
-            ),
-            _ => None,
-        }
+        let carrier = carrier_for(key)?;
+        let names = carrier.names(key)?;
+        (carrier.read)(self, &names)
     }
 
     /// The byte digest of the retained document — the revision a read
@@ -796,15 +1625,38 @@ impl Config {
 /// segment is never itself a known key, and an empty segment reads as
 /// unknown.
 pub fn is_readable_key(key: &str) -> bool {
-    if key == WORKFLOW_KEY || key == DECISIONS_MODE_KEY || key == CONTEXT_AUTO_COMPACT_KEY {
-        return true;
+    carrier_for(key).is_some()
+}
+
+/// The one carrier an address spells, from the table (DX-I3).
+pub(crate) fn carrier_for(key: &str) -> Option<&'static ConfigCarrier> {
+    CONFIG_CARRIERS
+        .iter()
+        .find(|carrier| carrier.names(key).is_some())
+}
+
+/// Whether the wire edit surfaces may address this key: a `[hooks]`
+/// declaration is document-only (DEC-010), so nothing under `hooks` is.
+pub fn is_hook_key(key: &str) -> bool {
+    key == "hooks" || key.starts_with("hooks.")
+}
+
+/// Whether the document owns this key and no wire surface serves it: a
+/// `[hooks]` declaration and a `[mcp.servers.<name>]` one are the file's own
+/// (DEC-010), so a read of one answers the file instead of an unknown key.
+pub fn is_document_only_key(key: &str) -> bool {
+    is_hook_key(key) || key == "mcp.servers" || key.starts_with("mcp.servers.")
+}
+
+/// The document-only sentence, worded once for both carriers: the edit
+/// surface raises it as a typed issue, the read surface answers the same
+/// text for the same key.
+#[must_use]
+pub fn document_only_message(key: &str) -> String {
+    ConfigIssue::DocumentOnlyKey {
+        key: key.to_string(),
     }
-    let segments: Vec<&str> = key.split('.').collect();
-    match segments.as_slice() {
-        ["connections", name, "region" | "profile"] => !name.is_empty(),
-        ["profiles", name, "credential_ref"] => !name.is_empty(),
-        _ => false,
-    }
+    .to_string()
 }
 
 /// `credential_ref` ingress is the credential seam's own grammar (INV-006,
@@ -826,16 +1678,19 @@ fn credential_ref_admitted(raw: &str, key: &str) -> Result<(), ConfigIssue> {
 
 /// The typed view `validated_document` extracts from the raw TOML:
 /// version, workflow, decisions and context tables, connections,
-/// credential profiles and the models section, all schema-checked.
-type ParsedDocument = (
-    u64,
-    Workflow,
-    Decisions,
-    Context,
-    BTreeMap<String, Connection>,
-    BTreeMap<String, Profile>,
-    Models,
-);
+/// credential profiles, the models section, the hook declarations and the
+/// declared MCP servers, all schema-checked.
+struct ParsedDocument {
+    version: u64,
+    workflow: Workflow,
+    decisions: Decisions,
+    context: Context,
+    connections: BTreeMap<String, Connection>,
+    profiles: BTreeMap<String, Profile>,
+    models: Models,
+    hooks: Hooks,
+    mcp: BTreeMap<String, McpServerDeclaration>,
+}
 
 fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
     let mut version = None;
@@ -845,6 +1700,8 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
     let mut connections = BTreeMap::new();
     let mut profiles = BTreeMap::new();
     let mut models = Models::default();
+    let mut hooks = Hooks::default();
+    let mut mcp = BTreeMap::new();
     for (key, item) in doc.iter() {
         match key {
             "config_version" => {
@@ -860,87 +1717,13 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
                 version = Some(value as u64);
             }
             "workflow" => {
-                let table = table_like(key, item)?;
-                for (field, value) in table.iter() {
-                    match field {
-                        "enabled" => {
-                            workflow.enabled = Some(value.as_bool().ok_or_else(|| {
-                                ConfigError::schema(
-                                    "workflow.enabled",
-                                    ConfigIssue::WorkflowEnabledNotBoolean,
-                                )
-                            })?);
-                        }
-                        other => {
-                            return Err(ConfigError::schema(
-                                format!("workflow.{other}"),
-                                ConfigIssue::UnknownKey {
-                                    key: other.to_string(),
-                                    known: WORKFLOW_KEYS,
-                                },
-                            ));
-                        }
-                    }
-                }
+                workflow = workflow_section(item)?;
             }
             "decisions" => {
-                let table = table_like(key, item)?;
-                for (field, value) in table.iter() {
-                    match field {
-                        "mode" => {
-                            let raw = value.as_str().ok_or_else(|| {
-                                ConfigError::schema(
-                                    "decisions.mode",
-                                    ConfigIssue::ExpectedString {
-                                        field: "mode".to_string(),
-                                    },
-                                )
-                            })?;
-                            decisions.mode =
-                                Some(DecisionModeValue::parse(raw).ok_or_else(|| {
-                                    ConfigError::schema(
-                                        "decisions.mode",
-                                        ConfigIssue::UnsupportedDecisionMode {
-                                            mode: raw.to_string(),
-                                        },
-                                    )
-                                })?);
-                        }
-                        other => {
-                            return Err(ConfigError::schema(
-                                format!("decisions.{other}"),
-                                ConfigIssue::UnknownKey {
-                                    key: other.to_string(),
-                                    known: DECISIONS_KEYS,
-                                },
-                            ));
-                        }
-                    }
-                }
+                decisions = decisions_section(item)?;
             }
             "context" => {
-                let table = table_like(key, item)?;
-                for (field, value) in table.iter() {
-                    match field {
-                        "auto_compact" => {
-                            context.auto_compact = Some(value.as_bool().ok_or_else(|| {
-                                ConfigError::schema(
-                                    CONTEXT_AUTO_COMPACT_KEY,
-                                    ConfigIssue::ContextAutoCompactNotBoolean,
-                                )
-                            })?);
-                        }
-                        other => {
-                            return Err(ConfigError::schema(
-                                format!("context.{other}"),
-                                ConfigIssue::UnknownKey {
-                                    key: other.to_string(),
-                                    known: CONTEXT_KEYS,
-                                },
-                            ));
-                        }
-                    }
-                }
+                context = context_section(item)?;
             }
             "connections" => {
                 let table = table_like(key, item)?;
@@ -957,6 +1740,14 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             "models" => {
                 models = models_table(table_like(key, item)?)?;
             }
+            "hooks" => {
+                hooks = hooks_table(table_like(key, item)?)?;
+            }
+            "mcp" => {
+                // The section names servers, so one more level is read here
+                // and the row schema owns the rest.
+                mcp = mcp_section(table_like(key, item)?)?;
+            }
             other => {
                 return Err(ConfigError::schema(
                     other,
@@ -967,20 +1758,7 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             }
         }
     }
-    let version = version.ok_or_else(|| {
-        ConfigError::schema(
-            "config_version",
-            ConfigIssue::Required {
-                field: "config_version".to_string(),
-            },
-        )
-    })?;
-    if version != 1 {
-        return Err(ConfigError::schema(
-            "config_version",
-            ConfigIssue::UnsupportedConfigVersion,
-        ));
-    }
+    let version = document_config_version(version)?;
     if connections.is_empty() {
         return Err(ConfigError::schema(
             "connections",
@@ -1029,23 +1807,49 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             ));
         }
     }
-    let Some(defaults) = &models.defaults else {
+    if models.defaults.is_none() {
         return Err(ConfigError::schema(
             "models.defaults",
             ConfigIssue::Required {
                 field: "models.defaults".to_string(),
             },
         ));
-    };
-    check_model_refs(&connections, &defaults.model, "models.defaults.model")?;
-    check_chain_refs(
-        &connections,
-        &defaults.fallback,
-        "models.defaults.fallback.chain",
-    )?;
+    }
+    check_model_references(&connections, &models)?;
+    Ok(ParsedDocument {
+        version,
+        workflow,
+        decisions,
+        context,
+        connections,
+        profiles,
+        models,
+        hooks,
+        mcp,
+    })
+}
+
+/// The referential checks a document's `[models]` section must pass: every fixed
+/// model and fallback entry names a declared connection, and every purpose group
+/// names a declared group. The file document and the composed document run this
+/// one function, so a base that names a connection or group the installation
+/// does not declare is refused where the layers meet instead of failing at
+/// dispatch, far from the cause.
+fn check_model_references(
+    connections: &BTreeMap<String, Connection>,
+    models: &Models,
+) -> Result<(), ConfigError> {
+    if let Some(defaults) = &models.defaults {
+        check_model_refs(connections, &defaults.model, "models.defaults.model")?;
+        check_chain_refs(
+            connections,
+            &defaults.fallback,
+            "models.defaults.fallback.chain",
+        )?;
+    }
     for (name, group) in &models.groups {
         check_model_refs(
-            &connections,
+            connections,
             &group.model,
             &format!("models.groups.{name}.model"),
         )?;
@@ -1063,21 +1867,177 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             ));
         }
         if let Some(model) = &purpose.model {
-            check_model_refs(&connections, model, &format!("{key}.model"))?;
+            check_model_refs(connections, model, &format!("{key}.model"))?;
         }
         if let Some(fallback) = &purpose.fallback {
-            check_chain_refs(&connections, fallback, &format!("{key}.fallback.chain"))?;
+            check_chain_refs(connections, fallback, &format!("{key}.fallback.chain"))?;
         }
     }
-    Ok((
-        version,
-        workflow,
-        decisions,
-        context,
-        connections,
-        profiles,
-        models,
-    ))
+    Ok(())
+}
+
+/// The `config_version` a document declares (DEC-010): absent and unsupported
+/// are both refusals, and the base document is admitted by the same rule as the
+/// user's so a base can never state a version the file schema rejects.
+fn document_config_version(version: Option<u64>) -> Result<u64, ConfigError> {
+    let version = version.ok_or_else(|| {
+        ConfigError::schema(
+            "config_version",
+            ConfigIssue::Required {
+                field: "config_version".to_string(),
+            },
+        )
+    })?;
+    if version != 1 {
+        return Err(ConfigError::schema(
+            "config_version",
+            ConfigIssue::UnsupportedConfigVersion,
+        ));
+    }
+    Ok(version)
+}
+
+fn workflow_section(item: &Item) -> Result<Workflow, ConfigError> {
+    let mut workflow = Workflow::default();
+    for (field, value) in table_like("workflow", item)?.iter() {
+        match field {
+            "enabled" => {
+                workflow.enabled = Some(value.as_bool().ok_or_else(|| {
+                    ConfigError::schema("workflow.enabled", ConfigIssue::WorkflowEnabledNotBoolean)
+                })?);
+            }
+            other => {
+                return Err(ConfigError::schema(
+                    format!("workflow.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: WORKFLOW_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(workflow)
+}
+
+fn decisions_section(item: &Item) -> Result<Decisions, ConfigError> {
+    let mut decisions = Decisions::default();
+    for (field, value) in table_like("decisions", item)?.iter() {
+        match field {
+            "mode" => {
+                let raw = value.as_str().ok_or_else(|| {
+                    ConfigError::schema(
+                        "decisions.mode",
+                        ConfigIssue::ExpectedString {
+                            field: "mode".to_string(),
+                        },
+                    )
+                })?;
+                decisions.mode = Some(DecisionModeValue::parse(raw).ok_or_else(|| {
+                    ConfigError::schema(
+                        "decisions.mode",
+                        ConfigIssue::UnsupportedDecisionMode {
+                            mode: raw.to_string(),
+                        },
+                    )
+                })?);
+            }
+            other => {
+                return Err(ConfigError::schema(
+                    format!("decisions.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: DECISIONS_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(decisions)
+}
+
+fn context_section(item: &Item) -> Result<Context, ConfigError> {
+    let mut context = Context::default();
+    for (field, value) in table_like("context", item)?.iter() {
+        match field {
+            "auto_compact" => {
+                context.auto_compact = Some(value.as_bool().ok_or_else(|| {
+                    ConfigError::schema(
+                        CONTEXT_AUTO_COMPACT_KEY,
+                        ConfigIssue::ContextAutoCompactNotBoolean,
+                    )
+                })?);
+            }
+            other => {
+                return Err(ConfigError::schema(
+                    format!("context.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: CONTEXT_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(context)
+}
+
+/// The base document's sections, read by the same schema as the user's
+/// document (AC-054): a base supplies defaults, so it may state the four
+/// default-bearing sections and owns nothing a user owns — connections,
+/// profiles and hooks stay the user's to declare, and a base that states one is
+/// refused rather than silently trusted with it.
+fn validated_base(
+    doc: &DocumentMut,
+) -> Result<(Workflow, Decisions, Context, Models), ConfigError> {
+    let mut version = None;
+    let mut workflow = Workflow::default();
+    let mut decisions = Decisions::default();
+    let mut context = Context::default();
+    let mut models = Models::default();
+    for (key, item) in doc.iter() {
+        match key {
+            "config_version" => {
+                let value = item
+                    .as_integer()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| {
+                        ConfigError::schema(
+                            "config_version",
+                            ConfigIssue::ConfigVersionNotNonNegativeInteger,
+                        )
+                    })?;
+                version = Some(value as u64);
+            }
+            "workflow" => workflow = workflow_section(item)?,
+            "decisions" => decisions = decisions_section(item)?,
+            "context" => context = context_section(item)?,
+            "models" => models = models_table(table_like(key, item)?)?,
+            other => {
+                return Err(ConfigError::schema(
+                    other,
+                    ConfigIssue::UnknownRootKey {
+                        key: other.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+    document_config_version(version)?;
+    // The reserved user namespace (AC-056, REQ-046): a base is the release's
+    // own document, so it may not name an id inside the namespace the user's
+    // identities live in — a mapping that could name it could rebind or
+    // overwrite the user's own experience. The user's own document keeps the
+    // namespace; only this layout is refused.
+    for name in models.purposes.keys() {
+        if crate::identity::claims_personal_namespace(name) {
+            return Err(ConfigError::schema(
+                format!("models.purposes.{name}"),
+                ConfigIssue::PersonalNamespaceClaimed { id: name.clone() },
+            ));
+        }
+    }
+    Ok((workflow, decisions, context, models))
 }
 
 #[derive(Debug)]
@@ -1115,10 +2075,15 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
     if segments.iter().any(|segment| segment.is_empty()) {
         return Err(unknown_edit_key(key));
     }
+    // The wire carriers answer from the one table (DX-I3); the model
+    // assignment slots below keep their own arms — they are document-shaped
+    // objects, not scalar wire carriers.
+    if let Some(carrier) = carrier_for(key)
+        && let Some(names) = carrier.names(key)
+    {
+        return Ok((carrier.target)(&names));
+    }
     match segments.as_slice() {
-        ["workflow", "enabled"] => Ok(EditTarget::WorkflowEnabled),
-        ["decisions", "mode"] => Ok(EditTarget::DecisionsMode),
-        ["context", "auto_compact"] => Ok(EditTarget::ContextAutoCompact),
         ["models", "defaults", "model"] => Ok(EditTarget::DefaultsModel),
         ["models", "defaults", "effort"] => Ok(EditTarget::DefaultsEffort),
         ["models", "defaults", "fallback"] => Ok(EditTarget::DefaultsFallback),
@@ -1130,15 +2095,6 @@ fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
         }
         ["models", "purposes", name, "eligible"] => {
             Ok(EditTarget::PurposeEligible(name.to_string()))
-        }
-        // The additive profile keys (DEC-013): connection `region` and
-        // `profile` plus the credential profiles' `credential_ref` are
-        // the only editable connection/profile fields — `kind`,
-        // `endpoint` and `credential_ref` stay non-editable.
-        ["connections", name, "region"] => Ok(EditTarget::ConnectionRegion(name.to_string())),
-        ["connections", name, "profile"] => Ok(EditTarget::ConnectionProfile(name.to_string())),
-        ["profiles", name, "credential_ref"] => {
-            Ok(EditTarget::ProfileCredentialRef(name.to_string()))
         }
         _ => Err(unknown_edit_key(key)),
     }
@@ -1212,6 +2168,15 @@ fn unknown_edit_key(key: &str) -> ConfigError {
             [_, field] if PROFILE_KEYS.contains(field) => not_editable_key(key),
             _ => unknown_scope_key(key, PROFILE_KEYS),
         },
+        // A hook is a program the executor runs, so `[hooks]` is
+        // document-only (DEC-010, I7a): every spelling below it is a legal
+        // location the edit surface cannot target, and the answer names the
+        // file that can.
+        "hooks" => document_only_key(key),
+        // A declared MCP server is a program the client launches and a
+        // destination its egress is admitted against, so `[mcp]` is
+        // document-only for the same reason `[hooks]` is.
+        "mcp" => document_only_key(key),
         "models" => match rest {
             [] => not_editable_key(key),
             ["defaults" | "groups" | "purposes"] | ["groups" | "purposes", _] => {
@@ -1243,6 +2208,15 @@ fn not_editable_key(key: &str) -> ConfigError {
     ConfigError::schema(
         key,
         ConfigIssue::KeyNotEditable {
+            key: key.to_string(),
+        },
+    )
+}
+
+fn document_only_key(key: &str) -> ConfigError {
+    ConfigError::schema(
+        key,
+        ConfigIssue::DocumentOnlyKey {
             key: key.to_string(),
         },
     )
@@ -1287,6 +2261,49 @@ fn unknown_root_key(key: &str, root: &str) -> ConfigError {
             key: root.to_string(),
         },
     )
+}
+
+/// The `unknown root key` refusal, with the diagnosis the root table makes
+/// possible (DX-I4): the legal roots and the nearest one. The nearest key
+/// is offered only for a plausible slip — a suggestion derived from an
+/// unrelated word would be noise dressed as help.
+fn unknown_root_message(key: &str) -> String {
+    match nearest_root(key) {
+        Some(nearest) => format!(
+            "unknown root key {key}; known roots: {}; nearest key: {nearest}",
+            CONFIG_ROOTS.join(", ")
+        ),
+        None => format!("unknown root key {key}"),
+    }
+}
+
+fn nearest_root(key: &str) -> Option<&'static str> {
+    CONFIG_ROOTS
+        .iter()
+        .copied()
+        .map(|root| (edit_distance(key, root), root))
+        .filter(|(distance, _)| *distance <= ROOT_KEY_HINT_DISTANCE)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, root)| root)
+}
+
+/// Character edit distance: one small dynamic program over two keys, so
+/// the root hint needs no dependency and no allocation beyond the rows.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (row, left_char) in left.chars().enumerate() {
+        current[0] = row + 1;
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn type_mismatch(key: &str) -> ConfigError {
@@ -2194,6 +3211,377 @@ fn profile(name: &str, item: &Item) -> Result<Profile, ConfigError> {
     Ok(Profile { credential_ref })
 }
 
+/// The `[hooks]` section: one entry per `<event>@<scope>` key, each a
+/// program declaration. Every rejection names the key it refused — a hook
+/// is a program the executor runs, so an entry this schema cannot read is
+/// never skipped silently.
+fn hooks_table(table: &dyn TableLike) -> Result<Hooks, ConfigError> {
+    let mut hooks = Hooks::default();
+    for (key, item) in table.iter() {
+        let address = format!("hooks.{key}");
+        let not_addressable = || {
+            ConfigError::schema(
+                &address,
+                ConfigIssue::HookEntryNotAddressable {
+                    key: address.clone(),
+                },
+            )
+        };
+        let Some((event, scope)) = key.split_once('@') else {
+            return Err(not_addressable());
+        };
+        if event.is_empty() || scope.is_empty() {
+            return Err(not_addressable());
+        }
+        if !HOOK_EVENTS.contains(&event) {
+            return Err(ConfigError::schema(
+                format!("{address}.event"),
+                ConfigIssue::UnsupportedHookEvent {
+                    event: event.to_string(),
+                },
+            ));
+        }
+        let entry = table_like(&address, item)?;
+        let mut command = None;
+        let mut args = Vec::new();
+        for (field, value) in entry.iter() {
+            match field {
+                "command" => {
+                    let raw = value.as_str().ok_or_else(|| {
+                        ConfigError::schema(
+                            format!("{address}.command"),
+                            ConfigIssue::ExpectedString {
+                                field: "command".to_string(),
+                            },
+                        )
+                    })?;
+                    let program = PathBuf::from(raw);
+                    // A hook is executed, not resolved: a bare name would
+                    // leave the program to `PATH` instead of the document.
+                    if !program.is_absolute() {
+                        return Err(ConfigError::schema(
+                            format!("{address}.command"),
+                            ConfigIssue::HookCommandNotAbsolutePath {
+                                key: format!("{address}.command"),
+                            },
+                        ));
+                    }
+                    command = Some(program);
+                }
+                "args" => {
+                    let args_key = format!("{address}.args");
+                    let Some(items) = value.as_array() else {
+                        return Err(ConfigError::schema(
+                            &args_key,
+                            ConfigIssue::HookArgsInvalid {
+                                key: args_key.clone(),
+                            },
+                        ));
+                    };
+                    for item in items {
+                        let Some(arg) = item.as_str() else {
+                            return Err(ConfigError::schema(
+                                &args_key,
+                                ConfigIssue::HookArgsInvalid {
+                                    key: args_key.clone(),
+                                },
+                            ));
+                        };
+                        args.push(arg.to_string());
+                    }
+                }
+                other => {
+                    return Err(ConfigError::schema(
+                        format!("{address}.{other}"),
+                        ConfigIssue::UnknownKey {
+                            key: other.to_string(),
+                            known: HOOK_KEYS,
+                        },
+                    ));
+                }
+            }
+        }
+        let Some(command) = command else {
+            return Err(ConfigError::schema(
+                format!("{address}.command"),
+                ConfigIssue::Required {
+                    field: format!("{address}.command"),
+                },
+            ));
+        };
+        hooks.entries.insert(
+            key.to_string(),
+            HookEntry {
+                event: event.to_string(),
+                scope: scope.to_string(),
+                command,
+                args,
+            },
+        );
+    }
+    Ok(hooks)
+}
+
+/// The `[mcp]` section: one declared server per `servers.<name>` row. Only
+/// `servers` exists, so a row this schema cannot read is a refusal naming its
+/// key instead of a server that silently disappears.
+fn mcp_section(
+    table: &dyn TableLike,
+) -> Result<BTreeMap<String, McpServerDeclaration>, ConfigError> {
+    let mut servers = BTreeMap::new();
+    for (key, item) in table.iter() {
+        match key {
+            "servers" => servers = mcp_servers_table(table_like("mcp.servers", item)?)?,
+            other => {
+                return Err(ConfigError::schema(
+                    format!("mcp.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: &["servers"],
+                    },
+                ));
+            }
+        }
+    }
+    Ok(servers)
+}
+
+/// The `[mcp.servers]` table: one operator-owned program declaration per name.
+fn mcp_servers_table(
+    table: &dyn TableLike,
+) -> Result<BTreeMap<String, McpServerDeclaration>, ConfigError> {
+    let mut servers = BTreeMap::new();
+    for (name, item) in table.iter() {
+        let address = format!("mcp.servers.{name}");
+        if !is_bounded_server_name(name) {
+            return Err(ConfigError::schema(
+                &address,
+                ConfigIssue::McpServerNameInvalid {
+                    name: name.to_string(),
+                },
+            ));
+        }
+        servers.insert(name.to_string(), mcp_server_declaration(&address, item)?);
+    }
+    Ok(servers)
+}
+
+/// One `[mcp.servers.<name>]` row: the program the client launches, its
+/// arguments, its environment, the origin its egress is admitted against and,
+/// when declared, the credential reference this server alone resolves.
+fn mcp_server_declaration(address: &str, item: &Item) -> Result<McpServerDeclaration, ConfigError> {
+    let entry = table_like(address, item)?;
+    let mut origin = None;
+    let mut program = None;
+    let mut args = Vec::new();
+    let mut env = BTreeMap::new();
+    let mut credential = None;
+    for (field, value) in entry.iter() {
+        let field_key = format!("{address}.{field}");
+        match field {
+            "origin" => origin = mcp_string(&field_key, value)?,
+            "program" => {
+                let raw = mcp_string(&field_key, value)?.ok_or_else(|| {
+                    ConfigError::schema(
+                        &field_key,
+                        ConfigIssue::Required {
+                            field: field_key.clone(),
+                        },
+                    )
+                })?;
+                let declared = PathBuf::from(raw);
+                // A declared server is executed, never resolved: a bare name
+                // would leave the program to `PATH` instead of the document.
+                if !declared.is_absolute() {
+                    return Err(ConfigError::schema(
+                        field_key.clone(),
+                        ConfigIssue::McpProgramNotAbsolutePath { key: field_key },
+                    ));
+                }
+                program = Some(declared);
+            }
+            "args" => args = mcp_string_array(&field_key, value)?,
+            "env" => env = mcp_env_table(&field_key, value)?,
+            "credential" => credential = Some(mcp_credential_declaration(&field_key, value)?),
+            other => {
+                return Err(ConfigError::schema(
+                    format!("{address}.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: MCP_SERVER_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    let origin = origin.ok_or_else(|| {
+        ConfigError::schema(
+            format!("{address}.origin"),
+            ConfigIssue::Required {
+                field: format!("{address}.origin"),
+            },
+        )
+    })?;
+    // The destination is the runtime's own grammar, checked here: a malformed
+    // origin is refused with the document, never deferred to the first call.
+    if !is_bounded_origin(&origin) {
+        return Err(ConfigError::schema(
+            format!("{address}.origin"),
+            ConfigIssue::McpOriginInvalid {
+                key: format!("{address}.origin"),
+            },
+        ));
+    }
+    let program = program.ok_or_else(|| {
+        ConfigError::schema(
+            format!("{address}.program"),
+            ConfigIssue::Required {
+                field: format!("{address}.program"),
+            },
+        )
+    })?;
+    Ok(McpServerDeclaration {
+        origin,
+        program,
+        args,
+        env,
+        credential,
+    })
+}
+
+/// One `[mcp.servers.<name>.credential]` row. The reference is the scoped
+/// secret grammar every other credential carrier enforces, and `origin` is the
+/// origin it was enrolled for — a mismatch with the server's own origin is
+/// refused at resolution, so a foreign credential is never handed over.
+fn mcp_credential_declaration(
+    address: &str,
+    item: &Item,
+) -> Result<McpCredentialDeclaration, ConfigError> {
+    let entry = table_like(address, item)?;
+    let mut reference = None;
+    let mut origin = None;
+    let mut variable = None;
+    for (field, value) in entry.iter() {
+        let field_key = format!("{address}.{field}");
+        match field {
+            "reference" => reference = mcp_string(&field_key, value)?,
+            "origin" => origin = mcp_string(&field_key, value)?,
+            "variable" => variable = mcp_string(&field_key, value)?,
+            other => {
+                return Err(ConfigError::schema(
+                    format!("{address}.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: MCP_CREDENTIAL_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    let required = |field: &str, value: Option<String>| {
+        value.ok_or_else(|| {
+            ConfigError::schema(
+                format!("{address}.{field}"),
+                ConfigIssue::Required {
+                    field: format!("{address}.{field}"),
+                },
+            )
+        })
+    };
+    let reference = required("reference", reference)?;
+    credential_ref_admitted(&reference, &format!("{address}.reference"))
+        .map_err(|issue| ConfigError::schema(format!("{address}.reference"), issue))?;
+    Ok(McpCredentialDeclaration {
+        reference,
+        origin: required("origin", origin)?,
+        variable: required("variable", variable)?,
+    })
+}
+
+fn mcp_string(key: &str, value: &Item) -> Result<Option<String>, ConfigError> {
+    match value.as_str() {
+        Some(text) => Ok(Some(text.to_string())),
+        None => Err(ConfigError::schema(
+            key,
+            ConfigIssue::ExpectedString {
+                field: key.to_string(),
+            },
+        )),
+    }
+}
+
+fn mcp_string_array(key: &str, value: &Item) -> Result<Vec<String>, ConfigError> {
+    let Some(items) = value.as_array() else {
+        return Err(ConfigError::schema(
+            key,
+            ConfigIssue::McpArgsInvalid {
+                key: key.to_string(),
+            },
+        ));
+    };
+    let mut args = Vec::new();
+    for item in items {
+        let Some(arg) = item.as_str() else {
+            return Err(ConfigError::schema(
+                key,
+                ConfigIssue::McpArgsInvalid {
+                    key: key.to_string(),
+                },
+            ));
+        };
+        args.push(arg.to_string());
+    }
+    Ok(args)
+}
+
+fn mcp_env_table(key: &str, value: &Item) -> Result<BTreeMap<String, String>, ConfigError> {
+    let Some(table) = value.as_table_like() else {
+        return Err(ConfigError::schema(
+            key,
+            ConfigIssue::McpEnvInvalid {
+                key: key.to_string(),
+            },
+        ));
+    };
+    let mut env = BTreeMap::new();
+    for (name, item) in table.iter() {
+        let Some(text) = item.as_str() else {
+            return Err(ConfigError::schema(
+                format!("{key}.{name}"),
+                ConfigIssue::McpEnvInvalid {
+                    key: format!("{key}.{name}"),
+                },
+            ));
+        };
+        env.insert(name.to_string(), text.to_string());
+    }
+    Ok(env)
+}
+
+/// A declared server's name. It reaches a file name, a retained record and the
+/// process's own argv, so the grammar is the wire's bounded-token one.
+fn is_bounded_server_name(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 64
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
+}
+
+/// A declared server's origin: the destination the executor's egress admission
+/// binds and a credential reference is enrolled for. The grammar lives here,
+/// where the document is parsed, so a spelling the runtime would refuse is a
+/// load-time refusal; [`crate::mcp::McpCall::validate`] re-checks the same
+/// bound at the seam for a server built outside the document.
+pub(crate) fn is_bounded_origin(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 128
+        && raw.contains("://")
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/' | '+'))
+}
+
 fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
     let mut models = Models::default();
     for (key, item) in table.iter() {
@@ -2249,58 +3637,10 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
             "purposes" => {
                 let purposes = table_like("models.purposes", item)?;
                 for (name, entry) in purposes.iter() {
-                    let purpose = table_like(name, entry)?;
                     let key = format!("models.purposes.{name}");
-                    let mut def = PurposeDef::default();
-                    for (field, value) in purpose.iter() {
-                        match field {
-                            "group" => {
-                                def.group =
-                                    Some(value.as_str().map(str::to_string).ok_or_else(|| {
-                                        ConfigError::schema(
-                                            format!("{key}.group"),
-                                            ConfigIssue::GroupReferenceNotString,
-                                        )
-                                    })?);
-                            }
-                            "model" => {
-                                def.model = Some(model_assign(value, &format!("{key}.model"))?)
-                            }
-                            "effort" => {
-                                def.effort = Some(effort_assign(value, &format!("{key}.effort"))?)
-                            }
-                            "fallback" => {
-                                def.fallback =
-                                    Some(fallback_assign(value, &format!("{key}.fallback"))?)
-                            }
-                            "pool" => {
-                                def.pool = Some(name_array(
-                                    value,
-                                    &format!("{key}.pool"),
-                                    ConfigIssue::PoolNotArray,
-                                    ConfigIssue::PoolEntryNotString,
-                                )?);
-                            }
-                            "eligible" => {
-                                def.eligible = Some(name_array(
-                                    value,
-                                    &format!("{key}.eligible"),
-                                    ConfigIssue::EligibleNotArray,
-                                    ConfigIssue::EligibleEntryNotString,
-                                )?);
-                            }
-                            other => {
-                                return Err(ConfigError::schema(
-                                    format!("{key}.{other}"),
-                                    ConfigIssue::UnknownKey {
-                                        key: other.to_string(),
-                                        known: PURPOSE_KEYS,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    models.purposes.insert(name.to_string(), def);
+                    models
+                        .purposes
+                        .insert(name.to_string(), purpose_def(&key, name, entry)?);
                 }
             }
             other => {
@@ -2315,6 +3655,57 @@ fn models_table(table: &dyn TableLike) -> Result<Models, ConfigError> {
         }
     }
     Ok(models)
+}
+
+/// One `models.purposes.<name>` row: the binding a purpose carries, judged by
+/// the one purpose schema. The whole-table parse and the targeted rebinding
+/// both read a row through this function, so a row is never judged by two
+/// rule sets — and a move that names its own row reads that row alone instead
+/// of every sibling ([`Config::rebind_purpose`]).
+fn purpose_def(key: &str, name: &str, entry: &Item) -> Result<PurposeDef, ConfigError> {
+    let purpose = table_like(name, entry)?;
+    let mut def = PurposeDef::default();
+    for (field, value) in purpose.iter() {
+        match field {
+            "group" => {
+                def.group = Some(value.as_str().map(str::to_string).ok_or_else(|| {
+                    ConfigError::schema(
+                        format!("{key}.group"),
+                        ConfigIssue::GroupReferenceNotString,
+                    )
+                })?);
+            }
+            "model" => def.model = Some(model_assign(value, &format!("{key}.model"))?),
+            "effort" => def.effort = Some(effort_assign(value, &format!("{key}.effort"))?),
+            "fallback" => def.fallback = Some(fallback_assign(value, &format!("{key}.fallback"))?),
+            "pool" => {
+                def.pool = Some(name_array(
+                    value,
+                    &format!("{key}.pool"),
+                    ConfigIssue::PoolNotArray,
+                    ConfigIssue::PoolEntryNotString,
+                )?);
+            }
+            "eligible" => {
+                def.eligible = Some(name_array(
+                    value,
+                    &format!("{key}.eligible"),
+                    ConfigIssue::EligibleNotArray,
+                    ConfigIssue::EligibleEntryNotString,
+                )?);
+            }
+            other => {
+                return Err(ConfigError::schema(
+                    format!("{key}.{other}"),
+                    ConfigIssue::UnknownKey {
+                        key: other.to_string(),
+                        known: PURPOSE_KEYS,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(def)
 }
 
 fn pick<'a>(table: &'a dyn TableLike, field: &str) -> Result<&'a Item, ConfigError> {
@@ -2622,55 +4013,150 @@ pub struct ConfigEntry {
     pub source: ConfigSource,
 }
 
-/// Effective snapshot over the two precedence passes that exist today:
-/// shipped defaults, then the user file.
+/// Effective snapshot over the precedence passes: the base document this build
+/// serves, then the user file. The layers are composed here and nowhere else —
+/// a value's layer decides it, never a comparison against another layer's
+/// value (DEC-009).
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub sources_digest: String,
+    /// The base layer the effective view was composed over (AC-054): its
+    /// version, its digest and the values it supplies.
+    pub base: BaseLayer,
     pub parsed: Option<Config>,
     pub workflow_entry: ConfigEntry,
     pub decisions_entry: ConfigEntry,
+    /// The context guard's served entry: the base answers an absent override,
+    /// so a base that moves `auto_compact` moves this entry with it.
+    pub context_entry: ConfigEntry,
 }
 
-/// The digest naming both configuration sources in order — the revision a
+/// The digest naming the configuration sources in order — the revision a
 /// `config.read` result and a `decisions.control` mutation precondition
 /// quote. Recomputed after every landed edit, so a stale precondition
 /// always conflicts instead of overwriting a concurrent write.
 pub fn sources_digest(user_bytes: &[u8]) -> String {
+    sources_digest_on(BaseSource::SHIPPED, user_bytes)
+}
+
+/// [`sources_digest`] over an explicit base: the layer order and its identity
+/// live in one place, so a base that differs from the shipped one is named by
+/// the same recipe instead of by a second hasher.
+pub fn sources_digest_on(base: BaseSource<'_>, user_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(SHIPPED_DEFAULTS_TOML.as_bytes());
+    hasher.update(base.text().as_bytes());
     hasher.update(user_bytes);
     hex(&hasher.finalize())
 }
 
 pub fn resolve_effective(user_toml: Option<&str>) -> Result<EffectiveConfig, ConfigError> {
-    if let Some(text) = user_toml {
-        Config::parse_validated(text)?;
-    }
+    resolve_effective_on(BaseSource::SHIPPED, user_toml)
+}
+
+/// [`resolve_effective`] over an explicit base (AC-054, DEC-009): production
+/// passes [`BaseSource::SHIPPED`], a test passes the next base. Both are parsed
+/// by the document schema before any value is read, so a base the schema would
+/// reject never answers a read.
+pub fn resolve_effective_on(
+    base: BaseSource<'_>,
+    user_toml: Option<&str>,
+) -> Result<EffectiveConfig, ConfigError> {
+    // The user document is parsed and validated once: a document the schema
+    // refuses never answers a read, and the value this view keeps is the one
+    // that passed — never a second parse whose refusal is discarded.
+    let parsed = user_toml.map(Config::parse_validated).transpose()?;
+    let layer = base.layer()?;
     let mut effective = EffectiveConfig {
-        sources_digest: sources_digest(user_toml.unwrap_or("").as_bytes()),
-        parsed: user_toml.and_then(|text| Config::parse_validated(text).ok()),
-        workflow_entry: shipped_workflow_entry(),
-        decisions_entry: shipped_decisions_entry(),
+        sources_digest: sources_digest_on(base, user_toml.unwrap_or("").as_bytes()),
+        workflow_entry: base_flag_entry(
+            WORKFLOW_KEY,
+            layer.workflow.unwrap_or(true),
+            &layer.digest,
+        ),
+        decisions_entry: base_decisions_entry(
+            layer.decisions.unwrap_or(DecisionModeValue::Ask),
+            &layer.digest,
+        ),
+        context_entry: base_flag_entry(
+            CONTEXT_AUTO_COMPACT_KEY,
+            layer.context.auto_compact.unwrap_or(false),
+            &layer.digest,
+        ),
+        base: layer,
+        parsed,
     };
     effective.refresh_mode_entries(&hex(&Sha256::digest(user_toml.unwrap_or("").as_bytes())));
+    // The composed document is the one the runtime acts on, so it passes the
+    // same referential checks a file document passes: a base that names a
+    // connection or group the installation does not declare is refused here,
+    // where the layers meet, instead of failing at dispatch.
+    let composed = effective.composed();
+    check_model_references(&composed.connections, &composed.models)?;
     Ok(effective)
 }
 
 impl EffectiveConfig {
+    /// The base version the effective view was composed over (INV-010a).
+    #[must_use]
+    pub fn base_version(&self) -> u64 {
+        self.base.version
+    }
+
+    /// The user's own document — the retained layer a read names as its
+    /// source. A base value is never reported through it (AC-054), so a read
+    /// surface can tell what the user set from what the base supplies.
+    #[must_use]
+    pub fn retained(&self) -> Config {
+        self.parsed.clone().unwrap_or_default()
+    }
+
+    /// The config a dispatch prepares against (AC-054): the user document over
+    /// the base layer. A user value wins its own slot even when it equals the
+    /// base's, because the layer supplies each value — `workflow: false`, a pin
+    /// and an explicit default all keep their provenance across a base change.
+    /// The base fills what the user's document leaves to the layer below: an
+    /// absent override, a purpose row it does not write, a default slot it
+    /// defers.
+    #[must_use]
+    pub fn composed(&self) -> Config {
+        let user = self.parsed.clone().unwrap_or_default();
+        Config {
+            version: user.version,
+            workflow: Workflow {
+                enabled: user.workflow.enabled.or(self.base.workflow),
+            },
+            decisions: Decisions {
+                mode: user.decisions.mode.or(self.base.decisions),
+            },
+            context: Context {
+                auto_compact: user.context.auto_compact.or(self.base.context.auto_compact),
+            },
+            connections: user.connections,
+            profiles: user.profiles,
+            models: compose_models(&self.base.models, user.models),
+            hooks: user.hooks,
+            mcp: user.mcp,
+            raw: user.raw,
+        }
+    }
+
     /// Rebuilds the entries the read surface serves from the retained
     /// document — pre-publication the retained doc is the effective view,
     /// so an accepted edit must move these entries with the doc.
     /// `revision` names the retained doc's byte digest; an absent
-    /// override keeps the shipped default.
+    /// override keeps the base's value.
     pub fn refresh_mode_entries(&mut self, revision: &str) {
         self.workflow_entry = match self
             .parsed
             .as_ref()
             .and_then(|config| config.workflow.enabled)
         {
-            Some(value) => user_workflow_entry(value, revision),
-            None => shipped_workflow_entry(),
+            Some(value) => user_flag_entry(WORKFLOW_KEY, value, revision),
+            None => base_flag_entry(
+                WORKFLOW_KEY,
+                self.base.workflow.unwrap_or(true),
+                &self.base.digest,
+            ),
         };
         self.decisions_entry = match self
             .parsed
@@ -2678,22 +4164,83 @@ impl EffectiveConfig {
             .and_then(|config| config.decisions.mode)
         {
             Some(value) => user_decisions_entry(value, revision),
-            None => shipped_decisions_entry(),
+            None => base_decisions_entry(
+                self.base.decisions.unwrap_or(DecisionModeValue::Ask),
+                &self.base.digest,
+            ),
+        };
+        self.context_entry = match self
+            .parsed
+            .as_ref()
+            .and_then(|config| config.context.auto_compact)
+        {
+            Some(value) => user_flag_entry(CONTEXT_AUTO_COMPACT_KEY, value, revision),
+            None => base_flag_entry(
+                CONTEXT_AUTO_COMPACT_KEY,
+                self.base.context.auto_compact.unwrap_or(false),
+                &self.base.digest,
+            ),
         };
     }
 
-    /// The mode a material fork observes — the retained document's
-    /// `decisions_mode`, or the shipped `ask` when no user file exists.
+    /// The mode a material fork observes: the dispatch view's own answer, so the
+    /// status surface and the fork path read one composition — an absent
+    /// override resolves through the base layer, an explicit `inherit` still
+    /// names the absent override.
     pub fn decisions_mode(&self) -> DecisionMode {
-        self.parsed
-            .as_ref()
-            .map_or(DecisionMode::Ask, Config::decisions_mode)
+        self.composed().decisions_mode()
     }
 }
 
-fn user_workflow_entry(value: bool, revision: &str) -> ConfigEntry {
+/// The base layer's models beneath the user's (AC-054, DEC-009).
+///
+/// A row, a group or a default slot is the unit of precedence. A purpose row the
+/// user writes is the user's whole: every resolved source names a document key,
+/// so a base value under a key the user wrote would be attributed to the user,
+/// and the user's own binding — one group or one model — would be replaced by
+/// the base's other slot of the same choice. What the user's document leaves to
+/// the layer below is the base's: a purpose row it does not write, a group it
+/// does not declare, and a default slot it defers ([`ModelAssign::Inherit`] /
+/// [`EffortAssign::Inherit`], the deferred spellings a required slot has).
+fn compose_models(base: &Models, user: Models) -> Models {
+    let mut groups = base.groups.clone();
+    for (name, def) in user.groups {
+        groups.insert(name, def);
+    }
+    let mut purposes = base.purposes.clone();
+    for (name, def) in user.purposes {
+        purposes.insert(name, def);
+    }
+    Models {
+        defaults: compose_defaults(base.defaults.as_ref(), user.defaults),
+        groups,
+        purposes,
+    }
+}
+
+/// The default slots: a slot the user states wins, a slot the user defers takes
+/// the base's value, and a store with no user document reads the base as its
+/// only layer rather than as a merge. `fallback` has no deferred spelling, so it
+/// is the user's wherever a user document states it.
+fn compose_defaults(base: Option<&Defaults>, user: Option<Defaults>) -> Option<Defaults> {
+    let Some(mut defaults) = user else {
+        return base.cloned();
+    };
+    if let Some(base) = base {
+        if matches!(defaults.model, ModelAssign::Inherit) {
+            defaults.model = base.model.clone();
+        }
+        if matches!(defaults.effort, EffortAssign::Inherit) {
+            defaults.effort = base.effort.clone();
+        }
+    }
+    Some(defaults)
+}
+
+/// A user-sourced read entry for one boolean carrier.
+fn user_flag_entry(key: &str, value: bool, revision: &str) -> ConfigEntry {
     ConfigEntry {
-        key: WORKFLOW_KEY.to_string(),
+        key: key.to_string(),
         effective: ConfigViewValue::Visible {
             value: Value::Bool(value),
         },
@@ -2708,18 +4255,21 @@ fn user_workflow_entry(value: bool, revision: &str) -> ConfigEntry {
 /// The digest of the shipped defaults — the revision a shipped-sourced
 /// read entry names.
 pub fn shipped_revision() -> String {
-    hex(&Sha256::digest(SHIPPED_DEFAULTS_TOML.as_bytes()))
+    BaseSource::SHIPPED.digest()
 }
 
-fn shipped_workflow_entry() -> ConfigEntry {
+/// A base-sourced read entry for one boolean carrier: the value comes from the
+/// base document and the revision names its bytes, so a base that moves the
+/// value moves the entry with it.
+fn base_flag_entry(key: &str, value: bool, revision: &str) -> ConfigEntry {
     ConfigEntry {
-        key: WORKFLOW_KEY.to_string(),
+        key: key.to_string(),
         effective: ConfigViewValue::Visible {
-            value: Value::Bool(true),
+            value: Value::Bool(value),
         },
         source: ConfigSource {
             kind: "shipped".to_string(),
-            revision: shipped_revision(),
+            revision: revision.to_string(),
             target: None,
         },
     }
@@ -2739,15 +4289,15 @@ fn user_decisions_entry(value: DecisionModeValue, revision: &str) -> ConfigEntry
     }
 }
 
-fn shipped_decisions_entry() -> ConfigEntry {
+fn base_decisions_entry(value: DecisionModeValue, revision: &str) -> ConfigEntry {
     ConfigEntry {
         key: DECISIONS_MODE_KEY.to_string(),
         effective: ConfigViewValue::Visible {
-            value: Value::String("ask".to_string()),
+            value: Value::String(value.as_str().to_string()),
         },
         source: ConfigSource {
             kind: "shipped".to_string(),
-            revision: shipped_revision(),
+            revision: revision.to_string(),
             target: None,
         },
     }

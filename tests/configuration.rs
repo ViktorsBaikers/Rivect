@@ -1973,8 +1973,156 @@ fn config_read_unknown_key_names_its_accepted_domain() {
 
     assert_eq!(
         response["error"]["data"]["message"],
-        "unknown key bogus; known keys: workflow.enabled, decisions.mode, context.auto_compact, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref"
+        "unknown key bogus; known keys: workflow.enabled, decisions.mode, context.auto_compact, connections.<id>.region, connections.<id>.profile, profiles.<name>.credential_ref; document-only, declare in the config file: hooks.<event>@<scope>, mcp.servers.<name>"
     );
+}
+
+/// The two declared sections the wire never writes are the document's own
+/// (DEC-010): a `[hooks]` or `[mcp.servers.<name>]` key answers with the file
+/// that can write it — the edit carrier names the key's status, the read
+/// carrier's hint names both sections — instead of a bare "not editable" or a
+/// list of unrelated keys.
+#[test]
+fn document_only_key_names_the_file_p2() {
+    let (mut world, session) = carrier_world("document-only");
+    let cases = [
+        "hooks.effect.request@project.command",
+        "mcp.servers.fixture.program",
+    ];
+
+    for (offset, key) in cases.iter().enumerate() {
+        let read = world.dispatch(&json!({
+            "jsonrpc": "2.0", "id": 7340 + offset as u64, "method": "config.read",
+            "params": { "schema_version": 1, "session_id": session.0, "keys": [key] }
+        }));
+        let message = read["error"]["data"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is not wire-readable: {read}"));
+        assert!(
+            message.starts_with(&format!("{key} is document-only")),
+            "the read carrier opens with the key's status, not the unknown-key frame: {message}"
+        );
+        assert!(
+            message.contains("declare it in the config file") && !message.contains("unknown key"),
+            "the read carrier names the file that writes it and offers no carrier list: {message}"
+        );
+
+        let edit = world.dispatch(&json!({
+            "jsonrpc": "2.0", "id": 7350 + offset as u64, "method": "command.execute",
+            "params": { "schema_version": 1, "session_id": session.0,
+                        "command": { "kind": "config.set" },
+                        "key": key, "value": "/bin/true" }
+        }));
+        let message = edit["error"]["data"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is not wire-supplied: {edit}"));
+        assert!(
+            message.contains(&format!("{key} is document-only"))
+                && message.contains("declare it in the config file"),
+            "the edit carrier names the key, its status and the file: {message}"
+        );
+    }
+
+    // The machine carrier answers the read surface the same way, and the edit
+    // surface for the section its own hook guard does not own.
+    for (offset, key) in cases.iter().enumerate() {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 7360 + offset as u64, "method": "config.read",
+            "params": { "schema_version": 1, "session_id": session.0, "keys": [key] }
+        });
+        let read: serde_json::Value =
+            serde_json::from_str(&rivect::commands::dispatch_runtime_request(
+                &mut world.runtime,
+                rivect::commands::Ingress::Machine,
+                support::CONNECTION_ID,
+                &request.to_string(),
+            ))
+            .expect("the machine answer is json");
+        let message = read["error"]["data"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is not wire-readable: {read}"));
+        assert!(
+            message.contains("document-only") && message.contains("config file"),
+            "the machine read carrier answers the same document-only rule: {message}"
+        );
+    }
+    let request = json!({
+        "jsonrpc": "2.0", "id": 7370, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": cases[1], "value": "/bin/true" }
+    });
+    let edit: serde_json::Value =
+        serde_json::from_str(&rivect::commands::dispatch_runtime_request(
+            &mut world.runtime,
+            rivect::commands::Ingress::Machine,
+            support::CONNECTION_ID,
+            &request.to_string(),
+        ))
+        .expect("the machine answer is json");
+    let message = edit["error"]["data"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{} is not wire-supplied: {edit}", cases[1]));
+    assert!(
+        message.contains(&format!("{} is document-only", cases[1]))
+            && message.contains("declare it in the config file"),
+        "the machine edit carrier names the key, its status and the file: {message}"
+    );
+}
+
+/// The origin grammar the runtime refuses is checked where the document is
+/// parsed: a spelling the first call would refuse is a load-time refusal
+/// naming the accepted form, so no document carries one to a send.
+#[test]
+fn unbounded_origin_is_refused_at_parse_p1() {
+    let declared = |origin: &str| {
+        format!(
+            "{}[mcp.servers.alpha]\norigin = \"{origin}\"\nprogram = \"/usr/local/bin/alpha\"\n",
+            support::base_config()
+        )
+    };
+
+    // The accepted form is operator data: one scheme, `://`, the bounded
+    // alphabet — `+` included, because a declared transport may carry one.
+    let parsed =
+        Config::parse_validated(&declared("mcp+stdio://alpha")).expect("a bounded origin parses");
+    assert_eq!(
+        parsed
+            .mcp
+            .get("alpha")
+            .expect("the server is declared")
+            .origin,
+        "mcp+stdio://alpha"
+    );
+    let longest = format!("mcp+stdio://{}", "a".repeat(128 - "mcp+stdio://".len()));
+    assert_eq!(longest.len(), 128);
+    Config::parse_validated(&declared(&longest)).expect("the bound admits 128 characters");
+
+    // Refused where the document is parsed, with the accepted form named: no
+    // scheme, a character outside the alphabet, and one past the bound.
+    let mut refused = vec!["alpha".to_string(), "mcp+stdio://alpha?query".to_string()];
+    refused.push(format!(
+        "mcp+stdio://{}",
+        "a".repeat(129 - "mcp+stdio://".len())
+    ));
+    for origin in refused {
+        let refusal = Config::parse_validated(&declared(&origin))
+            .expect_err("the origin grammar refuses this spelling");
+        assert_eq!(
+            refusal.key.as_deref(),
+            Some("mcp.servers.alpha.origin"),
+            "the refusal names the field: {refusal}"
+        );
+        assert!(
+            matches!(&refusal.issue, ConfigIssue::McpOriginInvalid { .. }),
+            "the refusal is the origin's own: {refusal}"
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("<scheme>://<host>") && message.contains("128"),
+            "the refusal names the accepted form: {message}"
+        );
+    }
 }
 
 /// AC-072 (DEC-013): `[context] auto_compact` answers on every domain the

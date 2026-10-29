@@ -24,7 +24,7 @@
 mod support;
 
 use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
-use rivect::model::RequestManifest;
+use rivect::model::{InputOrigin, RequestManifest};
 use rivect::providers::{
     CredentialStore, FlightedStore, KeyringBackend, ProviderError, SecretRef, SecretRefError,
     StoreKind, native_store, resolve_credential,
@@ -2077,6 +2077,8 @@ fn secrets_never_appear_in_config_export_log_output_or_debug() {
         inputs_digest: "inputs-digest".to_string(),
         epoch_id: "epoch-1".to_string(),
         mutation_reason: None,
+        epoch_cost: None,
+        input_origin: InputOrigin::Human,
         cost_bound: 1,
     };
     for rendered in [manifest.wire_bytes(), format!("{manifest:?}")] {

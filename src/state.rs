@@ -15,6 +15,7 @@ use crate::index::{
     CarryPolicy, EdgeConfidence, EdgeKind, EdgeProvenance, GenerationState, IndexEdge,
     ProjectGraph, SourceRef, StaleCause,
 };
+use crate::model::InputOrigin;
 use crate::verification::{AssumptionCheckRecord, RetainedAttempt};
 use rivect_sandbox_helper::{REUSE_TOKEN_MAX, ReuseToken};
 use rusqlite::types::Value as SqlValue;
@@ -30,6 +31,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+mod learning;
 mod sql;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -50,6 +52,8 @@ pub enum Missing {
     Reservation(String),
     #[error("obligation")]
     Obligation,
+    #[error("learning delta {0}")]
+    Delta(String),
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -211,6 +215,19 @@ pub enum StoreError {
     /// travels into another initialized database.
     #[error("reopen refused: database identity {presented} is not the bound {bound}")]
     ReopenIdentity { bound: PathBuf, presented: PathBuf },
+    /// The database reports a schema generation this build does not know
+    /// (DEC-008, I-6): it was written by a newer build, so it is refused
+    /// typed before this build's learning batch runs and the generation it
+    /// reports is never rewritten. The connection settles its own settings
+    /// (file mode, journal) before the ledger is read, so a refused open is a
+    /// refusal to serve, not an untouched file.
+    #[error("store schema generation {found} is newer than the {known} this build knows")]
+    UnsupportedGeneration { found: u64, known: u64 },
+    /// A learning-domain refusal, kept as its own typed class (P-001): the
+    /// delta owner's error surfaces unchanged instead of degrading into a
+    /// storage failure.
+    #[error("learning: {0}")]
+    Delta(#[from] crate::learning::DeltaError),
 }
 
 impl StoreError {
@@ -225,6 +242,8 @@ impl StoreError {
             Self::Storage(_) => ErrorCode::StorageUnavailable,
             Self::Closed => ErrorCode::StorageUnavailable,
             Self::ReopenIdentity { .. } => ErrorCode::InvalidInput,
+            Self::UnsupportedGeneration { .. } => ErrorCode::UnsupportedVersion,
+            Self::Delta(error) => error.code(),
             // The wire code stays the denial's: a caller acting on the
             // denial sees the same class whether or not its journal row
             // landed.
@@ -276,6 +295,8 @@ pub(crate) fn denial_class(error: &StoreError) -> &'static str {
         StoreError::InvalidInput(InvalidCause::EmptyCustomAnswer) => "empty_custom",
         StoreError::InvalidInput(_) => "invalid_input",
         StoreError::ReopenIdentity { .. } => "invalid_input",
+        StoreError::UnsupportedGeneration { .. } => "unsupported_version",
+        StoreError::Delta(error) => error.code().as_str(),
         StoreError::Storage(_) => "storage",
         StoreError::Closed => "storage",
         StoreError::DenialJournalFailed { denial, .. } => denial_class(denial),
@@ -1065,6 +1086,20 @@ impl Drop for TaskStore {
     }
 }
 
+/// Refuses a store a newer build wrote (I-6): the generation the ledger reports
+/// is compared against the one this build knows, before any DDL runs and again
+/// inside the batch's write transaction, so a store that advanced in between is
+/// refused typed instead of being rewound by this build's ledger write.
+fn require_known_generation(generation: u64) -> Result<()> {
+    if generation > learning::KNOWN_SCHEMA_GENERATION {
+        return Err(StoreError::UnsupportedGeneration {
+            found: generation,
+            known: learning::KNOWN_SCHEMA_GENERATION,
+        });
+    }
+    Ok(())
+}
+
 impl TaskStore {
     /// Opens the database at `path` as the one admitted writer of its file.
     ///
@@ -1477,6 +1512,16 @@ impl TaskStore {
     /// (3) the bootstrap split of the former `TaskStore::open`: the same
     /// statements, order and error mapping, run once per open/reopen and
     /// never before a carried write.
+    ///
+    /// The schema ledger (DEC-008) is read before any generation's DDL: a
+    /// store a newer build wrote is refused typed before any DDL runs, and
+    /// the generation this build introduces runs its idempotent batch in one
+    /// immediate transaction. The batch runs whether or not the ledger already
+    /// reports this generation, because the ledger records that the batch ran,
+    /// not that its schema is present: a store whose table was dropped — a
+    /// rollback that removed the generation-2 tables, or a later slice
+    /// appending DDL to the same batch — is repaired on the next open instead
+    /// of failing later as an untagged storage error.
     fn bootstrap(&mut self) -> Result<()> {
         if proof::bootstrap_fault() {
             return Err(storage(ConnectionLifecycleError::SettingMismatch {
@@ -1484,12 +1529,30 @@ impl TaskStore {
             }));
         }
         let conn = self.conn_mut()?;
+        require_known_generation(learning::schema_generation_on(conn)?)?;
         conn.execute_batch(sql::SCHEMA).map_err(storage)?;
         conn.execute_batch(sql::DECISIONS_SCHEMA).map_err(storage)?;
         conn.execute_batch(sql::PLANS_SCHEMA).map_err(storage)?;
         conn.execute_batch(sql::INDEX_SCHEMA).map_err(storage)?;
         conn.execute_batch(sql::ASSUMPTIONS_SCHEMA)
             .map_err(storage)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        // The ledger is read again inside the write transaction (INV-010a): a
+        // store that advanced past this build between the read above and this
+        // batch is refused typed instead of being rewound by the ledger write
+        // below.
+        let current = learning::schema_generation_on(&tx)?;
+        require_known_generation(current)?;
+        tx.execute_batch(sql::LEARNING_SCHEMA).map_err(storage)?;
+        if current < learning::KNOWN_SCHEMA_GENERATION {
+            tx.execute_batch(&sql::set_schema_generation(
+                learning::KNOWN_SCHEMA_GENERATION,
+            ))
+            .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
         migrate_supervisor_reactions(conn)
     }
 
@@ -3264,6 +3327,52 @@ impl TaskStore {
             .collect()
     }
 
+    /// Records the off transition's pause (AC-024/EDGE-016): work in
+    /// flight stops where it is — its checkpoint and its settled effects
+    /// intact — and only a new intent (`steer_task`) releases it. A
+    /// `blocked` task keeps its own hold, because converting it would
+    /// overwrite a plan-owned reason the off transition can never restore.
+    /// Idempotent: an already paused, blocked or terminal task gains no
+    /// transition and no second event.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] for an unknown task and
+    /// [`StoreError::Storage`] when the transition cannot be written.
+    pub fn pause_for_workflow_off(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<bool> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let (revision, lifecycle): (u64, String) = tx
+            .query_row(sql::TASK_REVISIONS, params![task_id.0], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get(2)?))
+            })
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| StoreError::missing_task(&task_id.0))?;
+        let paused = tx
+            .execute(PAUSE_TASK_FOR_WORKFLOW_OFF, params![task_id.0])
+            .map_err(storage)?;
+        if paused == 0 {
+            return Ok(false);
+        }
+        Self::append_event(
+            &tx,
+            session_id,
+            Some(task_id),
+            (&task_id.0, revision + 1),
+            "task.paused",
+            json!({ "kind": "workflow_off", "from": lifecycle }),
+            "runtime",
+        )?;
+        tx.commit().map_err(storage)?;
+        Ok(true)
+    }
+
     pub fn steer_task(
         &mut self,
         session_id: &SessionId,
@@ -3329,6 +3438,12 @@ impl TaskStore {
             json!({ "instruction": instruction }),
             "human",
         )?;
+        // A new intent is what releases the off pause (AC-024/DX-C1): the
+        // pause holds the intent that was in flight, so the revision this
+        // steer opens displaces it. The plan's own lifecycle rule still
+        // runs afterwards — a plan-owned block is never erased here.
+        tx.execute(RELEASE_WORKFLOW_OFF_PAUSE, params![task_id.0])
+            .map_err(storage)?;
         // Same rule as the answer path: ending the wait never erases a
         // plan block.
         Self::settle_plan_lifecycle(&tx, task_id)?;
@@ -3378,10 +3493,11 @@ impl TaskStore {
     /// `origin` names the request class, not the client actor:
     /// `"human"` is the external operator-class ingress spelling, so a
     /// headless `Ingress::Machine` client driving `task.submit`
-    /// cancel/steer/create still journals `"human"` here even though
-    /// its denied `answer` journals `author:"machine"`. Attributing
-    /// machine-vs-human clients on those kinds is a deferred contract
-    /// decision; until then the journal keeps the request-class
+    /// cancel/create still journals `"human"` here even though its
+    /// denied `answer` journals `author:"machine"` and its denied
+    /// `steer` never reaches the store at all. Attributing
+    /// machine-vs-human clients on the remaining kinds is a deferred
+    /// contract decision; until then the journal keeps the request-class
     /// convention.
     pub(crate) fn cancel_task_with_origin(
         &mut self,
@@ -3662,9 +3778,12 @@ impl TaskStore {
                     });
                 }
             }
+            // The off pause holds its own state, so it projects its own
+            // blocker: nothing in the plan tables can erase it (AC-024/I5).
+            "paused" => blockers.push(workflow_off_blocker()),
             _ => {}
         }
-        if matches!(lifecycle.as_str(), "waiting" | "blocked") {
+        if matches!(lifecycle.as_str(), "waiting" | "blocked" | "paused") {
             let plan = Self::plan_blockers_on(tx, std::slice::from_ref(&task_id.0))?
                 .remove(&task_id.0)
                 .unwrap_or_default();
@@ -3781,10 +3900,13 @@ impl TaskStore {
         drop(stmt);
 
         // One statement for every task's plan blockers (never a query
-        // per task); only a waiting or blocked task projects them.
+        // per task); only a waiting, blocked or paused task projects them.
         let mut plan = Self::plan_blockers_on(&tx, &task_ids)?;
         for (task_id, lifecycle) in tasks {
-            if !matches!(lifecycle, Lifecycle::Waiting | Lifecycle::Blocked) {
+            if !matches!(
+                lifecycle,
+                Lifecycle::Waiting | Lifecycle::Blocked | Lifecycle::Paused
+            ) {
                 continue;
             }
             if let Some(rows) = plan.remove(&task_id.0) {
@@ -3799,6 +3921,12 @@ impl TaskStore {
         }
 
         for (task_id, lifecycle) in tasks {
+            if *lifecycle == Lifecycle::Paused {
+                blockers
+                    .entry(task_id.0.clone())
+                    .or_default()
+                    .push(workflow_off_blocker());
+            }
             if *lifecycle == Lifecycle::Blocked {
                 let entry = blockers.entry(task_id.0.clone()).or_default();
                 if entry.is_empty() {
@@ -4205,6 +4333,22 @@ impl TaskStore {
             .optional()
             .map_err(storage)?;
         Ok(row.and_then(|(answer, origin)| Some((answer?, origin?))))
+    }
+
+    /// The origin of the bytes a request of this task carries into the
+    /// wire's user channel (AC-009, INV-003). The store owns the journal
+    /// vocabulary, so the recorded author is parsed here and no caller
+    /// compares the column's text. Only a recorded human answer proves
+    /// human authorship — an agent/system turn, an unrecognised spelling
+    /// or no answer at all reads as tool text, never as consent.
+    pub fn answer_input_origin(&self, task_id: &TaskId) -> Result<InputOrigin> {
+        let author = self
+            .answered_question(task_id)?
+            .map(|(_answer, author)| author);
+        Ok(match author.as_deref() {
+            Some("human") => InputOrigin::Human,
+            Some(_) | None => InputOrigin::Tool,
+        })
     }
 
     pub fn insert_evidence(
@@ -6899,6 +7043,25 @@ impl StoreWriter<'_> {
     }
 
     /// # Errors
+    /// See [`TaskStore::record_learning_corpus`].
+    pub fn record_learning_corpus(
+        &mut self,
+        delta_id: &str,
+        cases: &[crate::learning::CorpusCase],
+    ) -> Result<Vec<crate::learning::CorpusVerdict>> {
+        self.store.record_learning_corpus(delta_id, cases)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::record_learning_delta`].
+    pub fn record_learning_delta(
+        &mut self,
+        candidate: &crate::learning::DeltaCandidate,
+    ) -> Result<crate::learning::DeltaRecord> {
+        self.store.record_learning_delta(candidate)
+    }
+
+    /// # Errors
     /// See [`TaskStore::mark_applicability_unresolved`].
     pub fn mark_applicability_unresolved(&mut self, obligation_id: &str) -> Result<Option<String>> {
         self.store.mark_applicability_unresolved(obligation_id)
@@ -7225,6 +7388,38 @@ pub fn plan_blocker(reason: ErrorCode, action_id: &str) -> Blocker {
     }
 }
 
+/// Every off pause names this owner, never the plan's: the pause has its
+/// own record because the single `plan_gate_holds` row is deleted and
+/// rewritten by the plan settlement (AC-024/I5).
+const WORKFLOW_OFF_BLOCKER_OWNER: &str = "workflow";
+
+/// The blocker kind one off pause raises. Distinct from the plan gate's
+/// `plan_gate:*` kinds, so a reader never confuses the two holds.
+const WORKFLOW_OFF_BLOCKER_KIND: &str = "workflow_off:paused";
+
+/// The lifecycle write the off transition applies: work in flight stops
+/// where it is. A blocked task keeps its own hold, and a terminal one is
+/// already settled.
+const PAUSE_TASK_FOR_WORKFLOW_OFF: &str = "UPDATE tasks SET revision = revision + 1, lifecycle = 'paused', event_cursor = event_cursor + 1\n                 WHERE task_id = ?1 AND lifecycle IN ('running', 'waiting')";
+
+/// The one release of that pause: a new intent displaces the off hold.
+/// Only the off pause's own state matches, so a plan-owned block or a
+/// waiting question is never touched by it.
+const RELEASE_WORKFLOW_OFF_PAUSE: &str =
+    "UPDATE tasks SET lifecycle = 'running' WHERE task_id = ?1 AND lifecycle = 'paused'";
+
+/// The exact blocker one off pause raises: the workflow surface owns it and
+/// the condition names what must happen before work resumes — a new intent.
+fn workflow_off_blocker() -> Blocker {
+    Blocker {
+        reason: ErrorCode::DependencyBlocked,
+        owner: WORKFLOW_OFF_BLOCKER_OWNER.to_string(),
+        condition: ResumeCondition::Dependency {
+            action_id: crate::contracts::ActionId(WORKFLOW_OFF_BLOCKER_KIND.to_string()),
+        },
+    }
+}
+
 /// Appends a task's plan blockers after the ones the store already
 /// derived. A pending fork's `Decision` blocker shows only while that
 /// question is the task's pending one and no equal blocker is listed —
@@ -7313,7 +7508,7 @@ fn stage_from_db(raw: i64) -> Result<bool> {
 /// What the request asks for. Only a change or a delivery ever edits;
 /// only a delivery ever ships. The selection persists it so the effect
 /// gate reads the kind the plan was selected for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     Change,
@@ -7360,6 +7555,17 @@ pub struct IndexGeneration {
 /// project, and a `SnapshotId` past the window reports absent rather
 /// than answering with another generation.
 pub const INDEX_GENERATION_RETENTION: usize = 8;
+
+/// How many candidate deltas the store keeps (INV-010, AC-051). A
+/// never-activated candidate is a proposal, not experience, so retention may
+/// evict it; an activated delta and the tombstone a rollback leaves are
+/// primary evidence and are outside the pruning statements' reach.
+pub const LEARNING_DELTA_RETENTION: usize = 32;
+
+/// How many corpus verdict rows one delta keeps: one per case kind, so a
+/// verdict set cannot grow without bound and the newest judgement stays the
+/// readable one.
+pub const LEARNING_CORPUS_RETENTION: usize = crate::learning::CORPUS_CASE_LIMIT;
 
 fn stale_cause_of(state: GenerationState) -> Option<&'static str> {
     match state {
@@ -9320,8 +9526,14 @@ mod tests {
             events.get(carry_index + 4),
             Some(super::proof::ProofEvent::Stmt(sql)) if sql.starts_with("INSERT INTO retained")
         ));
+        // The schema ledger is read before any DDL (DEC-008), so the first
+        // bootstrap statement is the ledger read and the SCHEMA batch follows.
         assert!(matches!(
             events.get(carry_index + 5),
+            Some(super::proof::ProofEvent::Stmt(sql)) if sql == super::sql::SCHEMA_GENERATION
+        ));
+        assert!(matches!(
+            events.get(carry_index + 6),
             Some(super::proof::ProofEvent::Stmt(sql)) if sql.contains("CREATE TABLE IF NOT EXISTS sessions")
         ));
         let bootstrap_at = first_bootstrap_at.expect("bootstrap ran");
@@ -10040,14 +10252,26 @@ mod tests {
                 "the once-only insert"
             );
             match events.get(carry_at + 5) {
+                Some(proof::ProofEvent::Stmt(ledger)) => {
+                    assert_eq!(
+                        ledger,
+                        sql::SCHEMA_GENERATION,
+                        "the schema ledger is read before any DDL (DEC-008)"
+                    );
+                }
+                other => return Err(format!("the bootstrap follows the carry: {other:?}").into()),
+            }
+            match events.get(carry_at + 6) {
                 Some(proof::ProofEvent::Stmt(first)) => {
                     assert!(
                         first.starts_with("CREATE TABLE IF NOT EXISTS sessions")
                             && sql::SCHEMA.trim_start().starts_with(first.as_str()),
-                        "the first bootstrap statement is the first SCHEMA statement: {first}"
+                        "the first SCHEMA statement follows the ledger read: {first}"
                     );
                 }
-                other => return Err(format!("the bootstrap follows the carry: {other:?}").into()),
+                other => {
+                    return Err(format!("the bootstrap DDL follows the carry: {other:?}").into());
+                }
             }
 
             Ok(())
