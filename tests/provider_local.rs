@@ -13956,3 +13956,722 @@ async fn fireworks_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::fireworks = NOT_RUN"]
 fn provider_installed_fireworks() {}
+
+// ----- firepass ---------------------------------------------------------------
+
+// The `firepass` connection's proof legs (HZN-008 class P): the shared
+// Chat Completions adapter serves the literal id — no copied codec —
+// under its own recorded predicates (`auth/firepass.kdl`,
+// `firepassModelManagerOptions`, commit
+// `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`). The configured
+// `endpoint` carries the API base verbatim — an empty one resolves the
+// same recorded `api.fireworks.ai/inference/v1` default `fireworks`
+// serves, under this connection's own contract — and admission
+// discriminates by connection id, never by host. The catalogue is the
+// recorded static router list alone: the `fpk_…` key authorizes no
+// `/models` lookup, so no discovery leg exists and a listing answer
+// proves no access. The credential is the dedicated `fpk_` pass key —
+// a Fireworks account key on the shared host denies malformed before
+// any wire leg. The request body sends every pin on the
+// `accounts/fireworks/routers/` serving path with the `p` version
+// separator, so the pinned `kimi-k2.6-turbo` router and the documented
+// `kimi-k3-fast` id keep their own wire identities rather than folding
+// into one. The class records no per-model price, so no offer claims a
+// figure.
+
+/// The scoped credential ref the `firepass` connection binds.
+const FIREPASS_REF: &str = "keyring:rivect-test/firepass";
+
+/// Fixture Fire Pass key material — never a real credential, only ever
+/// sent to localhost.
+const FIREPASS_KEY: &str = "fpk_fixture-firepass-key";
+
+/// The pinned model id the fixed-pin legs carry — the pinned source's
+/// recorded router identity, so the pin is one the catalogue offers.
+const FIREPASS_MODEL: &str = "kimi-k2.6-turbo";
+
+/// One configured `firepass` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn firepass_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.firepass]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{FIREPASS_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"firepass\", model_id = \"{FIREPASS_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn firepass_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(FIREPASS_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "firepass".to_string(), store.clone())
+        .expect("the shared adapter builds for the firepass id");
+    (provider, store)
+}
+
+/// The `firepass` provider over the recorded enrolled pass key.
+fn enrolled_firepass_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    firepass_provider(config, FIREPASS_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::firepass ---------------------------------------------
+
+/// A configured `firepass` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the `fpk_` pass key rides the `Authorization`
+/// header and never the body, and the shared adapter posts exactly the
+/// frozen manifest as a `chat/completions` request — the pinned
+/// `kimi-k2.6-turbo` translated under the recorded router wire
+/// dispatch into `accounts/fireworks/routers/kimi-k2p6-turbo` (the
+/// digit-adjacent `.` folds to `p`), system+user messages, `stream`
+/// with `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt
+/// never re-sends.
+#[tokio::test]
+async fn firepass_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified firepass outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&firepass_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/firepass", "goal: prove the wire")
+        .expect("the firepass pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/firepass", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified firepass outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {FIREPASS_KEY}"),
+        "the pass key bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(FIREPASS_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("accounts/fireworks/routers/kimi-k2p6-turbo"),
+        "the pinned public router id translates into the recorded router wire form"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "firepass");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/firepass", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-AUTH::firepass ---------------------------------------------
+
+/// The recorded `fpk_` key grammar gates the `firepass` credential:
+/// the recorded `fpk_…` form is admitted and bears a real send, while
+/// a Fireworks account key on the shared `api.fireworks.ai` host — and
+/// a bare `fpk_` prefix that carries no key — deny `CredentialMalformed`
+/// typed before any wire leg, and the denied material never enters the
+/// error's Display or Debug.
+#[tokio::test]
+async fn firepass_fpk_grammar_denies_a_non_fpk_key() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "admitted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&firepass_config(&base)).expect("valid");
+
+    // the recorded pass-key form is admitted
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let (provider, admitted) = send_on_thread(provider, prepared_manifest(&config));
+    admitted.expect("the recorded fpk_ key is the connection's own credential");
+    drop_blocking(provider);
+
+    // a Fireworks account key and a bare prefix are unbound material
+    // for this connection: typed denial, zero further wire legs
+    for material in [FIREWORKS_KEY, "fpk_"] {
+        let (provider, _store) = firepass_provider(&config, material);
+        let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+        let err = denied.expect_err("material outside the pass-key grammar denies");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "the grammar denial is typed: {err}"
+        );
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+    }
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "only the admitted send reached the wire — the denials landed before any leg"
+    );
+}
+
+/// Wrong credential/profile/region never produce a false success for
+/// `firepass`, through the same shared construction its siblings use:
+/// a configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused pass key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches
+/// Display or Debug.
+#[tokio::test]
+async fn firepass_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &firepass_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "firepass".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, FIREPASS_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "firepass");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, FIREPASS_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.firepass]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"firepass\", model_id = \"{FIREPASS_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "firepass".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, FIREPASS_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, FIREPASS_KEY.as_bytes());
+
+    // a refused pass key is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the pass key
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused pass key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused pass key is transport: {err}")
+    };
+    assert_eq!(connection, "firepass");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, FIREPASS_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {FIREPASS_KEY}"),
+        "the admitted grammar reached the wire — the denial is the peer's status"
+    );
+}
+
+/// `firepass` and `fireworks` resolve the same `api.fireworks.ai`
+/// host under their own connections: the recorded default endpoint
+/// resolves for each literal id, the Fireworks account key is admitted
+/// as `fireworks`' plain bearer and denied as `firepass`' pass key, and
+/// a manifest pinning the other connection is refused by the literal-id
+/// send gate, never by host matching.
+#[tokio::test]
+async fn firepass_and_fireworks_share_a_host_but_not_a_connection() {
+    // the same host resolves for both ids from the recorded default
+    for (config, id) in [
+        (firepass_config(""), "firepass"),
+        (fireworks_config(""), "fireworks"),
+    ] {
+        let config = Config::parse_validated(&config).expect("an empty endpoint is valid");
+        let provider = provider_result(
+            config,
+            id.to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds");
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.fireworks.ai/inference/v1\""),
+            "the {id} connection resolves the shared recorded host: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "shared host",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+
+    // the Fireworks bearer is admitted on its own connection ...
+    let fireworks = Config::parse_validated(&fireworks_config(&base)).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_fireworks_provider(&fireworks),
+        &fireworks,
+        "/world/fireworks",
+        "goal: shared host",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    outcome.expect("the fireworks bearer is its own connection's credential");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one fireworks send reaches the wire");
+
+    // ... and denied on `firepass`, the same host's other connection
+    let firepass = Config::parse_validated(&firepass_config(&base)).expect("valid");
+    let (provider, _store) = firepass_provider(&firepass, FIREWORKS_KEY);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&firepass));
+    let err = denied.expect_err("the fireworks key is unbound material for firepass");
+    assert!(
+        matches!(err, ProviderError::CredentialMalformed { .. }),
+        "the shared host never shares a credential grammar: {err}"
+    );
+    assert_no_secret_or_body(&err, FIREWORKS_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // a pin naming the other connection is refused by the literal id,
+    // never admitted because the host agrees
+    let (provider, _store) = enrolled_firepass_provider(&firepass);
+    let foreign = prepared_manifest(&fireworks);
+    let (provider, refused) = send_on_thread(provider, foreign);
+    assert!(
+        matches!(refused, Err(ProviderError::DialectMismatch { .. })),
+        "the firepass adapter never serves a fireworks pin: {refused:?}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the denied key and the foreign pin both stopped before any wire leg"
+    );
+}
+
+/// The recorded router-identity divergence is carried, not folded: the
+/// static catalogue offers the pinned source's `kimi-k2.6-turbo` and
+/// the documented `kimi-k3-fast` as two distinct router identities,
+/// and each pin wires its own `accounts/fireworks/routers/` form —
+/// neither id is rewritten to the other, so the accountability for
+/// which router a pass key covers stays visible at both the offer and
+/// the wire.
+#[tokio::test]
+async fn firepass_k3_fast_k2p6_divergence_is_preserved() {
+    let config = Config::parse_validated(&firepass_config("http://127.0.0.1:1/v1")).expect("valid");
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the static router catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [FIREPASS_MODEL, "kimi-k3-fast"],
+        "both recorded router identities are offered as distinct entries"
+    );
+    for model in &models {
+        assert_eq!(
+            model.price,
+            ModelPrice::Unknown,
+            "{} carries no recorded firepass price — a borrowed fireworks figure would red here",
+            model.id
+        );
+        assert!(
+            !model.vision,
+            "{} carries no recorded firepass vision mark",
+            model.id
+        );
+        assert!(
+            !model.reasoning,
+            "{} carries no recorded firepass reasoning mark",
+            model.id
+        );
+    }
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "router identity",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    for (pinned, expected) in [
+        (
+            "kimi-k2.6-turbo",
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+        ),
+        ("kimi-k3-fast", "accounts/fireworks/routers/kimi-k3-fast"),
+        (
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+        ),
+    ] {
+        let config =
+            Config::parse_validated(&firepass_config(&base).replace(FIREPASS_MODEL, pinned))
+                .expect("valid");
+        let (broker, manifest) = prepared_with(
+            enrolled_firepass_provider(&config),
+            &config,
+            "/world/firepass",
+            "goal: router identity",
+        );
+        let (broker, outcome) = dispatch(broker, "/world/firepass", manifest);
+        outcome.expect("the router pin dispatches");
+        drop_blocking(broker);
+
+        let requests = server.received_requests().await.expect("recorded");
+        let body: Value =
+            serde_json::from_slice(&requests[requests.len() - 1].body).expect("json body");
+        assert_eq!(
+            body["model"],
+            json!(expected),
+            "a {pinned} pin wires its own router form — the ids never fold onto one another"
+        );
+    }
+}
+
+/// A `/models` HTTP 200 is never entitlement for `firepass`: the
+/// recorded `fpk_…` key does not authorize the listing, so the
+/// catalogue answers the static router list with no wire leg at all,
+/// and a fixture listing naming an unrelated roster neither joins the
+/// offer set nor stands in for the credential — without enrolled
+/// material the send denies `CredentialAbsent` typed before any leg.
+#[tokio::test]
+async fn firepass_models_listing_is_not_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "accounts/fireworks/models/kimi-k3"}),
+            json!({"id": "listed-entitlement-claim"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the static router catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [FIREPASS_MODEL, "kimi-k3-fast"],
+        "the static router list alone is the offer — the 200 listing adds nothing"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no discovery leg exists: the listing was never consulted"
+    );
+
+    let provider = provider_result(
+        config.clone(),
+        "firepass".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "a 200 catalogue never stands in for the pass key: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the credential denial lands before any leg"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::firepass -----------------------------------------
+
+/// A typed denial is recoverable through the same seam: material
+/// outside the pass-key grammar denies the first send, enrolling the
+/// recorded `fpk_` key at the scope admits the retry — no state
+/// wedged, no plaintext path taken.
+#[tokio::test]
+async fn firepass_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(FIREPASS_REF, FIREWORKS_KEY)],
+    ));
+    let provider = provider_result(config.clone(), "firepass".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(FIREPASS_REF, FIREPASS_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the recorded pass key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for `firepass`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside
+/// this run, and INSTALLED reports NOT_RUN — an omitted leg fails the
+/// suite rather than silently absenting.
+#[tokio::test]
+async fn firepass_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the static router list is the whole offer, and no
+    // entry borrows a price or capability mark the class never
+    // records — a borrowed fireworks figure fails the row.
+    let (provider, _store) = enrolled_firepass_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [FIREPASS_MODEL, "kimi-k3-fast"]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown && !model.vision && !model.reasoning
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a key outside the recorded pass-key grammar denies typed
+    // before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "firepass".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(FIREPASS_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialMalformed { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_firepass_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/firepass", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/firepass", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(FIREPASS_REF, FIREWORKS_KEY)],
+    ));
+    let provider = provider_result(config.clone(), "firepass".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialMalformed { .. }));
+    store.enroll(FIREPASS_REF, FIREPASS_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_firepass`
+    // case's status, as its sibling matrices do: the ignored count is
+    // the explicit NOT_RUN signal, and this literal keeps that row
+    // visible inside the executed set.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::firepass ----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::firepass = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::firepass = NOT_RUN"]
+fn provider_installed_firepass() {}

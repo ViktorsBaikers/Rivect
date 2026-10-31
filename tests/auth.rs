@@ -2594,3 +2594,82 @@ fn fireworks_api_key_binding_resolves_through_scoped_secret_ref() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class: firepass -------------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on a `firepass` fixture:
+/// both recorded credential bindings resolve through the scoped
+/// `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared or unbound id
+/// keeps the typed denial, a resolved binding admits the pin offline,
+/// and a divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The per-ID
+/// `firepass` proof is the provider target's
+/// `firepass_fpk_grammar_denies_a_non_fpk_key` and
+/// `firepass_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn firepass_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.firepass]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid\"\ncredential_ref = \"keyring:rivect-test/fp-direct\"\n\
+         [connections.fp-profiled]\nkind = \"api_key\"\nendpoint = \"https://api2.example.invalid\"\ncredential_ref = \"keyring:rivect-test/fp-scope\"\nprofile = \"fp-team\"\n\
+         [profiles.fp-team]\ncredential_ref = \"keyring:rivect-test/fp-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "firepass")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/fp-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "fp-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/fp-team");
+
+    // a declared id with neither binding, and an undeclared id, are
+    // the typed denials — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "firepass",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "fp-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/fp-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "fp-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

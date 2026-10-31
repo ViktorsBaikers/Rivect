@@ -1,14 +1,14 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek` and `fireworks` connections' adapter — the
-//! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
-//! HZN-008 class S, class A and class P). Dialect selection keys on
-//! the literal connection id, never an auth label, an endpoint shape
-//! or a catalogue answer: every compatible host a deployment wires
-//! under `custom-chat-completions` shares the one
-//! recorded generic contract, while `aiand`, `aimlapi`,
+//! `deepinfra`, `deepseek`, `firepass` and `fireworks` connections'
+//! adapter — the OpenAI-compatible Chat Completions dialect
+//! (DEC-007/DEC-025, HZN-008 class S, class A and class P).
+//! Dialect selection keys on the literal connection id, never an auth
+//! label, an endpoint shape or a catalogue answer: every compatible
+//! host a deployment wires under `custom-chat-completions` shares the
+//! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek` and `fireworks` carry their own
+//! `deepinfra`, `deepseek`, `firepass` and `fireworks` carry their own
 //! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
@@ -28,7 +28,11 @@
 //! the authoritative `/models` listing gated by the recorded
 //! built-in roster — built-in ids offered, benchmark ids never —
 //! the plain bearer credential and the recorded native reasoning
-//! rules on `deepseek`, and the configured-or-default
+//! rules on `deepseek`, the shared `api.fireworks.ai/inference/v1`
+//! host under the recorded static router catalogue — the `fpk_…` key
+//! authorizes no `/models` lookup, so no discovery leg exists — the
+//! dedicated `fpk_` key grammar and the router wire-model-id dispatch
+//! on `firepass`, and the configured-or-default
 //! `api.fireworks.ai/inference/v1` host, the request-model
 //! `/models` listing — the `/v1/accounts/fireworks/models`
 //! management API never a model source — the serverless/fast
@@ -255,6 +259,26 @@ const DEEPSEEK_PRICES: &[(&str, f64, f64)] = &[
 /// `vision-exp` build alone admits image input.
 const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 
+/// The recorded `firepass` static router catalogue (HZN-008 class P —
+/// `auth/firepass.kdl`, `firepassModelManagerOptions`): the manager
+/// returns a bare provider id with the bundled catalogue canonical,
+/// and the dedicated `fpk_…` keys do not authorize `/models`, so this
+/// connection opens no discovery leg at all and a `/models` answer
+/// never proves access. The two recorded router identities stay
+/// distinct entries, never one reconciled id: the pinned source's
+/// `kimi-k2.6-turbo` (Kimi K2.6 Turbo, wired as
+/// `accounts/fireworks/routers/kimi-k2p6-turbo`) and the id the
+/// official Fire Pass page documents at the same pin, `kimi-k3-fast`.
+/// The class records no vision mark and no per-model price for either,
+/// so those surfaces stay off and unknown.
+const FIREPASS_MODELS: &[(&str, bool)] = &[("kimi-k2.6-turbo", false), ("kimi-k3-fast", false)];
+
+/// The recorded `fpk_` prefix a Fire Pass key carries
+/// (`auth/firepass.kdl`, prompt `fpk_...`): the pass key is enrolled
+/// for this connection alone, so a Fireworks account key on the shared
+/// `api.fireworks.ai` host never satisfies the grammar.
+const FIREPASS_KEY_PREFIX: &str = "fpk_";
+
 /// The recorded default API root of a `fireworks` connection
 /// (`api.fireworks.ai/inference/v1`, `fireworksModelManagerOptions`'
 /// `config?.baseUrl ?? defaultBaseUrl` fallback): the host the
@@ -419,6 +443,12 @@ enum CredentialRule {
     /// leg, diagnostic or surface ever reads it. The bearer must carry
     /// the recorded `TOKEN_PATTERN` grammar.
     AlibabaTokenPlan,
+    /// `firepass`'s recorded credential (`auth/firepass.kdl`): a
+    /// dedicated `fpk_…` Fire Pass key bound to its own enrollment.
+    /// The connection shares `api.fireworks.ai` with `fireworks` but
+    /// never a key class — a Fireworks account key is unbound
+    /// material here and denies as malformed before any wire leg.
+    Firepass,
     /// `coreweave`'s recorded scoped credential (`Rivect/key +
     /// OpenAI-Project`, wire/coreweave.ts): a JSON object whose `key`
     /// is the bearer and whose `OpenAI-Project` is the
@@ -483,6 +513,14 @@ enum EntryRule {
     /// is a real figure); the listing row names nothing else, and
     /// the class records no other entry surface this transform maps.
     Fireworks,
+    /// The `firepass` arm: the class binds the recorded static router
+    /// allowlist, so no listing entry is ever transformed — a listed
+    /// id proves no access this class records and offers nothing —
+    /// while the arm's live duty is the wire dispatch: every offered
+    /// router id sends under the `accounts/fireworks/routers/` form.
+    /// Unreached under [`CatalogRule::Allowlist`]: no listing exists
+    /// to transform.
+    Firepass,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -610,6 +648,21 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::DeepSeek,
+        }),
+        // `firepass` (HZN-008 class P): the same
+        // `api.fireworks.ai/inference/v1` base `fireworks` serves under
+        // its own connection id, the recorded static router catalogue
+        // alone — the `fpk_…` key authorizes no `/models` lookup, so a
+        // listing answer never proves access and no discovery leg
+        // exists — the dedicated `fpk_` key grammar, and the class
+        // rule carrying the router wire dispatch: admission and egress
+        // discriminate by connection id, never by host.
+        "firepass" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(FIREWORKS_BASE_URL),
+            catalog: CatalogRule::Allowlist(FIREPASS_MODELS),
+            credential: CredentialRule::Firepass,
+            entries: EntryRule::Firepass,
         }),
         // `fireworks` (HZN-008 class A): the configured-or-recorded
         // `api.fireworks.ai/inference/v1` base — the host `firepass`
@@ -1061,6 +1114,10 @@ impl ChatCompletionsProvider {
             }
             EntryRule::DeepSeek => deepseek_entry(id),
             EntryRule::Fireworks => fireworks_entry(id),
+            // Unreached: this class binds the static allowlist, so no
+            // listing leg runs. A listed id would prove no access the
+            // class records, so the transform admits nothing.
+            EntryRule::Firepass => None,
         }
     }
 
@@ -1083,6 +1140,7 @@ impl ChatCompletionsProvider {
                 self.token_plan_bearer(&text).map(WireSecret::bearer)
             }
             CredentialRule::CoreWeave => self.coreweave_secret(&text),
+            CredentialRule::Firepass => self.firepass_bearer(&text).map(WireSecret::bearer),
         }
     }
 
@@ -1118,6 +1176,25 @@ impl ChatCompletionsProvider {
             bearer: bearer.to_string(),
             project: Some(project.to_string()),
         })
+    }
+
+    /// The bearer a `firepass` credential resolves (`auth/firepass.kdl`):
+    /// the recorded pass key is the dedicated `fpk_…` class, prefix
+    /// plus a non-empty body. The key is bound to this connection's
+    /// own enrollment, so material outside the grammar — notably a
+    /// Fireworks account key for the shared `api.fireworks.ai` host —
+    /// denies as malformed before any wire leg, never as a bearer the
+    /// pass product would bill differently. Every denial is typed and
+    /// lands before any leg.
+    fn firepass_bearer(&self, material: &str) -> Result<String, ProviderError> {
+        let token = material.trim();
+        token
+            .strip_prefix(FIREPASS_KEY_PREFIX)
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            })?;
+        Ok(token.to_string())
     }
 
     /// The bearer an `alibaba-coding-plan` credential resolves
@@ -1259,11 +1336,13 @@ impl ChatCompletionsProvider {
     /// `fireworks.kdl`): `fireworks` sends
     /// `accounts/fireworks/models/<id>` — `accounts/fireworks/
     /// routers/<id>` for a `*-fast` serving-path id — with the
-    /// recorded `p` version separator (`toFireworksWireModelId` /
-    /// `toFirepassWireModelId`); every other contract's wire name is
-    /// the offered id verbatim.
+    /// recorded `p` version separator (`toFireworksWireModelId`);
+    /// `firepass` sends `accounts/fireworks/routers/<id>` for every
+    /// pinned router id (`toFirepassWireModelId`); every other
+    /// contract's wire name is the offered id verbatim.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
+            EntryRule::Firepass => firepass_wire_model_id(model_id),
             EntryRule::Fireworks => fireworks_wire_model_id(model_id),
             _ => model_id.to_string(),
         }
@@ -2064,16 +2143,11 @@ fn fireworks_public_id(id: &str) -> String {
     public
 }
 
-/// The recorded `fireworks` wire id (`toFireworksWireModelId`, and
-/// `toFirepassWireModelId` for a `*-fast` serving-path id under the
-/// recorded `wire-model-id-mode "firepass"` arm): the
-/// `accounts/fireworks/models/` or `accounts/fireworks/routers/`
-/// prefix stripped, every `.` between digits folded to `p`, then the
-/// serving-path prefix: `routers/` exactly when the stripped id ends
-/// `-fast`, `models/` otherwise. A pin already carrying a wire
-/// prefix is therefore re-served under the path its id names, never
-/// echoed verbatim when the prefix disagrees with the id.
-fn fireworks_wire_model_id(id: &str) -> String {
+/// The recorded Fireworks-family wire-id body
+/// (`toFireworksWireModelId`/`toFirepassWireModelId`): whichever
+/// recorded wire prefix the id carries is stripped, then every `.`
+/// between digits folds to the `p` version separator.
+fn fireworks_wire_body(id: &str) -> String {
     let stripped = id
         .strip_prefix(FIREWORKS_WIRE_PREFIX)
         .or_else(|| id.strip_prefix(FIREWORKS_ROUTER_PREFIX))
@@ -2091,11 +2165,35 @@ fn fireworks_wire_model_id(id: &str) -> String {
             wire.push(ch);
         }
     }
+    wire
+}
+
+/// The recorded `fireworks` wire id (`toFireworksWireModelId`): the
+/// shared body fold, then the serving-path prefix — `routers/`
+/// exactly when the body ends `-fast`, `models/` otherwise. A pin
+/// already carrying a wire prefix is therefore re-served under the
+/// path its id names, never echoed verbatim when the prefix
+/// disagrees with the id.
+fn fireworks_wire_model_id(id: &str) -> String {
+    let wire = fireworks_wire_body(id);
     if wire.ends_with("-fast") {
         format!("{FIREWORKS_ROUTER_PREFIX}{wire}")
     } else {
         format!("{FIREWORKS_WIRE_PREFIX}{wire}")
     }
+}
+
+/// The recorded `firepass` wire id (`toFirepassWireModelId` under the
+/// recorded `wire-model-id-mode "firepass"`): the shared body fold,
+/// then the `accounts/fireworks/routers/` prefix unconditionally —
+/// the recorded login validate sends its router id in that form
+/// (`auth/firepass.kdl`), and the pass key is scoped to a router, so
+/// `kimi-k2.6-turbo` wires as
+/// `accounts/fireworks/routers/kimi-k2p6-turbo` while the documented
+/// `kimi-k3-fast` keeps its own router form instead of folding onto
+/// the pinned id.
+fn firepass_wire_model_id(id: &str) -> String {
+    format!("{FIREWORKS_ROUTER_PREFIX}{}", fireworks_wire_body(id))
 }
 
 /// The recorded `fireworks` entry transform — the admission surface
@@ -2298,8 +2396,9 @@ impl Provider for ChatCompletionsProvider {
         // The literal id's recorded wire-model-id dispatch decides
         // the body's `model` — `fireworks` translates the public id
         // into the `accounts/fireworks/…` wire form (routers for the
-        // `*-fast` serving path, models otherwise); every other
-        // contract names the id verbatim.
+        // `*-fast` serving path, models otherwise), `firepass` always
+        // the routers serving path; every other contract names the id
+        // verbatim.
         let wire_model_id = self.wire_model_id(&fixed.model_id);
         let body = self.request_body(manifest, &wire_model_id);
         let body_bytes = wire_body(&self.connection, &body)?;
