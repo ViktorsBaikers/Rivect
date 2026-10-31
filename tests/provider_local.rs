@@ -12851,3 +12851,1108 @@ async fn deepseek_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::deepseek = NOT_RUN"]
 fn provider_installed_deepseek() {}
+// ----- fireworks --------------------------------------------------------------
+
+// The `fireworks` connection's proof legs (HZN-008 class A): the
+// shared Chat Completions adapter serves the literal id — no copied
+// codec — under its own recorded predicates (`Rivect/key`,
+// `fireworksModelManagerOptions`, `providers/fireworks.kdl` +
+// `auth/fireworks.kdl`, commit `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`).
+// The configured `endpoint` carries the API base verbatim — an empty
+// one resolves the recorded `api.fireworks.ai/inference/v1` default
+// (`config?.baseUrl ?? defaultBaseUrl`'s absent arm), and a
+// configured `region` is denied: the contract names none. The
+// catalogue is the configured base's own request-model `/models`
+// listing — the `/v1/accounts/fireworks/models` management API is
+// never a model source — under the recorded serverless/fast
+// chat-model predicates: an `accounts/fireworks/models/` wire id
+// normalizes to its public form (`p` version separator folded back
+// to `.`), an id still carrying a reserved `accounts/fireworks/`
+// prefix is dropped (router ids are serving paths, never models
+// this connection offers), and the recorded Fast seed floors the
+// offer — Fast router variants the listing never surfaces. The
+// request body sends the recorded wire-model-id dispatch:
+// `accounts/fireworks/models/<id>` — `accounts/fireworks/routers/
+// <id>` for a `*-fast` id — with the `p` version separator. The
+// credential is the recorded plain `key` bearer; material that is
+// not UTF-8 text denies malformed before any wire leg; the recorded
+// per-model USD prices carry onto the offered surface — a stated
+// zero is a real figure — and the pinned rows' cache figures stay
+// uncarried: `ModelPrice` holds input/output alone.
+
+/// The scoped credential ref the `fireworks` connection binds.
+const FIREWORKS_REF: &str = "keyring:rivect-test/fireworks";
+
+/// Fixture fireworks key material — never a real credential, only
+/// ever sent to localhost.
+const FIREWORKS_KEY: &str = "fixture-fireworks-key";
+
+/// The pinned model id the fixed-pin legs carry — a recorded
+/// bundled row, so the pin is one the catalogue could itself offer.
+const FIREWORKS_MODEL: &str = "kimi-k2.7-code";
+
+/// The recorded Fast seed ids, sorted — the offer floor the listing
+/// never surfaces: every seeded id wires under the recorded
+/// `wire-model-id-mode "firepass"` router dispatch.
+const FIREWORKS_FAST_SEED_IDS: [&str; 4] = [
+    "glm-5.1-fast",
+    "glm-5.2-fast",
+    "kimi-k2.6-fast",
+    "kimi-k2.7-code-fast",
+];
+
+/// One configured `fireworks` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn fireworks_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.fireworks]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{FIREWORKS_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"fireworks\", model_id = \"{FIREWORKS_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn fireworks_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(FIREWORKS_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "fireworks".to_string(), store.clone())
+        .expect("the shared adapter builds for the fireworks id");
+    (provider, store)
+}
+
+/// The `fireworks` provider over the recorded enrolled credential.
+fn enrolled_fireworks_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    fireworks_provider(config, FIREWORKS_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::fireworks --------------------------------------------
+
+/// A configured `fireworks` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the plain bearer credential rides the
+/// `Authorization` header — no scope member, no body copy — and the
+/// shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — the pinned public id translated
+/// under the recorded `wire-model-id-mode` dispatch into
+/// `accounts/fireworks/models/<id>` (the digit-adjacent `.` in
+/// `kimi-k2.7-code` folds to `p`), system+user
+/// messages, `stream` with `stream_options.include_usage` and the
+/// pinned effort as `reasoning_effort` verbatim — the SSE stream
+/// validates its finish_reason/`[DONE]` terminal, and the one
+/// physical send is charged once with the provider's reported usage.
+#[tokio::test]
+async fn fireworks_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&fireworks_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/fireworks", "goal: prove the wire")
+        .expect("the fireworks pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {FIREWORKS_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(FIREWORKS_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("accounts/fireworks/models/kimi-k2p7-code"),
+        "the pinned public id translates under the recorded wire-model-id dispatch — the p separator folded"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "fireworks");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/fireworks", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded `wire-model-id-mode "firepass"` dispatch: a `*-fast`
+/// pin sends the router wire form `accounts/fireworks/routers/<id>`
+/// — the Fast serving path is a router, never a models/ id — while
+/// the models wire prefix stays for the base ids. A digit-adjacent
+/// `.` folds to `p` and a `p` between digits in the listing id folds
+/// back — the translation is the recorded round-trip.
+#[tokio::test]
+async fn fireworks_fast_pin_sends_the_recorded_router_wire_form() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "fast outcome",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(
+        &fireworks_config(&base).replace(FIREWORKS_MODEL, "kimi-k2.6-fast"),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_fireworks_provider(&config),
+        &config,
+        "/world/fireworks",
+        "goal: fast wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    let reply = outcome.expect("the fast pin dispatches");
+    assert_eq!(reply.text, "fast outcome");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one physical request — no catalogue leg");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("accounts/fireworks/routers/kimi-k2p6-fast"),
+        "a *-fast pin rides the recorded router wire form — never the models/ prefix"
+    );
+}
+
+/// The recorded wire-model-id dispatch strips whichever wire prefix a
+/// pin already carries before re-prefixing it: `routers/` exactly
+/// when the stripped id ends `-fast`, `models/` otherwise, so no pin
+/// stacks a second prefix and a prefix that disagrees with the id is
+/// replaced by the serving path the id names.
+#[tokio::test]
+async fn fireworks_router_form_pin_round_trips_the_recorded_wire_form() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "router form outcome",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    for (pinned, expected) in [
+        (
+            "accounts/fireworks/routers/kimi-k2p6-fast",
+            "accounts/fireworks/routers/kimi-k2p6-fast",
+        ),
+        (
+            "accounts/fireworks/models/kimi-k2p7-code",
+            "accounts/fireworks/models/kimi-k2p7-code",
+        ),
+        (
+            "accounts/fireworks/routers/kimi-k2p6-turbo",
+            "accounts/fireworks/models/kimi-k2p6-turbo",
+        ),
+        (
+            "accounts/fireworks/models/kimi-k2.6-fast",
+            "accounts/fireworks/routers/kimi-k2p6-fast",
+        ),
+    ] {
+        let config =
+            Config::parse_validated(&fireworks_config(&base).replace(FIREWORKS_MODEL, pinned))
+                .expect("valid");
+        let (broker, manifest) = prepared_with(
+            enrolled_fireworks_provider(&config),
+            &config,
+            "/world/fireworks",
+            "goal: router wire",
+        );
+        let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+        outcome.expect("the router-form pin dispatches");
+        drop_blocking(broker);
+
+        let requests = server.received_requests().await.expect("recorded");
+        let body: Value =
+            serde_json::from_slice(&requests[requests.len() - 1].body).expect("json body");
+        assert_eq!(
+            body["model"],
+            json!(expected),
+            "a {pinned} pin lands the serving-path wire form — routers/ for a *-fast id, models/ otherwise"
+        );
+    }
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving `fireworks`
+/// means the id is never fixture-served even when it declares
+/// `local` kind, and a manifest pinning a different connection id is
+/// refused at send.
+#[test]
+fn fireworks_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("fireworks"),
+        Some(rivect::providers::Dialect::ChatCompletions),
+        "the literal id binds the shared Chat Completions dialect"
+    );
+    let config =
+        Config::parse_validated(&fireworks_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "fireworks-plus".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `fireworks` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.fireworks]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"fireworks\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("fireworks").expect("declared");
+    assert!(
+        !loopback.serves("fireworks", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{FIREWORKS_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/fireworks", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::fireworks -----------------------------------------
+
+/// The `fireworks` catalogue is the configured base's own
+/// request-model `/models` listing under the recorded
+/// serverless/fast transform (HZN-008 class A): the lookup resolves
+/// the plain bearer credential on the one `GET {endpoint}/models`
+/// leg, a listed `accounts/fireworks/models/` wire id normalizes to
+/// its public form — the `p` separator between digits folds back to
+/// `.` — an id still carrying a reserved `accounts/fireworks/`
+/// prefix is dropped as a serving path, and every admitted id lands
+/// the recorded per-model USD price the pinned row states (a stated
+/// zero is a real figure, an unbundled id stays `Unknown`).
+#[tokio::test]
+async fn fireworks_catalog_lists_the_recorded_request_model_surface() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "accounts/fireworks/models/kimi-k2p7-code"}),
+            // a listed fast id the seed does not name — the listing
+            // leg alone must offer it under its public form
+            json!({"id": "accounts/fireworks/models/glm-5p3-flash-fast"}),
+            json!({"id": "deepseek-v4-pro"}),
+            json!({"id": "flux-1-schnell-fp8"}),
+            json!({"id": "unbundled-fixture-model"}),
+            // an empty or absent id can never name a model — and a
+            // listed router id is a serving path, never offered
+            json!({"id": ""}),
+            json!({"metadata": {}}),
+            json!({"id": "accounts/fireworks/routers/kimi-k2p6-turbo"}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&fireworks_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the request-model listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [
+            "deepseek-v4-pro",
+            "flux-1-schnell-fp8",
+            "glm-5.1-fast",
+            "glm-5.2-fast",
+            "glm-5.3-flash-fast",
+            "kimi-k2.6-fast",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-fast",
+            "unbundled-fixture-model",
+        ],
+        "the listing offers the normalized public ids plus the Fast seed floor — a router id never offers"
+    );
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+    };
+    assert_eq!(
+        model("kimi-k2.7-code"),
+        &CatalogModel {
+            id: "kimi-k2.7-code".to_string(),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.67,
+                output_per_1m: 3.4,
+            },
+            ..CatalogModel::default()
+        },
+        "a bundled id lands its public form and recorded USD price — the p separator folded back"
+    );
+    assert_eq!(
+        model("flux-1-schnell-fp8"),
+        &CatalogModel {
+            id: "flux-1-schnell-fp8".to_string(),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.0,
+                output_per_1m: 0.0,
+            },
+            ..CatalogModel::default()
+        },
+        "a stated zero is a real figure — a free SKU, never the unknown state"
+    );
+    assert_eq!(
+        model("unbundled-fixture-model"),
+        &CatalogModel {
+            id: "unbundled-fixture-model".to_string(),
+            ..CatalogModel::default()
+        },
+        "an id the pinned rows do not name keeps the unknown price, never a borrowed figure"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — the management API is never consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {FIREWORKS_KEY}"),
+        "the plain key bears the discovery leg"
+    );
+}
+
+/// The `/v1/accounts/fireworks/models` management API is never a
+/// model source (DEC-025, EDGE fireworks row): the catalogue is the
+/// configured base's own request-model `/models` listing, and the
+/// recorded serverless/fast predicates gate admission — a listing
+/// entry still carrying a reserved `accounts/fireworks/` prefix is
+/// dropped, a public id offers through the transform, and no leg
+/// ever touches the account-scoped management path.
+#[tokio::test]
+async fn fireworks_management_api_is_never_a_model_source() {
+    let server = MockServer::start().await;
+    // the management API is not mounted — any call toward
+    // /v1/accounts/fireworks/models would answer 404 and the lookup
+    // would fail rather than harvest a management page
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "accounts/fireworks/models/glm-5p2"}),
+            json!({"id": "accounts/fireworks/routers/managed-thing"}),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the request-model listing answers");
+    drop_blocking(provider);
+    assert!(
+        models.iter().any(|model| model.id == "glm-5.2"),
+        "a wire-prefixed id normalizes to its public form: {}",
+        model_ids(&models).join(", ")
+    );
+    assert!(
+        !models.iter().any(|model| model.id.contains("routers")),
+        "a listed router id is a serving path — never a model offer"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    for request in &requests {
+        assert!(
+            !request.url.path().starts_with("/v1/accounts/"),
+            "the management API is never a model source: {}",
+            request.url.path()
+        );
+    }
+    assert_eq!(requests.len(), 1, "one request-model listing leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+}
+
+/// The recorded Fast seed floors the offer (HZN-008 class A): Fast
+/// router variants never appear in the serverless list, so the seed
+/// ids offer even when the listing omits them — and every seeded
+/// offer carries the recorded surface the transform lands, the
+/// recorded variant USD price included, never a bare id-only stub.
+#[tokio::test]
+async fn fireworks_seed_floor_carries_the_full_recorded_surface() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // a base id the listing states — the whole Fast offer
+            // below is the seed's, never a listed entry's
+            json!({"id": "deepseek-v4-flash"}),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+    };
+    for (id, input_per_1m, output_per_1m) in [
+        ("glm-5.1-fast", 2.8, 8.8),
+        ("glm-5.2-fast", 2.1, 6.6),
+        ("kimi-k2.6-fast", 2.0, 8.0),
+        ("kimi-k2.7-code-fast", 1.9, 8.0),
+    ] {
+        assert_eq!(
+            model(id),
+            &CatalogModel {
+                id: id.to_string(),
+                price: ModelPrice::Usd {
+                    input_per_1m,
+                    output_per_1m,
+                },
+                ..CatalogModel::default()
+            },
+            "a seed-only Fast offer carries the recorded variant price — the discriminating leg a bare-stub seed arm would lose"
+        );
+    }
+    assert!(
+        FIREWORKS_FAST_SEED_IDS
+            .iter()
+            .all(|id| models.iter().any(|model| &model.id == id)),
+        "every recorded Fast seed id offers through the floor"
+    );
+}
+
+/// The recorded serverless/fast predicates gate the listing (DEC-025
+/// row wording): the `models/` wire prefix strips to the public id,
+/// a `p` version separator folds back to `.`, a `*-fast` public id
+/// is a router serving path offered as such — never under the
+/// models/ wire prefix — and an id still carrying the reserved
+/// `accounts/fireworks/` prefix drops as a non-model serving path.
+#[tokio::test]
+async fn fireworks_serverless_fast_predicates_filter_the_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "accounts/fireworks/models/glm-5p3-flash-fast"}),
+            json!({"id": "accounts/fireworks/routers/kimi-k2p6-turbo"}),
+            json!({"id": "accounts/fireworks/other-namespace/thing"}),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    let listed_fast = models
+        .iter()
+        .find(|model| model.id == "glm-5.3-flash-fast")
+        .unwrap_or_else(|| panic!("a listed fast id the seed never names offers"));
+    assert_eq!(
+        listed_fast.price,
+        ModelPrice::Unknown,
+        "an unshipped fast variant keeps the unknown price — a prefix-matching row never lends glm-5.3-flash its figure"
+    );
+    for listed in [
+        "accounts/fireworks/routers/kimi-k2p6-turbo",
+        "accounts/fireworks/other-namespace/thing",
+    ] {
+        assert!(
+            !models.iter().any(|model| model.id == listed),
+            "a reserved-prefix id is dropped as a serving path: {listed}"
+        );
+    }
+    assert!(
+        !models.iter().any(|model| model.id.starts_with("accounts/")),
+        "no reserved-prefix form lands on the offer surface"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default —
+/// the `config?.baseUrl ?? defaultBaseUrl` absent arm our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so the arm is proved without one byte toward
+/// `api.fireworks.ai`.
+#[test]
+fn fireworks_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&fireworks_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_fireworks_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.fireworks.ai/inference/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the request-model listing under
+/// the recorded transform: a listed serving-path id can never become
+/// the wire model — the dispatch narrows the pool to the `fireworks`
+/// member, the shared adapter resolves the deterministic
+/// sorted-first offer, and the send translates it under the recorded
+/// wire-model-id dispatch.
+#[tokio::test]
+async fn fireworks_auto_pick_resolves_through_the_request_model_catalog() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // would sort first if admitted — the transform keeps it
+            // out of the offer set entirely
+            json!({"id": "accounts/fireworks/routers/aaa-path"}),
+            json!({"id": "deepseek-v4-pro"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.fireworks]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{FIREWORKS_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"fireworks\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/fireworks", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("accounts/fireworks/models/deepseek-v4-pro"),
+        "the sorted-first offer names the wire model under the recorded dispatch — a serving path never picks"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::fireworks --------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `fireworks`: a configured `region` — the recorded contract names
+/// none — the profile-bound ref whose scope disagrees with the
+/// binding, an absent credential, credential material that is not
+/// UTF-8 text and a refused bearer token each land a typed denial,
+/// and none of them, nor any Debug surface the boundary exposes,
+/// renders credential material or the peer's body.
+#[tokio::test]
+async fn fireworks_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &fireworks_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "fireworks".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "fireworks");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, FIREWORKS_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.fireworks]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"fireworks\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "fireworks".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, FIREWORKS_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "fireworks".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, FIREWORKS_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // material that is not UTF-8 text cannot be a bearer token: the
+    // typed malformed denial lands before any wire leg — zero
+    // requests reach the mock
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(FIREWORKS_REF, &[0xFF, 0xFE, 0xFD]);
+    let provider =
+        provider_result(config.clone(), "fireworks".to_string(), store).expect("binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("non-text material denies before any wire leg");
+    assert!(
+        matches!(err, ProviderError::CredentialMalformed { .. }),
+        "non-UTF-8 material is the typed malformed denial: {err}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "denied credentials never reached the wire"
+    );
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "fireworks");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, FIREWORKS_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&fireworks_config(&base)).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "fireworks".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(FIREWORKS_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(FIREWORKS_KEY),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_fireworks_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/fireworks", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(FIREWORKS_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(FIREWORKS_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(FIREWORKS_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-fireworks",
+        Some(&fireworks_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(FIREWORKS_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement (INV-010): with the key
+/// enrolled the fixed pin still rides only its request leg, and a
+/// listing answering arbitrary ids neither stands in for the
+/// credential nor admits the send — the unmounted `chat/completions`
+/// peer answers the typed transport denial while the 200 listing is
+/// never consulted.
+#[tokio::test]
+async fn fireworks_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": FIREWORKS_MODEL})]).await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "fireworks".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(FIREWORKS_REF, FIREWORKS_KEY)],
+        )),
+    )
+    .expect("the enrolled binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "fireworks");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+}
+
+// ----- TP-PROVIDER-RECOVERY::fireworks ----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn fireworks_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "fireworks".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(FIREWORKS_REF, FIREWORKS_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `fireworks`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn fireworks_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "deepseek-v4-flash"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the listing's base id plus the recorded Fast seed
+    // floor is the offer — a serving path can never name a model.
+    let (provider, _store) = enrolled_fireworks_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    let offered = model_ids(&listed);
+    reported.insert(
+        "CATALOG",
+        if offered.contains(&"deepseek-v4-flash")
+            && FIREWORKS_FAST_SEED_IDS
+                .iter()
+                .all(|id| offered.contains(id))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "fireworks".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_fireworks_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/fireworks", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "fireworks".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(FIREWORKS_REF, FIREWORKS_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_fireworks` case below: its ignored count is
+    // the explicit NOT_RUN signal this matrix asserts — the row stays
+    // a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::fireworks ---------------------------------------
+
+/// TP-PROVIDER-INSTALLED::fireworks = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::fireworks = NOT_RUN"]
+fn provider_installed_fireworks() {}

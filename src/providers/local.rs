@@ -1,6 +1,6 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra` and `deepseek` connections' adapter — the
+//! `deepinfra`, `deepseek` and `fireworks` connections' adapter — the
 //! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
 //! HZN-008 class S, class A and class P). Dialect selection keys on
 //! the literal connection id, never an auth label, an endpoint shape
@@ -8,7 +8,7 @@
 //! under `custom-chat-completions` shares the one
 //! recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra` and `deepseek` carry their own
+//! `deepinfra`, `deepseek` and `fireworks` carry their own
 //! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
@@ -24,11 +24,17 @@
 //! `coreweave`, the configured-or-default host, the
 //! authoritative chat-model `/models` listing — the public metadata
 //! catalogue never an authentication surface — and the plain bearer
-//! credential on `deepinfra`, and the configured-or-default host,
+//! credential on `deepinfra`, the configured-or-default host,
 //! the authoritative `/models` listing gated by the recorded
 //! built-in roster — built-in ids offered, benchmark ids never —
 //! the plain bearer credential and the recorded native reasoning
-//! rules on `deepseek` — resolved per literal id by the
+//! rules on `deepseek`, and the configured-or-default
+//! `api.fireworks.ai/inference/v1` host, the request-model
+//! `/models` listing — the `/v1/accounts/fireworks/models`
+//! management API never a model source — the serverless/fast
+//! chat-model predicates with the recorded wire-model-id dispatch,
+//! the recorded Fast seed and the plain bearer credential on
+//! `fireworks` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -249,6 +255,92 @@ const DEEPSEEK_PRICES: &[(&str, f64, f64)] = &[
 /// `vision-exp` build alone admits image input.
 const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 
+/// The recorded default API root of a `fireworks` connection
+/// (`api.fireworks.ai/inference/v1`, `fireworksModelManagerOptions`'
+/// `config?.baseUrl ?? defaultBaseUrl` fallback): the host the
+/// required `endpoint` field's empty string resolves under — the
+/// same absent-override rule the plan classes bind. The connection
+/// shares the host with `firepass`, never a contract: egress and
+/// credential grammar bind per literal connection id.
+const FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+
+/// The recorded `accounts/fireworks/models/` wire prefix the
+/// inference listing returns on its ids — the catalogue offers the
+/// public form (`toFireworksPublicModelId`), the request body
+/// carries the wire form (`toFireworksWireModelId`). The
+/// `accounts/fireworks/routers/` prefix is the Fast/`firepass`
+/// serving path — the recorded `exclude-models
+/// prefix="accounts/fireworks/"` runtime rule drops any id still
+/// carrying a reserved prefix after the public-form strip, so a
+/// listed router id is never offered.
+const FIREWORKS_WIRE_PREFIX: &str = "accounts/fireworks/models/";
+const FIREWORKS_ROUTER_PREFIX: &str = "accounts/fireworks/routers/";
+
+/// The recorded public-id suffix a Fireworks Fast serving-path
+/// variant carries (`FIREWORKS_FAST_SUFFIX` —
+/// `fireworks-model-id.ts`): Fast routers never appear in the
+/// serverless list, so the recorded surface seeds the named variants
+/// as the offer floor (`buildFireworksFastSeed` /
+/// `FIREWORKS_FAST_VARIANT_SPECS`), and the recorded
+/// `wire-model-id-mode "firepass"` dispatch on a `*-fast` id sends
+/// the router wire form `accounts/fireworks/routers/<id>` with the
+/// recorded `p` version separator. The seed ids are the public
+/// catalogue ids the recorded variant specs name — a fast id the
+/// listing itself returns is offered through the same transform, so
+/// the offer set is a union, never a rekey.
+const FIREWORKS_FAST_IDS: &[&str] = &[
+    "glm-5.1-fast",
+    "glm-5.2-fast",
+    "kimi-k2.6-fast",
+    "kimi-k2.7-code-fast",
+];
+
+/// The recorded per-model USD prices the pinned `fireworks` rows of
+/// `models.json` state (`cost.input`/`cost.output` per 1M tokens),
+/// plus the recorded Fast variant prices
+/// (`FIREWORKS_FAST_VARIANT_SPECS`): a stated zero is a real figure
+/// — a free or bundled-only SKU — never the unknown state. The
+/// recorded `cacheRead`/`cacheWrite` figures have no carrier —
+/// [`ModelPrice`] states input/output alone — so they stay
+/// uncarried rather than flattened into the carried legs, and an
+/// id the pinned rows do not name keeps `ModelPrice::Unknown`.
+const FIREWORKS_PRICES: &[(&str, f64, f64)] = &[
+    ("deepseek-v4-flash", 0.14, 0.28),
+    ("deepseek-v4-flash-0731", 0.175, 0.35),
+    ("deepseek-v4-flash-vision-exp", 0.14, 0.28),
+    ("deepseek-v4-pro", 0.435, 0.87),
+    ("deepseek-v4-pro-0813", 1.65, 4.95),
+    ("flux-1-schnell-fp8", 0.0, 0.0),
+    ("glm-5", 1.0, 3.2),
+    ("glm-5.1", 1.4, 4.4),
+    ("glm-5.1-fast", 2.8, 8.8),
+    ("glm-5.2", 0.966, 3.036),
+    ("glm-5.2-fast", 2.1, 6.6),
+    ("glm-5.3", 1.4, 4.4),
+    ("glm-5.3-flash", 0.075, 0.25),
+    ("gpt-oss-120b", 0.35, 0.75),
+    ("gpt-oss-20b", 0.0, 0.0),
+    ("inkling", 1.25, 5.0625),
+    ("kimi-k2.5", 0.6, 3.0),
+    ("kimi-k2.6", 0.95, 4.0),
+    ("kimi-k2.6-fast", 2.0, 8.0),
+    ("kimi-k2.7-code", 0.67, 3.4),
+    ("kimi-k2.7-code-fast", 1.9, 8.0),
+    ("kimi-k3", 3.0, 15.0),
+    ("minimax-m2.5", 0.3, 1.2),
+    ("minimax-m2.7", 0.3, 1.2),
+    ("minimax-m3", 0.3, 1.2),
+    ("muse-glimmer-30b", 0.0, 0.0),
+    ("nemotron-3-ultra-nvfp4", 0.0, 0.0),
+    ("nemotron-lightning-3.5-30b-a3b", 0.0, 0.0),
+    ("qwen3-embedding-8b", 0.0, 0.0),
+    ("qwen3-reranker-8b", 0.0, 0.0),
+    ("qwen3.6-plus", 0.0, 0.0),
+    ("qwen3.7-plus", 0.32, 1.28),
+    ("qwen3.8-2.4t-a95b", 0.0, 0.0),
+    ("qwen3.8-max", 2.0, 6.0),
+];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -378,6 +470,19 @@ enum EntryRule {
     /// prepaid balance stays an account fact. A benchmark or legacy
     /// id the listing carries is never offered.
     DeepSeek,
+    /// The `fireworks` transform — the recorded serverless/fast
+    /// chat-model predicates (DEC-025): the listed id is normalized
+    /// to its public form (`toFireworksPublicModelId` — the
+    /// `accounts/fireworks/models/` prefix stripped, the `p` version
+    /// separator folded back to `.`), and an id still carrying the
+    /// reserved `accounts/fireworks/` prefix is dropped under the
+    /// recorded `exclude-models` runtime rule — a router id is a
+    /// serving path, never a model this connection offers. The
+    /// admitted id carries the per-model USD price the pinned
+    /// `models.json` row states (`FIREWORKS_PRICES` — a stated zero
+    /// is a real figure); the listing row names nothing else, and
+    /// the class records no other entry surface this transform maps.
+    Fireworks,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -505,6 +610,24 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::DeepSeek,
+        }),
+        // `fireworks` (HZN-008 class A): the configured-or-recorded
+        // `api.fireworks.ai/inference/v1` base — the host `firepass`
+        // shares under a distinct connection id and credential
+        // grammar — the configured base's own request-model
+        // `/models` listing (the `/v1/accounts/fireworks/models`
+        // management API is never a model source, and a `/models`
+        // HTTP 200 is never entitlement), the recorded Fast seed as
+        // the offer floor for the router variants the listing never
+        // surfaces, and the plain bearer credential: the
+        // serverless/fast predicates gate admission, the recorded
+        // per-model USD prices carry.
+        "fireworks" => Some(SourceContract {
+            seed: FIREWORKS_FAST_IDS,
+            endpoint: EndpointRule::PlanBaseOrDefault(FIREWORKS_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Fireworks,
         }),
         _ => None,
     }
@@ -896,6 +1019,7 @@ impl ChatCompletionsProvider {
                 .iter()
                 .filter_map(|id| match self.contract.entries {
                     EntryRule::DeepSeek => deepseek_entry(id),
+                    EntryRule::Fireworks => fireworks_entry(id),
                     _ => Some(CatalogModel {
                         id: (*id).to_string(),
                         ..CatalogModel::default()
@@ -936,6 +1060,7 @@ impl ChatCompletionsProvider {
                 })
             }
             EntryRule::DeepSeek => deepseek_entry(id),
+            EntryRule::Fireworks => fireworks_entry(id),
         }
     }
 
@@ -1127,6 +1252,21 @@ impl ChatCompletionsProvider {
             });
         }
         Ok(token)
+    }
+
+    /// The wire form the `model` member carries under the literal
+    /// id's recorded wire-model-id dispatch (`wire-model-id-mode`,
+    /// `fireworks.kdl`): `fireworks` sends
+    /// `accounts/fireworks/models/<id>` — `accounts/fireworks/
+    /// routers/<id>` for a `*-fast` serving-path id — with the
+    /// recorded `p` version separator (`toFireworksWireModelId` /
+    /// `toFirepassWireModelId`); every other contract's wire name is
+    /// the offered id verbatim.
+    fn wire_model_id(&self, model_id: &str) -> String {
+        match self.contract.entries {
+            EntryRule::Fireworks => fireworks_wire_model_id(model_id),
+            _ => model_id.to_string(),
+        }
     }
 
     /// The frozen manifest as the Chat Completions wire request:
@@ -1864,6 +2004,21 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
     }
 }
 
+/// The recorded per-model USD price a pinned row table states for
+/// an id (`cost.input`/`cost.output` per 1M tokens): a stated zero
+/// is a real figure — a free or bundled-only SKU — and an id the
+/// rows do not name keeps [`ModelPrice::Unknown`], never a borrowed
+/// or coerced figure.
+fn pinned_price(rows: &[(&str, f64, f64)], id: &str) -> ModelPrice {
+    rows.iter()
+        .find(|(model, ..)| *model == id)
+        .map(|(_, input_per_1m, output_per_1m)| ModelPrice::Usd {
+            input_per_1m: *input_per_1m,
+            output_per_1m: *output_per_1m,
+        })
+        .unwrap_or_default()
+}
+
 /// The recorded `deepseek` entry transform: only a built-in id the
 /// roster names offers — a benchmark or legacy id the listing
 /// carries never does. The admitted entry carries the recorded
@@ -1882,14 +2037,89 @@ fn deepseek_entry(id: &str) -> Option<CatalogModel> {
         vision: id == DEEPSEEK_VISION_MODEL,
         efforts: vec![EffortLevel::Low, EffortLevel::High],
         context_window: Some(1_000_000),
-        price: DEEPSEEK_PRICES
-            .iter()
-            .find(|(model, ..)| *model == id)
-            .map(|(_, input_per_1m, output_per_1m)| ModelPrice::Usd {
-                input_per_1m: *input_per_1m,
-                output_per_1m: *output_per_1m,
-            })
-            .unwrap_or_default(),
+        price: pinned_price(DEEPSEEK_PRICES, id),
+        ..CatalogModel::default()
+    })
+}
+
+/// The recorded `fireworks` public id
+/// (`toFireworksPublicModelId`): the `accounts/fireworks/models/`
+/// wire prefix stripped, then the `p` version separator between
+/// digits folded back to `.` (`kimi-k2p7-code` → `kimi-k2.7-code`).
+fn fireworks_public_id(id: &str) -> String {
+    let stripped = id.strip_prefix(FIREWORKS_WIRE_PREFIX).unwrap_or(id);
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut public = String::with_capacity(stripped.len());
+    for (at, &ch) in chars.iter().enumerate() {
+        if ch == 'p'
+            && at > 0
+            && chars[at - 1].is_ascii_digit()
+            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
+        {
+            public.push('.');
+        } else {
+            public.push(ch);
+        }
+    }
+    public
+}
+
+/// The recorded `fireworks` wire id (`toFireworksWireModelId`, and
+/// `toFirepassWireModelId` for a `*-fast` serving-path id under the
+/// recorded `wire-model-id-mode "firepass"` arm): the
+/// `accounts/fireworks/models/` or `accounts/fireworks/routers/`
+/// prefix stripped, every `.` between digits folded to `p`, then the
+/// serving-path prefix: `routers/` exactly when the stripped id ends
+/// `-fast`, `models/` otherwise. A pin already carrying a wire
+/// prefix is therefore re-served under the path its id names, never
+/// echoed verbatim when the prefix disagrees with the id.
+fn fireworks_wire_model_id(id: &str) -> String {
+    let stripped = id
+        .strip_prefix(FIREWORKS_WIRE_PREFIX)
+        .or_else(|| id.strip_prefix(FIREWORKS_ROUTER_PREFIX))
+        .unwrap_or(id);
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut wire = String::with_capacity(stripped.len());
+    for (at, &ch) in chars.iter().enumerate() {
+        if ch == '.'
+            && at > 0
+            && chars[at - 1].is_ascii_digit()
+            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
+        {
+            wire.push('p');
+        } else {
+            wire.push(ch);
+        }
+    }
+    if wire.ends_with("-fast") {
+        format!("{FIREWORKS_ROUTER_PREFIX}{wire}")
+    } else {
+        format!("{FIREWORKS_WIRE_PREFIX}{wire}")
+    }
+}
+
+/// The recorded `fireworks` entry transform — the admission surface
+/// of the DEC-025 row: any unreserved request-model id is admitted,
+/// carrying its public form after the `accounts/fireworks/models/`
+/// wire prefix is stripped, and an id still carrying the reserved
+/// `accounts/fireworks/` prefix is dropped under the recorded
+/// `exclude-models prefix="accounts/fireworks/"` runtime rule — a
+/// router id is a serving path, never a model this connection
+/// offers. The row records no per-id chat predicate beyond that
+/// reserved-prefix exclusion, so none is applied. The admitted id
+/// carries the per-model USD price [`FIREWORKS_PRICES`] states — a
+/// stated zero is a real figure — with [`ModelPrice::Unknown`] for
+/// an id the pinned rows do not name; the request-model listing
+/// names no other recorded surface, so every other field stays at
+/// its empty surface.
+fn fireworks_entry(id: &str) -> Option<CatalogModel> {
+    let public = fireworks_public_id(id);
+    if public.is_empty() || public.starts_with("accounts/fireworks/") {
+        return None;
+    }
+    Some(CatalogModel {
+        id: public.clone(),
+        price: pinned_price(FIREWORKS_PRICES, &public),
         ..CatalogModel::default()
     })
 }
@@ -2065,7 +2295,13 @@ impl Provider for ChatCompletionsProvider {
                 connection: fixed.connection,
             });
         }
-        let body = self.request_body(manifest, &fixed.model_id);
+        // The literal id's recorded wire-model-id dispatch decides
+        // the body's `model` — `fireworks` translates the public id
+        // into the `accounts/fireworks/…` wire form (routers for the
+        // `*-fast` serving path, models otherwise); every other
+        // contract names the id verbatim.
+        let wire_model_id = self.wire_model_id(&fixed.model_id);
+        let body = self.request_body(manifest, &wire_model_id);
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
