@@ -10805,3 +10805,871 @@ async fn coreweave_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::coreweave = NOT_RUN"]
 fn provider_installed_coreweave() {}
+
+// ----- deepinfra -------------------------------------------------------------
+//
+// The `deepinfra` connection's proof legs (HZN-008 class A): the
+// shared Chat Completions adapter serves the literal id — no copied
+// codec — under its own recorded predicates (`Rivect/key`,
+// `deepinfraModelManagerOptions` + `auth/deepinfra.kdl`). The
+// configured `endpoint` carries the API base verbatim — an empty one
+// resolves the recorded `api.deepinfra.com/v1/openai` default
+// (`config?.baseUrl ?? DEEPINFRA_BASE_URL`'s absent arm), and a
+// configured `region` is denied: the contract names none. The
+// catalogue is the configured base's own authoritative chat-model
+// `/models` listing and ids-only offers: the listing is public
+// metadata, never an authentication surface — the recorded validate
+// leg exercises `chat/completions`, not `/models` — and service-tier
+// and flex surcharges stay recorded billing metadata the ids-only
+// surface never synthesizes into a price. The credential is the
+// recorded plain `key` bearer; material that is not UTF-8 text
+// denies malformed before any wire leg.
+
+/// The scoped credential ref the `deepinfra` connection binds.
+const DEEPINFRA_REF: &str = "keyring:rivect-test/deepinfra";
+
+/// Fixture deepinfra key material — never a real credential, only
+/// ever sent to localhost.
+const DEEPINFRA_KEY: &str = "fixture-deepinfra-key";
+
+/// The pinned model id the fixed-pin legs carry.
+const DEEPINFRA_MODEL: &str = "fixture-di-model";
+
+/// One configured `deepinfra` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn deepinfra_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.deepinfra]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{DEEPINFRA_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"deepinfra\", model_id = \"{DEEPINFRA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn deepinfra_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(DEEPINFRA_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "deepinfra".to_string(), store.clone())
+        .expect("the shared adapter builds for the deepinfra id");
+    (provider, store)
+}
+
+/// The `deepinfra` provider over the recorded enrolled credential.
+fn enrolled_deepinfra_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    deepinfra_provider(config, DEEPINFRA_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::deepinfra ---------------------------------------------
+
+/// A configured `deepinfra` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the plain bearer credential rides the
+/// `Authorization` header — no scope member, no body copy — and the
+/// shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — pinned model, system+user messages,
+/// `stream` with `stream_options.include_usage` and the pinned effort
+/// as `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn deepinfra_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepinfra_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/deepinfra", "goal: prove the wire")
+        .expect("the deepinfra pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {DEEPINFRA_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(DEEPINFRA_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(DEEPINFRA_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "deepinfra");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/deepinfra", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving `deepinfra`
+/// means the id is never fixture-served even when it declares
+/// `local` kind, and a manifest pinning a different connection id is
+/// refused at send.
+#[test]
+fn deepinfra_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("deepinfra"),
+        Some(rivect::providers::Dialect::ChatCompletions),
+        "the literal id binds the shared Chat Completions dialect"
+    );
+    let config =
+        Config::parse_validated(&deepinfra_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "deepinfra-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `deepinfra` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.deepinfra]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"deepinfra\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("deepinfra").expect("declared");
+    assert!(
+        !loopback.serves("deepinfra", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{DEEPINFRA_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/deepinfra", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// Hostile stream input is never a false success: a stream ended mid
+/// `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are both the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn deepinfra_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepinfra_provider(&config),
+        &config,
+        "/world/deepinfra",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepinfra_provider(&config),
+        &config,
+        "/world/deepinfra",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::deepinfra ------------------------------------------
+
+/// The `deepinfra` catalogue is the configured base's own
+/// authoritative chat-model `/models` listing (HZN-008 class A): the
+/// lookup resolves the plain bearer credential on the one
+/// `GET {endpoint}/models` leg and every non-empty `id` is an offer
+/// landing the ids-only surface — a listing entry's metadata, tags,
+/// prices and context length stay recorded upstream data, never
+/// synthesized catalog fields; service-tier and flex surcharges stay
+/// distinguished metadata, never a price.
+#[tokio::test]
+async fn deepinfra_catalog_is_the_authoritative_ids_only_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "fixture-org/di-chat-large"}),
+            json!({"id": DEEPINFRA_MODEL}),
+            // the recorded listing can attach per-model metadata —
+            // tags, limits, prices — under `filter=with_meta`: none
+            // of it is catalog surface, and the recorded
+            // service-tier/flex surcharges never synthesize a price
+            json!({
+                "id": "priced-chat",
+                "metadata": {
+                    "tags": ["chat", "reasoning"],
+                    "context_length": 128000,
+                    "prices": {"input": 0.3, "output": 0.5},
+                },
+                "service_tier": {"priority": {"surcharge": 0.5}, "flex": {"discount": 0.2}},
+            }),
+            // only an empty or absent id fails the verbatim rule —
+            // whitespace is non-empty and offers as-is
+            json!({"id": ""}),
+            json!({"id": "   "}),
+            json!({"metadata": {}}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepinfra_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec![
+            "   ",
+            DEEPINFRA_MODEL,
+            "fixture-org/di-chat-large",
+            "priced-chat"
+        ],
+        "the authoritative listing answers every non-empty id verbatim, sorted"
+    );
+    // every admitted id lands the ids-only surface — stated metadata,
+    // tags, prices and tier/flex surcharges are never adopted
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{}: the listing states the id alone",
+            model.id
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — no other endpoint is consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {DEEPINFRA_KEY}"),
+        "the plain key bears the discovery leg"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default —
+/// the `config?.baseUrl ?? DEEPINFRA_BASE_URL` absent arm our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so the arm is proved without one byte toward
+/// `api.deepinfra.com`.
+#[test]
+fn deepinfra_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&deepinfra_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_deepinfra_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.deepinfra.com/v1/openai\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the authoritative listing: the
+/// dispatch narrows the pool to the `deepinfra` member and the shared
+/// adapter resolves the deterministic sorted-first id as the wire
+/// model.
+#[tokio::test]
+async fn deepinfra_auto_pick_resolves_through_the_authoritative_catalog() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "fixture-org/zz-late"}),
+            json!({"id": "fixture-org/aa-first"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.deepinfra]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{DEEPINFRA_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"deepinfra\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/deepinfra", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("fixture-org/aa-first"),
+        "the deterministic sorted-first id names the wire model"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::deepinfra ---------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `deepinfra`: a configured `region` — the recorded contract names
+/// none — the profile-bound ref whose scope disagrees with the
+/// binding, an absent credential, credential material that is not
+/// UTF-8 text and a refused bearer token each land a typed denial,
+/// and none of them, nor any Debug surface the boundary exposes,
+/// renders credential material or the peer's body.
+#[tokio::test]
+async fn deepinfra_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &deepinfra_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "deepinfra".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPINFRA_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "deepinfra");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, DEEPINFRA_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.deepinfra]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"deepinfra\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "deepinfra".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPINFRA_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, DEEPINFRA_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepinfra".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPINFRA_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, DEEPINFRA_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // material that is not UTF-8 text cannot be a bearer token: the
+    // typed malformed denial lands before any wire leg — zero
+    // requests reach the mock
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(DEEPINFRA_REF, &[0xFF, 0xFE, 0xFD]);
+    let provider =
+        provider_result(config.clone(), "deepinfra".to_string(), store).expect("binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("non-text material denies before any wire leg");
+    assert!(
+        matches!(err, ProviderError::CredentialMalformed { .. }),
+        "non-UTF-8 material is the typed malformed denial: {err}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "denied credentials never reached the wire"
+    );
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "deepinfra");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, DEEPINFRA_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepinfra_config(&base)).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepinfra".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(DEEPINFRA_REF, DEEPINFRA_KEY)],
+        )),
+    )
+    .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(DEEPINFRA_KEY),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_deepinfra_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/deepinfra", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(DEEPINFRA_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(DEEPINFRA_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(DEEPINFRA_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-deepinfra",
+        Some(&deepinfra_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(DEEPINFRA_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+/// The public catalogue is never an authentication surface
+/// (auth/deepinfra.kdl — `/models` is public and would accept any
+/// string as a key, so the recorded validate leg exercises
+/// `chat/completions`): a fixture `GET /models` answering 200 with an
+/// arbitrary roster proves nothing about entitlement — with no
+/// credential enrolled the pin still denies `CredentialAbsent`
+/// before any leg.
+#[tokio::test]
+async fn deepinfra_public_catalog_listing_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": DEEPINFRA_MODEL})]).await;
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepinfra".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(outcome, Err(ProviderError::CredentialAbsent { .. })),
+        "a 200 catalogue never stands in for the credential: {outcome:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the credential denial lands before any leg — the catalogue is never consulted"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::deepinfra -----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn deepinfra_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "deepinfra".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(DEEPINFRA_REF, DEEPINFRA_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `deepinfra`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn deepinfra_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "matrix"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&deepinfra_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the authoritative `/models` listing is the offer.
+    let (provider, _store) = enrolled_deepinfra_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed.expect("catalog answers")) == ["matrix"] {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "deepinfra".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_deepinfra_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/deepinfra", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/deepinfra", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "deepinfra".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(DEEPINFRA_REF, DEEPINFRA_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_deepinfra` case below: its ignored count is
+    // the explicit NOT_RUN signal this matrix asserts — the row stays
+    // a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::deepinfra -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::deepinfra = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::deepinfra = NOT_RUN"]
+fn provider_installed_deepinfra() {}

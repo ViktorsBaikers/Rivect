@@ -1,14 +1,14 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan` and `coreweave`
-//! connections' adapter — the OpenAI-compatible
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave` and
+//! `deepinfra` connections' adapter — the OpenAI-compatible
 //! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class
 //! A and class P). Dialect selection keys on the literal connection
 //! id, never an auth label, an endpoint shape or a catalogue answer:
 //! every compatible host a deployment wires under
 //! `custom-chat-completions` shares the one
 //! recorded generic contract, while `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan` and `coreweave` carry
-//! their own
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave` and
+//! `deepinfra` carry their own
 //! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
@@ -18,10 +18,13 @@
 //! the region-bound authoritative `/models` catalogue with its
 //! chat-id prefix filter and the enrolled-base credential binding —
 //! the optional quota `cookie` member admitted for shape and dropped —
-//! on `alibaba-token-plan`, and the configured-or-default host, the
+//! on `alibaba-token-plan`, the configured-or-default host, the
 //! authoritative `/models` listing and the scoped bearer credential —
 //! the `OpenAI-Project` member required before any leg — on
-//! `coreweave` — resolved per literal id by the
+//! `coreweave`, and the configured-or-default host, the
+//! authoritative chat-model `/models` listing — the public metadata
+//! catalogue never an authentication surface — and the plain bearer
+//! credential on `deepinfra` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -192,6 +195,14 @@ const COREWEAVE_DEFAULT_BASE_URL: &str = "https://api.inference.wandb.ai/v1";
 /// the same way the recorded pre-validation check denies an unset
 /// `COREWEAVE_PROJECT` before any fetch.
 const OPENAI_PROJECT_HEADER: &str = "OpenAI-Project";
+
+/// The recorded default API root of a `deepinfra` connection
+/// (`DEEPINFRA_BASE_URL` — `api.deepinfra.com/v1/openai`,
+/// `deepinfraModelManagerOptions`'s `defaultBaseUrl`): the host the
+/// required `endpoint` field's empty string resolves under the
+/// recorded `config?.baseUrl ?? DEEPINFRA_BASE_URL` fallback — the
+/// same absent-override rule the plan classes bind.
+const DEEPINFRA_DEFAULT_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
@@ -411,6 +422,20 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             endpoint: EndpointRule::PlanBaseOrDefault(COREWEAVE_DEFAULT_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::CoreWeave,
+            entries: EntryRule::IdsOnly,
+        }),
+        // `deepinfra` (HZN-008 class A): the configured-or-recorded
+        // `api.deepinfra.com/v1/openai` base, the authoritative
+        // chat-model `/models` listing — the public metadata
+        // catalogue never an authentication surface — and the plain
+        // bearer credential: ids-only offers keep service-tier and
+        // flex surcharges as recorded-separated metadata, never a
+        // synthesized price.
+        "deepinfra" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(DEEPINFRA_DEFAULT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
         _ => None,
