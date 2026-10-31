@@ -14675,3 +14675,781 @@ async fn firepass_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::firepass = NOT_RUN"]
 fn provider_installed_firepass() {}
+
+// ----- gmi-cloud ---------------------------------------------------------------
+
+// The `gmi-cloud` connection's proof legs (HZN-008 class A): the shared
+// Chat Completions adapter serves the literal id — no copied codec —
+// under its own recorded predicates (DEC-025 row: `Rivect/key` →
+// `api.gmi-serving.com/v1`). The configured `endpoint` carries the API
+// base verbatim — an empty one resolves the recorded
+// `api.gmi-serving.com/v1` default — and a configured `region` is
+// denied: the contract names none. The catalogue is the configured
+// base's own authoritative `/models` listing, and every listing row's
+// bare id is offered exactly as served: no vendor namespace is added,
+// stripped or otherwise rewritten. The credential is the recorded plain
+// bearer. The class records no per-model price, so an offered id keeps
+// `ModelPrice::Unknown` — no figure is borrowed from another
+// connection's price table.
+
+/// The scoped credential ref the `gmi-cloud` connection binds.
+const GMI_REF: &str = "keyring:rivect-test/gmi-cloud";
+
+/// Fixture gmi-cloud key material — never a real credential, only ever
+/// sent to localhost.
+const GMI_KEY: &str = "fixture-gmi-cloud-key";
+
+/// The pinned model id the fixed-pin legs carry.
+const GMI_MODEL: &str = "fixture-gmi-chat";
+
+/// One configured `gmi-cloud` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn gmi_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.gmi-cloud]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{GMI_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"gmi-cloud\", model_id = \"{GMI_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn gmi_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(GMI_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "gmi-cloud".to_string(), store.clone())
+        .expect("the shared adapter builds for the gmi-cloud id");
+    (provider, store)
+}
+
+/// The `gmi-cloud` provider over the recorded enrolled credential.
+fn enrolled_gmi_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    gmi_provider(config, GMI_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::gmi-cloud ---------------------------------------------
+
+/// A configured `gmi-cloud` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key pin
+/// under DEC-011, the plain bearer credential rides the
+/// `Authorization` header — no scope member, no body copy — and the
+/// shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — the pinned bare id verbatim, system+user
+/// messages, `stream` with `stream_options.include_usage` and the
+/// pinned effort as `reasoning_effort` verbatim — the SSE stream
+/// validates its finish_reason/`[DONE]` terminal, and the one physical
+/// send is charged once with the provider's reported usage.
+#[tokio::test]
+async fn gmi_cloud_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified gmi outcome",
+            Some(json!({"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&gmi_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/gmi", "goal: prove the wire")
+        .expect("the gmi-cloud pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/gmi", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified gmi outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GMI_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(GMI_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(GMI_MODEL),
+        "the bare id rides the wire exactly as pinned"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "gmi-cloud");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 3,
+            total_tokens: 9,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/gmi", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success: a stream ended mid
+/// `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are both the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn gmi_cloud_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_gmi_provider(&config),
+        &config,
+        "/world/gmi",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/gmi", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_gmi_provider(&config),
+        &config,
+        "/world/gmi",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/gmi", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::gmi-cloud ------------------------------------------
+
+/// The `gmi-cloud` catalogue is the configured base's own authoritative
+/// `/models` listing (HZN-008 class A): the lookup resolves the plain
+/// bearer credential on the one `GET {endpoint}/models` leg, every
+/// non-empty `id` is offered exactly as served — a bare id gains no
+/// vendor namespace, a namespaced id keeps its own form, and the
+/// listing's attached metadata is never adopted — while an empty or
+/// absent id can never name a model.
+#[tokio::test]
+async fn gmi_bare_id_rows_are_offered_verbatim() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": GMI_MODEL}),
+            json!({"id": "fixture-org/gmi-chat-large"}),
+            // the listing can attach per-model metadata — none of it
+            // is catalog surface this class records
+            json!({"id": "gmi-priced-chat", "metadata": {"context_length": 131072}}),
+            // a flat aiand-shaped row: the recorded `IdsOnly` transform
+            // reads no member, so this entry lands the default surface.
+            // An `Aiand` swap would adopt every member here and red the
+            // default-surface assertions below.
+            json!({
+                "id": "gmi-flat-aiand-shape",
+                "currency": "usd",
+                "input_per_1m": 0.3,
+                "output_per_1m": 0.5,
+                "capabilities": ["reasoning", "vision"],
+                "context_window": 131072,
+            }),
+            // only an empty or absent id fails the verbatim rule —
+            // whitespace is non-empty and offers as-is
+            json!({"id": ""}),
+            json!({"id": "  "}),
+            json!({"metadata": {}}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&gmi_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec![
+            "  ",
+            GMI_MODEL,
+            "fixture-org/gmi-chat-large",
+            "gmi-flat-aiand-shape",
+            "gmi-priced-chat",
+        ],
+        "every non-empty listing id is offered exactly as served, sorted — never namespaced or rewritten"
+    );
+    // The flat aiand-shaped row lands the default surface: `IdsOnly`
+    // reads no currency, price, capability or window member, so an
+    // `Aiand` swap reds on the first line here.
+    let flat = models
+        .iter()
+        .find(|model| model.id == "gmi-flat-aiand-shape")
+        .expect("the flat aiand-shaped row is offered");
+    assert_eq!(
+        flat.price,
+        ModelPrice::Unknown,
+        "a listing-stated figure is never adopted — the class records no price"
+    );
+    assert!(!flat.vision, "no image-input mark is read from the listing");
+    assert!(
+        !flat.reasoning,
+        "no reasoning mark is read from the listing"
+    );
+    assert!(
+        flat.efforts.is_empty(),
+        "no effort ladder is read from the listing"
+    );
+    assert!(
+        flat.effort_default.is_none(),
+        "no default effort is read from the listing"
+    );
+    assert_eq!(
+        flat.context_window, None,
+        "no context window is read from the listing"
+    );
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{}: the listing states the id alone",
+            model.id
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the listing leg is the only egress");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GMI_KEY}"),
+        "the plain key bears the discovery leg"
+    );
+}
+
+/// A `gmi-cloud` offer never borrows a price (DEC-025 row, AC-040e):
+/// the listing states ids only, so every offered id keeps
+/// `ModelPrice::Unknown` and carries no vision or reasoning mark — a
+/// listed id a sibling class's recorded table prices (`deepseek-v4-pro`,
+/// `kimi-k2.7-code`, `glm-5.1-fast`) included — and neither the seed
+/// floor nor the Fast ids of another connection join this offer set.
+#[tokio::test]
+async fn gmi_unknown_price_stays_unknown_never_borrowed() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // ids sibling classes' recorded price rows state figures for
+            json!({"id": "deepseek-v4-pro"}),
+            json!({"id": "kimi-k2.7-code"}),
+            json!({"id": "glm-5.1-fast"}),
+            json!({"id": "fixture-unrecorded-model"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec![
+            "deepseek-v4-pro",
+            "fixture-unrecorded-model",
+            "glm-5.1-fast",
+            "kimi-k2.7-code",
+        ],
+        "the listing's ids are the whole offer — no sibling seed id joins it"
+    );
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{} keeps the unknown price and no capability mark — a sibling table's figure would red here",
+            model.id
+        );
+    }
+}
+
+/// An empty configured endpoint resolves the recorded default —
+/// the `config?.baseUrl ?? defaultBaseUrl` absent arm our required
+/// `endpoint` field expresses as the empty string, and whitespace-only
+/// shares the arm under the recorded trim. Offline pin: the adapter's
+/// `Debug` surface reports the resolved endpoint, so the arm is proved
+/// without one byte toward `api.gmi-serving.com`.
+#[test]
+fn gmi_cloud_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&gmi_config(endpoint)).expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_gmi_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.gmi-serving.com/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the authoritative listing: the
+/// dispatch narrows the pool to the `gmi-cloud` member, the shared
+/// adapter resolves the deterministic sorted-first listed id, and the
+/// send carries that bare id verbatim — the listing's own row, never a
+/// namespaced or otherwise rewritten form.
+#[tokio::test]
+async fn gmi_cloud_auto_pick_resolves_through_the_authoritative_catalog() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "fixture-zz-late"}),
+            json!({"id": "fixture-aa-first"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.gmi-cloud]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{GMI_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"gmi-cloud\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/gmi", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/gmi", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("fixture-aa-first"),
+        "the sorted-first listed id names the wire model verbatim"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::gmi-cloud ---------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `gmi-cloud`, through the same shared construction its siblings use:
+/// a configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused bearer lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn gmi_cloud_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &gmi_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "gmi-cloud".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, GMI_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "gmi-cloud");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, GMI_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.gmi-cloud]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"gmi-cloud\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "gmi-cloud".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, GMI_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, GMI_KEY.as_bytes());
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "gmi-cloud");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, GMI_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GMI_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement (INV-010) for `gmi-cloud`:
+/// with the key enrolled the fixed pin still rides only its request
+/// leg, and a listing answering arbitrary ids neither stands in for the
+/// credential nor admits the send — the unmounted `chat/completions`
+/// peer answers the typed transport denial while the 200 listing is
+/// never consulted.
+#[tokio::test]
+async fn gmi_cloud_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": GMI_MODEL})]).await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "gmi-cloud".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[(GMI_REF, GMI_KEY)])),
+    )
+    .expect("the enrolled binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "gmi-cloud");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+}
+
+// ----- TP-PROVIDER-RECOVERY::gmi-cloud -----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn gmi_cloud_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "gmi-cloud".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(GMI_REF, GMI_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for `gmi-cloud`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn gmi_cloud_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": GMI_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&gmi_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the listing's bare id is the whole offer, and no entry
+    // borrows a price or capability mark the class never records.
+    let (provider, _store) = enrolled_gmi_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [GMI_MODEL]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown && !model.vision && !model.reasoning
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "gmi-cloud".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_gmi_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/gmi", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/gmi", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "gmi-cloud".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(GMI_REF, GMI_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_gmi_cloud`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::gmi-cloud ----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::gmi-cloud = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::gmi-cloud = NOT_RUN"]
+fn provider_installed_gmi_cloud() {}

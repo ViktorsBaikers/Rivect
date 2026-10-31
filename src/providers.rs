@@ -1113,7 +1113,7 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
-/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`
+/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`
 /// are its recorded class-A/class-P plugs speaking the same dialect
 /// (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
@@ -1161,6 +1161,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "deepseek" => Some(Dialect::ChatCompletions),
         "firepass" => Some(Dialect::ChatCompletions),
         "fireworks" => Some(Dialect::ChatCompletions),
+        "gmi-cloud" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

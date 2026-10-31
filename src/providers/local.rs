@@ -1,15 +1,15 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass` and `fireworks` connections'
-//! adapter — the OpenAI-compatible Chat Completions dialect
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks` and `gmi-cloud`
+//! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A and class P).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
 //! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass` and `fireworks` carry their own
-//! recorded predicates — the
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks` and `gmi-cloud` carry
+//! their own recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
@@ -38,7 +38,10 @@
 //! management API never a model source — the serverless/fast
 //! chat-model predicates with the recorded wire-model-id dispatch,
 //! the recorded Fast seed and the plain bearer credential on
-//! `fireworks` — resolved per literal id by the
+//! `fireworks`, and the configured-or-default
+//! `api.gmi-serving.com/v1` host, the authoritative `/models`
+//! listing whose bare-id rows are offered verbatim and the plain
+//! bearer credential on `gmi-cloud` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -365,6 +368,15 @@ const FIREWORKS_PRICES: &[(&str, f64, f64)] = &[
     ("qwen3.8-max", 2.0, 6.0),
 ];
 
+/// The recorded default API root of a `gmi-cloud` connection
+/// (`api.gmi-serving.com/v1`, DEC-025 row `Rivect/key →
+/// api.gmi-serving.com/v1`): the host the required `endpoint` field's
+/// empty string resolves under — the same absent-override rule the
+/// plan classes bind. The class records no per-model price, so an
+/// offered id keeps [`ModelPrice::Unknown`]: a figure is never
+/// borrowed from another connection's table.
+const GMI_BASE_URL: &str = "https://api.gmi-serving.com/v1";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -681,6 +693,21 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::Fireworks,
+        }),
+        // `gmi-cloud` (HZN-008 class A): the configured-or-recorded
+        // `api.gmi-serving.com/v1` base, the authoritative `/models`
+        // listing under ids-only offers — a listing row's bare id is
+        // offered exactly as served, never namespaced or otherwise
+        // rewritten — and the plain bearer credential. The class
+        // records no per-model price: an unrecorded id keeps
+        // [`ModelPrice::Unknown`], never a figure borrowed from
+        // another connection's table.
+        "gmi-cloud" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(GMI_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
         }),
         _ => None,
     }
@@ -1338,13 +1365,20 @@ impl ChatCompletionsProvider {
     /// routers/<id>` for a `*-fast` serving-path id — with the
     /// recorded `p` version separator (`toFireworksWireModelId`);
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
-    /// pinned router id (`toFirepassWireModelId`); every other
-    /// contract's wire name is the offered id verbatim.
+    /// pinned router id (`toFirepassWireModelId`); every verbatim
+    /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`
+    /// and `DeepSeek` — sends the offered id unchanged. Each variant
+    /// is listed so a future transform cannot ship verbatim ids
+    /// silently.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
             EntryRule::Fireworks => fireworks_wire_model_id(model_id),
-            _ => model_id.to_string(),
+            EntryRule::IdsOnly
+            | EntryRule::Aiand
+            | EntryRule::Aimlapi
+            | EntryRule::AlibabaTokenPlan
+            | EntryRule::DeepSeek => model_id.to_string(),
         }
     }
 

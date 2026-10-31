@@ -4661,3 +4661,58 @@ fn firepass_offline_eligibility_is_binding_level_typed() {
         "an undeclared pin is the typed denial"
     );
 }
+
+/// `gmi-cloud` is a served Chat-Completions id, not a reserved one: the
+/// dialect map routes the literal id and the api_key pin is
+/// offline-eligible at the binding level — an undeclared id is the typed
+/// denial, never a dispatch.
+#[test]
+fn gmi_cloud_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.gmi-cloud]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid\"\ncredential_ref = \"keyring:rivect/gmi\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"gmi-cloud\", model_id = \"gmi-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("gmi-cloud"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    // a bound api_key pin is usable without a separate live grant —
+    // eligibility reads the binding, never the store
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "gmi-cloud".to_string(),
+        model_id: "gmi-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a bound api_key pin is usable without a separate live grant"
+    );
+
+    // a fixed pin on an undeclared id is the typed unknown-connection
+    // denial at eligibility, before any ranking or send
+    let undeclared = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"local\", model_id = \"x\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    let missing = ModelAssign::Fixed(FixedModel {
+        connection: "gmi-cloud-missing".to_string(),
+        model_id: "x".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &missing,
+                &undeclared.connections,
+                &undeclared.profiles,
+            ),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+}
