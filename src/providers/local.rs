@@ -1,23 +1,27 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
-//! `alibaba-coding-plan` and `alibaba-token-plan` connections'
-//! adapter — the OpenAI-compatible
+//! `alibaba-coding-plan`, `alibaba-token-plan` and `coreweave`
+//! connections' adapter — the OpenAI-compatible
 //! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class
 //! A and class P). Dialect selection keys on the literal connection
 //! id, never an auth label, an endpoint shape or a catalogue answer:
 //! every compatible host a deployment wires under
 //! `custom-chat-completions` shares the one
 //! recorded generic contract, while `aiand`, `aimlapi`,
-//! `alibaba-coding-plan` and `alibaba-token-plan` carry their own
+//! `alibaba-coding-plan`, `alibaba-token-plan` and `coreweave` carry
+//! their own
 //! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
 //! static allowed-model catalogue and the enrolled-base credential
-//! binding on `alibaba-coding-plan`, and the region-choice endpoint,
+//! binding on `alibaba-coding-plan`, the region-choice endpoint,
 //! the region-bound authoritative `/models` catalogue with its
 //! chat-id prefix filter and the enrolled-base credential binding —
 //! the optional quota `cookie` member admitted for shape and dropped —
-//! on `alibaba-token-plan` — resolved per literal id by the
+//! on `alibaba-token-plan`, and the configured-or-default host, the
+//! authoritative `/models` listing and the scoped bearer credential —
+//! the `OpenAI-Project` member required before any leg — on
+//! `coreweave` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -174,6 +178,21 @@ const ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES: &[&str] = &[
     "wan2.7-",
 ];
 
+/// The recorded default API root of a `coreweave` connection
+/// (`api.inference.wandb.ai/v1`): the host an absent or empty
+/// configured endpoint resolves to under the recorded
+/// `… ?? defaultBaseUrl` absent-override case — the same rule the
+/// plan classes bind.
+const COREWEAVE_DEFAULT_BASE_URL: &str = "https://api.inference.wandb.ai/v1";
+
+/// The scope header CoreWeave Serverless Inference requires on every
+/// request (`OpenAI-Project`, wire/coreweave.ts): the recorded
+/// `<team>/<project>` member of the scoped credential — spend lands
+/// against that project, and a request without it is denied upstream
+/// the same way the recorded pre-validation check denies an unset
+/// `COREWEAVE_PROJECT` before any fetch.
+const OPENAI_PROJECT_HEADER: &str = "OpenAI-Project";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -252,6 +271,15 @@ enum CredentialRule {
     /// leg, diagnostic or surface ever reads it. The bearer must carry
     /// the recorded `TOKEN_PATTERN` grammar.
     AlibabaTokenPlan,
+    /// `coreweave`'s recorded scoped credential (`Rivect/key +
+    /// OpenAI-Project`, wire/coreweave.ts): a JSON object whose `key`
+    /// is the bearer and whose `OpenAI-Project` is the
+    /// `<team>/<project>` scope every request must carry — the
+    /// recorded surface resolves the scope before any fetch and
+    /// fails closed without it, so material lacking the member — a
+    /// bare key, a key-only blob, an empty scope — is unscoped
+    /// material that denies before any wire leg.
+    CoreWeave,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -371,6 +399,19 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::AlibabaTokenPlan,
             entries: EntryRule::AlibabaTokenPlan,
+        }),
+        // `coreweave` (HZN-008 class A): the configured-or-recorded
+        // `api.inference.wandb.ai/v1` base, the authoritative
+        // `/models` listing admitted id-only — team/project spend and
+        // geography stay recorded-separate data, never synthesized
+        // surface — and the scoped `key`/`OpenAI-Project` credential:
+        // unscoped material denies before any leg.
+        "coreweave" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(COREWEAVE_DEFAULT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::CoreWeave,
+            entries: EntryRule::IdsOnly,
         }),
         _ => None,
     }
@@ -522,6 +563,28 @@ struct StreamState {
     usage: Option<Value>,
     terminal: Option<Terminal>,
     done: bool,
+}
+
+/// The wire material one resolved credential carries — the bearer
+/// token, plus the `OpenAI-Project` scope the `coreweave` arm requires
+/// on every leg. Never rendered: both members are secret-store
+/// material.
+struct WireSecret {
+    /// The `Authorization: Bearer` token.
+    bearer: String,
+    /// The `OpenAI-Project` header value — `Some` only under
+    /// [`CredentialRule::CoreWeave`], where the grammar demands it.
+    project: Option<String>,
+}
+
+impl WireSecret {
+    /// A bare-bearer credential — every arm without a scope member.
+    fn bearer(token: String) -> Self {
+        Self {
+            bearer: token,
+            project: None,
+        }
+    }
 }
 
 /// The shared Chat Completions adapter — `custom-chat-completions`
@@ -678,8 +741,8 @@ impl ChatCompletionsProvider {
         // the check before it is the only point an expired budget
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
-        let token = self.secret()?;
-        self.catalog_within(&token, started)
+        let secret = self.secret()?;
+        self.catalog_within(&secret, started)
     }
 
     /// The catalogue leg under the caller's clock and credential —
@@ -688,7 +751,7 @@ impl ChatCompletionsProvider {
     /// one.
     fn catalog_within(
         &self,
-        token: &str,
+        secret: &WireSecret,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
@@ -697,10 +760,14 @@ impl ChatCompletionsProvider {
         if let CatalogRule::Allowlist(list) = self.contract.catalog {
             return Ok(allowlist_models(list));
         }
-        let mut response = self
+        let mut request = self
             .client
             .get(format!("{}/models", self.endpoint))
-            .bearer_auth(token)
+            .bearer_auth(&secret.bearer);
+        if let Some(project) = &secret.project {
+            request = request.header(OPENAI_PROJECT_HEADER, project);
+        }
+        let mut response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
@@ -769,22 +836,59 @@ impl ChatCompletionsProvider {
     }
 
     /// Reads the credential material for this send — the only place
-    /// secret bytes cross the store boundary — and answers the bearer
-    /// token the literal id's recorded credential grammar binds. A
+    /// secret bytes cross the store boundary — and answers the wire
+    /// material the literal id's recorded credential grammar binds. A
     /// non-UTF-8 secret cannot be a bearer token: typed denial, never
-    /// a mangled header. Every grammar or base denial lands here —
-    /// before any wire leg.
-    fn secret(&self) -> Result<String, ProviderError> {
+    /// a mangled header. Every grammar, scope or base denial lands
+    /// here — before any wire leg.
+    fn secret(&self) -> Result<WireSecret, ProviderError> {
         let material = self.store.resolve(&self.credential)?;
         let text =
             String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
             })?;
         match self.contract.credential {
-            CredentialRule::Bearer => Ok(text),
-            CredentialRule::AlibabaPlan => self.plan_bearer(&text),
-            CredentialRule::AlibabaTokenPlan => self.token_plan_bearer(&text),
+            CredentialRule::Bearer => Ok(WireSecret::bearer(text)),
+            CredentialRule::AlibabaPlan => self.plan_bearer(&text).map(WireSecret::bearer),
+            CredentialRule::AlibabaTokenPlan => {
+                self.token_plan_bearer(&text).map(WireSecret::bearer)
+            }
+            CredentialRule::CoreWeave => self.coreweave_secret(&text),
         }
+    }
+
+    /// The bearer and `OpenAI-Project` scope a `coreweave` credential
+    /// resolves (`Rivect/key + OpenAI-Project`, wire/coreweave.ts):
+    /// the stored material is a JSON object whose `key` is the bearer
+    /// and whose `OpenAI-Project` is the `<team>/<project>` scope the
+    /// header carries — the recorded surface resolves the scope
+    /// before any fetch and fails closed without it, so a bare key,
+    /// a key-only blob or an empty member is unscoped material and
+    /// denies as malformed before any wire leg. Anything the
+    /// recorded shape does not name — a non-string member, a
+    /// non-object body — is material the recorded credential never
+    /// produces and denies the same way.
+    fn coreweave_secret(&self, material: &str) -> Result<WireSecret, ProviderError> {
+        let malformed = || ProviderError::CredentialMalformed {
+            connection: self.connection.clone(),
+        };
+        let parsed: Value = serde_json::from_str(material.trim()).map_err(|_parse| malformed())?;
+        let bearer = parsed
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(&malformed)?;
+        let project = parsed
+            .get(OPENAI_PROJECT_HEADER)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(&malformed)?;
+        Ok(WireSecret {
+            bearer: bearer.to_string(),
+            project: Some(project.to_string()),
+        })
     }
 
     /// The bearer an `alibaba-coding-plan` credential resolves
@@ -1790,7 +1894,7 @@ impl Provider for ChatCompletionsProvider {
         // cannot be interrupted once running, so an already-spent budget
         // must deny it here rather than on the far side.
         check_deadline(&self.connection, self.deadline, started)?;
-        let token = self.secret()?;
+        let secret = self.secret()?;
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an
         // explicit pick of it — the pick pins the connection, and the
@@ -1804,7 +1908,7 @@ impl Provider for ChatCompletionsProvider {
                 if pool.len() == 1 && pool[0] == self.connection =>
             {
                 let model_id = self
-                    .catalog_within(&token, started)?
+                    .catalog_within(&secret, started)?
                     .into_iter()
                     .next()
                     .map(|model| model.id)
@@ -1833,13 +1937,17 @@ impl Provider for ChatCompletionsProvider {
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
         check_deadline(&self.connection, self.deadline, started)?;
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/chat/completions", self.endpoint))
-            .bearer_auth(&token)
+            .bearer_auth(&secret.bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .body(body_bytes)
+            .body(body_bytes);
+        if let Some(project) = &secret.project {
+            request = request.header(OPENAI_PROJECT_HEADER, project);
+        }
+        let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {

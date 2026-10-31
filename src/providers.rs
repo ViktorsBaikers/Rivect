@@ -1113,8 +1113,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
-/// `alibaba-token-plan` are its recorded class-A/class-P plugs
-/// speaking the same dialect
+/// `alibaba-token-plan`/`coreweave` are its recorded class-A/class-P
+/// plugs speaking the same dialect
 /// (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
@@ -1156,6 +1156,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "aimlapi" => Some(Dialect::ChatCompletions),
         "alibaba-coding-plan" => Some(Dialect::ChatCompletions),
         "alibaba-token-plan" => Some(Dialect::ChatCompletions),
+        "coreweave" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

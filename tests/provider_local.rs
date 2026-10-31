@@ -10019,3 +10019,789 @@ async fn alibaba_token_plan_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::alibaba-token-plan = NOT_RUN"]
 fn provider_installed_alibaba_token_plan() {}
+
+// ----- coreweave -------------------------------------------------------------
+//
+// The `coreweave` connection's proof legs (HZN-008 class A): the
+// shared Chat Completions adapter serves the literal id — no copied
+// codec — under its own recorded predicates (`Rivect/key +
+// OpenAI-Project`, wire/coreweave.ts). The configured `endpoint`
+// carries the API base verbatim — an empty one resolves the recorded
+// `api.inference.wandb.ai/v1` default (`config?.baseUrl ??
+// defaultBaseUrl`'s absent arm), and a configured `region` is denied:
+// the contract names none. The catalogue is the configured base's
+// own authoritative `/models` listing and ids-only offers: team and
+// project spend and geography stay recorded account data, never
+// synthesized catalog metadata. The credential is the recorded
+// structured `{"key": …, "OpenAI-Project": "<team>/<project>"}` —
+// `key` bears the wire and `OpenAI-Project` becomes the required
+// header; the recorded surface resolves the scope before any fetch
+// and fails closed without it, so a bare key, a key-only blob or an
+// empty member is unscoped material that denies before any wire leg.
+
+/// The scoped credential ref the `coreweave` connection binds.
+const COREWEAVE_REF: &str = "keyring:rivect-test/coreweave";
+
+/// Fixture coreweave key material — never a real credential, only
+/// ever sent to localhost.
+const COREWEAVE_KEY: &str = "fixture-coreweave-key";
+
+/// The recorded `<team>/<project>` scope the `OpenAI-Project` header
+/// carries.
+const COREWEAVE_PROJECT: &str = "fixture-team/fixture-project";
+
+/// The pinned model id the fixed-pin legs carry.
+const COREWEAVE_MODEL: &str = "fixture-cw-model";
+
+/// One configured `coreweave` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn coreweave_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.coreweave]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{COREWEAVE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"coreweave\", model_id = \"{COREWEAVE_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded `{"key": …, "OpenAI-Project": "<team>/<project>"}`
+/// credential shape.
+fn coreweave_credential(key: &str, project: &str) -> String {
+    json!({"key": key, "OpenAI-Project": project}).to_string()
+}
+
+fn coreweave_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(COREWEAVE_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "coreweave".to_string(), store.clone())
+        .expect("the shared adapter builds for the coreweave id");
+    (provider, store)
+}
+
+/// The `coreweave` provider over the recorded enrolled credential.
+fn enrolled_coreweave_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    coreweave_provider(
+        config,
+        &coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT),
+    )
+}
+
+/// The `OpenAI-Project` scope header the `coreweave` credential
+/// surface requires on every leg.
+fn received_project(request: &Request) -> String {
+    request
+        .headers
+        .get("openai-project")
+        .and_then(|value| value.to_str().ok())
+        .expect("the request carried an openai-project header")
+        .to_string()
+}
+
+// ----- TP-PROVIDER-WIRE::coreweave ---------------------------------------------
+
+/// A configured `coreweave` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the recorded structured credential unwraps to
+/// its `key` bearer plus the `OpenAI-Project` scope header, and the
+/// shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — pinned model, system+user messages,
+/// `stream` with `stream_options.include_usage` and the pinned effort
+/// as `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn coreweave_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&coreweave_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/coreweave", "goal: prove the wire")
+        .expect("the coreweave pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {COREWEAVE_KEY}"),
+        "the credential's `key` bears the wire — never the JSON blob"
+    );
+    assert_eq!(
+        received_project(&requests[0]),
+        COREWEAVE_PROJECT,
+        "the recorded scope member lands as the required OpenAI-Project header"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(COREWEAVE_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(COREWEAVE_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "coreweave");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/coreweave", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving `coreweave`
+/// means the id is never fixture-served even when it declares
+/// `local` kind, and a manifest pinning a different connection id is
+/// refused at send.
+#[test]
+fn coreweave_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("coreweave"),
+        Some(rivect::providers::Dialect::ChatCompletions),
+        "the literal id binds the shared Chat Completions dialect"
+    );
+    let config =
+        Config::parse_validated(&coreweave_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "coreweave-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `coreweave` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.coreweave]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"coreweave\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("coreweave").expect("declared");
+    assert!(
+        !loopback.serves("coreweave", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{COREWEAVE_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/coreweave", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::coreweave ------------------------------------------
+
+/// The `coreweave` catalogue is the configured base's own
+/// authoritative `/models` listing (HZN-008 class A): the lookup
+/// resolves the scoped credential — `key` bearer plus the required
+/// `OpenAI-Project` header on the one `GET {endpoint}/models` leg —
+/// and every non-empty `id` is an offer landing the ids-only
+/// surface: team and project spend and geography stay recorded
+/// account data, never synthesized catalog metadata.
+#[tokio::test]
+async fn coreweave_catalog_is_the_authoritative_ids_only_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "cw-chat-large"}),
+            json!({"id": COREWEAVE_MODEL}),
+            // fields the listing may state are account or deployment
+            // data — spend, team, region — never a surface this
+            // dialect reads: none of them lands
+            json!({
+                "id": "priced-chat",
+                "context_window": 262144,
+                "owned_by": "fixture-team",
+                "region": "eu-west",
+            }),
+            // only an empty or absent id fails the verbatim rule —
+            // whitespace is non-empty and offers as-is
+            json!({"id": ""}),
+            json!({"id": "   "}),
+            json!({"owned_by": "nobody"}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&coreweave_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        vec!["   ", "cw-chat-large", COREWEAVE_MODEL, "priced-chat"],
+        "the authoritative listing answers every non-empty id verbatim, sorted"
+    );
+    // every admitted id lands the ids-only surface — a stated context
+    // window, owner or region is never adopted
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{}: the listing states the id alone",
+            model.id
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — no other endpoint is consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {COREWEAVE_KEY}"),
+        "the credential's `key` bears the discovery leg"
+    );
+    assert_eq!(
+        received_project(&requests[0]),
+        COREWEAVE_PROJECT,
+        "the scope header rides the catalogue leg like every other leg"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default —
+/// the `config?.baseUrl ?? defaultBaseUrl` absent arm our required
+/// `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so the arm is proved without one byte toward
+/// `api.inference.wandb.ai` — the host the scoped credential would
+/// egress to.
+#[test]
+fn coreweave_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&coreweave_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_coreweave_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.inference.wandb.ai/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the authoritative listing: the
+/// dispatch narrows the pool to the `coreweave` member and the shared
+/// adapter resolves the deterministic sorted-first id as the wire
+/// model.
+#[tokio::test]
+async fn coreweave_auto_pick_resolves_through_the_authoritative_catalog() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({"id": "zz-late"}), json!({"id": "aa-first"})],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.coreweave]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{COREWEAVE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"coreweave\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/coreweave", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("aa-first"),
+        "the deterministic sorted-first id names the wire model"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::coreweave ---------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `coreweave`: a configured `region` — the recorded contract names
+/// none — the profile-bound ref whose scope disagrees with the
+/// binding, an absent credential, unscoped credential material and a
+/// refused bearer token each land a typed denial, and none of them,
+/// nor any Debug surface the boundary exposes, renders credential
+/// material or the peer's body.
+#[tokio::test]
+async fn coreweave_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &coreweave_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "coreweave".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, COREWEAVE_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "coreweave");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, COREWEAVE_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.coreweave]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"coreweave\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "coreweave".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, COREWEAVE_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, COREWEAVE_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "coreweave".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, COREWEAVE_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, COREWEAVE_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // unscoped material is the recorded fail-closed: a bare key, a
+    // key-only blob, an empty scope member or material that is not the
+    // recorded object at all each denies malformed before any wire
+    // leg — zero requests reach the mock
+    for material in [
+        COREWEAVE_KEY.to_string(),
+        json!({"key": COREWEAVE_KEY}).to_string(),
+        json!({"key": COREWEAVE_KEY, "OpenAI-Project": "  "}).to_string(),
+        json!({"key": "", "OpenAI-Project": COREWEAVE_PROJECT}).to_string(),
+        json!({"OpenAI-Project": COREWEAVE_PROJECT}).to_string(),
+        "not-json".to_string(),
+    ] {
+        let (provider, _store) = coreweave_provider(&config, &material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("unscoped material denies before any wire leg");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "unscoped material is the typed malformed denial: {err}"
+        );
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "unscoped material never reached the wire"
+    );
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "coreweave");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, COREWEAVE_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&coreweave_config(&base)).expect("valid");
+    let material = coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT);
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(COREWEAVE_REF, &material)],
+    ));
+    let provider = provider_result(config.clone(), "coreweave".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(COREWEAVE_KEY),
+        "provider Debug never carries credential material"
+    );
+    assert!(
+        !format!("{provider:?}").contains(COREWEAVE_PROJECT),
+        "provider Debug never carries the scope member — store material too"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = coreweave_provider(&config, &material);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/coreweave", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(COREWEAVE_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(COREWEAVE_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(COREWEAVE_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-coreweave",
+        Some(&coreweave_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(COREWEAVE_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::coreweave -----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the scoped material at
+/// the scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn coreweave_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "coreweave".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(
+        COREWEAVE_REF,
+        coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT).as_bytes(),
+    );
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `coreweave`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn coreweave_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "matrix"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the authoritative `/models` listing is the offer.
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed.expect("catalog answers")) == ["matrix"] {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "coreweave".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_coreweave_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/coreweave", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "coreweave".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(
+        COREWEAVE_REF,
+        coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT).as_bytes(),
+    );
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_coreweave` case below: its ignored count is
+    // the explicit NOT_RUN signal this matrix asserts — the row stays
+    // a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::coreweave -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::coreweave = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::coreweave = NOT_RUN"]
+fn provider_installed_coreweave() {}
