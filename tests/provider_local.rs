@@ -1,17 +1,21 @@
-//! Provider proof legs for four literal connection ids whose source
+//! Provider proof legs for the ten recorded connection ids of this band
+//! — `coreweave`, `deepinfra`, `deepseek`, `firepass`, `fireworks`,
+//! `gmi-cloud`, `groq`, `huggingface`, `kilo` and `litellm` (section
+//! owned by SLICE-108) — plus the four position-4 ids whose source
 //! classes resolve through this offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
 //! custom-chat-completions, abliteration, aiand, aimlapi): the
 //! configured literal `custom-chat-completions` connection returns a
 //! verified model outcome through the standard Broker against the
 //! source-derived `chat/completions` peer, `abliteration` does the
-//! same through the shared SLICE-016 Responses adapter, and `aiand`
-//! and `aimlapi` through the shared Chat Completions adapter — no
-//! copied codec — as localhost wiremock fixtures, no OMP, no user
-//! adapter, no real host. The shared SSE parser's WHATWG
+//! same through the shared SLICE-016 Responses adapter, `aiand` and
+//! `aimlapi` through the shared Chat Completions adapter, and each
+//! band id through that same shared adapter under its own recorded
+//! predicates — no copied codec — as localhost wiremock fixtures, no
+//! OMP, no user adapter, no real host. The shared SSE parser's WHATWG
 //! §9.2.5–9.2.6 conformance is pinned in provider_openai.rs; this file
-//! pins the Chat Completions dialect surface plus the abliteration,
-//! aiand and aimlapi per-connection predicates on top of it.
+//! pins the Chat Completions dialect surface plus the per-connection
+//! predicates on top of it.
 //! TP-PROVIDER-INSTALLED::<id> stays NOT_RUN — the ignored named cases
 //! carry that status explicitly.
 
@@ -29,7 +33,9 @@ use rivect::config::{Config, ConfigIssue, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::{CatalogModel, ChatCompletionsProvider, ModelPrice};
 use rivect::providers::openai::OpenAiProvider;
-use rivect::providers::{Provider, ProviderError, StoreKind, TransportCause, TransportClass};
+use rivect::providers::{
+    CredentialStore, Provider, ProviderError, SecretRef, StoreKind, TransportCause, TransportClass,
+};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -17689,3 +17695,906 @@ async fn huggingface_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::huggingface = NOT_RUN"]
 fn provider_installed_huggingface() {}
+
+// ----- kilo --------------------------------------------------------------------
+
+// The `kilo` connection's proof legs (HZN-008 class P): the shared Chat
+// Completions adapter serves the literal id — no copied codec — under
+// its own recorded predicates (`auth/kilo.kdl` `login "custom"`,
+// `kiloModelManagerOptions`, descriptor `defaultModel`, commit
+// `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`). The configured
+// `endpoint` carries the API base verbatim — an empty one resolves the
+// recorded `api.kilo.ai/api/gateway` default — and a configured `region`
+// is denied: the contract names none. The recorded discovery is
+// credential-optional (`catalogDiscovery.allowUnauthenticated`): a
+// keyless `/models` answer contributes its offers over the recorded
+// default row as the floor, an empty answer leaves the floor standing,
+// and the `Authorization` header rides only when the store resolves
+// material — no catalogue answer confers paid entitlement, since every
+// send resolves the profile first. The pinned roster (`models.json`) is
+// not vendored in this slice, so an offer carries no transcribed price
+// or SKU-bearing row and keeps `ModelPrice::Unknown`. The credential is
+// the recorded custom device/key profile: the device login's opaque
+// token or the recorded key rides the gateway bearer, and material
+// naming no token denies typed before any wire leg.
+
+/// The scoped credential ref the `kilo` connection binds.
+const KILO_REF: &str = "keyring:rivect-test/kilo";
+
+/// Fixture gateway bearer — never a real credential, only ever sent to
+/// localhost.
+const KILO_KEY: &str = "fixture-kilo-gateway-token";
+
+/// The recorded floor row the fixed-pin legs carry — the pinned
+/// descriptor's `defaultModel`, so the pin is one the catalogue offers.
+const KILO_MODEL: &str = "anthropic/claude-opus-4.8";
+
+/// A free-tier gateway row (`:free` tag, the recorded unauthenticated
+/// availability): a keyless `/models` answer contributes it as an offer,
+/// which never becomes paid entitlement.
+const KILO_FREE_MODEL: &str = "z-ai/glm-5:free";
+
+/// One configured `kilo` connection pointing at the fixture peer: the
+/// recorded custom class binds the explicit profile through a scoped
+/// `SecretRef` (the same DEC-011 seam every class uses), the dialect
+/// comes from the literal connection id (DEC-007), and the endpoint
+/// carries the API base verbatim.
+fn kilo_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.kilo]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{KILO_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"kilo\", model_id = \"{KILO_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn kilo_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(KILO_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "kilo".to_string(), store.clone())
+        .expect("the shared adapter builds for the kilo id");
+    (provider, store)
+}
+
+/// A `kilo` config whose credential arrives through the recorded
+/// explicit profile binding — `connections.kilo.profile` naming
+/// `profiles.kilo`, whose ref is the scope the store holds. The
+/// connection's own ref points at an unseeded scope, so only the
+/// profile precedence can resolve the material.
+fn kilo_profiled_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.kilo]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"keyring:rivect-test/kilo-scope\"\nprofile = \"kilo\"\n\
+         [profiles.kilo]\ncredential_ref = \"{KILO_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"kilo\", model_id = \"{KILO_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The `kilo` provider over the recorded enrolled profile material.
+fn enrolled_kilo_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    kilo_provider(config, KILO_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::kilo --------------------------------------------------
+
+/// A configured `kilo` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the profile's opaque token bears the `Authorization` header
+/// verbatim — never the body — and the shared adapter posts exactly the
+/// frozen manifest as a `chat/completions` request: the recorded row's
+/// id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort`. The SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt never
+/// re-sends.
+#[tokio::test]
+async fn kilo_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified kilo outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/kilo", "goal: prove the wire")
+        .expect("the kilo pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/kilo", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified kilo outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // A fixed pin opens no catalogue leg: the request is the one send.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {KILO_KEY}"),
+        "the recorded profile material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(KILO_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(KILO_MODEL),
+        "the pinned recorded row rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "kilo");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/kilo", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `kilo`: a stream
+/// ended mid `tool_calls` fragment — a partial call that never executes —
+/// and a finish_reason the dialect cannot classify are both the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn kilo_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_kilo_provider(&config),
+        &config,
+        "/world/kilo",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/kilo", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_kilo_provider(&config),
+        &config,
+        "/world/kilo",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/kilo", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+/// An empty configured endpoint resolves the recorded default — the
+/// `config?.baseUrl ?? "https://api.kilo.ai/api/gateway"` absent arm our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline pin:
+/// the adapter's `Debug` surface reports the resolved endpoint, so the
+/// arm is proved without one byte toward `api.kilo.ai`.
+#[test]
+fn kilo_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&kilo_config(endpoint)).expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_kilo_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.kilo.ai/api/gateway\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+// ----- TP-PROVIDER-AUTH::kilo --------------------------------------------------
+
+/// The recorded custom device/key profile binds for `kilo`: the
+/// credential arrives through `connections.kilo.profile`'s named
+/// profile — the connection's own ref points at a scope the store never
+/// holds, so only the profile precedence resolves the material — and
+/// that material is the gateway bearer, surrounding whitespace trimmed
+/// and the trimmed token verbatim on the wire. Material naming no token
+/// (empty or whitespace only) denies `CredentialMalformed` before any
+/// wire leg, on the catalogue leg as well as the send: resolved-but-
+/// unusable material is not the recorded keyless form.
+#[tokio::test]
+async fn kilo_explicit_device_key_profile_binds() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "profile bound",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&kilo_profiled_config(&server_uri_v1(&server))).expect("valid");
+
+    // the enrolled profile material — the opaque device token or key
+    // form — bears the wire, trimmed
+    for (material, expected) in [
+        (KILO_KEY, KILO_KEY),
+        ("  fixture-kilo-device-token  ", "fixture-kilo-device-token"),
+    ] {
+        let (provider, _store) = kilo_provider(&config, material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        outcome.expect("the enrolled profile material is the connection's credential");
+        drop_blocking(provider);
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(
+            received_auth(requests.last().expect("the send was recorded")),
+            format!("Bearer {expected}"),
+            "the trimmed profile material bears the gateway wire"
+        );
+    }
+
+    // material naming no token is unenrolled for this class: typed
+    // denial, zero further wire legs — the keyless catalogue form is
+    // the absent binding alone, never unusable material
+    for material in ["", "   "] {
+        let (provider, _store) = kilo_provider(&config, material);
+        let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+        let err = denied.expect_err("material naming no token denies");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "the grammar denial is typed: {err}"
+        );
+        drop_blocking(provider);
+
+        let (provider, _store) = kilo_provider(&config, material);
+        let (provider, catalogue) = catalog_on_thread(provider);
+        let err = catalogue.expect_err("unusable material has no keyless fallback");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "the catalogue leg denies the same material: {err}"
+        );
+        drop_blocking(provider);
+    }
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        2,
+        "only the two admitted profile sends reached the wire — the denials landed before any leg"
+    );
+}
+
+/// Wrong credential/profile/region never produce a false success for
+/// `kilo`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused bearer lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn kilo_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored. The sibling scope
+    // is seeded for parity with the landed sibling legs; this arm and
+    // the profile arm below deny before the store is read, so the
+    // no-secret assertion there is not the discriminating observation —
+    // the 401 arm at the end is where material resolves and renders.
+    let regioned = Config::parse_validated(
+        &kilo_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "kilo".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, KILO_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "kilo");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, KILO_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.kilo]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"kilo\", model_id = \"{KILO_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "kilo".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, KILO_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, KILO_KEY.as_bytes());
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "kilo");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, KILO_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {KILO_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// The recorded discovery is credential-optional, and that is no paid
+/// entitlement for `kilo` (AC-040e, INV-010): with no credential
+/// enrolled a keyless `/models` answer contributes its rows over the
+/// recorded default row as the floor — the request carries no
+/// `Authorization` header — an empty answer leaves the floor standing,
+/// and the same absent credential denies a paid send `CredentialAbsent`
+/// before any leg, so a keyless or free catalogue never pays for a
+/// request.
+#[tokio::test]
+async fn kilo_free_no_key_catalog_is_not_paid_entitlement() {
+    // a keyless answer contributes its own rows over the floor
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": KILO_FREE_MODEL})]).await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "kilo".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the catalogue is credential-optional");
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the keyless answer merges over the floor");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [KILO_MODEL, KILO_FREE_MODEL],
+        "the keyless answer's rows join the recorded floor in sorted order: {:?}",
+        model_ids(&models)
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyless catalogue is one leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "no credential resolved, so the discovery leg carries no Authorization header"
+    );
+
+    // an empty answer keeps the floor standing
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "kilo".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the catalogue is credential-optional");
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the empty answer still answers the floor");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [KILO_MODEL],
+        "the recorded floor survives an empty listing: {:?}",
+        model_ids(&models)
+    );
+
+    // the keyless catalogue is no credential: a paid send denies typed
+    // and opens no further leg
+    let provider = provider_result(
+        config.clone(),
+        "kilo".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "free availability never stands in for the explicit profile: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the credential denial lands before any send leg"
+    );
+}
+
+/// The typed outage every [`UnavailableStore`] call answers.
+fn unavailable_store() -> ProviderError {
+    ProviderError::StoreUnavailable {
+        store: STORE_KIND,
+        reason: "fixture store unavailable".to_string(),
+    }
+}
+
+/// A store double whose every call is the named outage — never the
+/// absent-scope answer the keyless discovery form tolerates.
+struct UnavailableStore;
+
+impl CredentialStore for UnavailableStore {
+    fn kind(&self) -> StoreKind {
+        STORE_KIND
+    }
+
+    fn occupied(&self, _credential: &SecretRef) -> Result<bool, ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn entry_accounts(&self, _service: &str) -> Result<Vec<String>, ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn login(&self, _credential: &SecretRef, _secret: &[u8]) -> Result<(), ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn resolve(&self, _credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn refresh(&self, _credential: &SecretRef, _secret: &[u8]) -> Result<(), ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn revoke(&self, _credential: &SecretRef) -> Result<(), ProviderError> {
+        Err(unavailable_store())
+    }
+
+    fn logout(&self, _credential: &SecretRef) -> Result<(), ProviderError> {
+        Err(unavailable_store())
+    }
+}
+
+/// A store outage is not the recorded keyless form: the credential-
+/// optional discovery resolves `None` only for an absent scope, so a
+/// `StoreUnavailable` answer surfaces as that typed error and opens no
+/// request — an outage is never read as an unenrolled profile.
+#[tokio::test]
+async fn kilo_store_outage_is_not_the_keyless_form() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": KILO_FREE_MODEL})]).await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let provider = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            ChatCompletionsProvider::new(&config, "kilo", Arc::new(UnavailableStore))
+        })
+        .join()
+        .expect("the provider thread joins")
+        .expect("the shared adapter builds for the kilo id")
+    };
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let err = catalogue.expect_err("a store outage is a typed denial, never a keyless answer");
+    assert!(
+        matches!(
+            &err,
+            ProviderError::StoreUnavailable { store, .. } if *store == STORE_KIND
+        ),
+        "the outage surfaces as the typed store error: {err}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the store denial lands before any wire leg"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement for `kilo`: the keyed
+/// listing contributes its rows as offers — merged over the recorded
+/// floor in sorted order, on one discovery leg whose header carries the
+/// enrolled bearer — yet the fixed pin's send still posts its own
+/// recorded model, never a listed id as a substitute, and the answer
+/// itself releases no request.
+#[tokio::test]
+async fn kilo_models_listing_is_not_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": KILO_FREE_MODEL}),
+            json!({"id": "listed-entitlement-claim"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "listing is no grant",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [KILO_MODEL, "listed-entitlement-claim", KILO_FREE_MODEL],
+        "the listed rows join the recorded floor in sorted order: {:?}",
+        model_ids(&models)
+    );
+    let discovery = server.received_requests().await.expect("recorded");
+    assert_eq!(discovery.len(), 1, "the catalogue opens one discovery leg");
+    assert_eq!(discovery[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&discovery[0]),
+        format!("Bearer {KILO_KEY}"),
+        "resolved material rides the discovery header"
+    );
+
+    let (broker, manifest) = prepared_with(
+        enrolled_kilo_provider(&config),
+        &config,
+        "/world/kilo",
+        "goal: listing is no grant",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/kilo", manifest);
+    outcome.expect("the pinned model dispatches");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the discovery leg then the chat request — a 200 listing releases no third leg"
+    );
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(KILO_MODEL),
+        "a listed row never substitutes the pinned recorded model"
+    );
+}
+
+// ----- TP-PROVIDER-CATALOG::kilo ------------------------------------------------
+
+/// No borrowed price or SKU-bearing row lands on a `kilo` offer
+/// (AC-040e): the offers are the recorded floor row, the pinned roster
+/// is not vendored here, and the class carries no price row or
+/// capability descriptor — so every offer keeps `ModelPrice::Unknown`
+/// and an empty capability surface. A figure transcribed from another
+/// class, a fabricated subscription price, or a row carrying a
+/// SKU-bearing surface lands here as a red.
+#[tokio::test]
+async fn kilo_no_subscription_sku_is_invented() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the recorded floor answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [KILO_MODEL],
+        "the offers are the recorded floor row alone"
+    );
+    for model in &models {
+        assert_eq!(
+            model.price,
+            ModelPrice::Unknown,
+            "{} carries no vendored price row — a borrowed figure or a fabricated subscription price would red here",
+            model.id
+        );
+        assert!(
+            !model.vision && !model.reasoning,
+            "{} carries no recorded capability mark",
+            model.id
+        );
+        assert!(
+            model.efforts.is_empty()
+                && model.effort_default.is_none()
+                && model.context_window.is_none(),
+            "{} carries no recorded effort or window surface",
+            model.id
+        );
+    }
+}
+
+// ----- TP-PROVIDER-RECOVERY::kilo -----------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material naming
+/// no token denies the first send, enrolling the recorded bearer at the
+/// scope admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn kilo_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(KILO_REF, "")]));
+    let provider = provider_result(config.clone(), "kilo".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(KILO_REF, KILO_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled bearer admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for `kilo`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN. The matrix is a self-check: a leg
+/// that reports `FAIL` here reds the suite, while a deleted case is
+/// caught by the gate's exact-name chain, not by this row.
+#[tokio::test]
+async fn kilo_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": KILO_FREE_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the keyless-eligible listing contributes its row over
+    // the recorded floor, each offer carrying no price or capability
+    // mark this slice carries no vendored row for.
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [KILO_MODEL, KILO_FREE_MODEL]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown && !model.vision && !model.reasoning
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: material naming no token denies typed before any leg.
+    let (provider, _store) = kilo_provider(&config, "");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialMalformed { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_kilo_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/kilo", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/kilo", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(KILO_REF, "")]));
+    let provider = provider_result(config.clone(), "kilo".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialMalformed { .. }));
+    store.enroll(KILO_REF, KILO_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_kilo`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::kilo ----------------------------------------------
+
+/// TP-PROVIDER-INSTALLED::kilo = NOT_RUN: the installed-provider proof
+/// is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::kilo = NOT_RUN"]
+fn provider_installed_kilo() {}

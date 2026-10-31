@@ -1,7 +1,7 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq` and `huggingface` connections' adapter — the OpenAI-compatible
+//! `groq`, `huggingface` and `kilo` connections' adapter — the OpenAI-compatible
 //! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class A
 //! and class P).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -10,7 +10,7 @@
 //! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq` and `huggingface` carry their own recorded predicates — the
+//! `groq`, `huggingface` and `kilo` carry their own recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
@@ -59,7 +59,16 @@
 //! fine-grained model-request token, whose `hf_…` grammar is the
 //! account/org billing form: material of another credential class
 //! denies typed before any wire leg rather than billing implicitly on
-//! `huggingface` — resolved per literal id by the
+//! `huggingface`, and the configured-or-default
+//! `api.kilo.ai/api/gateway` host with the recorded keyless
+//! `/models` discovery — its offers merge over the recorded default
+//! row as the floor, the `Authorization` header rides only when the
+//! store resolves material, and no catalogue answer confers paid
+//! entitlement — and the recorded custom device/key profile class,
+//! whose enrolled device login or key supplies the opaque gateway
+//! bearer a send requires (material naming no token denies typed
+//! before any wire leg), with no subscription SKU or price invented
+//! on `kilo` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -607,6 +616,24 @@ const HUGGINGFACE_SEED: &[&str] = &[
     "zai-org/GLM-5.3-Flash",
 ];
 
+/// The recorded default API root of a `kilo` connection
+/// (`auth/kilo.kdl`, `kiloModelManagerOptions`'s
+/// `config?.baseUrl ?? "https://api.kilo.ai/api/gateway"`): the host
+/// the required `endpoint` field's empty string resolves under — the
+/// same absent-override rule the plan classes bind.
+const KILO_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
+
+/// The recorded `kilo` catalogue floor (HZN-008 class P — the pinned
+/// descriptor's `defaultModel` at OMP 18.1.14 @ `0133f7ff`): the
+/// recorded keyless discovery merges its `/models` offers over this
+/// row, and an empty answer leaves it standing. The pinned roster
+/// (`models.json`) is not vendored in this slice, so the per-row
+/// descriptors it records for the id — cost, reasoning, effort — are
+/// not carried: the offer keeps [`ModelPrice::Unknown`] and an empty
+/// capability surface rather than a transcribed figure, and no
+/// subscription SKU is invented either.
+const KILO_MODELS: &[(&str, bool)] = &[("anthropic/claude-opus-4.8", false)];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -645,14 +672,29 @@ enum CatalogRule {
     /// under the per-entry transform, with the recorded static seed
     /// merged on top as the offer floor.
     Listing,
-    /// The recorded fixed allowed-model list alone — the class
-    /// records no dynamic `/models` discovery, so the lookup opens
-    /// no wire leg and resolves no credential. Each tuple is the
+    /// The recorded fixed allowed-model list alone — the lookup opens
+    /// no wire leg and resolves no credential, so a `/models` answer
+    /// (keyless or keyed) can never add an offer. Each tuple is the
     /// model id and its bundled-descriptor vision mark. An auto pick
     /// resolves the sorted-first id — the adapter's one uniform auto
     /// semantic; a descriptor's recorded `defaultModel` is a
     /// catalogue hint, not a product ranking this contract performs.
     Allowlist(&'static [(&'static str, bool)]),
+    /// The recorded credential-optional discovery (`kilo`'s
+    /// `catalogDiscovery.allowUnauthenticated` and its
+    /// `fetchOpenAICompatibleModels` call with `apiKey` optional): the
+    /// configured endpoint's own `/models` answer contributes its
+    /// offers under the per-entry transform, the recorded rows below
+    /// merge on top as the offer floor — an empty answer leaves the
+    /// floor standing — and the `Authorization` header rides only
+    /// when the store resolves material. A resolved-but-unusable
+    /// credential still denies typed rather than silently dropping to
+    /// the keyless form, and no answer confers entitlement: a paid
+    /// send resolves its credential before any leg. Each floor tuple
+    /// is the model id and its image-input mark — the bundled
+    /// descriptor's recorded mark where the class records one, `false`
+    /// otherwise.
+    UnauthenticatedListing(&'static [(&'static str, bool)]),
 }
 
 /// The recorded credential grammar a literal id binds (HZN-008):
@@ -709,6 +751,15 @@ enum CredentialRule {
     /// never writes — denies as malformed before any wire leg rather
     /// than being forwarded under an inferred billing mode (INV-005).
     HuggingFace,
+    /// `kilo`'s recorded credential (`auth/kilo.kdl` `login "custom"`,
+    /// `registry/oauth/kilo.ts`, descriptor env `KILO_API_KEY`): the
+    /// explicit device login's opaque gateway token, or the recorded
+    /// key, is a bare bearer with no prefix and no structured shape.
+    /// The class records no subscription SKU, so material naming no
+    /// token — empty or whitespace only — is unenrolled material and
+    /// denies as malformed before any wire leg rather than reaching
+    /// the gateway as an empty bearer.
+    Kilo,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -1003,11 +1054,38 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::HuggingFace,
             entries: EntryRule::HuggingFace,
         }),
+        // `kilo` (HZN-008 class P): the configured-or-recorded
+        // `api.kilo.ai/api/gateway` base, the recorded keyless
+        // discovery — its `/models` offers merge over the recorded
+        // default row as the floor, the header rides only when
+        // material resolves, and a keyless or free answer proves no
+        // paid entitlement — the recorded custom device/key profile
+        // credential, and no invented subscription SKU: an offer the
+        // class records no vendored price row for keeps
+        // [`ModelPrice::Unknown`].
+        "kilo" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(KILO_BASE_URL),
+            catalog: CatalogRule::UnauthenticatedListing(KILO_MODELS),
+            credential: CredentialRule::Kilo,
+            entries: EntryRule::IdsOnly,
+        }),
         _ => None,
     }
 }
 
 impl SourceContract {
+    /// Whether the recorded catalogue is the credential-optional
+    /// discovery form — an exhaustive decision over the catalogue rule,
+    /// so a further variant must state its credential requirement here
+    /// rather than inheriting the credential-required path by default.
+    fn credential_optional(&self) -> bool {
+        match self.catalog {
+            CatalogRule::Listing | CatalogRule::Allowlist(_) => false,
+            CatalogRule::UnauthenticatedListing(_) => true,
+        }
+    }
+
     /// The connection's API root under the recorded endpoint rule:
     /// egress stays bound to the configured endpoint — the `aiand`
     /// normalization only supplies the `/v1` tail a configured base
@@ -1307,7 +1385,10 @@ impl ChatCompletionsProvider {
     /// returns in deterministic sorted order. A class whose recorded
     /// catalogue is a fixed allowlist answers it alone: no listing
     /// leg exists, so no credential is resolved and no byte crosses
-    /// the wire. The generic class
+    /// the wire. A class whose recorded discovery allows an
+    /// unauthenticated catalogue sends no `Authorization` header when
+    /// no credential resolves, and still merges its recorded rows as
+    /// the offer floor. The generic class
     /// admits the listing verbatim: gateway-style ids carry path
     /// characters legitimately, since a model id is never URL
     /// material in this dialect — it rides the request body.
@@ -1331,17 +1412,25 @@ impl ChatCompletionsProvider {
         // the check before it is the only point an expired budget
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
+        // The recorded keyless discovery resolves material when the
+        // store holds some and rides without the header when it does
+        // not; every other listing class requires its credential.
+        if self.contract.credential_optional() {
+            let secret = self.discovery_secret()?;
+            return self.catalog_within(secret.as_ref(), started);
+        }
         let secret = self.secret()?;
-        self.catalog_within(&secret, started)
+        self.catalog_within(Some(&secret), started)
     }
 
-    /// The catalogue leg under the caller's clock and credential —
-    /// a send passes its own `started` so the lookup spends the same
-    /// whole-request budget instead of opening a second, unaccounted
-    /// one.
+    /// The catalogue leg under the caller's clock and resolved
+    /// credential — a send passes its own `started` so the lookup
+    /// spends the same whole-request budget instead of opening a
+    /// second, unaccounted one, and the recorded keyless discovery
+    /// passes `None` when no material resolves.
     fn catalog_within(
         &self,
-        secret: &WireSecret,
+        secret: Option<&WireSecret>,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
@@ -1350,12 +1439,12 @@ impl ChatCompletionsProvider {
         if let CatalogRule::Allowlist(list) = self.contract.catalog {
             return Ok(allowlist_models(list));
         }
-        let mut request = self
-            .client
-            .get(format!("{}/models", self.endpoint))
-            .bearer_auth(&secret.bearer);
-        if let Some(project) = &secret.project {
-            request = request.header(OPENAI_PROJECT_HEADER, project);
+        let mut request = self.client.get(format!("{}/models", self.endpoint));
+        if let Some(secret) = secret {
+            request = request.bearer_auth(&secret.bearer);
+            if let Some(project) = &secret.project {
+                request = request.header(OPENAI_PROJECT_HEADER, project);
+            }
         }
         let mut response = request
             .send()
@@ -1406,6 +1495,13 @@ impl ChatCompletionsProvider {
                     }),
                 }),
         );
+        // The recorded keyless discovery's rows are the floor too: an
+        // empty `/models` answer still offers them, and a listed entry
+        // precedes its floor stub, so the stable sort keeps the
+        // listing transform on a collision.
+        if let CatalogRule::UnauthenticatedListing(floor) = self.contract.catalog {
+            models.extend(allowlist_models(floor));
+        }
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
@@ -1458,14 +1554,36 @@ impl ChatCompletionsProvider {
         }
     }
 
-    /// Reads the credential material for this send — the only place
-    /// secret bytes cross the store boundary — and answers the wire
-    /// material the literal id's recorded credential grammar binds. A
-    /// non-UTF-8 secret cannot be a bearer token: typed denial, never
-    /// a mangled header. Every grammar, scope or base denial lands
-    /// here — before any wire leg.
+    /// Reads the credential material for this send — the store read
+    /// behind every wire leg — and answers the wire material the
+    /// literal id's recorded credential grammar binds. A non-UTF-8
+    /// secret cannot be a bearer token: typed denial, never a mangled
+    /// header. Every grammar, scope or base denial lands here — before
+    /// any wire leg.
     fn secret(&self) -> Result<WireSecret, ProviderError> {
         let material = self.store.resolve(&self.credential)?;
+        self.wire_secret(material)
+    }
+
+    /// The optional credential a recorded keyless discovery carries
+    /// (`kilo`'s `catalogDiscovery.allowUnauthenticated` with its
+    /// `apiKey`-optional fetch): an absent binding is the recorded
+    /// keyless form and resolves `None`, while material the store does
+    /// hold still passes the class grammar — resolved-but-unusable
+    /// material denies typed rather than silently dropping to the
+    /// keyless form. Any other store denial surfaces unchanged.
+    fn discovery_secret(&self) -> Result<Option<WireSecret>, ProviderError> {
+        match self.store.resolve(&self.credential) {
+            Ok(material) => self.wire_secret(material).map(Some),
+            Err(ProviderError::CredentialAbsent { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The wire material one resolved store answer binds under the
+    /// literal id's recorded credential grammar — the grammar half
+    /// both store reads share.
+    fn wire_secret(&self, material: Vec<u8>) -> Result<WireSecret, ProviderError> {
         let text =
             String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
@@ -1483,6 +1601,7 @@ impl ChatCompletionsProvider {
             CredentialRule::HuggingFace => self
                 .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
                 .map(WireSecret::bearer),
+            CredentialRule::Kilo => self.kilo_bearer(&text).map(WireSecret::bearer),
         }
     }
 
@@ -1535,6 +1654,23 @@ impl ChatCompletionsProvider {
             .ok_or_else(|| ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
             })?;
+        Ok(token.to_string())
+    }
+
+    /// The bearer a `kilo` credential resolves (`auth/kilo.kdl`
+    /// `login "custom"`, `registry/oauth/kilo.ts`): the recorded device
+    /// login's token and the recorded key are both bare gateway
+    /// bearers — no class prefix, no structured body — so the grammar
+    /// is the trimmed material verbatim. Material naming no token
+    /// denies as malformed before any wire leg: the class records no
+    /// subscription SKU an empty bearer could name.
+    fn kilo_bearer(&self, material: &str) -> Result<String, ProviderError> {
+        let token = material.trim();
+        if token.is_empty() {
+            return Err(ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            });
+        }
         Ok(token.to_string())
     }
 
@@ -2780,7 +2916,7 @@ impl Provider for ChatCompletionsProvider {
                 if pool.len() == 1 && pool[0] == self.connection =>
             {
                 let model_id = self
-                    .catalog_within(&secret, started)?
+                    .catalog_within(Some(&secret), started)?
                     .into_iter()
                     .next()
                     .map(|model| model.id)
