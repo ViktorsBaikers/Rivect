@@ -11673,3 +11673,1181 @@ async fn deepinfra_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::deepinfra = NOT_RUN"]
 fn provider_installed_deepinfra() {}
+
+// ----- deepseek --------------------------------------------------------------
+
+// The `deepseek` connection's proof legs (HZN-008 class A): the
+// shared Chat Completions adapter serves the literal id — no copied
+// codec — under its own recorded predicates (`Rivect/key`,
+// `deepseekModelManagerOptions` + `auth/deepseek.kdl`). The
+// configured `endpoint` carries the API base verbatim — an empty one
+// resolves the recorded `api.deepseek.com` default
+// (`config?.baseUrl ?? defaultBaseUrl`'s absent arm), and a
+// configured `region` is denied: the contract names none. The
+// catalogue is the configured base's own authoritative `/models`
+// listing gated by the recorded built-in roster — a built-in id
+// offers with its recorded native-reasoning surface; a benchmark or
+// legacy id the listing carries is never offered — and the seed is
+// the offer floor: a built-in offers even when the listing omits it.
+// The credential is the recorded plain `key` bearer; material that
+// is not UTF-8 text denies malformed before any wire leg; the
+// recorded per-model USD prices carry onto the offered surface while
+// the prepaid balance stays an account fact.
+
+/// The scoped credential ref the `deepseek` connection binds.
+const DEEPSEEK_REF: &str = "keyring:rivect-test/deepseek";
+
+/// Fixture deepseek key material — never a real credential, only
+/// ever sent to localhost.
+const DEEPSEEK_KEY: &str = "fixture-deepseek-key";
+
+/// The pinned model id the fixed-pin legs carry — a recorded
+/// built-in, so the pin is one the catalogue could itself offer.
+const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
+
+/// The recorded built-in ids, sorted — the whole offered universe
+/// this connection may name, listing or seed alike.
+const DEEPSEEK_BUILTIN_IDS: [&str; 3] = [
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-pro",
+];
+
+/// One configured `deepseek` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn deepseek_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.deepseek]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{DEEPSEEK_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"deepseek\", model_id = \"{DEEPSEEK_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn deepseek_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(DEEPSEEK_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "deepseek".to_string(), store.clone())
+        .expect("the shared adapter builds for the deepseek id");
+    (provider, store)
+}
+
+/// The `deepseek` provider over the recorded enrolled credential.
+fn enrolled_deepseek_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    deepseek_provider(config, DEEPSEEK_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::deepseek ---------------------------------------------
+
+/// A configured `deepseek` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key
+/// pin under DEC-011, the plain bearer credential rides the
+/// `Authorization` header — no scope member, no body copy — and the
+/// shared adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — pinned model, system+user messages,
+/// `stream` with `stream_options.include_usage` and the pinned effort
+/// as `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn deepseek_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified outcome text",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepseek_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/deepseek", "goal: prove the wire")
+        .expect("the deepseek pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {DEEPSEEK_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(DEEPSEEK_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(DEEPSEEK_MODEL));
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "deepseek");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/deepseek", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving `deepseek`
+/// means the id is never fixture-served even when it declares
+/// `local` kind, and a manifest pinning a different connection id is
+/// refused at send.
+#[test]
+fn deepseek_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("deepseek"),
+        Some(rivect::providers::Dialect::ChatCompletions),
+        "the literal id binds the shared Chat Completions dialect"
+    );
+    let config = Config::parse_validated(&deepseek_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "deepseek-pro".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `deepseek` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.deepseek]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"deepseek\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("deepseek").expect("declared");
+    assert!(
+        !loopback.serves("deepseek", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send —
+    // the bound credential is well-formed so the denial is the dialect's,
+    // never the credential seam's
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{DEEPSEEK_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/deepseek", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// Hostile stream input is never a false success: a stream ended mid
+/// `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are both the unknown
+/// terminal, a streamed call whose `type` is not the recorded
+/// `function` kind and a `reasoning_content` member that is not a
+/// string are typed rejections, and a rejected send charges nothing.
+#[tokio::test]
+async fn deepseek_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepseek_provider(&config),
+        &config,
+        "/world/deepseek",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepseek_provider(&config),
+        &config,
+        "/world/deepseek",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a non-function tool call kind is output the dialect cannot
+    // honour — the same typed rejection, never executed
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "retrieval",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            }))),
+            data_block(&finish_chunk("tool_calls")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepseek_provider(&config),
+        &config,
+        "/world/deepseek",
+        "goal: foreign tool kind",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::IncompatibleOutput { .. }
+            ))
+        ),
+        "a non-function tool kind is a typed rejection: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a refused send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a `reasoning_content` member that is not a string is hostile
+    // reasoning input — a typed wire violation, never progress
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"reasoning_content": 5}))),
+            data_block(&finish_chunk("stop")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepseek_provider(&config),
+        &config,
+        "/world/deepseek",
+        "goal: malformed reasoning",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a non-string reasoning member is a typed violation: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denied stream charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::deepseek ------------------------------------------
+
+/// The `deepseek` catalogue is the configured base's own
+/// authoritative `/models` listing under the recorded built-in
+/// transform (HZN-008 class A): the lookup resolves the plain bearer
+/// credential on the one `GET {endpoint}/models` leg, and every
+/// listed built-in id lands its recorded surface — the reasoning
+/// mark with the native effort ladder (the bundled `max` names no
+/// level our enum carries and never maps onto a lower one), the
+/// image-input mark, the context window and the recorded per-model
+/// USD prices — while the prepaid balance stays an account fact.
+#[tokio::test]
+async fn deepseek_catalog_lists_the_recorded_builtin_surface() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "deepseek-v4-pro"}),
+            json!({"id": DEEPSEEK_MODEL}),
+            json!({"id": "deepseek-v4-flash-vision-exp"}),
+            // an empty or absent id can never name a model — and a
+            // listed benchmark id is never offered whatever the
+            // listing states
+            json!({"id": ""}),
+            json!({"metadata": {}}),
+        ],
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepseek_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        DEEPSEEK_BUILTIN_IDS,
+        "the listing offers the recorded built-in roster, sorted"
+    );
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+    };
+    assert_eq!(
+        model("deepseek-v4-flash"),
+        &CatalogModel {
+            id: "deepseek-v4-flash".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.14,
+                output_per_1m: 0.28,
+            },
+            ..CatalogModel::default()
+        },
+        "a built-in lands the recorded native-reasoning surface with its recorded USD price"
+    );
+    assert_eq!(
+        model("deepseek-v4-flash-vision-exp"),
+        &CatalogModel {
+            id: "deepseek-v4-flash-vision-exp".to_string(),
+            reasoning: true,
+            vision: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.14,
+                output_per_1m: 0.28,
+            },
+            ..CatalogModel::default()
+        },
+        "the vision build carries its image-input mark and the recorded flash price"
+    );
+    assert_eq!(
+        model("deepseek-v4-pro"),
+        &CatalogModel {
+            id: "deepseek-v4-pro".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.435,
+                output_per_1m: 0.87,
+            },
+            ..CatalogModel::default()
+        },
+        "the pro built-in carries the recorded reasoning surface and its own recorded price"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the listing leg is the only egress — no other endpoint is consulted"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {DEEPSEEK_KEY}"),
+        "the plain key bears the discovery leg"
+    );
+}
+
+/// A benchmark or legacy id the listing carries is never offered
+/// (HZN-008 class A): the built-in roster is the whole offered
+/// universe — `deepseek-chat`, `deepseek-reasoner` and every
+/// non-roster id filter out of the catalogue, and the recorded seed
+/// floor still offers the built-ins the listing omitted.
+#[tokio::test]
+async fn deepseek_benchmark_ids_are_never_offered_as_models() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "deepseek-chat"}),
+            json!({"id": "deepseek-reasoner"}),
+            json!({"id": "deepseek-r1"}),
+            // a gateway-style or arbitrary listed id is no more
+            // offered — the roster, not the listing shape, decides
+            json!({"id": "fixture-org/aaa-benchmark"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        DEEPSEEK_BUILTIN_IDS,
+        "only the recorded built-in roster offers — every benchmark and foreign id is filtered"
+    );
+    for offered in &models {
+        assert!(
+            DEEPSEEK_BUILTIN_IDS.contains(&offered.id.as_str()),
+            "a non-built-in id can never land: {}",
+            offered.id
+        );
+    }
+}
+
+/// A built-in the authoritative listing omits still offers through
+/// the seed floor — and the seed carries the same recorded transform
+/// surface as the listing arm, not a bare id-only stub: the
+/// reasoning mark and ladder, the `vision-exp` image-input mark,
+/// the million-token window and the recorded per-model USD prices
+/// land on every seeded offer.
+#[tokio::test]
+async fn deepseek_seed_floor_carries_the_full_recorded_surface() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // benchmark ids the roster never names — the whole offer
+            // below is the seed's, never a listed entry's
+            json!({"id": "deepseek-chat"}),
+            json!({"id": "deepseek-reasoner"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        DEEPSEEK_BUILTIN_IDS,
+        "the seed floor offers the built-ins the listing omitted"
+    );
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is offered"))
+    };
+    assert_eq!(
+        model("deepseek-v4-flash"),
+        &CatalogModel {
+            id: "deepseek-v4-flash".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.14,
+                output_per_1m: 0.28,
+            },
+            ..CatalogModel::default()
+        },
+        "a seed-only offer carries the recorded surface — the discriminating leg a bare-stub seed arm would lose"
+    );
+    assert_eq!(
+        model("deepseek-v4-flash-vision-exp"),
+        &CatalogModel {
+            id: "deepseek-v4-flash-vision-exp".to_string(),
+            reasoning: true,
+            vision: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.14,
+                output_per_1m: 0.28,
+            },
+            ..CatalogModel::default()
+        },
+        "the seed-only vision build carries its image-input mark and price"
+    );
+    assert_eq!(
+        model("deepseek-v4-pro"),
+        &CatalogModel {
+            id: "deepseek-v4-pro".to_string(),
+            reasoning: true,
+            efforts: vec![EffortLevel::Low, EffortLevel::High],
+            context_window: Some(1_000_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 0.435,
+                output_per_1m: 0.87,
+            },
+            ..CatalogModel::default()
+        },
+        "the seed-only pro build carries its own recorded price"
+    );
+}
+
+/// The recorded native reasoning rules bind from the catalogue
+/// through the wire: every built-in offer is a reasoning model over
+/// the recorded effort ladder, the pinned effort rides the
+/// `reasoning_effort` member verbatim, and the native
+/// `reasoning_content` channel is consumed as progress — never
+/// dropped, never joined into the visible answer.
+#[tokio::test]
+async fn deepseek_native_reasoning_rules_are_preserved() {
+    // the catalogue surface: a built-in declares reasoning over the
+    // recorded ladder — the unmappable `max` level drops rather than
+    // coercing to a lower one — and the recorded USD price carries
+    // while the prepaid balance stays an account fact
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": DEEPSEEK_MODEL})]).await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    let built = models
+        .iter()
+        .find(|model| model.id == DEEPSEEK_MODEL)
+        .expect("the built-in offers");
+    assert!(built.reasoning, "the native reasoning surface binds");
+    assert_eq!(
+        built.efforts,
+        vec![EffortLevel::Low, EffortLevel::High],
+        "the recorded ladder lands without the unmappable max level"
+    );
+    assert_eq!(
+        built.price,
+        ModelPrice::Usd {
+            input_per_1m: 0.14,
+            output_per_1m: 0.28,
+        },
+        "the recorded per-model USD price carries"
+    );
+
+    // the wire surface: the pinned effort rides verbatim and the
+    // native `reasoning_content` channel is consumed as progress —
+    // the visible answer carries only content
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({
+                "reasoning_content": "internal chain of thought",
+            }))),
+            completed_stream(
+                "reasoned answer",
+                Some(json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_deepseek_provider(&config),
+        &config,
+        "/world/deepseek",
+        "goal: reasoning stream",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    let reply = outcome.expect("the reasoning stream completes");
+    assert_eq!(
+        reply.text, "reasoned answer",
+        "the reasoning channel is progress — never the visible answer"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        // verbatim send is the recorded band convention every prior id
+        // keeps — `classes/deepseek.kdl` folds medium/xhigh to high,
+        // but the wire carries what the pin declared
+        "the pinned effort rides the reasoning surface verbatim"
+    );
+    drop_blocking(broker);
+}
+
+/// An empty configured endpoint resolves the recorded default —
+/// the `config?.baseUrl ?? defaultBaseUrl` absent arm our
+/// required `endpoint` field expresses as the empty string, and
+/// whitespace-only shares the arm under the recorded trim. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so the arm is proved without one byte toward
+/// `api.deepseek.com`.
+#[test]
+fn deepseek_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&deepseek_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_deepseek_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.deepseek.com\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The auto-pick catalogue leg rides the authoritative listing under
+/// the built-in gate: a listed benchmark id can never become the
+/// wire model — the dispatch narrows the pool to the `deepseek`
+/// member and the shared adapter resolves the deterministic
+/// sorted-first built-in.
+#[tokio::test]
+async fn deepseek_auto_pick_resolves_through_the_authoritative_catalog() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // would sort first if admitted — the built-in gate keeps
+            // it out of the offer set entirely
+            json!({"id": "aaa-benchmark"}),
+            json!({"id": "deepseek-v4-pro"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.deepseek]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{DEEPSEEK_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"deepseek\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/deepseek", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("deepseek-v4-flash"),
+        "the sorted-first built-in names the wire model — a benchmark id never picks"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::deepseek ---------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `deepseek`: a configured `region` — the recorded contract names
+/// none — the profile-bound ref whose scope disagrees with the
+/// binding, an absent credential, credential material that is not
+/// UTF-8 text and a refused bearer token each land a typed denial,
+/// and none of them, nor any Debug surface the boundary exposes,
+/// renders credential material or the peer's body.
+#[tokio::test]
+async fn deepseek_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &deepseek_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "deepseek".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPSEEK_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "deepseek");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, DEEPSEEK_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.deepseek]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"deepseek\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "deepseek".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPSEEK_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, DEEPSEEK_KEY.as_bytes());
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepseek".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, DEEPSEEK_KEY)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err, DEEPSEEK_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // material that is not UTF-8 text cannot be a bearer token: the
+    // typed malformed denial lands before any wire leg — zero
+    // requests reach the mock
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(DEEPSEEK_REF, &[0xFF, 0xFE, 0xFD]);
+    let provider =
+        provider_result(config.clone(), "deepseek".to_string(), store).expect("binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("non-text material denies before any wire leg");
+    assert!(
+        matches!(err, ProviderError::CredentialMalformed { .. }),
+        "non-UTF-8 material is the typed malformed denial: {err}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "denied credentials never reached the wire"
+    );
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "deepseek");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, DEEPSEEK_KEY.as_bytes());
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&deepseek_config(&base)).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepseek".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(DEEPSEEK_REF, DEEPSEEK_KEY)],
+        )),
+    )
+    .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(DEEPSEEK_KEY),
+        "provider Debug never carries credential material"
+    );
+    mount_chat(
+        &server,
+        completed_stream(
+            "accounted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_deepseek_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/deepseek", "goal: debug surfaces")
+            .expect("the pin passes DEC-011 eligibility");
+        (broker, manifest)
+    };
+    assert!(
+        !format!("{manifest:?}").contains(DEEPSEEK_KEY),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(DEEPSEEK_KEY),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(DEEPSEEK_KEY),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-deepseek",
+        Some(&deepseek_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(DEEPSEEK_KEY),
+        "runtime Debug never carries credential material"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement (INV-010): the recorded
+/// validate leg exercises `chat/completions`, so a fixture listing
+/// answering an arbitrary roster proves nothing — with no credential
+/// enrolled the pin still denies `CredentialAbsent` before any leg.
+#[tokio::test]
+async fn deepseek_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": DEEPSEEK_MODEL})]).await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "deepseek".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(outcome, Err(ProviderError::CredentialAbsent { .. })),
+        "a 200 catalogue never stands in for the credential: {outcome:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the credential denial lands before any leg — the catalogue is never consulted"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::deepseek -----------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path
+/// taken.
+#[tokio::test]
+async fn deepseek_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "deepseek".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(DEEPSEEK_REF, DEEPSEEK_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `deepseek`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn deepseek_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "matrix"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the listing's non-built-in id filters out — the
+    // built-in seed floor alone is the offer.
+    let (provider, _store) = enrolled_deepseek_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed.expect("catalog answers")) == DEEPSEEK_BUILTIN_IDS {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "deepseek".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_deepseek_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/deepseek", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/deepseek", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "deepseek".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(DEEPSEEK_REF, DEEPSEEK_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_deepseek` case below: its ignored count is
+    // the explicit NOT_RUN signal this matrix asserts — the row stays
+    // a literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::deepseek ----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::deepseek = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::deepseek = NOT_RUN"]
+fn provider_installed_deepseek() {}

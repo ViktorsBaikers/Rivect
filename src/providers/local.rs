@@ -1,14 +1,14 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave` and
-//! `deepinfra` connections' adapter — the OpenAI-compatible
-//! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class
-//! A and class P). Dialect selection keys on the literal connection
-//! id, never an auth label, an endpoint shape or a catalogue answer:
-//! every compatible host a deployment wires under
-//! `custom-chat-completions` shares the one
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
+//! `deepinfra` and `deepseek` connections' adapter — the
+//! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025,
+//! HZN-008 class S, class A and class P). Dialect selection keys on
+//! the literal connection id, never an auth label, an endpoint shape
+//! or a catalogue answer: every compatible host a deployment wires
+//! under `custom-chat-completions` shares the one
 //! recorded generic contract, while `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave` and
-//! `deepinfra` carry their own
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
+//! `deepinfra` and `deepseek` carry their own
 //! recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
@@ -21,10 +21,14 @@
 //! on `alibaba-token-plan`, the configured-or-default host, the
 //! authoritative `/models` listing and the scoped bearer credential —
 //! the `OpenAI-Project` member required before any leg — on
-//! `coreweave`, and the configured-or-default host, the
+//! `coreweave`, the configured-or-default host, the
 //! authoritative chat-model `/models` listing — the public metadata
 //! catalogue never an authentication surface — and the plain bearer
-//! credential on `deepinfra` — resolved per literal id by the
+//! credential on `deepinfra`, and the configured-or-default host,
+//! the authoritative `/models` listing gated by the recorded
+//! built-in roster — built-in ids offered, benchmark ids never —
+//! the plain bearer credential and the recorded native reasoning
+//! rules on `deepseek` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -204,6 +208,47 @@ const OPENAI_PROJECT_HEADER: &str = "OpenAI-Project";
 /// same absent-override rule the plan classes bind.
 const DEEPINFRA_DEFAULT_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 
+/// The recorded default API root of a `deepseek` connection
+/// (`api.deepseek.com`, `deepseekModelManagerOptions`'s
+/// `defaultBaseUrl`): the host the required `endpoint` field's
+/// empty string resolves under the recorded
+/// `config?.baseUrl ?? defaultBaseUrl` fallback — the same
+/// absent-override rule the plan classes bind.
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+
+/// The recorded `deepseek` built-in roster (HZN-008 class A,
+/// `deepseekModelManagerOptions`'s `builtInModelManager`):
+/// `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp` and
+/// `deepseek-v4-pro` carry the recorded surface — the native
+/// reasoning mark with its `low`/`high`/`max` ladder (the recorded
+/// `max` has no landing level in our enum and never maps onto a
+/// lower one), the million-token window and the per-model USD
+/// prices [`DEEPSEEK_PRICES`] states — while the prepaid balance
+/// and off-peak rules stay account facts we never synthesize. A
+/// listed or seeded id outside the roster is a benchmark or legacy
+/// id and is never offered as a model.
+const DEEPSEEK_BUILTIN_MODELS: &[&str] = &[
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-pro",
+];
+
+/// The recorded per-model USD prices the `deepseek` roster rows
+/// state (`models.json` `cost.input`/`cost.output` per 1M tokens):
+/// the flash builds bill 0.14/0.28, the pro build 0.435/0.87. The
+/// recorded cache-read/cache-write figures have no carrier —
+/// [`ModelPrice`] states input/output alone — so they stay
+/// uncarried rather than flattened into the carried legs.
+const DEEPSEEK_PRICES: &[(&str, f64, f64)] = &[
+    ("deepseek-v4-flash", 0.14, 0.28),
+    ("deepseek-v4-flash-vision-exp", 0.14, 0.28),
+    ("deepseek-v4-pro", 0.435, 0.87),
+];
+
+/// The recorded vision mark a `deepseek` built-in carries: the
+/// `vision-exp` build alone admits image input.
+const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -324,6 +369,15 @@ enum EntryRule {
     /// this adapter does not carry, the same boundary `aimlapi`
     /// applies.
     AlibabaTokenPlan,
+    /// The `deepseek` transform: the id must name a recorded built-in
+    /// (`DEEPSEEK_BUILTIN_MODELS` — the offered universe the roster
+    /// bounds); an admitted id lands the recorded surface — the
+    /// native reasoning mark with the mappable effort levels, the
+    /// `vision-exp` build's image-input mark, the million-token
+    /// window and the recorded per-model USD prices — while the
+    /// prepaid balance stays an account fact. A benchmark or legacy
+    /// id the listing carries is never offered.
+    DeepSeek,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -437,6 +491,20 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
+        }),
+        // `deepseek` (HZN-008 class A): the configured-or-recorded
+        // `api.deepseek.com` base, the authoritative `/models`
+        // listing gated by the recorded built-in roster — built-in
+        // ids offered with their native reasoning surface, benchmark
+        // ids never — the roster merged on top as the offer floor,
+        // and the plain bearer credential: the recorded per-model
+        // USD prices carry; the prepaid balance stays an account fact.
+        "deepseek" => Some(SourceContract {
+            seed: DEEPSEEK_BUILTIN_MODELS,
+            endpoint: EndpointRule::PlanBaseOrDefault(DEEPSEEK_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::DeepSeek,
         }),
         _ => None,
     }
@@ -816,14 +884,24 @@ impl ChatCompletionsProvider {
             .collect();
         // The recorded seed unions on top as the offer floor — a
         // seeded id the listing omitted still offers, carrying the
-        // empty transform surface: the seed never states metadata the
-        // listing did not. Listed entries precede the stubs, so the
-        // stable sort keeps a listing entry's transform over its
-        // seed stub on a collision.
-        models.extend(self.contract.seed.iter().map(|id| CatalogModel {
-            id: (*id).to_string(),
-            ..CatalogModel::default()
-        }));
+        // id-only surface a generic seed states. `deepseek`'s seed is
+        // the built-in roster itself, so its stubs carry the same
+        // recorded transform surface the listing arm lands. Listed
+        // entries precede the stubs, so the stable sort keeps a
+        // listing entry's transform over its seed stub on a
+        // collision.
+        models.extend(
+            self.contract
+                .seed
+                .iter()
+                .filter_map(|id| match self.contract.entries {
+                    EntryRule::DeepSeek => deepseek_entry(id),
+                    _ => Some(CatalogModel {
+                        id: (*id).to_string(),
+                        ..CatalogModel::default()
+                    }),
+                }),
+        );
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
@@ -857,6 +935,7 @@ impl ChatCompletionsProvider {
                     ..CatalogModel::default()
                 })
             }
+            EntryRule::DeepSeek => deepseek_entry(id),
         }
     }
 
@@ -1783,6 +1862,36 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
         context_window: positive_count(entry.get("context_window")),
         price: aiand_price(entry),
     }
+}
+
+/// The recorded `deepseek` entry transform: only a built-in id the
+/// roster names offers — a benchmark or legacy id the listing
+/// carries never does. The admitted entry carries the recorded
+/// surface: the native reasoning mark with the `low`/`high`/`max`
+/// ladder's mappable levels (the recorded `max` names no level our
+/// enum carries and never maps onto a lower one), the `vision-exp`
+/// build's image-input mark, the million-token window and the
+/// per-model USD prices [`DEEPSEEK_PRICES`] states; the prepaid
+/// balance and off-peak rules stay account facts we never
+/// synthesize, and the recorded cache figures stay uncarried —
+/// [`ModelPrice`] holds input/output alone.
+fn deepseek_entry(id: &str) -> Option<CatalogModel> {
+    DEEPSEEK_BUILTIN_MODELS.contains(&id).then(|| CatalogModel {
+        id: id.to_string(),
+        reasoning: true,
+        vision: id == DEEPSEEK_VISION_MODEL,
+        efforts: vec![EffortLevel::Low, EffortLevel::High],
+        context_window: Some(1_000_000),
+        price: DEEPSEEK_PRICES
+            .iter()
+            .find(|(model, ..)| *model == id)
+            .map(|(_, input_per_1m, output_per_1m)| ModelPrice::Usd {
+                input_per_1m: *input_per_1m,
+                output_per_1m: *output_per_1m,
+            })
+            .unwrap_or_default(),
+        ..CatalogModel::default()
+    })
 }
 
 /// The recorded `aimlapi` exclusion tokens (`rules/runtime/
