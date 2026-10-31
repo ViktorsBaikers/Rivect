@@ -24,6 +24,7 @@ pub mod state;
 pub mod supervisor;
 pub mod tools;
 pub mod ui;
+pub mod update;
 pub mod verification;
 
 pub const BUILD_ATTEMPT_ID: &str = "slice001-20260909T180108Z-retry";

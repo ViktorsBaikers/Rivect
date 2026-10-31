@@ -75,10 +75,40 @@ pub struct Owner {
 /// off (see [`unlock_or_hand_off`]) and the file still closes.
 struct Election(File);
 
+/// The lock file an election over a data root holds, relative to that root. The
+/// boot, the deferred startup and an update refusal all name this one path, so
+/// an operator is pointed at the exact file another process owns.
+pub const OWNER_LOCK: &str = "runtime/owner.lock";
+
 impl Drop for Election {
     fn drop(&mut self) {
         unlock_or_hand_off(ReleasedLock::Owner, || self.0.unlock());
     }
+}
+
+/// Takes the one election over `data_root`: the private runtime directory, the
+/// advisory lock on [`OWNER_LOCK`], and the held descriptor the caller wraps.
+/// Both entries share it, so the directory shape and the refusal are stated
+/// once.
+fn elect_lock(data_root: &Path) -> Result<(PathBuf, Election), OwnerError> {
+    let runtime_dir = data_root.join("runtime");
+    std::fs::create_dir_all(&runtime_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_root.join(OWNER_LOCK))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::AlreadyOwned),
+        Err(err) => return Err(OwnerError::Io(io::Error::other(err))),
+    }
+    Ok((runtime_dir, Election(lock)))
 }
 
 impl Owner {
@@ -87,27 +117,35 @@ impl Owner {
     /// releases it after its store, and a failed election releases the same
     /// way. An unlock failure is handed to the surface that dropped the
     /// owner, which drains it after the drop (`Runtime::release`).
+    ///
+    /// # Errors
+    /// [`OwnerError::AlreadyOwned`] when another process holds the lock,
+    /// [`OwnerError::Io`] when the lock file cannot be opened, and the store
+    /// admission refusals [`TaskStore::open`] reports.
     pub fn elect(data_root: &Path) -> Result<Self, OwnerError> {
-        let runtime_dir = data_root.join("runtime");
-        std::fs::create_dir_all(&runtime_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let lock_path = runtime_dir.join("owner.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::AlreadyOwned),
-            Err(err) => return Err(OwnerError::Io(io::Error::other(err))),
-        }
-        let election = Election(lock);
+        let (runtime_dir, election) = elect_lock(data_root)?;
         let store = TaskStore::open(&runtime_dir.join("rivect.db"))?;
+        Ok(Self {
+            store,
+            generation: 1,
+            runtime_dir,
+            _election: election,
+        })
+    }
+
+    /// Elects the owner for the production startup: the lock is taken exactly as
+    /// [`Owner::elect`] takes it, but the store arrives admitted and *not yet
+    /// bootstrapped*. The caller publishes the schema it needs together with the
+    /// base and the policy it validated in one transaction
+    /// ([`TaskStore::publish_generation`]), so no generation is visible before all
+    /// of it is; a failure drops this owner and its election with it, which is
+    /// what a refused startup owes the data root.
+    ///
+    /// # Errors
+    /// The same election, data-root and admission refusals as [`Owner::elect`].
+    pub(crate) fn elect_deferred(data_root: &Path) -> Result<Self, OwnerError> {
+        let (runtime_dir, election) = elect_lock(data_root)?;
+        let store = TaskStore::open_deferred(&runtime_dir.join("rivect.db"))?;
         Ok(Self {
             store,
             generation: 1,

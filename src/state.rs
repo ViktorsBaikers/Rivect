@@ -311,30 +311,27 @@ fn storage(err: impl std::error::Error + Send + Sync + 'static) -> StoreError {
 /// `CREATE TABLE IF NOT EXISTS` leaves untouched a database whose
 /// `supervisor_reactions` predates the `id` append identity
 /// (intermediate commit 0131781), so `ORDER BY id` paging would fail.
-/// A current table is left as-is; an id-less one is rebuilt in one
-/// immediate transaction, preserving journal order by rowid.
-fn migrate_supervisor_reactions(conn: &mut Connection) -> Result<()> {
-    let has_id = {
-        let mut stmt = conn
-            .prepare(sql::SUPERVISOR_REACTIONS_COLUMNS)
-            .map_err(storage)?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(storage)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(storage)?;
-        columns.iter().any(|name| name == "id")
-    };
-    if has_id {
+/// A current table is left as-is; an id-less one is rebuilt, preserving journal
+/// order by rowid.
+///
+/// This mutating body owns no transaction: it runs inside the caller's, so the
+/// production startup publishes it with the rest of one generation and a direct
+/// open still commits it on its own.
+fn migrate_supervisor_reactions_on(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare(sql::SUPERVISOR_REACTIONS_COLUMNS)
+        .map_err(storage)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    drop(stmt);
+    if columns.iter().any(|name| name == "id") {
         return Ok(());
     }
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(storage)?;
-    tx.execute_batch(sql::MIGRATE_SUPERVISOR_REACTIONS)
-        .map_err(storage)?;
-    tx.commit().map_err(storage)?;
-    Ok(())
+    conn.execute_batch(sql::MIGRATE_SUPERVISOR_REACTIONS)
+        .map_err(storage)
 }
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -1076,6 +1073,12 @@ pub struct TaskStore {
     /// The inode this store's registry entry is keyed by; the entry
     /// lives until the store drops (reopen on the same inode keeps it).
     writer: FileId,
+    /// The digest of the effective configuration this process staged a base
+    /// against, held in memory until the activation that records it. It is never
+    /// read back from the database because a staged row carries no activation
+    /// metadata by design, and a crash between stage and commit deliberately
+    /// loses it with the checkpoint's validation.
+    staged_policy: Option<String>,
 }
 
 impl Drop for TaskStore {
@@ -1085,6 +1088,34 @@ impl Drop for TaskStore {
         retire_writer(self.writer);
     }
 }
+
+/// The process-death hatch of the startup transaction: when
+/// `RIVECT_STARTUP_PAUSE` names the data root's own generated marker, this
+/// process writes its pid there and blocks on stdin, so a parent can kill it in
+/// the middle of the one `IMMEDIATE` its generation publishes and observe what
+/// the primary holds afterwards.
+///
+/// Test-only: no product path sets the variable. It is inert unless the value is
+/// exactly the marker [`crate::update::hatch_marker`] generates under this data
+/// root's `runtime/` directory — an arbitrary caller path is refused before any
+/// write and without blocking — and the marker itself is created anchored
+/// (`O_NOFOLLOW|O_NONBLOCK`) at 0600 on the opened descriptor.
+#[cfg(debug_assertions)]
+fn startup_pause_marker(data_root: &Path) {
+    if let Err(error) = crate::update::pause_at(data_root, "RIVECT_STARTUP_PAUSE", "startup-pause")
+    {
+        // The hatch is the proof's own channel: a path it refuses must not refuse
+        // a generation the store can publish, and the proof observes the missing
+        // marker as a failed fixture rather than a failed startup.
+        drop(error);
+    }
+}
+
+/// The release build's answer: the startup transaction never blocks, so no
+/// environment string can wedge the data root while the owner election and the
+/// writer lock are held.
+#[cfg(not(debug_assertions))]
+fn startup_pause_marker(_data_root: &Path) {}
 
 /// Refuses a store a newer build wrote (I-6): the generation the ledger reports
 /// is compared against the one this build knows, before any DDL runs and again
@@ -1142,6 +1173,7 @@ impl TaskStore {
             bound_db,
             identity: std::sync::Arc::new(()),
             writer,
+            staged_policy: None,
         };
         store.bootstrap()?;
         Ok(store)
@@ -1191,9 +1223,39 @@ impl TaskStore {
         self.conn.as_ref().ok_or(StoreError::Closed)
     }
 
+    /// The write accessor for the mutators that need `&mut Connection` — the ones
+    /// that open a transaction. It is one of the three write doors, not the only one:
+    /// [`TaskStore::conn_write`] serves the mutators that need only `&Connection`, and
+    /// [`TaskStore::checkpoint_into`] takes the `&self` operator write. All three run
+    /// the same path fence, so the fence is exactly once per write: one `lstat` at the
+    /// write boundary, never a transaction per write. A store whose file another
+    /// process replaced resolves to another inode and refuses typed before any row
+    /// reaches the orphaned file.
+    ///
+    /// The fence is a check, not containment: between the `lstat` and the first row
+    /// there is a window in which another process could replace the path, which is
+    /// the limit REQ-007 requires be named rather than denied. The containment that
+    /// closes it is the owner election and the OFD writer lock, held before this store
+    /// opens; the fence is what refuses a replacement that happened while the lock was
+    /// not held.
+    ///
+    /// The fence never opens the database: POSIX byte-range locks are released
+    /// when any descriptor for that file closes, so an open-and-close beside a
+    /// write would drop SQLite's own locks.
     fn conn_mut(&mut self) -> Result<&mut Connection> {
         self.unquarantined()?;
+        self.verify_path_identity()?;
         self.conn.as_mut().ok_or(StoreError::Closed)
+    }
+
+    /// The same fence for the mutators that need only a shared connection: they
+    /// write through autocommit statements, so they take `&Connection` but are
+    /// still writes and pay the one `lstat` before their first row. Reads stay on
+    /// [`TaskStore::conn`], so an ordinary query never pays for a write.
+    fn conn_write(&mut self) -> Result<&Connection> {
+        self.unquarantined()?;
+        self.verify_path_identity()?;
+        self.conn.as_ref().ok_or(StoreError::Closed)
     }
 
     /// A held claim-commit record quarantines the store exactly like an
@@ -1514,8 +1576,8 @@ impl TaskStore {
     /// never before a carried write.
     ///
     /// The schema ledger (DEC-008) is read before any generation's DDL: a
-    /// store a newer build wrote is refused typed before any DDL runs, and
-    /// the generation this build introduces runs its idempotent batch in one
+    /// store a newer build wrote is refused typed before any DDL runs, and the
+    /// generation this build introduces runs its idempotent batch in one
     /// immediate transaction. The batch runs whether or not the ledger already
     /// reports this generation, because the ledger records that the batch ran,
     /// not that its schema is present: a store whose table was dropped — a
@@ -1529,31 +1591,238 @@ impl TaskStore {
             }));
         }
         let conn = self.conn_mut()?;
+        Self::bootstrap_on(conn)
+    }
+
+    /// The bootstrap body over one connection. The five legacy batches run in their
+    /// historical autocommit position, exactly as they always did; only the
+    /// generation this build owns — its DDL batch, the additive base-ledger
+    /// expansion, the schema ledger write and the reaction-journal rebuild — runs as
+    /// one `IMMEDIATE` transaction, so that half lands together or not at all. The
+    /// atomic startup path is [`TaskStore::publish_generation_ddl`], which runs every
+    /// batch of both halves inside the caller's generation transaction together with
+    /// the base and its pinned policy.
+    ///
+    /// The ledger is read twice: before the transaction, so a store a newer build
+    /// wrote is refused before a single byte of DDL, and again inside it, so a
+    /// store that advanced in between is refused instead of being rewound by the
+    /// ledger write.
+    pub(crate) fn bootstrap_on(conn: &mut Connection) -> Result<()> {
         require_known_generation(learning::schema_generation_on(conn)?)?;
-        conn.execute_batch(sql::SCHEMA).map_err(storage)?;
-        conn.execute_batch(sql::DECISIONS_SCHEMA).map_err(storage)?;
-        conn.execute_batch(sql::PLANS_SCHEMA).map_err(storage)?;
-        conn.execute_batch(sql::INDEX_SCHEMA).map_err(storage)?;
-        conn.execute_batch(sql::ASSUMPTIONS_SCHEMA)
-            .map_err(storage)?;
+        // The five legacy batches keep their historical autocommit position, so a
+        // direct open issues exactly the statements it always did; only the
+        // generation this build owns runs as one immediate transaction.
+        for batch in [
+            sql::SCHEMA,
+            sql::DECISIONS_SCHEMA,
+            sql::PLANS_SCHEMA,
+            sql::INDEX_SCHEMA,
+            sql::ASSUMPTIONS_SCHEMA,
+        ] {
+            conn.execute_batch(batch).map_err(storage)?;
+        }
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        // The ledger is read again inside the write transaction (INV-010a): a
-        // store that advanced past this build between the read above and this
-        // batch is refused typed instead of being rewound by the ledger write
-        // below.
-        let current = learning::schema_generation_on(&tx)?;
+        match Self::publish_generation_tx(&tx) {
+            Ok(()) => tx.commit().map_err(storage),
+            Err(error) => {
+                tx.rollback().map_err(storage)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Everything one generation publishes into a store, for the caller's
+    /// transaction: the DDL batches, the add-only base metadata expansion, the
+    /// schema ledger and the reaction-journal rebuild. The production startup
+    /// calls this inside its schema/base/policy commit and a direct open calls it
+    /// through [`TaskStore::bootstrap_on`], so both write exactly the same rows.
+    pub(crate) fn publish_generation_ddl(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        let current = learning::schema_generation_on(tx)?;
+        require_known_generation(current)?;
+        for (site, batch) in [
+            (GenerationSite::Core, sql::SCHEMA),
+            (GenerationSite::Decisions, sql::DECISIONS_SCHEMA),
+            (GenerationSite::Plans, sql::PLANS_SCHEMA),
+            (GenerationSite::Index, sql::INDEX_SCHEMA),
+            (GenerationSite::Assumptions, sql::ASSUMPTIONS_SCHEMA),
+            (GenerationSite::Learning, sql::LEARNING_SCHEMA),
+        ] {
+            // One named batch per iteration: a proof fails exactly one of them
+            // and the whole generation rolls back, so the token stays attributable
+            // to the batch it names.
+            proof::generation_fault(site).map_err(storage)?;
+            tx.execute_batch(batch).map_err(storage)?;
+        }
+        Self::expand_generation_tx(tx)?;
+        Ok(())
+    }
+
+    /// The ledger half of the startup generation: the schema this build owns, the
+    /// add-only base expansion, the reaction rebuild and the ledger write. A direct
+    /// open runs exactly this part in one immediate transaction, because the five
+    /// legacy batches above keep their historical autocommit position.
+    fn publish_generation_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        let current = learning::schema_generation_on(tx)?;
         require_known_generation(current)?;
         tx.execute_batch(sql::LEARNING_SCHEMA).map_err(storage)?;
-        if current < learning::KNOWN_SCHEMA_GENERATION {
+        Self::expand_generation_tx(tx)
+    }
+
+    /// The expansion, the reaction rebuild and the schema ledger, shared by both
+    /// paths, with the distinct fault seam each of them names.
+    fn expand_generation_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        proof::generation_fault(GenerationSite::Expand).map_err(storage)?;
+        learning::expand_base_state(tx)?;
+        proof::generation_fault(GenerationSite::Reactions).map_err(storage)?;
+        migrate_supervisor_reactions_on(tx)?;
+        proof::generation_fault(GenerationSite::SchemaLedger).map_err(storage)?;
+        // The ledger records that the batch ran, so it is written whenever the
+        // store is behind this build — never rewound and never raised by a reopen.
+        if learning::schema_generation_on(tx)? < learning::KNOWN_SCHEMA_GENERATION {
             tx.execute_batch(&sql::set_schema_generation(
                 learning::KNOWN_SCHEMA_GENERATION,
             ))
             .map_err(storage)?;
         }
-        tx.commit().map_err(storage)?;
-        migrate_supervisor_reactions(conn)
+        Ok(())
+    }
+
+    /// A store admitted and connected for the production startup, with the
+    /// guards already run and no DDL executed: the schema a direct open would
+    /// publish is left to [`TaskStore::publish_generation`], which the startup
+    /// calls inside its one schema/base/policy transaction.
+    ///
+    /// The store never leaves this module before that publication, so a writer is
+    /// never handed an uninitialized database. A direct [`TaskStore::open`] keeps
+    /// its own behaviour and is what every non-startup caller uses.
+    ///
+    /// # Errors
+    /// The same admission and guard refusals [`TaskStore::open`] documents.
+    pub(crate) fn open_deferred(path: &Path) -> Result<Self> {
+        let bound_db = Self::canonical_db_path(path)?;
+        let (conn, writer) = Self::connect(path, None)?;
+        let store = Self {
+            conn: Some(conn),
+            held_claim_commit: None,
+            bound_db,
+            identity: std::sync::Arc::new(()),
+            writer,
+            staged_policy: None,
+        };
+        require_known_generation(learning::schema_generation_on(store.conn()?)?)?;
+        Ok(store)
+    }
+
+    /// Whether the schema this store already holds can carry the two recovery
+    /// passes before the generation transaction. They write current-generation
+    /// rows, so a first install or an older store answers `false` and the startup
+    /// runs them after the commit, before the runtime is exposed.
+    ///
+    /// # Errors
+    /// Returns the store's typed storage error when the schema cannot be read.
+    pub(crate) fn startup_schema_compatible(&self) -> Result<bool> {
+        let present: i64 = self
+            .conn()?
+            .query_row(sql::RECOVERY_TABLES_PRESENT, [], |row| row.get(0))
+            .map_err(storage)?;
+        Ok(present == 3)
+    }
+
+    /// The production startup's single commit: see
+    /// [`TaskStore::publish_generation`]. It runs on the deferred store the startup
+    /// already admitted, so the connection, its identity and its guards are the
+    /// same ones the transaction writes through.
+    ///
+    /// # Errors
+    /// Returns the store's typed storage error for every refusal: a failed batch,
+    /// expansion, migration, ledger write or base publication.
+    pub(crate) fn publish_generation(
+        &mut self,
+        install: &crate::config::BaseInstall,
+    ) -> std::result::Result<Option<crate::config::BaseDocument>, crate::config::BaseError> {
+        if proof::bootstrap_fault() {
+            return Err(crate::config::BaseError::Store(storage(
+                ConnectionLifecycleError::SettingMismatch { pragma: "schema" },
+            )));
+        }
+        let assets = learning::classified_assets(self, install);
+        let conn = self.conn_mut().map_err(crate::config::BaseError::Store)?;
+        let abandoned = Self::publish_generation_on(conn, install, &assets)?;
+        // The activation this call performed has recorded the pin, so the
+        // in-memory copy has no further reader and must not be reused for
+        // another base.
+        self.staged_policy = None;
+        Ok(abandoned)
+    }
+
+    /// The mutators of one generation, in the order they publish, against the
+    /// caller's transaction: the DDL batches, the additive expansion, the schema
+    /// ledger, the reaction rebuild, then the base with its receipt, its set epoch
+    /// and the pinned policy. Every early return leaves the caller's transaction
+    /// uncommitted, so the whole generation rolls back with it.
+    fn publish_generation_body(
+        tx: &rusqlite::Transaction<'_>,
+        install: &crate::config::BaseInstall,
+        assets: &[(crate::config::UpdateAsset, String)],
+    ) -> std::result::Result<Option<crate::config::BaseDocument>, crate::config::BaseError> {
+        Self::publish_generation_ddl(tx).map_err(crate::config::BaseError::Store)?;
+        // The one point a process-death proof stops at: every DDL batch of this
+        // generation has run inside the transaction and nothing of the base has been
+        // written yet, so a kill here must leave the whole old tuple. The hatch is
+        // the named environment marker, never a production branch.
+        startup_pause_marker(&install.workspace_root);
+        proof::generation_fault(GenerationSite::Base)
+            .map_err(|error| crate::config::BaseError::Store(storage(error)))?;
+        let abandoned = Self::stage_for_cutover_on(tx, install, assets)?;
+        // A serving row an earlier build wrote is read back for its shape and left
+        // exactly as it is: this build invents no validation milestone for it.
+        learning::legacy_base_row_on(tx).map_err(crate::config::BaseError::Store)?;
+        proof::generation_fault(GenerationSite::Policy)
+            .map_err(|error| crate::config::BaseError::Store(storage(error)))?;
+        // A base that already serves has nothing to activate: the startup answers
+        // the receipt it holds instead of refusing a cutover it does not owe.
+        let already_active = learning::base_document_on(tx, crate::config::UpdateState::Active)
+            .map_err(learning::base_refusal)?
+            .is_some_and(|base| base.version == install.version);
+        if !already_active {
+            Self::commit_base_on(tx, install.version, &install.policy_generation)?;
+        }
+        Ok(abandoned)
+    }
+
+    /// The one transaction every startup mutator shares, over the connection the
+    /// deferred entry already admitted. The ledger is read before
+    /// any DDL and again inside the transaction, so a store a newer build wrote is
+    /// refused without a byte of DDL and one that advanced in between is refused
+    /// instead of rewound.
+    fn publish_generation_on(
+        conn: &mut Connection,
+        install: &crate::config::BaseInstall,
+        assets: &[(crate::config::UpdateAsset, String)],
+    ) -> std::result::Result<Option<crate::config::BaseDocument>, crate::config::BaseError> {
+        let as_base = crate::config::BaseError::Store;
+        require_known_generation(learning::schema_generation_on(conn).map_err(as_base)?)
+            .map_err(as_base)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| as_base(storage(error)))?;
+        let published = Self::publish_generation_body(&tx, install, assets);
+        match published {
+            Ok(abandoned) => {
+                tx.commit().map_err(|error| as_base(storage(error)))?;
+                Ok(abandoned)
+            }
+            Err(refusal) => {
+                // The rollback result is part of the contract, not a destructor:
+                // a refused generation leaves the old tuple only when this
+                // succeeds, and a failed rollback means the connection's state is
+                // unknown, which is the larger failure.
+                tx.rollback().map_err(|error| as_base(storage(error)))?;
+                Err(refusal)
+            }
+        }
     }
 
     /// DEC-048 «Reopen и quarantine»: closes the old connection
@@ -1893,10 +2162,15 @@ impl TaskStore {
         prior: std::time::Duration,
         primary: Option<i32>,
     ) -> ClaimTxOutcome {
-        let retention = self
-            .conn()
-            .map(|conn| Self::retain_rejection(conn, claim, site, primary))
-            .unwrap_or(RetentionOutcome::Unavailable);
+        // The denial row is a write like any other: it takes the same one-`lstat`
+        // fence before its first statement, so a store path another process
+        // replaced refuses it and the row never reaches the orphaned inode. A
+        // refused fence answers the `Unavailable` discriminator the caller already
+        // reads as "this refusal left no row".
+        let retention = match self.conn_write() {
+            Ok(conn) => Self::retain_rejection(conn, claim, site, primary),
+            Err(_) => RetentionOutcome::Unavailable,
+        };
         let restore_failed = self.restore_or_quarantine(prior);
         ClaimTxOutcome::Refused(ClaimRefusal {
             site,
@@ -2185,7 +2459,7 @@ impl TaskStore {
         })
         .to_string();
         let written = self
-            .conn()
+            .conn_write()
             .map(|conn| Self::retain_once(conn, &record, &boundary).is_ok());
         // A failed restoration quarantines the slot exactly like the
         // claim path's own restoration failure; the proof seam injects
@@ -2272,8 +2546,11 @@ impl TaskStore {
             attach_to.is_some()
         );
         let key = format!("{connection_id}|{bootstrap_id}");
-        let replay = self
-            .conn()?
+        // This entry writes the attachment, the session row and the receipt, so
+        // it takes the write fence before its first statement: a path another
+        // process replaced is refused before any of the three lands.
+        let conn = self.conn_write()?;
+        let replay = conn
             .query_row(sql::BOOTSTRAP_RECEIPT_BY_KEY, params![key], |row| {
                 row.get::<_, String>(0)
             })
@@ -2294,8 +2571,7 @@ impl TaskStore {
         }
         let session_id = match attach_to {
             Some(id) => {
-                let exists: bool = self
-                    .conn()?
+                let exists: bool = conn
                     .query_row(sql::SESSION_EXISTS, params![id.0], |row| row.get(0))
                     .map_err(storage)?;
                 if !exists {
@@ -2306,35 +2582,31 @@ impl TaskStore {
             None => SessionId::generate(),
         };
         let attachment_id = AttachmentId::generate();
-        self.conn()?
-            .execute(
-                sql::INSERT_ATTACHMENT,
-                params![
-                    attachment_id.0,
-                    session_id.0,
-                    connection_id,
-                    bootstrap_id,
-                    params_digest
-                ],
-            )
-            .map_err(storage)?;
-        let revision: u64 = self
-            .conn()?
+        conn.execute(
+            sql::INSERT_ATTACHMENT,
+            params![
+                attachment_id.0,
+                session_id.0,
+                connection_id,
+                bootstrap_id,
+                params_digest
+            ],
+        )
+        .map_err(storage)?;
+        let revision: u64 = conn
             .query_row(sql::NEXT_SESSION_REVISION, params![session_id.0], |row| {
                 row.get::<_, i64>(0).map(|v| v as u64)
             })
             .map_err(storage)?;
         if attach_to.is_none() {
-            self.conn()?
-                .execute(sql::INSERT_SESSION, params![session_id.0, revision as i64])
+            conn.execute(sql::INSERT_SESSION, params![session_id.0, revision as i64])
                 .map_err(storage)?;
         } else {
-            self.conn()?
-                .execute(
-                    sql::UPDATE_SESSION_REVISION,
-                    params![session_id.0, revision as i64],
-                )
-                .map_err(storage)?;
+            conn.execute(
+                sql::UPDATE_SESSION_REVISION,
+                params![session_id.0, revision as i64],
+            )
+            .map_err(storage)?;
         }
         let result_json = serde_json::to_string(&json!({
             "session_id": session_id.0,
@@ -2342,12 +2614,11 @@ impl TaskStore {
             "owner_generation": 1u64,
         }))
         .map_err(storage)?;
-        self.conn()?
-            .execute(
-                sql::INSERT_BOOTSTRAP_RECEIPT,
-                params![key, attachment_id.0, result_json],
-            )
-            .map_err(storage)?;
+        conn.execute(
+            sql::INSERT_BOOTSTRAP_RECEIPT,
+            params![key, attachment_id.0, result_json],
+        )
+        .map_err(storage)?;
         Ok((session_id, attachment_id, 1, false))
     }
 
@@ -4211,7 +4482,7 @@ impl TaskStore {
         describe: &str,
     ) -> Result<String> {
         let attempt_id = AttemptId::generate().0;
-        self.conn()?
+        self.conn_write()?
             .execute(
                 sql::INSERT_ATTEMPT,
                 params![
@@ -4233,7 +4504,7 @@ impl TaskStore {
         detail: Option<&str>,
     ) -> Result<()> {
         let changed = self
-            .conn()?
+            .conn_write()?
             .execute(sql::UPDATE_ATTEMPT, params![attempt_id, state, detail])
             .map_err(storage)?;
         if changed == 0 {
@@ -4360,7 +4631,7 @@ impl TaskStore {
         digest: &str,
     ) -> Result<String> {
         let obligation_id: String = self
-            .conn()?
+            .conn_write()?
             .query_row(
                 sql::OBLIGATION_AT_OFFSET,
                 params![task_id.0, obligation_index as i64],
@@ -4370,7 +4641,7 @@ impl TaskStore {
             .map_err(storage)?
             .ok_or_else(StoreError::missing_obligation)?;
         let evidence_id = EvidenceId::generate().0;
-        self.conn()?
+        self.conn_write()?
             .execute(
                 sql::INSERT_EVIDENCE,
                 params![
@@ -4383,7 +4654,7 @@ impl TaskStore {
                 ],
             )
             .map_err(storage)?;
-        self.conn()?
+        self.conn_write()?
             .execute(sql::SATISFY_OBLIGATION, params![obligation_id])
             .map_err(storage)?;
         Ok(evidence_id)
@@ -4573,7 +4844,7 @@ impl TaskStore {
     /// frame_goal contribution: the accepted receipt carries empty
     pub fn materialize_obligations(&mut self, task_id: &TaskId) -> Result<()> {
         let mut stmt = self
-            .conn()?
+            .conn_write()?
             .prepare(sql::MISSING_OBLIGATIONS)
             .map_err(storage)?;
         let missing: Vec<String> = stmt
@@ -4583,7 +4854,7 @@ impl TaskStore {
             .map_err(storage)?;
         drop(stmt);
         for criterion_id in missing {
-            self.conn()?
+            self.conn_write()?
                 .execute(
                     sql::INSERT_OBLIGATION,
                     params![EvidenceId::generate().0, task_id.0, criterion_id],
@@ -5641,7 +5912,7 @@ impl TaskStore {
         cause: StaleCause,
     ) -> Result<bool> {
         let changed = self
-            .conn()?
+            .conn_write()?
             .execute(
                 sql::MARK_INDEX_GENERATION_STALE,
                 params![
@@ -5769,7 +6040,7 @@ impl TaskStore {
     }
 
     pub fn retain(&mut self, record_json: &str, boundary_id: &str) -> Result<()> {
-        Self::retain_once(self.conn()?, record_json, boundary_id)
+        Self::retain_once(self.conn_write()?, record_json, boundary_id)
     }
 
     /// One retained-attempt write. The collision check reads BOTH keys
@@ -5920,7 +6191,7 @@ impl TaskStore {
         reaction: &crate::supervisor::Reaction,
     ) -> Result<()> {
         let reaction_json = serde_json::to_string(reaction).map_err(storage)?;
-        self.conn()?
+        self.conn_write()?
             .execute(
                 sql::INSERT_SUPERVISOR_REACTION,
                 params![reaction.task.0, reaction_json],
@@ -6057,7 +6328,7 @@ impl TaskStore {
             )));
         }
         let receipted = self
-            .conn()?
+            .conn_write()?
             .execute(
                 sql::COMPLETE_PUBLICATION,
                 params![owner, target, admission_seq as i64],
@@ -6084,7 +6355,7 @@ impl TaskStore {
         ttl_seconds: i64,
     ) -> Result<()> {
         let modifier = format!("{ttl_seconds:+} seconds");
-        self.conn()?
+        self.conn_write()?
             .execute(
                 sql::INSERT_PREAPPROVAL,
                 params![scope, granted_by, modifier],
@@ -6107,7 +6378,7 @@ impl TaskStore {
     pub fn open_budget(&mut self, scope: &str, limit_units: u64) -> Result<()> {
         let stored_limit = budget_units_i64(limit_units)?;
         let replayed = self
-            .conn()?
+            .conn_write()?
             .query_row(sql::BUDGET_SCOPE_ROW, params![scope], |row| {
                 row.get::<_, i64>(0)
             })
@@ -6118,7 +6389,7 @@ impl TaskStore {
                 scope: scope.to_string(),
             }));
         }
-        self.conn()?
+        self.conn_write()?
             .execute(sql::INSERT_BUDGET_SCOPE, params![scope, stored_limit])
             .map_err(storage)?;
         Ok(())
@@ -8011,6 +8282,85 @@ impl Question {
             recommended_option_id: OptionId(KNOWN_READY_OPTION.to_string()),
             recommendation_basis: ASK_RECOMMENDATION.to_string(),
         }
+    }
+}
+
+impl TaskStore {
+    /// Whether a cutover is waiting: a staged base the ledger has not
+    /// committed. Only then does an update own a snapshot, so an ordinary
+    /// open copies nothing.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the ledger cannot be read and
+    /// [`StoreError::Closed`] when the store is not open.
+    pub fn cutover_pending(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        // A store this build has never published to holds no ledger yet, and
+        // "no table" is the honest answer to "is a cutover waiting" there: the
+        // one generation transaction below creates it. A store that has published
+        // a generation and lost the table is corrupt, so the query below reports
+        // it instead of answering `false`.
+        let present: bool = conn
+            .query_row(sql::BASE_LEDGER_PRESENT, [], |row| row.get(0))
+            .map_err(storage)?;
+        if !present && learning::schema_generation_on(conn)? == 0 {
+            return Ok(false);
+        }
+        let staged = conn
+            .query_row(
+                sql::BASE_BY_STATE,
+                params![crate::config::UpdateState::Staged.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        Ok(staged.is_some())
+    }
+
+    /// The write-time path fence: the bound database path must still resolve to
+    /// the inode this writer admitted. A path another process replaced resolves
+    /// to a different inode, so this refuses typed and the caller never writes to
+    /// the orphaned file. It resolves the path on every call — a cached answer
+    /// would describe a resolution that has already moved.
+    ///
+    /// The check is one `lstat` and opens nothing: on POSIX a descriptor closed
+    /// for this file releases every byte-range lock the process holds on it, so
+    /// an open beside a write would drop SQLite's own locks. `lstat` also
+    /// refuses a symlink swapped onto the name, which resolves to another inode.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the path cannot be inspected — and,
+    /// because the refusal is that same class, when it resolves to another inode
+    /// than the admitted one.
+    pub fn verify_path_identity(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::symlink_metadata(&self.bound_db)
+            .map_err(|source| writer_file_check("db", source))?;
+        if !metadata.is_file() || (metadata.dev(), metadata.ino()) != self.writer {
+            return Err(storage(ConnectionLifecycleError::DatabaseMoved));
+        }
+        Ok(())
+    }
+
+    /// Writes the one consistent copy of this store into `target` through the
+    /// named `sql::checkpoint_store` operation, on this connection and under
+    /// the writer lock it already holds. `VACUUM INTO` produces a complete
+    /// database, so the copy never needs the `-wal` sidecar and never replaces
+    /// the primary.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Storage`] when the copy fails — no space, an
+    /// unusable target, or an engine refusal — and [`StoreError::Closed`] when
+    /// the store is not open.
+    pub fn checkpoint_into(&self, target: &Path) -> Result<()> {
+        // The copy reads the whole primary from this connection, so it is a write
+        // on behalf of an operator: the path fence runs first, and a name another
+        // process replaced refuses instead of copying from the orphaned inode.
+        self.unquarantined()?;
+        self.verify_path_identity()?;
+        let conn = self.conn()?;
+        conn.execute_batch(&sql::checkpoint_store(target))
+            .map_err(storage)
     }
 }
 
@@ -12679,6 +13029,187 @@ mod tests {
         Ok(())
     }
 
+    /// AC-055/REQ-001: every mutator of one generation publishes inside the same
+    /// transaction, so a failure at any of them leaves exactly the whole old
+    /// schema/base/policy tuple — never a mix — and the current owner's
+    /// post-checkpoint write intact.
+    #[test]
+    fn startup_transaction_rolls_back_every_bootstrap_mutator() -> ProofResult {
+        let root = tempfile::TempDir::with_prefix("rivect-startup-generation-")?;
+        let db = root.path().join("state.db");
+        let effective = crate::config::resolve_effective(None)?;
+        let pin = effective.sources_digest.clone();
+        let first = crate::config::BaseInstall::new(
+            crate::config::BaseSource::SHIPPED,
+            root.path().join("config.toml"),
+            root.path(),
+        )
+        .pinning(&effective);
+        {
+            let mut store = TaskStore::open_deferred(&db)?;
+            store.publish_generation(&first)?;
+        }
+        let old = read_generation(&db)?;
+        assert_eq!(
+            old,
+            (
+                super::learning::KNOWN_SCHEMA_GENERATION,
+                first.version,
+                pin.clone()
+            ),
+            "the first startup published one whole generation"
+        );
+
+        // A write confirmed after that generation, read back through its own
+        // connection so a rollback of the next generation cannot be mistaken for
+        // a lost record.
+        let confirmation = {
+            let mut store = TaskStore::open(&db)?;
+            let session = store.open_session("startup-ack", "fixture", None)?.0;
+            let task = store
+                .create_task(
+                    &session,
+                    "cmd-startup-ack",
+                    "human",
+                    "survive a refused generation",
+                    (&["one criterion".to_string()], &[]),
+                )?
+                .task_id;
+            store.materialize_obligations(&task)?;
+            store.insert_evidence_for_task(
+                &task,
+                "world",
+                "confirmed after the checkpoint",
+                "ab12",
+            )?;
+            let record = store
+                .evidence_for_task(&task)?
+                .into_iter()
+                .next()
+                .ok_or("the confirmed record reads back")?;
+            (task, record.evidence_id.0, record.scope, record.observation)
+        };
+
+        let next = crate::config::BaseInstall::new(
+            crate::config::BaseSource::new(third_base_version(), THIRD_BASE),
+            root.path().join("config.toml"),
+            root.path(),
+        )
+        .pinning(&effective);
+        // The ledger write only runs on a first install, so that one site is
+        // armed against a store that has none; the rest run on the primary that
+        // already holds a generation, which is where a resumed startup publishes.
+        let fresh = tempfile::TempDir::with_prefix("rivect-startup-first-")?;
+        let fresh_db = fresh.path().join("state.db");
+        let mut store = TaskStore::open_deferred(&fresh_db)?;
+        super::proof::arm_generation_fault(super::GenerationSite::SchemaLedger);
+        assert!(
+            store.publish_generation(&first).is_err(),
+            "the schema ledger fault refused the first install"
+        );
+        drop(store);
+        let uninitialized = rusqlite::Connection::open(&fresh_db)?;
+        let schema: i64 = uninitialized.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(
+            schema, 0,
+            "the refused first install published no generation"
+        );
+        let published: i64 = uninitialized.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            published, 0,
+            "the refused first install left no table of its generation"
+        );
+        drop(uninitialized);
+
+        let sites = [
+            super::GenerationSite::Core,
+            super::GenerationSite::Decisions,
+            super::GenerationSite::Plans,
+            super::GenerationSite::Index,
+            super::GenerationSite::Assumptions,
+            super::GenerationSite::Learning,
+            super::GenerationSite::Expand,
+            super::GenerationSite::Reactions,
+            super::GenerationSite::Base,
+            super::GenerationSite::Policy,
+        ];
+        for site in sites {
+            let mut store = TaskStore::open_deferred(&db)?;
+            super::proof::arm_generation_fault(site);
+            let refused = store.publish_generation(&next);
+            assert!(
+                refused.is_err(),
+                "{site:?}: the injected fault did not refuse the generation"
+            );
+            drop(store);
+            assert_eq!(
+                read_generation(&db)?,
+                old,
+                "{site:?}: a refused generation left a different tuple"
+            );
+            let (task, evidence_id, scope, observation) = confirmation.clone();
+            let reopened = TaskStore::open(&db)?;
+            let records = reopened.evidence_for_task(&task)?;
+            assert_eq!(records.len(), 1, "{site:?}: the owner's write survived");
+            assert_eq!(
+                (
+                    records[0].evidence_id.0.clone(),
+                    records[0].scope.clone(),
+                    records[0].observation.clone()
+                ),
+                (evidence_id, scope, observation),
+                "{site:?}: the post-checkpoint write reads back by id, scope and content"
+            );
+            drop(reopened);
+            // The next iteration runs on the same primary: no site left a
+            // partial generation another site could trip over.
+            assert_eq!(
+                read_generation(&db)?,
+                old,
+                "{site:?}: the retry starts clean"
+            );
+        }
+
+        // The unarmed run publishes the whole new generation, so the faults above
+        // refused for their own reason rather than because the transition is
+        // impossible.
+        let mut store = TaskStore::open_deferred(&db)?;
+        store.publish_generation(&next)?;
+        drop(store);
+        assert_eq!(
+            read_generation(&db)?,
+            (super::learning::KNOWN_SCHEMA_GENERATION, next.version, pin)
+        );
+        Ok(())
+    }
+
+    /// The generation a store publishes, read through a connection of its own:
+    /// the schema ledger, the base that serves and the digest of the effective
+    /// configuration that base was activated against.
+    fn read_generation(
+        db: &std::path::Path,
+    ) -> Result<(u64, u64, String), Box<dyn std::error::Error>> {
+        let conn = rusqlite::Connection::open(db)?;
+        let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let (base, policy): (i64, String) = conn.query_row(
+            "SELECT base_version, policy_generation FROM base_state WHERE state = 'active'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((u64::try_from(schema)?, u64::try_from(base)?, policy))
+    }
+
+    /// The version one step past the shipped one, and a document it can carry.
+    fn third_base_version() -> u64 {
+        crate::config::SHIPPED_BASE_VERSION + 1
+    }
+
+    const THIRD_BASE: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\nauto_compact = true\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
     #[test]
     fn both_rejection_producers_draw_distinct_uuid_identities_per_invocation() -> ProofResult {
         let (root, mut store, _session, _task, _attempt, claim) =
@@ -12921,12 +13452,263 @@ mod tests {
 
         Ok(())
     }
+
+    /// AC-055/INV-002: the named `sql::checkpoint_store` operation copies the
+    /// store consistently on the writer's own connection, and the write-time
+    /// fence refuses once the path stops naming the admitted inode.
+    ///
+    /// The snapshot is read back through a second connection — the only honest
+    /// way to prove the copy is a complete database and not a byte range — and
+    /// every committed row is matched by ID, scope and content. The primary is
+    /// left exactly as it was, because a snapshot is a backup/reference and
+    /// never a replacement.
+    #[test]
+    fn checkpoint_store_is_consistent_and_identity_bound() -> ProofResult {
+        let root = tempfile::TempDir::with_prefix("rivect-checkpoint-store-")?;
+        let db = root.path().join("state.db");
+        let snapshots = root.path().join("checkpoints");
+        std::fs::create_dir(&snapshots)?;
+        let mut store = TaskStore::open(&db)?;
+        let session = crate::contracts::SessionId("checkpoint-session".to_string());
+        let task = store
+            .create_task(
+                &session,
+                "cmd-checkpoint",
+                "human",
+                "survive one snapshot",
+                (&["one criterion".to_string()], &[]),
+            )?
+            .task_id;
+        store.materialize_obligations(&task)?;
+        store.insert_evidence_for_task(&task, "world", "the acknowledged observation", "ab12")?;
+        let committed = store.evidence_for_task(&task)?;
+        assert_eq!(committed.len(), 1, "one record is committed: {committed:?}");
+        let primary_before = std::fs::read(&db)?;
+
+        let target = snapshots.join(format!("{}.db", uuid::Uuid::new_v4()));
+        store.checkpoint_into(&target)?;
+        assert_eq!(
+            std::fs::read(&db)?,
+            primary_before,
+            "the snapshot never replaces the primary"
+        );
+        let copied: i64 = rusqlite::Connection::open(&target)?.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+            params![task.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(copied, 1, "the copy holds the committed task");
+        let copied_record: (String, String, String) = rusqlite::Connection::open(&target)?
+            .query_row(
+                "SELECT evidence_id, scope, observation FROM evidence WHERE task_id = ?1",
+                params![task.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(
+            copied_record,
+            (
+                committed[0].evidence_id.0.clone(),
+                committed[0].scope.clone(),
+                committed[0].observation.clone()
+            ),
+            "the copy names the same record by id, scope and content"
+        );
+
+        // The copy is a database, not a file: an edit made after the snapshot
+        // never reaches it.
+        store.insert_evidence_for_task(&task, "world", "written after the copy", "cd34")?;
+        let after: i64 = rusqlite::Connection::open(&target)?.query_row(
+            "SELECT COUNT(*) FROM evidence WHERE task_id = ?1",
+            params![task.0],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after, 1, "the snapshot is a point-in-time reference");
+        assert_eq!(
+            store.evidence_for_task(&task)?.len(),
+            2,
+            "the primary keeps the later record: no restore happened"
+        );
+
+        // A real attempt row for the attempt-state leg below: the mutator needs an
+        // id that exists, and creating it here keeps that leg on the same fixture.
+        let planned =
+            store.plan_attempt(&task, crate::contracts::EffectClass::Read, "a planned read")?;
+
+        // The fence: another name resolves to another inode. The whole database
+        // moves — sidecars included — so the orphaned inode stays a readable
+        // store and "no row reached it" is observable rather than assumed.
+        store.verify_path_identity()?;
+        let moved = root.path().join("moved.db");
+        std::fs::rename(&db, &moved)?;
+        for sidecar in ["-wal", "-shm"] {
+            let from = super::sidecar_path(&db, sidecar.trim_start_matches('-'));
+            let to = super::sidecar_path(&moved, sidecar.trim_start_matches('-'));
+            if from.exists() {
+                std::fs::rename(&from, &to)?;
+            }
+        }
+        std::fs::write(&db, b"a substituted path")?;
+        let refusal = store
+            .verify_path_identity()
+            .err()
+            .ok_or("a substituted path must be refused")?;
+        assert!(
+            matches!(
+                lifecycle_of(&refusal),
+                Some(super::ConnectionLifecycleError::DatabaseMoved)
+            ),
+            "{refusal:?}"
+        );
+        // The fence is on the write path: the next mutation is typed-refused
+        // before any row reaches the orphaned inode. (The connection itself
+        // cannot answer once its sidecars are gone, which is why the reads above
+        // happened before the swap.)
+        let write = store
+            .insert_evidence_for_task(&task, "world", "must never land", "ef56")
+            .expect_err("a write through a substituted path is refused");
+        assert!(
+            matches!(
+                lifecycle_of(&write),
+                Some(super::ConnectionLifecycleError::DatabaseMoved)
+            ),
+            "{write:?}"
+        );
+        // The shared-connection mutators are writes too: each one takes the same
+        // fence before its first statement, so none of them reaches the orphan.
+        let preapproval = store
+            .record_preapproval("read:grant-1:/scope", "fixture", 600)
+            .expect_err("a consent write through a substituted path is refused");
+        assert!(
+            matches!(
+                lifecycle_of(&preapproval),
+                Some(super::ConnectionLifecycleError::DatabaseMoved)
+            ),
+            "{preapproval:?}"
+        );
+        let attempt = store
+            .plan_attempt(&task, crate::contracts::EffectClass::Read, "a planned read")
+            .expect_err("an attempt write through a substituted path is refused");
+        assert!(
+            matches!(
+                lifecycle_of(&attempt),
+                Some(super::ConnectionLifecycleError::DatabaseMoved)
+            ),
+            "{attempt:?}"
+        );
+        // The attempt-state mutator is an effect-commit write on the executor's own
+        // path, so it takes the same fence: a substituted path refuses it typed and
+        // no state reaches the orphaned inode.
+        let transition = store
+            .set_attempt_state(&planned, "running", Some("claimed"))
+            .expect_err("an attempt-state write through a substituted path is refused");
+        assert!(
+            matches!(
+                lifecycle_of(&transition),
+                Some(super::ConnectionLifecycleError::DatabaseMoved)
+            ),
+            "{transition:?}"
+        );
+        assert_eq!(
+            std::fs::read(&db)?,
+            b"a substituted path",
+            "the refusal never writes to the orphaned inode"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&moved)?.query_row(
+                "SELECT state FROM attempts WHERE attempt_id = ?1",
+                params![planned],
+                |row| row.get::<_, String>(0)
+            )?,
+            "planned",
+            "the orphaned inode kept the state the row was written with"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&moved)?.query_row(
+                "SELECT COUNT(*) FROM evidence WHERE task_id = ?1",
+                params![task.0],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2,
+            "the orphaned inode gained no row either"
+        );
+        drop(store);
+        Ok(())
+    }
+
+    /// The claim refusal's denial row is a write too: `refuse_claim_with` routes it
+    /// through the fenced accessor, so a store path replaced between the claim's
+    /// admission and the refusal tail refuses the retention and the orphan gains no
+    /// row. The window is the check-then-act one REQ-007 names: the claim already
+    /// passed the fence, and the write must pay it again.
+    #[test]
+    fn claim_retention_is_refused_by_a_replaced_store_path() -> ProofResult {
+        let (root, mut store, _session, _task, _attempt, claim) = claim_fixture("retention-fence");
+        let db = root.path().join("state.db");
+        let moved = root.path().join("moved.db");
+        std::fs::rename(&db, &moved)?;
+        for sidecar in ["-wal", "-shm"] {
+            let from = super::sidecar_path(&db, sidecar.trim_start_matches('-'));
+            let to = super::sidecar_path(&moved, sidecar.trim_start_matches('-'));
+            if from.exists() {
+                std::fs::rename(&from, &to)?;
+            }
+        }
+        std::fs::write(&db, b"a substituted path")?;
+
+        // The refusal tail the claim reaches after its transaction is gone: it owes
+        // one denial row, and the path it would write through no longer names this
+        // writer's inode.
+        let outcome = store.refuse_claim_with(
+            &claim,
+            super::ClaimSite::Read,
+            std::time::Duration::from_millis(5_000),
+            None,
+        );
+        let super::ClaimTxOutcome::Refused(refused) = outcome else {
+            unreachable!("the refusal tail answers a refusal");
+        };
+        assert!(
+            !matches!(refused.retention, super::RetentionOutcome::Retained),
+            "a replaced path refuses the retention write instead of landing it"
+        );
+
+        // The orphan gained nothing, and the substituted path is untouched.
+        let orphaned: i64 = rusqlite::Connection::open(&moved)?.query_row(
+            "SELECT COUNT(*) FROM retained WHERE boundary_id LIKE '%claim_rejection%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(orphaned, 0, "the orphan gained no denial row");
+        assert_eq!(
+            std::fs::read(&db)?,
+            b"a substituted path",
+            "the refusal never writes to the substituted path"
+        );
+        Ok(())
+    }
 }
 
 /// Production proof seam (DEC-048): statement-position witnesses and
 /// the site-local fault hook, compiled to no-ops outside tests. The
 /// unarmed build is production-equivalent; an armed fault is the one
 /// explicit typed site-local deviation inside inline legs.
+/// One mutator of a single generation, named so a proof can fail each of them
+/// separately and observe the same rolled-back tuple from every site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationSite {
+    Core,
+    Decisions,
+    Plans,
+    Index,
+    Assumptions,
+    Learning,
+    Expand,
+    Reactions,
+    SchemaLedger,
+    Base,
+    Policy,
+}
+
 #[cfg(not(test))]
 mod proof {
     pub(super) enum Site {
@@ -13007,6 +13789,13 @@ mod proof {
     }
     pub(super) fn bootstrap_fault() -> bool {
         false
+    }
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the test twin returns the armed typed fault; both builds share one call shape"
+    )]
+    pub(super) fn generation_fault(_: super::GenerationSite) -> rusqlite::Result<()> {
+        Ok(())
     }
     pub(super) fn after_own_admit(_: &std::path::Path) {}
 }
@@ -13474,6 +14263,32 @@ pub mod proof {
 
     pub(super) fn bootstrap_fault() -> bool {
         take_fault(InjectedFault::Bootstrap)
+    }
+
+    thread_local! {
+        static GENERATION_FAULT: Cell<Option<super::GenerationSite>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn arm_generation_fault(site: super::GenerationSite) {
+        GENERATION_FAULT.with(|cell| cell.set(Some(site)));
+    }
+
+    /// Arms one reservation failure at the next admission's `dest`.
+    pub(super) fn generation_fault(site: super::GenerationSite) -> rusqlite::Result<()> {
+        let fired = GENERATION_FAULT.with(|cell| {
+            let armed = cell.get() == Some(site);
+            if armed {
+                cell.set(None);
+            }
+            armed
+        });
+        if fired {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some(format!("injected generation fault at {site:?}")),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn arm_bootstrap_fault() {

@@ -106,10 +106,49 @@ CREATE TABLE IF NOT EXISTS procedure_run_steps (
 CREATE TABLE IF NOT EXISTS base_state (
     base_version INTEGER PRIMARY KEY,
     digest TEXT NOT NULL,
-    state TEXT NOT NULL
+    state TEXT NOT NULL,
+    phase TEXT NULL,
+    blocker_count INTEGER NULL CHECK (blocker_count >= 0),
+    schema_generation INTEGER NULL,
+    policy_generation TEXT NULL,
+    set_epoch INTEGER NULL
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_base_state_active
     ON base_state (state) WHERE state = 'active';
+
+-- The five nullable columns after `state` are additive metadata: a row that
+-- predates them keeps NULL in all five, and that is the one legacy
+-- discriminator. `blocker_count` is the number of `base_blockers` rows of this
+-- base (0 for an empty set), `phase` the cutover milestone the row reached
+-- (`activated`; `checked` belongs to the attempt record, never to the ledger),
+-- `schema_generation` the generation the base was activated under,
+-- `policy_generation` the digest of the effective config it was validated
+-- against, and `set_epoch` the epoch `blocker_set_sequence` issued for its
+-- blocker set. A store that already holds the table gains a missing column
+-- through `ALTER TABLE ... ADD COLUMN` inside the bootstrap transaction; no
+-- column, row or index is rewritten.
+CREATE TABLE IF NOT EXISTS base_blockers (
+    base_version INTEGER NOT NULL REFERENCES base_state(base_version) ON DELETE CASCADE,
+    address TEXT NOT NULL COLLATE BINARY,
+    PRIMARY KEY (base_version, address)
+) STRICT;
+
+-- One base's blocker addresses, normalized so a page is a range read instead of
+-- a walk: `address` is the canonical `learning/E(id)/E(column)` or
+-- `config/E(pointer)/E(field)` pointer, and the composite key makes the set
+-- ordered and duplicate-free under `BINARY` collation. A row leaves with its
+-- base, so an abandoned checkpoint takes its set with it and a retained base
+-- keeps exactly the set it was validated with.
+CREATE TABLE IF NOT EXISTS blocker_set_sequence (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    next_epoch INTEGER NOT NULL
+) STRICT;
+-- The epoch source for a blocker set. A row is never deleted — not by
+-- `abandon_base`, not by retention — so an epoch once issued is never issued
+-- again and a page cursor minted for a discarded set cannot alias the set that
+-- replaced it. The seed row rides this DDL so the allocation always finds its
+-- row, and `OR IGNORE` keeps a reopen from resetting a used sequence.
+INSERT OR IGNORE INTO blocker_set_sequence (id, next_epoch) VALUES (0, 0);
 
 -- The update receipt (REQ-044, DEC-009): one row per persistent asset this
 -- build writes, with the location it exists at and the policy the update

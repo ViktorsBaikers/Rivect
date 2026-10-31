@@ -14,9 +14,10 @@ use super::{
 };
 use crate::config::{
     BaseCutover, BaseDocument, BaseError, BaseInstall, BaseServed, Config, ReceiptAsset,
-    SHIPPED_BASE_VERSION, UPDATE_ASSETS, UpdateAsset, UpdatePolicy, UpdateReceipt, UpdateState,
-    UpdateStatus,
+    SHIPPED_BASE_VERSION, SemanticInputs, UPDATE_ASSETS, UpdateAsset, UpdatePage, UpdatePhase,
+    UpdatePolicy, UpdateReceipt, UpdateState, UpdateStatus,
 };
+use crate::contracts::{ErrorCode, WireError};
 use crate::identity::{
     IdentityError, IdentityKind, IdentityMigration, IdentityRebind, IdentityRules, MigrationRule,
     NamedSubject, Placement, ReboundSubject,
@@ -50,6 +51,18 @@ pub(super) fn schema_generation_on(conn: &Connection) -> Result<u64> {
         .query_row(sql::SCHEMA_GENERATION, [], |row| row.get(0))
         .map_err(storage)?;
     u64::try_from(raw).map_err(|_negative| corrupt_column("schema generation", &raw.to_string()))
+}
+
+/// The three parts of one published generation, read back as one value: the
+/// schema the ledger reports, the base that serves and the digest of the
+/// effective configuration that base was activated with. An attempt that cannot
+/// say which whole tuple it left behind compares these three together; a mixed
+/// answer is what the attempt refuses to call its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationTuple {
+    pub schema: u64,
+    pub base: Option<u64>,
+    pub policy: Option<String>,
 }
 
 fn delta_missing(delta_id: &str) -> StoreError {
@@ -261,6 +274,46 @@ impl TaskStore {
     /// [`StoreError::Storage`] when the ledger cannot be read.
     pub fn schema_generation(&self) -> Result<u64> {
         schema_generation_on(self.conn()?)
+    }
+
+    /// The whole generation tuple the primary holds: the schema the ledger
+    /// reports, the base that serves and the policy digest that base was
+    /// activated with. A store no update installed answers the shipped generation
+    /// with no base and no policy, so the caller compares whole tuples rather
+    /// than inferring a half.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Closed`] when the store is not open,
+    /// [`StoreError::Storage`] when the ledger cannot be read, and the store's
+    /// own storage refusal when a row holds a value no producer writes — a mixed
+    /// tuple is unreadable on purpose, never reported as a whole one.
+    pub fn generation_tuple(&self) -> Result<GenerationTuple> {
+        let schema = schema_generation_on(self.conn()?)?;
+        let status = self.update_status().map_err(base_refusal)?;
+        Ok(GenerationTuple {
+            schema,
+            base: status.base_version,
+            policy: status.policy_generation,
+        })
+    }
+
+    /// Whether this connection holds no open transaction. The one probe a caller
+    /// runs after a COMMIT whose result did not arrive: an open transaction means
+    /// the engine is still inside the attempt, so the tuple cannot be read yet.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Closed`] when the store is not open.
+    pub fn in_autocommit(&self) -> Result<bool> {
+        Ok(self.conn()?.is_autocommit())
+    }
+
+    /// Ends this store's connection slot without SQL, after a step whose outcome
+    /// could not be established: every later call refuses typed until a
+    /// compatible reopen reads the whole tuple back. The slot is what
+    /// [`TaskStore::conn`] checks first, so no statement runs against a
+    /// connection whose transaction state is unknown.
+    pub(crate) fn quarantine(&mut self) {
+        self.conn = None;
     }
 
     /// Records one candidate delta `inactive`: validation runs before any
@@ -610,7 +663,7 @@ fn update_state(raw: &str) -> Result<UpdateState> {
 /// an unchanged version are a document change the version had to name, so the
 /// offer is refused instead of answering the receipt of a document this open did
 /// not compose.
-fn recorded_document_matches(
+pub(super) fn recorded_document_matches(
     recorded: &BaseDocument,
     install: &BaseInstall,
 ) -> std::result::Result<(), BaseError> {
@@ -623,10 +676,287 @@ fn recorded_document_matches(
     }
 }
 
+/// The add-only expansion of the base ledger (INV-010a): every metadata column
+/// this build reads is added when the store does not already have it, through
+/// `PRAGMA table_info` introspection and `ALTER TABLE ... ADD COLUMN`. A column
+/// already present is left exactly as it is, so a reopen adds nothing twice and no
+/// existing column, row or index is rewritten.
+///
+/// # Errors
+/// Returns the store's typed storage error when the column list cannot be read or
+/// a column cannot be added.
+pub(super) fn expand_base_state(conn: &Connection) -> Result<()> {
+    let present = {
+        let mut statement = conn.prepare(sql::BASE_STATE_COLUMNS).map_err(storage)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?
+    };
+    for (column, statement) in [
+        ("phase", sql::ADD_BASE_STATE_PHASE),
+        ("blocker_count", sql::ADD_BASE_STATE_BLOCKER_COUNT),
+        ("schema_generation", sql::ADD_BASE_STATE_SCHEMA_GENERATION),
+        ("policy_generation", sql::ADD_BASE_STATE_POLICY_GENERATION),
+        ("set_epoch", sql::ADD_BASE_STATE_SET_EPOCH),
+    ] {
+        if !present.iter().any(|name| name == column) {
+            conn.execute_batch(statement).map_err(storage)?;
+        }
+    }
+    Ok(())
+}
+
+/// Proves the serving row of a store an earlier build wrote still answers a shape
+/// this build accepts, and writes nothing.
+///
+/// A pre-column row has no `phase`, generation or epoch to report, and the shape
+/// check accepts exactly that NULL row. Inventing an `activated` milestone, a
+/// schema generation or today's resolved policy digest would claim the base was
+/// validated under a view that never ran, so this pass leaves the row alone. The
+/// epoch an activation needs is backfilled by [`TaskStore::stage_base_on`], which
+/// only ever touches a row that already records a set.
+///
+/// # Errors
+/// Returns the store's typed storage error when the serving row cannot be read, and
+/// the shape refusal when the row answers metadata this build does not write.
+pub(super) fn legacy_base_row_on(tx: &Transaction<'_>) -> Result<()> {
+    let Some(active) = base_document_on(tx, UpdateState::Active).map_err(base_refusal)? else {
+        return Ok(());
+    };
+    base_row_metadata(tx, active.version, UpdateState::Active).map_err(base_refusal)?;
+    Ok(())
+}
+
+/// A base-ledger refusal as the store's own error: the two owners speak the same
+/// storage class, and the caller here is the startup transaction, not a base
+/// caller.
+pub(super) fn base_refusal(error: BaseError) -> StoreError {
+    match error {
+        BaseError::Store(source) => source,
+        other => StoreError::Storage(Box::new(other)),
+    }
+}
+
+/// One base row's metadata as the store holds it, validated against the shape
+/// its state must have. The set's rows are read by the named page statement, so
+/// this validation walks them without keeping them.
+struct BaseRowMetadata {
+    phase: Option<UpdatePhase>,
+    blocker_count: Option<u64>,
+    schema_generation: Option<u64>,
+    policy_generation: Option<String>,
+}
+
+/// The one epoch a blocker set is issued, from the never-deleted sequence inside
+/// the caller's transaction. A discarded set keeps its epoch consumed, so a page
+/// cursor minted for it can never alias the set that replaced it.
+fn allocate_set_epoch(tx: &Transaction<'_>) -> std::result::Result<u64, BaseError> {
+    let raw: i64 = tx
+        .query_row(sql::ALLOCATE_SET_EPOCH, [], |row| row.get(0))
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    u64::try_from(raw)
+        .map_err(|_negative| BaseError::Store(corrupt_column("set epoch", &raw.to_string())))
+}
+
+/// The generation a base is activated under, read inside the activating
+/// transaction: it names the ledger this same transaction just wrote, so the
+/// row and the DDL cannot name different generations.
+fn generation_column(tx: &Transaction<'_>) -> std::result::Result<i64, BaseError> {
+    let generation = schema_generation_on(tx).map_err(BaseError::Store)?;
+    i64::try_from(generation).map_err(|_overflow| {
+        BaseError::Store(corrupt_column("schema generation", &generation.to_string()))
+    })
+}
+
+/// Whether one value is the 64-lowercase-hex digest of an effective
+/// configuration: the only shape an activation may record.
+fn policy_generation_shape(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether one stored address is a canonical blocker pointer: exactly the
+/// `learning` or `config` owner, then two JSON-Pointer-escaped tokens. A token
+/// decodes in one pass only — every `~` inside it introduces `0` or `1` — so the
+/// same record and field can never be addressed by two spellings.
+fn canonical_blocker_address(address: &str) -> bool {
+    let mut parts = address.split('/');
+    let (Some(owner), Some(record), Some(field), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    matches!(owner, "learning" | "config")
+        && canonical_pointer_token(record)
+        && canonical_pointer_token(field)
+}
+
+/// One canonical JSON-Pointer token: non-empty, and a `~` is always followed by
+/// `0` or `1`.
+fn canonical_pointer_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    let mut at_least_one = false;
+    while let Some(character) = chars.next() {
+        at_least_one = true;
+        if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return false;
+        }
+    }
+    at_least_one
+}
+
+/// The five metadata columns of one base row plus its blocker rows, validated
+/// against the shape the row's state must have. `blocker_count IS NULL` is the
+/// only legacy discriminator: such a row predates the columns, holds NULL in all
+/// five and answers no set. A row this build stages carries the count and the
+/// epoch; an activated one also carries the phase and both generations.
+fn base_row_metadata(
+    conn: &Connection,
+    version: u64,
+    state: UpdateState,
+) -> std::result::Result<BaseRowMetadata, BaseError> {
+    let row = conn
+        .query_row(sql::BASE_METADATA, params![stored_u64(version)?], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .optional()
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    let Some((phase, blocker_count, schema_generation, policy_generation, set_epoch)) = row else {
+        return Err(BaseError::ReceiptMissing { version });
+    };
+    let unsigned = |column: &'static str, raw: i64| {
+        u64::try_from(raw)
+            .map_err(|_negative| BaseError::Store(corrupt_column(column, &raw.to_string())))
+    };
+    let blocker_count = blocker_count
+        .map(|raw| unsigned("blocker count", raw))
+        .transpose()?;
+    let schema_generation = schema_generation
+        .map(|raw| unsigned("schema generation", raw))
+        .transpose()?;
+    let set_epoch = set_epoch
+        .map(|raw| unsigned("set epoch", raw))
+        .transpose()?;
+    let phase = phase
+        .as_deref()
+        .map(|raw| {
+            UpdatePhase::parse(raw)
+                .ok_or_else(|| BaseError::Store(corrupt_column("base phase", raw)))
+        })
+        .transpose()?;
+    if let Some(policy) = policy_generation.as_deref()
+        && !policy_generation_shape(policy)
+    {
+        return Err(BaseError::Store(corrupt_column(
+            "policy generation",
+            policy,
+        )));
+    }
+
+    // The three legal shapes, and nothing in between. A legacy row is the only
+    // one allowed to answer NULL everywhere; every row this build wrote carries
+    // the count and an epoch, and only an activated one carries a phase.
+    if blocker_count.is_none() {
+        if phase.is_some()
+            || schema_generation.is_some()
+            || policy_generation.is_some()
+            || set_epoch.is_some()
+        {
+            return Err(BaseError::Store(corrupt_column(
+                "base metadata",
+                "a legacy row carries no metadata",
+            )));
+        }
+        return Ok(BaseRowMetadata {
+            phase,
+            blocker_count,
+            schema_generation,
+            policy_generation,
+        });
+    }
+    if set_epoch.is_none() {
+        return Err(BaseError::Store(corrupt_column(
+            "set epoch",
+            "a recorded blocker set carries its epoch",
+        )));
+    }
+    match state {
+        UpdateState::Staged => {
+            if phase.is_some() || schema_generation.is_some() || policy_generation.is_some() {
+                return Err(BaseError::Store(corrupt_column(
+                    "base metadata",
+                    "a staged base carries no activation metadata",
+                )));
+            }
+        }
+        UpdateState::Active | UpdateState::Retired => {
+            if phase != Some(UpdatePhase::Activated)
+                || schema_generation.is_none()
+                || policy_generation.is_none()
+            {
+                return Err(BaseError::Store(corrupt_column(
+                    "base metadata",
+                    "an activated base carries its phase and both generations",
+                )));
+            }
+        }
+    }
+
+    if conn
+        .query_row(sql::BASE_BLOCKER_ORPHANS, [], |row| row.get::<_, i64>(0))
+        .map_err(|error| BaseError::Store(storage(error)))?
+        != 0
+    {
+        return Err(BaseError::Store(corrupt_column(
+            "base blockers",
+            "a blocker row names a base the ledger does not hold",
+        )));
+    }
+    let blockers = {
+        let mut statement = conn
+            .prepare(sql::BASE_BLOCKER_ADDRESSES)
+            .map_err(|error| BaseError::Store(storage(error)))?;
+        statement
+            .query_map(params![stored_u64(version)?], |row| row.get::<_, String>(0))
+            .map_err(|error| BaseError::Store(storage(error)))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| BaseError::Store(storage(error)))?
+    };
+    for address in &blockers {
+        if !canonical_blocker_address(address) {
+            return Err(BaseError::Store(corrupt_column("blocker address", address)));
+        }
+    }
+    if let Some(count) = blocker_count
+        && count != blockers.len() as u64
+    {
+        return Err(BaseError::Store(corrupt_column(
+            "blocker count",
+            &format!("{count} rows name {}", blockers.len()),
+        )));
+    }
+    Ok(BaseRowMetadata {
+        phase,
+        blocker_count,
+        schema_generation,
+        policy_generation,
+    })
+}
+
 /// The base one cutover state holds, if any: at most one row per state, so the
 /// staged checkpoint and the base still serving are read by name rather than by
 /// walking the ledger.
-fn base_document_on(
+pub(super) fn base_document_on(
     conn: &Connection,
     state: UpdateState,
 ) -> std::result::Result<Option<BaseDocument>, BaseError> {
@@ -675,14 +1005,337 @@ fn receipt_assets_on(
     Ok(assets)
 }
 
+/// The abandon half of one cutover inside a caller's transaction: the staged
+/// row, its receipt and the identity rules its release recorded leave together,
+/// and only a staged row is reachable, so abandoning a checkpoint can never
+/// retire the base that serves. Its blocker set leaves through the foreign key.
+///
+/// # Errors
+/// Returns [`BaseError::NotStaged`] when the version is not the staged one —
+/// nothing is removed then — and the store's typed storage error on a failed read
+/// or write.
+pub(super) fn abandon_base_on(
+    tx: &Transaction<'_>,
+    version: u64,
+) -> std::result::Result<BaseDocument, BaseError> {
+    let staged = base_document_on(tx, UpdateState::Staged)?;
+    let Some(staged) = staged.filter(|staged| staged.version == version) else {
+        return Err(BaseError::NotStaged { version });
+    };
+    let removed = tx
+        .execute(sql::DELETE_STAGED_BASE, params![stored_u64(version)?])
+        .map_err(storage)?;
+    if removed == 0 {
+        // The row is still staged only if another writer moved it between this
+        // read and the delete. Nothing has left the store: the receipt and rule
+        // rows are untouched and the transaction rolls back.
+        return Err(BaseError::NotStaged { version });
+    }
+    tx.execute(sql::DELETE_BASE_RECEIPT, params![stored_u64(version)?])
+        .map_err(storage)?;
+    tx.execute(
+        sql::DELETE_BASE_IDENTITY_MIGRATIONS,
+        params![stored_u64(version)?],
+    )
+    .map_err(storage)?;
+    Ok(staged)
+}
+
+/// The page-scoped refusal a status read carries inside its own answer: the
+/// requested base version and the recovery that clears it, never the RPC error
+/// envelope — the other collections of the same read must survive.
+///
+/// `base` is absent from the ledger, so re-requesting it re-enters this same arm
+/// forever. The only recovery is a base the ledger does hold: the one serving now,
+/// named, or the request with no `base` key at all.
+fn page_restart(base: u64, serving: Option<u64>, refusal: Option<&BaseError>) -> WireError {
+    let message = match refusal {
+        Some(refusal) => refusal.to_string(),
+        None => match serving {
+            Some(serving) => format!(
+                "base {base} is not in the ledger; request the serving base {serving} or omit the base key"
+            ),
+            None => format!(
+                "base {base} is not in the ledger; omit the base key to read the first page"
+            ),
+        },
+    };
+    let mut wire = WireError::new(ErrorCode::Conflict, message);
+    // The closed `upd.*` namespace holds this refusal too: the page decision is an
+    // update boundary, and a caller matching on the token must be able to say so.
+    wire.boundary_id = Some(crate::update::UpdateBoundary::BasePage.token().to_string());
+    wire
+}
+
+/// What one base's row holds for a page read: the ledger lost the base, the row
+/// records no set at all, or the row's set at the requested page. The first two
+/// are different answers — a legacy row is a legal shape, not a vanished set — so
+/// the status must not turn "this row records no set" into "restart from the first
+/// page" when no page ever existed.
+enum HeldSet {
+    /// The ledger holds no row for this base at all.
+    NoBase,
+    /// The row predates the set columns: it holds NULL in all five, so no page
+    /// exists for it and a request for one is the page-scoped refusal.
+    NoSet,
+    /// The row records a set, read at the caller's page.
+    Page(crate::contracts::Page<String>),
+}
+
+/// The page of one base's set as the status serves it.
+fn blocker_page_for(
+    conn: &Connection,
+    version: u64,
+    limit: u32,
+    cursor: Option<(u64, u64)>,
+) -> std::result::Result<HeldSet, BaseError> {
+    let held = conn
+        .query_row(
+            sql::BASE_BLOCKER_SET,
+            params![stored_u64(version)?],
+            |row| row.get::<_, Option<i64>>(1),
+        )
+        .optional()
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    match held {
+        None => Ok(HeldSet::NoBase),
+        // A legacy row recorded no set: its page is absent, and only a cursor
+        // that expects rows there is the page-scoped refusal.
+        Some(None) => match cursor {
+            None => Ok(HeldSet::NoSet),
+            Some((requested, _)) => Err(BaseError::BlockerSetGone { version, requested }),
+        },
+        Some(Some(_)) => {
+            let page = blocker_page_on(conn, version, limit, cursor)?;
+            Ok(HeldSet::Page(blocker_page(page, version)))
+        }
+    }
+}
+
+/// One page size a store-level page reader accepts: `1..=PAGE_MAX`. A size of zero
+/// would ask the read for one probe row, answer `more` and serve an empty page whose
+/// next cursor names the same offset, so a caller looping on `next_cursor` would never
+/// advance; a size above the ceiling would issue an unbounded `LIMIT`. The wire surface
+/// keeps its own caller-side rule — it clamps `page.page_size` before the store sees it —
+/// so the two remain told apart.
+fn checked_page_size(page_size: u32) -> std::result::Result<u32, BaseError> {
+    if (1..=crate::contracts::PAGE_MAX).contains(&page_size) {
+        Ok(page_size)
+    } else {
+        Err(BaseError::InvalidPage {
+            detail: "the page size is outside the range this store serves",
+        })
+    }
+}
+
+/// One page of a base's blocker set plus the epoch that identifies the set.
+struct BlockerPage {
+    addresses: Vec<String>,
+    epoch: u64,
+    /// The offset this page was read at. The next cursor resumes after the rows
+    /// this page served, never after its own length: those differ on every page
+    /// whose offset is not zero.
+    offset: u64,
+    /// One row past the requested page, so a next page is known without a
+    /// second count.
+    more: bool,
+}
+
+/// One bounded page of a base's blocker set, read inside the caller's read
+/// transaction so the base row, its set identity and its rows are one
+/// generation's answer. `cursor` is the epoch and offset the caller resumed
+/// from: an epoch the row no longer holds is the page-scoped conflict, because
+/// serving the replacement's rows under it would skip or repeat the set.
+fn blocker_page_on(
+    conn: &Connection,
+    version: u64,
+    limit: u32,
+    cursor: Option<(u64, u64)>,
+) -> std::result::Result<BlockerPage, BaseError> {
+    let stored = conn
+        .query_row(
+            sql::BASE_BLOCKER_SET,
+            params![stored_u64(version)?],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    let (epoch, count) = match stored {
+        Some((Some(epoch), Some(count))) => (
+            u64::try_from(epoch).map_err(|_negative| {
+                BaseError::Store(corrupt_column("set epoch", &epoch.to_string()))
+            })?,
+            u64::try_from(count).map_err(|_negative| {
+                BaseError::Store(corrupt_column("blocker count", &count.to_string()))
+            })?,
+        ),
+        // A row that predates the metadata, a base the ledger does not hold, or
+        // a row whose set was never recorded: none of them addresses a set, so a
+        // cursor into it restarts.
+        _ => {
+            return Err(
+                cursor.map_or(BaseError::ReceiptMissing { version }, |(requested, _)| {
+                    BaseError::BlockerSetGone { version, requested }
+                }),
+            );
+        }
+    };
+    let offset = match cursor {
+        None => 0,
+        Some((requested, offset)) => {
+            if requested != epoch {
+                return Err(BaseError::BlockerSetMoved {
+                    version,
+                    requested,
+                    stored: epoch,
+                });
+            }
+            offset
+        }
+    };
+    let rows = {
+        let mut statement = conn
+            .prepare(sql::BASE_BLOCKER_PAGE)
+            .map_err(|error| BaseError::Store(storage(error)))?;
+        statement
+            .query_map(
+                params![
+                    stored_u64(version)?,
+                    i64::from(limit) + 1,
+                    stored_u64(offset)?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| BaseError::Store(storage(error)))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| BaseError::Store(storage(error)))?
+    };
+    let more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut addresses = rows;
+    if more {
+        // The extra row only answered "is there a next page"; it is not part of
+        // this page.
+        drop(addresses.pop());
+    }
+    let served = u64::try_from(addresses.len()).unwrap_or(u64::MAX);
+    // A cursor whose offset lands past the set is the caller's refusal, not a
+    // corrupt store: the rows this read enumerated are exactly the rows the set
+    // holds, so nothing the store wrote contradicts itself. It rides the
+    // page-scoped conflict the status still serves, so the rest of the read
+    // survives; it never escalates to `storage_unavailable`.
+    if offset > count || offset.checked_add(served).is_none_or(|named| named > count) {
+        return Err(BaseError::InvalidPage {
+            detail: "the cursor offset is past the rows this set holds; restart from the first page",
+        });
+    }
+    Ok(BlockerPage {
+        addresses,
+        epoch,
+        offset,
+        more,
+    })
+}
+
+/// The page a caller resumes at, as the cursor grammar names it:
+/// `blk:<base_version>:<set_epoch>:offset:<n>`. The version the cursor carries
+/// must be the one the caller asked for — a cursor from another base is not an
+/// offset into this set — and every integer must parse inside its domain.
+fn parse_blocker_cursor(cursor: &str) -> std::result::Result<(u64, u64, u64), BaseError> {
+    let malformed = |detail: &'static str| BaseError::InvalidPage { detail };
+    let rest = cursor
+        .strip_prefix("blk:")
+        .ok_or_else(|| malformed("a cursor must start with blk:"))?;
+    let mut parts = rest.split(':');
+    let (Some(version), Some(epoch), Some(offset_tag), Some(offset), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(malformed(
+            "a cursor is blk:<base_version>:<set_epoch>:offset:<offset>",
+        ));
+    };
+    if offset_tag != "offset" {
+        return Err(malformed(
+            "a cursor is blk:<base_version>:<set_epoch>:offset:<offset>",
+        ));
+    }
+    let version = version
+        .parse::<u64>()
+        .map_err(|_overflow| malformed("the cursor base version is not a decimal integer"))?;
+    let epoch = epoch
+        .parse::<u64>()
+        .map_err(|_overflow| malformed("the cursor set epoch is not a decimal integer"))?;
+    let offset = offset
+        .parse::<u64>()
+        .map_err(|_overflow| malformed("the cursor offset is not a decimal integer"))?;
+    if offset > i64::MAX as u64 {
+        return Err(malformed("the cursor offset is past the storable range"));
+    }
+    Ok((version, epoch, offset))
+}
+
+/// The cursor a caller's page resumes at, checked against the base the request
+/// names: a cursor minted for another base is not an offset into this set.
+pub(super) fn blocker_cursor_for(
+    cursor: &str,
+    requested_base: u64,
+) -> std::result::Result<(u64, u64), BaseError> {
+    let (version, epoch, offset) = parse_blocker_cursor(cursor)?;
+    if version != requested_base {
+        return Err(BaseError::InvalidPage {
+            detail: "the cursor names another base version than the request does; request the base the cursor names, or restart from the first page",
+        });
+    }
+    Ok((epoch, offset))
+}
+
+/// The one page of a set a receipt or a status serves, plus the set identity
+/// that page belongs to. A terminal page carries no cursor; a page with more
+/// rows names the epoch it was read under, so the next read can tell a moved set
+/// from a moved newest base.
+fn blocker_page(page: BlockerPage, version: u64) -> crate::contracts::Page<String> {
+    let mut answer = crate::contracts::Page::new(page.addresses, version);
+    if page.more {
+        // The next page resumes after the rows this one served. `offset + len`
+        // was proved inside the set's count when this page was read, so the sum
+        // is exact; the check keeps an arithmetic impossibility from minting a
+        // cursor that names nothing.
+        let served = u64::try_from(answer.items.len()).unwrap_or(u64::MAX);
+        answer.next_cursor = page
+            .offset
+            .checked_add(served)
+            .map(|next| format!("blk:{version}:{}:offset:{next}", page.epoch));
+    }
+    answer
+}
+
 /// One base's receipt: the base's own row supplies the version, the digest and
 /// the cutover state, the receipt table the classification, and the identity map
 /// the rules the release carries (AC-056) — the one half of the pass a receipt
 /// read back from the store answers.
-fn receipt_on(
+pub(super) fn receipt_on(
     conn: &Connection,
     version: u64,
 ) -> std::result::Result<Option<UpdateReceipt>, BaseError> {
+    Ok(
+        receipt_page_on(conn, version, crate::contracts::PAGE_DEFAULT, None)?
+            .map(|(receipt, _)| receipt),
+    )
+}
+
+/// [`receipt_on`] at a caller's page: the receipt's own base is the one the page
+/// ranges over, so `cursor` is either absent or an offset into this receipt's
+/// set. The set identity the page was read under comes back beside it, so the
+/// status can name the epoch a later read resumes from.
+pub(super) fn receipt_page_on(
+    conn: &Connection,
+    version: u64,
+    limit: u32,
+    cursor: Option<(u64, u64)>,
+) -> std::result::Result<Option<(UpdateReceipt, u64)>, BaseError> {
     let row = conn
         .query_row(sql::BASE_BY_VERSION, params![stored_u64(version)?], |row| {
             Ok((
@@ -697,30 +1350,52 @@ fn receipt_on(
         return Ok(None);
     };
     let base = base_document(raw_version, digest)?;
+    let state = update_state(&state)?;
+    let metadata = base_row_metadata(conn, base.version, state)?;
     let assets = receipt_assets_on(conn, base.version)?;
     if assets.is_empty() {
         return Err(BaseError::ReceiptMissing {
             version: base.version,
         });
     }
-    Ok(Some(UpdateReceipt {
-        base_version: base.version,
-        digest: base.digest,
-        state: update_state(&state)?,
-        assets,
-        identity: IdentityRebind {
+    // A legacy row records no set, so its receipt answers no page; every row this
+    // build wrote answers one, empty included.
+    let (blockers, epoch) = match metadata.blocker_count {
+        None => (None, 0),
+        Some(_) => {
+            let page = blocker_page_on(conn, base.version, limit, cursor)?;
+            let epoch = page.epoch;
+            (Some(blocker_page(page, base.version)), epoch)
+        }
+    };
+    Ok(Some((
+        UpdateReceipt {
             base_version: base.version,
-            migrations: identity_migrations_on(conn, base.version)?,
-            rebound: Vec::new(),
-            unassigned: Vec::new(),
+            digest: base.digest,
+            state,
+            assets,
+            identity: IdentityRebind {
+                base_version: base.version,
+                migrations: identity_migrations_on(conn, base.version)?,
+                rebound: Vec::new(),
+                unassigned: Vec::new(),
+            },
+            phase: metadata.phase,
+            blockers,
+            schema_generation: metadata.schema_generation,
+            policy_generation: metadata.policy_generation,
         },
-    }))
+        epoch,
+    )))
 }
 
 /// The location each persistent asset exists at in this installation (REQ-044):
 /// the caller supplies the two it owns, the store knows the database it was
 /// bound to. Only assets [`UPDATE_ASSETS`] names are classified.
-fn classified_assets(store: &TaskStore, install: &BaseInstall) -> Vec<(UpdateAsset, String)> {
+pub(super) fn classified_assets(
+    store: &TaskStore,
+    install: &BaseInstall,
+) -> Vec<(UpdateAsset, String)> {
     let store_path = store.bound_db.display().to_string();
     UPDATE_ASSETS
         .iter()
@@ -737,7 +1412,7 @@ fn classified_assets(store: &TaskStore, install: &BaseInstall) -> Vec<(UpdateAss
 
 /// Writes one receipt's asset rows. Idempotent by primary key, so a resumed run
 /// re-classifies the same checkpoint without widening it.
-fn write_receipt(
+pub(super) fn write_receipt(
     tx: &Transaction<'_>,
     version: u64,
     assets: &[(UpdateAsset, String)],
@@ -757,7 +1432,210 @@ fn write_receipt(
     Ok(())
 }
 
+/// Fills one base's sealed conflict set from the generation it installs: every
+/// user-owned keyed field no rule of the release places, and every stored delta the
+/// generation declares no purpose for. The set is written inside the transaction
+/// that stages the base, so the row, its count and its rows are one answer, and a
+/// re-run over the same document replaces that set rather than widening it
+/// (REQ-004).
+///
+/// A generation that was never resolved against a user layer carries no semantic
+/// inputs: nothing is judged, and the set is the empty one every row this build
+/// stages carries.
+fn seal_blockers_on(
+    tx: &Transaction<'_>,
+    version: u64,
+    semantics: Option<&SemanticInputs>,
+) -> std::result::Result<(), BaseError> {
+    // A re-seal over a *serving* row that records no set — both columns NULL — is the
+    // legal legacy shape, and it leaves that row exactly as it found it. Writing this
+    // generation's rows onto it would need a count, an epoch and, on a serving row, the
+    // activation milestone together: a count without the epoch is a shape every reader
+    // refuses, and inventing the milestone would claim a validation this base never ran
+    // under. A staged row is different: it is the checkpoint this build is staging now, so
+    // the set lands with the row and `BACKFILL_BASE_SET_EPOCH` gives the surviving
+    // pre-column row its epoch.
+    let recorded = tx
+        .query_row(
+            sql::BASE_BLOCKER_SET,
+            params![stored_u64(version)?],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    let staging_here =
+        base_document_on(tx, UpdateState::Staged)?.is_some_and(|row| row.version == version);
+    if let Some((None, None)) = recorded
+        && !staging_here
+    {
+        return Ok(());
+    }
+    let mut addresses = blockless_addresses(tx, version, semantics)?;
+    // One spelling per record field: the composite key already forbids a repeat,
+    // and the sort is what every page of the set ranges over.
+    addresses.sort_unstable();
+    // A seal that replaces a different set rotates the epoch in this same
+    // transaction as the rows it renames, from the never-deleted sequence: a cursor
+    // minted for the discarded set answers `BlockerSetMoved` with both epochs
+    // instead of resuming into the replacement. An identical re-seal leaves the
+    // epoch alone, so a replay of the same release is not a move. The rule is the
+    // recorded set, not the path the seal came from: a staging transaction that
+    // re-offers a staged row keeps it through `INSERT OR IGNORE`, and replacing its
+    // members under the old epoch would serve a cursor the set it was never minted
+    // for.
+    let held = recorded.and_then(|(epoch, _)| epoch);
+    if held.is_some() {
+        let stored = {
+            let mut statement = tx
+                .prepare(sql::BASE_BLOCKER_ADDRESSES)
+                .map_err(|error| BaseError::Store(storage(error)))?;
+            statement
+                .query_map(params![stored_u64(version)?], |row| row.get::<_, String>(0))
+                .map_err(|error| BaseError::Store(storage(error)))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| BaseError::Store(storage(error)))?
+        };
+        if stored != addresses {
+            let rotated = allocate_set_epoch(tx)?;
+            tx.execute(
+                sql::SET_BASE_SET_EPOCH,
+                params![
+                    stored_u64(version)?,
+                    i64::try_from(rotated)
+                        .map_err(|_overflow| corrupt_column("set epoch", &rotated.to_string()))?
+                ],
+            )
+            .map_err(storage)?;
+        }
+    }
+    tx.execute(sql::DELETE_BASE_BLOCKERS, params![stored_u64(version)?])
+        .map_err(storage)?;
+    for address in &addresses {
+        tx.execute(
+            sql::INSERT_BASE_BLOCKER,
+            params![stored_u64(version)?, address],
+        )
+        .map_err(storage)?;
+    }
+    tx.execute(
+        sql::SET_BASE_BLOCKER_COUNT,
+        params![
+            stored_u64(version)?,
+            i64::try_from(addresses.len())
+                .map_err(|_overflow| BaseError::Store(corrupt_column("blocker count", "count")))?
+        ],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The addresses one generation cannot place. A keyed record the base already
+/// declares is mapped by the generation itself, and a record some rule of the
+/// release places is mapped by that rule; every other stated field of a user
+/// record is the scoped conflict.
+fn blockless_addresses(
+    tx: &Transaction<'_>,
+    version: u64,
+    semantics: Option<&SemanticInputs>,
+) -> std::result::Result<Vec<String>, BaseError> {
+    let Some(semantics) = semantics else {
+        return Ok(Vec::new());
+    };
+    let placed: Vec<(IdentityKind, String, String)> = identity_migrations_on(tx, version)
+        .map_err(|error| BaseError::Store(StoreError::Storage(Box::new(error))))?
+        .into_iter()
+        .map(|rule| (rule.kind, rule.old_id, rule.new_id))
+        .collect();
+    let mut addresses = Vec::new();
+    for (key, fields) in &semantics.user_records {
+        let declared = semantics.base_purposes.contains(key)
+            || placed
+                .iter()
+                .any(|(kind, from, to)| *kind == IdentityKind::Role && (from == key || to == key));
+        if declared {
+            continue;
+        }
+        let record = crate::config::purpose_record_pointer(key);
+        for field in fields {
+            addresses.push(crate::config::blocker_address(
+                "config",
+                &record,
+                &format!("/{field}"),
+            ));
+        }
+    }
+    addresses.extend(unplaced_bindings(tx, semantics)?);
+    Ok(addresses)
+}
+
+/// The stored bindings the generation leaves unplaced: a delta whose recorded
+/// purpose the base does not declare and no role rule names keeps its own id and
+/// content — never reminted, never rewritten — and is reported at its exact
+/// native address instead. Only the field the record really carries is named.
+fn unplaced_bindings(
+    tx: &Transaction<'_>,
+    semantics: &SemanticInputs,
+) -> std::result::Result<Vec<String>, BaseError> {
+    let mut statement = tx
+        .prepare(sql::LEARNING_DELTA_BINDINGS)
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|error| BaseError::Store(storage(error)))?;
+    let mut addresses = Vec::new();
+    for row in rows {
+        let (delta_id, scope, condition) = row.map_err(|error| BaseError::Store(storage(error)))?;
+        if DeltaScope::parse(&scope) != Some(DeltaScope::Instruction) {
+            continue;
+        }
+        let Some(raw) = condition else {
+            continue;
+        };
+        let Ok(ConditionFact::Purpose(purpose)) = serde_json::from_str::<ConditionFact>(&raw)
+        else {
+            continue;
+        };
+        if semantics.base_purposes.contains(&purpose) {
+            continue;
+        }
+        addresses.push(crate::config::blocker_address(
+            "learning",
+            &delta_id,
+            "condition_json",
+        ));
+    }
+    Ok(addresses)
+}
+
 impl TaskStore {
+    /// Whether one base's sealed set names this exact record field. The answer is
+    /// a named lookup, so a scoped conflict is enforced by address rather than by
+    /// a non-empty set or a page that happens to have been read.
+    ///
+    /// # Errors
+    /// Returns [`BaseError::Store`] when the row cannot be read.
+    pub fn base_blocker(
+        &self,
+        version: u64,
+        address: &str,
+    ) -> std::result::Result<bool, BaseError> {
+        let held: i64 = self
+            .conn()?
+            .query_row(
+                sql::BASE_BLOCKER_AT,
+                params![stored_u64(version)?, address],
+                |row| row.get(0),
+            )
+            .map_err(|error| BaseError::Store(storage(error)))?;
+        Ok(held != 0)
+    }
+
     /// The base the ledger serves now, if a base was ever installed.
     ///
     /// # Errors
@@ -785,6 +1663,29 @@ impl TaskStore {
         receipt_on(self.conn()?, version)?.ok_or(BaseError::ReceiptMissing { version })
     }
 
+    /// The receipt of one base at a caller's blocker page: the first page by
+    /// default, so a caller that asks for nothing reads what
+    /// [`TaskStore::update_receipt`] answers.
+    ///
+    /// # Errors
+    /// The refusals [`TaskStore::update_receipt`] reports, plus
+    /// [`BaseError::InvalidPage`] for a malformed cursor or a cursor of another
+    /// base.
+    pub fn update_receipt_page(
+        &self,
+        version: u64,
+        page: &UpdatePage,
+    ) -> std::result::Result<UpdateReceipt, BaseError> {
+        let page_size = checked_page_size(page.page_size)?;
+        let cursor = match page.cursor.as_deref() {
+            None => None,
+            Some(cursor) => Some(blocker_cursor_for(cursor, version)?),
+        };
+        receipt_page_on(self.conn()?, version, page_size, cursor)?
+            .map(|(receipt, _)| receipt)
+            .ok_or(BaseError::ReceiptMissing { version })
+    }
+
     /// The served projection of the base ledger (DEC-011): the base serving now
     /// and the receipt of the newest base the ledger holds. A staged base is
     /// newer than the one still serving, so a waiting cutover is visible here
@@ -793,8 +1694,32 @@ impl TaskStore {
     /// # Errors
     /// Returns [`BaseError::Store`] when the ledger cannot be read.
     pub fn update_status(&self) -> std::result::Result<UpdateStatus, BaseError> {
+        self.update_status_page(&UpdatePage::default())
+    }
+
+    /// The served projection at a caller's blocker page. `requested` names the
+    /// base whose set the page ranges over (default: the one serving) and the
+    /// cursor the caller resumes at; the receipt keeps its own newest-base
+    /// meaning, so the two pages coincide exactly when the request names that
+    /// receipt's base with no cursor.
+    ///
+    /// A page whose set is gone or was re-created cannot be served at the
+    /// requested offset. That refusal is page-scoped: it rides
+    /// `page_conflict` inside the status the caller still reads, so the other
+    /// collections of the same `runtime.status` survive rather than the whole
+    /// read failing.
+    ///
+    /// # Errors
+    /// Returns [`BaseError::InvalidPage`] for a malformed cursor, a cursor of
+    /// another base or a page size outside its range, and [`BaseError::Store`]
+    /// when the ledger cannot be read.
+    pub fn update_status_page(
+        &self,
+        requested: &UpdatePage,
+    ) -> std::result::Result<UpdateStatus, BaseError> {
+        let page_size = checked_page_size(requested.page_size)?;
         let conn = self.conn()?;
-        let base_version = base_document_on(conn, UpdateState::Active)?.map(|base| base.version);
+        let serving = base_document_on(conn, UpdateState::Active)?.map(|base| base.version);
         let newest = conn
             .query_row(sql::NEWEST_BASE_VERSION, [], |row| row.get::<_, i64>(0))
             .optional()
@@ -807,9 +1732,64 @@ impl TaskStore {
                 receipt_on(conn, version)?
             }
         };
+        // The page the request names: its own base (default: the serving one)
+        // and the cursor's offset into that set. The receipt above keeps its
+        // newest-base meaning, so the two pages agree exactly when the request
+        // names that receipt's base from the first page.
+        // The metadata fields keep the receipt's own meaning — the newest
+        // attempt's row — while `blockers` ranges over the *requested* base, so a
+        // page read never depends on which base happens to be the newest.
+        let (phase, schema_generation, policy_generation) = match receipt.as_ref() {
+            Some(receipt) => (
+                receipt.phase,
+                receipt.schema_generation,
+                receipt.policy_generation.clone(),
+            ),
+            None => (None, None, None),
+        };
+        let mut blockers = None;
+        let mut page_conflict = None;
+        if let Some(base) = requested.base.or(serving) {
+            let cursor = match requested.cursor.as_deref() {
+                None => None,
+                Some(cursor) => Some(blocker_cursor_for(cursor, base)?),
+            };
+            match blocker_page_for(conn, base, page_size, cursor) {
+                Ok(HeldSet::Page(page)) => blockers = Some(page),
+                // A legacy row records no set: the legal shape has no page to
+                // serve, so the status answers no page and no conflict — the
+                // cursor refusal belongs to a caller holding one into a set that is
+                // gone, not to a base that never had one.
+                Ok(HeldSet::NoSet) => {}
+                // A base the ledger no longer holds: the refusal names the base
+                // that answers instead, and the rest of this status still does.
+                Ok(HeldSet::NoBase) => {
+                    page_conflict = Some(page_restart(base, serving, None));
+                }
+                Err(
+                    refusal @ (BaseError::BlockerSetMoved { .. }
+                    | BaseError::BlockerSetGone { .. }
+                    | BaseError::InvalidPage { .. }),
+                ) => {
+                    page_conflict = Some(page_restart(base, serving, Some(&refusal)));
+                }
+                Err(other) => return Err(other),
+            }
+        }
         Ok(UpdateStatus {
-            base_version,
+            base_version: serving,
             receipt,
+            phase,
+            blockers,
+            schema_generation,
+            policy_generation,
+            // The retained cause and its record pointer live in the attempt
+            // record under the data root, which this owner does not know: the
+            // status surface projects them (`src/commands.rs`).
+            failure: None,
+            evidence: None,
+            page_conflict,
+            evidence_truncated: None,
         })
     }
 
@@ -840,7 +1820,34 @@ impl TaskStore {
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| BaseError::Store(storage(error)))?;
-        if let Some(active) = base_document_on(&tx, UpdateState::Active)? {
+        if let Err(refusal) = Self::stage_base_on(&tx, install, &assets) {
+            let rolled = tx.rollback().map_err(|_failed| ());
+            return Err(self.classify_rollback(install.version, refusal, rolled));
+        }
+        tx.commit().map_err(storage)?;
+        // The pin the caller validated this document against lives in memory
+        // until the activation that records it: the staged row itself carries no
+        // activation metadata, and a crash before the commit leaves a checkpoint
+        // the next run re-stages with a freshly resolved object.
+        self.staged_policy = Some(install.policy_generation.clone());
+        self.update_receipt(install.version)
+    }
+
+    /// [`TaskStore::stage_base`]'s body inside a caller's transaction: the
+    /// startup path stages and activates a base in the one generation
+    /// transaction, so this seam never opens a second one. A staged row carries
+    /// the metadata every row this build writes carries — the count of its
+    /// (empty here) blocker set and the epoch the sequence issued for it — while
+    /// the three activation-only columns stay NULL.
+    ///
+    /// # Errors
+    /// The refusals [`TaskStore::stage_base`] documents.
+    pub(crate) fn stage_base_on(
+        tx: &Transaction<'_>,
+        install: &BaseInstall,
+        assets: &[(UpdateAsset, String)],
+    ) -> std::result::Result<(), BaseError> {
+        if let Some(active) = base_document_on(tx, UpdateState::Active)? {
             if install.version < active.version {
                 return Err(BaseError::NewerRecorded {
                     offered: install.version,
@@ -849,9 +1856,10 @@ impl TaskStore {
             }
             if install.version == active.version {
                 recorded_document_matches(&active, install)?;
-                return receipt_on(&tx, install.version)?.ok_or(BaseError::ReceiptMissing {
-                    version: install.version,
-                });
+                // The recorded document is already installed: its row and set
+                // answer as written, and a re-run reuses the epoch a discarded
+                // set already consumed instead of minting another.
+                return Ok(());
             }
             if install.version != active.version + 1 {
                 return Err(BaseError::SkippedVersion {
@@ -860,25 +1868,73 @@ impl TaskStore {
                 });
             }
         }
-        if let Some(staged) = base_document_on(&tx, UpdateState::Staged)?
+        if let Some(staged) = base_document_on(tx, UpdateState::Staged)?
             && (staged.version != install.version || staged.digest != install.digest)
         {
             return Err(BaseError::AlreadyStaged {
                 version: staged.version,
             });
         }
+        let epoch = allocate_set_epoch(tx)?;
         tx.execute(
             sql::INSERT_BASE,
             params![
                 stored_u64(install.version)?,
                 install.digest,
-                UpdateState::Staged.as_str()
+                UpdateState::Staged.as_str(),
+                i64::try_from(epoch)
+                    .map_err(|_overflow| corrupt_column("set epoch", &epoch.to_string()))?
             ],
         )
         .map_err(storage)?;
-        write_receipt(&tx, install.version, &assets)?;
-        tx.commit().map_err(storage)?;
-        self.update_receipt(install.version)
+        write_receipt(tx, install.version, assets)?;
+        // The set is sealed with the row that names it: the validated generation,
+        // the rules its release already recorded and the conflicts it cannot
+        // resolve become one tuple, so a page read can never see a count without
+        // its rows.
+        seal_blockers_on(tx, install.version, install.semantics.as_ref())?;
+        // A row an earlier build staged under these exact bytes survived the
+        // `OR IGNORE` above, so it does not carry the epoch just allocated. This
+        // build is about to activate it, and every reader refuses a row whose set
+        // has no epoch, so the row is given one before that can happen.
+        tx.execute(
+            sql::BACKFILL_BASE_SET_EPOCH,
+            params![
+                stored_u64(install.version)?,
+                i64::try_from(epoch)
+                    .map_err(|_overflow| corrupt_column("set epoch", &epoch.to_string()))?
+            ],
+        )
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    /// The stage half of one cutover inside a caller's transaction (EDGE-006):
+    /// the offered document is staged and a checkpoint it may replace is
+    /// returned, so the caller commits both in the same transaction it is
+    /// already in. A refusal that must win never touches a checkpoint.
+    ///
+    /// # Errors
+    /// The [`TaskStore::stage_base`] refusals; a checkpoint of another document
+    /// under this version is the one recoverable refusal and is discarded here.
+    pub(crate) fn stage_for_cutover_on(
+        tx: &Transaction<'_>,
+        install: &BaseInstall,
+        assets: &[(UpdateAsset, String)],
+    ) -> std::result::Result<Option<BaseDocument>, BaseError> {
+        match Self::stage_base_on(tx, install, assets) {
+            Ok(()) => Ok(None),
+            // The only recoverable refusal: a checkpoint that never served,
+            // holding a version this build is at or past. A newer checkpoint
+            // propagates, and the guards have already passed, so the re-stage
+            // below can only fail on a store fault.
+            Err(BaseError::AlreadyStaged { version }) if version <= install.version => {
+                let abandoned = abandon_base_on(tx, version)?;
+                Self::stage_base_on(tx, install, assets)?;
+                Ok(Some(abandoned))
+            }
+            Err(refusal) => Err(refusal),
+        }
     }
 
     /// Commits the staged base: the base serving now stops serving, the staged
@@ -892,16 +1948,223 @@ impl TaskStore {
     /// # Errors
     /// Returns [`BaseError::NotStaged`] when the version is not staged, the
     /// identity refusals [`IdentityError`] reports through [`BaseError::Identity`],
-    /// and [`BaseError::Store`] when the write fails.
+    /// and [`BaseError::Store`] when the write fails or the validated policy this
+    /// process staged is no longer known.
+    ///
+    /// A refusal inside the transaction is undone by an explicit `ROLLBACK`
+    /// whose own result decides the outcome: a rollback that reports an error
+    /// leaves the connection in a state this call cannot vouch for, so the store
+    /// is quarantined and [`BaseError::RollbackFailed`] names it. A `COMMIT` that
+    /// answers with an error is read back — an ended transaction plus one whole
+    /// tuple is the answer, anything else quarantines as
+    /// [`BaseError::OutcomeUnread`]. Neither path retries blind, and neither
+    /// treats a dropped handle as a success.
     pub fn commit_base(&mut self, version: u64) -> std::result::Result<UpdateReceipt, BaseError> {
+        let pin = self.staged_policy.clone();
         let tx = self
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| BaseError::Store(storage(error)))?;
+        let identity = match Self::prepare_activation(&tx, version, pin.as_deref()) {
+            Ok(identity) => identity,
+            Err(refusal) => {
+                // The rollback result is the evidence: the transaction is consumed
+                // by it, so the store can no longer be observed through it.
+                let rolled = match Self::fault_step("rollback") {
+                    // The injected rollback that never runs: the transaction is
+                    // left open, which is exactly the state the classification
+                    // must refuse instead of calling it undone.
+                    true => {
+                        let mut tx = tx;
+                        tx.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+                        drop(tx);
+                        Err(())
+                    }
+                    false => tx.rollback().map_err(|_failed| ()),
+                };
+                return Err(self.classify_rollback(version, refusal, rolled));
+            }
+        };
+        let committed = match Self::fault_step("commit") {
+            // The injected ambiguity: the `COMMIT` result never arrives and the
+            // transaction is still open, which is what an interrupted commit
+            // leaves behind.
+            true => {
+                let mut tx = tx;
+                tx.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+                drop(tx);
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("the activation commit did not answer".to_string()),
+                ))
+            }
+            false => tx.commit(),
+        };
+        if let Err(source) = committed {
+            return self.read_back_after_refused_commit(version, source);
+        }
+        self.staged_policy = None;
+        let mut receipt = self.update_receipt(version)?;
+        receipt.identity = identity;
+        Ok(receipt)
+    }
+
+    /// The steps of one activation that run before its `COMMIT`: the staged
+    /// check, the pin the caller validated this document against, and the
+    /// activation itself. A refusal here is the caller's to undo explicitly.
+    fn prepare_activation(
+        tx: &Transaction<'_>,
+        version: u64,
+        pin: Option<&str>,
+    ) -> std::result::Result<IdentityRebind, BaseError> {
+        let staged =
+            base_document_on(tx, UpdateState::Staged)?.is_some_and(|row| row.version == version);
+        if !staged {
+            // Refused before the pin is examined: a version nothing staged is
+            // the caller's mistake, not a missing policy.
+            return Err(BaseError::NotStaged { version });
+        }
+        let Some(pin) = pin else {
+            return Err(BaseError::Store(corrupt_column(
+                "policy generation",
+                "no validated policy was pinned for this activation",
+            )));
+        };
+        Self::commit_base_on(tx, version, pin)
+    }
+
+    /// Classifies one refused activation from the primary itself, after its
+    /// transaction ended or failed to end: an ended connection that still holds
+    /// another serving base answered the old tuple, so the original refusal stands;
+    /// an open transaction or an unreadable tuple quarantines the store as
+    /// [`BaseError::RollbackFailed`] until a compatible reopen reads the tuple
+    /// back. A destructor never counts as the rollback.
+    fn classify_rollback(
+        &mut self,
+        version: u64,
+        refusal: BaseError,
+        rolled: std::result::Result<(), ()>,
+    ) -> BaseError {
+        if rolled.is_ok() {
+            return refusal;
+        }
+        match self.in_autocommit() {
+            Ok(true) => match self.generation_tuple() {
+                Ok(tuple) if tuple.base != Some(version) => refusal,
+                _ => {
+                    self.quarantine();
+                    BaseError::RollbackFailed { version }
+                }
+            },
+            // An unreadable state is not a rollback: refuse to claim one.
+            Ok(false) | Err(_) => {
+                self.quarantine();
+                BaseError::RollbackFailed { version }
+            }
+        }
+    }
+
+    /// The one test-armed fault of this seam, outside the `upd.*` namespace: it
+    /// names the step whose failure the proof injects, so a real rollback failure
+    /// and a real ambiguous commit are exercised rather than simulated by dropping
+    /// a handle.
+    ///
+    /// Contained by build, not by a runtime check: the environment probe exists only
+    /// in a build with debug assertions on. A release binary carries the constant
+    /// `false` below, so no environment string can make it drop a transaction and
+    /// quarantine a store. The effect stays on the activation's own transaction, so
+    /// even an armed debug build cannot corrupt state outside the store it refuses.
+    #[cfg(debug_assertions)]
+    fn fault_step(step: &str) -> bool {
+        std::env::var_os("RIVECT_UPDATE_FAULT_STEP").is_some_and(|value| value == step)
+    }
+
+    /// The release build's answer: no environment names a step, so no transaction is
+    /// dropped for one.
+    #[cfg(not(debug_assertions))]
+    fn fault_step(_step: &str) -> bool {
+        false
+    }
+
+    /// Establishes which tuple a `COMMIT` that answered with an error left
+    /// behind, from the primary itself: an ended transaction that now serves the
+    /// offered base answered a commit that landed, one that still serves another
+    /// base answered a rollback the engine already performed, and anything else —
+    /// an open transaction, an unreadable tuple — quarantines the store instead of
+    /// retrying blind.
+    fn read_back_after_refused_commit(
+        &mut self,
+        version: u64,
+        source: rusqlite::Error,
+    ) -> std::result::Result<UpdateReceipt, BaseError> {
+        if !self.in_autocommit().unwrap_or(false) {
+            self.quarantine();
+            return Err(BaseError::OutcomeUnread { version });
+        }
+        match self.generation_tuple() {
+            Ok(tuple) if tuple.base == Some(version) => {
+                // The activation landed: the row serves, so the receipt is read
+                // from the tuple rather than fabricated from the failed call.
+                self.staged_policy = None;
+                self.update_receipt(version)
+            }
+            Ok(_old) => Err(BaseError::Store(storage(source))),
+            Err(_unreadable) => {
+                self.quarantine();
+                Err(BaseError::OutcomeUnread { version })
+            }
+        }
+    }
+
+    /// [`TaskStore::commit_base`]'s body inside a caller's transaction: the
+    /// activation, the rule pass and retention land together, and the startup
+    /// transaction calls this seam so no nested `BEGIN` can deadlock the one
+    /// generation commit. `policy_generation` is the digest of the effective
+    /// configuration the cutover was validated against and is recorded as given —
+    /// it is never recomputed after validation.
+    ///
+    /// # Errors
+    /// The refusals [`TaskStore::commit_base`] documents.
+    #[expect(
+        clippy::needless_borrow,
+        reason = "the rebinding seam is called once, from this function, with this exact argument"
+    )]
+    pub(crate) fn commit_base_on(
+        tx: &Transaction<'_>,
+        version: u64,
+        policy_generation: &str,
+    ) -> std::result::Result<IdentityRebind, BaseError> {
+        if !policy_generation_shape(policy_generation) {
+            return Err(BaseError::Store(corrupt_column(
+                "policy generation",
+                policy_generation,
+            )));
+        }
+        let generation = generation_column(tx)?;
+        // A staged row whose set carries no epoch is metadata no reader accepts,
+        // so activating it would publish exactly the unreadable state this guard
+        // exists to prevent. Only a row that recorded a set is refused here: a
+        // legacy row records none and is staged by nothing.
+        let epochless = tx
+            .query_row(sql::BASE_METADATA, params![stored_u64(version)?], |row| {
+                Ok(row.get::<_, Option<i64>>(1)?.is_some()
+                    && row.get::<_, Option<i64>>(4)?.is_none())
+            })
+            .optional()
+            .map_err(storage)?;
+        if epochless == Some(true) {
+            return Err(BaseError::Store(corrupt_column(
+                "set epoch",
+                "a recorded blocker set carries its epoch",
+            )));
+        }
         tx.execute(sql::RETIRE_ACTIVE_BASE, params![stored_u64(version)?])
             .map_err(storage)?;
         let activated = tx
-            .execute(sql::ACTIVATE_BASE, params![stored_u64(version)?])
+            .execute(
+                sql::ACTIVATE_BASE,
+                params![stored_u64(version)?, generation, policy_generation],
+            )
             .map_err(storage)?;
         if activated == 0 {
             // The transaction drops without committing: the retirement above
@@ -915,10 +2178,7 @@ impl TaskStore {
         let identity = rebind_learning_identities_on(&tx)?;
         tx.execute_batch(&sql::prune_base_versions(BASE_VERSION_RETENTION))
             .map_err(storage)?;
-        tx.commit().map_err(storage)?;
-        let mut receipt = self.update_receipt(version)?;
-        receipt.identity = identity;
-        Ok(receipt)
+        Ok(identity)
     }
 
     /// Applies the base this build serves in one call — the write surface an
@@ -1006,7 +2266,7 @@ impl TaskStore {
         let abandoned = match self.active_base()? {
             Some(active) if active.version == install.version => {
                 recorded_document_matches(&active, install)?;
-                self.record_release_rules(install.version, rules)?;
+                self.record_release_rules(install, rules)?;
                 return Ok(BaseServed {
                     receipt: self.update_receipt(install.version)?,
                     abandoned: None,
@@ -1014,7 +2274,7 @@ impl TaskStore {
             }
             _ => self.stage_for_cutover(install)?,
         };
-        self.record_release_rules(install.version, rules)?;
+        self.record_release_rules(install, rules)?;
         Ok(BaseServed {
             receipt: self.commit_base(install.version)?,
             abandoned,
@@ -1024,14 +2284,18 @@ impl TaskStore {
     /// Records the rules a base's release carries under that base, one
     /// transaction for the set: a rule the map cannot hold leaves the ledger
     /// exactly as it was, and a replayed rule re-reads the row it already has.
+    /// The scoped set is re-sealed in the same transaction, because a subject a
+    /// rule places is no longer a conflict — the set and the rules it was judged
+    /// against land together.
     fn record_release_rules(
         &mut self,
-        version: u64,
+        install: &BaseInstall,
         rules: &[IdentityMigration],
     ) -> std::result::Result<(), BaseError> {
         if rules.is_empty() {
             return Ok(());
         }
+        let version = install.version;
         let tx = self
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1039,6 +2303,7 @@ impl TaskStore {
         for rule in rules {
             record_migration_on(&tx, rule, version)?;
         }
+        seal_blockers_on(&tx, version, install.semantics.as_ref())?;
         tx.commit().map_err(storage)?;
         Ok(())
     }
@@ -1051,20 +2316,15 @@ impl TaskStore {
         &mut self,
         install: &BaseInstall,
     ) -> std::result::Result<Option<BaseDocument>, BaseError> {
-        match self.stage_base(install) {
-            Ok(_) => Ok(None),
-            // The only recoverable refusal: a checkpoint that never served,
-            // holding a version this build is at or past. A newer checkpoint
-            // propagated above, and the guards have already passed, so the
-            // re-stage below can only fail on a store fault — never on this
-            // checkpoint again.
-            Err(BaseError::AlreadyStaged { version }) if version <= install.version => {
-                let abandoned = self.abandon_base(version)?;
-                self.stage_base(install)?;
-                Ok(Some(abandoned))
-            }
-            Err(refusal) => Err(refusal),
-        }
+        let assets = classified_assets(self, install);
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| BaseError::Store(storage(error)))?;
+        let abandoned = Self::stage_for_cutover_on(&tx, install, &assets)?;
+        tx.commit().map_err(storage)?;
+        self.staged_policy = Some(install.policy_generation.clone());
+        Ok(abandoned)
     }
 
     /// Abandons the checkpoint a stopped cutover staged (EDGE-006): the staged
@@ -1093,27 +2353,7 @@ impl TaskStore {
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| BaseError::Store(storage(error)))?;
-        let staged = base_document_on(&tx, UpdateState::Staged)?;
-        let Some(staged) = staged.filter(|staged| staged.version == version) else {
-            return Err(BaseError::NotStaged { version });
-        };
-        let removed = tx
-            .execute(sql::DELETE_STAGED_BASE, params![stored_u64(version)?])
-            .map_err(storage)?;
-        if removed == 0 {
-            // The row is still staged only if another writer moved it between
-            // this read and the delete. Nothing has left the store: the
-            // receipt and rule rows are untouched and the transaction rolls
-            // back.
-            return Err(BaseError::NotStaged { version });
-        }
-        tx.execute(sql::DELETE_BASE_RECEIPT, params![stored_u64(version)?])
-            .map_err(storage)?;
-        tx.execute(
-            sql::DELETE_BASE_IDENTITY_MIGRATIONS,
-            params![stored_u64(version)?],
-        )
-        .map_err(storage)?;
+        let staged = abandon_base_on(&tx, version)?;
         tx.commit().map_err(storage)?;
         Ok(staged)
     }
@@ -1915,7 +3155,7 @@ impl TaskStore {
             });
         }
         let prepared = self
-            .conn()?
+            .conn_write()?
             .execute(
                 sql::PREPARE_PROCEDURE_STEP,
                 params![run.run_id, stored_u64(position)?, tool, attempt_id],
@@ -1955,7 +3195,7 @@ impl TaskStore {
             return Ok(false);
         }
         let released = self
-            .conn()?
+            .conn_write()?
             .execute(
                 sql::RELEASE_PROCEDURE_STEP,
                 params![run_id, stored_u64(position)?],
@@ -2061,7 +3301,7 @@ impl TaskStore {
         run_id: &str,
     ) -> std::result::Result<ProcedureRun, ProcedureError> {
         let completed = self
-            .conn()?
+            .conn_write()?
             .execute(sql::COMPLETE_PROCEDURE_RUN, params![run_id])
             .map_err(storage)?;
         if completed == 0 {
@@ -2085,7 +3325,7 @@ impl TaskStore {
         stop: &StopDecision,
     ) -> std::result::Result<ProcedureRun, ProcedureError> {
         let stopped = self
-            .conn()?
+            .conn_write()?
             .execute(
                 sql::STOP_PROCEDURE_RUN,
                 params![run_id, stop.trigger.as_str(), stop.detail],
@@ -2195,7 +3435,7 @@ impl TaskStore {
         if run.state != RunState::Stopped {
             return Ok(run);
         }
-        self.conn()?
+        self.conn_write()?
             .execute(sql::RESUME_PROCEDURE_RUN, params![run.run_id])
             .map_err(storage)?;
         self.procedure_run(&run.run_id)
@@ -2266,5 +3506,172 @@ impl TaskStore {
         }
         .decode()?
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BaseSource, UPDATE_ASSETS, UpdatePhase};
+    use crate::state::Connection;
+
+    type ProofResult = Result<(), Box<dyn std::error::Error>>;
+    type ProofResult2 = Result<Vec<String>, Box<dyn std::error::Error>>;
+
+    fn base_document(extra: &str) -> String {
+        format!(
+            "config_version = 1\n\
+             [workflow]\n\
+             enabled = true\n\
+             [decisions]\n\
+             mode = \"ask\"\n\
+             [context]\n\
+             auto_compact = false\n\
+             [models.defaults]\n\
+             model = {{ mode = \"auto\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"auto\" }}\n\
+             {extra}"
+        )
+    }
+
+    fn install(root: &std::path::Path, version: u64, text: &str) -> BaseInstall {
+        BaseInstall::new(
+            BaseSource::new(version, text),
+            root.join("config.toml"),
+            root,
+        )
+    }
+
+    /// AC-055: the additive schema expansion preserves every existing column, row
+    /// and index, adds only the missing nullable columns, and is idempotent across a
+    /// reopen. The legacy shapes read back as legacy, and the invalid ones are
+    /// refused instead of being projected.
+    #[test]
+    fn receipt_metadata_round_trips() -> ProofResult {
+        let root = tempfile::TempDir::with_prefix("rivect-base-metadata-")?;
+        let db = root.path().join("state.db");
+
+        // A store shaped like one an earlier build wrote: the ledger and the
+        // receipt rows exist, the five metadata columns do not. The fixture is the
+        // only place a schema is written by hand; the product path always comes
+        // through `TaskStore`.
+        drop(TaskStore::open(&db)?);
+        {
+            let conn = Connection::open(&db)?;
+            conn.execute_batch(
+                "DROP TABLE base_state;
+                 CREATE TABLE base_state (
+                     base_version INTEGER PRIMARY KEY,
+                     digest TEXT NOT NULL,
+                     state TEXT NOT NULL
+                 ) STRICT;
+                 CREATE UNIQUE INDEX idx_base_state_active
+                     ON base_state (state) WHERE state = 'active';
+                 INSERT INTO base_state (base_version, digest, state)
+                     VALUES (1, 'legacy-bytes', 'active');
+                 INSERT INTO update_receipts (base_version, asset, location, policy)
+                     VALUES (1, 'sqlite_rows', '/legacy/state.db', 'preserve');",
+            )?;
+        }
+        let legacy_columns = |conn: &Connection| -> ProofResult2 {
+            let mut statement = conn.prepare("PRAGMA table_info(base_state)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+            Ok(columns)
+        };
+        let before = {
+            let conn = Connection::open(&db)?;
+            legacy_columns(&conn)?
+        };
+        assert_eq!(before, ["base_version", "digest", "state"]);
+
+        // The first open expands the ledger in one transaction and leaves the
+        // legacy row exactly as it was: it keeps no metadata, so it is the one
+        // shape that reads as legacy.
+        let store = TaskStore::open(&db)?;
+        let legacy = store.update_status()?;
+        assert_eq!(legacy.base_version, Some(1));
+        let legacy_receipt = legacy.receipt.ok_or("the legacy row keeps its place")?;
+        assert_eq!(legacy_receipt.phase, None);
+        assert_eq!(legacy_receipt.blockers, None);
+        assert_eq!(legacy_receipt.schema_generation, None);
+        assert_eq!(legacy_receipt.policy_generation, None);
+        assert_eq!(legacy_receipt.state, UpdateState::Active);
+        assert_eq!(
+            legacy.phase, None,
+            "a legacy row is not an activated attempt"
+        );
+        // A store this build writes: the staged row carries the count and an epoch
+        // and no activation metadata; the activated row adds the phase and both
+        // generations, and its blocker page is the empty set of that base.
+        let fresh = tempfile::TempDir::with_prefix("rivect-base-fresh-")?;
+        let mut store = TaskStore::open(&fresh.path().join("state.db"))?;
+        let first = install(fresh.path(), 1, &base_document(""));
+        let staged = store.stage_base(&first)?;
+        assert_eq!(staged.state, UpdateState::Staged);
+        assert_eq!(staged.phase, None, "a staged base is not activated");
+        assert_eq!(staged.schema_generation, None);
+        assert_eq!(staged.policy_generation, None);
+        let blockers = staged.blockers.ok_or("a staged base carries its set")?;
+        assert!(blockers.items.is_empty(), "an empty set is still a set");
+        assert_eq!(blockers.snapshot_generation, 1);
+        assert_eq!(
+            staged.assets.len(),
+            UPDATE_ASSETS.len(),
+            "the staged checkpoint classifies every asset"
+        );
+        let activated = store.commit_base(1)?;
+        assert_eq!(activated.state, UpdateState::Active);
+        assert_eq!(activated.phase, Some(UpdatePhase::Activated));
+        assert_eq!(
+            activated.schema_generation,
+            Some(KNOWN_SCHEMA_GENERATION),
+            "the activated row names the ledger it was published under"
+        );
+        assert_eq!(
+            activated.policy_generation.as_deref(),
+            Some(first.policy_generation.as_str()),
+            "the activated row names the policy the cutover pinned"
+        );
+
+        // A reopen reads the same values back from storage, never from memory.
+        drop(store);
+        let store = TaskStore::open(&fresh.path().join("state.db"))?;
+        let reread = store.update_status()?;
+        assert_eq!(reread.phase, Some(UpdatePhase::Activated));
+        assert_eq!(reread.schema_generation, Some(KNOWN_SCHEMA_GENERATION));
+        assert_eq!(
+            reread.policy_generation.as_deref(),
+            Some(first.policy_generation.as_str())
+        );
+        let page = reread.blockers.ok_or("the status serves the set")?;
+        assert!(page.items.is_empty());
+        assert_eq!(page.snapshot_generation, 1);
+
+        // The invalid shapes: a count without rows, a row without its epoch, and a
+        // noncanonical address are all refused, never projected.
+        let corrupt = tempfile::TempDir::with_prefix("rivect-base-corrupt-")?;
+        let corrupt_db = corrupt.path().join("state.db");
+        drop(TaskStore::open(&corrupt_db)?);
+        let conn = Connection::open(&corrupt_db)?;
+        conn.execute_batch(
+            "INSERT INTO base_state
+                 (base_version, digest, state, phase, blocker_count, schema_generation,
+                  policy_generation, set_epoch)
+                 VALUES (1, 'bytes', 'staged', NULL, 2, NULL, NULL, 1);",
+        )?;
+        drop(conn);
+        let store = TaskStore::open(&corrupt_db)?;
+        let refusal = store
+            .update_status()
+            .expect_err("a count without rows is corrupt");
+        assert!(
+            matches!(refusal, BaseError::Store(StoreError::Storage(_))),
+            "{refusal}"
+        );
+        drop(store);
+        Ok(())
     }
 }

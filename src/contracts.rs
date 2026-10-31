@@ -96,7 +96,7 @@ pub enum RetryClass {
 
 /// Safe, bounded wire error: names the failed operation, a safe cause and the
 /// allowed recovery read, never secret bytes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireError {
     pub code: ErrorCode,
     pub message: String,
@@ -273,7 +273,7 @@ impl AnswerAttemptOutcome {
 
 /// Bounded page of a snapshot collection. The CLI starts at `page_size` 20
 /// without a cursor; `next_cursor` is absent on the last page.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub snapshot_generation: u64,

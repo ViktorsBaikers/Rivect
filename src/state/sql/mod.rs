@@ -2,6 +2,8 @@
 //! statements are constants so CAS/outbox logic is not mixed with DDL.
 //! The one bounded existence read the session switch asks for executes
 //! here beside its statement, so the switch never walks a page.
+use std::path::Path;
+
 pub const SCHEMA: &str = include_str!("schema.sql");
 /// Decision-owned DDL: the append-only answer-attempt journal. Idempotent
 /// at open like `SCHEMA`; statement texts stay named below (P-002).
@@ -553,6 +555,11 @@ pub fn prune_learning_candidates(keep: usize) -> String {
 
 /// The base one state holds: at most one row per state serves or waits, so a
 /// cutover's staged row and the row still serving are read by name.
+/// Whether this store holds the base ledger at all. A store no generation of
+/// this build has published to answers `false`, which is why a first install
+/// owes no snapshot.
+pub const BASE_LEDGER_PRESENT: &str = "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'base_state'";
 pub const BASE_BY_STATE: &str = "SELECT base_version, digest FROM base_state WHERE state = ?1";
 /// One base by version, with the state its cutover reached.
 pub const BASE_BY_VERSION: &str =
@@ -564,13 +571,130 @@ pub const NEWEST_BASE_VERSION: &str =
 /// A base lands under its version. The first document a version was staged with
 /// stays: the bytes that differ under a recorded or staged version are refused
 /// before this statement, so `OR IGNORE` only resumes the same document's
-/// checkpoint instead of rewriting the bytes its receipt names.
+/// checkpoint instead of rewriting the bytes its receipt names. A staged row
+/// carries the discriminator this build's rows always carry — `blocker_count`
+/// present (its set is empty here, so `0`) — and the epoch the sequence issued
+/// for that set; `phase`, `schema_generation` and `policy_generation` stay NULL
+/// until activation writes them.
 pub const INSERT_BASE: &str = "INSERT OR IGNORE INTO base_state
-             (base_version, digest, state) VALUES (?1, ?2, ?3)";
+             (base_version, digest, state, blocker_count, set_epoch)
+             VALUES (?1, ?2, ?3, 0, ?4)";
 /// The cutover (PROH-004): the staged row becomes the serving one only when it
-/// is still staged, so a second cutover matches nothing.
-pub const ACTIVATE_BASE: &str = "UPDATE base_state SET state = 'active'
+/// is still staged, so a second cutover matches nothing. Activation is where a
+/// row gains the three metadata columns only an activated base has: the phase
+/// milestone, the schema generation it was activated under and the digest of
+/// the validated effective configuration.
+pub const ACTIVATE_BASE: &str = "UPDATE base_state
+             SET state = 'active', phase = 'activated',
+                 schema_generation = ?2, policy_generation = ?3
              WHERE base_version = ?1 AND state = 'staged'";
+/// The epoch a staged row an earlier build wrote never carried: `INSERT OR IGNORE`
+/// above is a no-op over that row, so the epoch this build allocated would be
+/// discarded and no reader would accept the row's metadata. Only a row that
+/// already records a set is given an epoch — a legacy row's legal shape is NULL in
+/// all five metadata columns — and a row that carries one keeps it.
+pub const BACKFILL_BASE_SET_EPOCH: &str = "UPDATE base_state SET set_epoch = ?2
+             WHERE base_version = ?1 AND set_epoch IS NULL AND blocker_count IS NOT NULL";
+/// One blocker-set epoch from the never-deleted sequence. `RETURNING` hands the
+/// allocated value back inside the allocating transaction, so a staged row and
+/// its epoch are written together and no `MAX(set_epoch) + 1` can reuse an epoch
+/// a discarded set already carried.
+pub const ALLOCATE_SET_EPOCH: &str = "UPDATE blocker_set_sequence
+             SET next_epoch = next_epoch + 1 WHERE id = 0
+             RETURNING next_epoch";
+/// The five additive metadata columns of one base row. A row that predates them
+/// answers NULL in all five: `blocker_count IS NULL` is the one legacy
+/// discriminator every shape check starts from.
+pub const BASE_METADATA: &str = "SELECT phase, blocker_count, schema_generation,
+             policy_generation, set_epoch FROM base_state WHERE base_version = ?1";
+/// A blocker row whose base is gone. The foreign key cascades, so a non-zero
+/// answer means the store was written with enforcement off and its metadata
+/// cannot be trusted.
+pub const BASE_BLOCKER_ORPHANS: &str = "SELECT COUNT(*) FROM base_blockers
+             WHERE base_version NOT IN (SELECT base_version FROM base_state)";
+/// One base's blocker addresses in page order: the set is ranged by
+/// `BINARY`-collated address, so a page never walks the rows.
+pub const BASE_BLOCKER_ADDRESSES: &str =
+    "SELECT address FROM base_blockers WHERE base_version = ?1 ORDER BY address";
+/// The set identity of one base row: the epoch the sequence issued for its set
+/// and the number of child rows that set holds. A page read ties the cursor's
+/// epoch to this one, so a cursor minted for a discarded set never serves the
+/// replacement's rows.
+pub const BASE_BLOCKER_SET: &str = "SELECT set_epoch, blocker_count FROM base_state
+             WHERE base_version = ?1";
+/// One page of a base's blocker addresses, bounded by the caller: `LIMIT ?3`
+/// asks for one row past the page, so the answer says whether a next page
+/// exists without a second count query. The row order is the composite key's
+/// `BINARY` order, which is the order every page of one set shares.
+pub const BASE_BLOCKER_PAGE: &str = "SELECT address FROM base_blockers
+             WHERE base_version = ?1 ORDER BY address COLLATE BINARY
+             LIMIT ?2 OFFSET ?3";
+/// One blocker row of one base, by its exact canonical address: the scoped
+/// applicability check. A named lookup answers whether *this* record field is
+/// blocked, so a page that has not been read and a set that is non-empty for
+/// other records can never stand in for it.
+pub const BASE_BLOCKER_AT: &str = "SELECT COUNT(*) FROM base_blockers
+             WHERE base_version = ?1 AND address = ?2";
+/// Idempotent by composite key, so a resumed run re-seals the same set over the
+/// same row instead of widening it.
+pub const INSERT_BASE_BLOCKER: &str = "INSERT OR IGNORE INTO base_blockers
+             (base_version, address) VALUES (?1, ?2)";
+/// The sealed count of one base's set, written in the transaction that stages
+/// the base so the row and its size never disagree.
+pub const SET_BASE_BLOCKER_COUNT: &str = "UPDATE base_state SET blocker_count = ?2
+             WHERE base_version = ?1";
+/// The epoch a re-seal writes when it replaces a different set under the same
+/// base row: a cursor minted for the discarded set must answer `BlockerSetMoved`
+/// rather than resume into the replacement's rows. An identical re-seal leaves
+/// the column alone, so a replayed release is not a move.
+pub const SET_BASE_SET_EPOCH: &str = "UPDATE base_state SET set_epoch = ?2
+             WHERE base_version = ?1";
+/// A re-seal replaces the whole set of one base, so a resumed run over the same
+/// document reads exactly the addresses that generation resolves — never a mix of
+/// two passes.
+pub const DELETE_BASE_BLOCKERS: &str = "DELETE FROM base_blockers WHERE base_version = ?1";
+/// The column list of the base ledger, for the add-only expansion: a store
+/// created before a column existed gains it, and a store that has it is left
+/// exactly as it is.
+pub const BASE_STATE_COLUMNS: &str = "PRAGMA table_info(base_state)";
+/// The add-only column statements. `ALTER TABLE ... ADD COLUMN` appends a
+/// nullable column without touching a row, an index or an existing column, so
+/// the expansion is idempotent and reversible by the reader that ignores an
+/// absent value.
+pub const ADD_BASE_STATE_PHASE: &str = "ALTER TABLE base_state ADD COLUMN phase TEXT NULL";
+pub const ADD_BASE_STATE_BLOCKER_COUNT: &str =
+    "ALTER TABLE base_state ADD COLUMN blocker_count INTEGER NULL CHECK (blocker_count >= 0)";
+pub const ADD_BASE_STATE_SCHEMA_GENERATION: &str =
+    "ALTER TABLE base_state ADD COLUMN schema_generation INTEGER NULL";
+pub const ADD_BASE_STATE_POLICY_GENERATION: &str =
+    "ALTER TABLE base_state ADD COLUMN policy_generation TEXT NULL";
+pub const ADD_BASE_STATE_SET_EPOCH: &str =
+    "ALTER TABLE base_state ADD COLUMN set_epoch INTEGER NULL";
+/// Whether the two recovery owners can run against the schema a store already
+/// has. They write current-generation rows, so before the generation
+/// transaction they run only on a store that holds every table they touch; on a
+/// first install or an older generation they run after the commit and before the
+/// runtime is exposed.
+pub const RECOVERY_TABLES_PRESENT: &str = "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+             AND name IN ('config_publications', 'retained', 'attempts')";
+/// The consistent copy an update takes before it touches anything: `VACUUM
+/// INTO` writes one complete database beside the primary from the connection
+/// that holds the writer lock, so the copy is transactionally consistent
+/// without a second connection and the primary is never replaced. The target
+/// is a named operation on this connection — never a raw one — and the caller
+/// binds an absolute path it generated itself.
+pub fn checkpoint_store(target: &Path) -> String {
+    format!("VACUUM INTO {}", quote_literal(target))
+}
+
+/// One SQL string literal: single quotes doubled, so a generated path can
+/// carry any byte the filesystem allowed without ending the literal early.
+fn quote_literal(value: &Path) -> String {
+    let raw = value.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
 /// The base that stops serving once its successor commits. It keeps its row
 /// and its receipt as the previous base that served, so the commit is not a
 /// rewrite of what was there.

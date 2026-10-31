@@ -166,12 +166,169 @@ pub struct BaseInstall {
     pub digest: String,
     pub config_path: PathBuf,
     pub workspace_root: PathBuf,
+    /// The generation of the effective configuration this base is offered
+    /// under: the `sources_digest` of the object the cutover was validated
+    /// against. [`BaseInstall::new`] fills it with the digest of the base layer
+    /// alone — the configuration a data root with no user document resolves to —
+    /// and a caller that resolved a user document over the base replaces it with
+    /// that object's digest (see [`BaseInstall::pinning`]), so an activated base
+    /// always names a configuration that really exists.
+    pub policy_generation: String,
+    /// The two layers a scoped semantic conflict is judged between (REQ-004).
+    /// `None` when this install was built without a resolved view, so the store
+    /// records no conflict against a surface it never saw.
+    pub(crate) semantics: Option<SemanticInputs>,
+}
+
+/// What one generation offers and what the user's own document states, kept as
+/// the store's input for the scoped-conflict set: the purposes the base declares,
+/// and each keyed purpose record of the user's layer with the fields it states
+/// explicitly. Nothing here names a field the generation maps — the store reads
+/// its own recorded rules and decides that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticInputs {
+    pub(crate) base_purposes: Vec<String>,
+    pub(crate) user_records: Vec<(String, Vec<String>)>,
+}
+
+impl SemanticInputs {
+    /// The purposes the base declares and the fields of every user record, read
+    /// from the one validated effective object the cutover pins.
+    fn of(effective: &EffectiveConfig) -> Self {
+        let base_purposes = effective.base.models.purposes.keys().cloned().collect();
+        let user_records = effective
+            .parsed
+            .as_ref()
+            .map(|user| {
+                user.models
+                    .purposes
+                    .iter()
+                    .map(|(key, def)| (key.clone(), stated_fields(def)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            base_purposes,
+            user_records,
+        }
+    }
+}
+
+/// The fields one purpose row states explicitly, in the schema's own order so the
+/// set is deterministic. A field the row leaves absent is not a value the user
+/// owns at that key.
+fn stated_fields(def: &PurposeDef) -> Vec<String> {
+    let stated = [
+        ("group", def.group.is_some()),
+        ("model", def.model.is_some()),
+        ("effort", def.effort.is_some()),
+        ("fallback", def.fallback.is_some()),
+        ("pool", def.pool.is_some()),
+        ("eligible", def.eligible.is_some()),
+    ];
+    stated
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(field, _)| field.to_string())
+        .collect()
+}
+
+/// One canonical blocker address: `learning/E(id)/E(column)` or
+/// `config/E(record_pointer)/E(field_pointer)`, where `E` is the RFC 6901 token
+/// escape (`~` → `~0`, `/` → `~1`). The owner is part of the identity, so a
+/// native learning id and a keyed config record can never be confused, and no id
+/// is reminted, case-folded, normalised, percent-decoded or truncated on the way
+/// in.
+#[must_use]
+pub fn blocker_address(owner: &str, record: &str, field: &str) -> String {
+    format!(
+        "{owner}/{}/{}",
+        pointer_escape(record),
+        pointer_escape(field)
+    )
+}
+
+/// The three parts of one canonical blocker address, or `None` when the value is
+/// not one. Splitting on `/` is the escaping boundary — a `/` inside a token is
+/// always `~1`, so exactly three segments exist — and each token decodes one
+/// layer only, so one field can never be addressed by two spellings.
+#[must_use]
+pub fn blocker_address_parts(address: &str) -> Option<(String, String, String)> {
+    let mut parts = address.split('/');
+    let (Some(owner), Some(record), Some(field), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let record = pointer_unescape(record)?;
+    let field = pointer_unescape(field)?;
+    match owner {
+        // A native id and a column spelling: neither is a pointer, so neither
+        // may start at a pointer root.
+        "learning" if !record.is_empty() && !field.is_empty() => {
+            if record.starts_with('/') || field.starts_with('/') {
+                return None;
+            }
+        }
+        // A keyed record and the field inside it, both canonical absolute
+        // pointers.
+        "config" if record.starts_with('/') && field.starts_with('/') => {}
+        _ => return None,
+    }
+    if blocker_address(owner, &record, &field) != address {
+        return None;
+    }
+    Some((owner.to_string(), record, field))
+}
+
+/// RFC 6901 token escaping: the spelling one pointer segment carries inside an
+/// address token.
+fn pointer_escape(token: &str) -> String {
+    let mut escaped = String::with_capacity(token.len());
+    for character in token.chars() {
+        match character {
+            '~' => escaped.push_str("~0"),
+            '/' => escaped.push_str("~1"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// One layer of RFC 6901 unescaping. A `~` introducing anything but `0` or `1` is
+/// malformed rather than literal, so the decode is total only on well-formed
+/// tokens.
+fn pointer_unescape(token: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(token.len());
+    let mut characters = token.chars();
+    while let Some(character) = characters.next() {
+        if character != '~' {
+            decoded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('0') => decoded.push('~'),
+            Some('1') => decoded.push('/'),
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+/// The absolute pointer of one keyed purpose record, as its own document path.
+/// The address builder escapes it, so a key carrying `/` or `~` keeps one
+/// spelling and a plain dotted display path never decides the segment.
+#[must_use]
+pub(crate) fn purpose_record_pointer(key: &str) -> String {
+    format!("/models/purposes/{key}")
 }
 
 impl BaseInstall {
     /// The install of one base document. The digest is taken from the source
     /// itself, so the receipt can never name bytes the layer was not read
-    /// from.
+    /// from; the policy generation is the one this build resolves for that
+    /// document over an absent user document, which is the honest value until a
+    /// caller pins the object it validated.
     #[must_use]
     pub fn new(
         source: BaseSource<'_>,
@@ -183,7 +340,19 @@ impl BaseInstall {
             digest: source.digest(),
             config_path: config_path.into(),
             workspace_root: workspace_root.into(),
+            policy_generation: sources_digest_on(source, b""),
+            semantics: None,
         }
+    }
+
+    /// The same install, pinned to the one validated effective configuration it
+    /// was checked against: the digest recorded with the activated base is then
+    /// the object the checks ran on, never a re-computation after them.
+    #[must_use]
+    pub fn pinning(mut self, effective: &EffectiveConfig) -> Self {
+        self.policy_generation.clone_from(&effective.sources_digest);
+        self.semantics = Some(SemanticInputs::of(effective));
+        self
     }
 }
 
@@ -325,6 +494,34 @@ impl UpdateState {
     }
 }
 
+/// The closed attempt phase (AC-055, REQ-001). `checked` is the validation
+/// milestone — the effective policy and smoke checks passed and activation had
+/// not committed — so it lives in the attempt's evidence and in this status
+/// projection, never in a ledger row; `activated` is the row's own phase and
+/// `rolled_back` belongs to a discarded attempt. JSON/SQL spelling is
+/// `checked|activated|rolled_back`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    Checked,
+    Activated,
+    RolledBack,
+}
+
+impl UpdatePhase {
+    /// The phase one stored spelling names; `None` for a value this build does
+    /// not write.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "checked" => Some(Self::Checked),
+            "activated" => Some(Self::Activated),
+            "rolled_back" => Some(Self::RolledBack),
+            _ => None,
+        }
+    }
+}
+
 /// One classified asset of the update receipt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReceiptAsset {
@@ -340,6 +537,16 @@ pub struct ReceiptAsset {
 /// writes with the policy the update followed for it, and the identity rules the
 /// base was released with (AC-056) — what the cutover placed, so the receipt
 /// names what moved by meaning as well as what it classified.
+///
+/// The four optional fields are the durable metadata the base row carries, and each
+/// one reports exactly what its column holds. All four are absent on a row written
+/// before those columns existed — the one legacy shape. A row this build staged
+/// carries `blockers` (the empty page included if its set is empty) and **no**
+/// `phase`, `schema_generation` or `policy_generation`: a staged base has not been
+/// activated, and a phase on it would claim a validation that never ran. Only an
+/// activated or retired row carries `phase: activated` together with both
+/// generations. A row that answers some but not the rest is not a shape either
+/// producer writes, so reading it refuses instead of inventing the missing half.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct UpdateReceipt {
     pub base_version: u64,
@@ -348,6 +555,16 @@ pub struct UpdateReceipt {
     pub state: UpdateState,
     pub assets: Vec<ReceiptAsset>,
     pub identity: IdentityRebind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<UpdatePhase>,
+    /// The base's blocker set as a bounded page: `snapshot_generation` is the
+    /// base version the set is immutable under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<crate::contracts::Page<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<String>,
 }
 
 /// One base the ledger records.
@@ -386,6 +603,85 @@ pub struct BaseCutover {
 pub struct UpdateStatus {
     pub base_version: Option<u64>,
     pub receipt: Option<UpdateReceipt>,
+    /// The phase of the newest attempt: `checked` while validation passed and
+    /// activation has not committed, `activated` once the row says so,
+    /// `rolled_back` for a discarded attempt. `None` for a row this build never
+    /// touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<UpdatePhase>,
+    /// The base's blocker set as a bounded page, absent for a legacy row whose
+    /// set was never recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<crate::contracts::Page<String>>,
+    /// The schema generation the base was activated under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_generation: Option<u64>,
+    /// The digest of the effective configuration the base was validated against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<String>,
+    /// The original cause of the newest attempt that recorded one, after
+    /// recovery as well as before it: the retained record is never rewritten by
+    /// a later convergence, so the operator keeps the failure they still have to
+    /// act on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::contracts::WireError>,
+    /// The retained attempt record that cause (or the newest attempt when none
+    /// recorded one) lives in, relative to the data root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// Set when part of this status could not be answered as asked, and the rest of
+    /// the read still is — the refusal rides the success-shaped status instead of the
+    /// RPC error envelope, so the other collections survive. It reports two
+    /// conditions, and `blockers` tells them apart:
+    ///
+    /// - the requested blocker page cannot be served because its set is gone, was
+    ///   re-created, or names a base the ledger does not hold — the page-scoped
+    ///   refusal — and `blockers` is then absent;
+    /// - the retained attempt-record tree under `reports/update` cannot be read or
+    ///   decoded, so `failure`/`evidence` answer nothing — here `blockers` still
+    ///   carries the page it could serve.
+    ///
+    /// A `page_conflict` the ledger already set for an invalidated cursor is never
+    /// overwritten by the record-tree fault, so a caller holding a stale cursor is
+    /// still told to restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_conflict: Option<crate::contracts::WireError>,
+    /// Set when this status projected only part of the retained attempt records: the
+    /// tree under `reports/update` holds more records than one bounded read covers, so a
+    /// cause older than the read's window is not reported here. The message names that
+    /// directory and what went unread, because truncation and "no attempt ever ran" are
+    /// different answers and the caller must be able to tell them apart. Absent when the
+    /// read covered the whole tree, which is every tree at or below the count bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_truncated: Option<String>,
+}
+
+/// One `runtime.status` blocker-page request: the page size, the base whose set
+/// is ranged (absent: the serving one) and the cursor the caller resumes at.
+/// Sibling to the task collections' `page`, never flat inside it — one request
+/// has two independent paged collections.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpdatePage {
+    /// One to [`crate::contracts::PAGE_MAX`], default
+    /// [`crate::contracts::PAGE_DEFAULT`].
+    pub page_size: u32,
+    /// The requested base version; absent means the base serving now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<u64>,
+    /// `blk:<base_version>:<set_epoch>:offset:<offset>`; absent means the first
+    /// page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl Default for UpdatePage {
+    fn default() -> Self {
+        Self {
+            page_size: crate::contracts::PAGE_DEFAULT,
+            base: None,
+            cursor: None,
+        }
+    }
 }
 
 /// The base ledger's typed refusals (P-001, EDGE-005). A refusal never leaves
@@ -400,7 +696,12 @@ pub enum BaseError {
     #[error("base version {offered} skips the recorded base {recorded}")]
     SkippedVersion { offered: u64, recorded: u64 },
     /// I-6: an older build must not write over a base a newer one recorded.
-    #[error("base version {offered} is older than the recorded base {recorded}")]
+    /// Nothing this build can run rewrites the recorded row, so the refusal
+    /// names the only step that serves: the runtime that recorded that base
+    /// opens this data root and keeps serving it.
+    #[error(
+        "base version {offered} is older than the recorded base {recorded}; recovery: open this data root with a runtime compatible with the recorded base {recorded}"
+    )]
     NewerRecorded { offered: u64, recorded: u64 },
     /// The recorded version arrived with other bytes: the ledger answers no
     /// receipt for a document this open did not compose, because the receipt
@@ -435,6 +736,48 @@ pub enum BaseError {
     /// ledger moves, so the previous base keeps serving.
     #[error("base cutover document: {0}")]
     Document(#[from] ConfigError),
+    /// The requested blocker page names a set this ledger re-created under the
+    /// same base version: the rows at the requested offset are not the ones the
+    /// cursor was minted for, so the read restarts from the first page. Both
+    /// epochs are named, and the variant — not its prose — separates this from
+    /// the absent-set case below.
+    #[error(
+        "base {version} blocker set was re-created: requested epoch {requested}, stored epoch {stored}, restart from the first page"
+    )]
+    BlockerSetMoved {
+        version: u64,
+        requested: u64,
+        stored: u64,
+    },
+    /// The requested base holds no blocker set at all (pruned, or abandoned and
+    /// not yet restaged), so no offset into it exists and the read restarts from
+    /// the first page.
+    #[error(
+        "base {version} holds no blocker set for requested epoch {requested}, restart from the first page"
+    )]
+    BlockerSetGone { version: u64, requested: u64 },
+    /// The page request itself is outside its domain: a malformed or
+    /// overflowing cursor, a cursor that names another base than the request
+    /// does, or a page size outside its range. The caller's typo is
+    /// `invalid_input`, never the store's `storage_unavailable`.
+    #[error("base blocker page: {detail}")]
+    InvalidPage { detail: &'static str },
+    /// The explicit `ROLLBACK` of a refused activation reported an error: the
+    /// connection is left in a transaction state this call cannot vouch for, so
+    /// the store is quarantined and no further statement runs until a compatible
+    /// reopen reads the whole tuple back. A destructor is not evidence of a
+    /// rollback.
+    #[error(
+        "base version {version} rollback did not report success; the store stays closed until a compatible reopen reads its tuple"
+    )]
+    RollbackFailed { version: u64 },
+    /// The activation's `COMMIT` answered with an error and the store could not
+    /// establish which tuple it holds: neither an ended transaction with one whole
+    /// tuple nor a readable one. The store is quarantined instead of retried blind.
+    #[error(
+        "base version {version} outcome could not be read back; the store stays closed until a compatible reopen reads its tuple"
+    )]
+    OutcomeUnread { version: u64 },
 }
 
 impl BaseError {
@@ -449,12 +792,22 @@ impl BaseError {
                 Stage::Parse | Stage::Schema => ErrorCode::InvalidInput,
                 Stage::Resolve => ErrorCode::Conflict,
             },
+            Self::InvalidPage { .. } => ErrorCode::InvalidInput,
+            // A failed rollback and an unreadable outcome are the store's own
+            // state, not a caller's input: they report the same unavailable
+            // class a closed store does, and the quarantine is what the next
+            // compatible open clears.
+            Self::RollbackFailed { .. } | Self::OutcomeUnread { .. } => {
+                ErrorCode::StorageUnavailable
+            }
             Self::NewerRecorded { .. }
             | Self::SkippedVersion { .. }
             | Self::AlreadyStaged { .. }
             | Self::DocumentChanged { .. }
             | Self::NotStaged { .. }
             | Self::ReceiptMissing { .. }
+            | Self::BlockerSetMoved { .. }
+            | Self::BlockerSetGone { .. }
             | Self::Identity { .. } => ErrorCode::Conflict,
         }
     }

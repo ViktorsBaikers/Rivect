@@ -3403,22 +3403,43 @@ mod tests {
 
                 assert_no_release_lines();
 
-                // A live owner: the chain ends at the `OwnerError`.
+                // A live owner: the refusal rides the retry carrier, and the
+                // original io error is preserved through it — the chain still
+                // ends at the `OwnerError`, with the carried refusal lines' own
+                // context above it, because those lines travel on that carrier.
                 let root = tempfile::TempDir::with_prefix("rivect-ui-open-owned-")?;
                 let owner = crate::owner::Owner::elect(root.path())?;
                 let error = retry_error(open_failure(root.path())?)?;
                 assert_eq!(error.kind(), std::io::ErrorKind::Other);
                 assert_eq!(error.raw_os_error(), None);
                 let hops = chain(&error);
-                assert_eq!(hops.len(), 1, "the chain ends at the OwnerError");
-                assert!(matches!(
+                assert_eq!(
+                    hops.len(),
+                    2,
+                    "the retry carrier keeps the open context above the OwnerError; \
+                     the original failure is preserved, not replaced"
+                );
+                assert!(
                     hops.first()
-                        .and_then(|hop| hop.downcast_ref::<OwnerError>()),
+                        .and_then(|hop| hop.downcast_ref::<std::io::Error>())
+                        .is_some(),
+                    "the primary under the carrier is still the runtime open context"
+                );
+                assert!(matches!(
+                    hops.get(1).and_then(|hop| hop.downcast_ref::<OwnerError>()),
                     Some(OwnerError::AlreadyOwned)
                 ));
+                // The diagnostic names the lock relative to the data root, never as an
+                // absolute path: an operator joins it with the root they already know.
+                let pointer = crate::owner::OWNER_LOCK;
                 assert_eq!(
                     super::failure_report(&error).to_string(),
-                    "tui runtime open failed: another owner already holds this data root"
+                    format!(
+                        "tui runtime open failed: another owner already holds this data root\n\
+                         update boundary: upd.owner pointer: {pointer}\n\
+                         update next: stop the update, close the process that holds this data root, then retry"
+                    ),
+                    "the failed open names the seam, the held lock and the correction"
                 );
                 drop(owner);
                 assert_no_release_lines();

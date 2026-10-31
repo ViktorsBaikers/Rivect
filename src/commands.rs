@@ -800,6 +800,146 @@ impl Runtime {
         })
     }
 
+    /// The two boot recovery passes, in the one order the contract names: the
+    /// publication receipt first, then the check-attempt reconcile. Both write
+    /// current-generation rows, so the startup runs them either on a store that
+    /// already holds every table they touch (before the generation transaction) or
+    /// right after the commit and before the runtime is exposed.
+    ///
+    /// # Errors
+    /// Returns the same typed failures the recovery owners report: a failed
+    /// settlement retention fails the open, and a root cleanup failure only
+    /// appends a diagnostic.
+    fn run_startup_recovery(owner: &mut Owner) -> Result<Vec<String>, OpenError> {
+        // A crash between the managed write and its receipt leaves one pending
+        // row; receipt exactly the writes attributable to this publisher before
+        // any config surface serves (AC-093). Every verdict a human must resolve
+        // is collected into the boot diagnostics — each surface reports the lines
+        // its own way — while the receipted rows stay silent.
+        let diagnostics: Vec<String> = config::recover_publications(&mut owner.store)
+            .map_err(OwnerError::from)?
+            .iter()
+            .filter_map(recovery_diagnostic)
+            .collect();
+        // DEC-047 check-attempt reconcile before any surface serves: settlement
+        // writes `close.unrecovered` for unrecorded interruptions and
+        // cleanup-resume removes roots that survived their durable row. A
+        // settlement retention failure is a storage fault and fails the open; a
+        // root cleanup failure only appends a diagnostic and preserves every
+        // approved row.
+        let mut diagnostics = diagnostics;
+        match reconcile_unrecovered_checks(&mut owner.store) {
+            Ok(lines) => diagnostics.extend(lines),
+            Err(error) => return Err(OpenError::new(error, diagnostics)),
+        }
+        Ok(diagnostics)
+    }
+
+    /// The one generation this open publishes, through the update owner when a
+    /// cutover waits (AC-055): the reference snapshot, the durable attempt
+    /// reserve, the validation milestone, the one `IMMEDIATE` generation
+    /// transaction, then the terminal record and the snapshot cleanup after the
+    /// outcome is proved and the tuple read back.
+    ///
+    /// An ordinary open — no staged base — publishes exactly the transaction it
+    /// always did: no snapshot, no report directory and no record.
+    ///
+    /// # Errors
+    /// The same base-ledger refusals the generation transaction reports, and the
+    /// update owner's own refusal, which carries the retained record pointer in
+    /// the boot diagnostics so an operator can read the cause it left behind.
+    fn publish_startup(
+        owner: &mut Owner,
+        data_root: &Path,
+        install: &config::BaseInstall,
+        boot_diagnostics: &[String],
+    ) -> Result<Option<config::BaseDocument>, OpenError> {
+        let pending = owner
+            .store
+            .cutover_pending()
+            .map_err(|error| open_failure(error.into(), boot_diagnostics))?;
+        if !pending {
+            return owner
+                .store
+                .publish_generation(install)
+                .map_err(|error| open_failure(base_open_failure(error), boot_diagnostics));
+        }
+        let evidence = crate::update::EvidenceStore::open(data_root).map_err(|error| {
+            // The directory itself refused: no record exists to point at, so the
+            // line names the directory.
+            update_open_failure(
+                error,
+                crate::update::EvidencePointer::Directory,
+                boot_diagnostics,
+            )
+        })?;
+        // The reserve is durable before the first effect it names, so a kill
+        // during the snapshot leaves the boundary the next open classifies.
+        let mut attempt = crate::update::UpdateEvidence::fresh(Some(install.version));
+        attempt.pending = Some(crate::update::UpdateBoundary::CheckpointCreate);
+        // The reserve write failed, so the record the attempt names does not exist:
+        // the pointer names the directory that could not hold it.
+        evidence.write(&attempt).map_err(|error| {
+            update_open_failure(
+                error,
+                crate::update::EvidencePointer::Directory,
+                boot_diagnostics,
+            )
+        })?;
+        let name = match crate::update::snapshot(&owner.store, data_root) {
+            Ok(taken) => taken.map(|snapshot| snapshot.name),
+            Err(error) => {
+                // The cause is retained before the open reports it, so the record
+                // carries the seam an operator acts on; when even that write fails
+                // the retention refusal is the one worth reporting.
+                attempt.note_failure(crate::update::Failure::at(
+                    error.boundary(),
+                    error.code(),
+                    None,
+                ));
+                attempt.terminal = crate::update::Terminal::Rejected;
+                attempt.pending = None;
+                let refusal = evidence.write(&attempt).err().unwrap_or(error);
+                // The retention write is what decides the pointer: `write` lists, decodes
+                // and prunes the records already in the tree before it renames this
+                // attempt's file, so a tree that refused, or that holds a record this build
+                // will not decode, leaves nothing of this attempt on disk to name.
+                let record = format!("{}.json", attempt.attempt_id);
+                let pointer = crate::update::refusal_pointer(&refusal, &record);
+                return Err(update_open_failure(refusal, pointer, boot_diagnostics));
+            }
+        };
+        let mut abandoned = None;
+        let outcome = crate::update::activate(
+            &mut owner.store,
+            data_root,
+            &evidence,
+            &mut attempt,
+            name.as_deref(),
+            |store| crate::update::validate_generation(store, install),
+            |store| {
+                let published = store.publish_generation(install)?;
+                abandoned = published;
+                // The commit alone is the publication's answer: the receipt read
+                // that follows it is evidence, so a fault there cannot report a
+                // landed activation as refused.
+                Ok(())
+            },
+        );
+        match outcome {
+            Ok(_) => Ok(abandoned),
+            // The activation's own milestones landed, so the attempt's record exists
+            // and the pointer names it. A terminal-write refusal is the one exception:
+            // then no record was made durable and the directory is what an operator
+            // can fix.
+            Err(error) => {
+                let record = format!("{}.json", attempt.attempt_id);
+                let pointer = crate::update::refusal_pointer(&error, &record);
+                Err(update_open_failure(error, pointer, boot_diagnostics))
+            }
+        }
+    }
+
     /// The open body: it owns the [`Owner`] until the runtime is built, so
     /// a failure drops the election and the store before the caller drains
     /// their release failures.
@@ -808,34 +948,51 @@ impl Runtime {
         provider: Box<dyn Provider>,
         read_worker: Box<dyn crate::executor::ReadWorker>,
     ) -> Result<Self, OpenError> {
-        let mut owner = Owner::elect(data_root)?;
-        // Boot recovery: a crash between the managed write and its receipt
-        // leaves one pending row; receipt exactly the writes attributable
-        // to this publisher before any config surface serves (AC-093).
-        // Every verdict a human must resolve is collected into
-        // `boot_diagnostics` — each surface reports the lines its own
-        // way — while the receipted rows stay silent.
-        let boot_diagnostics: Vec<String> = config::recover_publications(&mut owner.store)
-            .map_err(OwnerError::from)?
-            .iter()
-            .filter_map(recovery_diagnostic)
-            .collect();
-        // DEC-047 check-attempt reconcile before any surface serves:
-        // settlement writes `close.unrecovered` for unrecorded
-        // interruptions, cleanup-resume removes roots that survived
-        // their durable row. A settlement retention failure is a
-        // storage fault and fails the open (with the diagnostics
-        // reported, like every other failed open); a root cleanup
-        // failure only appends a diagnostic and preserves every
-        // approved row.
-        let mut boot_diagnostics = boot_diagnostics;
-        match reconcile_unrecovered_checks(&mut owner.store) {
-            Ok(lines) => boot_diagnostics.extend(lines),
-            Err(error) => return Err(OpenError::new(error, boot_diagnostics)),
+        // The startup admits the store without publishing the schema: everything
+        // this generation writes — the DDL batches, the reaction rebuild, the
+        // ledger, the base and the pinned policy — commits in one transaction
+        // below, so no surface can observe half a generation (REQ-001).
+        // The ownership pre-check of the cutover: a data root another process
+        // holds is refused here, before any DDL of this open, with the owner's own
+        // typed cause. That refusal is the one cause an operator cannot resolve
+        // from the error alone, so its `upd.owner` row — the seam, the lock file
+        // the other process holds and the correction — joins the pre-open
+        // diagnostics this failed open prints to stderr. The helper answers no line
+        // for any other owner failure, so those diagnostics stay exactly as they were.
+        let mut owner = Owner::elect_deferred(data_root).map_err(|error| {
+            let diagnostics = crate::update::owner_refusal_diagnostics(&error);
+            OpenError::new(error, diagnostics)
+        })?;
+        // A store that already holds the tables the recovery owners write runs
+        // them before the generation transaction: their rows describe the old
+        // generation, and the commit that follows must not depend on them being
+        // written afterwards. A first install or an older generation has nothing
+        // for them to reconcile, so they run after the commit — but they still run
+        // before any surface serves, and a verdict they collect rides the failed
+        // open of a later step.
+        let compatible = owner
+            .store
+            .startup_schema_compatible()
+            .map_err(|error| open_failure(error.into(), &[]))?;
+        let mut boot_diagnostics = Vec::new();
+        if compatible {
+            // A refused recovery keeps its verdicts on the error it returns, so the
+            // caller still reports what this open already found.
+            match Self::run_startup_recovery(&mut owner) {
+                Ok(lines) => boot_diagnostics.extend(lines),
+                Err(failure) => {
+                    let mut failure = failure;
+                    failure.diagnostics.splice(0..0, boot_diagnostics);
+                    return Err(failure);
+                }
+            }
         }
         let config_path = data_root.join("config.toml");
         let user_toml = crate::owner::read_user_config(&config_path, CONFIG_MAX_BYTES)
             .map_err(|error| open_failure(error, &boot_diagnostics))?;
+        // One bounded read and one resolve: the object validated here is the same
+        // object the transaction pins and the runtime serves, so the recorded
+        // policy generation names a configuration that really exists.
         let effective = config::resolve_effective(user_toml.as_deref()).map_err(|source| {
             open_failure(
                 OwnerError::Config {
@@ -845,31 +1002,36 @@ impl Runtime {
                 &boot_diagnostics,
             )
         })?;
-        // The base the effective view was composed from is the base the ledger
-        // records (AC-054): the write surface resolves and installs it in the
-        // same call, so a receipt can never name a base this open did not read
-        // — and a store whose recorded base this build cannot step from fails
-        // the open instead of serving a base it did not install. A checkpoint
-        // the cutover had to clear (EDGE-006) is reported, not swallowed.
-        let served = owner
-            .store
-            .serve_base(&config::BaseInstall::new(
-                config::BaseSource::SHIPPED,
-                config_path.clone(),
-                data_root.to_path_buf(),
-            ))
-            .map_err(|error| open_failure(base_open_failure(error), &boot_diagnostics))?;
-        let base_recovery = served.abandoned;
-        // Every verdict a human must resolve reaches the boot channel — the
-        // publication recoveries collected above and the checkpoint this
-        // cutover cleared alike — so a surface that only prints boot lines
-        // still names the recovery and its resolution, and a failure after this
-        // step still carries the line into the failed open (DX-I2).
+        let install = config::BaseInstall::new(
+            config::BaseSource::SHIPPED,
+            config_path.clone(),
+            data_root.to_path_buf(),
+        )
+        .pinning(&effective);
+        // The broker — and with it the injected provider, the one seam a model send
+        // would cross — exists before the update path runs. The counted provider is
+        // therefore live for the whole startup, so a zero measured on it after the
+        // open is "the update path sent nothing" rather than "no counter existed
+        // yet", which is what it said while the broker was built after the cutover.
+        let broker = Broker::new(provider);
+        let base_recovery =
+            Self::publish_startup(&mut owner, data_root, &install, &boot_diagnostics)?;
+        if !compatible {
+            match Self::run_startup_recovery(&mut owner) {
+                Ok(lines) => boot_diagnostics.extend(lines),
+                Err(failure) => {
+                    let mut failure = failure;
+                    failure.diagnostics.splice(0..0, boot_diagnostics);
+                    return Err(failure);
+                }
+            }
+        }
+        // The cutover that the one transaction performed may have discarded a
+        // checkpoint (EDGE-006); its verdict reaches the boot channel so a surface
+        // that only prints boot lines still names the recovery and its resolution
+        // (DX-I2).
         if let Some(abandoned) = &base_recovery {
-            boot_diagnostics.push(base_recovery_diagnostic(
-                abandoned,
-                served.receipt.base_version,
-            ));
+            boot_diagnostics.push(base_recovery_diagnostic(abandoned, install.version));
         }
         let supervisor = Supervisor::new(SupervisorPolicy::default())
             .map_err(|source| open_failure(source.into(), &boot_diagnostics))?;
@@ -886,7 +1048,7 @@ impl Runtime {
         let mut runtime = Self {
             owner,
             policy: Policy::default(),
-            broker: Broker::new(provider),
+            broker,
             notifications: NotificationQueue::new(8),
             scheduler: Scheduler::new(DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP),
             supervisor,
@@ -1131,11 +1293,21 @@ impl OpenError {
     /// document whose bytes changed — instead of the slot's
     /// `storage_unavailable`, which would report a document conflict as an
     /// unavailable backend.
+    ///
+    /// A refused update attempt wraps the ledger's refusal one level deeper: the
+    /// slot holds [`crate::update::UpdateError::Activation`], which carries the
+    /// [`config::BaseError`]. Both carriers are unwrapped here, so the typed base
+    /// class survives the pending-cutover path too, and the update boundary stays
+    /// in the message and diagnostics this error already carries.
     pub fn base_refusal(&self) -> Option<&config::BaseError> {
-        match &self.cause {
-            OwnerError::Store(StoreError::Storage(source)) => {
-                source.downcast_ref::<config::BaseError>()
-            }
+        let OwnerError::Store(StoreError::Storage(source)) = &self.cause else {
+            return None;
+        };
+        if let Some(refusal) = source.downcast_ref::<config::BaseError>() {
+            return Some(refusal);
+        }
+        match source.downcast_ref::<crate::update::UpdateError>() {
+            Some(crate::update::UpdateError::Activation { refusal, .. }) => Some(refusal),
             _ => None,
         }
     }
@@ -1310,6 +1482,14 @@ enum RequestError {
     InvalidPageCursor,
     #[error("page cursor offset is out of range")]
     PageCursorOffsetOutOfRange,
+    #[error("update_blockers must be an object")]
+    InvalidUpdateBlockers,
+    #[error("update_blockers.page_size must be an integer from 1 to 200")]
+    InvalidUpdatePageSize,
+    #[error("update_blockers.base must be an integer within the base version range")]
+    InvalidUpdateBase,
+    #[error("update_blockers.cursor must be a string")]
+    InvalidUpdateCursor,
     #[error("after_cursor must be a non-negative integer within the SQLite cursor range")]
     InvalidAfterCursor,
     #[error("params must be an object")]
@@ -1652,6 +1832,28 @@ fn base_open_failure(error: config::BaseError) -> OwnerError {
         config::BaseError::Store(source) => OwnerError::from(source),
         other => OwnerError::from(StoreError::Storage(Box::new(other))),
     }
+}
+
+/// One refused update attempt and what its evidence really is: the diagnostics name
+/// the attempt's record only when that record was durably written, the directory
+/// when the directory or a write inside it refused, and the seam alone when the
+/// refusal preceded the evidence step. A pointer to a file that does not exist is
+/// worse than no pointer: the operator would look for a cause that was never kept.
+fn update_open_failure(
+    error: crate::update::UpdateError,
+    pointer: crate::update::EvidencePointer<'_>,
+    diagnostics: &[String],
+) -> OpenError {
+    let mut lines = diagnostics.to_vec();
+    lines.extend(crate::update::refusal_diagnostics(
+        pointer,
+        error.boundary(),
+        error.correction(),
+    ));
+    open_failure(
+        OwnerError::from(StoreError::Storage(Box::new(error))),
+        &lines,
+    )
 }
 
 /// One failed open, carrying the boot verdicts collected so far. The verdicts
@@ -2817,7 +3019,15 @@ fn handle_method(
                 Ok(learning) => learning,
                 Err(err) => return store_error(id, &err),
             };
-            let update = match rt.owner.store.update_status() {
+            let update_page = match update_blockers_page(&params) {
+                Ok(page) => page,
+                Err(err) => return request_error(id, err),
+            };
+            let update = match crate::update::project_status(
+                rt.owner.store(),
+                &update_page,
+                &rt.data_root,
+            ) {
                 Ok(update) => update,
                 Err(err) => return base_error(id, &err),
             };
@@ -4090,6 +4300,61 @@ fn page_limit(params: &Value) -> Result<u32, RequestError> {
         Ok(limit) => Ok(limit),
         Err(_) => Err(RequestError::InvalidPageSize),
     }
+}
+
+/// The `update_blockers` request, a nested object sibling to `page`: the page
+/// size (one to [`PAGE_MAX`], refused outside it — unlike `page.page_size`,
+/// which clamps, so the two rules stay told apart), the requested base version
+/// and the cursor. A malformed value is a caller error, never the store's
+/// storage class, and the base is checked against its domain before it reaches
+/// the store's `stored_u64`.
+fn update_blockers_page(params: &Value) -> Result<config::UpdatePage, RequestError> {
+    let Some(request) = params.get("update_blockers") else {
+        return Ok(config::UpdatePage::default());
+    };
+    let Some(request) = request.as_object() else {
+        return Err(RequestError::InvalidUpdateBlockers);
+    };
+    let page_size = match request.get("page_size") {
+        None => PAGE_DEFAULT,
+        Some(raw) => {
+            let Some(size) = raw.as_u64() else {
+                return Err(RequestError::InvalidUpdatePageSize);
+            };
+            let bounded =
+                u32::try_from(size).map_err(|_overflow| RequestError::InvalidUpdatePageSize)?;
+            if !(1..=PAGE_MAX).contains(&bounded) {
+                return Err(RequestError::InvalidUpdatePageSize);
+            }
+            bounded
+        }
+    };
+    let base = match request.get("base") {
+        None => None,
+        Some(raw) => {
+            let Some(base) = raw.as_u64() else {
+                return Err(RequestError::InvalidUpdateBase);
+            };
+            if base > i64::MAX as u64 {
+                return Err(RequestError::InvalidUpdateBase);
+            }
+            Some(base)
+        }
+    };
+    let cursor = match request.get("cursor") {
+        None => None,
+        Some(raw) => {
+            let Some(cursor) = raw.as_str() else {
+                return Err(RequestError::InvalidUpdateCursor);
+            };
+            Some(cursor.to_string())
+        }
+    };
+    Ok(config::UpdatePage {
+        page_size,
+        base,
+        cursor,
+    })
 }
 
 fn status_page(params: &Value) -> Result<(Option<(u64, u64)>, u32), RequestError> {
