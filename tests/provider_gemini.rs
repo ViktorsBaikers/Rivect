@@ -795,6 +795,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::UnknownTerminal { .. }) => "UnknownTerminal",
         Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
+        Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
         None => "none",
     };
@@ -1674,6 +1675,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         UnknownTerminal,
         StreamViolation,
         IncompatibleOutput,
+        UnsupportedParameter,
         ReasoningProvenance,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
@@ -1702,6 +1704,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::UnknownTerminal { .. } => ProviderVariant::UnknownTerminal,
             ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
+            ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
         }
     }

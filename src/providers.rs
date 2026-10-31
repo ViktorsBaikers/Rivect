@@ -313,6 +313,16 @@ pub enum ProviderError {
     /// request never declared.
     #[error("connection {connection} produced an incompatible output: {reason}")]
     IncompatibleOutput { connection: String, reason: String },
+    /// The frozen request carries a parameter the connection's recorded
+    /// contract rejects for the pinned model — a rejected parameter is
+    /// a typed denial before any wire leg, never silently dropped from
+    /// the body.
+    #[error("connection {connection} rejects request parameter {parameter} for model {model}")]
+    UnsupportedParameter {
+        connection: String,
+        parameter: &'static str,
+        model: String,
+    },
     /// DEC-012: a reasoning artifact outside this manifest's
     /// session/epoch lineage — absent or foreign `encrypted_content`
     /// is a provenance failure, never silently dropped or replayed.
@@ -1113,7 +1123,7 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
-/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`
+/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`
 /// are its recorded class-A/class-P plugs speaking the same dialect
 /// (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
@@ -1162,6 +1172,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "firepass" => Some(Dialect::ChatCompletions),
         "fireworks" => Some(Dialect::ChatCompletions),
         "gmi-cloud" => Some(Dialect::ChatCompletions),
+        "groq" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

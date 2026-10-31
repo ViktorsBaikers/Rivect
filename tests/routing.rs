@@ -4716,3 +4716,65 @@ fn gmi_cloud_offline_eligibility_is_binding_level_typed() {
         "an undeclared pin is the typed denial"
     );
 }
+
+/// `groq` is a served Chat-Completions id under the recorded
+/// env/credential-chain class: the dialect map routes the literal id,
+/// and the pin is offline-eligible at the binding level through a
+/// profile-bound scoped ref — an undeclared id is the typed denial,
+/// never a dispatch.
+#[test]
+fn groq_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid\"\ncredential_ref = \"keyring:rivect/groq-scope\"\nprofile = \"groq-team\"\n\
+         [profiles.groq-team]\ncredential_ref = \"keyring:rivect/groq-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"groq\", model_id = \"openai/gpt-oss-120b\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("groq"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    // the profile-bound scoped chain is usable without a separate live
+    // grant — eligibility reads the binding, never the store
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "groq".to_string(),
+        model_id: "openai/gpt-oss-120b".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a profile-bound credential chain is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "groq",
+    ));
+
+    // a fixed pin on an undeclared id is the typed unknown-connection
+    // denial at eligibility, before any ranking or send
+    let undeclared = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"local\", model_id = \"x\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    let missing = ModelAssign::Fixed(FixedModel {
+        connection: "groq-missing".to_string(),
+        model_id: "x".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &missing,
+                &undeclared.connections,
+                &undeclared.profiles,
+            ),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+}

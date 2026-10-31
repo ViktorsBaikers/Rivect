@@ -1,15 +1,15 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass`, `fireworks` and `gmi-cloud`
-//! connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud` and
+//! `groq` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A and class P).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
 //! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass`, `fireworks` and `gmi-cloud` carry
-//! their own recorded predicates — the
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud` and
+//! `groq` carry their own recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
@@ -41,7 +41,15 @@
 //! `fireworks`, and the configured-or-default
 //! `api.gmi-serving.com/v1` host, the authoritative `/models`
 //! listing whose bare-id rows are offered verbatim and the plain
-//! bearer credential on `gmi-cloud` — resolved per literal id by the
+//! bearer credential on `gmi-cloud`, and the configured-or-default
+//! `api.groq.com/openai/v1` host, the recorded static and benchmark
+//! floor merged over the provider's non-authoritative `/models` list —
+//! a listed foreign id is offered while a 200 listing confers no
+//! entitlement — the per-model effort predicate (a pinned level the
+//! model does not record denies typed: before any wire leg for a fixed
+//! pin, and before the chat request leg for an auto pick that resolved
+//! its model from the listing first) and the
+//! plain bearer credential on `groq` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -377,6 +385,120 @@ const FIREWORKS_PRICES: &[(&str, f64, f64)] = &[
 /// borrowed from another connection's table.
 const GMI_BASE_URL: &str = "https://api.gmi-serving.com/v1";
 
+/// The recorded default API root of a `groq` connection
+/// (`api.groq.com/openai/v1`, DEC-025 row `Rivect/key →
+/// api.groq.com/openai/v1`): the host the required `endpoint` field's
+/// empty string resolves under — the same absent-override rule the
+/// plan classes bind.
+const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+
+/// The recorded `groq` static and benchmark model floor (HZN-008 class
+/// A, `groqModelManagerOptions` → `createSimpleOpenAICompletionsOptions`
+/// over the pinned `models.json` rows): the ids the contract merges
+/// over the provider's non-authoritative `/models` list. The listing
+/// contributes ids — a foreign listed id is offered — while these
+/// seeded ids keep their recorded reference surface; neither list
+/// proves entitlement.
+const GROQ_SEED: &[&str] = &[
+    "deepseek-r1-distill-llama-70b",
+    "gemma2-9b-it",
+    "groq/compound",
+    "groq/compound-mini",
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "mistral-saba-24b",
+    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2-instruct-0905",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-safeguard-20b",
+    "qwen-qwq-32b",
+    "qwen/qwen3-32b",
+    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
+];
+
+/// The recorded `groq` image-input builds (`input: ["text", "image"]`
+/// in the pinned rows): every other build is text-only.
+const GROQ_VISION_MODELS: &[&str] = &[
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
+];
+
+/// The recorded ladder the `groq/compound` systems carry.
+const GROQ_EFFORT_FULL: &[EffortLevel] = &[
+    EffortLevel::Minimal,
+    EffortLevel::Low,
+    EffortLevel::Medium,
+    EffortLevel::High,
+    EffortLevel::Xhigh,
+];
+
+/// The recorded ladder the `gpt-oss` builds carry.
+const GROQ_EFFORT_OSS: &[EffortLevel] = &[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High];
+
+/// The recorded ladder the Qwen builds carry.
+const GROQ_EFFORT_QWEN: &[EffortLevel] = &[
+    EffortLevel::Minimal,
+    EffortLevel::Low,
+    EffortLevel::Medium,
+    EffortLevel::High,
+];
+
+/// The recorded per-model effort ladder the pinned `groq` rows state
+/// (`thinking.efforts`, `thinking-mode "effort"`): a level a model
+/// does not name is a parameter its wire contract rejects, so a pin
+/// carrying it denies typed rather than dropping `reasoning_effort`
+/// from the body. A model absent here records no effort surface, so
+/// every pinned level denies for it. The recorded `max` level has no
+/// landing in our enum and never maps onto a lower one — the R1
+/// distill row therefore carries `high` alone.
+const GROQ_EFFORTS: &[(&str, &[EffortLevel])] = &[
+    ("deepseek-r1-distill-llama-70b", &[EffortLevel::High]),
+    ("groq/compound", GROQ_EFFORT_FULL),
+    ("groq/compound-mini", GROQ_EFFORT_FULL),
+    ("openai/gpt-oss-120b", GROQ_EFFORT_OSS),
+    ("openai/gpt-oss-20b", GROQ_EFFORT_OSS),
+    ("openai/gpt-oss-safeguard-20b", GROQ_EFFORT_OSS),
+    ("qwen-qwq-32b", GROQ_EFFORT_QWEN),
+    ("qwen/qwen3.6-27b", GROQ_EFFORT_QWEN),
+    ("qwen/qwen3.8-27b", GROQ_EFFORT_QWEN),
+];
+
+/// The recorded per-model USD prices the pinned `groq` rows state
+/// (`cost.input`/`cost.output` per 1M tokens): a stated zero is a
+/// real figure — a bundled or free SKU. The recorded `cacheRead`
+/// figures have no carrier — [`ModelPrice`] states input/output
+/// alone — so they stay uncarried.
+const GROQ_PRICES: &[(&str, f64, f64)] = &[
+    ("deepseek-r1-distill-llama-70b", 0.75, 0.99),
+    ("gemma2-9b-it", 0.2, 0.2),
+    ("groq/compound", 0.0, 0.0),
+    ("groq/compound-mini", 0.0, 0.0),
+    ("llama-3.1-8b-instant", 0.05, 0.08),
+    ("llama-3.3-70b-versatile", 0.59, 0.79),
+    ("llama3-70b-8192", 0.59, 0.79),
+    ("llama3-8b-8192", 0.05, 0.08),
+    ("meta-llama/llama-4-maverick-17b-128e-instruct", 0.2, 0.6),
+    ("meta-llama/llama-4-scout-17b-16e-instruct", 0.11, 0.34),
+    ("mistral-saba-24b", 0.79, 0.79),
+    ("moonshotai/kimi-k2-instruct", 1.0, 3.0),
+    ("moonshotai/kimi-k2-instruct-0905", 1.0, 3.0),
+    ("openai/gpt-oss-120b", 0.15, 0.6),
+    ("openai/gpt-oss-20b", 0.075, 0.3),
+    ("openai/gpt-oss-safeguard-20b", 0.075, 0.3),
+    ("qwen-qwq-32b", 0.29, 0.39),
+    ("qwen/qwen3-32b", 0.29, 0.59),
+    ("qwen/qwen3.6-27b", 0.6, 3.0),
+    ("qwen/qwen3.8-27b", 0.8, 4.0),
+];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -533,6 +655,18 @@ enum EntryRule {
     /// Unreached under [`CatalogRule::Allowlist`]: no listing exists
     /// to transform.
     Firepass,
+    /// The `groq` arm: the recorded static and benchmark floor merges
+    /// over the provider's non-authoritative `/models` listing, so a
+    /// listed foreign id is offered as served — no recorded price,
+    /// effort or vision surface — while a seeded recorded id keeps the
+    /// reference surface [`groq_entry`] states. The per-model effort
+    /// predicate does not live here: [`ChatCompletionsProvider::check_parameters`]
+    /// owns the typed denial of a pinned `reasoning_effort` the model's
+    /// recorded ladder does not carry — never a silently dropped body
+    /// field. The class's other recorded-rejected parameters (logprobs,
+    /// logit_bias, top_logprobs, `messages[].name`, `n`, temperature)
+    /// are never constructed by this adapter, so none can be dropped.
+    Groq,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -708,6 +842,24 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
+        }),
+        // `groq` (HZN-008 class A): the configured-or-recorded
+        // `api.groq.com/openai/v1` base, the recorded static and
+        // benchmark floor merged over the provider's non-authoritative
+        // `/models` list — a listed foreign id is offered, and a 200
+        // listing never proves entitlement — the plain bearer
+        // credential, and the recorded per-model effort predicate: a
+        // pinned `reasoning_effort` the pin's model does not record is
+        // a rejected parameter that denies typed — before any wire leg
+        // for a fixed pin, and before the chat request leg for an auto
+        // pick that resolved its model from the listing first — never
+        // silently dropped.
+        "groq" => Some(SourceContract {
+            seed: GROQ_SEED,
+            endpoint: EndpointRule::PlanBaseOrDefault(GROQ_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Groq,
         }),
         _ => None,
     }
@@ -1100,7 +1252,12 @@ impl ChatCompletionsProvider {
                 .filter_map(|id| match self.contract.entries {
                     EntryRule::DeepSeek => deepseek_entry(id),
                     EntryRule::Fireworks => fireworks_entry(id),
-                    _ => Some(CatalogModel {
+                    EntryRule::Groq => Some(groq_entry(id)),
+                    EntryRule::IdsOnly
+                    | EntryRule::Aiand
+                    | EntryRule::Aimlapi
+                    | EntryRule::AlibabaTokenPlan
+                    | EntryRule::Firepass => Some(CatalogModel {
                         id: (*id).to_string(),
                         ..CatalogModel::default()
                     }),
@@ -1141,6 +1298,10 @@ impl ChatCompletionsProvider {
             }
             EntryRule::DeepSeek => deepseek_entry(id),
             EntryRule::Fireworks => fireworks_entry(id),
+            // A listed id is offered under the recorded entry surface:
+            // a foreign id carries no recorded price, effort or vision
+            // mark, while a recorded id carries its full surface.
+            EntryRule::Groq => Some(groq_entry(id)),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -1366,10 +1527,10 @@ impl ChatCompletionsProvider {
     /// recorded `p` version separator (`toFireworksWireModelId`);
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
-    /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`
-    /// and `DeepSeek` — sends the offered id unchanged. Each variant
-    /// is listed so a future transform cannot ship verbatim ids
-    /// silently.
+    /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
+    /// `DeepSeek` and `Groq` — sends the offered id unchanged. Each
+    /// variant is listed so a future transform cannot ship verbatim
+    /// ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
@@ -1378,7 +1539,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Aiand
             | EntryRule::Aimlapi
             | EntryRule::AlibabaTokenPlan
-            | EntryRule::DeepSeek => model_id.to_string(),
+            | EntryRule::DeepSeek
+            | EntryRule::Groq => model_id.to_string(),
         }
     }
 
@@ -1424,6 +1586,42 @@ impl ChatCompletionsProvider {
             );
         }
         body
+    }
+
+    /// The recorded parameter predicate (HZN-008 `groq` row): a pinned
+    /// `reasoning_effort` rides the body only where the pin's model
+    /// records that level — every other level, and every model with no
+    /// recorded effort surface, is a parameter this class rejects. The
+    /// denial is typed and lands before the request body exists: a
+    /// fixed pin denies before any wire leg, while an auto pin — whose
+    /// model the non-authoritative listing resolved first — denies
+    /// before the chat request leg. The value is never dropped from the
+    /// body behind the caller's back. The class's other recorded-rejected
+    /// parameters (logprobs, logit_bias, top_logprobs, `messages[].name`,
+    /// `n`, temperature) are never constructed by this adapter, so none
+    /// can be dropped.
+    fn check_parameters(
+        &self,
+        manifest: &RequestManifest,
+        model_id: &str,
+    ) -> Result<(), ProviderError> {
+        if !matches!(self.contract.entries, EntryRule::Groq) {
+            return Ok(());
+        }
+        let EffortAssign::Fixed { value } = &manifest.effort else {
+            return Ok(());
+        };
+        let recorded = GROQ_EFFORTS
+            .iter()
+            .any(|(model, levels)| *model == model_id && levels.contains(value));
+        if recorded {
+            return Ok(());
+        }
+        Err(ProviderError::UnsupportedParameter {
+            connection: self.connection.clone(),
+            parameter: "reasoning_effort",
+            model: model_id.to_string(),
+        })
     }
 
     /// Reads the SSE body through the shared bounded parser and
@@ -2132,6 +2330,28 @@ fn pinned_price(rows: &[(&str, f64, f64)], id: &str) -> ModelPrice {
         .unwrap_or_default()
 }
 
+/// The recorded `groq` entry transform (pinned `models.json`): a
+/// listed or seeded id is offered as served. A recorded row carries its
+/// reasoning mark, effort ladder, image-input mark and USD price; an id
+/// the pinned rows do not name is a foreign listing id — offered with
+/// no reasoning, effort, vision or price surface, so no figure is
+/// borrowed and no entitlement is implied.
+fn groq_entry(id: &str) -> CatalogModel {
+    let efforts = GROQ_EFFORTS
+        .iter()
+        .find(|(model, _)| *model == id)
+        .map(|(_, levels)| (*levels).to_vec())
+        .unwrap_or_default();
+    CatalogModel {
+        id: id.to_string(),
+        reasoning: !efforts.is_empty(),
+        vision: GROQ_VISION_MODELS.contains(&id),
+        efforts,
+        price: pinned_price(GROQ_PRICES, id),
+        ..CatalogModel::default()
+    }
+}
+
 /// The recorded `deepseek` entry transform: only a built-in id the
 /// roster names offers — a benchmark or legacy id the listing
 /// carries never does. The admitted entry carries the recorded
@@ -2374,9 +2594,11 @@ impl Provider for ChatCompletionsProvider {
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
     /// [`ProviderError::StreamViolation`] — including a serialized
-    /// request body over the wire bound — and
-    /// [`ProviderError::IncompatibleOutput`] as the stream legs
-    /// document.
+    /// request body over the wire bound — [`ProviderError::IncompatibleOutput`]
+    /// as the stream legs document, and
+    /// [`ProviderError::UnsupportedParameter`] when the frozen request
+    /// pins a parameter the connection's recorded contract rejects for
+    /// the pinned model.
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         // The whole call spends one budget: credential resolution, the
         // auto-pool catalogue leg, and the streamed response all count
@@ -2434,6 +2656,10 @@ impl Provider for ChatCompletionsProvider {
         // the routers serving path; every other contract names the id
         // verbatim.
         let wire_model_id = self.wire_model_id(&fixed.model_id);
+        // A parameter the literal id's recorded contract rejects for
+        // this model is a typed denial before the body exists — never
+        // a value silently omitted from the request.
+        self.check_parameters(manifest, &fixed.model_id)?;
         let body = self.request_body(manifest, &wire_model_id);
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or

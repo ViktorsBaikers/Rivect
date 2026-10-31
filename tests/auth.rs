@@ -191,6 +191,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::UnknownTerminal { .. } => "UnknownTerminal",
         ProviderError::StreamViolation { .. } => "StreamViolation",
         ProviderError::IncompatibleOutput { .. } => "IncompatibleOutput",
+        ProviderError::UnsupportedParameter { .. } => "UnsupportedParameter",
         ProviderError::ReasoningProvenance { .. } => "ReasoningProvenance",
     }
 }
@@ -2745,6 +2746,104 @@ fn gmi_cloud_api_key_binding_resolves_through_scoped_secret_ref() {
     assert!(
         matches!(
             resolve_credential(&mismatched, "gmi-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}
+
+// ----- env/credential chain class: groq ---------------------------------------
+
+/// The env/credential-chain class leg (AC-040f), exercised on a `groq`
+/// fixture: the recorded class names an env key in the upstream policy
+/// but this build admits no env store kind, so an `env:GROQ_API_KEY`
+/// reference is the typed ingress refusal and never a plaintext or env
+/// resolution path. The stored binding resolves through the scoped
+/// `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared id keeps the
+/// typed denial, a resolved binding admits the pin offline, and a
+/// divergent profile scope is the mismatch. Resolution is binding-level:
+/// the store is read at send, never here. The per-ID `groq` chain proof
+/// is the provider target's
+/// `groq_env_chain_resolves_through_the_scoped_secret_ref_seam`; this
+/// case exercises the class seam.
+#[test]
+fn groq_env_chain_resolves_through_the_scoped_secret_ref_seam() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\ncredential_ref = \"keyring:rivect-test/groq-direct\"\n\
+         [connections.groq-profiled]\nkind = \"api_key\"\nendpoint = \"https://api2.example.invalid/v1\"\ncredential_ref = \"keyring:rivect-test/groq-scope\"\nprofile = \"groq-team\"\n\
+         [profiles.groq-team]\ncredential_ref = \"keyring:rivect-test/groq-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    // the recorded env spelling names no admitted store class
+    let env_spelled = toml.replace("keyring:rivect-test/groq-direct", "env:GROQ_API_KEY");
+    let Err(error) = Config::parse_validated(&env_spelled) else {
+        panic!("an env-spelled credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store } if store.as_str() == "env"
+        ),
+        "the refusal names the refused store class: {error}"
+    );
+    assert!(
+        !error.to_string().contains("env:GROQ_API_KEY"),
+        "the refusal never echoes the credential value: {error}"
+    );
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "groq")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/groq-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "groq-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/groq-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "groq",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "groq-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/groq-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "groq-profiled"),
             Err(ProviderError::CredentialProfileMismatch { .. })
         ),
         "profile/scope disagreement is CredentialProfileMismatch"

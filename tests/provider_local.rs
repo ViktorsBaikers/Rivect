@@ -25,7 +25,7 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::{Config, EffortLevel};
+use rivect::config::{Config, ConfigIssue, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::{CatalogModel, ChatCompletionsProvider, ModelPrice};
 use rivect::providers::openai::OpenAiProvider;
@@ -866,6 +866,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::UnknownTerminal { .. }) => "UnknownTerminal",
         Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
+        Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
         None => "none",
     };
@@ -1709,6 +1710,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         UnknownTerminal,
         StreamViolation,
         IncompatibleOutput,
+        UnsupportedParameter,
         ReasoningProvenance,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
@@ -1737,6 +1739,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::UnknownTerminal { .. } => ProviderVariant::UnknownTerminal,
             ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
+            ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
         }
     }
@@ -15453,3 +15456,1174 @@ async fn gmi_cloud_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::gmi-cloud = NOT_RUN"]
 fn provider_installed_gmi_cloud() {}
+
+// ----- groq --------------------------------------------------------------------
+
+// The `groq` connection's proof legs (HZN-008 class A): the shared Chat
+// Completions adapter serves the literal id — no copied codec — under
+// its own recorded predicates (DEC-025 row: `Rivect/key` →
+// `api.groq.com/openai/v1`, static and reference model data plus a
+// non-authoritative list, unsupported parameters and per-model effort).
+// The configured `endpoint` carries the API base verbatim — an empty one
+// resolves the recorded `api.groq.com/openai/v1` default — and a
+// configured `region` is denied: the contract names none. The catalogue
+// merges the recorded static and benchmark floor over the provider's
+// non-authoritative `/models` list: a listed foreign id is offered with
+// no recorded surface, a listed recorded id keeps the floor's surface,
+// and a `/models` HTTP 200 never proves entitlement. The auth class is
+// the recorded env/credential chain: an `env:`-spelled reference is
+// refused at ingress, and the stored binding resolves through the scoped
+// `SecretRef` seam under DEC-013 profile precedence. A pinned
+// `reasoning_effort` a model's recorded ladder does not carry is a
+// rejected parameter — a typed denial before any wire leg, never a
+// silently dropped body field.
+
+/// The scoped credential ref the `groq` connection binds.
+const GROQ_REF: &str = "keyring:rivect-test/groq";
+
+/// Fixture groq key material — never a real credential, only ever sent
+/// to localhost.
+const GROQ_KEY: &str = "fixture-groq-key";
+
+/// The pinned model id the fixed-pin legs carry — a recorded reasoning
+/// build carrying the `low`/`medium`/`high` effort ladder.
+const GROQ_MODEL: &str = "openai/gpt-oss-120b";
+
+/// Recorded reasoning builds that discriminate the per-model effort
+/// predicate: the systems ladder carries `xhigh`, the R1 distill carries
+/// `high` alone.
+const GROQ_COMPOUND: &str = "groq/compound";
+const GROQ_R1: &str = "deepseek-r1-distill-llama-70b";
+
+/// A recorded non-reasoning build: no effort ladder.
+const GROQ_PLAIN: &str = "gemma2-9b-it";
+
+/// One configured `groq` connection pointing at the fixture peer: the
+/// api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn groq_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{GROQ_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"groq\", model_id = \"{GROQ_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// A `groq` config pinning a specific model and effort.
+fn groq_pin_config(endpoint: &str, model: &str, effort: &str) -> String {
+    groq_config(endpoint)
+        .replace(GROQ_MODEL, model)
+        .replace("value = \"medium\"", &format!("value = \"{effort}\""))
+}
+
+fn groq_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(GROQ_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "groq".to_string(), store.clone())
+        .expect("the shared adapter builds for the groq id");
+    (provider, store)
+}
+
+/// The `groq` provider over the recorded enrolled credential.
+fn enrolled_groq_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    groq_provider(config, GROQ_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::groq --------------------------------------------------
+
+/// A configured `groq` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the plain bearer credential rides the `Authorization`
+/// header — no scope member, no body copy — and the shared adapter posts
+/// exactly the frozen manifest as a `chat/completions` request — the
+/// pinned id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt never
+/// re-sends.
+#[tokio::test]
+async fn groq_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified groq outcome",
+            Some(json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&groq_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/groq", "goal: prove the wire")
+        .expect("the groq pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/groq", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified groq outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing the
+    // manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GROQ_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(GROQ_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(GROQ_MODEL),
+        "the recorded id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "groq");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/groq", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `groq`: a stream
+/// ended mid `tool_calls` fragment — a partial call that never executes
+/// — and a finish_reason the dialect cannot classify are both the
+/// unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn groq_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_groq_provider(&config),
+        &config,
+        "/world/groq",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/groq", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_groq_provider(&config),
+        &config,
+        "/world/groq",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/groq", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+/// A parameter the `groq` class records as rejected is denied, never
+/// dropped: a pinned `reasoning_effort` the pinned model's recorded
+/// ladder does not carry — a non-reasoning build, or a level outside the
+/// build's ladder — yields the typed `UnsupportedParameter` denial
+/// naming the connection, parameter and model before any wire leg, so no
+/// request is ever posted with a silently stripped body. The admitted
+/// control posts the parameter verbatim, proving the gate denies rather
+/// than removes.
+#[tokio::test]
+async fn groq_unsupported_parameters_are_denied_not_dropped() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "admitted",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+
+    for (model, effort) in [(GROQ_PLAIN, "medium"), (GROQ_MODEL, "xhigh")] {
+        let config =
+            Config::parse_validated(&groq_pin_config(&base, model, effort)).expect("valid");
+        let (provider, _store) = enrolled_groq_provider(&config);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("the unrecorded level is a rejected parameter");
+        match &err {
+            ProviderError::UnsupportedParameter {
+                connection,
+                parameter,
+                model: named,
+            } => {
+                assert_eq!(connection, "groq");
+                assert_eq!(*parameter, "reasoning_effort");
+                assert_eq!(named, model);
+            }
+            other => panic!("the rejection is typed and names the parameter: {other:?}"),
+        }
+        assert_no_secret_or_body(&err, GROQ_KEY.as_bytes());
+        drop_blocking(provider);
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "a rejected parameter never reaches the wire — no stripped body is posted"
+    );
+
+    // the admitted pin still carries the parameter: the gate denies, it
+    // does not drop
+    let config = Config::parse_validated(&groq_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the recorded level is admitted");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "only the admitted send reached the wire");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the admitted parameter rides the body verbatim"
+    );
+}
+
+// ----- TP-PROVIDER-CATALOG::groq -----------------------------------------------
+
+/// The pinned `groq` rows as an independent expected snapshot: id,
+/// image-input mark, recorded effort ladder, and USD input/output per
+/// 1M tokens.
+fn groq_expected_rows() -> Vec<(&'static str, bool, Vec<EffortLevel>, f64, f64)> {
+    vec![
+        (
+            "deepseek-r1-distill-llama-70b",
+            false,
+            vec![EffortLevel::High],
+            0.75,
+            0.99,
+        ),
+        ("gemma2-9b-it", false, vec![], 0.2, 0.2),
+        (
+            "groq/compound",
+            false,
+            vec![
+                EffortLevel::Minimal,
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::Xhigh,
+            ],
+            0.0,
+            0.0,
+        ),
+        (
+            "groq/compound-mini",
+            false,
+            vec![
+                EffortLevel::Minimal,
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::Xhigh,
+            ],
+            0.0,
+            0.0,
+        ),
+        ("llama-3.1-8b-instant", false, vec![], 0.05, 0.08),
+        ("llama-3.3-70b-versatile", false, vec![], 0.59, 0.79),
+        ("llama3-70b-8192", false, vec![], 0.59, 0.79),
+        ("llama3-8b-8192", false, vec![], 0.05, 0.08),
+        (
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            true,
+            vec![],
+            0.2,
+            0.6,
+        ),
+        (
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            true,
+            vec![],
+            0.11,
+            0.34,
+        ),
+        ("mistral-saba-24b", false, vec![], 0.79, 0.79),
+        ("moonshotai/kimi-k2-instruct", false, vec![], 1.0, 3.0),
+        ("moonshotai/kimi-k2-instruct-0905", false, vec![], 1.0, 3.0),
+        (
+            "openai/gpt-oss-120b",
+            false,
+            vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            0.15,
+            0.6,
+        ),
+        (
+            "openai/gpt-oss-20b",
+            false,
+            vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            0.075,
+            0.3,
+        ),
+        (
+            "openai/gpt-oss-safeguard-20b",
+            false,
+            vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            0.075,
+            0.3,
+        ),
+        (
+            "qwen-qwq-32b",
+            false,
+            vec![
+                EffortLevel::Minimal,
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+            ],
+            0.29,
+            0.39,
+        ),
+        ("qwen/qwen3-32b", false, vec![], 0.29, 0.59),
+        (
+            "qwen/qwen3.6-27b",
+            true,
+            vec![
+                EffortLevel::Minimal,
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+            ],
+            0.6,
+            3.0,
+        ),
+        (
+            "qwen/qwen3.8-27b",
+            true,
+            vec![
+                EffortLevel::Minimal,
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+            ],
+            0.8,
+            4.0,
+        ),
+    ]
+}
+
+/// The `groq` catalogue merges the recorded static and benchmark floor
+/// over the provider's non-authoritative `/models` list (HZN-008 class
+/// A): the lookup resolves the plain bearer on one `GET {endpoint}/models`
+/// leg, a listed foreign id is offered exactly as served with no
+/// recorded surface — never a borrowed price — a listed recorded id
+/// does not duplicate its seeded row, and every seeded row keeps its
+/// recorded reasoning mark, effort ladder, vision mark and USD price.
+#[tokio::test]
+async fn groq_non_authoritative_listing_merges_offers_without_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "foreign-listed-chat"}),
+            // a listed id the static floor already carries
+            json!({"id": GROQ_MODEL}),
+            // an empty id never names a model
+            json!({"id": ""}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the catalogue answers");
+    drop_blocking(provider);
+
+    let expected = groq_expected_rows();
+    assert_eq!(
+        models.len(),
+        expected.len() + 1,
+        "the static floor unions the foreign listed id: {:?}",
+        model_ids(&models)
+    );
+    for (id, vision, efforts, input_per_1m, output_per_1m) in &expected {
+        let model = models
+            .iter()
+            .find(|model| model.id == *id)
+            .unwrap_or_else(|| panic!("{id} is offered"));
+        assert_eq!(model.vision, *vision, "{id}: image-input mark");
+        assert_eq!(model.efforts, *efforts, "{id}: recorded effort ladder");
+        assert_eq!(
+            model.reasoning,
+            !efforts.is_empty(),
+            "{id}: reasoning follows the recorded ladder"
+        );
+        assert_eq!(
+            model.price,
+            ModelPrice::Usd {
+                input_per_1m: *input_per_1m,
+                output_per_1m: *output_per_1m,
+            },
+            "{id}: recorded USD price"
+        );
+        assert_eq!(model.context_window, None, "{id}: no window is carried");
+        assert_eq!(
+            model.effort_default, None,
+            "{id}: no default effort is carried"
+        );
+    }
+    assert_eq!(
+        models.iter().filter(|model| model.id == GROQ_MODEL).count(),
+        1,
+        "a listed recorded id deduplicates against its seeded row"
+    );
+
+    let foreign = models
+        .iter()
+        .find(|model| model.id == "foreign-listed-chat")
+        .expect("a listed foreign id is offered");
+    assert_eq!(
+        foreign,
+        &CatalogModel {
+            id: "foreign-listed-chat".to_string(),
+            ..CatalogModel::default()
+        },
+        "a foreign id carries no borrowed price, effort or vision surface"
+    );
+
+    let mut sorted = model_ids(&models);
+    sorted.sort_unstable();
+    assert_eq!(
+        model_ids(&models),
+        sorted,
+        "the merged offer is deterministic sorted order"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one discovery leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GROQ_KEY}"),
+        "the plain key bears the discovery leg"
+    );
+}
+
+/// The auto-pick leg rides the non-authoritative listing under the
+/// record's auto semantic: the dispatch narrows the pool to the `groq`
+/// member, the merged catalogue is sorted deterministically, and the
+/// sorted-first **listed** id — a foreign id the static floor does not
+/// carry — names the wire model verbatim, in the inverted order the
+/// peer answered.
+#[tokio::test]
+async fn groq_auto_pick_resolves_through_the_non_authoritative_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "zz-listed-late"}),
+            json!({"id": "aaa-listed-first"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{GROQ_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"groq\"] }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/groq", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/groq", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("aaa-listed-first"),
+        "the sorted-first listed id names the wire model verbatim"
+    );
+}
+
+/// The recorded effort predicate applies per model, not per connection:
+/// on the one `groq` connection, `xhigh` is admitted for the systems
+/// build and denied for the `gpt-oss` build, while `high` is admitted for
+/// both; the R1 distill admits `high` and denies `low`. The catalogue
+/// carries the same per-model ladders.
+#[tokio::test]
+async fn groq_per_model_effort_predicates_apply() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "per model",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+
+    for (model, effort, admitted) in [
+        (GROQ_COMPOUND, "xhigh", true),
+        (GROQ_MODEL, "xhigh", false),
+        (GROQ_MODEL, "high", true),
+        (GROQ_R1, "low", false),
+        (GROQ_R1, "high", true),
+    ] {
+        let config =
+            Config::parse_validated(&groq_pin_config(&base, model, effort)).expect("valid");
+        let (provider, _store) = enrolled_groq_provider(&config);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        if admitted {
+            outcome.expect("the recorded level is admitted");
+        } else {
+            assert!(
+                matches!(outcome, Err(ProviderError::UnsupportedParameter { .. })),
+                "a {model} pin at {effort} is outside its recorded ladder: {outcome:?}"
+            );
+        }
+        drop_blocking(provider);
+        if admitted {
+            let requests = server.received_requests().await.expect("recorded");
+            let body: Value =
+                serde_json::from_slice(&requests[requests.len() - 1].body).expect("json body");
+            assert_eq!(
+                body["model"],
+                json!(model),
+                "the admitted pin names its own model"
+            );
+            assert_eq!(body["reasoning_effort"], json!(effort));
+        }
+    }
+
+    let config = Config::parse_validated(&groq_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the merged catalogue answers");
+    drop_blocking(provider);
+    let ladder = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.efforts.clone())
+            .expect("the pinned model is offered")
+    };
+    assert_eq!(
+        ladder(GROQ_COMPOUND),
+        vec![
+            EffortLevel::Minimal,
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Xhigh,
+        ]
+    );
+    assert_eq!(
+        ladder(GROQ_MODEL),
+        vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+        "the same connection offers a different ladder per model"
+    );
+}
+
+/// An auto pick that resolves the sorted-first recorded id while the
+/// effort is pinned is the same per-model predicate, not a
+/// connection-wide exception: the discovery leg merges the floor, the
+/// deterministic pick is the R1 distill build — whose recorded ladder is
+/// `high` alone — and a pinned `medium` is therefore a rejected
+/// parameter, denied typed before the chat leg exists.
+#[tokio::test]
+async fn groq_auto_pick_with_a_pinned_effort_denies_the_short_ladder_seed() {
+    let server = MockServer::start().await;
+    // a listed id sorting after the seeded R1 build
+    mount_models(&server, vec![json!({"id": "zz-foreign-listed"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "never sent",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{GROQ_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"groq\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("the sorted-first build does not carry the pinned level");
+    match &err {
+        ProviderError::UnsupportedParameter {
+            connection,
+            parameter,
+            model,
+        } => {
+            assert_eq!(connection, "groq");
+            assert_eq!(*parameter, "reasoning_effort");
+            assert_eq!(model, GROQ_R1);
+        }
+        other => panic!("the auto pick denies the unrecorded level typed: {other:?}"),
+    }
+    assert_no_secret_or_body(&err, GROQ_KEY.as_bytes());
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the discovery leg runs — the denied parameter never reaches the chat leg"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+}
+
+/// An empty configured endpoint resolves the recorded default — the
+/// `config?.baseUrl ?? defaultBaseUrl` absent arm our required `endpoint`
+/// field expresses as the empty string, and whitespace-only shares the
+/// arm under the recorded trim. Offline pin: the adapter's `Debug`
+/// surface reports the resolved endpoint, so the arm is proved without
+/// one byte toward `api.groq.com`.
+#[test]
+fn groq_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&groq_config(endpoint)).expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_groq_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.groq.com/openai/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+// ----- TP-PROVIDER-AUTH::groq --------------------------------------------------
+
+/// The recorded env/credential-chain auth class resolves through the
+/// scoped `SecretRef` seam and never through an env spelling or a
+/// plaintext fallback: an `env:GROQ_API_KEY` reference is refused at
+/// config ingress with the typed store refusal that never echoes the
+/// value, and on a connection that binds both the connection ref and a
+/// profile, DEC-013 precedence sends the profile's scoped material —
+/// the connection-scope key never bears the wire.
+#[tokio::test]
+async fn groq_env_chain_resolves_through_the_scoped_secret_ref_seam() {
+    // the recorded env spelling is not an admitted store class
+    let env_spelled = groq_config("http://127.0.0.1:1/v1").replace(
+        &format!("credential_ref = \"{GROQ_REF}\""),
+        "credential_ref = \"env:GROQ_API_KEY\"",
+    );
+    let Err(error) = Config::parse_validated(&env_spelled) else {
+        panic!("an env-spelled credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store } if store.as_str() == "env"
+        ),
+        "the refusal names the refused store class: {error}"
+    );
+    assert!(
+        !error.to_string().contains("env:GROQ_API_KEY"),
+        "the refusal never echoes the credential value: {error}"
+    );
+
+    // a stored profile binding wins over the connection's own ref — the
+    // chain resolves scoped store material, not a dummy local key
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "chained",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"keyring:rivect-test/groq-connection\"\nprofile = \"groq-chain\"\n\
+         [profiles.groq-chain]\ncredential_ref = \"keyring:rivect-test/groq-chain\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"groq\", model_id = \"{GROQ_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[
+            (
+                "keyring:rivect-test/groq-connection",
+                "fixture-connection-scope",
+            ),
+            ("keyring:rivect-test/groq-chain", GROQ_KEY),
+        ],
+    ));
+    let provider = provider_result(config.clone(), "groq".to_string(), store.clone())
+        .expect("the chained binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the profile-bound credential admits the send");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GROQ_KEY}"),
+        "the profile's scoped material bears the wire"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains("fixture-connection-scope"),
+        "the connection-scope material never reaches the wire"
+    );
+}
+
+/// Wrong credential/profile/region never produce a false success for
+/// `groq`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, and a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`; both deny before the store is read. A
+/// refused bearer lands the typed transport denial carrying the peer's
+/// status alone, and on that arm — the one that resolves and sends the
+/// material — neither the offered credential nor the peer's body reaches
+/// Display or Debug.
+#[tokio::test]
+async fn groq_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — before any
+    // credential resolution
+    let regioned = Config::parse_validated(
+        &groq_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "groq".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "groq");
+    assert_eq!(region, "eu");
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.groq]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"groq\", model_id = \"{GROQ_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "groq".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "groq");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, GROQ_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {GROQ_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// A `/models` HTTP 200 contributes ids but confers no entitlement
+/// (INV-010) for `groq`: the catalogue offers the listed foreign id
+/// beside the recorded floor, yet with the key enrolled the fixed pin
+/// still rides only its request leg — the unmounted `chat/completions`
+/// peer answers the typed transport denial, so the 200 listing never
+/// releases a send or a credential.
+#[tokio::test]
+async fn groq_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({"id": "listed-foreign-entitlement-claim"})],
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the merged catalogue answers");
+    drop_blocking(provider);
+    assert!(
+        model_ids(&models).contains(&"listed-foreign-entitlement-claim"),
+        "the 200 listing contributes its id"
+    );
+    assert_eq!(models.len(), 21, "the listing adds ids, never surface");
+    let discovery = server.received_requests().await.expect("recorded");
+    assert_eq!(discovery.len(), 1, "the catalogue reads the listing once");
+    assert_eq!(discovery[0].url.path(), "/v1/models");
+
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "groq");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the discovery leg plus the request leg — the 200 listing adds nothing"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+}
+
+// ----- TP-PROVIDER-RECOVERY::groq ----------------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn groq_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "groq".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(GROQ_REF, GROQ_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for `groq`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn groq_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "foreign-listed-chat"}),
+            json!({"id": GROQ_MODEL}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&groq_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the non-authoritative listing contributes the foreign id
+    // while the recorded floor keeps its reasoning/effort surface, and
+    // the one discovery leg is the only request so far.
+    let (provider, _store) = enrolled_groq_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    let discovery = server.received_requests().await.expect("recorded");
+    reported.insert(
+        "CATALOG",
+        if listed.len() == 21
+            && listed.iter().any(|model| model.id == "foreign-listed-chat")
+            && listed
+                .iter()
+                .any(|model| model.id == GROQ_MODEL && model.reasoning && !model.efforts.is_empty())
+            && discovery.len() == 1
+            && discovery[0].url.path() == "/v1/models"
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "groq".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_groq_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/groq", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/groq", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "groq".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(GROQ_REF, GROQ_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_groq`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::groq ---------------------------------------------
+
+/// TP-PROVIDER-INSTALLED::groq = NOT_RUN: the installed-provider proof
+/// is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::groq = NOT_RUN"]
+fn provider_installed_groq() {}
