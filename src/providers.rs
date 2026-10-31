@@ -1123,7 +1123,7 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
-/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
+/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`/`litellm`
 /// are its recorded class-A/class-P plugs speaking the same dialect
 /// (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
@@ -1175,6 +1175,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "groq" => Some(Dialect::ChatCompletions),
         "huggingface" => Some(Dialect::ChatCompletions),
         "kilo" => Some(Dialect::ChatCompletions),
+        "litellm" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
@@ -1255,24 +1256,47 @@ impl Provider for LoopbackProvider {
     }
 }
 
-/// Whether the connection's recorded auth class resolves a scoped
-/// [`SecretRef`] under DEC-013 precedence (DEC-011): the offline
-/// dispatch precondition for `api_key` connections. Resolution is
-/// binding-level — the store is read at send time — so a missing,
-/// malformed or mismatched binding is the unresolved case.
-fn credential_resolves(
+/// Whether a literal connection id records the credential-optional
+/// open-proxy class (`litellm`): its configured proxy serves with or
+/// without a key, so the declaration may omit `credential_ref`, an
+/// absent binding sends no `Authorization` header — never a dummy key —
+/// and the pin stays offline-usable. Every other `api_key` id requires
+/// its scoped binding at ingress and at eligibility.
+#[must_use]
+pub(crate) fn open_proxy_connection(connection: &str) -> bool {
+    connection == "litellm"
+}
+
+/// [`resolve_credential_in`] under the recorded open-proxy form: a
+/// connection whose declaration binds no credential at all resolves
+/// `None` on that class, while every other binding resolves the scoped
+/// [`SecretRef`] unchanged. A bound-but-malformed or
+/// profile-mismatched reference keeps its typed denial — the absent
+/// binding is the only admitted form.
+///
+/// # Errors
+/// [`resolve_credential_in`]'s typed denials for every binding the
+/// declaration does carry.
+pub(crate) fn resolve_optional_credential_in(
     connections: &BTreeMap<String, Connection>,
     profiles: &BTreeMap<String, Profile>,
     connection: &str,
-) -> bool {
-    resolve_credential_in(connections, profiles, connection).is_ok()
+) -> Result<Option<SecretRef>, ProviderError> {
+    let unbound = connections
+        .get(connection)
+        .is_some_and(|conn| conn.profile.is_none() && conn.credential_ref.is_none());
+    if unbound && open_proxy_connection(connection) {
+        return Ok(None);
+    }
+    resolve_credential_in(connections, profiles, connection).map(Some)
 }
 
 /// Connection eligibility for offline dispatch (DEC-011): local
 /// connections are always usable; an `api_key` connection is usable
 /// exactly when its recorded auth class resolves a scoped
-/// [`SecretRef`] — catalogue presence is never entitlement, and an
-/// unresolved binding keeps the typed live-grant denial.
+/// [`SecretRef`] — or, on the recorded open-proxy class, when its
+/// declaration binds none — catalogue presence is never entitlement,
+/// and an unresolved binding keeps the typed live-grant denial.
 ///
 /// # Errors
 /// [`ProviderError::UnknownConnection`] for a fixed pin on an
@@ -1298,7 +1322,8 @@ pub fn offline_eligible(
 /// Offline eligibility as a ranking predicate (AC-044/DEC-011): a
 /// candidate usable without a separate live grant — a local
 /// connection always; an `api_key` one exactly when its credential
-/// resolves. A `subscription` names a live grant no scoped reference
+/// resolves, or binds none on the recorded open-proxy class. A
+/// `subscription` names a live grant no scoped reference
 /// confers — it stays grant-gated until the subscription machinery
 /// lands. Ranking filters candidates with this; [`offline_eligible`]
 /// keeps the typed rejection vocabulary for the single-candidate
@@ -1313,7 +1338,9 @@ pub fn offline_usable(
         None => false,
         Some(entry) => match entry.kind {
             ConnKind::Local => true,
-            ConnKind::ApiKey => credential_resolves(connections, profiles, connection),
+            ConnKind::ApiKey => {
+                resolve_optional_credential_in(connections, profiles, connection).is_ok()
+            }
             ConnKind::Subscription => false,
         },
     }

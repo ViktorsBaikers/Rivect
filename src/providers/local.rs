@@ -1,9 +1,9 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq`, `huggingface` and `kilo` connections' adapter — the OpenAI-compatible
-//! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class A
-//! and class P).
+//! `groq`, `huggingface`, `kilo` and `litellm` connections' adapter — the
+//! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025, HZN-008
+//! class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
@@ -68,7 +68,15 @@
 //! whose enrolled device login or key supplies the opaque gateway
 //! bearer a send requires (material naming no token denies typed
 //! before any wire leg), with no subscription SKU or price invented
-//! on `kilo` — resolved per literal id by the
+//! on `kilo`, and the user-configured `litellm` proxy base verbatim —
+//! the class records no default host, so none is invented and no
+//! localhost catalogue exists — whose discovery is the proxy's own
+//! management metadata first (four recorded paths under one bounded
+//! phase) with the recorded fall-through to `/models`, and whose
+//! recorded credential arm is the open proxy: an undeclared binding
+//! rides headerless on every leg, a declared binding that cannot
+//! resolve denies typed, and a scoped key sends the bearer — neither
+//! form invents a catalogue — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -99,12 +107,12 @@ use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
     SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, payload_reason,
-    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
-    wire_body,
+    read_catalog_body, read_chunk, resolve_credential, resolve_optional_credential_in, sse,
+    transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -634,6 +642,38 @@ const KILO_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
 /// subscription SKU is invented either.
 const KILO_MODELS: &[(&str, bool)] = &[("anthropic/claude-opus-4.8", false)];
 
+/// The recorded `litellm` management-metadata paths, in the pinned
+/// fetcher's order (`LITELLM_RICH_ENDPOINTS` in
+/// `packages/catalog/src/provider-models/openai-compat.ts` at commit
+/// `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`): the proxy's model-group
+/// metadata first, then the v2 and v1 `model/info` forms. The paths are
+/// appended to the management base — the configured base minus its
+/// `/v1` segment.
+const LITELLM_METADATA_PATHS: &[&str] = &[
+    "/model_group/info",
+    "/v2/model/info",
+    "/model/info",
+    "/v1/model/info",
+];
+
+/// The recorded bound on the whole management-metadata phase — the
+/// pinned `litellmModelManagerOptions`' `timeoutMs: 10_000` around
+/// `fetchLiteLLMRichModels`. Each probe spends at most the bound's
+/// remainder ([`litellm_probe_budget`]); once it is spent the walk ends
+/// with whatever it served.
+const LITELLM_METADATA_BUDGET: Duration = Duration::from_secs(10);
+
+/// The recorded `litellm` placeholder model groups
+/// (`LITELLM_UNUSABLE_SENTINEL_IDS`): a row naming one of these and
+/// carrying no metadata is the proxy's placeholder answer, never a
+/// model it serves.
+const LITELLM_SENTINEL_IDS: &[&str] = &["all-team-models", "all-proxy-models", "no-default-models"];
+
+/// The recorded scale of the rich metadata's per-token USD prices
+/// (`getLiteLLMPerMillionCost`): `input_cost_per_token` and
+/// `output_cost_per_token` are per token, [`ModelPrice::Usd`] per 1M.
+const LITELLM_PRICE_SCALE: f64 = 1_000_000.0;
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -680,20 +720,26 @@ enum CatalogRule {
     /// semantic; a descriptor's recorded `defaultModel` is a
     /// catalogue hint, not a product ranking this contract performs.
     Allowlist(&'static [(&'static str, bool)]),
-    /// The recorded credential-optional discovery (`kilo`'s
+    /// The recorded credential-optional *discovery* (`kilo`'s
     /// `catalogDiscovery.allowUnauthenticated` and its
     /// `fetchOpenAICompatibleModels` call with `apiKey` optional): the
     /// configured endpoint's own `/models` answer contributes its
     /// offers under the per-entry transform, the recorded rows below
     /// merge on top as the offer floor — an empty answer leaves the
     /// floor standing — and the `Authorization` header rides only
-    /// when the store resolves material. A resolved-but-unusable
-    /// credential still denies typed rather than silently dropping to
-    /// the keyless form, and no answer confers entitlement: a paid
-    /// send resolves its credential before any leg. Each floor tuple
-    /// is the model id and its image-input mark — the bundled
-    /// descriptor's recorded mark where the class records one, `false`
-    /// otherwise.
+    /// when the store resolves material. This variant's tolerance is
+    /// the catalogue's alone, over an absent *scope* on a class that
+    /// still binds a credential ([`CredentialRule::Kilo`]): the
+    /// recorded keyless catalogue answers, while the same absent
+    /// material denies a send. An undeclared *binding* is a different
+    /// recorded fact with its own arm ([`CredentialRule::OpenProxy`]),
+    /// so neither policy is inferred from the other. A
+    /// resolved-but-unusable credential still denies typed rather than
+    /// silently dropping to the keyless form, and no answer confers
+    /// entitlement: a paid send resolves its credential before any
+    /// leg. Each floor tuple is the model id and its image-input mark
+    /// — the bundled descriptor's recorded mark where the class
+    /// records one, `false` otherwise.
     UnauthenticatedListing(&'static [(&'static str, bool)]),
 }
 
@@ -760,6 +806,17 @@ enum CredentialRule {
     /// denies as malformed before any wire leg rather than reaching
     /// the gateway as an empty bearer.
     Kilo,
+    /// `litellm`'s recorded credential-optional auth class (HZN-008
+    /// class B, `auth/litellm.kdl` `login "api-key"` against a
+    /// user-configured proxy): the recorded open-proxy form. A
+    /// declaration that binds nothing is admitted and rides headerless
+    /// on *every* leg — the proxy's own unauthenticated path, never a
+    /// dummy key — while a declaration that does bind resolves the
+    /// plain bearer and a bound scope that cannot resolve denies typed
+    /// on every leg. The admission fact lives here, not in the
+    /// catalogue: [`CatalogRule::UnauthenticatedListing`] is `kilo`'s
+    /// separate discovery tolerance over an absent scope.
+    OpenProxy,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -844,6 +901,18 @@ enum EntryRule {
     /// The router selects the serving provider from that suffix, so a
     /// rewrite would silently reroute a pinned model.
     HuggingFace,
+    /// The `litellm` arm: the recorded discovery is the proxy's
+    /// management metadata first — [`LITELLM_METADATA_PATHS`] probed in
+    /// order under one bounded phase budget, with the recorded
+    /// fall-through to `/models` — and this arm carries both halves of
+    /// that shape. A metadata entry maps through the rich transform
+    /// ([`litellm_metadata_model`]): the id from `model_group` /
+    /// `model_name` / `id` / `litellm_params.model`, the capability
+    /// marks, the input window and the per-token→per-1M price from the
+    /// entry or its `model_info` object. A row the `/models`
+    /// fall-through yields is the OpenAI-compatible listing form, so it
+    /// carries its id alone — the metadata leg is the rich source.
+    LiteLlm,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1070,16 +1139,54 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Kilo,
             entries: EntryRule::IdsOnly,
         }),
+        // `litellm` (HZN-008 class B — the configured-proxy cell): the
+        // user-configured proxy base verbatim, with no recorded default
+        // host and none invented — an empty configured base stays empty
+        // rather than resolving a localhost catalogue — the recorded
+        // listing whose discovery is the proxy's own management
+        // metadata first ([`LITELLM_METADATA_PATHS`] under one bounded
+        // phase budget) with the recorded fall-through to `/models`,
+        // no seed (the class records no built-in roster), the recorded
+        // open-proxy credential arm (an absent binding rides headerless
+        // on every leg, a declared binding that cannot resolve denies
+        // typed — never a dummy key), and ids riding the catalogue and
+        // the wire verbatim.
+        "litellm" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::Verbatim,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::OpenProxy,
+            entries: EntryRule::LiteLlm,
+        }),
         _ => None,
     }
 }
 
 impl SourceContract {
-    /// Whether the recorded catalogue is the credential-optional
-    /// discovery form — an exhaustive decision over the catalogue rule,
-    /// so a further variant must state its credential requirement here
-    /// rather than inheriting the credential-required path by default.
-    fn credential_optional(&self) -> bool {
+    /// Whether the recorded credential arm admits a declaration that
+    /// binds no credential at all — the open-proxy form. An exhaustive
+    /// decision over the credential rule, so a further arm must state
+    /// its admission here rather than inheriting the required-binding
+    /// path by default.
+    fn binds_optional_credential(&self) -> bool {
+        match self.credential {
+            CredentialRule::OpenProxy => true,
+            CredentialRule::Bearer
+            | CredentialRule::AlibabaPlan
+            | CredentialRule::AlibabaTokenPlan
+            | CredentialRule::Firepass
+            | CredentialRule::CoreWeave
+            | CredentialRule::HuggingFace
+            | CredentialRule::Kilo => false,
+        }
+    }
+
+    /// Whether the recorded catalogue tolerates an absent scope on the
+    /// classification leg — the keyless discovery form. An exhaustive
+    /// decision over the catalogue rule; this is the discovery fact
+    /// alone, separate from [`Self::binds_optional_credential`], so
+    /// neither policy is inferred from the other.
+    fn keyless_discovery(&self) -> bool {
         match self.catalog {
             CatalogRule::Listing | CatalogRule::Allowlist(_) => false,
             CatalogRule::UnauthenticatedListing(_) => true,
@@ -1131,6 +1238,31 @@ impl SourceContract {
             }
         }
     }
+}
+
+/// The wire leg that reads the credential — the one seam both legs share.
+/// A send (and its auto-pick catalogue leg) requires the material a bound
+/// scope names, while a standalone catalogue read is the recorded keyless
+/// discovery's leg, which admits an absent scope as the headerless form.
+#[derive(Clone, Copy)]
+enum CredentialLeg {
+    Send,
+    Discovery,
+}
+
+/// The recorded `litellm` management-metadata phase's outcome
+/// (`fetchLiteLLMRichModels`): either the proxy served its metadata, or
+/// the class takes the recorded fall-through to `/models`. Every cause
+/// of the fall-through is recorded as non-terminal — an absent form
+/// (404 from a proxy that does not expose it), a refused or failed
+/// status, an unreadable or empty body, a transport failure, or a spent
+/// phase budget — because `/models` is the class's remaining recorded
+/// source, never a failure the catalogue may surface.
+enum MetadataPhase {
+    /// The proxy served management metadata for at least one model.
+    Served(Vec<CatalogModel>),
+    /// The recorded fall-through to the `/models` listing.
+    FallThrough,
 }
 
 /// The stated price a catalogued model carries (HZN-008): the literal
@@ -1273,8 +1405,11 @@ pub struct ChatCompletionsProvider {
     endpoint: String,
     /// The scoped credential binding resolved under DEC-013
     /// precedence — material is read from the store per send so a
-    /// rotation is honoured without rebuilding the adapter.
-    credential: SecretRef,
+    /// rotation is honoured without rebuilding the adapter — or `None`
+    /// on a recorded credential-optional class whose declaration binds
+    /// nothing: the recorded open-proxy form sends no `Authorization`
+    /// header and never a dummy key.
+    credential: Option<SecretRef>,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
     /// The one budget the whole send — credential resolution, the
@@ -1293,7 +1428,9 @@ impl ChatCompletionsProvider {
     /// per-connection contract (HZN-008), the connection must be
     /// declared, carry no configured region — no recorded class
     /// has one — and resolve a scoped credential under DEC-013
-    /// precedence.
+    /// precedence, except on the recorded credential-optional class
+    /// whose declaration binds none: that is the open-proxy form, and
+    /// the adapter then bears no material at all.
     ///
     /// # Errors
     /// [`ProviderError::DialectMismatch`] for a connection id without
@@ -1356,7 +1493,11 @@ impl ChatCompletionsProvider {
                 region: region.clone(),
             });
         }
-        let credential = resolve_credential(config, connection)?;
+        let credential = if contract.binds_optional_credential() {
+            resolve_optional_credential_in(&config.connections, &config.profiles, connection)?
+        } else {
+            Some(resolve_credential(config, connection)?)
+        };
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
         // names itself the send's deadline, while reqwest's timer only
@@ -1385,10 +1526,16 @@ impl ChatCompletionsProvider {
     /// returns in deterministic sorted order. A class whose recorded
     /// catalogue is a fixed allowlist answers it alone: no listing
     /// leg exists, so no credential is resolved and no byte crosses
-    /// the wire. A class whose recorded discovery allows an
+    /// wire. A class whose recorded discovery allows an
     /// unauthenticated catalogue sends no `Authorization` header when
     /// no credential resolves, and still merges its recorded rows as
-    /// the offer floor. The generic class
+    /// the offer floor; a class whose credential arm admits an
+    /// undeclared binding — the open-proxy form — sends the same
+    /// headerless lookup over its configured base alone. A class whose
+    /// recorded discovery is its proxy's management metadata
+    /// (`litellm`) probes that metadata first and takes the recorded
+    /// `/models` fall-through only when the metadata yields nothing.
+    /// The generic class
     /// admits the listing verbatim: gateway-style ids carry path
     /// characters legitimately, since a model id is never URL
     /// material in this dialect — it rides the request body.
@@ -1412,15 +1559,12 @@ impl ChatCompletionsProvider {
         // the check before it is the only point an expired budget
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
-        // The recorded keyless discovery resolves material when the
-        // store holds some and rides without the header when it does
-        // not; every other listing class requires its credential.
-        if self.contract.credential_optional() {
-            let secret = self.discovery_secret()?;
-            return self.catalog_within(secret.as_ref(), started);
-        }
-        let secret = self.secret()?;
-        self.catalog_within(Some(&secret), started)
+        // The discovery leg answers the material this class bears:
+        // `None` when the declaration binds none (the open-proxy form)
+        // or the recorded keyless discovery tolerates an empty store,
+        // so the leg rides without the header instead of failing.
+        let secret = self.leg_secret(CredentialLeg::Discovery)?;
+        self.catalog_within(secret.as_ref(), started)
     }
 
     /// The catalogue leg under the caller's clock and resolved
@@ -1439,6 +1583,18 @@ impl ChatCompletionsProvider {
         if let CatalogRule::Allowlist(list) = self.contract.catalog {
             return Ok(allowlist_models(list));
         }
+        // The recorded metadata-first discovery answers alone when the
+        // proxy serves it; otherwise the listing below is the class's
+        // remaining recorded source.
+        if matches!(self.contract.entries, EntryRule::LiteLlm)
+            && let MetadataPhase::Served(models) = self.litellm_metadata(secret, started)?
+        {
+            return Ok(models);
+        }
+        // The fall-through leg is a request too: a budget the metadata
+        // phase spent is the typed deadline, never a post on an expired
+        // clock.
+        check_deadline(&self.connection, self.deadline, started)?;
         let mut request = self.client.get(format!("{}/models", self.endpoint));
         if let Some(secret) = secret {
             request = request.bearer_auth(&secret.bearer);
@@ -1489,7 +1645,8 @@ impl ChatCompletionsProvider {
                     | EntryRule::Aimlapi
                     | EntryRule::AlibabaTokenPlan
                     | EntryRule::Firepass
-                    | EntryRule::HuggingFace => Some(CatalogModel {
+                    | EntryRule::HuggingFace
+                    | EntryRule::LiteLlm => Some(CatalogModel {
                         id: (*id).to_string(),
                         ..CatalogModel::default()
                     }),
@@ -1505,6 +1662,124 @@ impl ChatCompletionsProvider {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
+    }
+
+    /// The recorded `litellm` management-metadata phase
+    /// (`fetchLiteLLMRichModels` at commit
+    /// `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`): the management base
+    /// — the configured base minus a trailing `/v1` — probed in
+    /// [`LITELLM_METADATA_PATHS`] order, every probe carrying
+    /// `Accept: application/json` and the resolved material when there
+    /// is any. Each probe is bounded by [`litellm_probe_budget`] — the
+    /// recorded phase bound's remainder against the whole call's — so no
+    /// request starts, and no read runs, after either budget is spent.
+    /// The first answering endpoint owns the offered id set; later
+    /// endpoints only enrich those ids, and a set whose window and price
+    /// are both stated ends the phase early. Each entry maps through the
+    /// rich transform ([`litellm_metadata_model`]).
+    ///
+    /// A later form's failure ends the walk with the set already served:
+    /// offers are never discarded for a form the phase had outgrown, and
+    /// only a walk that offered nothing is
+    /// [`MetadataPhase::FallThrough`]. An absent form (404) is skipped
+    /// in order; a refused or failed status, an unreadable body, a
+    /// transport failure and a spent phase bound all end the walk, and
+    /// the record's next source for an empty walk is `/models`, so none
+    /// of them is a catalogue error.
+    ///
+    /// # Errors
+    /// [`ProviderError::Transport`] when the whole-call budget expires —
+    /// [`check_deadline`]'s typed denial, re-raised before every probe
+    /// so an expired call is never converted into the recorded
+    /// fall-through.
+    fn litellm_metadata(
+        &self,
+        secret: Option<&WireSecret>,
+        started: Instant,
+    ) -> Result<MetadataPhase, ProviderError> {
+        let management_base = litellm_management_base(&self.endpoint);
+        if management_base.is_empty() {
+            return Ok(MetadataPhase::FallThrough);
+        }
+        let phase_started = Instant::now();
+        let mut offered: BTreeMap<String, CatalogModel> = BTreeMap::new();
+        for path in LITELLM_METADATA_PATHS {
+            check_deadline(&self.connection, self.deadline, started)?;
+            let Some(budget) = litellm_probe_budget(phase_started, started, self.deadline) else {
+                // The recorded phase bound is spent: the walk ends with
+                // whatever it served.
+                break;
+            };
+            let probe_started = Instant::now();
+            let mut request = self
+                .client
+                .get(format!("{management_base}{path}"))
+                .timeout(budget)
+                .header(reqwest::header::ACCEPT, "application/json");
+            if let Some(secret) = secret {
+                request = request.bearer_auth(&secret.bearer);
+            }
+            let mut response = match request.send() {
+                Ok(response) => response,
+                // A transport failure ends the walk; a served set stays.
+                Err(_transport) => break,
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // The proxy does not expose this metadata form: the
+                // recorded walk continues with the next path.
+                continue;
+            }
+            if !status.is_success() {
+                // A refused or failed form ends the walk; a served set
+                // stays served.
+                break;
+            }
+            let body =
+                match read_catalog_body(&self.connection, budget, &mut response, probe_started) {
+                    Ok(body) => body,
+                    // An unreadable body — the probe's remaining bound
+                    // included — ends the walk; a served set stays.
+                    Err(_unreadable) => break,
+                };
+            let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+                // A body outside the recorded shape ends the walk.
+                break;
+            };
+            let Some(entries) = litellm_metadata_entries(&payload) else {
+                continue;
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            if offered.is_empty() {
+                for entry in entries {
+                    if let Some(model) = litellm_metadata_model(entry) {
+                        offered.insert(model.id.clone(), model);
+                    }
+                }
+            } else {
+                for entry in entries {
+                    if let Some(model) = litellm_metadata_model(entry)
+                        && let Some(existing) = offered.get_mut(&model.id)
+                    {
+                        // A later endpoint only enriches an id the first
+                        // answering form owns; it never adds one.
+                        litellm_metadata_fill(existing, &model);
+                    }
+                }
+            }
+            // A form whose rows were all placeholders served nothing, so
+            // it cannot read as complete: the walk keeps going for a form
+            // that carries real offers.
+            if !offered.is_empty() && !litellm_metadata_incomplete(&offered) {
+                break;
+            }
+        }
+        if offered.is_empty() {
+            return Ok(MetadataPhase::FallThrough);
+        }
+        Ok(MetadataPhase::Served(offered.into_values().collect()))
     }
 
     /// One `data[]` entry under the literal id's recorded transform —
@@ -1547,6 +1822,13 @@ impl ChatCompletionsProvider {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
+            // This class's rich source is its management metadata; a
+            // `/models` row the recorded fall-through yields is the
+            // OpenAI-compatible listing form and names its id alone.
+            EntryRule::LiteLlm => Some(CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -1554,28 +1836,32 @@ impl ChatCompletionsProvider {
         }
     }
 
-    /// Reads the credential material for this send — the store read
-    /// behind every wire leg — and answers the wire material the
-    /// literal id's recorded credential grammar binds. A non-UTF-8
-    /// secret cannot be a bearer token: typed denial, never a mangled
-    /// header. Every grammar, scope or base denial lands here — before
-    /// any wire leg.
-    fn secret(&self) -> Result<WireSecret, ProviderError> {
-        let material = self.store.resolve(&self.credential)?;
-        self.wire_secret(material)
-    }
-
-    /// The optional credential a recorded keyless discovery carries
-    /// (`kilo`'s `catalogDiscovery.allowUnauthenticated` with its
-    /// `apiKey`-optional fetch): an absent binding is the recorded
-    /// keyless form and resolves `None`, while material the store does
-    /// hold still passes the class grammar — resolved-but-unusable
-    /// material denies typed rather than silently dropping to the
-    /// keyless form. Any other store denial surfaces unchanged.
-    fn discovery_secret(&self) -> Result<Option<WireSecret>, ProviderError> {
-        match self.store.resolve(&self.credential) {
+    /// Reads the credential material behind the wire leg `leg` names —
+    /// the one store read this adapter performs — and answers the wire
+    /// material the literal id's recorded credential grammar binds.
+    /// A declaration that binds no credential at all resolves `None` on
+    /// every leg: that is the recorded open-proxy form, which sends the
+    /// unauthenticated request, never a dummy key. An absent scope on a
+    /// class the declaration does bind resolves `None` on the discovery
+    /// leg alone (the recorded keyless catalogue); a send still denies
+    /// `CredentialAbsent`, so a keyless or free catalogue never pays for
+    /// a request. Material the store does hold still passes the class
+    /// grammar — resolved-but-unusable material denies typed rather
+    /// than silently dropping to the keyless form — and a non-UTF-8
+    /// secret can never be a bearer token: typed denial, never a
+    /// mangled header. Every grammar, scope or base denial lands here,
+    /// before any wire leg.
+    fn leg_secret(&self, leg: CredentialLeg) -> Result<Option<WireSecret>, ProviderError> {
+        let Some(credential) = &self.credential else {
+            return Ok(None);
+        };
+        match self.store.resolve(credential) {
             Ok(material) => self.wire_secret(material).map(Some),
-            Err(ProviderError::CredentialAbsent { .. }) => Ok(None),
+            Err(ProviderError::CredentialAbsent { .. })
+                if matches!(leg, CredentialLeg::Discovery) && self.contract.keyless_discovery() =>
+            {
+                Ok(None)
+            }
             Err(err) => Err(err),
         }
     }
@@ -1602,6 +1888,10 @@ impl ChatCompletionsProvider {
                 .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
                 .map(WireSecret::bearer),
             CredentialRule::Kilo => self.kilo_bearer(&text).map(WireSecret::bearer),
+            // The open-proxy class's declared form is the proxy's own
+            // key — master or virtual — carried as the plain bearer the
+            // recorded `api-key` login pastes.
+            CredentialRule::OpenProxy => Ok(WireSecret::bearer(text)),
         }
     }
 
@@ -1817,9 +2107,9 @@ impl ChatCompletionsProvider {
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek`, `Groq` and `HuggingFace` — sends the offered id
-    /// unchanged. Each variant is listed so a future transform cannot
-    /// ship verbatim ids silently.
+    /// `DeepSeek`, `Groq`, `HuggingFace` and `LiteLlm` — sends the
+    /// offered id unchanged. Each variant is listed so a future
+    /// transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
@@ -1830,7 +2120,8 @@ impl ChatCompletionsProvider {
             | EntryRule::AlibabaTokenPlan
             | EntryRule::DeepSeek
             | EntryRule::Groq
-            | EntryRule::HuggingFace => model_id.to_string(),
+            | EntryRule::HuggingFace
+            | EntryRule::LiteLlm => model_id.to_string(),
         }
     }
 
@@ -2605,6 +2896,199 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
     }
 }
 
+/// The recorded `litellm` management base
+/// (`normalizeLiteLLMManagementBaseUrl`): the configured base trimmed
+/// of trailing slashes with a trailing `/v1` segment removed, so the
+/// recorded paths append to the proxy's own root. An absent base stays
+/// empty, and the phase then opens no request at all — never a
+/// substituted host.
+fn litellm_management_base(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    base.strip_suffix("/v1")
+        .unwrap_or(base)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The budget one `litellm` metadata probe may spend: the shorter of the
+/// recorded phase bound's remainder and the whole call's remainder, or
+/// `None` when either is spent — a spent phase ends the walk, and a spent
+/// call is [`check_deadline`]'s typed denial to raise.
+fn litellm_probe_budget(
+    phase_started: Instant,
+    call_started: Instant,
+    call_deadline: Duration,
+) -> Option<Duration> {
+    let phase_left = LITELLM_METADATA_BUDGET.checked_sub(phase_started.elapsed())?;
+    let call_left = call_deadline.checked_sub(call_started.elapsed())?;
+    Some(phase_left.min(call_left)).filter(|left| !left.is_zero())
+}
+
+/// The recorded `litellm` metadata payload's entries
+/// (`extractLiteLLMRichEntries`): a JSON array of records, or the first
+/// of the recorded wrappers — `data`, `models`, `result`, `items` —
+/// that holds one. A payload carrying none of them has no entries.
+fn litellm_metadata_entries(payload: &Value) -> Option<Vec<&Value>> {
+    match payload {
+        Value::Array(items) => Some(items.iter().filter(|item| item.is_object()).collect()),
+        Value::Object(map) => ["data", "models", "result", "items"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(litellm_metadata_entries)),
+        _ => None,
+    }
+}
+
+/// One rich `litellm` metadata field (`getLiteLLMMetadataValue`): the
+/// entry's own member, else the same member of its `model_info` object.
+fn litellm_metadata_value<'a>(entry: &'a Value, key: &str) -> Option<&'a Value> {
+    entry
+        .get(key)
+        .or_else(|| entry.get("model_info").and_then(|info| info.get(key)))
+}
+
+/// The model id a rich `litellm` entry names
+/// (`getLiteLLMRichModelId`): `model_group`, then `model_name`, then
+/// `id`, then the backend `litellm_params.model` — each as a non-empty
+/// trimmed string.
+fn litellm_model_id(entry: &Value) -> Option<String> {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    text("model_group")
+        .or_else(|| text("model_name"))
+        .or_else(|| text("id"))
+        .or_else(|| {
+            entry
+                .get("litellm_params")
+                .and_then(|params| params.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Whether a rich `litellm` entry is the proxy's placeholder row
+/// (`isLiteLLMUnusableSentinelPlaceholder`): it names a recorded
+/// sentinel id and carries no metadata at all — no window, no stated
+/// capability, no supported parameters, no provider list. Such a row is
+/// never offered as a model.
+fn is_litellm_sentinel_placeholder(entry: &Value) -> bool {
+    let names_sentinel = ["model_group", "id", "model_name"].iter().any(|key| {
+        litellm_metadata_value(entry, key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| LITELLM_SENTINEL_IDS.contains(&value.trim()))
+    }) || entry
+        .get("litellm_params")
+        .and_then(|params| params.get("model"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| LITELLM_SENTINEL_IDS.contains(&value.trim()));
+    if !names_sentinel {
+        return false;
+    }
+    let providers = entry.get("providers");
+    if providers.is_some_and(|list| !list.as_array().is_some_and(Vec::is_empty)) {
+        return false;
+    }
+    let carries_window = ["max_input_tokens", "max_output_tokens"]
+        .iter()
+        .any(|key| positive_count(litellm_metadata_value(entry, key)).is_some());
+    let carries_capability = [
+        "supports_vision",
+        "supports_reasoning",
+        "supports_function_calling",
+        "supports_tools",
+    ]
+    .iter()
+    .any(|key| litellm_metadata_value(entry, key).and_then(Value::as_bool) == Some(true));
+    let carries_params = litellm_metadata_value(entry, "supported_openai_params")
+        .and_then(Value::as_array)
+        .is_some_and(|params| !params.is_empty());
+    !(carries_window || carries_capability || carries_params)
+}
+
+/// The recorded USD price a rich `litellm` entry states
+/// (`getLiteLLMReportedCost` / `getLiteLLMCost`): the per-token
+/// `input_cost_per_token` and `output_cost_per_token` figures, each
+/// scaled to [`ModelPrice::Usd`]'s per-1M basis. Both legs are needed —
+/// a row stating one alone keeps [`ModelPrice::Unknown`], never a zero
+/// the accounting could release.
+fn litellm_metadata_price(entry: &Value) -> ModelPrice {
+    let per_million = |key: &str| {
+        litellm_metadata_value(entry, key)
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0)
+            .map(|value| value * LITELLM_PRICE_SCALE)
+    };
+    match (
+        per_million("input_cost_per_token"),
+        per_million("output_cost_per_token"),
+    ) {
+        (Some(input_per_1m), Some(output_per_1m)) => ModelPrice::Usd {
+            input_per_1m,
+            output_per_1m,
+        },
+        _ => ModelPrice::Unknown,
+    }
+}
+
+/// One rich `litellm` metadata entry as an offer (`mapLiteLLMRichEntry`,
+/// reduced to the surface [`CatalogModel`] carries): the id, the stated
+/// capability marks, the input window and the per-1M price. The
+/// recorded effort ladder and API route have no landing here — this
+/// adapter's effort surface is per-pin, not per-model — and an absent
+/// window stays absent rather than adopting the reference default the
+/// upstream mapper fills.
+fn litellm_metadata_model(entry: &Value) -> Option<CatalogModel> {
+    if is_litellm_sentinel_placeholder(entry) {
+        return None;
+    }
+    let id = litellm_model_id(entry)?;
+    Some(CatalogModel {
+        id,
+        reasoning: litellm_metadata_value(entry, "supports_reasoning").and_then(Value::as_bool)
+            == Some(true),
+        vision: litellm_metadata_value(entry, "supports_vision").and_then(Value::as_bool)
+            == Some(true),
+        efforts: Vec::new(),
+        effort_default: None,
+        context_window: positive_count(litellm_metadata_value(entry, "max_input_tokens")),
+        price: litellm_metadata_price(entry),
+    })
+}
+
+/// Fills the gaps a later `litellm` metadata form covers
+/// (`mergeLiteLLMRichEndpointModels`): the first answering endpoint owns
+/// the id set, and a later one may only add capability marks, a window
+/// or a price the first left unstated.
+fn litellm_metadata_fill(existing: &mut CatalogModel, next: &CatalogModel) {
+    existing.reasoning |= next.reasoning;
+    existing.vision |= next.vision;
+    if existing.context_window.is_none() {
+        existing.context_window = next.context_window;
+    }
+    if existing.price == ModelPrice::Unknown {
+        existing.price = next.price;
+    }
+}
+
+/// Whether the metadata phase has more to learn
+/// (`needsMoreMetadata`): an offer still missing its input window or its
+/// price keeps the recorded walk alive. The upstream predicate also
+/// watches a vision mark that no answer stated; [`CatalogModel`] carries
+/// that mark as a bool whose absence is `false`, so this reduction
+/// watches the two surfaces the model actually carries.
+fn litellm_metadata_incomplete(offered: &BTreeMap<String, CatalogModel>) -> bool {
+    offered
+        .values()
+        .any(|model| model.context_window.is_none() || model.price == ModelPrice::Unknown)
+}
+
 /// The recorded per-model USD price a pinned row table states for
 /// an id (`cost.input`/`cost.output` per 1M tokens): a stated zero
 /// is a real figure — a free or bundled-only SKU — and an id the
@@ -2902,7 +3386,9 @@ impl Provider for ChatCompletionsProvider {
         // cannot be interrupted once running, so an already-spent budget
         // must deny it here rather than on the far side.
         check_deadline(&self.connection, self.deadline, started)?;
-        let secret = self.secret()?;
+        // The send leg requires the material a bound scope names; only a
+        // declaration binding nothing rides headerless.
+        let secret = self.leg_secret(CredentialLeg::Send)?;
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an
         // explicit pick of it — the pick pins the connection, and the
@@ -2916,7 +3402,7 @@ impl Provider for ChatCompletionsProvider {
                 if pool.len() == 1 && pool[0] == self.connection =>
             {
                 let model_id = self
-                    .catalog_within(Some(&secret), started)?
+                    .catalog_within(secret.as_ref(), started)?
                     .into_iter()
                     .next()
                     .map(|model| model.id)
@@ -2959,12 +3445,16 @@ impl Provider for ChatCompletionsProvider {
         let mut request = self
             .client
             .post(format!("{}/chat/completions", self.endpoint))
-            .bearer_auth(&secret.bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(body_bytes);
-        if let Some(project) = &secret.project {
-            request = request.header(OPENAI_PROJECT_HEADER, project);
+        // The open-proxy form bears no material: the request carries no
+        // `Authorization` header at all, never an empty or dummy bearer.
+        if let Some(secret) = &secret {
+            request = request.bearer_auth(&secret.bearer);
+            if let Some(project) = &secret.project {
+                request = request.header(OPENAI_PROJECT_HEADER, project);
+            }
         }
         let response = request
             .send()

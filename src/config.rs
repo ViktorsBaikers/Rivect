@@ -7,7 +7,7 @@
 use crate::contracts::ErrorCode;
 use crate::executor::{FileIdentity, Unattested, WriteIdentity};
 use crate::identity::{IdentityError, IdentityKind, IdentityMigration, IdentityRebind};
-use crate::providers::{SecretRef, SecretRefError};
+use crate::providers::{SecretRef, SecretRefError, open_proxy_connection};
 use crate::state::{StoreError, TaskStore};
 use serde::Serialize;
 use serde_json::Value;
@@ -2122,7 +2122,13 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
         let key = format!("connections.{name}");
         match connection.kind {
             ConnKind::ApiKey | ConnKind::Subscription => {
-                if connection.credential_ref.is_none() {
+                // The recorded open-proxy class serves a configured proxy
+                // with or without a key, so an absent `credential_ref` is
+                // its recorded unauthenticated form — never a dummy key.
+                // Every other kind still states the binding.
+                if connection.credential_ref.is_none()
+                    && !(connection.kind == ConnKind::ApiKey && open_proxy_connection(name))
+                {
                     return Err(ConfigError::schema(
                         format!("{key}.credential_ref"),
                         ConfigIssue::CredentialRefRequired {

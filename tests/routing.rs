@@ -4896,3 +4896,95 @@ fn kilo_offline_eligibility_is_binding_level_typed() {
         "an undeclared pin is the typed denial"
     );
 }
+
+/// `litellm` is a served Chat-Completions id under the recorded
+/// credential-optional api-key class: the dialect map routes the literal
+/// id, and a fixed pin is offline-eligible both on the recorded
+/// open-proxy declaration — which binds no `credential_ref` at all — and
+/// through a scoped key, while an undeclared id is the typed denial.
+#[test]
+fn litellm_offline_eligibility_admits_the_open_proxy_binding() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\n\
+         [connections.litellm-keyed]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\ncredential_ref = \"keyring:rivect/litellm-scope\"\nprofile = \"litellm-team\"\n\
+         [profiles.litellm-team]\ncredential_ref = \"keyring:rivect/litellm-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"litellm\", model_id = \"proxy/chat-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("litellm"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    assert_eq!(
+        config.connections["litellm"].credential_ref, None,
+        "the open-proxy row binds no credential"
+    );
+    let open_proxy = ModelAssign::Fixed(FixedModel {
+        connection: "litellm".to_string(),
+        model_id: "proxy/chat-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&open_proxy, &config.connections, &config.profiles)
+            .is_ok(),
+        "the recorded open proxy is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "litellm",
+    ));
+
+    let keyed = ModelAssign::Fixed(FixedModel {
+        connection: "litellm-keyed".to_string(),
+        model_id: "proxy/chat-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyed, &config.connections, &config.profiles).is_ok(),
+        "a scoped key is usable on the same class"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "litellm-keyed",
+    ));
+
+    // a litellm row whose declared binding cannot resolve is the typed
+    // live-grant denial at eligibility: the open proxy is the
+    // *undeclared* binding, never an unresolvable one
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\nprofile = \"litellm\"\n\
+         [profiles.litellm]\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"litellm\", model_id = \"proxy/chat-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    let unresolvable_pin = ModelAssign::Fixed(FixedModel {
+        connection: "litellm".to_string(),
+        model_id: "proxy/chat-model".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &unresolvable_pin,
+                &unresolvable.connections,
+                &unresolvable.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &unresolvable.connections,
+            &unresolvable.profiles,
+            "litellm",
+        ),
+        "only the undeclared binding is the open-proxy form"
+    );
+}

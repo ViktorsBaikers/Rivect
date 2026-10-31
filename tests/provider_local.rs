@@ -18598,3 +18598,1599 @@ async fn kilo_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::kilo = NOT_RUN"]
 fn provider_installed_kilo() {}
+
+// ----- litellm -----------------------------------------------------------------
+
+// The `litellm` connection's proof legs (HZN-008 class B — the
+// configured-proxy cell): the shared Chat Completions adapter serves the
+// literal id under its own recorded predicates. The proxy base is
+// user-configured and the class records no default host, so none is
+// invented: an empty configured base resolves empty and no localhost or
+// built-in catalogue exists. The recorded discovery is the proxy's own
+// management metadata first — four paths under one bounded phase — with
+// the recorded fall-through to `/models` (DEC-025, DRIFT-010). The
+// recorded credential arm is the open proxy: an undeclared binding rides
+// headerless on every leg, a declared binding that cannot resolve denies
+// typed, and a scoped key bears the wire. A `/models` 200 is never
+// entitlement; a metadata answer's capability, window and per-1M price
+// ride the offer, while a `/models` fall-through row carries its id
+// alone and keeps `ModelPrice::Unknown`.
+
+/// The scoped credential ref a keyed `litellm` connection binds.
+const LITELLM_REF: &str = "keyring:rivect-test/litellm";
+
+/// Fixture proxy key — never a real credential, only ever sent to
+/// localhost.
+const LITELLM_KEY: &str = "fixture-litellm-proxy-key";
+
+/// The pinned manual model id the fixed-pin legs carry: a proxy model id
+/// is the operator's own naming, never a recorded catalogue row.
+const LITELLM_MODEL: &str = "proxy/chat-model";
+
+/// A model id the fixture peer's `/models` answer offers.
+const LITELLM_LISTED: &str = "proxy/listed-model";
+
+/// The profile-only binding the recorded class admits: a connection
+/// naming `profile` and no own ref, so the profile's scope is the
+/// binding.
+const LITELLM_PROFILE_REF: &str = "keyring:rivect-test/litellm-team";
+
+/// The material the profile's scope holds — the key the proxy login
+/// pastes.
+const LITELLM_PROFILE_KEY: &str = "fixture-litellm-team-key";
+
+/// The rich metadata row the fixture's management answer carries: the
+/// id from `model_group`, and the capability marks, window and per-token
+/// prices from its `model_info` object — the pinned fetcher's shape.
+fn litellm_rich_entry(model_group: &str) -> Value {
+    json!({
+        "model_group": model_group,
+        "model_info": {
+            "max_input_tokens": 1000,
+            "max_output_tokens": 500,
+            "supports_vision": true,
+            "supports_reasoning": true,
+            "input_cost_per_token": 0.000003,
+            "output_cost_per_token": 0.000010,
+        },
+    })
+}
+
+/// Mount one management-metadata form at `request_path` with the body.
+async fn mount_metadata(server: &MockServer, request_path: &str, body: Value) {
+    Mock::given(method("GET"))
+        .and(path(request_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
+/// The request paths the fixture peer recorded, in order.
+fn request_paths(requests: &[Request]) -> Vec<&str> {
+    requests.iter().map(|request| request.url.path()).collect()
+}
+
+/// One configured `litellm` connection pointing at the fixture peer,
+/// carrying no `credential_ref` — the recorded open-proxy form.
+fn litellm_open_proxy_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"litellm\", model_id = \"{LITELLM_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same connection with a scoped key enrolled — the recorded
+/// authenticated form of the one class.
+fn litellm_config(endpoint: &str) -> String {
+    litellm_open_proxy_config(endpoint).replace(
+        "endpoint = \"",
+        &format!("credential_ref = \"{LITELLM_REF}\"\nendpoint = \""),
+    )
+}
+
+fn litellm_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(LITELLM_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "litellm".to_string(), store.clone())
+        .expect("the shared adapter builds for the litellm id");
+    (provider, store)
+}
+
+/// The `litellm` provider over the recorded scoped key.
+fn enrolled_litellm_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    litellm_provider(config, LITELLM_KEY)
+}
+
+/// The `litellm` provider over the recorded open-proxy form: no
+/// credential is bound, so the store is never consulted.
+fn open_proxy_litellm_provider(config: &Config) -> ChatCompletionsProvider {
+    provider_result(
+        config.clone(),
+        "litellm".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("an unbound declaration is the recorded open-proxy form")
+}
+
+// ----- TP-PROVIDER-AUTH::litellm ------------------------------------------------
+
+/// The recorded open proxy is an admitted path for `litellm`, never a
+/// dummy key: a declaration binding no `credential_ref` passes DEC-011
+/// eligibility, the send reaches the peer with no `Authorization`
+/// header at all, the frozen manifest rides as the one physical request,
+/// its reply is charged once, and the catalogue lookup over the same
+/// form probes the four recorded management paths headerless and takes
+/// the recorded `/models` fall-through — neither leg carries a bearer
+/// the declaration never bound.
+#[tokio::test]
+async fn litellm_open_proxy_without_key_is_admitted() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "open proxy outcome",
+            Some(json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    assert_eq!(
+        config.connections["litellm"].credential_ref, None,
+        "the open-proxy row binds no credential — never a materialized dummy"
+    );
+
+    let (broker, manifest) = prepared_with(
+        (
+            open_proxy_litellm_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/litellm",
+        "goal: open proxy",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest.clone());
+    let reply = outcome.expect("the open-proxy pin is admitted and dispatched");
+    assert_eq!(reply.text, "open proxy outcome");
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "one physical send is charged once"
+    );
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "litellm");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+        }
+    );
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "a fixed pin opens no catalogue leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "no binding means no Authorization header — never a dummy key"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], json!(LITELLM_MODEL));
+
+    // the same form reads the configured base's discovery headerless:
+    // no management metadata is mounted, so the class takes the
+    // recorded fall-through to `/models`
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the open-proxy catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [LITELLM_LISTED],
+        "the fall-through listing is the offer surface: no seed floor, no invented catalogue"
+    );
+    for model in &models {
+        assert_eq!(
+            model.price,
+            ModelPrice::Unknown,
+            "{} carries no recorded price row",
+            model.id
+        );
+        assert!(
+            !model.vision && !model.reasoning && model.efforts.is_empty(),
+            "{} carries no recorded capability surface",
+            model.id
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    let paths = request_paths(&requests);
+    assert_eq!(
+        paths,
+        [
+            "/v1/chat/completions",
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+            "/v1/models",
+        ],
+        "the send, then the four recorded metadata probes, then the fall-through"
+    );
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|request| request.headers.get("authorization").is_none()),
+        "the open-proxy discovery carries no Authorization header on any leg"
+    );
+}
+
+/// A scoped key on the same class is the recorded authenticated form for
+/// `litellm`: the store material bears the discovery leg and the send,
+/// the pinned model rides the wire verbatim, and one reply is one
+/// physical usage.
+#[tokio::test]
+async fn litellm_scoped_key_sends_bearer() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "keyed proxy outcome",
+            Some(json!({"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LITELLM_LISTED]);
+
+    let (broker, manifest) = prepared_with(
+        enrolled_litellm_provider(&config),
+        &config,
+        "/world/litellm",
+        "goal: scoped key",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest.clone());
+    let reply = outcome.expect("the scoped-key pin dispatches");
+    assert_eq!(reply.text, "keyed proxy outcome");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let paths = request_paths(&requests);
+    assert_eq!(
+        paths,
+        [
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+            "/v1/models",
+            "/v1/chat/completions",
+        ],
+        "the discovery legs then the chat request"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| { received_auth(request) == format!("Bearer {LITELLM_KEY}") }),
+        "the enrolled key bears every leg of the same class"
+    );
+    let body: Value = serde_json::from_slice(&requests[5].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LITELLM_MODEL),
+        "the pinned proxy model id rides the wire verbatim"
+    );
+}
+
+/// The recorded open-proxy class admits a declaration that binds only a
+/// profile: `connections.litellm` names `profile = "litellm-team"` and
+/// no own `credential_ref`, so the profile's scope is the binding and
+/// its material is the bearer the send must carry. A resolution that
+/// ignored the profile — treating the row as unbound — would send
+/// headerless here, so the header itself is the discriminating
+/// observation.
+#[tokio::test]
+async fn litellm_profile_only_binding_reaches_the_wire() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "profile bound",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"{}\"\nprofile = \"litellm-team\"\n\
+         [profiles.litellm-team]\ncredential_ref = \"{LITELLM_PROFILE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"litellm\", model_id = \"{LITELLM_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("a profile-only declaration is the recorded binding form");
+    assert_eq!(
+        config.connections["litellm"].credential_ref, None,
+        "the row binds only its profile"
+    );
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(LITELLM_PROFILE_REF, LITELLM_PROFILE_KEY)],
+    ));
+    let provider = provider_result(config.clone(), "litellm".to_string(), store)
+        .expect("the profile binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("the profile key admits the send");
+    assert_eq!(reply.text, "profile bound");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "a fixed pin opens no discovery leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LITELLM_PROFILE_KEY}"),
+        "the profile's material is the wire bearer"
+    );
+}
+
+/// The open proxy is the absent *binding*, never an absent scope: a
+/// connection that does bind a `credential_ref` whose store holds
+/// nothing is a configured-but-missing key and denies
+/// `CredentialAbsent` on both legs — the catalogue read as well as the
+/// send, exactly like every other keyed class, because this class's
+/// catalogue is the recorded `Listing` and the keyless tolerance
+/// belongs to `kilo`'s discovery form alone. A keyless send would be a
+/// fabricated credential, and a headerless catalogue answer would be a
+/// silent fall-back the record never names.
+#[tokio::test]
+async fn litellm_bound_scope_without_material_is_not_the_open_proxy() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [litellm_rich_entry(LITELLM_LISTED)]}),
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "unreachable",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+
+    let provider = provider_result(
+        config.clone(),
+        "litellm".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the binding resolves; the store is read per leg");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "a bound scope with no material is not the open proxy: {denied:?}"
+    );
+    drop_blocking(provider);
+
+    let provider = provider_result(
+        config.clone(),
+        "litellm".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let err = catalogue.expect_err("the catalogue denies the same absent material");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the catalogue leg is the recorded Listing, never the keyless form: {err}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "both denies land before any wire leg"
+    );
+}
+
+// ----- TP-PROVIDER-CATALOG::litellm ---------------------------------------------
+
+/// The recorded discovery order for `litellm`: the proxy's management
+/// metadata is asked first — the four recorded paths in order, appended
+/// to the configured base minus its `/v1` — and an answer there is the
+/// whole catalogue, so `/models` is never asked. The rich shape rides
+/// the offer: the id from `model_group`, the capability marks, the
+/// window and the per-token price scaled to per-1M. A form the proxy
+/// does not expose (404) is skipped and the walk keeps its order; when
+/// every form is absent the class takes the recorded fall-through to
+/// `/models`; and a refused form takes the fall-through at once rather
+/// than probing the rest.
+#[tokio::test]
+async fn litellm_management_metadata_precedes_the_models_listing() {
+    // (1) the leading form answers: no `/models` leg at all
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [litellm_rich_entry("proxy/rich-model")]}),
+    )
+    .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the metadata answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/rich-model"],
+        "the metadata id is the offer — the listing never adds a row here"
+    );
+    let model = &models[0];
+    assert_eq!(
+        model.context_window,
+        Some(1000),
+        "the metadata's input window rides the offer"
+    );
+    assert!(
+        model.vision && model.reasoning,
+        "the metadata's capability marks ride the offer"
+    );
+    assert_eq!(
+        model.price,
+        ModelPrice::Usd {
+            input_per_1m: 3.0,
+            output_per_1m: 10.0,
+        },
+        "the per-token figures scale to per-1M USD"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info"],
+        "the first answering form is the whole discovery"
+    );
+
+    // (2) earlier forms absent: the walk keeps the recorded order and
+    // the late form still owns the offer
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/v1/model/info",
+        json!({"data": [litellm_rich_entry("proxy/late-form-model")]}),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the late form answers");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), ["proxy/late-form-model"]);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        [
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+        ],
+        "each absent form is skipped in the recorded order"
+    );
+
+    // (3) every form absent: the recorded fall-through to `/models`
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the fall-through listing answers");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LITELLM_LISTED]);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        [
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+            "/v1/models",
+        ],
+        "the absent metadata phase falls through once"
+    );
+
+    // (4) a refused form takes the fall-through immediately
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/model_group/info"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("a refused form is the typed fall-through");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LITELLM_LISTED]);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info", "/v1/models"],
+        "a refusal ends the metadata phase instead of probing the rest"
+    );
+
+    // (5) a served set survives a later form's failure: the first form
+    // answers, the second fails, and the offers are kept — the catalogue
+    // never falls through to `/models`
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [{"model_group": "proxy/served-then-failed"}]}),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/model/info"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the served set survives the later failure");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/served-then-failed"],
+        "a later form's failure never discards the offers already served"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info", "/v2/model/info"],
+        "the failing form ends the walk, and no `/models` leg follows a served set"
+    );
+
+    // (6) a later form whose body exceeds the catalogue byte bound is the
+    // unreadable case: the walk ends and the served set is kept
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [{"model_group": "proxy/served-then-oversize"}]}),
+    )
+    .await;
+    // one byte past the catalogue bound (1 MiB) in a well-formed body
+    let oversize = format!(
+        "{{\"data\": [{{\"model_group\": \"{}\"}}]}}",
+        "a".repeat(1024 * 1024 + 16)
+    );
+    Mock::given(method("GET"))
+        .and(path("/v2/model/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(oversize))
+        .mount(&server)
+        .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the served set survives the unreadable form");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/served-then-oversize"],
+        "an over-bound body ends the walk without discarding the served set"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info", "/v2/model/info"],
+        "the over-bound form is read as far as its bound and no further leg follows"
+    );
+}
+
+/// The recorded enrichment semantics: the first answering form owns the
+/// offered id set, a later form only fills the gaps that set leaves —
+/// never overwriting a value already stated — and the walk stops as soon
+/// as every offer states its window and price. A foreign id a later form
+/// carries is never added: the first answer's set is the catalogue. The
+/// marks and prices one form states survive the next form that states
+/// none of them, while the window every earlier form left unstated is
+/// filled from the form that states it.
+#[tokio::test]
+async fn litellm_metadata_merges_into_the_served_set_and_stops_when_complete() {
+    let server = MockServer::start().await;
+    // the leading form owns the id set and states nothing else, so the
+    // walk continues
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [{"model_group": "proxy/enriched"}]}),
+    )
+    .await;
+    // this form fills the marks and the prices but no window, beside an id
+    // the leading form never offered, so the walk continues
+    mount_metadata(
+        &server,
+        "/v2/model/info",
+        json!({"data": [
+            {
+                "model_group": "proxy/enriched",
+                "model_info": {
+                    "supports_vision": true,
+                    "supports_reasoning": true,
+                    "input_cost_per_token": 0.000003,
+                    "output_cost_per_token": 0.000010,
+                },
+            },
+            litellm_rich_entry("proxy/foreign"),
+        ]}),
+    )
+    .await;
+    // this form states only the window: every mark and price it omits must
+    // survive from the form that stated them, and the window fills
+    mount_metadata(
+        &server,
+        "/model/info",
+        json!({"data": [
+            {
+                "model_group": "proxy/enriched",
+                "model_info": {"max_input_tokens": 2000},
+            },
+        ]}),
+    )
+    .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the metadata answers");
+    drop_blocking(provider);
+
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/enriched"],
+        "the first form's id set is the catalogue — the foreign id is absent"
+    );
+    let model = &models[0];
+    assert_eq!(
+        model.context_window,
+        Some(2000),
+        "the window every earlier form left unstated is filled from the form that states it"
+    );
+    assert_eq!(
+        model.price,
+        ModelPrice::Usd {
+            input_per_1m: 3.0,
+            output_per_1m: 10.0,
+        },
+        "the price one form stated survives a later form that omits it"
+    );
+    assert!(
+        model.reasoning,
+        "the reasoning mark one form stated survives a later form that omits it"
+    );
+    assert!(
+        model.vision,
+        "the vision mark one form stated survives a later form that omits it"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info", "/v2/model/info", "/model/info"],
+        "the completed set stops the walk — no further form and no `/models`"
+    );
+}
+
+/// The recorded placeholder filter: a sentinel group carrying no
+/// metadata is the proxy's placeholder, never an offer, while a
+/// different sentinel naming real metadata is served. The bare
+/// placeholder's own id is distinct from every served id, so dropping
+/// the filter changes the offered set.
+#[tokio::test]
+async fn litellm_metadata_drops_a_bare_sentinel_placeholder() {
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [
+            {"model_group": "all-team-models", "model_info": {"max_input_tokens": 1000}},
+            {"model_group": "all-proxy-models"},
+            {"model_group": "no-default-models", "supports_vision": true},
+        ]}),
+    )
+    .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the metadata answers");
+    drop_blocking(provider);
+
+    assert_eq!(
+        model_ids(&models),
+        ["all-team-models", "no-default-models"],
+        "only the rows carrying metadata are offered — the bare placeholder is absent"
+    );
+    assert_eq!(
+        models[0].context_window,
+        Some(1000),
+        "the stated window rides the served sentinel id"
+    );
+    assert!(
+        models[1].vision,
+        "a stated capability keeps a sentinel-named row a real offer"
+    );
+    assert!(
+        !model_ids(&models).contains(&LITELLM_LISTED),
+        "a served metadata set never falls through to `/models`"
+    );
+
+    // a form whose every row is a placeholder serves nothing, so it is
+    // not a complete answer: the walk continues to the next form, whose
+    // real row is served — the class never falls through to `/models`
+    let server = MockServer::start().await;
+    mount_metadata(
+        &server,
+        "/model_group/info",
+        json!({"data": [{"model_group": "all-proxy-models"}]}),
+    )
+    .await;
+    mount_metadata(
+        &server,
+        "/v2/model/info",
+        json!({"data": [litellm_rich_entry("proxy/later-form-row")]}),
+    )
+    .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the later form answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/later-form-row"],
+        "an all-placeholder form keeps the walk alive for the next form's offers"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info", "/v2/model/info"],
+        "the placeholder-only form is not a complete answer"
+    );
+}
+
+/// One lookup against a peer whose leading metadata form answers
+/// `response`: the offers and the request paths the peer recorded.
+async fn litellm_lookup_over(response: ResponseTemplate) -> (Vec<CatalogModel>, Vec<String>) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/model_group/info"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the catalogue answers");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    (
+        models,
+        request_paths(&requests)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// One lookup against a peer whose leading metadata form answers the
+/// `payload` as a successful JSON body.
+async fn litellm_lookup_over_json(payload: Value) -> (Vec<CatalogModel>, Vec<String>) {
+    litellm_lookup_over(ResponseTemplate::new(200).set_body_json(payload)).await
+}
+
+/// The recorded metadata payload shape variants and the recorded
+/// fall-through causes. A bare array, the `models` and `result`
+/// wrappers all carry entries; the id falls back through
+/// `model_name`→`id`→`litellm_params.model` when `model_group` is
+/// absent; a one-sided cost stays `ModelPrice::Unknown`. A 5xx, a
+/// non-JSON body, an empty entry list and an unknown wrapper all end the
+/// phase without offers, so the class takes the recorded `/models`
+/// fall-through.
+#[tokio::test]
+async fn litellm_metadata_shape_variants_and_fall_through_causes() {
+    // the bare-array payload
+    let (models, paths) =
+        litellm_lookup_over_json(json!([litellm_rich_entry("proxy/array-model")])).await;
+    assert_eq!(model_ids(&models), ["proxy/array-model"]);
+    assert_eq!(paths, ["/model_group/info"]);
+
+    // the `models` and `result` wrappers
+    for (wrapper, id) in [
+        ("models", "proxy/models-wrapper"),
+        ("result", "proxy/result-wrapper"),
+    ] {
+        let (models, paths) =
+            litellm_lookup_over_json(json!({ wrapper: [litellm_rich_entry(id)] })).await;
+        assert_eq!(
+            model_ids(&models),
+            [id],
+            "the {wrapper} wrapper carries entries"
+        );
+        assert_eq!(paths, ["/model_group/info"]);
+    }
+
+    // the recorded id fallbacks, each row stating its window and price
+    let mut by_name = litellm_rich_entry("");
+    by_name["model_name"] = json!("proxy/name-model");
+    by_name
+        .as_object_mut()
+        .expect("fixture object")
+        .remove("model_group");
+    let mut by_id = litellm_rich_entry("");
+    by_id["id"] = json!("proxy/id-model");
+    by_id
+        .as_object_mut()
+        .expect("fixture object")
+        .remove("model_group");
+    let mut by_params = litellm_rich_entry("");
+    by_params["litellm_params"] = json!({"model": "proxy/params-model"});
+    by_params
+        .as_object_mut()
+        .expect("fixture object")
+        .remove("model_group");
+    let (models, _) = litellm_lookup_over_json(json!({"data": [by_name, by_id, by_params]})).await;
+    assert_eq!(
+        model_ids(&models),
+        ["proxy/id-model", "proxy/name-model", "proxy/params-model"],
+        "each recorded id fallback names its offer, in sorted order"
+    );
+
+    // a one-sided cost stays unknown, and the incomplete set keeps the
+    // recorded walk alive (every later form absent)
+    let (models, paths) = litellm_lookup_over_json(json!({"data": [{
+        "model_group": "proxy/one-sided",
+        "model_info": {"max_input_tokens": 10, "input_cost_per_token": 0.001},
+    }]}))
+    .await;
+    assert_eq!(model_ids(&models), ["proxy/one-sided"]);
+    assert_eq!(
+        models[0].price,
+        ModelPrice::Unknown,
+        "a cost stating one leg alone is never half a price"
+    );
+    assert_eq!(
+        paths,
+        [
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+        ],
+        "an incomplete served set keeps the walk alive"
+    );
+
+    // the fall-through causes: a served-nothing phase answers `/models`
+    for (label, response, expected_paths) in [
+        (
+            "a 5xx form",
+            ResponseTemplate::new(500),
+            vec!["/model_group/info", "/v1/models"],
+        ),
+        (
+            "a non-JSON body",
+            ResponseTemplate::new(200).set_body_string("not json"),
+            vec!["/model_group/info", "/v1/models"],
+        ),
+        (
+            "an empty entry list",
+            ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+            vec![
+                "/model_group/info",
+                "/v2/model/info",
+                "/model/info",
+                "/v1/model/info",
+                "/v1/models",
+            ],
+        ),
+        (
+            "an unknown wrapper",
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"entries": [litellm_rich_entry("proxy/unwrapped")]})),
+            vec![
+                "/model_group/info",
+                "/v2/model/info",
+                "/model/info",
+                "/v1/model/info",
+                "/v1/models",
+            ],
+        ),
+    ] {
+        let (models, paths) = litellm_lookup_over(response).await;
+        assert_eq!(
+            model_ids(&models),
+            [LITELLM_LISTED],
+            "{label} falls through to the listing"
+        );
+        assert_eq!(
+            paths, expected_paths,
+            "{label} takes the recorded fall-through"
+        );
+    }
+}
+
+/// A spent whole-call budget bounds the catalogue path: the leading
+/// metadata probe is issued under the remaining budget and the delayed
+/// form cannot answer inside it, so the walk ends without offers. The
+/// typed `DeadlineExpired` is raised by the guard before the fall-through
+/// `/models` leg — the catalogue leg is a request too — so exactly the
+/// one bounded probe reaches the wire and no `/models` request follows.
+#[tokio::test]
+async fn litellm_metadata_never_probes_past_a_spent_budget() {
+    let server = MockServer::start().await;
+    // the leading form answers well past the constrained budget
+    Mock::given(method("GET"))
+        .and(path("/model_group/info"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(json!({"data": [litellm_rich_entry("proxy/slow-model")]})),
+        )
+        .mount(&server)
+        .await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let provider = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            ChatCompletionsProvider::with_deadline(
+                &config,
+                "litellm",
+                Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+                Duration::from_millis(250),
+            )
+        })
+        .join()
+        .expect("the provider thread joins")
+        .expect("the shared adapter builds for the litellm id")
+    };
+    // The blocking lookup runs on the blocking pool so the fixture peer's
+    // runtime stays free to record and answer the probe.
+    let (provider, catalogue) = tokio::task::spawn_blocking(move || {
+        let outcome = provider.catalog();
+        (provider, outcome)
+    })
+    .await
+    .expect("the lookup task joins");
+    let err = catalogue.expect_err("a spent budget is the typed deadline");
+    assert!(
+        matches!(&err, ProviderError::Transport { cause, .. }
+            if cause.class() == TransportClass::DeadlineExpired),
+        "the expired whole-call budget is the typed deadline: {err}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/model_group/info"],
+        "exactly the one bounded probe reached the wire — no later probe and no `/models` leg"
+    );
+}
+
+/// No built-in catalogue and no recorded default host exists for
+/// `litellm`: an empty configured base resolves empty rather than a
+/// substituted host — so no localhost catalogue can be invented — and
+/// the lookup over it denies typed instead of reaching any host, while
+/// a peer's empty listing offers nothing (the class records no seed
+/// floor). The resolved endpoint is read from the adapter's `Debug`
+/// surface, and the denial is pinned to the *URL-construction* class:
+/// a substituted default host would answer a connection or status
+/// failure instead, so a mere `Transport` variant would not
+/// discriminate the invented host.
+#[test]
+fn litellm_no_localhost_catalog_is_invented() {
+    use std::error::Error as _;
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&litellm_open_proxy_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let provider = open_proxy_litellm_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains(&format!("endpoint: \"{endpoint}\"")),
+            "endpoint {endpoint:?} resolved no default host: {debug}"
+        );
+        assert!(
+            !debug.contains("localhost") && !debug.contains("127.0.0.1"),
+            "no localhost catalogue host is invented: {debug}"
+        );
+        let (provider, catalogue) = catalog_on_thread(provider);
+        let err = catalogue.expect_err("an absent base opens no leg");
+        let ProviderError::Transport { connection, cause } = &err else {
+            panic!("the absent base is transport: {err}")
+        };
+        assert_eq!(connection, "litellm");
+        assert!(
+            cause.class() == TransportClass::RequestFailure,
+            "no request was attempted: {cause}"
+        );
+        let request = cause
+            .source()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .expect("the retained reqwest source");
+        assert!(
+            request.is_builder(),
+            "the absent base fails URL construction — never a substituted host: {cause}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The one catalogue scope this adapter has is the configured endpoint,
+/// and this adapter holds no cache of its own: the same adapter asked
+/// twice issues both lookups — five legs each, the four metadata probes
+/// then the fall-through listing — and a provider configured for
+/// another endpoint answers that endpoint's own listing. The recorded
+/// rich-model cache lives in the upstream client layer keyed by the
+/// base; nothing here is carried across bases, so an invented cache or
+/// a shared catalogue would red this leg.
+#[tokio::test]
+async fn litellm_cache_is_scoped_to_the_endpoint() {
+    let first = MockServer::start().await;
+    mount_models(&first, vec![json!({"id": "first-endpoint-model"})]).await;
+    let second = MockServer::start().await;
+    mount_models(&second, vec![json!({"id": "second-endpoint-model"})]).await;
+
+    let config =
+        Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&first))).expect("valid");
+    let provider = open_proxy_litellm_provider(&config);
+    let (provider, first_lookup) = catalog_on_thread(provider);
+    let (provider, second_lookup) = catalog_on_thread(provider);
+    drop_blocking(provider);
+    for lookup in [first_lookup, second_lookup] {
+        let models = lookup.expect("the configured base answers");
+        assert_eq!(
+            model_ids(&models),
+            ["first-endpoint-model"],
+            "each lookup reads the configured base, never a cached answer"
+        );
+    }
+    assert_eq!(
+        first.received_requests().await.expect("recorded").len(),
+        10,
+        "the one adapter asked twice issues both lookups against its base"
+    );
+
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&second)))
+        .expect("valid");
+    let (provider, catalogue) = catalog_on_thread(open_proxy_litellm_provider(&config));
+    let models = catalogue.expect("the second base answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["second-endpoint-model"],
+        "the answer follows the configured endpoint — nothing is carried across bases"
+    );
+    assert_eq!(
+        second.received_requests().await.expect("recorded").len(),
+        5,
+        "the second endpoint got its one lookup"
+    );
+    assert_eq!(
+        first.received_requests().await.expect("recorded").len(),
+        10,
+        "the first endpoint saw no further leg"
+    );
+}
+
+// ----- TP-PROVIDER-WIRE::litellm ------------------------------------------------
+
+/// Hostile stream input is never a false success for `litellm`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn litellm_adverse_wire_input_never_reports_success() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            open_proxy_litellm_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/litellm",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            open_proxy_litellm_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/litellm",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+}
+
+/// Wrong credential/profile/region never produce a false success for
+/// `litellm`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, and a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`; both deny before the store is read, so
+/// neither arm renders material at all. A refused bearer then lands the
+/// typed transport denial carrying the peer's status alone, and on that
+/// arm — the one that resolves and sends the material — neither the
+/// offered credential nor the peer's body reaches Display or Debug.
+#[tokio::test]
+async fn litellm_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    let regioned = Config::parse_validated(
+        &litellm_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "litellm".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "litellm");
+    assert_eq!(region, "eu");
+
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"litellm\", model_id = \"{LITELLM_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "litellm".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "litellm");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, LITELLM_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LITELLM_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement for `litellm` (INV-010):
+/// with the key enrolled the catalogue offers the listed id beside
+/// nothing else, yet the fixed pin's send still posts its own model —
+/// never the listed id as a substitute — and the unmounted
+/// `chat/completions` peer answers the typed transport denial, so a 200
+/// listing neither rewrites the wire model nor admits the request.
+#[tokio::test]
+async fn litellm_models_listing_is_not_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["listed-entitlement-claim"],
+        "the listed id is the whole offer — an answer confers no row beyond it"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        5,
+        "the four metadata probes fall through to the one listing leg"
+    );
+
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "litellm");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 6, "the discovery legs plus the request leg");
+    assert_eq!(requests[4].url.path(), "/v1/models");
+    assert_eq!(requests[5].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[5].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LITELLM_MODEL),
+        "the pinned model rides the wire — a listed id never substitutes it"
+    );
+}
+
+/// The auto pick rides the configured base's listing under the record's
+/// auto semantic: the dispatch narrows the pool to the `litellm`
+/// member, the offer is sorted deterministically, and the sorted-first
+/// listed id — ahead of a later-sorting sibling in the peer's inverted
+/// order — names the wire model verbatim, on the headerless open-proxy
+/// form.
+#[tokio::test]
+async fn litellm_auto_pick_resolves_through_the_listing() {
+    const FIRST_IN_SORT_ORDER: &str = "aaa-proxy-model";
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "zzz-proxy-model"}),
+            json!({"id": FIRST_IN_SORT_ORDER}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"{}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"litellm\"] }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let mut broker = Broker::new(Box::new(open_proxy_litellm_provider(&config)));
+    let manifest = broker
+        .prepare("main", &config, "/world/litellm", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let paths = request_paths(&requests);
+    assert_eq!(
+        paths,
+        [
+            "/model_group/info",
+            "/v2/model/info",
+            "/model/info",
+            "/v1/model/info",
+            "/v1/models",
+            "/v1/chat/completions",
+        ],
+        "the discovery legs and then the send"
+    );
+    assert!(
+        requests[..5]
+            .iter()
+            .all(|request| request.headers.get("authorization").is_none()),
+        "the open-proxy discovery carries no header"
+    );
+    let body: Value = serde_json::from_slice(&requests[5].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(FIRST_IN_SORT_ORDER),
+        "the sorted-first listed id names the wire model verbatim"
+    );
+    assert!(
+        requests[5].headers.get("authorization").is_none(),
+        "the open-proxy send carries no header"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::litellm --------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can never be
+/// a bearer token — denies `CredentialMalformed` on the first send, and
+/// enrolling the recorded key at the same scope admits the retry with
+/// that bearer. No state is wedged and no plaintext path is taken.
+#[tokio::test]
+async fn litellm_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LITELLM_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "litellm".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(LITELLM_REF, LITELLM_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LITELLM_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `litellm`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn litellm_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+    let open = Config::parse_validated(&litellm_open_proxy_config(&server_uri_v1(&server)))
+        .expect("the open-proxy row is valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the configured base's listing is the whole offer surface
+    // — no seed floor — and no offer carries a price or capability
+    // mark the class does not record.
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let listed = catalogue.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [LITELLM_LISTED]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown
+                    && !model.vision
+                    && !model.reasoning
+                    && model.efforts.is_empty()
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: the one class carries both recorded forms — the scoped key
+    // bears the chat request, the unbound declaration sends headerless.
+    let (provider, _store) = enrolled_litellm_provider(&config);
+    let (provider, keyed_outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let keyed_ok = keyed_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let keyed_bearer = requests.last().is_some_and(|request| {
+        request.headers.get("authorization").is_some_and(|value| {
+            value
+                .to_str()
+                .is_ok_and(|header| header == format!("Bearer {LITELLM_KEY}"))
+        })
+    });
+    let (provider, headerless_outcome) =
+        send_on_thread(open_proxy_litellm_provider(&open), prepared_manifest(&open));
+    let headerless_ok = headerless_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let headerless_absent = requests
+        .last()
+        .is_some_and(|request| request.headers.get("authorization").is_none());
+    reported.insert(
+        "AUTH",
+        if keyed_ok && keyed_bearer && headerless_ok && headerless_absent {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // WIRE: the full broker dispatch over the recorded open-proxy form
+    // returns the verified outcome.
+    let (broker, manifest) = {
+        let mut broker = Broker::new(Box::new(open_proxy_litellm_provider(&open)));
+        let manifest = broker
+            .prepare("main", &open, "/world/litellm", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/litellm", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: unusable material denies typed, and the recorded key at
+    // the same scope admits the retry.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LITELLM_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "litellm".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialMalformed { .. }));
+    store.enroll(LITELLM_REF, LITELLM_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::litellm -------------------------------------------
+
+/// TP-PROVIDER-INSTALLED::litellm = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::litellm = NOT_RUN"]
+fn provider_installed_litellm() {}

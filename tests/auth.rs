@@ -3025,3 +3025,99 @@ fn kilo_auth_class_leg_marks_the_custom_store_class() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class, credential optional: litellm -----------------------------
+
+/// The api-key class leg (AC-040f) for the one class whose credential is
+/// optional, exercised on a `litellm` fixture: a declaration that binds
+/// no `credential_ref` is admitted at ingress and offline-eligible at the
+/// binding level — the recorded open-proxy path — while the seam itself
+/// still types the absent binding `CredentialUnresolved` rather than
+/// fabricating a ref, so no dummy key exists. Where the connection does
+/// bind, the scoped `SecretRef` resolves through DEC-013 precedence (the
+/// connection's own ref, and a bound profile's ref where the scope's
+/// trailing segment names that profile), an undeclared id keeps the typed
+/// denial, and a divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The per-ID
+/// `litellm` open-proxy/scoped-key proof is the provider target's
+/// `litellm_open_proxy_without_key_is_admitted` and
+/// `litellm_scoped_key_sends_bearer`; this case exercises the class seam.
+#[test]
+fn litellm_open_proxy_and_scoped_key_resolve_through_the_scoped_secret_ref_seam() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\n\
+         [connections.litellm-keyed]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\ncredential_ref = \"keyring:rivect-test/litellm-direct\"\n\
+         [connections.litellm-profiled]\nkind = \"api_key\"\nendpoint = \"https://proxy.example.invalid/v1\"\ncredential_ref = \"keyring:rivect-test/litellm-scope\"\nprofile = \"litellm-team\"\n\
+         [profiles.litellm-team]\ncredential_ref = \"keyring:rivect-test/litellm-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    // the absent binding is admitted and offline-usable as the recorded
+    // open-proxy form, and the seam still types it — no ref is invented
+    assert_eq!(config.connections["litellm"].credential_ref, None);
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "litellm",
+    ));
+    assert!(
+        matches!(
+            resolve_credential(&config, "litellm"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "the absent binding stays unresolved — the open proxy carries no materialized ref"
+    );
+
+    let resolved = resolve_credential(&config, "litellm-keyed")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/litellm-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref
+    let resolved = resolve_credential(&config, "litellm-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/litellm-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // both bound forms are offline-eligible at the binding level
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "litellm-keyed",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "litellm-profiled",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/litellm-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "litellm-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

@@ -4388,3 +4388,142 @@ fn owner_config_ingress_never_blocks_on_a_writerless_fifo() -> Result<(), Box<dy
         other => unreachable!("a FIFO config is the typed read failure, got {other:?}"),
     }
 }
+
+// ----- open-proxy credential grammar (EDGE-007) -------------------------------
+
+/// One `litellm` connection row at `endpoint` plus whatever the caller
+/// appends to it, with a fixed pin naming the same connection.
+fn open_proxy_row(endpoint: &str, extra: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.litellm]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n{extra}\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"litellm\", model_id = \"proxy-chat-model\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same unbound single-connection document with the connection and
+/// its pin renamed to `id` — the shape every literal-id grammar check
+/// needs. The endpoint is irrelevant to the binding rule.
+fn open_proxy_row_for(id: &str) -> String {
+    open_proxy_row("https://proxy.example.invalid/v1", "")
+        .replace("connections.litellm", &format!("connections.{id}"))
+        .replace(
+            "connection = \"litellm\"",
+            &format!("connection = \"{id}\""),
+        )
+}
+
+/// The recorded open-proxy class admits a connection that binds no
+/// `credential_ref` — that declaration is the unauthenticated request
+/// form, and the parsed row carries `None` rather than a materialized
+/// dummy key — while a scoped key stays admitted on the same class. The
+/// relaxation is that one class only: a sibling `api_key` id and any
+/// `subscription` id still require their binding, an unknown key beside
+/// the admitted row still rejects with the connection csv, and a present
+/// value still carries the scoped-secret grammar.
+#[test]
+fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys() {
+    let config = Config::parse_validated(&open_proxy_row("https://proxy.example.invalid/v1", ""))
+        .expect("the open-proxy row is admitted");
+    let connection = config.connections.get("litellm").expect("the declared row");
+    assert_eq!(connection.kind, ConnKind::ApiKey);
+    assert_eq!(
+        connection.credential_ref, None,
+        "the open-proxy row binds no credential — never a materialized dummy"
+    );
+
+    let keyed = Config::parse_validated(&open_proxy_row(
+        "https://proxy.example.invalid/v1",
+        "credential_ref = \"keyring:rivect/litellm\"\n",
+    ))
+    .expect("the scoped-key row is admitted");
+    assert_eq!(
+        keyed.connections["litellm"].credential_ref.as_deref(),
+        Some("keyring:rivect/litellm"),
+        "the same class still admits its scoped key"
+    );
+
+    let sibling = open_proxy_row_for("openai");
+    let error =
+        Config::parse_validated(&sibling).expect_err("a sibling api_key id requires its binding");
+    assert!(
+        matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+        "wrong rejection: {error}"
+    );
+
+    let subscription = open_proxy_row("https://api.example.invalid/v1", "")
+        .replace("kind = \"api_key\"", "kind = \"subscription\"");
+    let error = Config::parse_validated(&subscription)
+        .expect_err("a subscription id still requires its binding");
+    assert!(
+        matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::Subscription),
+        "wrong rejection: {error}"
+    );
+
+    // the admission keys on the literal id: a name merely containing the
+    // class name is a different connection and still requires its ref
+    for lookalike in ["litellm-proxy", "my-litellm", "LiteLLM"] {
+        let row = open_proxy_row_for(lookalike);
+        let error =
+            Config::parse_validated(&row).expect_err("a lookalike id is not the recorded class");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{lookalike} wrong rejection: {error}"
+        );
+    }
+
+    // the band-wide fixed set: each of the ten recorded Chat Completions
+    // ids declared without a binding — only `litellm` is admitted, so the
+    // relaxation is one recorded class, never the band
+    let band = [
+        "coreweave",
+        "deepinfra",
+        "deepseek",
+        "firepass",
+        "fireworks",
+        "gmi-cloud",
+        "groq",
+        "huggingface",
+        "kilo",
+        "litellm",
+    ];
+    let mut admitted = Vec::new();
+    for id in band {
+        let row = open_proxy_row_for(id);
+        match Config::parse_validated(&row) {
+            Ok(_) => admitted.push(id),
+            Err(error) => assert!(
+                matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+                "{id} wrong rejection: {error}"
+            ),
+        }
+    }
+    assert_eq!(
+        admitted,
+        ["litellm"],
+        "the open-proxy admission is that one literal id, not the band"
+    );
+
+    let error = Config::parse_validated(&open_proxy_row(
+        "https://proxy.example.invalid/v1",
+        "bogus = 1\n",
+    ))
+    .expect_err("an unknown connection key is still refused");
+    assert!(
+        matches!(&error.issue, ConfigIssue::UnknownKey { key, .. } if key == "bogus"),
+        "wrong rejection: {error}"
+    );
+
+    let error = Config::parse_validated(&open_proxy_row(
+        "https://proxy.example.invalid/v1",
+        "credential_ref = \"not a scoped ref\"\n",
+    ))
+    .expect_err("a present value carries the scoped-secret grammar");
+    assert!(
+        matches!(&error.issue, ConfigIssue::SecretRefExpected { key } if key == "connections.litellm.credential_ref"),
+        "wrong rejection: {error}"
+    );
+}
