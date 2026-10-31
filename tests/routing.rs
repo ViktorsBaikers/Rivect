@@ -4778,3 +4778,62 @@ fn groq_offline_eligibility_is_binding_level_typed() {
         "an undeclared pin is the typed denial"
     );
 }
+
+/// `huggingface` is a served Chat-Completions id under the recorded
+/// api-key class: the dialect map routes the literal id, and the pin is
+/// offline-eligible at the binding level through a profile-bound scoped
+/// ref — an undeclared id is the typed denial, never a dispatch.
+#[test]
+fn huggingface_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.huggingface]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid\"\ncredential_ref = \"keyring:rivect/huggingface-scope\"\nprofile = \"huggingface-team\"\n\
+         [profiles.huggingface-team]\ncredential_ref = \"keyring:rivect/huggingface-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"huggingface\", model_id = \"Qwen/Qwen3-235B-A22B-Thinking-2507\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("huggingface"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "huggingface".to_string(),
+        model_id: "Qwen/Qwen3-235B-A22B-Thinking-2507".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a profile-bound credential binding is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "huggingface",
+    ));
+
+    // a fixed pin on an undeclared id is the typed unknown-connection
+    // denial at eligibility, before any ranking or send
+    let undeclared = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"local\", model_id = \"x\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    let missing = ModelAssign::Fixed(FixedModel {
+        connection: "huggingface-missing".to_string(),
+        model_id: "x".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &missing,
+                &undeclared.connections,
+                &undeclared.profiles,
+            ),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+}

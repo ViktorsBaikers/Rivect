@@ -1,15 +1,16 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud` and
-//! `groq` connections' adapter — the OpenAI-compatible Chat Completions dialect
-//! (DEC-007/DEC-025, HZN-008 class S, class A and class P).
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
+//! `groq` and `huggingface` connections' adapter — the OpenAI-compatible
+//! Chat Completions dialect (DEC-007/DEC-025, HZN-008 class S, class A
+//! and class P).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
 //! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
-//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud` and
-//! `groq` carry their own recorded predicates — the
+//! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
+//! `groq` and `huggingface` carry their own recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
 //! on `aiand`, the default-host endpoint rule and the chat-id
 //! catalogue filter on `aimlapi`, the region-choice endpoint, the
@@ -49,7 +50,16 @@
 //! model does not record denies typed: before any wire leg for a fixed
 //! pin, and before the chat request leg for an auto pick that resolved
 //! its model from the listing first) and the
-//! plain bearer credential on `groq` — resolved per literal id by the
+//! plain bearer credential on `groq`, and the configured-or-default
+//! `router.huggingface.co/v1` host, the recorded T1 static bundled
+//! rows as the offer floor with the key-gated `/models` listing as
+//! their non-authoritative supplement, the ids riding the catalogue
+//! and the wire verbatim — the `provider/model` routing suffix is
+//! never stripped, folded or re-prefixed — and the
+//! fine-grained model-request token, whose `hf_…` grammar is the
+//! account/org billing form: material of another credential class
+//! denies typed before any wire leg rather than billing implicitly on
+//! `huggingface` — resolved per literal id by the
 //! contract table, never inherited across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -499,6 +509,104 @@ const GROQ_PRICES: &[(&str, f64, f64)] = &[
     ("qwen/qwen3.8-27b", 0.8, 4.0),
 ];
 
+/// The recorded default API root of a `huggingface` connection
+/// (`router.huggingface.co/v1`, DEC-025 row: a fine-grained
+/// model-request token → that host): the host the required `endpoint`
+/// field's empty string resolves under — the same absent-override rule
+/// the plan classes bind.
+const HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
+
+/// The recorded `huggingface` token grammar (`auth/huggingface.kdl`:
+/// the API-key login pastes a fine-grained `hf_…` model-request
+/// token): prefix plus a non-empty body. That token is the recorded
+/// account/org billing form — material outside the grammar names
+/// another class and never rides this contract.
+const HUGGINGFACE_TOKEN_PREFIX: &str = "hf_";
+
+/// The recorded `huggingface` static bundled rows (HZN-008 DEC-025 T1
+/// static-bearer-chat cell; the pinned `models.json` `huggingface`
+/// rows at OMP 18.1.14 @ `0133f7ff`): the class records these bundled
+/// ids as the model universe, so they form the offer floor the
+/// key-gated `/models` answer merges over without conferring
+/// entitlement. The floor carries ids only — the bundled reference
+/// descriptors (cost, image-input, context window, reasoning/effort)
+/// stay uncarried, so a floor offer keeps [`ModelPrice::Unknown`] and
+/// an empty capability surface.
+const HUGGINGFACE_SEED: &[&str] = &[
+    "MiniMaxAI/MiniMax-M2",
+    "MiniMaxAI/MiniMax-M2.1",
+    "MiniMaxAI/MiniMax-M2.5",
+    "MiniMaxAI/MiniMax-M2.7",
+    "MiniMaxAI/MiniMax-M3",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "Qwen/Qwen3-235B-A22B",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "Qwen/Qwen3-235B-A22B-Thinking-2507",
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    "Qwen/Qwen3-Coder-Next",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct",
+    "Qwen/Qwen3-Next-80B-A3B-Thinking",
+    "Qwen/Qwen3-VL-235B-A22B-Instruct",
+    "Qwen/Qwen3-VL-235B-A22B-Thinking",
+    "Qwen/Qwen3.5-122B-A10B",
+    "Qwen/Qwen3.5-27B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-397B-A17B",
+    "Qwen/Qwen3.5-9B",
+    "Qwen/Qwen3.6-27B",
+    "Qwen/Qwen3.6-35B-A3B",
+    "Qwen/Qwen3.8-2.4T-A95B",
+    "Qwen/Qwen3.8-27B",
+    "XiaomiMiMo/MiMo-V2-Flash",
+    "XiaomiMiMo/MiMo-V2.5",
+    "XiaomiMiMo/MiMo-V2.5-Pro",
+    "deepseek-ai/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-R1-0528",
+    "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V3-0324",
+    "deepseek-ai/DeepSeek-V3.1",
+    "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    "deepseek-ai/DeepSeek-V4-Pro",
+    "deepseek-ai/DeepSeek-V4-Pro-0813",
+    "google/gemma-4-26B-A4B-it",
+    "google/gemma-4-31B-it",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "moonshotai/Kimi-K2-Instruct",
+    "moonshotai/Kimi-K2-Instruct-0905",
+    "moonshotai/Kimi-K2-Thinking",
+    "moonshotai/Kimi-K2.5",
+    "moonshotai/Kimi-K2.6",
+    "moonshotai/Kimi-K2.7-Code",
+    "moonshotai/Kimi-K3",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "stepfun-ai/Step-3.5-Flash",
+    "stepfun-ai/Step-3.7-Flash",
+    "tencent/Hy3",
+    "thinkingmachines/Inkling",
+    "thinkingmachines/Inkling-Small",
+    "zai-org/GLM-4.5",
+    "zai-org/GLM-4.5-Air",
+    "zai-org/GLM-4.5V",
+    "zai-org/GLM-4.6",
+    "zai-org/GLM-4.6V-Flash",
+    "zai-org/GLM-4.7",
+    "zai-org/GLM-4.7-Flash",
+    "zai-org/GLM-5",
+    "zai-org/GLM-5.1",
+    "zai-org/GLM-5.2",
+    "zai-org/GLM-5.3",
+    "zai-org/GLM-5.3-Flash",
+];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -592,6 +700,15 @@ enum CredentialRule {
     /// bare key, a key-only blob, an empty scope — is unscoped
     /// material that denies before any wire leg.
     CoreWeave,
+    /// `huggingface`'s recorded credential (`auth/huggingface.kdl`):
+    /// the fine-grained model-request token the API-key login pastes
+    /// — the `hf_…` grammar — and the one billing form the row
+    /// records: the router charges the request to the token's user or
+    /// org. Material of another class — a provider-signed key that
+    /// would bill at the provider (BYOK), a structured blob the login
+    /// never writes — denies as malformed before any wire leg rather
+    /// than being forwarded under an inferred billing mode (INV-005).
+    HuggingFace,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -667,6 +784,15 @@ enum EntryRule {
     /// logit_bias, top_logprobs, `messages[].name`, `n`, temperature)
     /// are never constructed by this adapter, so none can be dropped.
     Groq,
+    /// The `huggingface` arm: the recorded `provider/model` routing
+    /// rule is why the class carries its own arm, and that rule's
+    /// transform is identity — not a rewrite a reader should expect.
+    /// A listed namespaced id (`org/model`) and a listed id carrying the
+    /// `:provider` serving suffix ride the catalogue and the wire
+    /// exactly as served; nothing is stripped, folded or re-prefixed.
+    /// The router selects the serving provider from that suffix, so a
+    /// rewrite would silently reroute a pinned model.
+    HuggingFace,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -860,6 +986,22 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::Groq,
+        }),
+        // `huggingface` (HZN-008 class A): the configured-or-recorded
+        // `router.huggingface.co/v1` base, the recorded T1 static
+        // bundled rows as the offer floor with the key-gated `/models`
+        // listing as their non-authoritative supplement, the ids riding
+        // verbatim — the recorded `provider/model` routing suffix
+        // included — and the recorded fine-grained model-request token:
+        // its `hf_…` grammar is the account/org billing form, so
+        // material of another class denies before any wire leg and the
+        // billing mode is never inferred (INV-005).
+        "huggingface" => Some(SourceContract {
+            seed: HUGGINGFACE_SEED,
+            endpoint: EndpointRule::PlanBaseOrDefault(HUGGINGFACE_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::HuggingFace,
+            entries: EntryRule::HuggingFace,
         }),
         _ => None,
     }
@@ -1257,7 +1399,8 @@ impl ChatCompletionsProvider {
                     | EntryRule::Aiand
                     | EntryRule::Aimlapi
                     | EntryRule::AlibabaTokenPlan
-                    | EntryRule::Firepass => Some(CatalogModel {
+                    | EntryRule::Firepass
+                    | EntryRule::HuggingFace => Some(CatalogModel {
                         id: (*id).to_string(),
                         ..CatalogModel::default()
                     }),
@@ -1302,6 +1445,12 @@ impl ChatCompletionsProvider {
             // a foreign id carries no recorded price, effort or vision
             // mark, while a recorded id carries its full surface.
             EntryRule::Groq => Some(groq_entry(id)),
+            // The recorded routing form — `org/model` and a
+            // `:provider` suffix included — rides the listing unchanged.
+            EntryRule::HuggingFace => Some(CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -1328,7 +1477,12 @@ impl ChatCompletionsProvider {
                 self.token_plan_bearer(&text).map(WireSecret::bearer)
             }
             CredentialRule::CoreWeave => self.coreweave_secret(&text),
-            CredentialRule::Firepass => self.firepass_bearer(&text).map(WireSecret::bearer),
+            CredentialRule::Firepass => self
+                .prefixed_bearer(&text, FIREPASS_KEY_PREFIX)
+                .map(WireSecret::bearer),
+            CredentialRule::HuggingFace => self
+                .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
+                .map(WireSecret::bearer),
         }
     }
 
@@ -1366,18 +1520,17 @@ impl ChatCompletionsProvider {
         })
     }
 
-    /// The bearer a `firepass` credential resolves (`auth/firepass.kdl`):
-    /// the recorded pass key is the dedicated `fpk_…` class, prefix
-    /// plus a non-empty body. The key is bound to this connection's
-    /// own enrollment, so material outside the grammar — notably a
-    /// Fireworks account key for the shared `api.fireworks.ai` host —
-    /// denies as malformed before any wire leg, never as a bearer the
-    /// pass product would bill differently. Every denial is typed and
-    /// lands before any leg.
-    fn firepass_bearer(&self, material: &str) -> Result<String, ProviderError> {
+    /// The bearer a prefix-keyed credential grammar resolves
+    /// (`firepass`'s dedicated `fpk_…` pass key and `huggingface`'s
+    /// fine-grained `hf_…` model-request token): the trimmed material
+    /// must carry that class's recorded prefix plus a non-empty body,
+    /// and the trimmed material is then the bearer verbatim. Material
+    /// outside the grammar — a key of another enrollment or billing
+    /// class included — denies as malformed before any wire leg.
+    fn prefixed_bearer(&self, material: &str, prefix: &str) -> Result<String, ProviderError> {
         let token = material.trim();
         token
-            .strip_prefix(FIREPASS_KEY_PREFIX)
+            .strip_prefix(prefix)
             .filter(|body| !body.is_empty())
             .ok_or_else(|| ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
@@ -1528,9 +1681,9 @@ impl ChatCompletionsProvider {
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek` and `Groq` — sends the offered id unchanged. Each
-    /// variant is listed so a future transform cannot ship verbatim
-    /// ids silently.
+    /// `DeepSeek`, `Groq` and `HuggingFace` — sends the offered id
+    /// unchanged. Each variant is listed so a future transform cannot
+    /// ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
@@ -1540,7 +1693,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Aimlapi
             | EntryRule::AlibabaTokenPlan
             | EntryRule::DeepSeek
-            | EntryRule::Groq => model_id.to_string(),
+            | EntryRule::Groq
+            | EntryRule::HuggingFace => model_id.to_string(),
         }
     }
 

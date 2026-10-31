@@ -16627,3 +16627,1065 @@ async fn groq_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::groq = NOT_RUN"]
 fn provider_installed_groq() {}
+
+// ----- huggingface -------------------------------------------------------------
+
+// The `huggingface` connection's proof legs (HZN-008 class A): the
+// shared Chat Completions adapter serves the literal id — no copied
+// codec — under its own recorded predicates (DEC-025 row: a
+// fine-grained model-request token → `router.huggingface.co/v1`,
+// `/models` listing). The configured `endpoint` carries the API base
+// verbatim — an empty one resolves the recorded
+// `router.huggingface.co/v1` default — and a configured `region` is
+// denied: the contract names none. The recorded T1 static-bearer-chat
+// cell makes the bundled `huggingface` rows the model universe and the
+// key-gated `/models` answer a non-authoritative supplement: the static
+// floor offers every bundled id even when the listing omits it, and the
+// floor's reference descriptors (cost/vision/context) stay uncarried —
+// this class offers ids only. Listed ids ride the catalogue and the
+// wire verbatim, the `provider/model` routing suffix included: the
+// adapter never strips a namespace, folds a suffix or re-prefixes one.
+// The credential is the recorded fine-grained model-request token; its
+// `hf_…` grammar is the account/org billing form, so material of
+// another class — a provider-signed key that would bill at the provider
+// (BYOK), a structured blob — denies typed before any wire leg rather
+// than being forwarded under an inferred billing mode.
+
+/// The scoped credential ref the `huggingface` connection binds.
+const HUGGINGFACE_REF: &str = "keyring:rivect-test/huggingface";
+
+/// Fixture fine-grained model-request token — never a real credential,
+/// only ever sent to localhost.
+const HUGGINGFACE_KEY: &str = "hf_fixture-huggingface-model-request-token";
+
+/// Provider-signed material of another billing class: a BYOK key would
+/// bill the request at the provider, not through the token's account or
+/// org.
+const HUGGINGFACE_BYOK_KEY: &str = "sk-fixture-provider-issued-key";
+
+/// The pinned namespaced model id the fixed-pin legs carry.
+const HUGGINGFACE_MODEL: &str = "Qwen/Qwen3-235B-A22B-Thinking-2507";
+
+/// A namespaced id carrying the recorded `:provider` routing suffix —
+/// the form the catalogue and the wire must carry unchanged.
+const HUGGINGFACE_ROUTED: &str = "deepseek-ai/DeepSeek-V3.1:novita";
+
+/// One configured `huggingface` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn huggingface_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.huggingface]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{HUGGINGFACE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"huggingface\", model_id = \"{HUGGINGFACE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn huggingface_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(HUGGINGFACE_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "huggingface".to_string(), store.clone())
+        .expect("the shared adapter builds for the huggingface id");
+    (provider, store)
+}
+
+/// The `huggingface` provider over the recorded token class.
+fn enrolled_huggingface_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    huggingface_provider(config, HUGGINGFACE_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::huggingface -------------------------------------------
+
+/// A configured `huggingface` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key pin
+/// under DEC-011, the token bears the `Authorization` header verbatim —
+/// never the body — the shared adapter posts exactly the frozen manifest
+/// as a `chat/completions` request, the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt never
+/// re-sends.
+#[tokio::test]
+async fn huggingface_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified huggingface outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/huggingface",
+            "goal: prove the wire",
+        )
+        .expect("the huggingface pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/huggingface", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified huggingface outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // A fixed pin opens no catalogue leg: the request is the one send.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {HUGGINGFACE_KEY}"),
+        "the recorded token bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(HUGGINGFACE_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(HUGGINGFACE_MODEL),
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "huggingface");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/huggingface", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `huggingface`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn huggingface_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_huggingface_provider(&config),
+        &config,
+        "/world/huggingface",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/huggingface", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_huggingface_provider(&config),
+        &config,
+        "/world/huggingface",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/huggingface", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded `provider/model` routing suffix is preserved: a listed
+/// namespaced id and a listed id carrying the `:provider` suffix are
+/// offered exactly as served, and the pinned routed id names the wire
+/// model verbatim — never stripped to its bare model name, folded or
+/// re-prefixed by this adapter.
+#[tokio::test]
+async fn huggingface_provider_model_routing_suffix_is_preserved() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": HUGGINGFACE_MODEL}),
+            json!({"id": HUGGINGFACE_ROUTED}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "routed",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.huggingface]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{HUGGINGFACE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"huggingface\", model_id = \"{HUGGINGFACE_ROUTED}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+
+    // the catalogue carries both routing forms unchanged — the static
+    // bundled floor plus the one routed listed id
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    let ids = model_ids(&models);
+    assert_eq!(
+        ids.len(),
+        73,
+        "the static bundled floor plus the routed listing id: {ids:?}"
+    );
+    assert!(
+        ids.contains(&HUGGINGFACE_MODEL) && ids.contains(&HUGGINGFACE_ROUTED),
+        "the namespaced ids ride the catalogue verbatim in sorted order: {ids:?}"
+    );
+
+    // the pinned routed id names the wire model verbatim
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the routed pin dispatches");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the discovery leg and the send");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(HUGGINGFACE_ROUTED),
+        "the namespace and the routing suffix ride the wire untouched"
+    );
+}
+
+/// The recorded billing distinction is explicit in the credential path,
+/// never inferred: the fine-grained model-request token — the recorded
+/// account/org billing form — bears the wire, while provider-signed
+/// material (a BYOK key) and a structured blob deny `CredentialMalformed`
+/// on the send and on the catalogue leg, opening no wire leg at all, so
+/// neither billing mode is ever inferred from the other.
+#[tokio::test]
+async fn huggingface_account_org_and_byok_billing_are_explicit_never_implicit() {
+    // the recorded token class is the account/org form: it sends
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "account billed",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the recorded token class admits the send");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {HUGGINGFACE_KEY}"),
+        "the recorded token bears the wire"
+    );
+
+    // the other billing class denies typed on both legs, before any wire
+    // request exists
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": HUGGINGFACE_MODEL})]).await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    for material in [
+        HUGGINGFACE_BYOK_KEY,
+        "{\"token\": \"hf_fixture-structured-blob\"}",
+    ] {
+        let (provider, _store) = huggingface_provider(&config, material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("material of another billing class denies");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "the denial is the typed malformed credential: {err:?}"
+        );
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+
+        let (provider, _store) = huggingface_provider(&config, material);
+        let (provider, catalog) = catalog_on_thread(provider);
+        let err = catalog.expect_err("the catalogue leg denies the same material");
+        assert!(matches!(err, ProviderError::CredentialMalformed { .. }));
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "material of another billing class never reaches the wire"
+    );
+}
+
+/// The recorded token grammar requires a non-empty body: material that
+/// is the `hf_` prefix alone, or the prefix followed only by
+/// whitespace, names no token — `CredentialMalformed` on the send and on
+/// the catalogue leg, with no wire request opened on either path.
+#[tokio::test]
+async fn huggingface_bare_token_prefix_denies_before_any_wire_leg() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": HUGGINGFACE_MODEL})]).await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    for material in ["hf_", "hf_   "] {
+        let (provider, _store) = huggingface_provider(&config, material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("the bare prefix names no token");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "the bare prefix is the typed malformed credential: {err:?}"
+        );
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+
+        let (provider, _store) = huggingface_provider(&config, material);
+        let (provider, catalog) = catalog_on_thread(provider);
+        let err = catalog.expect_err("the catalogue leg denies the bare prefix");
+        assert!(matches!(err, ProviderError::CredentialMalformed { .. }));
+        assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the bare prefix never reaches the wire"
+    );
+}
+
+/// An empty configured endpoint resolves the recorded default — the
+/// `config?.baseUrl ?? defaultBaseUrl` absent arm our required `endpoint`
+/// field expresses as the empty string, and whitespace-only shares the
+/// arm under the recorded trim. Offline pin: the adapter's `Debug`
+/// surface reports the resolved endpoint, so the arm is proved without
+/// one byte toward `router.huggingface.co`.
+#[test]
+fn huggingface_empty_endpoint_resolves_the_recorded_default() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&huggingface_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let (provider, _store) = enrolled_huggingface_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://router.huggingface.co/v1\""),
+            "endpoint {endpoint:?} resolved to the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+// ----- TP-PROVIDER-AUTH::huggingface -------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `huggingface`, through the same shared construction its siblings
+/// use: a configured `region` — the recorded contract names none —
+/// denies `RegionMismatch` with the connection context, and a
+/// profile-bound ref whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`; both deny before the store is read. A
+/// refused bearer lands the typed transport denial carrying the peer's
+/// status alone, and on that arm — the one that resolves and sends the
+/// material — neither the offered credential nor the peer's body
+/// reaches Display or Debug.
+#[tokio::test]
+async fn huggingface_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+{
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — before any
+    // credential resolution
+    let regioned = Config::parse_validated(
+        &huggingface_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "huggingface".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "huggingface");
+    assert_eq!(region, "eu");
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.huggingface]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"huggingface\", model_id = \"{HUGGINGFACE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "huggingface".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "huggingface");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, HUGGINGFACE_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {HUGGINGFACE_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// A `/models` HTTP 200 contributes ids but confers no entitlement
+/// (INV-010) for `huggingface`: the catalogue offers the listed id
+/// beside the static bundled floor, yet with the token enrolled the
+/// fixed pin's send still posts its own pinned model — never the
+/// listed id as a substitute — and the unmounted `chat/completions`
+/// peer answers the typed transport denial, so a 200 listing neither
+/// rewrites the wire model nor admits the request.
+#[tokio::test]
+async fn huggingface_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "org/listed-entitlement-claim"})]).await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        models.len(),
+        73,
+        "the static floor plus the listed id: {:?}",
+        model_ids(&models)
+    );
+    assert!(
+        model_ids(&models).contains(&"org/listed-entitlement-claim"),
+        "the 200 listing contributes its id"
+    );
+    let discovery = server.received_requests().await.expect("recorded");
+    assert_eq!(discovery.len(), 1, "the catalogue reads the listing once");
+    assert_eq!(discovery[0].url.path(), "/v1/models");
+
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "huggingface");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the discovery leg plus the request leg — the 200 listing adds nothing"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(HUGGINGFACE_MODEL),
+        "the pinned model rides the wire — a listed id never substitutes it"
+    );
+}
+
+// ----- TP-PROVIDER-CATALOG::huggingface ----------------------------------------
+
+/// The pinned bundled floor as an independent expected snapshot: the 72
+/// ids the recorded T1 static-bearer-chat cell bundles for
+/// `huggingface`, in sorted order. This is a self-consistency control,
+/// not source proof — the pinned OMP snapshot is not vendored in this
+/// workspace, so the list pins what this adapter's seed must offer, not
+/// that upstream still records it.
+fn huggingface_expected_floor() -> Vec<&'static str> {
+    vec![
+        "MiniMaxAI/MiniMax-M2",
+        "MiniMaxAI/MiniMax-M2.1",
+        "MiniMaxAI/MiniMax-M2.5",
+        "MiniMaxAI/MiniMax-M2.7",
+        "MiniMaxAI/MiniMax-M3",
+        "Qwen/Qwen2.5-Coder-32B-Instruct",
+        "Qwen/Qwen3-235B-A22B",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "Qwen/Qwen3-Coder-Next",
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        "Qwen/Qwen3-Next-80B-A3B-Thinking",
+        "Qwen/Qwen3-VL-235B-A22B-Instruct",
+        "Qwen/Qwen3-VL-235B-A22B-Thinking",
+        "Qwen/Qwen3.5-122B-A10B",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+        "Qwen/Qwen3.8-2.4T-A95B",
+        "Qwen/Qwen3.8-27B",
+        "XiaomiMiMo/MiMo-V2-Flash",
+        "XiaomiMiMo/MiMo-V2.5",
+        "XiaomiMiMo/MiMo-V2.5-Pro",
+        "deepseek-ai/DeepSeek-R1",
+        "deepseek-ai/DeepSeek-R1-0528",
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-V3-0324",
+        "deepseek-ai/DeepSeek-V3.1",
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "deepseek-ai/DeepSeek-V4-Pro-0813",
+        "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-31B-it",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Kimi-K2-Instruct-0905",
+        "moonshotai/Kimi-K2-Thinking",
+        "moonshotai/Kimi-K2.5",
+        "moonshotai/Kimi-K2.6",
+        "moonshotai/Kimi-K2.7-Code",
+        "moonshotai/Kimi-K3",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "stepfun-ai/Step-3.5-Flash",
+        "stepfun-ai/Step-3.7-Flash",
+        "tencent/Hy3",
+        "thinkingmachines/Inkling",
+        "thinkingmachines/Inkling-Small",
+        "zai-org/GLM-4.5",
+        "zai-org/GLM-4.5-Air",
+        "zai-org/GLM-4.5V",
+        "zai-org/GLM-4.6",
+        "zai-org/GLM-4.6V-Flash",
+        "zai-org/GLM-4.7",
+        "zai-org/GLM-4.7-Flash",
+        "zai-org/GLM-5",
+        "zai-org/GLM-5.1",
+        "zai-org/GLM-5.2",
+        "zai-org/GLM-5.3",
+        "zai-org/GLM-5.3-Flash",
+    ]
+}
+
+/// The recorded T1 static-bearer-chat cell makes the bundled rows the
+/// model universe: an empty `/models` answer leaves the static floor
+/// intact — every bundled id offered ids-only in deterministic sorted
+/// order — while the key-gated listing stays a non-authoritative
+/// supplement the floor never depends on. The offered set is compared
+/// against the pinned 72-id snapshot as a self-consistency control, so a
+/// mistyped, swapped or dropped seed id cannot stay green.
+#[tokio::test]
+async fn huggingface_static_floor_survives_an_empty_listing() {
+    use std::collections::BTreeSet;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the empty listing answers");
+    drop_blocking(provider);
+
+    let ids = model_ids(&models);
+    let offered: BTreeSet<&str> = ids.iter().copied().collect();
+    let expected: BTreeSet<&str> = huggingface_expected_floor().into_iter().collect();
+    assert_eq!(
+        offered, expected,
+        "the floor offers exactly the pinned bundled row set"
+    );
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "the floor answers in sorted order");
+    assert!(
+        models.iter().all(|model| model.price == ModelPrice::Unknown
+            && !model.vision
+            && !model.reasoning
+            && model.efforts.is_empty()
+            && model.effort_default.is_none()
+            && model.context_window.is_none()),
+        "the bundled reference descriptors stay uncarried"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the empty listing is still the one discovery leg"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+}
+
+/// The `huggingface` catalogue merges the recorded static bundled floor
+/// with the configured endpoint's own `/models` listing (T1 cell): every
+/// non-empty `data[].id` is offered exactly as served beside the bundled
+/// ids, a listed id the floor already carries does not duplicate, and an
+/// empty id never names a model. The floor's reference descriptors
+/// (cost/vision/context, reasoning/effort) stay uncarried — this class
+/// offers ids only — so every offer keeps [`ModelPrice::Unknown`] and an
+/// empty capability surface, in deterministic sorted order. The union is
+/// compared against the pinned snapshot plus the listed id as a
+/// self-consistency control, not source proof.
+#[tokio::test]
+async fn huggingface_listing_offers_ids_with_no_recorded_surface() {
+    use std::collections::BTreeSet;
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": HUGGINGFACE_ROUTED}),
+            json!({"id": ""}),
+            json!({"id": HUGGINGFACE_MODEL}),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the listing answers");
+    drop_blocking(provider);
+
+    let ids = model_ids(&models);
+    let offered: BTreeSet<&str> = ids.iter().copied().collect();
+    let mut floor = huggingface_expected_floor();
+    floor.push(HUGGINGFACE_ROUTED);
+    let expected: BTreeSet<&str> = floor.into_iter().collect();
+    assert_eq!(
+        offered, expected,
+        "the merge offers exactly the pinned floor plus the routed listed id"
+    );
+    assert_eq!(
+        ids.iter().filter(|id| **id == HUGGINGFACE_MODEL).count(),
+        1,
+        "a listed id the floor carries does not duplicate its seeded row"
+    );
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        ids, sorted,
+        "the merged offer is deterministic sorted order"
+    );
+    assert!(
+        models.iter().all(|model| model.price == ModelPrice::Unknown
+            && !model.vision
+            && !model.reasoning
+            && model.efforts.is_empty()
+            && model.effort_default.is_none()
+            && model.context_window.is_none()),
+        "no bundled reference descriptor is carried onto an offer"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one discovery leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {HUGGINGFACE_KEY}"),
+        "the token bears the discovery leg"
+    );
+}
+
+/// The auto pick rides the merged catalogue under the record's auto
+/// semantic: the dispatch narrows the pool to the `huggingface` member,
+/// the merged offer is sorted deterministically, and the sorted-first
+/// offer is a **listed** routed id that sorts ahead of every bundled
+/// floor id — the wire body then names that id verbatim, namespace and
+/// `:provider` suffix untouched, in the inverted order the peer answered.
+#[tokio::test]
+async fn huggingface_auto_pick_resolves_through_the_listing() {
+    const ROUTED_FIRST: &str = "AAA-org/AAA-chat:novita";
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "zz-late/zz-model"}),
+            json!({"id": ROUTED_FIRST}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.huggingface]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{HUGGINGFACE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"huggingface\"] }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/huggingface", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/huggingface", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(ROUTED_FIRST),
+        "the sorted-first listed routed id names the wire model verbatim"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::huggingface ---------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling the material at the
+/// scope admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn huggingface_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "huggingface".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(HUGGINGFACE_REF, HUGGINGFACE_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `huggingface`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an omitted
+/// leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn huggingface_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "org/listed-foreign"}),
+            json!({"id": HUGGINGFACE_MODEL}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&huggingface_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the listing contributes both ids verbatim, each carrying
+    // no recorded surface, and the one discovery leg is the only
+    // request so far.
+    let (provider, _store) = enrolled_huggingface_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    let discovery = server.received_requests().await.expect("recorded");
+    reported.insert(
+        "CATALOG",
+        if listed.len() == 73
+            && listed.iter().any(|model| {
+                model.id == HUGGINGFACE_MODEL
+                    && model.price == ModelPrice::Unknown
+                    && !model.vision
+                    && !model.reasoning
+            })
+            && listed.iter().any(|model| {
+                model.id == "org/listed-foreign"
+                    && model.price == ModelPrice::Unknown
+                    && model.efforts.is_empty()
+            })
+            && discovery.len() == 1
+            && discovery[0].url.path() == "/v1/models"
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "huggingface".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_huggingface_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/huggingface", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/huggingface", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "huggingface".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(HUGGINGFACE_REF, HUGGINGFACE_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_huggingface`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::huggingface --------------------------------------
+
+/// TP-PROVIDER-INSTALLED::huggingface = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::huggingface = NOT_RUN"]
+fn provider_installed_huggingface() {}
