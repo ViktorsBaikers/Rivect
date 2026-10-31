@@ -1,0 +1,40 @@
+# typos gate configuration (docs/engineering-standards.md §14, pre-commit hook).
+#
+# Every entry below is a word this repository uses correctly. None is a
+# misspelling, and none is a blanket suppression: the checker still runs over
+# the whole tree, it simply knows these spellings are intended here.
+
+[default.extend-words]
+# "unparseable" is standard English, and it is also the public Rust variant
+# `PublicationVerdict::TornOrUnparseable`, whose spelling is part of a wire
+# value ("torn_or_unparseable"). Renaming either would churn a contract.
+unparseable = "unparseable"
+Unparseable = "Unparseable"
+
+# The Linux `/proc/<pid>/status` capability field is literally `CapInh:`.
+# The fixtures that read it derive `cap_inh`, and setpriv's flag is
+# `--inh-caps`. None of these is the word "in".
+inh = "inh"
+Inh = "Inh"
+
+# Split-codepoint byte fixtures: "caf" is the ASCII prefix of "café"/"caf€"
+# cut in the middle of its UTF-8 sequence to prove the decoder refuses a
+# partial sequence rather than guessing.
+caf = "caf"
+
+# "mis-scoped" and "mis-counts": the mis- prefix of hyphenated compounds.
+mis = "mis"
+
+# PTY fixtures that deliberately send truncated commands — `/query` cut to
+# "uery" and `/clear` cut to "cler" — to prove a partial line is inert.
+uery = "uery"
+cler = "cler"
+
+# An SSE fixture whose field value is literally one byte short ("ba").
+ba = "ba"
+
+# "pre-empted" and "pre-emption" are correct English; the checker splits them.
+empted = "empted"
+
+# "pendings", pluralised as a code term inside a comment.
+pendings = "pendings"
