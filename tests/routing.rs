@@ -3142,6 +3142,14 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
             rivect::contracts::ErrorCode::Denied,
         ),
         (
+            ModelError::Provider(ProviderError::UnsupportedParameter {
+                connection: "local".to_string(),
+                parameter: "temperature",
+                model: "fixture-chat-model".to_string(),
+            }),
+            rivect::contracts::ErrorCode::InvalidInput,
+        ),
+        (
             ModelError::ManualFallbackPending {
                 attempt_id: "attempt".to_string(),
                 purpose: "relay".to_string(),

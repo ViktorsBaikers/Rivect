@@ -13,6 +13,7 @@ use crate::contracts::{
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::{ModelError, PendingFallback, RequestManifest};
 use crate::policy::PolicyError;
+use crate::providers::ProviderError;
 use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
@@ -225,6 +226,12 @@ impl ControllerError {
             // publishable question — the honest class is a blocked
             // decision dependency, never a denial.
             Self::Model(ModelError::ManualFallbackPending { .. }) => ErrorCode::DependencyBlocked,
+            // A parameter the frozen request cannot honour is the
+            // caller's own input, never a denial of the connection:
+            // sibling caller-input causes carry their own code too.
+            Self::Model(ModelError::Provider(ProviderError::UnsupportedParameter { .. })) => {
+                ErrorCode::InvalidInput
+            }
             Self::Model(_) => ErrorCode::Denied,
             Self::Executor(error) => error.error_code(),
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,

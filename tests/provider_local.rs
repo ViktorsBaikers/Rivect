@@ -11621,9 +11621,10 @@ async fn deepinfra_wrong_credential_profile_or_region_denies_with_typed_context_
 /// (auth/deepinfra.kdl — `/models` is public and would accept any
 /// string as a key, so the recorded validate leg exercises
 /// `chat/completions`): a fixture `GET /models` answering 200 with an
-/// arbitrary roster proves nothing about entitlement — with no
-/// credential enrolled the pin still denies `CredentialAbsent`
-/// before any leg.
+/// arbitrary roster proves nothing about entitlement — with the key
+/// enrolled the fixed pin still rides only its request leg, and the
+/// unmounted `chat/completions` peer answers the typed transport
+/// denial while the 200 listing is never consulted.
 #[tokio::test]
 async fn deepinfra_public_catalog_listing_is_never_entitlement() {
     let server = MockServer::start().await;
@@ -11633,23 +11634,30 @@ async fn deepinfra_public_catalog_listing_is_never_entitlement() {
     let provider = provider_result(
         config.clone(),
         "deepinfra".to_string(),
-        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(DEEPINFRA_REF, DEEPINFRA_KEY)],
+        )),
     )
-    .expect("binding resolves; the store is read at send");
+    .expect("the enrolled binding resolves");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "deepinfra");
     assert!(
-        matches!(outcome, Err(ProviderError::CredentialAbsent { .. })),
-        "a 200 catalogue never stands in for the credential: {outcome:?}"
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
     );
     drop_blocking(provider);
-    assert!(
-        server
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "the credential denial lands before any leg — the catalogue is never consulted"
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
     );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
 }
 
 // ----- TP-PROVIDER-RECOVERY::deepinfra -----------------------------------------
@@ -12802,33 +12810,34 @@ async fn deepseek_wrong_credential_profile_or_region_denies_with_typed_context_w
 
 /// A `/models` HTTP 200 is never entitlement (INV-010): the recorded
 /// validate leg exercises `chat/completions`, so a fixture listing
-/// answering an arbitrary roster proves nothing — with no credential
-/// enrolled the pin still denies `CredentialAbsent` before any leg.
+/// answering an arbitrary roster proves nothing — with the key
+/// enrolled the fixed pin still rides only its request leg, and the
+/// unmounted `chat/completions` peer answers the typed transport
+/// denial while the 200 listing is never consulted.
 #[tokio::test]
 async fn deepseek_models_http_200_is_never_entitlement() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": DEEPSEEK_MODEL})]).await;
     let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
-    let provider = provider_result(
-        config.clone(),
-        "deepseek".to_string(),
-        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
-    )
-    .expect("binding resolves; the store is read at send");
+    let (provider, _store) = enrolled_deepseek_provider(&config);
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "deepseek");
     assert!(
-        matches!(outcome, Err(ProviderError::CredentialAbsent { .. })),
-        "a 200 catalogue never stands in for the credential: {outcome:?}"
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
     );
     drop_blocking(provider);
-    assert!(
-        server
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "the credential denial lands before any leg — the catalogue is never consulted"
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
     );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
 }
 
 // ----- TP-PROVIDER-RECOVERY::deepseek -----------------------------------------
@@ -17676,6 +17685,123 @@ async fn huggingface_static_floor_survives_an_empty_listing() {
     assert_eq!(requests[0].url.path(), "/v1/models");
 }
 
+/// One seeded class in the failed-listing cohort: the connection id,
+/// its fixture config, its enrolled provider and its recorded floor.
+type SeededFloorClass = (
+    &'static str,
+    fn(&str) -> String,
+    fn(&Config) -> (ChatCompletionsProvider, Arc<support::MapStore>),
+    Vec<String>,
+);
+
+/// The recorded seed is the offer floor, so a listing that answered
+/// nothing usable still offers it: a 5xx, a non-JSON body and an
+/// oversized body each answer the recorded floor alone — every seeded
+/// class keeps its recorded universe, in deterministic sorted order,
+/// and the failed answer contributes no offer of its own.
+#[tokio::test]
+async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
+    // a listed id the failed 5xx answer carries: the floor offers it
+    // only if the failure had been admitted as a catalogue answer
+    const FAILED_ANSWER_ID: &str = "failed-answer-entitlement-claim";
+
+    fn sorted(ids: &[&str]) -> Vec<String> {
+        let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    let groq_rows = groq_expected_rows();
+    let groq_ids: Vec<&str> = groq_rows.iter().map(|row| row.0).collect();
+    let huggingface_ids = huggingface_expected_floor();
+    let classes: [SeededFloorClass; 4] = [
+        (
+            "deepseek",
+            deepseek_config,
+            enrolled_deepseek_provider,
+            sorted(&DEEPSEEK_BUILTIN_IDS),
+        ),
+        (
+            "fireworks",
+            fireworks_config,
+            enrolled_fireworks_provider,
+            sorted(&FIREWORKS_FAST_SEED_IDS),
+        ),
+        (
+            "groq",
+            groq_config,
+            enrolled_groq_provider,
+            sorted(&groq_ids),
+        ),
+        (
+            "huggingface",
+            huggingface_config,
+            enrolled_huggingface_provider,
+            sorted(&huggingface_ids),
+        ),
+    ];
+    let oversized = json!({
+        "object": "list",
+        "data": vec![json!({"id": "x".repeat(4096)}); 300],
+    })
+    .to_string();
+    assert!(
+        oversized.len() > 1024 * 1024,
+        "the fixture listing exceeds the catalog byte bound: {} bytes",
+        oversized.len()
+    );
+    for (answer, template) in [
+        (
+            "a 5xx answer",
+            ResponseTemplate::new(503).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": FAILED_ANSWER_ID}],
+            })),
+        ),
+        (
+            "a non-JSON body",
+            ResponseTemplate::new(200).set_body_string("not json"),
+        ),
+        (
+            "an oversized body",
+            ResponseTemplate::new(200).set_body_string(oversized.clone()),
+        ),
+    ] {
+        for (connection, config_for, provider_for, floor) in &classes {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(template.clone())
+                .mount(&server)
+                .await;
+            let config =
+                Config::parse_validated(&config_for(&server_uri_v1(&server))).expect("valid");
+            let (provider, _store) = provider_for(&config);
+            let (provider, catalog) = catalog_on_thread(provider);
+            let models = catalog.unwrap_or_else(|err| {
+                panic!("{connection} on {answer}: the recorded floor answers: {err:?}")
+            });
+            drop_blocking(provider);
+            let ids = model_ids(&models);
+            assert_eq!(
+                ids, *floor,
+                "{connection} on {answer}: the recorded floor alone offers, sorted"
+            );
+            assert!(
+                !ids.contains(&FAILED_ANSWER_ID),
+                "{connection} on {answer}: the failed answer contributes no offer"
+            );
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(
+                requests.len(),
+                1,
+                "{connection} on {answer}: the failed listing is the one discovery leg"
+            );
+            assert_eq!(requests[0].url.path(), "/v1/models");
+        }
+    }
+}
+
 /// The `huggingface` catalogue merges the recorded static bundled floor
 /// with the configured endpoint's own `/models` listing (T1 cell): every
 /// non-empty `data[].id` is offered exactly as served beside the bundled
@@ -20343,6 +20469,35 @@ async fn litellm_typed_denial_recovers_through_the_same_credential_seam() {
         format!("Bearer {LITELLM_KEY}"),
         "the recovered material bears the wire"
     );
+}
+
+/// The open-proxy arm carries the proxy's own key verbatim, so a
+/// declared binding that resolves to empty or whitespace-only material
+/// names no key at all: the send denies `CredentialMalformed` before any
+/// leg rather than riding an empty `Authorization` value the recorded
+/// login never writes.
+#[tokio::test]
+async fn litellm_open_proxy_empty_material_denies_before_any_leg() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&litellm_config(&server_uri_v1(&server))).expect("valid");
+    for material in ["", "   "] {
+        let (provider, _store) = litellm_provider(&config, material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("material naming no key never sends");
+        let ProviderError::CredentialMalformed { connection } = &err else {
+            panic!("empty material is the typed malformed denial: {err:?}");
+        };
+        assert_eq!(connection, "litellm");
+        drop_blocking(provider);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "the denial lands before any leg — no headerless or empty-bearer request"
+        );
+    }
 }
 
 /// The legs matrix enforces the recorded expected set for `litellm`:

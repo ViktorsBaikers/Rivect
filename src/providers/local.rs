@@ -1562,7 +1562,11 @@ impl ChatCompletionsProvider {
     /// The credential seam's typed denials, [`ProviderError::Transport`]
     /// on a failed call or non-success status or an expired whole-call
     /// budget, and [`ProviderError::StreamViolation`] when the payload
-    /// does not carry the `data` array the contract requires.
+    /// does not carry the `data` array the contract requires. A
+    /// *seeded* class answers its recorded seed floor instead of denying
+    /// on a failed or unparseable listing — that seed is the offer floor
+    /// the listing only supplements — while a seedless class has no
+    /// floor and keeps the typed denial.
     pub fn catalog(&self) -> Result<Vec<CatalogModel>, ProviderError> {
         // The recorded allowlist is the whole catalogue — no wire
         // leg, no credential resolution.
@@ -1619,11 +1623,19 @@ impl ChatCompletionsProvider {
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
-            return Err(transport_status(&self.connection, response.status()));
+            return self.floor_or(transport_status(&self.connection, response.status()));
         }
-        let body = read_catalog_body(&self.connection, self.deadline, &mut response, started)?;
-        let body: Value = serde_json::from_slice(&body)
-            .map_err(|_parse| violation(&self.connection, "models payload is not json"))?;
+        let body = match read_catalog_body(&self.connection, self.deadline, &mut response, started)
+        {
+            Ok(body) => body,
+            Err(err) => return self.floor_or(err),
+        };
+        let body: Value = match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(_parse) => {
+                return self.floor_or(violation(&self.connection, "models payload is not json"));
+            }
+        };
         let Some(data) = body.get("data").and_then(Value::as_array) else {
             return Err(violation(
                 &self.connection,
@@ -1645,26 +1657,7 @@ impl ChatCompletionsProvider {
         // entries precede the stubs, so the stable sort keeps a
         // listing entry's transform over its seed stub on a
         // collision.
-        models.extend(
-            self.contract
-                .seed
-                .iter()
-                .filter_map(|id| match self.contract.entries {
-                    EntryRule::DeepSeek => deepseek_entry(id),
-                    EntryRule::Fireworks => fireworks_entry(id),
-                    EntryRule::Groq => Some(groq_entry(id)),
-                    EntryRule::IdsOnly
-                    | EntryRule::Aiand
-                    | EntryRule::Aimlapi
-                    | EntryRule::AlibabaTokenPlan
-                    | EntryRule::Firepass
-                    | EntryRule::HuggingFace
-                    | EntryRule::LiteLlm => Some(CatalogModel {
-                        id: (*id).to_string(),
-                        ..CatalogModel::default()
-                    }),
-                }),
-        );
+        models.extend(self.seed_models());
         // The recorded keyless discovery's rows are the floor too: an
         // empty `/models` answer still offers them, and a listed entry
         // precedes its floor stub, so the stable sort keeps the
@@ -1675,6 +1668,55 @@ impl ChatCompletionsProvider {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
+    }
+
+    /// The recorded seed ids under the literal id's per-entry
+    /// transform — the offer floor a listing only supplements.
+    fn seed_models(&self) -> Vec<CatalogModel> {
+        self.contract
+            .seed
+            .iter()
+            .filter_map(|id| match self.contract.entries {
+                EntryRule::DeepSeek => deepseek_entry(id),
+                EntryRule::Fireworks => fireworks_entry(id),
+                EntryRule::Groq => Some(groq_entry(id)),
+                EntryRule::IdsOnly
+                | EntryRule::Aiand
+                | EntryRule::Aimlapi
+                | EntryRule::AlibabaTokenPlan
+                | EntryRule::Firepass
+                | EntryRule::HuggingFace
+                | EntryRule::LiteLlm => Some(CatalogModel {
+                    id: (*id).to_string(),
+                    ..CatalogModel::default()
+                }),
+            })
+            .collect()
+    }
+
+    /// The seed alone as a catalogue answer: the recorded floor in the
+    /// union's sorted, deduplicated order, or `None` for a class that
+    /// records no seed and so has no floor to fall back to.
+    fn seed_floor(&self) -> Option<Vec<CatalogModel>> {
+        let mut models = self.seed_models();
+        if models.is_empty() {
+            return None;
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        Some(models)
+    }
+
+    /// A listing leg that answered nothing usable still answers a
+    /// seeded class's recorded floor — that seed is the offer floor the
+    /// listing only supplements, so a failed or unparseable answer
+    /// contributes no offer and takes none away — while a seedless
+    /// class keeps the leg's typed denial.
+    fn floor_or(&self, err: ProviderError) -> Result<Vec<CatalogModel>, ProviderError> {
+        match self.seed_floor() {
+            Some(floor) => Ok(floor),
+            None => Err(err),
+        }
     }
 
     /// The recorded `litellm` management-metadata phase
@@ -1902,11 +1944,12 @@ impl ChatCompletionsProvider {
             CredentialRule::HuggingFace => self
                 .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
                 .map(WireSecret::bearer),
-            CredentialRule::Kilo => self.kilo_bearer(&text).map(WireSecret::bearer),
+            CredentialRule::Kilo => self.opaque_bearer(&text).map(WireSecret::bearer),
             // The open-proxy class's declared form is the proxy's own
             // key — master or virtual — carried as the plain bearer the
-            // recorded `api-key` login pastes.
-            CredentialRule::OpenProxy => Ok(WireSecret::bearer(text)),
+            // recorded `api-key` login pastes; material naming no key
+            // denies typed rather than sending an empty bearer.
+            CredentialRule::OpenProxy => self.opaque_bearer(&text).map(WireSecret::bearer),
         }
     }
 
@@ -1962,14 +2005,15 @@ impl ChatCompletionsProvider {
         Ok(token.to_string())
     }
 
-    /// The bearer a `kilo` credential resolves (`auth/kilo.kdl`
-    /// `login "custom"`, `registry/oauth/kilo.ts`): the recorded device
-    /// login's token and the recorded key are both bare gateway
-    /// bearers — no class prefix, no structured body — so the grammar
-    /// is the trimmed material verbatim. Material naming no token
-    /// denies as malformed before any wire leg: the class records no
-    /// subscription SKU an empty bearer could name.
-    fn kilo_bearer(&self, material: &str) -> Result<String, ProviderError> {
+    /// The bearer an opaque-key credential resolves — `kilo`'s recorded
+    /// device login token or key (`auth/kilo.kdl` `login "custom"`,
+    /// `registry/oauth/kilo.ts`) and the `litellm` open proxy's own
+    /// master or virtual key: no class prefix, no structured body, so
+    /// the grammar is the trimmed material verbatim. Material naming no
+    /// key denies as malformed before any wire leg — neither class
+    /// records a subscription SKU or a proxy login an empty bearer
+    /// could name.
+    fn opaque_bearer(&self, material: &str) -> Result<String, ProviderError> {
         let token = material.trim();
         if token.is_empty() {
             return Err(ProviderError::CredentialMalformed {
