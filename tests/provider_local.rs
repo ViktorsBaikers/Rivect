@@ -10240,6 +10240,91 @@ async fn coreweave_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// means the id is never fixture-served even when it declares
 /// `local` kind, and a manifest pinning a different connection id is
 /// refused at send.
+/// Hostile stream input is never a false success for `coreweave`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn coreweave_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_coreweave_provider(&config),
+        &config,
+        "/world/coreweave",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_coreweave_provider(&config),
+        &config,
+        "/world/coreweave",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/coreweave", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
 #[test]
 fn coreweave_dialect_is_keyed_on_the_literal_connection_id() {
     assert_eq!(
@@ -10652,6 +10737,44 @@ async fn coreweave_wrong_credential_profile_or_region_denies_with_typed_context_
     assert!(
         !format!("{:?}", world.runtime).contains(COREWEAVE_KEY),
         "runtime Debug never carries credential material"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement (INV-010) for
+/// `coreweave`: with the scoped key enrolled the fixed pin still rides
+/// only its request leg, and a listing answering the pinned id neither
+/// stands in for the credential nor admits the send — the unmounted
+/// `chat/completions` peer answers the typed transport denial while the
+/// 200 listing is never consulted.
+#[tokio::test]
+async fn coreweave_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": COREWEAVE_MODEL})]).await;
+    let config =
+        Config::parse_validated(&coreweave_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_coreweave_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "coreweave");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_project(&requests[0]),
+        COREWEAVE_PROJECT,
+        "the scope header rides the one request leg"
     );
 }
 
@@ -13063,6 +13186,91 @@ async fn fireworks_valid_control_yields_one_outcome_and_one_physical_usage() {
     drop_blocking(broker);
 }
 
+/// Hostile stream input is never a false success for `fireworks`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn fireworks_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_fireworks_provider(&config),
+        &config,
+        "/world/fireworks",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&fireworks_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_fireworks_provider(&config),
+        &config,
+        "/world/fireworks",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/fireworks", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
 /// The recorded `wire-model-id-mode "firepass"` dispatch: a `*-fast`
 /// pin sends the router wire form `accounts/fireworks/routers/<id>`
 /// — the Fast serving path is a router, never a models/ id — while
@@ -14142,6 +14350,89 @@ async fn firepass_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert!(
         matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
         "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `firepass`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn firepass_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_firepass_provider(&config),
+        &config,
+        "/world/firepass",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/firepass", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&firepass_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_firepass_provider(&config),
+        &config,
+        "/world/firepass",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/firepass", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
     );
     drop_blocking(broker);
 }
