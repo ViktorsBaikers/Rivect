@@ -315,7 +315,8 @@ pub enum ProviderError {
     IncompatibleOutput { connection: String, reason: String },
     /// The frozen request carries a parameter the connection's recorded
     /// contract rejects for the pinned model — a rejected parameter is
-    /// a typed denial before any wire leg, never silently dropped from
+    /// a typed denial before the chat leg (an auto pick resolved its
+    /// model from the catalogue leg first), never silently dropped from
     /// the body.
     #[error("connection {connection} rejects request parameter {parameter} for model {model}")]
     UnsupportedParameter {
@@ -1123,9 +1124,10 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
-/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`/`litellm`
-/// are its recorded class-A/class-P plugs speaking the same dialect
-/// (HZN-008) — never inferred from an
+/// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
+/// are its recorded class-A/class-P plugs speaking the same dialect,
+/// with `litellm` the recorded class-B configured-proxy plug on that
+/// same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
@@ -1262,6 +1264,9 @@ impl Provider for LoopbackProvider {
 /// absent binding sends no `Authorization` header — never a dummy key —
 /// and the pin stays offline-usable. Every other `api_key` id requires
 /// its scoped binding at ingress and at eligibility.
+///
+/// Its contract-side twin is `CredentialRule::OpenProxy` in the local
+/// adapter's per-id table, the arm that carries the class's wire form.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
     connection == "litellm"

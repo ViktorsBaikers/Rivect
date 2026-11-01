@@ -1385,6 +1385,24 @@ impl WireSecret {
             project: None,
         }
     }
+
+    /// The material's headers on one leg: `Authorization` first, the
+    /// `OpenAI-Project` scope next when the arm carries one — and no
+    /// header at all when the declaration binds nothing.
+    fn attach(
+        request: reqwest::blocking::RequestBuilder,
+        secret: Option<&WireSecret>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let Some(secret) = secret else {
+            return request;
+        };
+        let request = request.bearer_auth(&secret.bearer);
+        if let Some(project) = &secret.project {
+            request.header(OPENAI_PROJECT_HEADER, project)
+        } else {
+            request
+        }
+    }
 }
 
 /// The shared Chat Completions adapter — `custom-chat-completions`
@@ -1595,13 +1613,8 @@ impl ChatCompletionsProvider {
         // phase spent is the typed deadline, never a post on an expired
         // clock.
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut request = self.client.get(format!("{}/models", self.endpoint));
-        if let Some(secret) = secret {
-            request = request.bearer_auth(&secret.bearer);
-            if let Some(project) = &secret.project {
-                request = request.header(OPENAI_PROJECT_HEADER, project);
-            }
-        }
+        let request =
+            WireSecret::attach(self.client.get(format!("{}/models", self.endpoint)), secret);
         let mut response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
@@ -1746,12 +1759,14 @@ impl ChatCompletionsProvider {
                 // A body outside the recorded shape ends the walk.
                 break;
             };
-            let Some(entries) = litellm_metadata_entries(&payload) else {
+            let Some(entries) =
+                litellm_metadata_entries(&payload).filter(|entries| !entries.is_empty())
+            else {
+                // A body naming no entry list, or a list carrying no
+                // object row, serves nothing here: the walk continues
+                // with the next path.
                 continue;
             };
-            if entries.is_empty() {
-                continue;
-            }
             if offered.is_empty() {
                 for entry in entries {
                     if let Some(model) = litellm_metadata_model(entry) {
@@ -3149,26 +3164,38 @@ fn deepseek_entry(id: &str) -> Option<CatalogModel> {
     })
 }
 
+/// The recorded version-separator fold the Fireworks-family ids share:
+/// every `from` sitting between two digits becomes `to` — the `p`↔`.`
+/// pair the public and wire forms disagree on. Any other character,
+/// including a separator at an edge or beside a non-digit, rides
+/// verbatim.
+fn fold_version_separator(text: &str, from: char, to: char) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut folded = String::with_capacity(text.len());
+    for (at, &ch) in chars.iter().enumerate() {
+        if ch == from
+            && at > 0
+            && chars[at - 1].is_ascii_digit()
+            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
+        {
+            folded.push(to);
+        } else {
+            folded.push(ch);
+        }
+    }
+    folded
+}
+
 /// The recorded `fireworks` public id
 /// (`toFireworksPublicModelId`): the `accounts/fireworks/models/`
 /// wire prefix stripped, then the `p` version separator between
 /// digits folded back to `.` (`kimi-k2p7-code` → `kimi-k2.7-code`).
 fn fireworks_public_id(id: &str) -> String {
-    let stripped = id.strip_prefix(FIREWORKS_WIRE_PREFIX).unwrap_or(id);
-    let chars: Vec<char> = stripped.chars().collect();
-    let mut public = String::with_capacity(stripped.len());
-    for (at, &ch) in chars.iter().enumerate() {
-        if ch == 'p'
-            && at > 0
-            && chars[at - 1].is_ascii_digit()
-            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
-        {
-            public.push('.');
-        } else {
-            public.push(ch);
-        }
-    }
-    public
+    fold_version_separator(
+        id.strip_prefix(FIREWORKS_WIRE_PREFIX).unwrap_or(id),
+        'p',
+        '.',
+    )
 }
 
 /// The recorded Fireworks-family wire-id body
@@ -3180,20 +3207,7 @@ fn fireworks_wire_body(id: &str) -> String {
         .strip_prefix(FIREWORKS_WIRE_PREFIX)
         .or_else(|| id.strip_prefix(FIREWORKS_ROUTER_PREFIX))
         .unwrap_or(id);
-    let chars: Vec<char> = stripped.chars().collect();
-    let mut wire = String::with_capacity(stripped.len());
-    for (at, &ch) in chars.iter().enumerate() {
-        if ch == '.'
-            && at > 0
-            && chars[at - 1].is_ascii_digit()
-            && chars.get(at + 1).is_some_and(char::is_ascii_digit)
-        {
-            wire.push('p');
-        } else {
-            wire.push(ch);
-        }
-    }
-    wire
+    fold_version_separator(stripped, '.', 'p')
 }
 
 /// The recorded `fireworks` wire id (`toFireworksWireModelId`): the
@@ -3442,20 +3456,16 @@ impl Provider for ChatCompletionsProvider {
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut request = self
-            .client
-            .post(format!("{}/chat/completions", self.endpoint))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .body(body_bytes);
         // The open-proxy form bears no material: the request carries no
         // `Authorization` header at all, never an empty or dummy bearer.
-        if let Some(secret) = &secret {
-            request = request.bearer_auth(&secret.bearer);
-            if let Some(project) = &secret.project {
-                request = request.header(OPENAI_PROJECT_HEADER, project);
-            }
-        }
+        let request = WireSecret::attach(
+            self.client
+                .post(format!("{}/chat/completions", self.endpoint))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .body(body_bytes),
+            secret.as_ref(),
+        );
         let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
