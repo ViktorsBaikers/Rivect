@@ -1119,8 +1119,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 
 /// The recorded wire dialect of a connection id (DEC-007/DEC-025):
 /// keyed by the literal id's source class — `openai` speaks the
-/// OpenAI Responses API and `abliteration` is its recorded class-A
-/// exception speaking the same dialect (HZN-008), `google` speaks
+/// OpenAI Responses API, `abliteration` is its recorded class-A
+/// exception speaking the same dialect and `meta` its recorded
+/// class-B plug on `api.meta.ai/v1` (HZN-008), `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
@@ -1163,6 +1164,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
     match connection {
         "openai" => Some(Dialect::Responses),
         "abliteration" => Some(Dialect::Responses),
+        "meta" => Some(Dialect::Responses),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         "aiand" => Some(Dialect::ChatCompletions),

@@ -1,11 +1,12 @@
-//! OpenAI provider proof legs (TP-PROVIDER-{CATALOG,AUTH,WIRE,
-//! RECOVERY,INSTALLED}::openai): the configured literal `openai`
-//! connection returns a verified model outcome through the standard
-//! Broker — the real synchronous adapter against the source-derived
-//! protocol peer as localhost wiremock fixtures, no OMP, no user
-//! adapter, no real host. The SSE legs pin the shared parser's WHATWG
-//! §9.2.5–9.2.6 conformance. TP-PROVIDER-INSTALLED::openai stays
-//! NOT_RUN — the ignored named case carries that status explicitly.
+//! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,meta}): the configured
+//! literal `openai` and `meta` connections each return a verified
+//! model outcome through the standard Broker — the real synchronous
+//! adapter against the source-derived protocol peer as localhost
+//! wiremock fixtures, no OMP, no user adapter, no real host. The SSE
+//! legs pin the shared parser's WHATWG §9.2.5–9.2.6 conformance.
+//! TP-PROVIDER-INSTALLED::{openai,meta} stays NOT_RUN — the ignored
+//! named cases carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -19,6 +20,7 @@
 
 use rivect::config::Config;
 use rivect::model::{Broker, ModelError, RequestManifest};
+use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
 use rivect::providers::{Provider, ProviderError, StoreKind, TransportCause, TransportClass};
@@ -33,8 +35,8 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 mod support;
 
 use support::{
-    SlowStore, drop_blocking, mount_responses, received_bodies, responses_completed_stream,
-    send_on_thread, sse_block,
+    SlowStore, drop_blocking, mount_responses, prepared_with, received_bodies,
+    responses_completed_stream, send_on_thread, sse_block,
 };
 
 /// The scoped credential ref the `openai` connection binds — a
@@ -4108,6 +4110,964 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::openai = NOT_RUN"]
 fn provider_installed_openai() {}
+
+// ----- meta -------------------------------------------------------------
+//
+// The `meta` connection's proof legs (HZN-008 class B, the band's only
+// Responses id, EDGE-008): the shared Responses adapter serves the
+// literal id over the recorded `api.meta.ai/v1` base — no copied codec
+// — under the connection's own recorded predicates. `/models` is
+// authoritative and merges the static Muse roster as the offer floor:
+// an empty listing still answers the floor, while a failed listing is
+// a typed denial — this owner carries no `floor_or` twin, the
+// divergence is asserted rather than assumed. The record names an
+// excluded-id filter but never its contents, so no roster exclusion is
+// asserted; the recorded `x-api-version: 1.0.0` transport header has
+// no seam on this adapter and stays a bounded residual (HZN-005). The
+// record states no encrypted reasoning artifact for the id, so the
+// request never asks for the include, and the Standard-or-Contributor
+// payment predicate is stated by the model id itself, never chosen
+// silently.
+
+/// The scoped credential ref the `meta` connection binds.
+const META_REF: &str = "keyring:rivect-test/meta";
+
+/// The pinned model id the fixed-pin `meta` legs carry — one of the
+/// recorded static Muse roster ids (HZN-008).
+const META_MODEL: &str = "muse-spark-1.3";
+
+/// The recorded static Muse roster the `meta` catalogue merges as the
+/// offer floor, in the sorted order the adapter returns.
+const META_FLOOR: [&str; 6] = [
+    "muse-spark-1.1",
+    "muse-spark-1.1-contributor",
+    "muse-spark-1.2",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.3",
+    "muse-spark-1.3-contributor",
+];
+
+/// One configured `meta` connection pointing at the fixture peer: the
+/// api_key auth class resolves a scoped `SecretRef`, the dialect comes
+/// from the literal connection id, and the endpoint carries the API
+/// base's `/v1` segment verbatim — like the recorded `api.meta.ai/v1`.
+fn meta_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.meta]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{META_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"meta\", model_id = \"{META_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same construction seam as `provider_result`, named for the
+/// `meta` fixture the legs below read.
+fn meta_provider_result(
+    config: Config,
+    connection: String,
+    store: Arc<support::MapStore>,
+) -> Result<OpenAiProvider, ProviderError> {
+    std::thread::spawn(move || OpenAiProvider::new(&config, &connection, store))
+        .join()
+        .expect("the provider thread joins")
+}
+
+fn meta_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
+    let provider = meta_provider_result(config.clone(), "meta".to_string(), store.clone())
+        .expect("the shared adapter builds for the meta id");
+    (provider, store)
+}
+
+// ----- TP-PROVIDER-WIRE::meta --------------------------------------
+
+/// A configured `meta` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin, the
+/// shared adapter posts exactly the frozen manifest as a Responses
+/// request — `store: false`, `stream: true`, pinned model,
+/// instructions, tool surface and pinned effort verbatim, and no
+/// `include` member, since the record states no encrypted reasoning
+/// artifact for the id — the SSE stream validates its terminal, and
+/// the one physical send is charged once with the provider's reported
+/// usage.
+#[tokio::test]
+async fn meta_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified outcome text",
+            Vec::new(),
+            Some(json!({"input_tokens": 11, "output_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: prove the wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified outcome text");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the body rides the recorded json content type"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SECRET),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], META_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the record states no encrypted reasoning artifact for the id — the include is never requested: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    // Exactly one accounting record carries the one physical usage
+    // report — the provider's 18 tokens are the confirmed charge, and
+    // a replayed attempt reports spent.
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "meta");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/meta", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Responses class builds no
+/// adapter, the Chat-Completions adapter refuses `meta` outright —
+/// the same id, the same store, still a dialect mismatch, never a
+/// served connection (EDGE-008) — a manifest pinning a different
+/// connection id is refused at send, and `dialect_for` reserving
+/// `meta` means the id is never fixture-served even when it declares
+/// `local` kind.
+#[test]
+fn meta_dialect_is_keyed_on_the_literal_connection_id() {
+    let config = Config::parse_validated(&meta_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = meta_provider_result(config.clone(), "meta-plus".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    // the Chat-Completions adapter refuses the same id — `meta` rides
+    // the Responses dialect, never the other way
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let built = config.clone();
+    let err = std::thread::spawn(move || ChatCompletionsProvider::new(&built, "meta", store))
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("the CC adapter refuses the Responses id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "a CC arm for `meta` is a dialect mismatch, not a served connection"
+    );
+
+    // a dialect-reserved id is never fixture-served whatever kind it
+    // declares — `meta` pinned `local` keeps the typed denial
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.meta]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"meta\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("meta").expect("declared");
+    assert!(
+        !loopback.serves("meta", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a manifest pinning a different connection id is refused at send
+    let (provider, _store) = meta_provider(&config);
+    let foreign = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.other]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{META_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"other\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &foreign, "/world/meta", "goal: x")
+            .expect("foreign pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never speaks this dialect: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-CATALOG::meta ------------------------------------
+
+/// `/models` is authoritative for `meta` (HZN-008): every `data[]` id
+/// with a non-empty body is offered, and the recorded static Muse
+/// roster merges on top as the offer floor — an empty-`data` 200
+/// listing still answers the floor alone, the union deduplicates and
+/// sorts, and the bearer credential came through the store seam.
+#[tokio::test]
+async fn meta_static_floor_survives_an_empty_listing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    let ids = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalog thread joins")
+        .expect("an empty listing still answers the recorded floor");
+    assert_eq!(
+        ids,
+        META_FLOOR
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>(),
+        "the static Muse roster survives an empty listing"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
+
+    // a populated listing merges its own ids with the floor — the
+    // floor is additive, never a replacement for the listing
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id": "muse-spark-2.0"},
+                {"id": "muse-spark-1.3"},
+                {"id": ""},
+                {"owned_by": "nobody"},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    let ids = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalog thread joins")
+        .expect("the populated listing answers");
+    let mut expected: Vec<String> = META_FLOOR.iter().map(|id| (*id).to_string()).collect();
+    expected.push("muse-spark-2.0".to_string());
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "the authoritative listing and the static roster merge, sorted and deduplicated"
+    );
+}
+
+/// A non-success `/models` status is the typed transport denial for
+/// `meta` — this owner carries no `floor_or` twin, so a failed listing
+/// answers no floor: the divergence from the CC adapter's seeded
+/// fallback is asserted rather than assumed.
+#[tokio::test]
+async fn meta_failed_listing_denies_typed_without_a_floor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    let outcome = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalog thread joins");
+    let ProviderError::Transport { connection, cause } =
+        &outcome.expect_err("a failed listing denies typed — never a silent floor")
+    else {
+        unreachable!("the failed listing's denial is transport-typed")
+    };
+    assert_eq!(connection, "meta");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the listing's own status is the denial's context: {cause}"
+    );
+}
+
+/// A `/models` HTTP 200 is never entitlement (INV-010) for `meta`:
+/// with the scoped key enrolled the fixed pin still rides only its
+/// request leg, and a listing answering the pinned id neither stands
+/// in for the credential nor admits the send — the unmounted
+/// `/v1/responses` peer answers the typed transport denial while the
+/// 200 listing is never consulted.
+#[tokio::test]
+async fn meta_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": META_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "meta");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the request leg runs — the 200 listing releases no entitlement"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+}
+
+/// The request never carries an `include` member (DEC-013): the record
+/// states no encrypted reasoning artifact for `meta`, so the request
+/// asks for none — and the dialect's other recorded ids keep their own
+/// predicates: `openai`'s recorded include still rides its own request,
+/// because the suppression binds the literal `meta` id, never the
+/// shared Responses dialect.
+#[tokio::test]
+async fn meta_request_carries_no_reasoning_artifact_include() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream("answered", Vec::new(), None),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the meta send completes");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert!(
+        body.get("include").is_none(),
+        "the record states no encrypted reasoning artifact — the request asks for none: {body}"
+    );
+
+    // the non-suppressed arm: `openai` keeps its own recorded
+    // predicate — the artifact include stays on for the dialect's
+    // other id
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream("openai", Vec::new(), None),
+    )
+    .await;
+    let openai = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{META_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"openai\", model_id = \"gpt-5.2\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
+    let provider = meta_provider_result(openai.clone(), "openai".to_string(), store)
+        .expect("the shared adapter builds for openai too");
+    let manifest = {
+        let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        broker
+            .prepare("main", &openai, "/world/meta", "goal: openai arm")
+            .expect("the openai pin prepares")
+    };
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    outcome.expect("the openai send completes");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "the artifact include stays on for the dialect's other id — the predicate binds the literal id"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::meta ---------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `meta`: a configured region — the recorded contract names none —
+/// the profile-bound ref whose scope disagrees with the binding, an
+/// absent credential and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
+#[tokio::test]
+async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(&meta_config(&server_uri_v1(&server)).replace(
+        "kind = \"api_key\"",
+        "kind = \"api_key\"\nregion = \"eu-1\"",
+    ))
+    .expect("valid");
+    let err = meta_provider_result(
+        regioned,
+        "meta".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "meta");
+    assert_eq!(region, "eu-1");
+    assert_no_secret_or_body(&err);
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.meta]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"meta\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = meta_provider_result(
+        mismatched,
+        "meta".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err);
+
+    // a bound ref with no material at its own scope — the sibling
+    // scope's material stays sealed behind the typed denial
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let provider = meta_provider_result(
+        config.clone(),
+        "meta".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_no_secret_or_body(&err);
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial — the wire
+    // never coerces a wrong credential into success, and the peer's
+    // body never enters the error
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
+    let provider = meta_provider_result(config.clone(), "meta".to_string(), store).expect("builds");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "meta");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err);
+    drop_blocking(provider);
+
+    // The same boundary on the Debug surfaces the dispatch path
+    // exposes: provider, manifest, accounting record, broker and
+    // runtime each render without the material the store alone holds.
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
+    let provider = meta_provider_result(config.clone(), "meta".to_string(), store)
+        .expect("the adapter builds");
+    assert!(
+        !format!("{provider:?}").contains(SECRET),
+        "provider Debug never carries credential material"
+    );
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "accounted",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: debug surfaces",
+    );
+    assert!(
+        !format!("{manifest:?}").contains(SECRET),
+        "manifest Debug never carries credential material"
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest.clone());
+    outcome.expect("the debug-surface send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert!(
+        !format!("{record:?}").contains(SECRET),
+        "accounting-record Debug never carries credential material"
+    );
+    assert!(
+        !format!("{broker:?}").contains(SECRET),
+        "broker Debug never carries credential material"
+    );
+    drop_blocking(broker);
+    drop_blocking(provider);
+
+    let world = support::open_world(
+        "auth-debug-meta",
+        Some(&meta_config(&server_uri_v1(&server))),
+    );
+    assert!(
+        !format!("{:?}", world.runtime).contains(SECRET),
+        "runtime Debug never carries credential material"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::meta ------------------------------------
+
+/// A typed denial is recoverable through the same seam: the absent
+/// credential denies the first send, enrolling material at the scope
+/// admits the retry — no state wedged, no plaintext path taken.
+#[tokio::test]
+async fn meta_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "recovered",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = meta_provider_result(config.clone(), "meta".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialAbsent { .. })
+    ));
+
+    store.enroll(META_REF, SECRET.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled credential admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+}
+
+/// Adverse wire input never reports success: a stream ending mid
+/// `function_call` item is a partial-tool violation, an EOF without a
+/// terminal is the unknown terminal, a `function_call` naming a tool
+/// the frozen request never declared is incompatible output, and a
+/// reasoning item carrying `encrypted_content` is the provenance
+/// denial — the record states no artifact for the id, so any present
+/// member, whatever its value, is off-contract foreign material. The
+/// peer's normal blobless reasoning item is not a failure leg at all:
+/// it is tolerated — dropped from the lineage, the reply unaffected,
+/// the one send charged once.
+#[tokio::test]
+async fn meta_adverse_wire_input_never_reports_success() {
+    // a stream ended mid `function_call` item — a partial tool call
+    // is never a usable one
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "call_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""}, "output_index": 0}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: partial item",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a stream ended mid output item is a typed violation: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denied stream charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a stream that ends without a terminal event is the unknown
+    // terminal — never success
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        format!(
+            "{}{}",
+            sse_block(
+                "response.output_item.added",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}, "output_index": 0}),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: no terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF without a terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a completed `function_call` naming a tool the frozen request
+    // never declared is incompatible output — never executed
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({
+                "id": "call_1", "type": "function_call", "status": "completed",
+                "name": "exec_shell", "arguments": "{}",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: undeclared call",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::IncompatibleOutput { .. }
+            ))
+        ),
+        "an undeclared tool name is a typed rejection: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a blobless reasoning item is the recorded peer's tolerated
+    // shape — the record states no artifact for the id: the item is
+    // dropped from the lineage rather than adopted, the reply is
+    // unaffected and the one send charges once
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "answered",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": []})],
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: blobless reasoning",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    let reply = outcome.expect("a blobless reasoning item is the peer's tolerated shape");
+    assert_eq!(reply.text, "answered");
+    assert!(reply.tool_calls.is_empty());
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the tolerated item still charges the one send"
+    );
+    drop_blocking(broker);
+
+    // a reasoning item carrying `encrypted_content` is off-contract
+    // foreign material where the record states none — the provenance
+    // denial, refused and never adopted
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "enc-foreign-blob"})],
+            None,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: foreign artifact",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(
+                ProviderError::ReasoningProvenance { .. }
+            ))
+        ),
+        "a reasoning item carrying an artifact the record never states is the provenance denial: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+}
+
+/// The legs matrix enforces the recorded expected set for `meta`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn meta_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": "muse-spark-1.3"}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative listing plus the static Muse floor
+    // answer through the credential seam.
+    let (provider, _) = meta_provider(&config);
+    let catalog = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("catalog thread joins");
+    reported.insert(
+        "CATALOG",
+        if matches!(catalog, Ok(ref ids) if ids == &META_FLOOR.iter().map(|id| (*id).to_string()).collect::<Vec<_>>()) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: an empty store denies at send with the typed verdict.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        meta_provider_result(config.clone(), "meta".to_string(), empty).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        meta_provider(&config),
+        &config,
+        "/world/meta",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/meta", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        meta_provider_result(config.clone(), "meta".to_string(), empty.clone()).expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(META_REF, SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(ref reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The literal row mirrors the `#[ignore]`d
+    // `provider_installed_meta` case below: its ignored count is the
+    // explicit NOT_RUN signal this matrix asserts — the row stays a
+    // literal so the two cannot drift.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::meta ----------------------------------
+
+/// TP-PROVIDER-INSTALLED::meta = NOT_RUN: the installed-provider proof
+/// is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::meta = NOT_RUN"]
+fn provider_installed_meta() {}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 

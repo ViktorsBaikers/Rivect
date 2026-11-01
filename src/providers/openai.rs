@@ -1,9 +1,9 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
-//! the literal connection ids `openai` and `abliteration` record this
-//! dialect. Dialect selection keys on the literal connection id,
-//! never an auth label or a catalogue answer, and `openai-codex` is
-//! a distinct literal id with its own recorded class. The adapter
-//! authors no async code — [`Provider::send`] is
+//! the literal connection ids `openai`, `abliteration` and `meta`
+//! record this dialect. Dialect selection keys on the literal
+//! connection id, never an auth label or a catalogue answer, and
+//! `openai-codex` is a distinct literal id with its own recorded
+//! class. The adapter authors no async code — [`Provider::send`] is
 //! a blocking single-shot seam and Tokio appears only inside reqwest's
 //! blocking client plus the dev-dependency test harness — and
 //! `store: false` is sent verbatim on
@@ -62,6 +62,24 @@ const ABLITERATION_MODELS: &[&str] = &[
     "abliterated-model-large-v2",
 ];
 
+/// The recorded static Muse roster of `meta` model ids (HZN-008,
+/// `META_MUSE_STATIC_MODELS`): the merge floor the catalogue unions
+/// over the authoritative `/models` listing — a rostered id offers
+/// even when the listing omits it. Both tiers ride verbatim: the
+/// `-contributor` SKUs are the recorded training-eligible variants,
+/// and the Standard-or-Contributor payment predicate is stated by
+/// the id itself, never chosen silently by omitting either half. The
+/// record names an excluded-id filter but never its contents, so no
+/// exclusion is applied here.
+const META_MUSE_MODELS: &[&str] = &[
+    "muse-spark-1.1",
+    "muse-spark-1.1-contributor",
+    "muse-spark-1.2",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.3",
+    "muse-spark-1.3-contributor",
+];
+
 /// The predicates the recorded source class binds to a literal
 /// Responses id (HZN-008): the dialect is shared across connection
 /// ids — the catalogue rule and the reasoning-artifact surface are
@@ -77,7 +95,8 @@ struct SourceContract {
     /// of the listing as the offer floor (`abliteration`: the
     /// recorded model manager marks the listing authoritative while
     /// the recorded seed's ids stay offered even when the listing
-    /// omits them); `false` — the listing filters to `seed`
+    /// omits them; `meta`: the same dynamic-plus-static rule over the
+    /// recorded Muse roster); `false` — the listing filters to `seed`
     /// (`openai`: the recorded sample is the offer set).
     authoritative_models: bool,
     /// `true` — the request asks for the `reasoning.encrypted_content`
@@ -86,7 +105,8 @@ struct SourceContract {
     /// returning encrypted reasoning items, so the include is never
     /// requested (`abliteration`: every model reasons intrinsically —
     /// `reasoning: true` forced in the recorded mapper — and none
-    /// returns a replayable artifact).
+    /// returns a replayable artifact; `meta`: the record states no
+    /// encrypted reasoning artifact for the id, so none is asked for).
     reasoning_artifact: bool,
 }
 
@@ -105,6 +125,11 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         }),
         "abliteration" => Some(SourceContract {
             seed: ABLITERATION_MODELS,
+            authoritative_models: true,
+            reasoning_artifact: false,
+        }),
+        "meta" => Some(SourceContract {
+            seed: META_MUSE_MODELS,
             authoritative_models: true,
             reasoning_artifact: false,
         }),
@@ -275,9 +300,9 @@ impl OpenAiProvider {
     /// The model catalogue for this connection (HZN-008): `GET
     /// /models` under the literal id's recorded rule — `openai`
     /// filters the listing to the recorded Responses-capable sample,
-    /// `abliteration` treats the listing as authoritative and merges
-    /// its static source seed on top — returned in deterministic
-    /// sorted order.
+    /// `abliteration` and `meta` treat the listing as authoritative
+    /// and merge their static source seeds on top — returned in
+    /// deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -324,9 +349,9 @@ impl OpenAiProvider {
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
-        // while `abliteration` treats the listing as authoritative:
-        // every non-empty id offers, and the recorded seed merges on
-        // top as the offer floor.
+        // while `abliteration` and `meta` treat the listing as
+        // authoritative: every non-empty id offers, and the recorded
+        // seed merges on top as the offer floor.
         let mut ids: Vec<String> = data
             .iter()
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
@@ -398,10 +423,10 @@ impl OpenAiProvider {
             "stream": true,
         });
         // The replay-artifact include rides only where the recorded
-        // peer returns encrypted reasoning items (SRC-019/D-006): the
-        // `abliteration` gateway never does — its recorded compat
-        // marks `include-encrypted-reasoning #false` and every model
-        // reasons intrinsically — so its request never asks.
+        // peer returns encrypted reasoning items (SRC-019/D-006):
+        // `abliteration` never does — its recorded compat marks
+        // `include-encrypted-reasoning #false` — and `meta`'s record
+        // states no artifact either, so neither request ever asks.
         if self.contract.reasoning_artifact {
             body["include"] = json!(["reasoning.encrypted_content"]);
         }

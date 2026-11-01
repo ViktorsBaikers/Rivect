@@ -4589,9 +4589,9 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         );
     }
 
-    // the band-wide fixed set plus this band's two local ids: each
-    // declared without a binding — only the credential-optional classes
-    // are admitted, so the relaxation is literal ids, never the band
+    // band-1's fixed set plus every band-2 id: each declared without a
+    // binding — only the credential-optional classes are admitted, so
+    // the relaxation is literal ids, never the band
     let band = [
         "coreweave",
         "deepinfra",
@@ -4605,6 +4605,14 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "llama.cpp",
         "lm-studio",
         "litellm",
+        "meta",
+        "minimax-code",
+        "minimax-code-cn",
+        "mistral",
+        "moonshot",
+        "nanogpt",
+        "novita",
+        "nvidia",
     ];
     let mut admitted = Vec::new();
     for id in band {
