@@ -20990,3 +20990,816 @@ async fn litellm_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::litellm = NOT_RUN"]
 fn provider_installed_litellm() {}
+
+// ----- llama.cpp ---------------------------------------------------------------
+
+// The `llama.cpp` connection's proof legs (HZN-008 class B — the
+// local-endpoint cell): the shared Chat Completions adapter serves the
+// literal id under its own recorded predicates. The endpoint is the
+// configured local base verbatim, and the required `endpoint` field's
+// empty string resolves the recorded default `http://127.0.0.1:8080`
+// from `auth/llama.cpp.kdl`'s login instructions. The recorded auth is
+// optional beside a server key, so the credential arm is the shared
+// absent-binding form: an unbound declaration rides headerless, a
+// declared binding that cannot resolve denies typed, and a scoped key
+// bears the wire. The manual model path is the supported route — no
+// automatic discovery and no base-URL merging is built or claimed
+// (DEC-008/PROH-009), so a fixed pin opens exactly one request — and
+// the class's `/models` listing is its own catalogue rule alone, never
+// paid entitlement.
+
+/// The scoped credential ref a server-keyed `llama.cpp` connection binds.
+const LLAMA_CPP_REF: &str = "keyring:rivect-test/llama.cpp";
+
+/// Fixture server key — never a real credential, only ever sent to
+/// localhost.
+const LLAMA_CPP_KEY: &str = "fixture-llama-cpp-server-key";
+
+/// The pinned manual model id the fixed-pin legs carry: a locally
+/// served GGUF's own naming, never a recorded catalogue row.
+const LLAMA_CPP_MODEL: &str = "fixture-gguf-model";
+
+/// A model id the fixture peer's `/models` answer offers.
+const LLAMA_CPP_LISTED: &str = "fixture-listed-gguf";
+
+/// One configured `llama.cpp` connection pointing at the fixture peer,
+/// carrying no `credential_ref` — the recorded keyless local mode.
+fn llama_cpp_keyless_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.\"llama.cpp\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"llama.cpp\", model_id = \"{LLAMA_CPP_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same connection with a scoped server key enrolled — the recorded
+/// server-key mode of the one class.
+fn llama_cpp_config(endpoint: &str) -> String {
+    llama_cpp_keyless_config(endpoint).replace(
+        "endpoint = \"",
+        &format!("credential_ref = \"{LLAMA_CPP_REF}\"\nendpoint = \""),
+    )
+}
+
+fn llama_cpp_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(LLAMA_CPP_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "llama.cpp".to_string(), store.clone())
+        .expect("the shared adapter builds for the llama.cpp id");
+    (provider, store)
+}
+
+/// The `llama.cpp` provider over the recorded server key.
+fn enrolled_llama_cpp_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    llama_cpp_provider(config, LLAMA_CPP_KEY)
+}
+
+/// The `llama.cpp` provider over the recorded keyless local mode: no
+/// credential is bound, so the store is never consulted.
+fn keyless_llama_cpp_provider(config: &Config) -> ChatCompletionsProvider {
+    provider_result(
+        config.clone(),
+        "llama.cpp".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("an unbound declaration is the recorded keyless local mode")
+}
+
+// ----- TP-PROVIDER-WIRE::llama.cpp ----------------------------------------------
+
+/// A configured `llama.cpp` connection returns a verified model outcome
+/// through the standard Broker on the recorded keyless local mode:
+/// prepare admits the api_key pin under DEC-011, the shared adapter
+/// posts exactly the frozen manifest as one `chat/completions` request —
+/// the pinned id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is charged
+/// once with the provider's reported usage.
+#[tokio::test]
+async fn llama_cpp_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified local outcome",
+            Some(json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections["llama.cpp"].credential_ref, None,
+        "the keyless row binds no credential — never a materialized dummy"
+    );
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_llama_cpp_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/llama",
+        "goal: prove the wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest.clone());
+    let reply = outcome.expect("the keyless pin is admitted and dispatched");
+    assert_eq!(reply.text, "verified local outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the keyless local mode sends no Authorization header"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LLAMA_CPP_MODEL),
+        "the pinned model id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "one physical send is charged once"
+    );
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "llama.cpp");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/llama", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded keyless local mode carries no credential material at
+/// all: the declaration binds no `credential_ref`, DEC-011 eligibility
+/// admits the pin, the send reaches the peer with no `Authorization`
+/// header — never an empty or dummy bearer — and its reply is one
+/// outcome charged as one physical usage. The catalogue leg rides the
+/// same keyless form.
+#[tokio::test]
+async fn llama_cpp_keyless_local_mode_sends_no_credential() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "keyless local outcome",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&config));
+    let models = catalogue.expect("the keyless catalogue answers headerless");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LLAMA_CPP_LISTED]);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the catalogue leg is one listing");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the keyless local mode sends no Authorization header on the catalogue leg"
+    );
+
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_llama_cpp_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/llama",
+        "goal: keyless local",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest);
+    let reply = outcome.expect("the keyless pin dispatches");
+    assert_eq!(reply.text, "keyless local outcome");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the listing leg then the one send");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    assert!(
+        requests[1].headers.get("authorization").is_none(),
+        "no binding means no Authorization header — never a fabricated key"
+    );
+}
+
+/// The recorded server-key mode of the same class: the enrolled scoped
+/// `SecretRef` material is the bearer the send and the catalogue leg
+/// both carry — one keyed form, never a mixed one.
+#[tokio::test]
+async fn llama_cpp_server_key_mode_sends_the_scoped_bearer() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "server key outcome",
+            Some(json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(enrolled_llama_cpp_provider(&config).0);
+    let models = catalogue.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LLAMA_CPP_LISTED]);
+
+    let (provider, _store) = enrolled_llama_cpp_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("the server key admits the send");
+    assert_eq!(reply.text, "server key outcome");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/v1/models", "/v1/chat/completions"],
+        "the keyed listing leg then the send"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| received_auth(request) == format!("Bearer {LLAMA_CPP_KEY}")),
+        "the enrolled server key bears every leg of the same class"
+    );
+}
+
+/// Hostile stream input is never a false success for `llama.cpp`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn llama_cpp_adverse_wire_input_never_reports_success() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_llama_cpp_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/llama",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_llama_cpp_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/llama",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::llama.cpp -------------------------------------------
+
+/// The configured local base resolves verbatim and the required
+/// `endpoint` field's empty string resolves the recorded default
+/// `http://127.0.0.1:8080` from the auth source — never a borrowed
+/// host: `lm-studio`'s `127.0.0.1:1234/v1` and every cloud class's base
+/// stay out of this connection (EDGE-006). Offline pin: the adapter's
+/// `Debug` surface reports the resolved endpoint, so both arms are
+/// proved without one byte toward any host.
+#[test]
+fn llama_cpp_discriminates_the_recorded_default_base() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&llama_cpp_keyless_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let provider = keyless_llama_cpp_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"http://127.0.0.1:8080\""),
+            "endpoint {endpoint:?} resolved the recorded local default: {debug}"
+        );
+        assert!(
+            !debug.contains("1234") && !debug.contains("localhost"),
+            "no sibling local or cloud host is substituted: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    // a configured base wins verbatim — the trailing slash is the only
+    // normalization, never a `/v1` append or a default substitution
+    let config = Config::parse_validated(&llama_cpp_keyless_config("http://127.0.0.1:9931/v1/"))
+        .expect("a configured local base is valid");
+    let provider = keyless_llama_cpp_provider(&config);
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"http://127.0.0.1:9931/v1\""),
+        "the configured base rides verbatim: {debug}"
+    );
+    assert!(
+        !debug.contains("8080"),
+        "the recorded default never overrides a configured base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// The manual model path is the supported route: a fixed pin sends
+/// exactly one request, the chat leg, and never a `GET …/models` — no
+/// automatic discovery and no base-URL merging exists on this
+/// connection (DEC-008/PROH-009). A mounted listing leaves that count
+/// unchanged, so a discovery leg added anywhere on the send path reds
+/// here.
+#[tokio::test]
+async fn llama_cpp_discovery_is_never_attempted() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "manual path outcome",
+            Some(json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_llama_cpp_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/llama",
+        "goal: manual model path",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest);
+    let reply = outcome.expect("the manual pin dispatches");
+    assert_eq!(reply.text, "manual path outcome");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/v1/chat/completions"],
+        "exactly the one chat request — no discovery leg is attempted"
+    );
+    assert!(
+        !request_paths(&requests)
+            .iter()
+            .any(|path| path.ends_with("/models")),
+        "no `/models` request is sent on this connection"
+    );
+}
+
+/// A `/models` HTTP 200 is never paid entitlement for `llama.cpp`
+/// (INV-010): the class's own catalogue rule is the configured base's
+/// listing under ids-only offers, so a listed id is offered as served
+/// with no price or capability mark, and the fixed pin's send still
+/// posts its own model — never the listed id as a substitute.
+#[tokio::test]
+async fn llama_cpp_local_listing_is_never_paid_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    let config =
+        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&config));
+    let models = catalogue.expect("the local listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["listed-entitlement-claim"],
+        "the class's own catalogue rule decides the offer — no seed floor joins it"
+    );
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{} keeps the ids-only surface — a local answer confers no price or capability",
+            model.id
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the listing leg is one request, never a paid-access check"
+    );
+
+    let (provider, outcome) = send_on_thread(
+        keyless_llama_cpp_provider(&config),
+        prepared_manifest(&config),
+    );
+    let err = outcome.expect_err("a 200 listing never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "llama.cpp");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the listing leg plus the request leg");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LLAMA_CPP_MODEL),
+        "the pinned model rides the wire — a listed id never substitutes it"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::llama.cpp ----------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `llama.cpp`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded local contract names none —
+/// denies `RegionMismatch` with the connection context, and a
+/// profile-bound ref whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`; both deny before the store is read, so
+/// neither arm renders material at all. A refused server key then lands
+/// the typed transport denial carrying the peer's status alone, and on
+/// that arm — the one that resolves and sends the material — neither
+/// the offered credential nor the peer's body reaches Display or Debug.
+#[tokio::test]
+async fn llama_cpp_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    let regioned = Config::parse_validated(
+        &llama_cpp_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "llama.cpp".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "llama.cpp");
+    assert_eq!(region, "eu");
+
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.\"llama.cpp\"]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"llama.cpp\", model_id = \"{LLAMA_CPP_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "llama.cpp".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&llama_cpp_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_llama_cpp_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused server key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, "llama.cpp");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, LLAMA_CPP_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LLAMA_CPP_KEY}"),
+        "the admitted server key reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::llama.cpp ------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can never
+/// be a bearer token — denies `CredentialMalformed` on the first send,
+/// and enrolling the recorded server key at the same scope admits the
+/// retry with that bearer. No state is wedged and no plaintext path is
+/// taken.
+#[tokio::test]
+async fn llama_cpp_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LLAMA_CPP_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "llama.cpp".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(LLAMA_CPP_REF, LLAMA_CPP_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled server key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LLAMA_CPP_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `llama.cpp`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn llama_cpp_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&llama_cpp_config(&server_uri_v1(&server))).expect("valid");
+    let keyless = Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server)))
+        .expect("the keyless row is valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the configured base's listing is the whole offer surface —
+    // no seed floor — and no offer carries a price or capability mark the
+    // class does not record.
+    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&keyless));
+    let listed = catalogue.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [LLAMA_CPP_LISTED]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown
+                    && !model.vision
+                    && !model.reasoning
+                    && model.efforts.is_empty()
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: the one class carries both recorded forms — the server key
+    // bears the chat request, the keyless declaration sends headerless.
+    let (provider, _store) = enrolled_llama_cpp_provider(&config);
+    let (provider, keyed_outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let keyed_ok = keyed_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let keyed_bearer = requests.last().is_some_and(|request| {
+        request.headers.get("authorization").is_some_and(|value| {
+            value
+                .to_str()
+                .is_ok_and(|header| header == format!("Bearer {LLAMA_CPP_KEY}"))
+        })
+    });
+    let (provider, headerless_outcome) = send_on_thread(
+        keyless_llama_cpp_provider(&keyless),
+        prepared_manifest(&keyless),
+    );
+    let headerless_ok = headerless_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let headerless_absent = requests
+        .last()
+        .is_some_and(|request| request.headers.get("authorization").is_none());
+    reported.insert(
+        "AUTH",
+        if keyed_ok && keyed_bearer && headerless_ok && headerless_absent {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // WIRE: the full broker dispatch over the recorded keyless local mode
+    // returns the verified outcome.
+    let (broker, manifest) = {
+        let mut broker = Broker::new(Box::new(keyless_llama_cpp_provider(&keyless)));
+        let manifest = broker
+            .prepare("main", &keyless, "/world/llama", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/llama", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: unusable material denies typed, and the recorded server
+    // key at the same scope admits the retry.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LLAMA_CPP_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "llama.cpp".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialMalformed { .. }));
+    store.enroll(LLAMA_CPP_REF, LLAMA_CPP_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::llama.cpp -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::llama.cpp = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::llama.cpp = NOT_RUN"]
+fn provider_installed_llama_cpp() {}

@@ -1126,8 +1126,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
 /// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
 /// are its recorded class-A/class-P plugs speaking the same dialect,
-/// with `litellm` the recorded class-B configured-proxy plug on that
-/// same dialect (HZN-008) — never inferred from an
+/// with `litellm` the recorded class-B configured-proxy plug and
+/// `llama.cpp` the recorded class-B local-endpoint plug on that same
+/// dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
@@ -1178,6 +1179,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "huggingface" => Some(Dialect::ChatCompletions),
         "kilo" => Some(Dialect::ChatCompletions),
         "litellm" => Some(Dialect::ChatCompletions),
+        "llama.cpp" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
@@ -1259,22 +1261,25 @@ impl Provider for LoopbackProvider {
 }
 
 /// Whether a literal connection id records the credential-optional
-/// open-proxy class (`litellm`): its configured proxy serves with or
-/// without a key, so the declaration may omit `credential_ref`, an
-/// absent binding sends no `Authorization` header — never a dummy key —
-/// and the pin stays offline-usable. Every other `api_key` id requires
-/// its scoped binding at ingress and at eligibility.
+/// absent-binding form: the open proxy (`litellm`) — a configured proxy
+/// that serves with or without a key — and the local-endpoint class
+/// (`llama.cpp`) — a local server whose recorded auth is optional beside
+/// its server-key mode. Both admit a declaration that omits
+/// `credential_ref`, an absent binding sends no `Authorization` header —
+/// never a dummy key — and the pin stays offline-usable. Every other
+/// `api_key` id requires its scoped binding at ingress and at
+/// eligibility.
 ///
 /// Its contract-side twin is `CredentialRule::OpenProxy` in the local
 /// adapter's per-id table, the arm that carries the class's wire form.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
-    connection == "litellm"
+    matches!(connection, "litellm" | "llama.cpp")
 }
 
-/// [`resolve_credential_in`] under the recorded open-proxy form: a
-/// connection whose declaration binds no credential at all resolves
-/// `None` on that class, while every other binding resolves the scoped
+/// [`resolve_credential_in`] under the recorded absent-binding form: a
+/// connection of that class whose declaration binds no credential at all
+/// resolves `None`, while every other binding resolves the scoped
 /// [`SecretRef`] unchanged. A bound-but-malformed or
 /// profile-mismatched reference keeps its typed denial — the absent
 /// binding is the only admitted form.
@@ -1299,7 +1304,7 @@ pub(crate) fn resolve_optional_credential_in(
 /// Connection eligibility for offline dispatch (DEC-011): local
 /// connections are always usable; an `api_key` connection is usable
 /// exactly when its recorded auth class resolves a scoped
-/// [`SecretRef`] — or, on the recorded open-proxy class, when its
+/// [`SecretRef`] — or, on the recorded absent-binding class, when its
 /// declaration binds none — catalogue presence is never entitlement,
 /// and an unresolved binding keeps the typed live-grant denial.
 ///
@@ -1327,7 +1332,7 @@ pub fn offline_eligible(
 /// Offline eligibility as a ranking predicate (AC-044/DEC-011): a
 /// candidate usable without a separate live grant — a local
 /// connection always; an `api_key` one exactly when its credential
-/// resolves, or binds none on the recorded open-proxy class. A
+/// resolves, or binds none on the recorded absent-binding class. A
 /// `subscription` names a live grant no scoped reference
 /// confers — it stays grant-gated until the subscription machinery
 /// lands. Ranking filters candidates with this; [`offline_eligible`]

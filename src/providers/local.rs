@@ -1,9 +1,9 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq`, `huggingface`, `kilo` and `litellm` connections' adapter — the
-//! OpenAI-compatible Chat Completions dialect (DEC-007/DEC-025, HZN-008
-//! class S, class A, class P and class B).
+//! `groq`, `huggingface`, `kilo`, `litellm` and `llama.cpp` connections'
+//! adapter — the OpenAI-compatible Chat Completions dialect
+//! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
@@ -84,8 +84,13 @@
 //! recorded credential arm is the open proxy: an undeclared binding
 //! rides headerless on every leg, a declared binding that cannot
 //! resolve denies typed, and a scoped key sends the bearer — neither
-//! form invents a catalogue — resolved per literal id by the
-//! contract table, never inherited across ids. The adapter authors no
+//! form invents a catalogue — and the configured `llama.cpp` local base
+//! verbatim, or the recorded `http://127.0.0.1:8080` default when the
+//! field is empty, whose catalogue is that base's own `/models` listing
+//! and whose recorded optional auth shares the same absent-binding form
+//! (no discovery beyond the listing leg, no base-URL merging) —
+//! resolved per literal id by the contract table, never inherited
+//! across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -687,6 +692,14 @@ const LITELLM_SENTINEL_IDS: &[&str] = &["all-team-models", "all-proxy-models", "
 /// `output_cost_per_token` are per token, [`ModelPrice::Usd`] per 1M.
 const LITELLM_PRICE_SCALE: f64 = 1_000_000.0;
 
+/// The recorded default base of a `llama.cpp` connection
+/// (`auth/llama.cpp.kdl`'s login instructions: "default base URL:
+/// http://127.0.0.1:8080; set LLAMA_CPP_BASE_URL to customize") — the
+/// host the required `endpoint` field's empty string resolves under. The
+/// recorded default carries no `/v1` segment, so the dialect's own
+/// `/chat/completions` path is appended to it verbatim.
+const LLAMA_CPP_BASE_URL: &str = "http://127.0.0.1:8080";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -705,13 +718,14 @@ enum EndpointRule {
     /// field's empty string standing for the absent override the
     /// `??` fallback covers: the recorded default host.
     ConfiguredElseDefault,
-    /// The plan providers' shared base resolution
-    /// (`alibaba-coding-plan`, `alibaba-token-plan`): the configured
-    /// origin verbatim under the recorded ingress normalization —
+    /// The configured-or-recorded base resolution the plan providers
+    /// (`alibaba-coding-plan`, `alibaba-token-plan`) and the
+    /// local-endpoint class (`llama.cpp`) share: the configured origin
+    /// verbatim under the recorded ingress normalization —
     /// trimmed, all trailing slashes stripped, as the login hook's
     /// custom-origin input is normalized — with the required field's
     /// empty string standing for the absent override: the carried
-    /// recorded international endpoint. The region choice —
+    /// recorded class endpoint. The region choice —
     /// international, China or a custom origin — is this configured
     /// base itself; neither recorded contract names a `region` field.
     PlanBaseOrDefault(&'static str),
@@ -825,14 +839,15 @@ enum CredentialRule {
     Kilo,
     /// `litellm`'s recorded credential-optional auth class (HZN-008
     /// class B, `auth/litellm.kdl` `login "api-key"` against a
-    /// user-configured proxy): the recorded open-proxy form. A
-    /// declaration that binds nothing is admitted and rides headerless
-    /// on *every* leg — the proxy's own unauthenticated path, never a
-    /// dummy key — while a declaration that does bind resolves the
-    /// plain bearer and a bound scope that cannot resolve denies typed
-    /// on every leg. The admission fact lives here, not in the
-    /// catalogue: [`CatalogRule::UnauthenticatedListing`] is `kilo`'s
-    /// separate discovery tolerance over an absent scope.
+    /// user-configured proxy) and `llama.cpp`'s recorded optional auth
+    /// beside its server-key mode (`auth/llama.cpp.kdl`): the recorded
+    /// absent-binding form. A declaration that binds nothing is admitted
+    /// and rides headerless on *every* leg — the host's own
+    /// unauthenticated path, never a dummy key — while a declaration that
+    /// does bind resolves the plain bearer and a bound scope that cannot
+    /// resolve denies typed on every leg. The admission fact lives here,
+    /// not in the catalogue: [`CatalogRule::UnauthenticatedListing`] is
+    /// `kilo`'s separate discovery tolerance over an absent scope.
     OpenProxy,
 }
 
@@ -1182,13 +1197,33 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::OpenProxy,
             entries: EntryRule::LiteLlm,
         }),
+        // `llama.cpp` (HZN-008 class B — the local-endpoint cell): the
+        // configured local base verbatim, or the recorded default
+        // `http://127.0.0.1:8080` when the required `endpoint` field is
+        // empty. The catalogue is the configured base's own `/models`
+        // listing under ids-only offers — a local listing answer proves
+        // no paid entitlement — and no discovery is attempted beyond
+        // that leg: the recorded manual model path is the supported
+        // route, with no base-URL merging (DEC-008/PROH-009). The
+        // recorded auth is optional beside the server-key mode, so the
+        // credential arm is the absent-binding form: an unbound
+        // declaration rides headerless, a declared binding that cannot
+        // resolve denies typed, and a scoped key rides as the bearer.
+        "llama.cpp" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(LLAMA_CPP_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::OpenProxy,
+            entries: EntryRule::IdsOnly,
+        }),
         _ => None,
     }
 }
 
 impl SourceContract {
     /// Whether the recorded credential arm admits a declaration that
-    /// binds no credential at all — the open-proxy form. An exhaustive
+    /// binds no credential at all — the absent-binding form shared by
+    /// the open proxy and the local-endpoint class. An exhaustive
     /// decision over the credential rule, so a further arm must state
     /// its admission here rather than inheriting the required-binding
     /// path by default.
@@ -1451,8 +1486,8 @@ pub struct ChatCompletionsProvider {
     /// precedence — material is read from the store per send so a
     /// rotation is honoured without rebuilding the adapter — or `None`
     /// on a recorded credential-optional class whose declaration binds
-    /// nothing: the recorded open-proxy form sends no `Authorization`
-    /// header and never a dummy key.
+    /// nothing: the recorded absent-binding form sends no
+    /// `Authorization` header and never a dummy key.
     credential: Option<SecretRef>,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
@@ -1472,9 +1507,9 @@ impl ChatCompletionsProvider {
     /// per-connection contract (HZN-008), the connection must be
     /// declared, carry no configured region — no recorded class
     /// has one — and resolve a scoped credential under DEC-013
-    /// precedence, except on the recorded credential-optional class
-    /// whose declaration binds none: that is the open-proxy form, and
-    /// the adapter then bears no material at all.
+    /// precedence, except on the recorded credential-optional classes
+    /// whose declaration binds none: that is the absent-binding form,
+    /// and the adapter then bears no material at all.
     ///
     /// # Errors
     /// [`ProviderError::DialectMismatch`] for a connection id without
@@ -1575,7 +1610,7 @@ impl ChatCompletionsProvider {
     /// unauthenticated catalogue sends no `Authorization` header when
     /// no credential resolves, and still merges its recorded rows as
     /// the offer floor; a class whose credential arm admits an
-    /// undeclared binding — the open-proxy form — sends the same
+    /// undeclared binding — the absent-binding form — sends the same
     /// headerless lookup over its configured base alone. A class whose
     /// recorded discovery is its proxy's management metadata
     /// (`litellm`) probes that metadata first and takes the recorded
@@ -1611,9 +1646,9 @@ impl ChatCompletionsProvider {
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
         // The discovery leg answers the material this class bears:
-        // `None` when the declaration binds none (the open-proxy form)
-        // or the recorded keyless discovery tolerates an empty store,
-        // so the leg rides without the header instead of failing.
+        // `None` when the declaration binds none (the absent-binding
+        // form) or the recorded keyless discovery tolerates an empty
+        // store, so the leg rides without the header instead of failing.
         let secret = self.leg_secret(CredentialLeg::Discovery)?;
         self.catalog_within(secret.as_ref(), started)
     }
@@ -1948,13 +1983,13 @@ impl ChatCompletionsProvider {
     /// the one store read this adapter performs — and answers the wire
     /// material the literal id's recorded credential grammar binds.
     /// A declaration that binds no credential at all resolves `None` on
-    /// every leg: that is the recorded open-proxy form, which sends the
-    /// unauthenticated request, never a dummy key. An absent scope on a
-    /// class the declaration does bind resolves `None` on the discovery
-    /// leg alone (the recorded keyless catalogue); a send still denies
-    /// `CredentialAbsent`, so a keyless or free catalogue never pays for
-    /// a request. Material the store does hold still passes the class
-    /// grammar — resolved-but-unusable material denies typed rather
+    /// every leg: that is the recorded absent-binding form, which sends
+    /// the unauthenticated request, never a dummy key. An absent scope
+    /// on a class the declaration does bind resolves `None` on the
+    /// discovery leg alone (the recorded keyless catalogue); a send still
+    /// denies `CredentialAbsent`, so a keyless or free catalogue never
+    /// pays for a request. Material the store does hold still passes the
+    /// class grammar — resolved-but-unusable material denies typed rather
     /// than silently dropping to the keyless form — and a non-UTF-8
     /// secret can never be a bearer token: typed denial, never a
     /// mangled header. Every grammar, scope or base denial lands here,
@@ -1996,10 +2031,11 @@ impl ChatCompletionsProvider {
                 .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
                 .map(WireSecret::bearer),
             CredentialRule::Kilo => self.opaque_bearer(&text).map(WireSecret::bearer),
-            // The open-proxy class's declared form is the proxy's own
-            // key — master or virtual — carried as the plain bearer the
-            // recorded `api-key` login pastes; material naming no key
-            // denies typed rather than sending an empty bearer.
+            // The absent-binding class's declared form is the host's own
+            // key — a proxy master/virtual key, or a local server key —
+            // carried as the plain bearer the recorded `api-key` login
+            // pastes; material naming no key denies typed rather than
+            // sending an empty bearer.
             CredentialRule::OpenProxy => self.opaque_bearer(&text).map(WireSecret::bearer),
         }
     }
@@ -2066,12 +2102,12 @@ impl ChatCompletionsProvider {
 
     /// The bearer an opaque-key credential resolves — `kilo`'s recorded
     /// device login token or key (`auth/kilo.kdl` `login "custom"`,
-    /// `registry/oauth/kilo.ts`) and the `litellm` open proxy's own
-    /// master or virtual key: no class prefix, no structured body, so
-    /// the grammar is the trimmed material verbatim. Material naming no
-    /// key denies as malformed before any wire leg — neither class
-    /// records a subscription SKU or a proxy login an empty bearer
-    /// could name.
+    /// `registry/oauth/kilo.ts`), `litellm`'s proxy master or virtual
+    /// key, and `llama.cpp`'s optional server key: no class prefix, no
+    /// structured body, so the grammar is the trimmed material verbatim.
+    /// Material naming no key denies as malformed before any wire leg —
+    /// none of these classes records a subscription SKU or a login an
+    /// empty bearer could name.
     fn opaque_bearer(&self, material: &str) -> Result<String, ProviderError> {
         let token = material.trim();
         if token.is_empty() {
@@ -3559,8 +3595,8 @@ impl Provider for ChatCompletionsProvider {
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
         check_deadline(&self.connection, self.deadline, started)?;
-        // The open-proxy form bears no material: the request carries no
-        // `Authorization` header at all, never an empty or dummy bearer.
+        // The absent-binding form bears no material: the request carries
+        // no `Authorization` header at all, never an empty or dummy bearer.
         let request = WireSecret::attach(
             self.client
                 .post(format!("{}/chat/completions", self.endpoint))

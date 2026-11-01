@@ -4996,3 +4996,106 @@ fn litellm_offline_eligibility_admits_the_open_proxy_binding() {
         "only the undeclared binding is the open-proxy form"
     );
 }
+
+/// `llama.cpp` is a served Chat-Completions id under the recorded
+/// local-endpoint class: the dialect map routes the literal id, and the
+/// keyless declaration — which binds no `credential_ref` at all — reads
+/// the same absent-binding predicate config admission does, so a fixed
+/// pin prepares through the real Broker. The server-key half of the same
+/// class stays eligible, and a declared-but-unresolvable binding is the
+/// typed live-grant denial rather than a silent keyless fallback.
+#[test]
+fn llama_cpp_keyless_local_connection_is_offline_eligible() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"llama.cpp\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8080\"\n\
+         [connections.\"llama.cpp-keyed\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8080\"\ncredential_ref = \"keyring:rivect/llama.cpp-scope\"\nprofile = \"llama-cpp-team\"\n\
+         [profiles.llama-cpp-team]\ncredential_ref = \"keyring:rivect/llama-cpp-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"llama.cpp\", model_id = \"fixture-gguf-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("llama.cpp"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    assert_eq!(
+        config.connections["llama.cpp"].credential_ref, None,
+        "the keyless local row binds no credential"
+    );
+    let keyless = ModelAssign::Fixed(FixedModel {
+        connection: "llama.cpp".to_string(),
+        model_id: "fixture-gguf-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyless, &config.connections, &config.profiles)
+            .is_ok(),
+        "the keyless local mode is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "llama.cpp",
+    ));
+
+    // the eligible-but-unbound connection prepares through the real
+    // Broker — eligibility reads the same predicate config admission does
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("main", &config, "/world/llama", "goal: keyless local")
+        .expect("the unbound local connection prepares");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "llama.cpp" && fixed.model_id == "fixture-gguf-model"),
+        "the prepared manifest pins the local connection and model: {:?}",
+        manifest.model
+    );
+
+    let keyed = ModelAssign::Fixed(FixedModel {
+        connection: "llama.cpp-keyed".to_string(),
+        model_id: "fixture-gguf-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyed, &config.connections, &config.profiles).is_ok(),
+        "a scoped server key is usable on the same class"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "llama.cpp-keyed",
+    ));
+
+    // a row whose declared binding cannot resolve is the typed
+    // live-grant denial at eligibility: the keyless form is the
+    // *undeclared* binding, never an unresolvable one
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"llama.cpp\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8080\"\nprofile = \"llama.cpp\"\n\
+         [profiles.\"llama.cpp\"]\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"llama.cpp\", model_id = \"fixture-gguf-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &keyless,
+                &unresolvable.connections,
+                &unresolvable.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &unresolvable.connections,
+            &unresolvable.profiles,
+            "llama.cpp",
+        ),
+        "only the undeclared binding is the keyless local form"
+    );
+}

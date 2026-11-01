@@ -837,10 +837,12 @@ pub struct ConfigCarrier {
 impl ConfigCarrier {
     /// The name captures this address yields, or `None` when the key does
     /// not spell this carrier. A `<...>` segment captures exactly one
-    /// non-empty key segment; every other segment is literal.
+    /// non-empty key segment; every other segment is literal. The address is
+    /// read with [`key_segments`], so a quoted id — one carrying the
+    /// separator, like `llama.cpp` — still names a single row.
     fn names<'key>(&self, key: &'key str) -> Option<Vec<&'key str>> {
         let pattern: Vec<&str> = self.pattern.split('.').collect();
-        let segments: Vec<&str> = key.split('.').collect();
+        let segments = key_segments(key)?;
         if pattern.len() != segments.len() {
             return None;
         }
@@ -943,6 +945,45 @@ fn first_name<'name>(names: &[&'name str]) -> &'name str {
     names.first().copied().unwrap_or_default()
 }
 
+/// One dotted wire address split the way TOML splits a dotted key: a
+/// `"…"`-quoted segment is one segment with its quotes stripped, so an id
+/// carrying the separator — `llama.cpp` — is addressed as
+/// `connections."llama.cpp".profile`, while an unquoted segment splits on
+/// `.` exactly as before. `None` when a quote is left unterminated: a
+/// malformed address must be refused, never read as a longer path.
+fn key_segments(key: &str) -> Option<Vec<&str>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (index, byte) in key.bytes().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'.' if !quoted => {
+                segments.push(&key[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    // The split always yields at least one segment — an empty key yields
+    // `[""]` — so no caller needs an unreachable empty arm.
+    segments.push(&key[start..]);
+    Some(
+        segments
+            .into_iter()
+            .map(|segment| {
+                segment
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .unwrap_or(segment)
+            })
+            .collect(),
+    )
+}
+
 /// The keys `config.read` serves, named once for the read surface's
 /// unknown-key hint: the pattern of every carrier, in table order, then the
 /// document-only sections. A name-bearing key prints its pattern form — a
@@ -996,6 +1037,10 @@ pub enum ConfigIssue {
     DocumentOnlyKey { key: String },
     #[error("malformed key {key}: empty segment")]
     EmptyKeySegment { key: String },
+    /// A `"`-quoted key segment with no closing quote: the address cannot be
+    /// split, so it is refused rather than read as one long segment.
+    #[error("malformed key {key}: unterminated quote")]
+    UnterminatedKeyQuote { key: String },
     #[error("{}", unknown_root_message(key))]
     UnknownRootKey { key: String },
     #[error("{field} is required")]
@@ -2122,10 +2167,12 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
         let key = format!("connections.{name}");
         match connection.kind {
             ConnKind::ApiKey | ConnKind::Subscription => {
-                // The recorded open-proxy class serves a configured proxy
-                // with or without a key, so an absent `credential_ref` is
-                // its recorded unauthenticated form — never a dummy key.
-                // Every other kind still states the binding.
+                // The recorded credential-optional classes serve with or
+                // without a key — the open proxy (`litellm`) and the
+                // local-endpoint class (`llama.cpp`) — so an absent
+                // `credential_ref` is their recorded unauthenticated
+                // form, never a dummy key. Every other kind still states
+                // the binding.
                 if connection.credential_ref.is_none()
                     && !(connection.kind == ConnKind::ApiKey && open_proxy_connection(name))
                 {
@@ -2430,7 +2477,9 @@ impl EditTarget {
 }
 
 fn edit_target(key: &str) -> Result<EditTarget, ConfigError> {
-    let segments: Vec<&str> = key.split('.').collect();
+    let Some(segments) = key_segments(key) else {
+        return Err(unterminated_quote_key(key));
+    };
     if segments.iter().any(|segment| segment.is_empty()) {
         return Err(unknown_edit_key(key));
     }
@@ -2488,10 +2537,15 @@ fn unknown_edit_key(key: &str) -> ConfigError {
     // so it is diagnosed malformed while still naming the requested key.
     // `config_version` is a scalar root, so every descent from it
     // diagnoses the root itself.
-    // `str::split('.')` always yields at least one segment — an empty key
+    // [`key_segments`] always yields at least one segment — an empty key
     // splits to `[""]`, diagnosed as an empty segment just below — so the
-    // root always exists without an unreachable-empty arm.
-    let segments: Vec<&str> = key.split('.').collect();
+    // root always exists without an unreachable-empty arm. A quoted segment
+    // is walked as the one id it names, so
+    // `connections."llama.cpp".bogus` answers the connection csv like every
+    // unquoted spelling of the same scope.
+    let Some(segments) = key_segments(key) else {
+        return unterminated_quote_key(key);
+    };
     let (&root, rest) = segments.split_first().unwrap_or((&"", &[]));
     if root.is_empty() || rest.iter().any(|segment| segment.is_empty()) {
         return malformed_edit_key(key);
@@ -2585,6 +2639,18 @@ fn malformed_edit_key(key: &str) -> ConfigError {
     ConfigError::schema(
         key,
         ConfigIssue::EmptyKeySegment {
+            key: key.to_string(),
+        },
+    )
+}
+
+/// A quoted segment that never closes: the address names no path this
+/// surface can walk, so it is diagnosed instead of being read as one long
+/// segment and slipping past as an unknown key.
+fn unterminated_quote_key(key: &str) -> ConfigError {
+    ConfigError::schema(
+        key,
+        ConfigIssue::UnterminatedKeyQuote {
             key: key.to_string(),
         },
     )

@@ -4293,6 +4293,79 @@ fn config_read_serves_the_profile_keys_with_source_attribution() {
     );
 }
 
+/// The first recorded id carrying the key separator — `llama.cpp` — is
+/// addressable through the same `config.set`/`config.read` spellings the
+/// TOML table itself uses: quoting that segment keeps it one id. The
+/// unquoted spelling stays the unknown key it is today, and a quote that
+/// never closes is a malformed key rather than a silently longer path.
+#[test]
+fn quoted_key_segment_addresses_a_dotted_connection_id() {
+    support::ensure_helper();
+    let text = open_proxy_row_for("llama.cpp").replace(
+        "[models.defaults]",
+        "[profiles.p1]\ncredential_ref = \"keyring:rivect/p1\"\n\n[models.defaults]",
+    );
+    let mut world = support::open_world("quoted-connection-id", Some(&text));
+    let session = world.open_session("quoted-id-boot");
+    let key = "connections.\"llama.cpp\".profile";
+
+    let read = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7360, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0, "keys": [key] }
+    }));
+    assert!(read["error"].is_null(), "{read}");
+    let entry = &read["result"]["entries"]["items"][0];
+    assert_eq!(entry["key"], key, "{read}");
+    assert_eq!(
+        entry["effective"]["value"],
+        json!(null),
+        "the quoted id resolves to the declared row, whose profile is unset: {read}"
+    );
+
+    let set = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7361, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": key, "value": "p1" }
+    }));
+    assert!(set["error"].is_null(), "{set}");
+    let read = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7362, "method": "config.read",
+        "params": { "schema_version": 1, "session_id": session.0, "keys": [key] }
+    }));
+    assert_eq!(
+        read["result"]["entries"]["items"][0]["effective"]["value"],
+        json!("p1"),
+        "the edit landed on the dotted id: {read}"
+    );
+
+    // the unquoted spelling still splits into four segments and misses
+    let unset = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7363, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.llama.cpp.profile", "value": "p2" }
+    }));
+    assert_eq!(
+        unset["error"]["data"]["message"],
+        "schema connections.llama.cpp.profile: unknown key connections.llama.cpp.profile; known keys: kind, endpoint, credential_ref, region, profile",
+        "an unquoted dotted id is unchanged: {unset}"
+    );
+
+    // an unterminated quote names no path at all
+    let unterminated = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 7364, "method": "command.execute",
+        "params": { "schema_version": 1, "session_id": session.0,
+                    "command": { "kind": "config.set" },
+                    "key": "connections.\"llama.cpp.profile", "value": "p2" }
+    }));
+    assert_eq!(
+        unterminated["error"]["data"]["message"],
+        "schema connections.\"llama.cpp.profile: malformed key connections.\"llama.cpp.profile: unterminated quote",
+        "a quote that never closes is malformed, never a longer path: {unterminated}"
+    );
+}
+
 /// DEC-056 item 7: the owner's one config ingress is a checked,
 /// nofollow, nonblocking, bounded regular-file open. A writerless FIFO
 /// never blocks the reload, a symlink never redirects it, an oversize or
@@ -4406,24 +4479,27 @@ fn open_proxy_row(endpoint: &str, extra: &str) -> String {
 
 /// The same unbound single-connection document with the connection and
 /// its pin renamed to `id` — the shape every literal-id grammar check
-/// needs. The endpoint is irrelevant to the binding rule.
+/// needs. The renamed table key is quoted so an id carrying a `.`
+/// (`llama.cpp`) stays one table rather than a nested path. The
+/// endpoint is irrelevant to the binding rule.
 fn open_proxy_row_for(id: &str) -> String {
     open_proxy_row("https://proxy.example.invalid/v1", "")
-        .replace("connections.litellm", &format!("connections.{id}"))
+        .replace("connections.litellm", &format!("connections.\"{id}\""))
         .replace(
             "connection = \"litellm\"",
             &format!("connection = \"{id}\""),
         )
 }
 
-/// The recorded open-proxy class admits a connection that binds no
-/// `credential_ref` — that declaration is the unauthenticated request
-/// form, and the parsed row carries `None` rather than a materialized
-/// dummy key — while a scoped key stays admitted on the same class. The
-/// relaxation is that one class only: a sibling `api_key` id and any
-/// `subscription` id still require their binding, an unknown key beside
-/// the admitted row still rejects with the connection csv, and a present
-/// value still carries the scoped-secret grammar.
+/// The recorded credential-optional classes admit a connection that
+/// binds no `credential_ref` — that declaration is the unauthenticated
+/// request form, and the parsed row carries `None` rather than a
+/// materialized dummy key — while a scoped key stays admitted on the
+/// same classes. The relaxation is those literal ids only: a sibling
+/// `api_key` id and any `subscription` id still require their binding,
+/// an unknown key beside the admitted row still rejects with the
+/// connection csv, and a present value still carries the scoped-secret
+/// grammar.
 #[test]
 fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys() {
     let config = Config::parse_validated(&open_proxy_row("https://proxy.example.invalid/v1", ""))
@@ -4435,6 +4511,20 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "the open-proxy row binds no credential — never a materialized dummy"
     );
 
+    // the recorded keyless local mode of the same class: an `api_key`
+    // row that omits its binding outright
+    let local = Config::parse_validated(&open_proxy_row_for("llama.cpp"))
+        .expect("the keyless local-endpoint row is admitted");
+    let connection = local
+        .connections
+        .get("llama.cpp")
+        .expect("the declared row");
+    assert_eq!(connection.kind, ConnKind::ApiKey);
+    assert_eq!(
+        connection.credential_ref, None,
+        "the keyless local row binds no credential — never a materialized dummy"
+    );
+
     let keyed = Config::parse_validated(&open_proxy_row(
         "https://proxy.example.invalid/v1",
         "credential_ref = \"keyring:rivect/litellm\"\n",
@@ -4444,6 +4534,21 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         keyed.connections["litellm"].credential_ref.as_deref(),
         Some("keyring:rivect/litellm"),
         "the same class still admits its scoped key"
+    );
+
+    // the server-key half of the local class: the same literal id with a
+    // scoped binding is the recorded authenticated form
+    let local_keyed = Config::parse_validated(&open_proxy_row_for("llama.cpp").replace(
+        "[connections.\"llama.cpp\"]",
+        "[connections.\"llama.cpp\"]\ncredential_ref = \"keyring:rivect/llama.cpp\"",
+    ))
+    .expect("the server-key local row is admitted");
+    assert_eq!(
+        local_keyed.connections["llama.cpp"]
+            .credential_ref
+            .as_deref(),
+        Some("keyring:rivect/llama.cpp"),
+        "the local class still admits its scoped server key"
     );
 
     let sibling = open_proxy_row_for("openai");
@@ -4463,9 +4568,16 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "wrong rejection: {error}"
     );
 
-    // the admission keys on the literal id: a name merely containing the
-    // class name is a different connection and still requires its ref
-    for lookalike in ["litellm-proxy", "my-litellm", "LiteLLM"] {
+    // the admission keys on the literal id: a name merely containing or
+    // resembling a class name is a different connection and still
+    // requires its ref
+    for lookalike in [
+        "litellm-proxy",
+        "my-litellm",
+        "LiteLLM",
+        "llama-cpp",
+        "llama",
+    ] {
         let row = open_proxy_row_for(lookalike);
         let error =
             Config::parse_validated(&row).expect_err("a lookalike id is not the recorded class");
@@ -4475,9 +4587,10 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         );
     }
 
-    // the band-wide fixed set: each of the ten recorded Chat Completions
-    // ids declared without a binding — only `litellm` is admitted, so the
-    // relaxation is one recorded class, never the band
+    // the band-wide fixed set plus this band's first local id: each
+    // declared without a binding — only the two credential-optional
+    // classes are admitted, so the relaxation is literal ids, never the
+    // band
     let band = [
         "coreweave",
         "deepinfra",
@@ -4488,6 +4601,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "groq",
         "huggingface",
         "kilo",
+        "llama.cpp",
         "litellm",
     ];
     let mut admitted = Vec::new();
@@ -4503,8 +4617,8 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     }
     assert_eq!(
         admitted,
-        ["litellm"],
-        "the open-proxy admission is that one literal id, not the band"
+        ["llama.cpp", "litellm"],
+        "the absent-binding admission is those two literal ids, not the band"
     );
 
     let error = Config::parse_validated(&open_proxy_row(
