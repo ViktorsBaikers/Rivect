@@ -1,8 +1,8 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq`, `huggingface`, `kilo`, `litellm` and `llama.cpp` connections'
-//! adapter — the OpenAI-compatible Chat Completions dialect
+//! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp` and `lm-studio`
+//! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -88,8 +88,11 @@
 //! verbatim, or the recorded `http://127.0.0.1:8080` default when the
 //! field is empty, whose catalogue is that base's own `/models` listing
 //! and whose recorded optional auth shares the same absent-binding form
-//! (no discovery beyond the listing leg, no base-URL merging) —
-//! resolved per literal id by the contract table, never inherited
+//! (no discovery beyond the listing leg, no base-URL merging), and the
+//! configured `lm-studio` local base under the same shape with its own
+//! recorded default `http://127.0.0.1:1234/v1` — neither local class
+//! borrows the other's base (EDGE-006) — resolved per literal id by the
+//! contract table, never inherited
 //! across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -700,6 +703,14 @@ const LITELLM_PRICE_SCALE: f64 = 1_000_000.0;
 /// `/chat/completions` path is appended to it verbatim.
 const LLAMA_CPP_BASE_URL: &str = "http://127.0.0.1:8080";
 
+/// The recorded default base of an `lm-studio` connection (the
+/// traceability per-ID row's `127.0.0.1:1234/v1`) — the API root the
+/// required `endpoint` field's empty string resolves under. Unlike
+/// `llama.cpp`'s recorded base this one carries its `/v1` segment, so
+/// the dialect's resource paths append directly; each local class keeps
+/// its own recorded default and neither borrows the other's (EDGE-006).
+const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -720,7 +731,7 @@ enum EndpointRule {
     ConfiguredElseDefault,
     /// The configured-or-recorded base resolution the plan providers
     /// (`alibaba-coding-plan`, `alibaba-token-plan`) and the
-    /// local-endpoint class (`llama.cpp`) share: the configured origin
+    /// local-endpoint class (`llama.cpp`, `lm-studio`) share: the configured origin
     /// verbatim under the recorded ingress normalization —
     /// trimmed, all trailing slashes stripped, as the login hook's
     /// custom-origin input is normalized — with the required field's
@@ -840,7 +851,9 @@ enum CredentialRule {
     /// `litellm`'s recorded credential-optional auth class (HZN-008
     /// class B, `auth/litellm.kdl` `login "api-key"` against a
     /// user-configured proxy) and `llama.cpp`'s recorded optional auth
-    /// beside its server-key mode (`auth/llama.cpp.kdl`): the recorded
+    /// beside its server-key mode (`auth/llama.cpp.kdl`) and
+    /// `lm-studio`'s recorded optional auth over its local base
+    /// (`auth/lm-studio.kdl`): the recorded
     /// absent-binding form. A declaration that binds nothing is admitted
     /// and rides headerless on *every* leg — the host's own
     /// unauthenticated path, never a dummy key — while a declaration that
@@ -1212,6 +1225,31 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "llama.cpp" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(LLAMA_CPP_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::OpenProxy,
+            entries: EntryRule::IdsOnly,
+        }),
+        // `lm-studio` (HZN-008 class B — the local-endpoint cell): the
+        // configured local base verbatim, or the recorded default
+        // `http://127.0.0.1:1234/v1` when the required `endpoint` field
+        // is empty — its own base, never `llama.cpp`'s `:8080`
+        // (EDGE-006). The catalogue is that base's own `/models`
+        // listing under ids-only offers, so a listing answer proves no
+        // paid access; the recorded `/models` response also carries the
+        // loaded-context metadata, which has no carrier on
+        // [`CatalogModel`] and is not synthesized, and no discovery or
+        // base-URL merging is built beyond the listing leg (D8: the
+        // recorded extra `/v1/responses` path is a different connection
+        // class and stays unbuilt). The local class records no account
+        // or org predicate — no shared external account exists — so
+        // none is asserted. The recorded auth is optional beside the
+        // server-key mode, so the credential arm is the absent-binding
+        // form: an unbound declaration rides headerless, a declared
+        // binding that cannot resolve denies typed, and a scoped key
+        // rides as the bearer.
+        "lm-studio" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(LM_STUDIO_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::OpenProxy,
             entries: EntryRule::IdsOnly,
@@ -2103,8 +2141,9 @@ impl ChatCompletionsProvider {
     /// The bearer an opaque-key credential resolves — `kilo`'s recorded
     /// device login token or key (`auth/kilo.kdl` `login "custom"`,
     /// `registry/oauth/kilo.ts`), `litellm`'s proxy master or virtual
-    /// key, and `llama.cpp`'s optional server key: no class prefix, no
-    /// structured body, so the grammar is the trimmed material verbatim.
+    /// key, and `llama.cpp`/`lm-studio`'s optional server key: no class
+    /// prefix, no structured body, so the grammar is the trimmed
+    /// material verbatim.
     /// Material naming no key denies as malformed before any wire leg —
     /// none of these classes records a subscription SKU or a login an
     /// empty bearer could name.

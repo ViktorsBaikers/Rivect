@@ -4512,18 +4512,18 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     );
 
     // the recorded keyless local mode of the same class: an `api_key`
-    // row that omits its binding outright
-    let local = Config::parse_validated(&open_proxy_row_for("llama.cpp"))
-        .expect("the keyless local-endpoint row is admitted");
-    let connection = local
-        .connections
-        .get("llama.cpp")
-        .expect("the declared row");
-    assert_eq!(connection.kind, ConnKind::ApiKey);
-    assert_eq!(
-        connection.credential_ref, None,
-        "the keyless local row binds no credential — never a materialized dummy"
-    );
+    // row that omits its binding outright — both local-endpoint ids
+    // carry that form
+    for id in ["llama.cpp", "lm-studio"] {
+        let local = Config::parse_validated(&open_proxy_row_for(id))
+            .expect("the keyless local-endpoint row is admitted");
+        let connection = local.connections.get(id).expect("the declared row");
+        assert_eq!(connection.kind, ConnKind::ApiKey);
+        assert_eq!(
+            connection.credential_ref, None,
+            "the keyless local row binds no credential — never a materialized dummy"
+        );
+    }
 
     let keyed = Config::parse_validated(&open_proxy_row(
         "https://proxy.example.invalid/v1",
@@ -4536,20 +4536,21 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "the same class still admits its scoped key"
     );
 
-    // the server-key half of the local class: the same literal id with a
-    // scoped binding is the recorded authenticated form
-    let local_keyed = Config::parse_validated(&open_proxy_row_for("llama.cpp").replace(
-        "[connections.\"llama.cpp\"]",
-        "[connections.\"llama.cpp\"]\ncredential_ref = \"keyring:rivect/llama.cpp\"",
-    ))
-    .expect("the server-key local row is admitted");
-    assert_eq!(
-        local_keyed.connections["llama.cpp"]
-            .credential_ref
-            .as_deref(),
-        Some("keyring:rivect/llama.cpp"),
-        "the local class still admits its scoped server key"
-    );
+    // the server-key half of the local class: the same literal ids with a
+    // scoped binding are the recorded authenticated form
+    for id in ["llama.cpp", "lm-studio"] {
+        let local_keyed = Config::parse_validated(&open_proxy_row_for(id).replace(
+            &format!("[connections.\"{id}\"]"),
+            &format!("[connections.\"{id}\"]\ncredential_ref = \"keyring:rivect/{id}\""),
+        ))
+        .expect("the server-key local row is admitted");
+        let expected = format!("keyring:rivect/{id}");
+        assert_eq!(
+            local_keyed.connections[id].credential_ref.as_deref(),
+            Some(expected.as_str()),
+            "the local class still admits its scoped server key"
+        );
+    }
 
     let sibling = open_proxy_row_for("openai");
     let error =
@@ -4577,6 +4578,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "LiteLLM",
         "llama-cpp",
         "llama",
+        "lm-studio-local",
     ] {
         let row = open_proxy_row_for(lookalike);
         let error =
@@ -4587,10 +4589,9 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         );
     }
 
-    // the band-wide fixed set plus this band's first local id: each
-    // declared without a binding — only the two credential-optional
-    // classes are admitted, so the relaxation is literal ids, never the
-    // band
+    // the band-wide fixed set plus this band's two local ids: each
+    // declared without a binding — only the credential-optional classes
+    // are admitted, so the relaxation is literal ids, never the band
     let band = [
         "coreweave",
         "deepinfra",
@@ -4602,6 +4603,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "huggingface",
         "kilo",
         "llama.cpp",
+        "lm-studio",
         "litellm",
     ];
     let mut admitted = Vec::new();
@@ -4617,8 +4619,8 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     }
     assert_eq!(
         admitted,
-        ["llama.cpp", "litellm"],
-        "the absent-binding admission is those two literal ids, not the band"
+        ["llama.cpp", "lm-studio", "litellm"],
+        "the absent-binding admission is those three literal ids, not the band"
     );
 
     let error = Config::parse_validated(&open_proxy_row(

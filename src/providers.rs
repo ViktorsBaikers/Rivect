@@ -1127,8 +1127,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
 /// are its recorded class-A/class-P plugs speaking the same dialect,
 /// with `litellm` the recorded class-B configured-proxy plug and
-/// `llama.cpp` the recorded class-B local-endpoint plug on that same
-/// dialect (HZN-008) — never inferred from an
+/// `llama.cpp`/`lm-studio` the recorded class-B local-endpoint plugs on
+/// that same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
@@ -1180,6 +1180,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "kilo" => Some(Dialect::ChatCompletions),
         "litellm" => Some(Dialect::ChatCompletions),
         "llama.cpp" => Some(Dialect::ChatCompletions),
+        "lm-studio" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
@@ -1263,18 +1264,18 @@ impl Provider for LoopbackProvider {
 /// Whether a literal connection id records the credential-optional
 /// absent-binding form: the open proxy (`litellm`) — a configured proxy
 /// that serves with or without a key — and the local-endpoint class
-/// (`llama.cpp`) — a local server whose recorded auth is optional beside
-/// its server-key mode. Both admit a declaration that omits
-/// `credential_ref`, an absent binding sends no `Authorization` header —
-/// never a dummy key — and the pin stays offline-usable. Every other
-/// `api_key` id requires its scoped binding at ingress and at
+/// (`llama.cpp`, `lm-studio`) — a local server whose recorded auth is
+/// optional beside its server-key mode. Both admit a declaration that
+/// omits `credential_ref`, an absent binding sends no `Authorization`
+/// header — never a dummy key — and the pin stays offline-usable. Every
+/// other `api_key` id requires its scoped binding at ingress and at
 /// eligibility.
 ///
 /// Its contract-side twin is `CredentialRule::OpenProxy` in the local
 /// adapter's per-id table, the arm that carries the class's wire form.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
-    matches!(connection, "litellm" | "llama.cpp")
+    matches!(connection, "litellm" | "llama.cpp" | "lm-studio")
 }
 
 /// [`resolve_credential_in`] under the recorded absent-binding form: a

@@ -21803,3 +21803,785 @@ async fn llama_cpp_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::llama.cpp = NOT_RUN"]
 fn provider_installed_llama_cpp() {}
+
+// ----- lm-studio ---------------------------------------------------------------
+
+// The `lm-studio` connection's proof legs (HZN-008 class B — the
+// local-endpoint cell): the shared Chat Completions adapter serves the
+// literal id under its own recorded predicates. The endpoint is the
+// configured local base verbatim, and the required `endpoint` field's
+// empty string resolves the recorded default `http://127.0.0.1:1234/v1`
+// — its own base, never `llama.cpp`'s `:8080` (EDGE-006). The recorded
+// auth is optional beside a server key, so the credential arm is the
+// shared absent-binding form: an unbound declaration rides headerless, a
+// declared binding that cannot resolve denies typed, and a scoped key
+// bears the wire. The class's `/models` listing is its own catalogue
+// rule and never paid access — the recorded local class has no shared
+// external account, so no account/org predicate exists to assert — and
+// no discovery or base-URL merging is built beyond that listing leg
+// (D8: the recorded extra `/v1/responses` path stays a different
+// connection class).
+
+/// The scoped credential ref a server-keyed `lm-studio` connection binds.
+const LM_STUDIO_REF: &str = "keyring:rivect-test/lm-studio";
+
+/// Fixture server key — never a real credential, only ever sent to
+/// localhost.
+const LM_STUDIO_KEY: &str = "fixture-lm-studio-server-key";
+
+/// The pinned manual model id the fixed-pin legs carry: the locally
+/// loaded model's own naming, never a recorded catalogue row.
+const LM_STUDIO_MODEL: &str = "fixture-lm-studio-model";
+
+/// A model id the fixture peer's `/models` answer offers.
+const LM_STUDIO_LISTED: &str = "fixture-listed-lm-studio";
+
+/// One configured `lm-studio` connection pointing at the fixture peer,
+/// carrying no `credential_ref` — the recorded keyless local mode.
+fn lm_studio_keyless_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.lm-studio]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"lm-studio\", model_id = \"{LM_STUDIO_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same connection with a scoped server key enrolled — the recorded
+/// server-key mode of the one class.
+fn lm_studio_config(endpoint: &str) -> String {
+    lm_studio_keyless_config(endpoint).replace(
+        "endpoint = \"",
+        &format!("credential_ref = \"{LM_STUDIO_REF}\"\nendpoint = \""),
+    )
+}
+
+fn lm_studio_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(LM_STUDIO_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "lm-studio".to_string(), store.clone())
+        .expect("the shared adapter builds for the lm-studio id");
+    (provider, store)
+}
+
+/// The `lm-studio` provider over the recorded server key.
+fn enrolled_lm_studio_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    lm_studio_provider(config, LM_STUDIO_KEY)
+}
+
+/// The `lm-studio` provider over the recorded keyless local mode: no
+/// credential is bound, so the store is never consulted.
+fn keyless_lm_studio_provider(config: &Config) -> ChatCompletionsProvider {
+    provider_result(
+        config.clone(),
+        "lm-studio".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("an unbound declaration is the recorded keyless local mode")
+}
+
+// ----- TP-PROVIDER-WIRE::lm-studio ----------------------------------------------
+
+/// A configured `lm-studio` connection returns a verified model outcome
+/// through the standard Broker on the recorded keyless local mode:
+/// prepare admits the api_key pin under DEC-011, the shared adapter
+/// posts exactly the frozen manifest as one `chat/completions` request —
+/// the pinned id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is charged
+/// once with the provider's reported usage.
+#[tokio::test]
+async fn lm_studio_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified local outcome",
+            Some(json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections["lm-studio"].credential_ref, None,
+        "the keyless row binds no credential — never a materialized dummy"
+    );
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_lm_studio_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/studio",
+        "goal: prove the wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/studio", manifest.clone());
+    let reply = outcome.expect("the keyless pin is admitted and dispatched");
+    assert_eq!(reply.text, "verified local outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the keyless local mode sends no Authorization header"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LM_STUDIO_MODEL),
+        "the pinned model id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "one physical send is charged once"
+    );
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "lm-studio");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/studio", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded keyless local mode carries no credential material at
+/// all: the declaration binds no `credential_ref`, DEC-011 eligibility
+/// admits the pin, the send reaches the peer with no `Authorization`
+/// header — never an empty or dummy bearer — and its reply is one
+/// outcome charged as one physical usage. The catalogue leg rides the
+/// same keyless form.
+#[tokio::test]
+async fn lm_studio_keyless_local_mode_sends_no_credential() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LM_STUDIO_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "keyless local outcome",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(keyless_lm_studio_provider(&config));
+    let models = catalogue.expect("the keyless catalogue answers headerless");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LM_STUDIO_LISTED]);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the catalogue leg is one listing");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the keyless local mode sends no Authorization header on the catalogue leg"
+    );
+
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_lm_studio_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/studio",
+        "goal: keyless local",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/studio", manifest);
+    let reply = outcome.expect("the keyless pin dispatches");
+    assert_eq!(reply.text, "keyless local outcome");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the listing leg then the one send");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    assert!(
+        requests[1].headers.get("authorization").is_none(),
+        "no binding means no Authorization header — never a fabricated key"
+    );
+}
+
+/// The recorded server-key mode of the same class: the enrolled scoped
+/// `SecretRef` material is the bearer the send and the catalogue leg
+/// both carry — one keyed form, never a mixed one.
+#[tokio::test]
+async fn lm_studio_server_key_mode_sends_the_scoped_bearer() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LM_STUDIO_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "server key outcome",
+            Some(json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(enrolled_lm_studio_provider(&config).0);
+    let models = catalogue.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(model_ids(&models), [LM_STUDIO_LISTED]);
+
+    let (provider, _store) = enrolled_lm_studio_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("the server key admits the send");
+    assert_eq!(reply.text, "server key outcome");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/v1/models", "/v1/chat/completions"],
+        "the keyed listing leg then the send"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| received_auth(request) == format!("Bearer {LM_STUDIO_KEY}")),
+        "the enrolled server key bears every leg of the same class"
+    );
+}
+
+/// Hostile stream input is never a false success for `lm-studio`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn lm_studio_adverse_wire_input_never_reports_success() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_lm_studio_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/studio",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/studio", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        (
+            keyless_lm_studio_provider(&config),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &config,
+        "/world/studio",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/studio", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::lm-studio -------------------------------------------
+
+/// The configured local base resolves verbatim and the required
+/// `endpoint` field's empty string resolves the recorded default
+/// `http://127.0.0.1:1234/v1`, `/v1` segment included — never
+/// `llama.cpp`'s `127.0.0.1:8080` and never a cloud class's base
+/// (EDGE-006). Offline pin: the adapter's `Debug` surface reports the
+/// resolved endpoint, so both arms are proved without one byte toward
+/// any host.
+#[test]
+fn lm_studio_discriminates_the_recorded_default_base() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&lm_studio_keyless_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let provider = keyless_lm_studio_provider(&config);
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"http://127.0.0.1:1234/v1\""),
+            "endpoint {endpoint:?} resolved the recorded local default: {debug}"
+        );
+        assert!(
+            !debug.contains("8080") && !debug.contains("localhost"),
+            "no sibling local or cloud host is substituted: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    // a configured base wins verbatim — trailing slashes are the only
+    // normalization, never a `/v1` append or a default substitution
+    let config = Config::parse_validated(&lm_studio_keyless_config("http://127.0.0.1:9931/v1/"))
+        .expect("a configured local base is valid");
+    let provider = keyless_lm_studio_provider(&config);
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"http://127.0.0.1:9931/v1\""),
+        "the configured base rides verbatim: {debug}"
+    );
+    assert!(
+        !debug.contains("1234"),
+        "the recorded default never overrides a configured base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// A `/models` HTTP 200 is never paid access for `lm-studio` (INV-010):
+/// the class's own catalogue rule is the configured base's listing under
+/// ids-only offers, so a listed id is offered as served with no price or
+/// capability mark, and the fixed pin's send still posts its own model —
+/// never the listed id as a substitute. The recorded local class has no
+/// shared external account, so no account/org predicate is asserted. An
+/// empty listing leaves the class's own floor, which records no seed row.
+#[tokio::test]
+async fn lm_studio_listing_is_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, catalogue) = catalog_on_thread(keyless_lm_studio_provider(&config));
+    let models = catalogue.expect("the local listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["listed-entitlement-claim"],
+        "the class's own catalogue rule decides the offer — no seed floor joins it"
+    );
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "{} keeps the ids-only surface — a local answer confers no price or capability",
+            model.id
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the listing leg is one request, never a paid-access check"
+    );
+
+    let (provider, outcome) = send_on_thread(
+        keyless_lm_studio_provider(&config),
+        prepared_manifest(&config),
+    );
+    let err = outcome.expect_err("a 200 listing never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "lm-studio");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "the listing leg plus the request leg");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(LM_STUDIO_MODEL),
+        "the pinned model rides the wire — a listed id never substitutes it"
+    );
+
+    // an empty listing is never an error: the class records no seed row,
+    // so its own floor is empty and the offer set stays empty
+    let server = MockServer::start().await;
+    mount_models(&server, Vec::new()).await;
+    let config =
+        Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, catalogue) = catalog_on_thread(keyless_lm_studio_provider(&config));
+    let models = catalogue.expect("an empty local listing answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "an empty listing leaves the class's own (seedless) floor: {models:?}"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::lm-studio ----------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `lm-studio`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded local contract names none —
+/// denies `RegionMismatch` with the connection context, and a
+/// profile-bound ref whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`; both deny before the store is read, so
+/// neither arm renders material at all. A refused server key then lands
+/// the typed transport denial carrying the peer's status alone, and on
+/// that arm — the one that resolves and sends the material — neither
+/// the offered credential nor the peer's body reaches Display or Debug.
+#[tokio::test]
+async fn lm_studio_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    let regioned = Config::parse_validated(
+        &lm_studio_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "lm-studio".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "lm-studio");
+    assert_eq!(region, "eu");
+
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.lm-studio]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"lm-studio\", model_id = \"{LM_STUDIO_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "lm-studio".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&lm_studio_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_lm_studio_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused server key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, "lm-studio");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, LM_STUDIO_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LM_STUDIO_KEY}"),
+        "the admitted server key reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::lm-studio ------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can never
+/// be a bearer token — denies `CredentialMalformed` on the first send,
+/// and enrolling the recorded server key at the same scope admits the
+/// retry with that bearer. No state is wedged and no plaintext path is
+/// taken.
+#[tokio::test]
+async fn lm_studio_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LM_STUDIO_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "lm-studio".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(LM_STUDIO_REF, LM_STUDIO_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the enrolled server key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LM_STUDIO_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `lm-studio`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting.
+#[tokio::test]
+async fn lm_studio_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": LM_STUDIO_LISTED})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&lm_studio_config(&server_uri_v1(&server))).expect("valid");
+    let keyless = Config::parse_validated(&lm_studio_keyless_config(&server_uri_v1(&server)))
+        .expect("the keyless row is valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the configured base's listing is the whole offer surface —
+    // no seed floor — and no offer carries a price or capability mark the
+    // class does not record.
+    let (provider, catalogue) = catalog_on_thread(keyless_lm_studio_provider(&keyless));
+    let listed = catalogue.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if model_ids(&listed) == [LM_STUDIO_LISTED]
+            && listed.iter().all(|model| {
+                model.price == ModelPrice::Unknown
+                    && !model.vision
+                    && !model.reasoning
+                    && model.efforts.is_empty()
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: the one class carries both recorded forms — the server key
+    // bears the chat request, the keyless declaration sends headerless.
+    let (provider, _store) = enrolled_lm_studio_provider(&config);
+    let (provider, keyed_outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let keyed_ok = keyed_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let keyed_bearer = requests.last().is_some_and(|request| {
+        request.headers.get("authorization").is_some_and(|value| {
+            value
+                .to_str()
+                .is_ok_and(|header| header == format!("Bearer {LM_STUDIO_KEY}"))
+        })
+    });
+    let (provider, headerless_outcome) = send_on_thread(
+        keyless_lm_studio_provider(&keyless),
+        prepared_manifest(&keyless),
+    );
+    let headerless_ok = headerless_outcome.is_ok();
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    let headerless_absent = requests
+        .last()
+        .is_some_and(|request| request.headers.get("authorization").is_none());
+    reported.insert(
+        "AUTH",
+        if keyed_ok && keyed_bearer && headerless_ok && headerless_absent {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // WIRE: the full broker dispatch over the recorded keyless local mode
+    // returns the verified outcome.
+    let (broker, manifest) = {
+        let mut broker = Broker::new(Box::new(keyless_lm_studio_provider(&keyless)));
+        let manifest = broker
+            .prepare("main", &keyless, "/world/studio", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/studio", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: unusable material denies typed, and the recorded server
+    // key at the same scope admits the retry.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(LM_STUDIO_REF, &[0xff, 0xfe]);
+    let provider =
+        provider_result(config.clone(), "lm-studio".to_string(), store.clone()).expect("binding");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialMalformed { .. }));
+    store.enroll(LM_STUDIO_REF, LM_STUDIO_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::lm-studio -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::lm-studio = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::lm-studio = NOT_RUN"]
+fn provider_installed_lm_studio() {}

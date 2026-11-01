@@ -5099,3 +5099,107 @@ fn llama_cpp_keyless_local_connection_is_offline_eligible() {
         "only the undeclared binding is the keyless local form"
     );
 }
+
+/// `lm-studio` is the second served Chat-Completions id under the
+/// recorded local-endpoint class: the dialect map routes the literal id
+/// and the keyless declaration — which binds no `credential_ref` at all
+/// — reads the same absent-binding predicate config admission does, so a
+/// fixed pin prepares through the real Broker. Its own recorded base
+/// (`127.0.0.1:1234/v1`, never `llama.cpp`'s `:8080` — EDGE-006) is what
+/// the declaration carries, the server-key half stays eligible, and a
+/// declared-but-unresolvable binding is the typed live-grant denial.
+#[test]
+fn lm_studio_keyless_local_connection_is_offline_eligible() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"lm-studio\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1234/v1\"\n\
+         [connections.\"lm-studio-keyed\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1234/v1\"\ncredential_ref = \"keyring:rivect/lm-studio-scope\"\nprofile = \"lm-studio-team\"\n\
+         [profiles.lm-studio-team]\ncredential_ref = \"keyring:rivect/lm-studio-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"lm-studio\", model_id = \"fixture-local-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("lm-studio"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    assert_eq!(
+        config.connections["lm-studio"].credential_ref, None,
+        "the keyless local row binds no credential"
+    );
+    let keyless = ModelAssign::Fixed(FixedModel {
+        connection: "lm-studio".to_string(),
+        model_id: "fixture-local-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyless, &config.connections, &config.profiles)
+            .is_ok(),
+        "the keyless local mode is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "lm-studio",
+    ));
+
+    // the eligible-but-unbound connection prepares through the real
+    // Broker — eligibility reads the same predicate config admission does
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("main", &config, "/world/studio", "goal: keyless local")
+        .expect("the unbound local connection prepares");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "lm-studio" && fixed.model_id == "fixture-local-model"),
+        "the prepared manifest pins the local connection and model: {:?}",
+        manifest.model
+    );
+
+    let keyed = ModelAssign::Fixed(FixedModel {
+        connection: "lm-studio-keyed".to_string(),
+        model_id: "fixture-local-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyed, &config.connections, &config.profiles).is_ok(),
+        "a scoped server key is usable on the same class"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "lm-studio-keyed",
+    ));
+
+    // a row whose declared binding cannot resolve is the typed
+    // live-grant denial at eligibility: the keyless form is the
+    // *undeclared* binding, never an unresolvable one
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"lm-studio\"]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1234/v1\"\nprofile = \"lm-studio\"\n\
+         [profiles.\"lm-studio\"]\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"lm-studio\", model_id = \"fixture-local-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &keyless,
+                &unresolvable.connections,
+                &unresolvable.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &unresolvable.connections,
+            &unresolvable.profiles,
+            "lm-studio",
+        ),
+        "only the undeclared binding is the keyless local form"
+    );
+}
