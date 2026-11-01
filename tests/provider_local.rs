@@ -498,8 +498,9 @@ async fn dialect_is_keyed_on_the_literal_connection_id() {
 // ----- TP-PROVIDER-CATALOG::custom-chat-completions ------------------
 
 /// `GET {endpoint}/models` is the configured endpoint's own listing —
-/// every non-empty `data[].id` is an offered model in sorted order,
-/// and the bearer credential came through the store seam.
+/// every `data[]` id with a non-whitespace body is an offered model
+/// in sorted order, and the bearer credential came through the store
+/// seam.
 #[tokio::test]
 async fn catalog_lists_the_configured_endpoints_models() {
     let server = MockServer::start().await;
@@ -564,6 +565,27 @@ async fn catalog_payload_over_the_byte_bound_is_a_typed_violation() {
         matches!(outcome, Err(ProviderError::StreamViolation { .. })),
         "an over-bound catalog payload is a typed violation: {outcome:?}"
     );
+}
+
+/// A seedless class keeps the typed denial on a failed discovery send
+/// (DEC-012): the refused endpoint contributes no offer and this class
+/// records no floor to fall back to, so the `Transport` denial stands
+/// unchanged rather than a fabricated catalogue.
+#[tokio::test]
+async fn failed_discovery_send_keeps_the_seedless_typed_denial() {
+    let config = Config::parse_validated(&local_config("http://127.0.0.1:1/v1")).expect("valid");
+    let (provider, _store) = local_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let err = catalogue.expect_err("a seedless class has no floor to answer");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused discovery send is transport: {err}")
+    };
+    assert_eq!(connection, CONNECTION);
+    assert!(
+        cause.class() == TransportClass::RequestFailure,
+        "the refused connection is the typed request failure: {cause}"
+    );
+    drop_blocking(provider);
 }
 
 /// The listing reads under the same whole-request deadline: a peer
@@ -4839,11 +4861,11 @@ fn abliteration_dialect_is_keyed_on_the_literal_connection_id() {
 // ----- TP-PROVIDER-CATALOG::abliteration -------------------------------
 
 /// `GET /models` is authoritative for `abliteration` (HZN-008): every
-/// non-empty `data[].id` is offered — never filtered to a sample —
-/// the recorded static seed merges on top as the offer floor (its
-/// recorded rationale — offering models before a live key exists —
-/// stays upstream's), the union deduplicates and sorts, and the
-/// bearer credential came through the store seam.
+/// `data[]` id with a non-empty body is offered — never filtered
+/// to a sample — the recorded static seed merges on top as the offer
+/// floor (its recorded rationale — offering models before a live key
+/// exists — stays upstream's), the union deduplicates and sorts, and
+/// the bearer credential came through the store seam.
 #[tokio::test]
 async fn abliteration_catalog_is_the_authoritative_listing_over_the_static_seed() {
     let server = MockServer::start().await;
@@ -6006,9 +6028,9 @@ fn aiand_dialect_is_keyed_on_the_literal_connection_id() {
 /// `GET /models` is the authoritative org-scoped listing for `aiand`
 /// (HZN-008): the configured endpoint normalizes onto the recorded
 /// `/v1` API root — a bare configured origin gains the version tail —
-/// every non-empty `data[].id` is offered, the recorded static seed
-/// merges on top as the offer floor, the union deduplicates and
-/// sorts, every listed entry runs the recorded
+/// every `data[]` id with a non-whitespace body is offered, the
+/// recorded static seed merges on top as the offer floor, the union
+/// deduplicates and sorts, every listed entry runs the recorded
 /// capability/effort/currency transform, and the bearer credential
 /// came through the store seam. The generic arm keeps the verbatim
 /// endpoint rule — the normalization binds the literal `aiand` id,
@@ -6994,10 +7016,9 @@ async fn aimlapi_models_listing_filters_chat_models_and_shares_account_balance()
                 "output_per_1m": "2",
                 "context_length": 262144,
             }),
-            // a raw-empty id drops upstream in `catalog_entry`'s
-            // `!id.is_empty()`; a whitespace-only id survives that
-            // check and the predicate's trim-to-empty arm drops it —
-            // neither, nor an entry with no id, reaches the pool
+            // a raw-empty or whitespace-only id drops at
+            // `catalog_entry`'s shared trim rule, and an entry with no
+            // id drops too — none of them reaches the pool
             json!({"id": ""}),
             json!({"id": "   "}),
             json!({"owned_by": "nobody"}),
@@ -10041,12 +10062,18 @@ fn provider_installed_alibaba_token_plan() {}
 // the contract names none. The catalogue is the configured base's
 // own authoritative `/models` listing and ids-only offers: team and
 // project spend and geography stay recorded account data, never
-// synthesized catalog metadata. The credential is the recorded
-// structured `{"key": …, "OpenAI-Project": "<team>/<project>"}` —
-// `key` bears the wire and `OpenAI-Project` becomes the required
-// header; the recorded surface resolves the scope before any fetch
-// and fails closed without it, so a bare key, a key-only blob or an
-// empty member is unscoped material that denies before any wire leg.
+// synthesized catalog metadata. The credential slot holds the scoped
+// `{"key": …, "OpenAI-Project": "<team>/<project>"}` JSON — Rivect's
+// translated store form of the recorded `api-key` login, whose
+// `OpenAI-Project` header hook resolves from the environment, a
+// channel the transport has none of: the `key` is the bearer and the
+// `OpenAI-Project` becomes the header (the recorded surface resolves
+// that scope before any fetch and fails closed without it). The bare
+// pasted key is login input the credential substrate resolves into
+// that stored form, never store material here, so material outside
+// the scoped shape — a bare key, a key-only blob, an empty member,
+// JSON that is not an object with both members — denies before any
+// wire leg.
 
 /// The scoped credential ref the `coreweave` connection binds.
 const COREWEAVE_REF: &str = "keyring:rivect-test/coreweave";
@@ -10077,8 +10104,10 @@ fn coreweave_config(endpoint: &str) -> String {
     )
 }
 
-/// The recorded `{"key": …, "OpenAI-Project": "<team>/<project>"}`
-/// credential shape.
+/// The scoped `{"key": …, "OpenAI-Project": "<team>/<project>"}` JSON —
+/// Rivect's translated store form of the recorded `api-key` login; the
+/// bare pasted key is login input the credential substrate resolves,
+/// never store material.
 fn coreweave_credential(key: &str, project: &str) -> String {
     json!({"key": key, "OpenAI-Project": project}).to_string()
 }
@@ -10096,7 +10125,8 @@ fn coreweave_provider(
     (provider, store)
 }
 
-/// The `coreweave` provider over the recorded enrolled credential.
+/// The `coreweave` provider over the recorded scoped credential —
+/// the documented `key` plus `OpenAI-Project` form.
 fn enrolled_coreweave_provider(
     config: &Config,
 ) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
@@ -10106,8 +10136,8 @@ fn enrolled_coreweave_provider(
     )
 }
 
-/// The `OpenAI-Project` scope header the `coreweave` credential
-/// surface requires on every leg.
+/// The `OpenAI-Project` scope header a scoped `coreweave` credential
+/// carries.
 fn received_project(request: &Request) -> String {
     request
         .headers
@@ -10121,8 +10151,9 @@ fn received_project(request: &Request) -> String {
 
 /// A configured `coreweave` connection returns a verified model
 /// outcome through the standard Broker: prepare admits the api_key
-/// pin under DEC-011, the recorded structured credential unwraps to
-/// its `key` bearer plus the `OpenAI-Project` scope header, and the
+/// pin under DEC-011, the scoped store material bears the wire —
+/// `Authorization: Bearer` with the recorded `OpenAI-Project` scope
+/// header, resolved by the login before the store — and the
 /// shared adapter posts exactly the frozen manifest as a
 /// `chat/completions` request — pinned model, system+user messages,
 /// `stream` with `stream_options.include_usage` and the pinned effort
@@ -10164,12 +10195,12 @@ async fn coreweave_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(
         received_auth(&requests[0]),
         format!("Bearer {COREWEAVE_KEY}"),
-        "the credential's `key` bears the wire — never the JSON blob"
+        "the scoped material's `key` bears the wire verbatim"
     );
     assert_eq!(
         received_project(&requests[0]),
         COREWEAVE_PROJECT,
-        "the recorded scope member lands as the required OpenAI-Project header"
+        "the scoped material's `OpenAI-Project` rides every leg"
     );
     assert!(
         !String::from_utf8_lossy(&requests[0].body).contains(COREWEAVE_KEY),
@@ -10233,13 +10264,6 @@ async fn coreweave_valid_control_yields_one_outcome_and_one_physical_usage() {
     drop_blocking(broker);
 }
 
-/// The dialect keys on the literal connection id, never an auth
-/// label: an id without the recorded Chat Completions class builds
-/// no adapter — a Chat-Completions-classed id is reserved for its
-/// own named contract arm — `dialect_for` reserving `coreweave`
-/// means the id is never fixture-served even when it declares
-/// `local` kind, and a manifest pinning a different connection id is
-/// refused at send.
 /// Hostile stream input is never a false success for `coreweave`: a
 /// stream ended mid `tool_calls` fragment — a partial call that never
 /// executes — and a finish_reason the dialect cannot classify are both
@@ -10325,6 +10349,13 @@ async fn coreweave_adverse_wire_input_never_reports_success() {
     drop_blocking(broker);
 }
 
+/// The dialect keys on the literal connection id, never an auth
+/// label: an id without the recorded Chat Completions class builds
+/// no adapter — a Chat-Completions-classed id is reserved for its
+/// own named contract arm — `dialect_for` reserving `coreweave`
+/// means the id is never fixture-served even when it declares
+/// `local` kind, and a manifest pinning a different connection id is
+/// refused at send.
 #[test]
 fn coreweave_dialect_is_keyed_on_the_literal_connection_id() {
     assert_eq!(
@@ -10386,11 +10417,11 @@ fn coreweave_dialect_is_keyed_on_the_literal_connection_id() {
 
 /// The `coreweave` catalogue is the configured base's own
 /// authoritative `/models` listing (HZN-008 class A): the lookup
-/// resolves the scoped credential — `key` bearer plus the required
+/// resolves the scoped credential — `key` bearer plus its
 /// `OpenAI-Project` header on the one `GET {endpoint}/models` leg —
-/// and every non-empty `id` is an offer landing the ids-only
-/// surface: team and project spend and geography stay recorded
-/// account data, never synthesized catalog metadata.
+/// and every `id` with a non-whitespace body is an offer landing the
+/// ids-only surface: team and project spend and geography stay
+/// recorded account data, never synthesized catalog metadata.
 #[tokio::test]
 async fn coreweave_catalog_is_the_authoritative_ids_only_listing() {
     let server = MockServer::start().await;
@@ -10408,8 +10439,8 @@ async fn coreweave_catalog_is_the_authoritative_ids_only_listing() {
                 "owned_by": "fixture-team",
                 "region": "eu-west",
             }),
-            // only an empty or absent id fails the verbatim rule —
-            // whitespace is non-empty and offers as-is
+            // only a non-whitespace id offers — an empty, absent or
+            // whitespace-only id can never name a model
             json!({"id": ""}),
             json!({"id": "   "}),
             json!({"owned_by": "nobody"}),
@@ -10424,8 +10455,13 @@ async fn coreweave_catalog_is_the_authoritative_ids_only_listing() {
     drop_blocking(provider);
     assert_eq!(
         model_ids(&models),
-        vec!["   ", "cw-chat-large", COREWEAVE_MODEL, "priced-chat"],
-        "the authoritative listing answers every non-empty id verbatim, sorted"
+        vec!["cw-chat-large", COREWEAVE_MODEL, "priced-chat"],
+        "the authoritative listing answers every usable id verbatim, sorted"
+    );
+    assert!(
+        !models.iter().any(|model| model.id.trim().is_empty()),
+        "a whitespace-only id names no model: {:?}",
+        model_ids(&models)
     );
     // every admitted id lands the ids-only surface — a stated context
     // window, owner or region is never adopted
@@ -10541,10 +10577,10 @@ async fn coreweave_auto_pick_resolves_through_the_authoritative_catalog() {
 /// Wrong credential/profile/region never produce a false success for
 /// `coreweave`: a configured `region` — the recorded contract names
 /// none — the profile-bound ref whose scope disagrees with the
-/// binding, an absent credential, unscoped credential material and a
-/// refused bearer token each land a typed denial, and none of them,
-/// nor any Debug surface the boundary exposes, renders credential
-/// material or the peer's body.
+/// binding, an absent credential, credential material outside the
+/// scoped store shape and a refused bearer token each land a typed
+/// denial, and none of them, nor any Debug surface the boundary
+/// exposes, renders credential material or the peer's body.
 #[tokio::test]
 async fn coreweave_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
@@ -10618,26 +10654,59 @@ async fn coreweave_wrong_credential_profile_or_region_denies_with_typed_context_
     assert_no_secret_or_body(&err, COREWEAVE_KEY.as_bytes());
     drop_blocking(provider);
 
-    // unscoped material is the recorded fail-closed: a bare key, a
-    // key-only blob, an empty scope member or material that is not the
-    // recorded object at all each denies malformed before any wire
-    // leg — zero requests reach the mock
+    // material outside the scoped store shape is the recorded
+    // fail-closed: the recorded bare paste key — login input the
+    // credential substrate resolves, never store material — a
+    // key-only blob, an empty scope member, an empty or
+    // whitespace-only key, an object naming no `key`, a JSON body
+    // of the wrong shape — a quoted string, an array — and
+    // structure-looking material that does not parse: a truncated
+    // object, a BOM-prefixed scoped blob, a single-quoted shell blob,
+    // and the bare paste wrapped the same ways — each denies
+    // malformed before any wire leg — zero requests reach the mock
     for material in [
         COREWEAVE_KEY.to_string(),
         json!({"key": COREWEAVE_KEY}).to_string(),
         json!({"key": COREWEAVE_KEY, "OpenAI-Project": "  "}).to_string(),
         json!({"key": "", "OpenAI-Project": COREWEAVE_PROJECT}).to_string(),
+        json!({"key": "  ", "OpenAI-Project": COREWEAVE_PROJECT}).to_string(),
         json!({"OpenAI-Project": COREWEAVE_PROJECT}).to_string(),
-        "not-json".to_string(),
+        json!("\"quoted-json-string\"").to_string(),
+        json!([COREWEAVE_KEY]).to_string(),
+        "{\"key\": \"sk-live\",".to_string(),
+        "[1".to_string(),
+        "\"sk-live".to_string(),
+        format!(
+            "\u{feff}{}",
+            coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT)
+        ),
+        format!(
+            "'{}'",
+            coreweave_credential(COREWEAVE_KEY, COREWEAVE_PROJECT)
+        ),
+        format!("\u{feff}{COREWEAVE_KEY}"),
+        format!("'{COREWEAVE_KEY}'"),
     ] {
         let (provider, _store) = coreweave_provider(&config, &material);
         let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
-        let err = outcome.expect_err("unscoped material denies before any wire leg");
+        let err = outcome
+            .expect_err("material outside the scoped store shape denies before any wire leg");
         assert!(
             matches!(err, ProviderError::CredentialMalformed { .. }),
-            "unscoped material is the typed malformed denial: {err}"
+            "material outside the scoped store shape is the typed malformed denial: {err}"
         );
         assert_no_secret_or_body(&err, material.as_bytes());
+        drop_blocking(provider);
+    }
+    // empty and whitespace-only material names no key at all
+    for material in ["", "   "] {
+        let (provider, _store) = coreweave_provider(&config, material);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("empty material denies before any wire leg");
+        assert!(
+            matches!(err, ProviderError::CredentialMalformed { .. }),
+            "empty material is the typed malformed denial: {err}"
+        );
         drop_blocking(provider);
     }
     assert!(
@@ -10646,7 +10715,7 @@ async fn coreweave_wrong_credential_profile_or_region_denies_with_typed_context_
             .await
             .expect("recorded")
             .is_empty(),
-        "unscoped material never reached the wire"
+        "material outside the scoped store shape never reached the wire"
     );
 
     // a refused bearer token is a typed transport denial — the wire
@@ -11267,11 +11336,11 @@ async fn deepinfra_adverse_wire_input_never_reports_success() {
 /// The `deepinfra` catalogue is the configured base's own
 /// authoritative chat-model `/models` listing (HZN-008 class A): the
 /// lookup resolves the plain bearer credential on the one
-/// `GET {endpoint}/models` leg and every non-empty `id` is an offer
-/// landing the ids-only surface — a listing entry's metadata, tags,
-/// prices and context length stay recorded upstream data, never
-/// synthesized catalog fields; service-tier and flex surcharges stay
-/// distinguished metadata, never a price.
+/// `GET {endpoint}/models` leg and every `id` with a non-whitespace
+/// body is an offer landing the ids-only surface — a listing entry's
+/// metadata, tags, prices and context length stay recorded upstream
+/// data, never synthesized catalog fields; service-tier and flex
+/// surcharges stay distinguished metadata, never a price.
 #[tokio::test]
 async fn deepinfra_catalog_is_the_authoritative_ids_only_listing() {
     let server = MockServer::start().await;
@@ -11293,10 +11362,10 @@ async fn deepinfra_catalog_is_the_authoritative_ids_only_listing() {
                 },
                 "service_tier": {"priority": {"surcharge": 0.5}, "flex": {"discount": 0.2}},
             }),
-            // only an empty or absent id fails the verbatim rule —
-            // whitespace is non-empty and offers as-is
+            // the listing is the authoritative chat-model surface:
+            // `catalog_entry`'s shared trim rule drops an empty or
+            // whitespace-only id, so the fixture offers no such model
             json!({"id": ""}),
-            json!({"id": "   "}),
             json!({"metadata": {}}),
         ],
     )
@@ -11309,13 +11378,8 @@ async fn deepinfra_catalog_is_the_authoritative_ids_only_listing() {
     drop_blocking(provider);
     assert_eq!(
         model_ids(&models),
-        vec![
-            "   ",
-            DEEPINFRA_MODEL,
-            "fixture-org/di-chat-large",
-            "priced-chat"
-        ],
-        "the authoritative listing answers every non-empty id verbatim, sorted"
+        vec![DEEPINFRA_MODEL, "fixture-org/di-chat-large", "priced-chat"],
+        "the authoritative chat-model listing offers the ids it names, sorted"
     );
     // every admitted id lands the ids-only surface — stated metadata,
     // tags, prices and tier/flex surcharges are never adopted
@@ -11853,6 +11917,31 @@ const DEEPSEEK_BUILTIN_IDS: [&str; 3] = [
     "deepseek-v4-pro",
 ];
 
+/// The recorded surface of one built-in as an independent expected
+/// snapshot: the reasoning mark, the `vision-exp` image-input mark,
+/// the recorded effort ladder, the million-token window and the
+/// per-model USD price.
+fn deepseek_expected_model(id: &str) -> CatalogModel {
+    let (vision, input_per_1m, output_per_1m) = match id {
+        "deepseek-v4-flash" => (false, 0.14, 0.28),
+        "deepseek-v4-flash-vision-exp" => (true, 0.14, 0.28),
+        "deepseek-v4-pro" => (false, 0.435, 0.87),
+        other => panic!("{other} is not a recorded deepseek built-in"),
+    };
+    CatalogModel {
+        id: id.to_string(),
+        reasoning: true,
+        vision,
+        efforts: vec![EffortLevel::Low, EffortLevel::High],
+        context_window: Some(1_000_000),
+        price: ModelPrice::Usd {
+            input_per_1m,
+            output_per_1m,
+        },
+        ..CatalogModel::default()
+    }
+}
+
 /// One configured `deepseek` connection pointing at the fixture
 /// peer: the api_key auth class resolves a scoped `SecretRef`
 /// (DEC-011), the dialect comes from the literal connection id
@@ -12271,48 +12360,17 @@ async fn deepseek_catalog_lists_the_recorded_builtin_surface() {
     };
     assert_eq!(
         model("deepseek-v4-flash"),
-        &CatalogModel {
-            id: "deepseek-v4-flash".to_string(),
-            reasoning: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.14,
-                output_per_1m: 0.28,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-flash"),
         "a built-in lands the recorded native-reasoning surface with its recorded USD price"
     );
     assert_eq!(
         model("deepseek-v4-flash-vision-exp"),
-        &CatalogModel {
-            id: "deepseek-v4-flash-vision-exp".to_string(),
-            reasoning: true,
-            vision: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.14,
-                output_per_1m: 0.28,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-flash-vision-exp"),
         "the vision build carries its image-input mark and the recorded flash price"
     );
     assert_eq!(
         model("deepseek-v4-pro"),
-        &CatalogModel {
-            id: "deepseek-v4-pro".to_string(),
-            reasoning: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.435,
-                output_per_1m: 0.87,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-pro"),
         "the pro built-in carries the recorded reasoning surface and its own recorded price"
     );
     let requests = server.received_requests().await.expect("recorded");
@@ -12405,58 +12463,29 @@ async fn deepseek_seed_floor_carries_the_full_recorded_surface() {
     };
     assert_eq!(
         model("deepseek-v4-flash"),
-        &CatalogModel {
-            id: "deepseek-v4-flash".to_string(),
-            reasoning: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.14,
-                output_per_1m: 0.28,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-flash"),
         "a seed-only offer carries the recorded surface — the discriminating leg a bare-stub seed arm would lose"
     );
     assert_eq!(
         model("deepseek-v4-flash-vision-exp"),
-        &CatalogModel {
-            id: "deepseek-v4-flash-vision-exp".to_string(),
-            reasoning: true,
-            vision: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.14,
-                output_per_1m: 0.28,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-flash-vision-exp"),
         "the seed-only vision build carries its image-input mark and price"
     );
     assert_eq!(
         model("deepseek-v4-pro"),
-        &CatalogModel {
-            id: "deepseek-v4-pro".to_string(),
-            reasoning: true,
-            efforts: vec![EffortLevel::Low, EffortLevel::High],
-            context_window: Some(1_000_000),
-            price: ModelPrice::Usd {
-                input_per_1m: 0.435,
-                output_per_1m: 0.87,
-            },
-            ..CatalogModel::default()
-        },
+        &deepseek_expected_model("deepseek-v4-pro"),
         "the seed-only pro build carries its own recorded price"
     );
 }
 
-/// The recorded native reasoning rules bind from the catalogue
-/// through the wire: every built-in offer is a reasoning model over
-/// the recorded effort ladder, the pinned effort rides the
-/// `reasoning_effort` member verbatim, and the native
-/// `reasoning_content` channel is consumed as progress — never
-/// dropped, never joined into the visible answer.
+/// The `deepseek` reasoning surface this band proves: every built-in
+/// offer carries its catalogue reasoning mark over the recorded
+/// effort ladder, the pinned effort rides the `reasoning_effort`
+/// member verbatim, and a native `reasoning_content` fragment never
+/// joins the visible answer — the stream completes carrying only its
+/// `content`. The recorded `thinking` body member that disables
+/// reasoning on a non-reasoner request is not sent here; it is
+/// deferred as `D5` to the first recorded-request body carrying it.
 #[tokio::test]
 async fn deepseek_native_reasoning_rules_are_preserved() {
     // the catalogue surface: a built-in declares reasoning over the
@@ -12489,9 +12518,11 @@ async fn deepseek_native_reasoning_rules_are_preserved() {
         "the recorded per-model USD price carries"
     );
 
-    // the wire surface: the pinned effort rides verbatim and the
-    // native `reasoning_content` channel is consumed as progress —
-    // the visible answer carries only content
+    // the wire surface: the pinned effort rides verbatim and a
+    // native `reasoning_content` fragment never joins the visible
+    // answer — the stream completes with its content alone; the
+    // recorded `thinking` body member stays unsent here (deferred as
+    // `D5`)
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -12518,7 +12549,7 @@ async fn deepseek_native_reasoning_rules_are_preserved() {
     let reply = outcome.expect("the reasoning stream completes");
     assert_eq!(
         reply.text, "reasoned answer",
-        "the reasoning channel is progress — never the visible answer"
+        "the reasoning fragment never joins the visible answer"
     );
     let requests = server.received_requests().await.expect("recorded");
     let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
@@ -12529,6 +12560,10 @@ async fn deepseek_native_reasoning_rules_are_preserved() {
         // keeps — `classes/deepseek.kdl` folds medium/xhigh to high,
         // but the wire carries what the pin declared
         "the pinned effort rides the reasoning surface verbatim"
+    );
+    assert!(
+        body.get("thinking").is_none(),
+        "the recorded thinking body member is unsent (D5): {body}"
     );
     drop_blocking(broker);
 }
@@ -13041,6 +13076,17 @@ const FIREWORKS_FAST_SEED_IDS: [&str; 4] = [
     "kimi-k2.6-fast",
     "kimi-k2.7-code-fast",
 ];
+
+/// The recorded Fast seed's price as an independent expected
+/// snapshot: id and USD input/output per 1M tokens.
+fn fireworks_expected_fast_prices() -> [(&'static str, f64, f64); 4] {
+    [
+        ("glm-5.1-fast", 2.8, 8.8),
+        ("glm-5.2-fast", 2.1, 6.6),
+        ("kimi-k2.6-fast", 2.0, 8.0),
+        ("kimi-k2.7-code-fast", 1.9, 8.0),
+    ]
+}
 
 /// One configured `fireworks` connection pointing at the fixture
 /// peer: the api_key auth class resolves a scoped `SecretRef`
@@ -13629,12 +13675,7 @@ async fn fireworks_seed_floor_carries_the_full_recorded_surface() {
             .find(|model| model.id == id)
             .unwrap_or_else(|| panic!("{id} is offered"))
     };
-    for (id, input_per_1m, output_per_1m) in [
-        ("glm-5.1-fast", 2.8, 8.8),
-        ("glm-5.2-fast", 2.1, 6.6),
-        ("kimi-k2.6-fast", 2.0, 8.0),
-        ("kimi-k2.7-code-fast", 1.9, 8.0),
-    ] {
+    for (id, input_per_1m, output_per_1m) in fireworks_expected_fast_prices() {
         assert_eq!(
             model(id),
             &CatalogModel {
@@ -15241,10 +15282,11 @@ async fn gmi_cloud_adverse_wire_input_never_reports_success() {
 /// The `gmi-cloud` catalogue is the configured base's own authoritative
 /// `/models` listing (HZN-008 class A): the lookup resolves the plain
 /// bearer credential on the one `GET {endpoint}/models` leg, every
-/// non-empty `id` is offered exactly as served — a bare id gains no
-/// vendor namespace, a namespaced id keeps its own form, and the
-/// listing's attached metadata is never adopted — while an empty or
-/// absent id can never name a model.
+/// `id` with a non-whitespace body is offered exactly as served — a
+/// bare id gains no vendor namespace, a namespaced id keeps its own
+/// form, and the listing's attached metadata is never adopted —
+/// while an empty, absent or whitespace-only id can never name a
+/// model.
 #[tokio::test]
 async fn gmi_bare_id_rows_are_offered_verbatim() {
     let server = MockServer::start().await;
@@ -15268,8 +15310,8 @@ async fn gmi_bare_id_rows_are_offered_verbatim() {
                 "capabilities": ["reasoning", "vision"],
                 "context_window": 131072,
             }),
-            // only an empty or absent id fails the verbatim rule —
-            // whitespace is non-empty and offers as-is
+            // only a non-whitespace id offers — an empty, absent or
+            // whitespace-only id can never name a model
             json!({"id": ""}),
             json!({"id": "  "}),
             json!({"metadata": {}}),
@@ -15285,13 +15327,12 @@ async fn gmi_bare_id_rows_are_offered_verbatim() {
     assert_eq!(
         model_ids(&models),
         vec![
-            "  ",
             GMI_MODEL,
             "fixture-org/gmi-chat-large",
             "gmi-flat-aiand-shape",
             "gmi-priced-chat",
         ],
-        "every non-empty listing id is offered exactly as served, sorted — never namespaced or rewritten"
+        "every usable listing id is offered exactly as served, sorted — never namespaced or rewritten"
     );
     // The flat aiand-shaped row lands the default surface: `IdsOnly`
     // reads no currency, price, capability or window member, so an
@@ -17694,11 +17735,82 @@ type SeededFloorClass = (
     Vec<String>,
 );
 
+/// The recorded surface a seeded class's floor carries on a failed
+/// listing: the floor is the recorded offer, not an id-only stub, so
+/// the capability and price pins a successful answer would have
+/// supplied still land.
+fn seeded_floor_surface(connection: &str, models: &[CatalogModel]) {
+    let model = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{connection}: {id} offers through the floor"))
+    };
+    match connection {
+        "deepseek" => assert_eq!(
+            model(DEEPSEEK_MODEL),
+            &deepseek_expected_model(DEEPSEEK_MODEL),
+            "deepseek: the recorded surface rides the floor"
+        ),
+        "fireworks" => {
+            for (id, input_per_1m, output_per_1m) in fireworks_expected_fast_prices() {
+                assert_eq!(
+                    model(id),
+                    &CatalogModel {
+                        id: id.to_string(),
+                        price: ModelPrice::Usd {
+                            input_per_1m,
+                            output_per_1m,
+                        },
+                        ..CatalogModel::default()
+                    },
+                    "fireworks: the recorded variant price rides the floor"
+                );
+            }
+        }
+        "groq" => {
+            for (id, _vision, efforts, input_per_1m, output_per_1m) in groq_expected_rows() {
+                let offered = model(id);
+                assert_eq!(
+                    offered.efforts, efforts,
+                    "groq: the recorded effort ladder rides the floor"
+                );
+                assert_eq!(
+                    offered.price,
+                    ModelPrice::Usd {
+                        input_per_1m,
+                        output_per_1m,
+                    },
+                    "groq: the recorded price rides the floor"
+                );
+            }
+        }
+        "aiand" => assert!(
+            models.iter().all(|model| model.price == ModelPrice::Unknown
+                && !model.vision
+                && !model.reasoning
+                && model.efforts.is_empty()
+                && model.effort_default.is_none()
+                && model.context_window.is_none()),
+            "aiand: the ids-only floor carries no borrowed surface"
+        ),
+        "huggingface" => assert!(
+            models
+                .iter()
+                .all(|model| model.price == ModelPrice::Unknown && model.efforts.is_empty()),
+            "huggingface: the ids-only floor carries no borrowed surface"
+        ),
+        other => panic!("{other} is not a seeded floor class"),
+    }
+}
+
 /// The recorded seed is the offer floor, so a listing that answered
-/// nothing usable still offers it: a 5xx, a non-JSON body and an
-/// oversized body each answer the recorded floor alone — every seeded
-/// class keeps its recorded universe, in deterministic sorted order,
-/// and the failed answer contributes no offer of its own.
+/// nothing usable still offers it: a 5xx, a non-JSON body, an
+/// oversized body and a 200 without a `data` array each answer the
+/// recorded floor alone, and a refused endpoint — no answer at all —
+/// answers it too: every seeded class keeps its recorded universe, in
+/// deterministic sorted order, and the failed answer contributes no
+/// offer of its own.
 #[tokio::test]
 async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
     // a listed id the failed 5xx answer carries: the floor offers it
@@ -17714,7 +17826,7 @@ async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
     let groq_rows = groq_expected_rows();
     let groq_ids: Vec<&str> = groq_rows.iter().map(|row| row.0).collect();
     let huggingface_ids = huggingface_expected_floor();
-    let classes: [SeededFloorClass; 4] = [
+    let classes: [SeededFloorClass; 5] = [
         (
             "deepseek",
             deepseek_config,
@@ -17739,6 +17851,12 @@ async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
             enrolled_huggingface_provider,
             sorted(&huggingface_ids),
         ),
+        (
+            "aiand",
+            aiand_config,
+            aiand_provider,
+            sorted(&AIAND_SEED_IDS),
+        ),
     ];
     let oversized = json!({
         "object": "list",
@@ -17753,29 +17871,40 @@ async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
     for (answer, template) in [
         (
             "a 5xx answer",
-            ResponseTemplate::new(503).set_body_json(json!({
+            Some(ResponseTemplate::new(503).set_body_json(json!({
                 "object": "list",
                 "data": [{"id": FAILED_ANSWER_ID}],
-            })),
+            }))),
         ),
         (
             "a non-JSON body",
-            ResponseTemplate::new(200).set_body_string("not json"),
+            Some(ResponseTemplate::new(200).set_body_string("not json")),
         ),
         (
             "an oversized body",
-            ResponseTemplate::new(200).set_body_string(oversized.clone()),
+            Some(ResponseTemplate::new(200).set_body_string(oversized.clone())),
         ),
+        (
+            "a 200 without a data array",
+            Some(ResponseTemplate::new(200).set_body_json(json!({"object": "list"}))),
+        ),
+        // no answer at all: the connection is refused before a status
+        ("a refused endpoint", None),
     ] {
         for (connection, config_for, provider_for, floor) in &classes {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path("/v1/models"))
-                .respond_with(template.clone())
-                .mount(&server)
-                .await;
-            let config =
-                Config::parse_validated(&config_for(&server_uri_v1(&server))).expect("valid");
+            let (endpoint, server) = match &template {
+                Some(template) => {
+                    let server = MockServer::start().await;
+                    Mock::given(method("GET"))
+                        .and(path("/v1/models"))
+                        .respond_with(template.clone())
+                        .mount(&server)
+                        .await;
+                    (server_uri_v1(&server), Some(server))
+                }
+                None => ("http://127.0.0.1:1/v1".to_string(), None),
+            };
+            let config = Config::parse_validated(&config_for(&endpoint)).expect("valid");
             let (provider, _store) = provider_for(&config);
             let (provider, catalog) = catalog_on_thread(provider);
             let models = catalog.unwrap_or_else(|err| {
@@ -17791,25 +17920,205 @@ async fn seeded_classes_offer_the_recorded_floor_on_a_failed_listing() {
                 !ids.contains(&FAILED_ANSWER_ID),
                 "{connection} on {answer}: the failed answer contributes no offer"
             );
-            let requests = server.received_requests().await.expect("recorded");
-            assert_eq!(
-                requests.len(),
-                1,
-                "{connection} on {answer}: the failed listing is the one discovery leg"
-            );
-            assert_eq!(requests[0].url.path(), "/v1/models");
+            seeded_floor_surface(connection, &models);
+            if let Some(server) = server {
+                let requests = server.received_requests().await.expect("recorded");
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "{connection} on {answer}: the failed listing is the one discovery leg"
+                );
+                assert_eq!(requests[0].url.path(), "/v1/models");
+            }
         }
     }
 }
 
+/// A spent whole-call budget is never an answer: a seeded class whose
+/// discovery stalls past the deadline re-raises the typed `Transport`
+/// deadline denial instead of substituting the recorded floor, whether
+/// the late answer would have been a listing body or a failure status
+/// (DEC-012, INV-004).
+#[tokio::test]
+async fn seeded_class_keeps_the_deadline_denial_never_the_floor() {
+    // The peer answers 1700 ms in — later than the adapter's 1500 ms
+    // budget but well inside the client's 3000 ms backstop — so the
+    // adapter's own guard, not the reqwest timeout, raises the named
+    // deadline. A status that lands after the budget is no answer
+    // either: the 503 must not become the recorded floor.
+    for (answer, template) in [
+        (
+            "a late 200 listing",
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(1700))
+                .set_body_json(json!({
+                    "object": "list",
+                    "data": [{"id": "floor-claim"}],
+                })),
+        ),
+        (
+            "a late 503 status",
+            ResponseTemplate::new(503).set_delay(Duration::from_millis(1700)),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let config =
+            Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
+        let store = Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(DEEPSEEK_REF, DEEPSEEK_KEY)],
+        ));
+        let provider = {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                ChatCompletionsProvider::with_deadline(
+                    &config,
+                    "deepseek",
+                    store,
+                    Duration::from_millis(1500),
+                )
+            })
+            .join()
+            .expect("the provider thread joins")
+            .expect("the shared adapter builds for the deepseek id")
+        };
+        let (provider, catalogue) = catalog_on_thread(provider);
+        let err = catalogue.expect_err("a spent budget never answers the recorded floor");
+        let ProviderError::Transport { connection, cause } = &err else {
+            panic!("{answer}: the deadline is a typed transport denial: {err}")
+        };
+        assert_eq!(connection, "deepseek");
+        assert!(
+            cause.class() == TransportClass::DeadlineExpired,
+            "{answer}: the expired whole-call budget is the named deadline: {cause}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// A seeded class whose discovery peer answers headers inside the
+/// budget but dribbles the body past it keeps the typed deadline, never
+/// the recorded floor (DEC-012, INV-004): the body read spends the same
+/// whole-call budget the status branch does.
+#[tokio::test]
+async fn seeded_class_mid_body_deadline_denies_never_the_floor() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let address = listener.local_addr().expect("address");
+    let stop = Arc::new(AtomicBool::new(false));
+    let answered_headers = Arc::new(AtomicBool::new(false));
+    let drips = Arc::new(AtomicUsize::new(0));
+    let peer = {
+        let stop = Arc::clone(&stop);
+        let answered_headers = Arc::clone(&answered_headers);
+        let drips = Arc::clone(&drips);
+        std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut headers = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk)?;
+                if read == 0 {
+                    return Ok(());
+                }
+                headers.extend_from_slice(&chunk[..read]);
+            }
+            // Headers answer inside the budget; the body then dribbles
+            // so only the whole-call clock can end the read.
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n")?;
+            answered_headers.store(true, Ordering::SeqCst);
+            let started = Instant::now();
+            while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+                match stream.write_all(b"x") {
+                    Ok(()) => {
+                        drips.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Ok(())
+        })
+    };
+
+    let endpoint = format!("http://{address}/v1");
+    let config = Config::parse_validated(&deepseek_config(&endpoint)).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(DEEPSEEK_REF, DEEPSEEK_KEY)],
+    ));
+    let provider = std::thread::spawn(move || {
+        ChatCompletionsProvider::with_deadline(
+            &config,
+            "deepseek",
+            store,
+            Duration::from_millis(1500),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the shared adapter builds for the deepseek id");
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let err = catalogue.expect_err("a dribbled body never answers the recorded floor");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a spent body read is a typed transport deadline: {err}")
+    };
+    assert_eq!(connection, "deepseek");
+    assert!(
+        cause.class() == TransportClass::DeadlineExpired,
+        "the dribbled body spends the whole-call budget: {cause}"
+    );
+    drop_blocking(provider);
+    stop.store(true, Ordering::SeqCst);
+    assert!(
+        answered_headers.load(Ordering::SeqCst),
+        "the peer answered headers inside the budget"
+    );
+    assert!(
+        drips.load(Ordering::SeqCst) > 0,
+        "the body was dribbling when the budget expired"
+    );
+    peer.join()
+        .expect("the fixture peer thread joins")
+        .expect("the fixture peer ends cleanly");
+}
+
 /// The `huggingface` catalogue merges the recorded static bundled floor
 /// with the configured endpoint's own `/models` listing (T1 cell): every
-/// non-empty `data[].id` is offered exactly as served beside the bundled
-/// ids, a listed id the floor already carries does not duplicate, and an
-/// empty id never names a model. The floor's reference descriptors
-/// (cost/vision/context, reasoning/effort) stay uncarried — this class
-/// offers ids only — so every offer keeps [`ModelPrice::Unknown`] and an
-/// empty capability surface, in deterministic sorted order. The union is
+/// `data[]` id with a non-whitespace body is offered exactly as served
+/// beside the bundled ids, a listed id the floor already carries does
+/// not duplicate, and an empty id never names a model. The floor's
+/// reference descriptors (cost/vision/context, reasoning/effort) stay
+/// uncarried — this class offers ids only — so every offer keeps
+/// [`ModelPrice::Unknown`] and an empty capability surface, in
+/// deterministic sorted order. The union is
 /// compared against the pinned snapshot plus the listed id as a
 /// self-consistency control, not source proof.
 #[tokio::test]
@@ -18818,6 +19127,43 @@ async fn kilo_models_listing_is_not_entitlement() {
 
 // ----- TP-PROVIDER-CATALOG::kilo ------------------------------------------------
 
+/// A failed listing leaves the recorded floor standing for `kilo`
+/// (DEC-012): the recorded default row is a catalogue floor, not the
+/// answer's offer, so a 503 contributes no offer and takes none away.
+#[tokio::test]
+async fn kilo_failed_listing_answers_the_recorded_floor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": "failed-answer-entitlement-claim"}],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&kilo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_kilo_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the recorded floor answers the failed listing");
+    drop_blocking(provider);
+    let ids = model_ids(&models);
+    assert_eq!(
+        ids,
+        [KILO_MODEL],
+        "the recorded floor alone offers on a failed listing: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"failed-answer-entitlement-claim"),
+        "the failed answer contributes no offer"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the failed listing is the one discovery leg"
+    );
+}
+
 /// No borrowed price or SKU-bearing row lands on a `kilo` offer
 /// (AC-040e): the offers are the recorded floor row, the pinned roster
 /// is not vendored here, and the class carries no price row or
@@ -19021,17 +19367,19 @@ fn provider_installed_kilo() {}
 // The `litellm` connection's proof legs (HZN-008 class B — the
 // configured-proxy cell): the shared Chat Completions adapter serves the
 // literal id under its own recorded predicates. The proxy base is
-// user-configured and the class records no default host, so none is
-// invented: an empty configured base resolves empty and no localhost or
-// built-in catalogue exists. The recorded discovery is the proxy's own
-// management metadata first — four paths under one bounded phase — with
-// the recorded fall-through to `/models` (DEC-025, DRIFT-010). The
-// recorded credential arm is the open proxy: an undeclared binding rides
-// headerless on every leg, a declared binding that cannot resolve denies
-// typed, and a scoped key bears the wire. A `/models` 200 is never
-// entitlement; a metadata answer's capability, window and per-1M price
-// ride the offer, while a `/models` fall-through row carries its id
-// alone and keeps `ModelPrice::Unknown`.
+// user-configured — the recorded default is
+// `LITELLM_BASE_URL ?? http://localhost:4000/v1`, and our required
+// `endpoint` field means a base must be configured, so the default is
+// never substituted: an empty configured base resolves empty and no
+// localhost or built-in catalogue exists. The recorded discovery is
+// the proxy's own management metadata first — four paths under one
+// bounded phase — with the recorded fall-through to `/models`
+// (DEC-025, DRIFT-010). The recorded credential arm is the open proxy:
+// an undeclared binding rides headerless on every leg, a declared
+// binding that cannot resolve denies typed, and a scoped key bears the
+// wire. A `/models` 200 is never entitlement; a metadata answer's
+// capability, window and per-1M price ride the offer, while a `/models`
+// fall-through row carries its id alone and keeps `ModelPrice::Unknown`.
 
 /// The scoped credential ref a keyed `litellm` connection binds.
 const LITELLM_REF: &str = "keyring:rivect-test/litellm";
@@ -20026,15 +20374,17 @@ async fn litellm_metadata_never_probes_past_a_spent_budget() {
     );
 }
 
-/// No built-in catalogue and no recorded default host exists for
-/// `litellm`: an empty configured base resolves empty rather than a
-/// substituted host — so no localhost catalogue can be invented — and
-/// the lookup over it denies typed instead of reaching any host, while
-/// a peer's empty listing offers nothing (the class records no seed
-/// floor). The resolved endpoint is read from the adapter's `Debug`
-/// surface, and the denial is pinned to the *URL-construction* class:
-/// a substituted default host would answer a connection or status
-/// failure instead, so a mere `Transport` variant would not
+/// `litellm` substitutes no default host: the recorded default
+/// (`LITELLM_BASE_URL ?? http://localhost:4000/v1`) needs a
+/// configured base, and our required `endpoint` field means one is
+/// always configured — an empty configured base resolves empty rather
+/// than the recorded default, so no localhost catalogue is invented
+/// and the lookup over it denies typed instead of reaching any host,
+/// while a peer's empty listing offers nothing (the class records no
+/// seed floor). The resolved endpoint is read from the adapter's
+/// `Debug` surface, and the denial is pinned to the *URL-construction*
+/// class: a substituted default host would answer a connection or
+/// status failure instead, so a mere `Transport` variant would not
 /// discriminate the invented host.
 #[test]
 fn litellm_no_localhost_catalog_is_invented() {
@@ -20046,7 +20396,7 @@ fn litellm_no_localhost_catalog_is_invented() {
         let debug = format!("{provider:?}");
         assert!(
             debug.contains(&format!("endpoint: \"{endpoint}\"")),
-            "endpoint {endpoint:?} resolved no default host: {debug}"
+            "endpoint {endpoint:?} resolved no substituted host: {debug}"
         );
         assert!(
             !debug.contains("localhost") && !debug.contains("127.0.0.1"),

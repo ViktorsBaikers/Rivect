@@ -20,16 +20,23 @@
 //! chat-id prefix filter and the enrolled-base credential binding —
 //! the optional quota `cookie` member admitted for shape and dropped —
 //! on `alibaba-token-plan`, the configured-or-default host, the
-//! authoritative `/models` listing and the scoped bearer credential —
-//! the `OpenAI-Project` member required before any leg — on
-//! `coreweave`, the configured-or-default host, the
+//! authoritative `/models` listing and the scoped `key` with its
+//! `OpenAI-Project` member — the recorded login is `api-key`, whose
+//! `OpenAI-Project` header hook resolves from the environment, a
+//! channel the transport has none of, so Rivect's store form
+//! materializes that scope as the scoped JSON; the bare paste key is
+//! login input the credential substrate resolves (D4), never store
+//! material — on `coreweave`, the configured-or-default host, the
 //! authoritative chat-model `/models` listing — the public metadata
 //! catalogue never an authentication surface — and the plain bearer
 //! credential on `deepinfra`, the configured-or-default host,
 //! the authoritative `/models` listing gated by the recorded
 //! built-in roster — built-in ids offered, benchmark ids never —
 //! the plain bearer credential and the recorded native reasoning
-//! rules on `deepseek`, the shared `api.fireworks.ai/inference/v1`
+//! rules on `deepseek` — catalogue reasoning marks, the verbatim
+//! reasoning-effort pin and reasoning-content progress, while the
+//! recorded `thinking` body toggle is unsent (D5) — the shared
+//! `api.fireworks.ai/inference/v1`
 //! host under the recorded static router catalogue — the `fpk_…` key
 //! authorizes no `/models` lookup, so no discovery leg exists — the
 //! dedicated `fpk_` key grammar and the router wire-model-id dispatch
@@ -69,7 +76,8 @@
 //! bearer a send requires (material naming no token denies typed
 //! before any wire leg), with no subscription SKU or price invented
 //! on `kilo`, and the user-configured `litellm` proxy base verbatim —
-//! the class records no default host, so none is invented and no
+//! the recorded default (`LITELLM_BASE_URL ?? http://localhost:4000/v1`)
+//! is never substituted because the base must be configured, so no
 //! localhost catalogue exists — whose discovery is the proxy's own
 //! management metadata first (four recorded paths under one bounded
 //! phase) with the recorded fall-through to `/models`, and whose
@@ -106,9 +114,9 @@ use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, payload_reason,
-    read_catalog_body, read_chunk, resolve_credential, resolve_optional_credential_in, sse,
-    transport, transport_status, violation, wire_body,
+    SecretRef, ToolCall, TransportCause, bounded_reason, check_deadline, dialect_for,
+    payload_reason, read_catalog_body, read_chunk, resolve_credential,
+    resolve_optional_credential_in, sse, transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -241,11 +249,16 @@ const ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES: &[&str] = &[
 const COREWEAVE_DEFAULT_BASE_URL: &str = "https://api.inference.wandb.ai/v1";
 
 /// The scope header CoreWeave Serverless Inference requires on every
-/// request (`OpenAI-Project`, wire/coreweave.ts): the recorded
-/// `<team>/<project>` member of the scoped credential — spend lands
-/// against that project, and a request without it is denied upstream
-/// the same way the recorded pre-validation check denies an unset
-/// `COREWEAVE_PROJECT` before any fetch.
+/// scoped request (`OpenAI-Project`, wire/coreweave.ts): the recorded
+/// `<team>/<project>` member of the stored scoped credential — spend
+/// lands against that project, and a scoped request without it is
+/// denied upstream the same way the recorded pre-validation check
+/// denies an unset `COREWEAVE_PROJECT` before any fetch. The stored
+/// material always names it: the recorded `api-key` login's
+/// `OpenAI-Project` header hook resolves from the environment, and
+/// Rivect's translated store form materializes that scope, while the
+/// bare pasted key is input to that login, never material this
+/// class's store slot holds.
 const OPENAI_PROJECT_HEADER: &str = "OpenAI-Project";
 
 /// The recorded default API root of a `deepinfra` connection
@@ -779,14 +792,18 @@ enum CredentialRule {
     /// never a key class — a Fireworks account key is unbound
     /// material here and denies as malformed before any wire leg.
     Firepass,
-    /// `coreweave`'s recorded scoped credential (`Rivect/key +
-    /// OpenAI-Project`, wire/coreweave.ts): a JSON object whose `key`
-    /// is the bearer and whose `OpenAI-Project` is the
-    /// `<team>/<project>` scope every request must carry — the
-    /// recorded surface resolves the scope before any fetch and
-    /// fails closed without it, so material lacking the member — a
-    /// bare key, a key-only blob, an empty scope — is unscoped
-    /// material that denies before any wire leg.
+    /// `coreweave`'s recorded credential (`Rivect/key +
+    /// OpenAI-Project`, wire/coreweave.ts): the recorded login is
+    /// `api-key`, whose `OpenAI-Project` header hook resolves from the
+    /// environment — a channel the transport has none of — so the
+    /// store slot holds Rivect's translated scoped JSON: `key` is the
+    /// bearer and `OpenAI-Project` is the `<team>/<project>` scope the
+    /// request carries, resolved before any fetch and failed closed
+    /// without. The bare pasted key is login input the credential
+    /// substrate resolves into that stored form (D4), never store
+    /// material: a bare key, a key-only blob, an empty member or
+    /// material outside the scoped shape denies as malformed before
+    /// any wire leg.
     CoreWeave,
     /// `huggingface`'s recorded credential (`auth/huggingface.kdl`):
     /// the fine-grained model-request token the API-key login pastes
@@ -825,8 +842,8 @@ enum CredentialRule {
 /// capability/effort/currency map (`mapAiandModel`), and `aimlapi`'s
 /// applies the recorded chat-id filter to a defaults-only surface.
 enum EntryRule {
-    /// Every non-empty `id` verbatim — the generic class records no
-    /// per-model metadata surface.
+    /// Every id with a non-whitespace body verbatim — the generic
+    /// class records no per-model metadata surface.
     IdsOnly,
     /// The org-scoped `aiand` transform: `capabilities` names the
     /// reasoning and image-input surface, `reasoning_efforts` maps
@@ -1004,8 +1021,13 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // `api.inference.wandb.ai/v1` base, the authoritative
         // `/models` listing admitted id-only — team/project spend and
         // geography stay recorded-separate data, never synthesized
-        // surface — and the scoped `key`/`OpenAI-Project` credential:
-        // unscoped material denies before any leg.
+        // surface — and the scoped `{key, OpenAI-Project}` JSON as
+        // Rivect's translated store form of the recorded `api-key`
+        // login, whose `OpenAI-Project` hook the environment resolves
+        // — a channel the transport has none of. The bare pasted key
+        // is login input the credential substrate resolves (D4),
+        // never store material, so material outside the scoped shape
+        // denies before any leg.
         "coreweave" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(COREWEAVE_DEFAULT_BASE_URL),
@@ -1140,10 +1162,12 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entries: EntryRule::IdsOnly,
         }),
         // `litellm` (HZN-008 class B — the configured-proxy cell): the
-        // user-configured proxy base verbatim, with no recorded default
-        // host and none invented — an empty configured base stays empty
-        // rather than resolving a localhost catalogue — the recorded
-        // listing whose discovery is the proxy's own management
+        // user-configured proxy base verbatim — the recorded default is
+        // `LITELLM_BASE_URL ?? http://localhost:4000/v1`, but our
+        // required `endpoint` field means a base must be configured, so
+        // the default is never substituted and no localhost catalogue
+        // is invented: an empty configured base stays empty — the
+        // recorded listing whose discovery is the proxy's own management
         // metadata first ([`LITELLM_METADATA_PATHS`] under one bounded
         // phase budget) with the recorded fall-through to `/models`,
         // no seed (the class records no built-in roster), the recorded
@@ -1366,14 +1390,16 @@ struct StreamState {
 }
 
 /// The wire material one resolved credential carries — the bearer
-/// token, plus the `OpenAI-Project` scope the `coreweave` arm requires
-/// on every leg. Never rendered: both members are secret-store
+/// token, plus the `OpenAI-Project` scope a scoped `coreweave`
+/// credential names. Never rendered: both members are secret-store
 /// material.
 struct WireSecret {
     /// The `Authorization: Bearer` token.
     bearer: String,
-    /// The `OpenAI-Project` header value — `Some` only under
-    /// [`CredentialRule::CoreWeave`], where the grammar demands it.
+    /// The `OpenAI-Project` header value — `Some` only for the
+    /// `coreweave` scoped store material, whose `<team>/<project>` is
+    /// the recorded login's env-resolved hook materialized in the
+    /// store; every leg of that class carries it.
     project: Option<String>,
 }
 
@@ -1538,8 +1564,9 @@ impl ChatCompletionsProvider {
 
     /// The model catalogue for this connection (HZN-008): the
     /// configured endpoint's own `models` listing under the literal
-    /// id's recorded contract — every non-empty `data[].id` is an
-    /// offered model under its per-entry transform, the recorded
+    /// id's recorded contract — every `data[]` id with a non-whitespace
+    /// body is an offered model under its per-entry transform, the
+    /// recorded
     /// static seed merges on top as the offer floor, and the union
     /// returns in deterministic sorted order. A class whose recorded
     /// catalogue is a fixed allowlist answers it alone: no listing
@@ -1565,8 +1592,10 @@ impl ChatCompletionsProvider {
     /// does not carry the `data` array the contract requires. A
     /// *seeded* class answers its recorded seed floor instead of denying
     /// on a failed or unparseable listing — that seed is the offer floor
-    /// the listing only supplements — while a seedless class has no
-    /// floor and keeps the typed denial.
+    /// the listing only supplements, and a keyless class's recorded
+    /// discovery rows are that floor too — while a seedless class has no
+    /// floor and keeps the typed denial. A spent whole-call budget is
+    /// never a failed answer: its deadline denial stands.
     pub fn catalog(&self) -> Result<Vec<CatalogModel>, ProviderError> {
         // The recorded allowlist is the whole catalogue — no wire
         // leg, no credential resolution.
@@ -1619,9 +1648,15 @@ impl ChatCompletionsProvider {
         check_deadline(&self.connection, self.deadline, started)?;
         let request =
             WireSecret::attach(self.client.get(format!("{}/models", self.endpoint)), secret);
-        let mut response = request
-            .send()
-            .map_err(|err| transport(&self.connection, err))?;
+        let mut response = match request.send() {
+            Ok(response) => response,
+            Err(err) => return self.floor_or(transport(&self.connection, err)),
+        };
+        // The wait spent the budget: a status that lands after it is no
+        // answer at all, so the deadline denial stands before the status
+        // branch — a status inside the budget keeps its recorded floor
+        // handling below.
+        check_deadline(&self.connection, self.deadline, started)?;
         if !response.status().is_success() {
             return self.floor_or(transport_status(&self.connection, response.status()));
         }
@@ -1637,34 +1672,25 @@ impl ChatCompletionsProvider {
             }
         };
         let Some(data) = body.get("data").and_then(Value::as_array) else {
-            return Err(violation(
+            return self.floor_or(violation(
                 &self.connection,
                 "models payload carries no data array",
             ));
         };
         // Every listed `id` is an offer under the literal id's
-        // recorded per-entry transform — an empty or absent one can
-        // never name a model.
+        // recorded per-entry transform — an empty, absent or
+        // whitespace-only one can never name a model.
         let mut models: Vec<CatalogModel> = data
             .iter()
             .filter_map(|entry| self.catalog_entry(entry))
             .collect();
-        // The recorded seed unions on top as the offer floor — a
-        // seeded id the listing omitted still offers, carrying the
-        // id-only surface a generic seed states. `deepseek`'s seed is
-        // the built-in roster itself, so its stubs carry the same
-        // recorded transform surface the listing arm lands. Listed
-        // entries precede the stubs, so the stable sort keeps a
-        // listing entry's transform over its seed stub on a
+        // The recorded floor unions on top as the offer floor — a
+        // seeded or keyless-floor id the listing omitted still offers,
+        // carrying the recorded transform surface the listing arm
+        // lands. Listed entries precede the floor, so the stable sort
+        // keeps a listing entry's transform over its floor stub on a
         // collision.
-        models.extend(self.seed_models());
-        // The recorded keyless discovery's rows are the floor too: an
-        // empty `/models` answer still offers them, and a listed entry
-        // precedes its floor stub, so the stable sort keeps the
-        // listing transform on a collision.
-        if let CatalogRule::UnauthenticatedListing(floor) = self.contract.catalog {
-            models.extend(allowlist_models(floor));
-        }
+        models.extend(self.floor_models());
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
@@ -1694,16 +1720,29 @@ impl ChatCompletionsProvider {
             .collect()
     }
 
-    /// The seed alone as a catalogue answer: the recorded floor in the
-    /// union's sorted, deduplicated order, or `None` for a class that
-    /// records no seed and so has no floor to fall back to.
-    fn seed_floor(&self) -> Option<Vec<CatalogModel>> {
+    /// The recorded offer floor — the seed ids under the literal id's
+    /// per-entry transform plus the keyless discovery's recorded rows —
+    /// in the union's sorted, deduplicated order. A listing only
+    /// supplements it.
+    fn floor_models(&self) -> Vec<CatalogModel> {
         let mut models = self.seed_models();
-        if models.is_empty() {
-            return None;
+        if let CatalogRule::UnauthenticatedListing(floor) = self.contract.catalog {
+            models.extend(allowlist_models(floor));
         }
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models.dedup_by(|a, b| a.id == b.id);
+        models
+    }
+
+    /// The recorded floor alone as a catalogue answer: the seed and the
+    /// keyless discovery's recorded rows in the union's sorted,
+    /// deduplicated order, or `None` for a class that records no floor
+    /// and so has nothing to fall back to.
+    fn seed_floor(&self) -> Option<Vec<CatalogModel>> {
+        let models = self.floor_models();
+        if models.is_empty() {
+            return None;
+        }
         Some(models)
     }
 
@@ -1711,8 +1750,19 @@ impl ChatCompletionsProvider {
     /// seeded class's recorded floor — that seed is the offer floor the
     /// listing only supplements, so a failed or unparseable answer
     /// contributes no offer and takes none away — while a seedless
-    /// class keeps the leg's typed denial.
+    /// class keeps the leg's typed denial. A spent whole-call budget is
+    /// no answer: its deadline denial is re-raised unchanged, never
+    /// converted into the floor.
     fn floor_or(&self, err: ProviderError) -> Result<Vec<CatalogModel>, ProviderError> {
+        if matches!(
+            &err,
+            ProviderError::Transport {
+                cause: TransportCause::Deadline { .. },
+                ..
+            }
+        ) {
+            return Err(err);
+        }
         match self.seed_floor() {
             Some(floor) => Ok(floor),
             None => Err(err),
@@ -1840,14 +1890,15 @@ impl ChatCompletionsProvider {
     }
 
     /// One `data[]` entry under the literal id's recorded transform —
-    /// `None` when the entry names no usable id: an empty or absent
-    /// id can never name a model, and an `aimlapi` id the recorded
-    /// `exclude-models` roster names is filtered before offer.
+    /// `None` when the entry names no usable id: an empty, absent or
+    /// whitespace-only id can never name a model, and an `aimlapi` id
+    /// the recorded `exclude-models` roster names is filtered before
+    /// offer.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         let id = entry
             .get("id")
             .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())?;
+            .filter(|id| !id.trim().is_empty())?;
         match self.contract.entries {
             EntryRule::IdsOnly => Some(CatalogModel {
                 id: id.to_string(),
@@ -1953,22 +2004,30 @@ impl ChatCompletionsProvider {
         }
     }
 
-    /// The bearer and `OpenAI-Project` scope a `coreweave` credential
-    /// resolves (`Rivect/key + OpenAI-Project`, wire/coreweave.ts):
-    /// the stored material is a JSON object whose `key` is the bearer
-    /// and whose `OpenAI-Project` is the `<team>/<project>` scope the
-    /// header carries — the recorded surface resolves the scope
-    /// before any fetch and fails closed without it, so a bare key,
-    /// a key-only blob or an empty member is unscoped material and
-    /// denies as malformed before any wire leg. Anything the
-    /// recorded shape does not name — a non-string member, a
-    /// non-object body — is material the recorded credential never
-    /// produces and denies the same way.
+    /// The wire material a `coreweave` credential resolves
+    /// (`Rivect/key + OpenAI-Project`, wire/coreweave.ts): the recorded
+    /// login is `api-key`, whose `OpenAI-Project` header hook resolves
+    /// from the environment — a channel the transport has none of — so
+    /// the store slot holds Rivect's translated scoped JSON: `key` is
+    /// the bearer and `OpenAI-Project` is the `<team>/<project>` scope
+    /// the header carries, which the recorded surface resolves before
+    /// any fetch and fails closed without. The bare pasted key is
+    /// login input the credential substrate resolves into that stored
+    /// form (D4), never store material here: only a JSON object naming
+    /// both members as non-empty strings is store material, and
+    /// anything else — a bare key, a key-only or empty-scope blob,
+    /// empty or whitespace-only material, a quoted string, an array,
+    /// JSON that does not parse — denies as malformed before any wire
+    /// leg.
     fn coreweave_secret(&self, material: &str) -> Result<WireSecret, ProviderError> {
         let malformed = || ProviderError::CredentialMalformed {
             connection: self.connection.clone(),
         };
-        let parsed: Value = serde_json::from_str(material.trim()).map_err(|_parse| malformed())?;
+        let trimmed = material.trim();
+        if trimmed.is_empty() {
+            return Err(malformed());
+        }
+        let parsed: Value = serde_json::from_str(trimmed).map_err(|_parse| malformed())?;
         let bearer = parsed
             .get("key")
             .and_then(Value::as_str)
