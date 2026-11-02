@@ -6124,6 +6124,7 @@ async fn aiand_catalog_is_the_authoritative_org_listing_over_the_static_seed() {
             efforts: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
             effort_default: Some(EffortLevel::Medium),
             context_window: Some(262144),
+            max_output_tokens: None,
             price: ModelPrice::Usd {
                 input_per_1m: 0.75,
                 output_per_1m: 3.5,
@@ -7878,6 +7879,7 @@ async fn alibaba_coding_plan_catalog_is_the_recorded_allowlist_without_a_wire_le
         efforts: vec![],
         effort_default: None,
         context_window: None,
+        max_output_tokens: None,
         price: ModelPrice::Unknown,
     };
     assert_eq!(
@@ -19830,6 +19832,10 @@ async fn litellm_management_metadata_precedes_the_models_listing() {
         Some(1000),
         "the metadata's input window rides the offer"
     );
+    assert_eq!(
+        model.max_output_tokens, None,
+        "the recorded output cap stays uncarried — the metadata maps the input window alone"
+    );
     assert!(
         model.vision && model.reasoning,
         "the metadata's capability marks ride the offer"
@@ -21001,3 +21007,6 @@ fn provider_installed_litellm() {}
 
 // Band-2 tests keep their root names; the split restores the duplicate scanner's per-file coverage.
 include!("provider_local/band2.rs");
+
+// Band-3 tests keep their root names; the split restores the duplicate scanner's per-file coverage.
+include!("provider_local/band3.rs");

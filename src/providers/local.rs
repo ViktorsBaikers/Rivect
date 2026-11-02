@@ -1774,6 +1774,12 @@ pub struct CatalogModel {
     pub effort_default: Option<EffortLevel>,
     /// The listing's declared context window in tokens.
     pub context_window: Option<u64>,
+    /// The maximum output tokens this adapter carries from the
+    /// listing — populated only by a per-id adapter that maps it.
+    /// `None` means this adapter does not carry the listing's value,
+    /// which may include a source field the recorded class does not
+    /// map.
+    pub max_output_tokens: Option<u64>,
     /// The listing's stated per-1M-token price under the recorded
     /// currency rule.
     pub price: ModelPrice,
@@ -3642,6 +3648,7 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
         efforts,
         effort_default,
         context_window: positive_count(entry.get("context_window")),
+        max_output_tokens: None,
         price: aiand_price(entry),
     }
 }
@@ -3808,6 +3815,7 @@ fn litellm_metadata_model(entry: &Value) -> Option<CatalogModel> {
         efforts: Vec::new(),
         effort_default: None,
         context_window: positive_count(litellm_metadata_value(entry, "max_input_tokens")),
+        max_output_tokens: None,
         price: litellm_metadata_price(entry),
     })
 }

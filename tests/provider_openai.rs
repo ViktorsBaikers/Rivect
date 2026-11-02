@@ -23,7 +23,9 @@ use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
-use rivect::providers::{Provider, ProviderError, StoreKind, TransportCause, TransportClass};
+use rivect::providers::{
+    CatalogModel, Provider, ProviderError, StoreKind, TransportCause, TransportClass,
+};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -317,6 +319,119 @@ async fn provider_catalog_filters_models_to_the_responses_sample() {
     assert_eq!(received_auth(&requests[0]), format!("Bearer {SECRET}"));
 }
 
+// ----- TP-PROVIDER-CATALOG::shared record (DEC-007) -----------------
+
+/// Both catalogue surfaces of one Responses provider, on a plain OS
+/// thread: the client's shell runtime cannot be built inside a tokio
+/// context, and the provider comes back for a blocking drop.
+fn catalogue_surfaces(
+    provider: OpenAiProvider,
+) -> (OpenAiProvider, Vec<String>, Vec<CatalogModel>) {
+    std::thread::spawn(move || {
+        let ids = provider.catalog().expect("the id-only catalogue answers");
+        let models = provider.catalog_models().expect("the rich sibling answers");
+        (provider, ids, models)
+    })
+    .join()
+    .expect("the catalog thread joins")
+}
+
+/// The id-only surface stays byte-for-byte the same and the rich
+/// sibling is additive: the same sorted ids, and one shared record per
+/// id whose metadata is still the default — per-id entry rules stay
+/// uncarried.
+fn assert_id_only_surface(provider: OpenAiProvider, expected: &[&str]) {
+    let (provider, ids, models) = catalogue_surfaces(provider);
+    drop_blocking(provider);
+    let expected_ids: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the id-only catalogue surface is unchanged"
+    );
+    let expected_models: Vec<CatalogModel> = expected
+        .iter()
+        .map(|id| CatalogModel {
+            id: (*id).to_string(),
+            ..CatalogModel::default()
+        })
+        .collect();
+    assert_eq!(
+        models, expected_models,
+        "the rich sibling adds the shared record with the existing ids and default metadata"
+    );
+    assert!(
+        models.iter().all(|model| model.max_output_tokens.is_none()),
+        "no entry rule states a maximum-output cap"
+    );
+}
+
+/// The rich catalogue mirrors the id-only answer for every Responses
+/// id: `openai` keeps its filtered sample, `abliteration` and `meta`
+/// keep their authoritative listing plus static seed, and the new
+/// shared record adds no metadata beyond the id.
+#[tokio::test]
+async fn responses_catalogue_keeps_the_id_only_surface() {
+    // openai: the recorded sample filters and sorts the listing.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "o3"},
+                {"id": "dall-e-3"},
+                {"id": "gpt-5.2"},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = openai_provider(&config);
+    assert_id_only_surface(provider, &["gpt-5.2", "o3"]);
+
+    // abliteration: the authoritative listing merges the static seed.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"abliteration\", model_id = \"abliterated-model\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CREDENTIAL_REF, SECRET)],
+    ));
+    let provider = provider_result(config, "abliteration".to_string(), store)
+        .expect("the shared adapter builds for the abliteration id");
+    assert_id_only_surface(
+        provider,
+        &[
+            "abliterated-model",
+            "abliterated-model-large",
+            "abliterated-model-large-v2",
+        ],
+    );
+
+    // meta: the authoritative listing merges the static Muse floor.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = meta_provider(&config);
+    assert_id_only_surface(provider, &META_FLOOR);
+}
+
 /// The listing payload is bounded like the stream: a body past the
 /// byte bound is a typed violation, never buffered unbounded.
 #[tokio::test]
@@ -339,6 +454,51 @@ async fn catalog_payload_over_the_byte_bound_is_a_typed_violation() {
         matches!(outcome, Err(ProviderError::StreamViolation { .. })),
         "an over-bound catalog payload is a typed violation: {outcome:?}"
     );
+}
+
+/// The rich catalogue's denials are the same typed errors the id-only
+/// surface reports: both read the one listing leg, so an over-bound
+/// payload denies `catalog_models()` exactly as `catalog()` denies it —
+/// never a second, differently-typed failure path.
+#[tokio::test]
+async fn catalogue_models_denies_with_the_same_typed_error_as_catalog() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            // the bound is 1 MiB — one byte past it trips the read loop
+            "x".repeat(1024 * 1024 + 1),
+        ))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = openai_provider(&config);
+    let (provider, models, ids) = std::thread::spawn(move || {
+        let models = provider.catalog_models();
+        let ids = provider.catalog();
+        (provider, models, ids)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    drop_blocking(provider);
+
+    let models = models.expect_err("an over-bound listing denies the rich catalogue");
+    let ids = ids.expect_err("the id-only surface denies the same payload");
+    let (
+        ProviderError::StreamViolation {
+            connection: models_connection,
+            reason: models_reason,
+        },
+        ProviderError::StreamViolation {
+            connection: ids_connection,
+            reason: ids_reason,
+        },
+    ) = (&models, &ids)
+    else {
+        panic!("both surfaces land the payload violation: {models:?} / {ids:?}");
+    };
+    assert_eq!(models_connection, ids_connection);
+    assert_eq!(models_reason, ids_reason);
 }
 
 /// The listing reads under the same whole-request deadline: a peer

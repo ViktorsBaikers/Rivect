@@ -22,9 +22,10 @@ use crate::config::{Config, Connection, EffortAssign, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, read_catalog_body,
-    read_chunk, resolve_credential, sse, transport, transport_status, violation, wire_body,
+    CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply,
+    STREAM_CHUNK_BYTES, SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for,
+    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
+    wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -298,19 +299,33 @@ impl OpenAiProvider {
         })
     }
 
-    /// The model catalogue for this connection (HZN-008): `GET
-    /// /models` under the literal id's recorded rule — `openai`
-    /// filters the listing to the recorded Responses-capable sample,
-    /// `abliteration` and `meta` treat the listing as authoritative
-    /// and merge their static source seeds on top — returned in
-    /// deterministic sorted order.
+    /// The model catalogue for this connection (HZN-008): the ids of
+    /// [`catalog_models`](Self::catalog_models) in the same
+    /// deterministic sorted order, from one physical `/models` fetch.
+    ///
+    /// # Errors
+    /// [`Self::catalog_models`]'s typed denials.
+    pub fn catalog(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .catalog_models()?
+            .into_iter()
+            .map(|model| model.id)
+            .collect())
+    }
+
+    /// The rich catalogue (DEC-007): `GET /models` under the literal
+    /// id's recorded rule — `openai` filters the listing to the
+    /// recorded Responses-capable sample, `abliteration` and `meta`
+    /// treat the listing as authoritative and merge their static
+    /// source seeds on top — each id carrying the shared
+    /// [`CatalogModel`], returned in deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
     /// on a failed call or non-success status or an expired whole-call
     /// budget, and [`ProviderError::StreamViolation`] when the payload
     /// does not carry the `data` array the contract requires.
-    pub fn catalog(&self) -> Result<Vec<String>, ProviderError> {
+    pub fn catalog_models(&self) -> Result<Vec<CatalogModel>, ProviderError> {
         // A standalone lookup opens its own whole-call budget — the
         // credential resolution and the wire leg share it, the same
         // bound a send's catalogue leg rides.
@@ -320,7 +335,14 @@ impl OpenAiProvider {
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
-        self.catalog_within(&token, started)
+        Ok(self
+            .catalog_within(&token, started)?
+            .into_iter()
+            .map(|id| CatalogModel {
+                id,
+                ..CatalogModel::default()
+            })
+            .collect())
     }
 
     /// The catalogue leg under the caller's clock and credential —

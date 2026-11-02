@@ -24,6 +24,11 @@ pub mod local;
 pub mod openai;
 pub mod sse;
 
+/// The one catalogue record both dialect owners share (DEC-007):
+/// defined once in the local adapter, re-exported here so the
+/// Responses surface offers the same vocabulary.
+pub use local::{CatalogModel, ModelPrice};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub tool: String,
