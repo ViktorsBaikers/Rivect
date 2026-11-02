@@ -23993,3 +23993,933 @@ async fn minimax_code_cn_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::minimax-code-cn = NOT_RUN"]
 fn provider_installed_minimax_code_cn() {}
+
+// ----- mistral ---------------------------------------------------------------
+
+// The `mistral` connection's proof legs (HZN-008 class B — the
+// env/credential-chain cell): the shared Chat Completions adapter
+// serves the literal id — no copied codec — under its own recorded
+// predicates (DEC-025 row: `Rivect/key → api.mistral.ai/v1` CC). The
+// configured `endpoint` carries the API base verbatim — an empty one
+// resolves the recorded `api.mistral.ai/v1` default under the same
+// absent-override rule the plan classes bind — and a configured
+// `region` is denied: the contract names none. The recorded
+// `requireApiKey` `/models` listing is the whole catalogue — built-in
+// ids are discovered there, the class records no vendored roster (D4),
+// so an empty or failed answer has no floor to fall back to — and the
+// recorded env/credential-chain class resolves through the scoped
+// `SecretRef` seam the same way `groq`'s does (DEC-006): an
+// `env:`/`file:`/plaintext ref is refused at ingress and the traversal
+// itself stays credential-substrate debt. The recorded parameter-naming
+// notes (`random_seed`, `prediction`, `prompt_cache_key`, `safe_prompt`,
+// `prompt_mode`) are contract notes, not adapter fields — no leg builds
+// or asserts them — and an authorization or payment failure surfaces
+// as the typed transport denial.
+
+/// The scoped credential ref the `mistral` connection binds.
+const MISTRAL_REF: &str = "keyring:rivect-test/mistral";
+
+/// Fixture `mistral` key material — never a real credential, only
+/// ever sent to localhost.
+const MISTRAL_KEY: &str = "fixture-mistral-key";
+
+/// The pinned model id the fixed-pin legs carry — a discovered id the
+/// `requireApiKey` listing returns.
+const MISTRAL_MODEL: &str = "mistral-small-latest";
+
+/// One configured `mistral` connection pointing at the fixture peer:
+/// the env/credential-chain class resolves a scoped `SecretRef`
+/// (DEC-006/DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn mistral_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{MISTRAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"mistral\", model_id = \"{MISTRAL_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn mistral_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(MISTRAL_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "mistral".to_string(), store.clone())
+        .expect("the shared adapter builds for the mistral id");
+    (provider, store)
+}
+
+/// The `mistral` provider over the recorded enrolled key.
+fn enrolled_mistral_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    mistral_provider(config, MISTRAL_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::mistral ---------------------------------------------
+
+/// A configured `mistral` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the scoped chain's material rides the `Authorization`
+/// header — never the body — and the shared adapter posts exactly the
+/// frozen manifest as a `chat/completions` request — the pinned model
+/// id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt
+/// never re-sends.
+#[tokio::test]
+async fn mistral_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified mistral outcome",
+            Some(json!({"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&mistral_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/mistral", "goal: prove the wire")
+        .expect("the mistral pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/mistral", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified mistral outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MISTRAL_KEY}"),
+        "the scoped chain's material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(MISTRAL_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], MISTRAL_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "mistral");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            total_tokens: 12,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/mistral", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `mistral`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are both
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn mistral_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_mistral_provider(&config),
+        &config,
+        "/world/mistral",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/mistral", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_mistral_provider(&config),
+        &config,
+        "/world/mistral",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/mistral", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::mistral ------------------------------------------
+
+/// The configured-or-recorded base resolves under the plan classes'
+/// absent-override rule: the required `endpoint` field's empty string
+/// resolves the recorded `https://api.mistral.ai/v1` default, and a
+/// configured base wins verbatim, trailing slashes trimmed. Offline
+/// pin: the adapter's `Debug` surface reports the resolved endpoint,
+/// so both arms are proved without one byte toward any host.
+#[test]
+fn mistral_discriminates_the_recorded_default_base() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&mistral_config(endpoint)).expect("an empty endpoint is valid");
+        let provider = provider_result(
+            config,
+            "mistral".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds");
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.mistral.ai/v1\""),
+            "endpoint {endpoint:?} resolved the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    // a configured base wins verbatim — trailing slashes are the only
+    // normalization, never a default substitution
+    let config = Config::parse_validated(&mistral_config("http://127.0.0.1:9931/cloud/v1//"))
+        .expect("a configured base is valid");
+    let provider = provider_result(
+        config,
+        "mistral".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the adapter builds");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"http://127.0.0.1:9931/cloud/v1\""),
+        "the configured base rides verbatim: {debug}"
+    );
+    assert!(
+        !debug.contains("api.mistral.ai"),
+        "the recorded default never overrides a configured base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// The recorded `requireApiKey` listing is the whole catalogue for
+/// `mistral` (HZN-008 class B): the lookup resolves the scoped
+/// material and sends one `GET {endpoint}/models` under the bearer —
+/// an absent scope denies `CredentialAbsent` before any request — a
+/// listed id is offered ids-only, an empty `data` answer offers
+/// nothing (no built-in roster is vendored, D4, so no empty fallback
+/// exists), a failed status keeps the typed denial rather than
+/// inventing a floor, and a `/models` HTTP 200 confers no entitlement.
+#[tokio::test]
+async fn mistral_authoritative_listing_requires_material() {
+    // the keyed listing answers under the resolved bearer — listed
+    // ids are the offers, an empty id names nothing
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": MISTRAL_MODEL}),
+            json!({"id": "codestral-latest"}),
+            json!({"id": ""}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        ["codestral-latest", MISTRAL_MODEL],
+        "the listing's ids alone are the offers — no vendored roster joins them"
+    );
+    for model in &models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "a listed id carries no invented surface"
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyed listing is the one leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MISTRAL_KEY}"),
+        "the listing requires the resolved material"
+    );
+
+    // an empty `data` answer is a real answer with no offers — the
+    // record names no vendored roster, so no fallback fills it
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("an empty listing still answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        model_ids(&models)
+    );
+
+    // an absent scope denies before any request — the listing
+    // requires the material, never a keyless or empty-catalogue form
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, denied) = catalog_on_thread(
+        provider_result(
+            config,
+            "mistral".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+    );
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "the requireApiKey listing denies keyless: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial opened no wire leg"
+    );
+
+    // a `/models` HTTP 200 confers no entitlement (INV-010): the same
+    // listing answer never releases a send — the keyless form denies
+    // `CredentialAbsent` before the wire, and the keyed pin meets the
+    // unmounted request leg's typed transport denial
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, denied) = send_on_thread(
+        provider_result(
+            config.clone(),
+            "mistral".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+        prepared_manifest(&config),
+    );
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "a 200 listing never stands in for the material: {denied:?}"
+    );
+    drop_blocking(provider);
+
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "mistral");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the send's own request leg is the only egress — the 200 listing adds nothing"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+
+    // a refused listing — the recorded authorization/payment failure —
+    // keeps the typed denial; no floor substitutes an answer
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, denied) = catalog_on_thread(provider);
+    let err = denied.expect_err("a refused listing is the typed denial, never a floor");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the authorization denial is transport: {err}")
+    };
+    assert_eq!(connection, "mistral");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the peer's status is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, MISTRAL_KEY.as_bytes());
+    drop_blocking(provider);
+}
+
+/// The auto pick rides the authoritative listing under the record's
+/// auto semantic: the dispatch narrows the pool to the `mistral`
+/// member, the listing is the whole catalogue — no vendored roster
+/// merges (D4) — and the sorted-first listed id names the wire model
+/// verbatim, in the inverted order the peer answered.
+#[tokio::test]
+async fn mistral_auto_pick_resolves_through_the_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "zz-listed-late"}),
+            json!({"id": "aa-listed-first"}),
+        ],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"{MISTRAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"mistral\"] }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/mistral", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/mistral", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("aa-listed-first"),
+        "the sorted-first listed id names the wire model verbatim"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::mistral ----------------------------------------------
+
+/// The recorded env/credential-chain class resolves through the
+/// scoped `SecretRef` seam and never through an env, file or
+/// plaintext spelling (DEC-006): an `env:`, `file:`-spelled or
+/// bare-token `credential_ref` is refused at config ingress — the
+/// typed store/refusal that never echoes the value — and on a
+/// connection that binds both the connection ref and a profile,
+/// DEC-013 precedence sends the profile's scoped material — the
+/// connection-scope key never bears the wire.
+#[tokio::test]
+async fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
+    // the recorded env spelling names no admitted store class — nor
+    // does a file indirection or a bare token
+    for (spelling, store) in [
+        ("env:MISTRAL_API_KEY", "env"),
+        ("file:rivect/mistral-key", "file"),
+    ] {
+        let refused = mistral_config("http://127.0.0.1:1/v1").replace(
+            &format!("credential_ref = \"{MISTRAL_REF}\""),
+            &format!("credential_ref = \"{spelling}\""),
+        );
+        let Err(error) = Config::parse_validated(&refused) else {
+            panic!("a {spelling} credential reference is refused at ingress")
+        };
+        assert!(
+            matches!(
+                &error.issue,
+                ConfigIssue::UnsupportedCredentialStore { store: refused }
+                    if refused.as_str() == store
+            ),
+            "the refusal names the refused store class: {error}"
+        );
+        assert!(
+            !error.to_string().contains(spelling),
+            "the refusal never echoes the credential value: {error}"
+        );
+    }
+    let bare = mistral_config("http://127.0.0.1:1/v1").replace(
+        &format!("credential_ref = \"{MISTRAL_REF}\""),
+        "credential_ref = \"fixture-mistral-plaintext\"",
+    );
+    let Err(error) = Config::parse_validated(&bare) else {
+        panic!("a bare credential token is refused at ingress")
+    };
+    assert!(
+        matches!(&error.issue, ConfigIssue::SecretRefExpected { .. }),
+        "the bare token is the scoped-ref refusal, not material: {error}"
+    );
+
+    // a profile-bound ref is the same ingress — an env or file
+    // spelling under `profiles.<name>.credential_ref` is refused typed
+    // identically, never resolved through the profile seam
+    for (spelling, store) in [
+        ("env:MISTRAL_API_KEY", "env"),
+        ("file:rivect/mistral-key", "file"),
+    ] {
+        let refused = mistral_config("http://127.0.0.1:1/v1").replace(
+            "[models.defaults]",
+            &format!(
+                "[profiles.mistral-chain]\ncredential_ref = \"{spelling}\"\n[models.defaults]"
+            ),
+        );
+        let Err(error) = Config::parse_validated(&refused) else {
+            panic!("a {spelling} profile credential reference is refused at ingress")
+        };
+        assert!(
+            matches!(
+                &error.issue,
+                ConfigIssue::UnsupportedCredentialStore { store: refused }
+                    if refused.as_str() == store
+            ),
+            "the profile refusal names the refused store class: {error}"
+        );
+        assert!(
+            !error.to_string().contains(spelling),
+            "the refusal never echoes the credential value: {error}"
+        );
+    }
+
+    // a stored profile binding wins over the connection's own ref —
+    // the chain resolves scoped store material, not an env lookup
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "chained",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"{base}\"\ncredential_ref = \"keyring:rivect-test/mistral-connection\"\nprofile = \"mistral-chain\"\n\
+         [profiles.mistral-chain]\ncredential_ref = \"keyring:rivect-test/mistral-chain\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"mistral\", model_id = \"{MISTRAL_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[
+            (
+                "keyring:rivect-test/mistral-connection",
+                "fixture-connection-scope",
+            ),
+            ("keyring:rivect-test/mistral-chain", MISTRAL_KEY),
+        ],
+    ));
+    let provider = provider_result(config.clone(), "mistral".to_string(), store.clone())
+        .expect("the chained binding resolves");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the profile-bound credential admits the send");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MISTRAL_KEY}"),
+        "the profile's scoped material bears the wire"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains("fixture-connection-scope"),
+        "the connection-scope material never reaches the wire"
+    );
+}
+
+/// Wrong credential/profile/region never produce a false success for
+/// `mistral`, through the same shared construction its siblings use:
+/// a configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused key — the recorded
+/// authorization/payment failure — lands the typed transport denial
+/// carrying the peer's status alone — no error, nor the offered
+/// credential material or the peer's body, reaches Display or Debug.
+#[tokio::test]
+async fn mistral_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &mistral_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "mistral".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, MISTRAL_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "mistral");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, MISTRAL_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"mistral\", model_id = \"{MISTRAL_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "mistral".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, MISTRAL_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, MISTRAL_KEY.as_bytes());
+
+    // a refused key is a typed transport denial — the recorded
+    // authorization/payment failure: the wire never coerces a wrong
+    // credential into success, the peer's body never enters the
+    // error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, "mistral");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, MISTRAL_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MISTRAL_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::mistral -------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can never
+/// be a bearer token — denies `CredentialMalformed` on the first send,
+/// and enrolling the recorded key at the same scope admits the retry
+/// with that bearer. The retry is the same credential at the same
+/// scope — no key class is substituted — no state is wedged and no
+/// plaintext path is taken.
+#[tokio::test]
+async fn mistral_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(MISTRAL_REF, &[0xff, 0xfe]);
+    let provider = provider_result(config.clone(), "mistral".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(MISTRAL_REF, MISTRAL_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the recorded key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MISTRAL_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `mistral`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside
+/// this run, and INSTALLED reports NOT_RUN — an omitted leg fails the
+/// suite rather than silently absenting.
+#[tokio::test]
+async fn mistral_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": MISTRAL_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&mistral_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the keyed listing answers the discovered ids under one
+    // `/models` leg bearing the scoped material.
+    let (provider, _store) = enrolled_mistral_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    let discovery = server.received_requests().await.expect("recorded");
+    reported.insert(
+        "CATALOG",
+        if listed.iter().any(|model| model.id == MISTRAL_MODEL)
+            && discovery.len() == 1
+            && discovery[0].url.path() == "/v1/models"
+            && received_auth(&discovery[0]) == format!("Bearer {MISTRAL_KEY}")
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "mistral".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_mistral_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/mistral", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/mistral", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "mistral".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    store.enroll(MISTRAL_REF, MISTRAL_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_mistral`
+    // case's status, as its sibling matrices do: the ignored count is
+    // the explicit NOT_RUN signal, and this literal keeps that row
+    // visible inside the executed set.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::mistral ------------------------------------------
+
+/// TP-PROVIDER-INSTALLED::mistral = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::mistral = NOT_RUN"]
+fn provider_installed_mistral() {}

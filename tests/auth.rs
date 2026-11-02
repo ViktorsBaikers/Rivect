@@ -3364,3 +3364,126 @@ fn minimax_code_cn_api_key_binding_resolves_through_scoped_secret_ref() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- env/credential chain class: mistral ------------------------------------
+
+/// The env/credential-chain class leg (AC-040f), exercised on a
+/// `mistral` fixture (DEC-006): the recorded class resolves through
+/// the scoped `SecretRef` seam — this build admits no env, file or
+/// plaintext store kind, so an `env:`, `file:`-spelled or bare-token
+/// `credential_ref` is the typed ingress refusal and never a
+/// plaintext or env resolution path; traversal itself stays
+/// credential-substrate debt (D4). The stored binding resolves
+/// through the scoped `SecretRef`/DEC-013 precedence — the
+/// connection's own `credential_ref`, and a bound profile's ref where
+/// the scope's trailing segment names that profile — an undeclared id
+/// keeps the typed denial, a resolved binding admits the pin offline,
+/// and a divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The per-ID
+/// `mistral` credential/profile/region and listing proof is the
+/// provider target's `mistral_*` section; this case exercises the
+/// class seam.
+#[test]
+fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"https://api.mistral.ai/v1\"\ncredential_ref = \"keyring:rivect-test/mistral-direct\"\n\
+         [connections.mistral-profiled]\nkind = \"api_key\"\nendpoint = \"https://api.mistral.ai/v1\"\ncredential_ref = \"keyring:rivect-test/mistral-scope\"\nprofile = \"mistral-team\"\n\
+         [profiles.mistral-team]\ncredential_ref = \"keyring:rivect-test/mistral-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    // the recorded env spelling names no admitted store class — nor
+    // does a file indirection; both are the typed store refusal
+    for (spelling, store) in [
+        ("env:MISTRAL_API_KEY", "env"),
+        ("file:rivect/mistral-key", "file"),
+    ] {
+        let refused = toml.replace("keyring:rivect-test/mistral-direct", spelling);
+        let Err(error) = Config::parse_validated(&refused) else {
+            panic!("a {spelling} credential reference is refused at ingress")
+        };
+        assert!(
+            matches!(
+                &error.issue,
+                ConfigIssue::UnsupportedCredentialStore { store: refused } if refused.as_str() == store
+            ),
+            "the refusal names the refused store class: {error}"
+        );
+        assert!(
+            !error.to_string().contains(spelling),
+            "the refusal never echoes the credential value: {error}"
+        );
+    }
+    // a bare token is not a store:scope reference — the same typed
+    // refusal, never a plaintext credential path
+    let bare = toml.replace(
+        "keyring:rivect-test/mistral-direct",
+        "fixture-mistral-plaintext",
+    );
+    let Err(error) = Config::parse_validated(&bare) else {
+        panic!("a bare credential token is refused at ingress")
+    };
+    assert!(
+        matches!(&error.issue, ConfigIssue::SecretRefExpected { .. }),
+        "the bare token is the scoped-ref refusal, not material: {error}"
+    );
+    assert!(
+        !error.to_string().contains("fixture-mistral-plaintext"),
+        "the refusal never echoes the credential value: {error}"
+    );
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "mistral")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/mistral-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "mistral-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/mistral-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "mistral",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "mistral-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/mistral-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "mistral-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

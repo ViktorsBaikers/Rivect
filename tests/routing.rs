@@ -5463,3 +5463,107 @@ fn minimax_code_cn_offline_eligibility_is_binding_level_typed() {
         "only the resolvable binding is the plan-key form"
     );
 }
+
+/// `mistral` is a served Chat-Completions id under the recorded
+/// env/credential-chain class (DEC-006): the dialect map routes the
+/// literal id, and the pin is offline-eligible at the binding level
+/// through a profile-bound scoped ref — the same `SecretRef` seam the
+/// api-key class binds, traversal staying credential-substrate debt —
+/// while an undeclared id or a declared-but-unresolvable binding is
+/// the typed denial, never a dispatch.
+#[test]
+fn mistral_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"https://api.mistral.ai/v1\"\ncredential_ref = \"keyring:rivect/mistral-scope\"\nprofile = \"mistral-team\"\n\
+         [profiles.mistral-team]\ncredential_ref = \"keyring:rivect/mistral-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"mistral\", model_id = \"mistral-small-latest\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("mistral"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    // the profile-bound scoped chain is usable without a separate live
+    // grant — eligibility reads the binding, never the store
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "mistral".to_string(),
+        model_id: "mistral-small-latest".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a profile-bound credential chain is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "mistral",
+    ));
+
+    // a fixed pin on an undeclared id is the typed unknown-connection
+    // denial at eligibility, before any ranking or send
+    let undeclared = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"local\", model_id = \"x\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert!(!rivect::providers::offline_usable(
+        &undeclared.connections,
+        &undeclared.profiles,
+        "mistral-missing",
+    ));
+    let missing = ModelAssign::Fixed(FixedModel {
+        connection: "mistral-missing".to_string(),
+        model_id: "x".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &missing,
+                &undeclared.connections,
+                &undeclared.profiles,
+            ),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+
+    // a declared binding whose profile ref disagrees with the
+    // connection's scope is the typed live-grant denial: the scoped
+    // chain binds the *declared* ref, never a mismatched one — and
+    // this class requires `credential_ref` at admission, so a declared
+    // row can never bind absent
+    let mismatched = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.mistral]\nkind = \"api_key\"\nendpoint = \"https://api.mistral.ai/v1\"\ncredential_ref = \"keyring:rivect/mistral-scope\"\nprofile = \"mistral-team\"\n\
+         [profiles.mistral-team]\ncredential_ref = \"keyring:rivect/other\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"mistral\", model_id = \"mistral-small-latest\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &mismatched.connections,
+                &mismatched.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &mismatched.connections,
+            &mismatched.profiles,
+            "mistral",
+        ),
+        "only the resolvable binding is the env-chain form"
+    );
+}

@@ -1,8 +1,8 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
-//! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`
-//! and `minimax-code`/`minimax-code-cn`
+//! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
+//! `minimax-code`/`minimax-code-cn` and `mistral`
 //! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -103,7 +103,15 @@
 //! URL is a recorded divergence, never substituted (EDGE-007) —
 //! neither class records a discovery leg: no `/models` call and no
 //! vendored roster, so the catalogue opens no wire leg and the
-//! manual model path is the only served route — resolved per literal
+//! manual model path is the only served route — and the
+//! configured-or-recorded `api.mistral.ai/v1` base of `mistral`,
+//! whose recorded `requireApiKey` `/models` listing is the whole
+//! catalogue — no vendored roster exists (D4), so an empty or failed
+//! answer has no floor to fall back to — and whose recorded
+//! env/credential-chain class resolves through the scoped `SecretRef`
+//! seam the same way `groq`'s does: an `env:`/`file:`/plaintext ref
+//! is refused at ingress, traversal stays substrate debt (DEC-006) —
+//! resolved per literal
 //! id by the contract table, never inherited
 //! across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
@@ -746,6 +754,15 @@ const MINIMAX_CODE_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 /// recorded divergence, never substituted (EDGE-007/DEC-007).
 const MINIMAX_CODE_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 
+/// The recorded `mistral` endpoint — the `api.mistral.ai/v1` host the
+/// DEC-025 row's `Rivect/key → api.mistral.ai/v1` binding names: the
+/// API root the required `endpoint` field's empty string resolves
+/// under, under the same absent-override rule the plan classes bind.
+/// The env/credential-chain login's env traversal stays credential-
+/// substrate debt (DEC-006/D4): the band carries the scoped `SecretRef`
+/// seam alone and this constant carries the base alone.
+const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -1329,6 +1346,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(MINIMAX_CODE_CN_BASE_URL),
             catalog: CatalogRule::Allowlist(&[]),
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
+        // `mistral` (HZN-008 class B — the env/credential-chain cell,
+        // DEC-006): the configured-or-recorded `api.mistral.ai/v1`
+        // base, and the recorded `requireApiKey` `/models` listing is
+        // the whole catalogue — built-in ids are discovered there, and
+        // no vendored roster exists (D4), so an empty or failed answer
+        // has no floor to fall back to and keeps the leg's typed
+        // denial. The recorded env class resolves at the scoped
+        // `SecretRef` seam the same way `groq`'s does — the plain
+        // bearer arm carries the stored material, an
+        // `env:`/`file:`/plaintext ref is refused at ingress, and the
+        // traversal itself stays credential-substrate debt (D4). The
+        // recorded parameter-naming notes (`random_seed`,
+        // `prediction`, `prompt_cache_key`, `safe_prompt`,
+        // `prompt_mode`) are contract notes, not adapter fields — no
+        // leg builds or asserts them. Authorization and payment
+        // failures surface as the typed transport denial.
+        "mistral" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(MISTRAL_BASE_URL),
+            catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
