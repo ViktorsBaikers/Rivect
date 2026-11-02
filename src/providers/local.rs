@@ -775,6 +775,13 @@ const LLAMA_CPP_BASE_URL: &str = "http://127.0.0.1:8080";
 /// its own recorded default and neither borrows the other's (EDGE-006).
 const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
+/// The recorded bound on the `lm-studio` native metadata probe
+/// (`LM_STUDIO_NATIVE_METADATA_TIMEOUT_MS = 250` at commit
+/// `0133f7ff52d3859944b4fd4ccf3852df7fbf1b54`): the probe runs beside
+/// the `/models` listing under this bound clipped to the whole call's
+/// remainder, and a spent bound leaves the listing's offers untouched.
+const LM_STUDIO_NATIVE_METADATA_BUDGET: Duration = Duration::from_millis(250);
+
 /// The recorded `minimax-code` international endpoint — the
 /// `api.minimax.io/v1` host the DEC-025 row's `ключ подписки →
 /// api.minimax.io/v1` binding names: the API root the required
@@ -1111,6 +1118,16 @@ enum EntryRule {
     /// fall-through yields is the OpenAI-compatible listing form, so it
     /// carries its id alone — the metadata leg is the rich source.
     LiteLlm,
+    /// The `lm-studio` arm: the listed id is the OpenAI-compatible
+    /// listing form offered id-only, and the class records one extra
+    /// catalogue source beside that listing — its native loaded-context
+    /// probe (`GET {native base}/api/v0/models`, the configured base
+    /// without its `/v1` segment) —
+    /// [`ChatCompletionsProvider::lm_studio_catalog`] starts in
+    /// parallel and overlays on the ids the listing already offers.
+    /// The listing stays authoritative: a row the probe alone names
+    /// adds nothing.
+    LmStudio,
     /// The `moonshot` arm: the `requireApiKey` `/models` listing's
     /// rows are offered id-only — the recorded price/roster metadata
     /// has no vendored carrier (D6) — while the arm's live duty is
@@ -1422,10 +1439,11 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // (EDGE-006). The catalogue is that base's own `/models`
         // listing under ids-only offers, so a listing answer proves no
         // paid access; the recorded loaded-context metadata rides the
-        // native `/api/v0/models` probe, and this band builds no
-        // native-endpoint seam to fetch it, so it is neither read nor
-        // synthesized (D9), and no discovery or base-URL merging is
-        // built beyond the listing leg (D8: the recorded extra
+        // native `/api/v0/models` probe started beside that listing —
+        // an advisory overlay that marks vision and fills the window
+        // for ids the listing already offers, never a catalogue a probe
+        // can deny or widen (D9) — and no discovery or base-URL merging
+        // is built beyond the listing leg (D8: the recorded extra
         // `/v1/responses` path is a different connection class and
         // stays unbuilt). The local class records no account
         // or org predicate — no shared external account exists — so
@@ -1439,7 +1457,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             endpoint: EndpointRule::PlanBaseOrDefault(LM_STUDIO_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::OpenProxy,
-            entries: EntryRule::IdsOnly,
+            entries: EntryRule::LmStudio,
         }),
         // `minimax-code` (HZN-008 class P — the plan-key cell): the
         // configured-or-recorded `api.minimax.io/v1` international base,
@@ -1704,6 +1722,15 @@ enum MetadataPhase {
     Served(Vec<CatalogModel>),
     /// The recorded fall-through to the `/models` listing.
     FallThrough,
+}
+
+/// One `lm-studio` native row's loaded-context surface: whether the
+/// row is image-capable — a `vlm` type or a `vision`/`image`
+/// capability — and the positive context window the runtime reports
+/// for the id.
+struct LmStudioNativeModel {
+    vision: bool,
+    context_window: Option<u64>,
 }
 
 /// The stated price a catalogued model carries (HZN-008): the literal
@@ -2039,7 +2066,10 @@ impl ChatCompletionsProvider {
     /// credential — a send passes its own `started` so the lookup
     /// spends the same whole-request budget instead of opening a
     /// second, unaccounted one, and the recorded keyless discovery
-    /// passes `None` when no material resolves.
+    /// passes `None` when no material resolves. `lm-studio`'s leg also
+    /// runs the class's native loaded-context probe beside the listing
+    /// ([`Self::lm_studio_catalog`]); every other class answers the
+    /// listing alone.
     fn catalog_within(
         &self,
         secret: Option<&WireSecret>,
@@ -2063,6 +2093,122 @@ impl ChatCompletionsProvider {
         // phase spent is the typed deadline, never a post on an expired
         // clock.
         check_deadline(&self.connection, self.deadline, started)?;
+        // `lm-studio` records one extra catalogue source beside the
+        // listing — its native loaded-context probe — so its leg runs
+        // on the class's own path; every other class answers the
+        // listing alone.
+        if matches!(self.contract.entries, EntryRule::LmStudio) {
+            return self.lm_studio_catalog(secret, started);
+        }
+        self.listing_catalog(secret, started)
+    }
+
+    /// The `lm-studio` catalogue leg: the configured base's `/models`
+    /// listing with the class's native loaded-context probe
+    /// (`GET {native base}/api/v0/models`, the configured base without
+    /// its `/v1` segment) started in parallel, and the probe's
+    /// marks overlaid on the ids the listing already offers. The probe
+    /// spends at most [`LM_STUDIO_NATIVE_METADATA_BUDGET`], clipped to
+    /// the whole call's remainder, and it is advisory: a refused,
+    /// unreadable, failed or timed-out answer leaves the listing's
+    /// offers untouched, so it never denies a listing it could not read
+    /// and never invents an offer. The listing stays authoritative — an
+    /// id only the probe names gets nothing.
+    fn lm_studio_catalog(
+        &self,
+        secret: Option<&WireSecret>,
+        started: Instant,
+    ) -> Result<Vec<CatalogModel>, ProviderError> {
+        let budget = self
+            .deadline
+            .checked_sub(started.elapsed())
+            .map(|left| left.min(LM_STUDIO_NATIVE_METADATA_BUDGET))
+            .filter(|left| !left.is_zero());
+        let (listed, native) = std::thread::scope(|scope| {
+            // The probe overlaps the listing instead of serializing
+            // behind it, so the class pays one round trip, not two.
+            let probe = budget
+                .map(|budget| scope.spawn(move || self.lm_studio_native_metadata(secret, budget)));
+            let listed = self.listing_catalog(secret, started);
+            // A probe thread that panicked is the same advisory miss as
+            // a failed answer — never a catalogue failure.
+            let native = probe.and_then(|handle| handle.join().unwrap_or_default());
+            (listed, native)
+        });
+        let mut models = listed?;
+        if let Some(native) = native {
+            for model in &mut models {
+                let Some(metadata) = native.get(&model.id) else {
+                    continue;
+                };
+                model.vision |= metadata.vision;
+                if let Some(window) = metadata.context_window {
+                    model.context_window = Some(window);
+                }
+            }
+        }
+        // The probe runs inside the same clock as every other leg: an
+        // answer that completes past the whole-call budget is the typed
+        // deadline, never a late catalogue.
+        check_deadline(&self.connection, self.deadline, started)?;
+        Ok(models)
+    }
+
+    /// The class's recorded native loaded-context probe
+    /// (`fetchLmStudioNativeModelMetadata`): `GET {native
+    /// base}/api/v0/models` — the configured base trimmed of its `/v1`
+    /// segment — under [`LM_STUDIO_NATIVE_METADATA_BUDGET`], keyed by
+    /// the model id it names. Every miss answers `None` — this is the
+    /// declared advisory fallback over the listing, so a non-2xx
+    /// status, a transport failure, a spent bound or a payload outside
+    /// the recorded shape contributes no mark and never a catalogue
+    /// denial. The bearer rides only when the connection resolved
+    /// material; the keyless local mode probes headerless.
+    fn lm_studio_native_metadata(
+        &self,
+        secret: Option<&WireSecret>,
+        budget: Duration,
+    ) -> Option<HashMap<String, LmStudioNativeModel>> {
+        let started = Instant::now();
+        let mut request = self
+            .client
+            .get(format!(
+                "{}/api/v0/models",
+                lm_studio_native_base(&self.endpoint)
+            ))
+            .timeout(budget)
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(secret) = secret {
+            request = request.bearer_auth(&secret.bearer);
+        }
+        let Ok(mut response) = request.send() else {
+            return None;
+        };
+        if !response.status().is_success() {
+            return None;
+        }
+        let Ok(body) = read_catalog_body(&self.connection, budget, &mut response, started) else {
+            return None;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+            return None;
+        };
+        lm_studio_native_models(&payload)
+    }
+
+    /// The `/models` listing leg under the literal id's recorded
+    /// contract: every `data[]` id with a non-whitespace body under its
+    /// per-entry transform, the recorded floor unioned on top as the
+    /// offer floor, and the union in deterministic sorted order. As in
+    /// [`Self::catalog_within`], a seeded or keyless-floor class answers
+    /// its floor instead of denying on a failed or unparseable listing,
+    /// a seedless class keeps the typed denial, and a spent whole-call
+    /// budget is never converted into the floor ([`Self::floor_or`]).
+    fn listing_catalog(
+        &self,
+        secret: Option<&WireSecret>,
+        started: Instant,
+    ) -> Result<Vec<CatalogModel>, ProviderError> {
         let request =
             WireSecret::attach(self.client.get(format!("{}/models", self.endpoint)), secret);
         let mut response = match request.send() {
@@ -2138,6 +2284,7 @@ impl ChatCompletionsProvider {
                 | EntryRule::Firepass
                 | EntryRule::HuggingFace
                 | EntryRule::LiteLlm
+                | EntryRule::LmStudio
                 | EntryRule::Moonshot
                 | EntryRule::NanoGpt
                 | EntryRule::Novita => Some(CatalogModel {
@@ -2362,6 +2509,13 @@ impl ChatCompletionsProvider {
             // `/models` row the recorded fall-through yields is the
             // OpenAI-compatible listing form and names its id alone.
             EntryRule::LiteLlm => Some(CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+            // This class's richer source is its native metadata probe,
+            // run beside this fall-through listing; a listed id is
+            // still offered exactly as served.
+            EntryRule::LmStudio => Some(CatalogModel {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
@@ -2697,6 +2851,7 @@ impl ChatCompletionsProvider {
             | EntryRule::Groq
             | EntryRule::HuggingFace
             | EntryRule::LiteLlm
+            | EntryRule::LmStudio
             | EntryRule::Moonshot
             | EntryRule::NanoGpt
             | EntryRule::Novita => model_id.to_string(),
@@ -2780,6 +2935,7 @@ impl ChatCompletionsProvider {
             | EntryRule::Fireworks
             | EntryRule::HuggingFace
             | EntryRule::LiteLlm
+            | EntryRule::LmStudio
             | EntryRule::NanoGpt
             | EntryRule::Novita => return Ok(()),
         };
@@ -3986,6 +4142,72 @@ fn mark_nanogpt_thinking_bases(data: &[Value], models: &mut [CatalogModel]) {
             model.reasoning = true;
         }
     }
+}
+
+/// The recorded `lm-studio` native base
+/// (`toLmStudioNativeBaseUrl`): the configured base trimmed of
+/// surrounding whitespace, one trailing `/`, then a trailing `/v1` —
+/// the runtime's native API root the probe appends its own
+/// `/api/v0/models` path to.
+fn lm_studio_native_base(base: &str) -> String {
+    let trimmed = base.trim();
+    let normalized = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    normalized
+        .strip_suffix("/v1")
+        .unwrap_or(normalized)
+        .to_string()
+}
+
+/// The recorded `lm-studio` native payload (`/api/v0/models`) keyed by
+/// model id: a `vlm` type or a `vision`/`image` capability marks the
+/// row image-capable, and the window is the loaded length of a loaded
+/// model, else the max, train or model-len length in the recorded
+/// order. A row naming no id is skipped; a payload without a `data`
+/// array is outside the recorded shape and contributes no mark.
+fn lm_studio_native_models(payload: &Value) -> Option<HashMap<String, LmStudioNativeModel>> {
+    let entries = payload.get("data")?.as_array()?;
+    let mut models = HashMap::new();
+    for entry in entries {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let model_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        let vision = model_type == "vlm"
+            || entry
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| {
+                        capability.as_str().is_some_and(|capability| {
+                            matches!(capability.to_lowercase().as_str(), "vision" | "image")
+                        })
+                    })
+                });
+        let loaded = if entry.get("state").and_then(Value::as_str) == Some("loaded") {
+            positive_count(entry.get("loaded_context_length"))
+        } else {
+            None
+        };
+        let context_window = loaded
+            .or_else(|| positive_count(entry.get("max_context_length")))
+            .or_else(|| positive_count(entry.get("context_length")))
+            .or_else(|| positive_count(entry.get("max_model_len")));
+        models.insert(
+            id.to_string(),
+            LmStudioNativeModel {
+                vision,
+                context_window,
+            },
+        );
+    }
+    Some(models)
 }
 
 /// The recorded `novita` entry filter (`novitaModelManagerOptions`'s

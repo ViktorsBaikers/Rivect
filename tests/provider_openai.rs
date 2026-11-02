@@ -4138,9 +4138,8 @@ const META_MODEL: &str = "muse-spark-1.3";
 
 /// The recorded static Muse roster the `meta` catalogue merges as the
 /// offer floor, in the sorted order the adapter returns.
-const META_FLOOR: [&str; 6] = [
+const META_FLOOR: [&str; 5] = [
     "muse-spark-1.1",
-    "muse-spark-1.1-contributor",
     "muse-spark-1.2",
     "muse-spark-1.2-contributor",
     "muse-spark-1.3",

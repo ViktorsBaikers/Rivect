@@ -65,15 +65,16 @@ const ABLITERATION_MODELS: &[&str] = &[
 /// The recorded static Muse roster of `meta` model ids (HZN-008,
 /// `META_MUSE_STATIC_MODELS`): the merge floor the catalogue unions
 /// over the authoritative `/models` listing — a rostered id offers
-/// even when the listing omits it. Both tiers ride verbatim: the
-/// `-contributor` SKUs are the recorded training-eligible variants,
-/// and the Standard-or-Contributor payment predicate is stated by
-/// the id itself, never chosen silently by omitting either half. The
+/// even when the listing omits it. The recorded tiers ride verbatim:
+/// `muse-spark-1.1` ships as the standard SKU only, while
+/// `muse-spark-1.2` and `muse-spark-1.3` each carry both the
+/// standard and the `-contributor` training-eligible variant, and
+/// the Standard-or-Contributor payment predicate is stated by the
+/// id itself, never chosen silently by omitting either half. The
 /// record names an excluded-id filter but never its contents, so no
 /// exclusion is applied here.
 const META_MUSE_MODELS: &[&str] = &[
     "muse-spark-1.1",
-    "muse-spark-1.1-contributor",
     "muse-spark-1.2",
     "muse-spark-1.2-contributor",
     "muse-spark-1.3",
