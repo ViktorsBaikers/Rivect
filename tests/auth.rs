@@ -26,8 +26,8 @@ mod support;
 use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
 use rivect::model::{InputOrigin, RequestManifest};
 use rivect::providers::{
-    CredentialStore, FlightedStore, KeyringBackend, ProviderError, SecretRef, SecretRefError,
-    StoreKind, native_store, resolve_credential,
+    CredentialStore, Dialect, FlightedStore, KeyringBackend, ProviderError, SecretRef,
+    SecretRefError, StoreKind, native_store, resolve_credential,
 };
 use serde_json::{Value, json};
 use std::any::Any;
@@ -3729,6 +3729,106 @@ fn novita_api_key_binding_resolves_through_scoped_secret_ref() {
     assert!(
         matches!(
             resolve_credential(&mismatched, "novita-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}
+
+// ----- api-key class: nvidia ---------------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on an `nvidia` fixture:
+/// both recorded credential bindings resolve through the scoped
+/// `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared id keeps the
+/// typed denial, a resolved binding admits the pin offline, and a
+/// divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The recorded
+/// `NVIDIA_API_KEY` env spelling names no admitted store class, so the
+/// name never substitutes a binding, and the recorded login validation
+/// is optional (`optional=#true`) — a `401`/`403` is the hard auth
+/// rejection, any other failure proves neither access nor denial. The
+/// per-ID `nvidia` credential/profile/region proof is the provider
+/// target's
+/// `nvidia_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn nvidia_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.nvidia]\nkind = \"api_key\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\ncredential_ref = \"keyring:rivect-test/nvidia-direct\"\n\
+         [connections.nvidia-profiled]\nkind = \"api_key\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\ncredential_ref = \"keyring:rivect-test/nvidia-scope\"\nprofile = \"nvidia-team\"\n\
+         [profiles.nvidia-team]\ncredential_ref = \"keyring:rivect-test/nvidia-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    assert_eq!(
+        rivect::providers::dialect_for("nvidia"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+
+    let resolved = resolve_credential(&config, "nvidia")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/nvidia-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "nvidia-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/nvidia-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "nvidia",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "nvidia-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // the recorded env spelling names no admitted store class: the
+    // name never substitutes a binding
+    let env_spelled = toml.replace("keyring:rivect-test/nvidia-direct", "env:NVIDIA_API_KEY");
+    let Err(error) = Config::parse_validated(&env_spelled) else {
+        panic!("an env-spelled credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(&error.issue, ConfigIssue::UnsupportedCredentialStore { store } if store == "env"),
+        "the env spelling is refused as an unadmitted store class: {error}"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/nvidia-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "nvidia-profiled"),
             Err(ProviderError::CredentialProfileMismatch { .. })
         ),
         "profile/scope disagreement is CredentialProfileMismatch"

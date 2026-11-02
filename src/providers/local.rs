@@ -2,8 +2,8 @@
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
-//! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt` and
-//! `novita` connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
+//! `novita` and `nvidia` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -145,7 +145,17 @@
 //! row (D6), so an admitted offer keeps [`ModelPrice::Unknown`] —
 //! resolved per literal
 //! id by the contract table, never inherited
-//! across ids. The adapter authors no
+//! across ids. The configured-or-recorded
+//! `integrate.api.nvidia.com/v1` base of `nvidia` follows the same
+//! shape: its recorded `createSimpleOpenAICompletionsOptions`
+//! discovery is the plain keyed `/models` listing as the whole
+//! catalogue — no vendored floor and no entry filter beyond the
+//! recorded simple answer, so every listed `vendor/model` id rides
+//! the catalogue and the wire verbatim — and its recorded login
+//! validation is optional (`optional=#true`): a `401`/`403` from the
+//! validation/model request is the typed hard denial, while any other
+//! non-success proves neither access nor denial and is never reported
+//! as success or as entitlement. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -829,6 +839,16 @@ const NANOGPT_BASE_URL: &str = "https://nano-gpt.com/api/v1";
 /// 1/10,000-USD units, which this class carries no vendored row for
 /// (D6): no price is borrowed from another connection.
 const NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
+
+/// The recorded `nvidia` endpoint — the `integrate.api.nvidia.com/v1`
+/// host the pinned `nvidiaModelManagerOptions` hands to
+/// `createSimpleOpenAICompletionsOptions`: the API root the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The recorded login
+/// validates the key against inference optionally (`optional=#true`):
+/// a `401`/`403` is the hard auth rejection, any other failure proves
+/// neither access nor denial.
+const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -1551,6 +1571,28 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::UnauthenticatedListing(&[]),
             credential: CredentialRule::Bearer,
             entries: EntryRule::Novita,
+        }),
+        // `nvidia` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded base redirects discovery and
+        // streaming alike, and the recorded
+        // `createSimpleOpenAICompletionsOptions` discovery is the
+        // plain keyed `/models` listing — no `filterModel` and no
+        // vendored floor, so every listed id is an offer and a
+        // `vendor/model` namespace rides the catalogue and the wire
+        // verbatim, while an empty or failed answer has no floor to
+        // fall back to. The plain bearer arm carries the stored
+        // material. The recorded login's validation is optional
+        // (`optional=#true`): this adapter constructs no login probe,
+        // so a `401`/`403` from a validation/model request is the
+        // typed hard denial, while any other non-success proves
+        // neither access nor denial — never a success or an
+        // entitlement claim.
+        "nvidia" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(NVIDIA_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
         }),
         _ => None,
     }

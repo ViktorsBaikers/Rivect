@@ -5927,3 +5927,158 @@ fn novita_offline_eligibility_is_binding_level_typed() {
         "the absent binding is the local-endpoint predicate's alone: {error}"
     );
 }
+
+/// `nvidia` is a served Chat-Completions id under the recorded
+/// class-B api-key cell: the dialect map routes the literal id and the
+/// api_key pin is offline-eligible at the binding level — an undeclared
+/// id or a declared-but-unresolvable binding is the typed denial, never
+/// a plaintext or env path (the recorded `NVIDIA_API_KEY` key name
+/// proves no entitlement, and the recorded login validates optionally
+/// against inference, never payment administration). A
+/// `subscription`-kind declaration is the live-grant class, never this
+/// connection's binding (DEC-010).
+#[test]
+fn nvidia_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.nvidia]\nkind = \"api_key\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\ncredential_ref = \"keyring:rivect/nv\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"nvidia\", model_id = \"nvidia/llama-3.1-nemotron-70b-instruct\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("nvidia"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    // a bound api_key pin is usable without a separate live grant —
+    // eligibility reads the binding, never the store
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "nvidia".to_string(),
+        model_id: "nvidia/llama-3.1-nemotron-70b-instruct".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a bound api_key pin is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "nvidia",
+    ));
+
+    // a fixed pin on an undeclared id is the typed unknown-connection
+    // denial at eligibility, before any ranking or send
+    let undeclared = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"local\", model_id = \"x\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert!(!rivect::providers::offline_usable(
+        &undeclared.connections,
+        &undeclared.profiles,
+        "nvidia-missing",
+    ));
+    let missing = ModelAssign::Fixed(FixedModel {
+        connection: "nvidia-missing".to_string(),
+        model_id: "x".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &missing,
+                &undeclared.connections,
+                &undeclared.profiles,
+            ),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+
+    // a declared binding whose profile ref disagrees with the
+    // connection's scope is the typed live-grant denial: the api key
+    // is the *declared* binding, never a mismatched one — and this
+    // class requires `credential_ref` at admission, so a declared row
+    // can never bind absent
+    let mismatched = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.nvidia]\nkind = \"api_key\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\ncredential_ref = \"keyring:rivect/nv-scope\"\nprofile = \"nvidia-team\"\n\
+         [profiles.nvidia-team]\ncredential_ref = \"keyring:rivect/other\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"nvidia\", model_id = \"nvidia/llama-3.1-nemotron-70b-instruct\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &mismatched.connections,
+                &mismatched.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(&mismatched.connections, &mismatched.profiles, "nvidia",),
+        "only the resolvable binding is the api-key form"
+    );
+
+    // the recorded class is the api_key binding: a subscription-kind
+    // declaration stays the live-grant class and is never offline
+    // usable (DEC-010)
+    let subscription = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.nvidia]\nkind = \"subscription\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\ncredential_ref = \"keyring:rivect/nv-plan\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"nvidia\", model_id = \"nvidia/llama-3.1-nemotron-70b-instruct\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a subscription declaration parses");
+    assert!(
+        !rivect::providers::offline_usable(
+            &subscription.connections,
+            &subscription.profiles,
+            "nvidia",
+        ),
+        "a subscription declaration never becomes this api-key binding"
+    );
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &subscription.connections,
+                &subscription.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::Subscription
+            })
+        ),
+        "a subscription declaration is the separate live-grant denial"
+    );
+
+    // an api_key declaration that binds no credential is refused at
+    // admission: the absent-binding predicate names the open proxy and
+    // the local-endpoint class alone (DEC-009), so `nvidia` can never
+    // resolve the keyless form the local ids record
+    let unbound = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.nvidia]\nkind = \"api_key\"\nendpoint = \"https://integrate.api.nvidia.com/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    );
+    let Err(error) = unbound else {
+        panic!("a cloud api_key declaration without a binding is refused at admission")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::CredentialRefRequired {
+                kind: ConnKind::ApiKey
+            }
+        ),
+        "the absent binding is the local-endpoint predicate's alone: {error}"
+    );
+}
