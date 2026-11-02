@@ -2,7 +2,7 @@
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`
-//! and `minimax-code`
+//! and `minimax-code`/`minimax-code-cn`
 //! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -96,11 +96,15 @@
 //! `api.minimax.io/v1` international base of `minimax-code`, whose plan
 //! key rides as the plain bearer — a plan-scoped key is a billing fact
 //! of the connection, never a connection kind and never a PAYG
-//! substitute (DEC-007/DEC-010) — and whose recorded contract names no
-//! discovery leg: the class records no `/models` call and no vendored
-//! roster, so the catalogue opens no wire leg and the manual model
-//! path is the only served route — resolved per literal id by the
-//! contract table, never inherited
+//! substitute (DEC-007/DEC-010) — and `minimax-code-cn`'s own recorded
+//! `api.minimaxi.com/v1` CN base under the same shape — the CN plan's
+//! fixed window vs the international plan's rolling window stays a
+//! billing fact of each enrolled key, and the `minimax.cn` Anthropic
+//! URL is a recorded divergence, never substituted (EDGE-007) —
+//! neither class records a discovery leg: no `/models` call and no
+//! vendored roster, so the catalogue opens no wire leg and the
+//! manual model path is the only served route — resolved per literal
+//! id by the contract table, never inherited
 //! across ids. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -730,6 +734,18 @@ const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 /// `api.minimaxi.com` is a different connection's arm (EDGE-007).
 const MINIMAX_CODE_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 
+/// The recorded `minimax-code-cn` CN endpoint — the
+/// `api.minimaxi.com/v1` host the DEC-025 row's `ключ подписки →
+/// api.minimaxi.com/v1` binding names: the API root the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The CN plan's fixed
+/// window and credits stay account facts of the enrolled key — the
+/// record names no `/models` discovery and no vendored roster, so this
+/// constant carries the base alone; the international sibling's
+/// `api.minimax.io` host and the `minimax.cn` Anthropic URL are a
+/// recorded divergence, never substituted (EDGE-007/DEC-007).
+const MINIMAX_CODE_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -1293,6 +1309,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
+        // `minimax-code-cn` (HZN-008 class P — the CN plan-key cell):
+        // the configured-or-recorded `api.minimaxi.com/v1` CN base —
+        // never the international sibling's `api.minimax.io` host and
+        // never the `minimax.cn` Anthropic URL, a recorded divergence
+        // that stays a divergence (EDGE-007/DEC-007) — and the recorded
+        // contract names no discovery leg — no `/models` call and no
+        // vendored roster — so the catalogue is the recorded fixed
+        // list alone, which this class leaves unrecorded: the lookup
+        // opens no wire leg and resolves no credential, a listing
+        // answer never adds an offer, and the manual model path is the
+        // only served route. The recorded subscription key is a
+        // plan-scoped `api_key` (DEC-010), never
+        // `ConnKind::Subscription`, and the CN plan's fixed window vs
+        // the international plan's rolling window stays a billing fact
+        // of the enrolled key — the plain bearer arm carries no
+        // grammar, so no window or host is ever substituted.
+        "minimax-code-cn" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(MINIMAX_CODE_CN_BASE_URL),
+            catalog: CatalogRule::Allowlist(&[]),
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
         _ => None,
     }
 }
@@ -1365,7 +1404,7 @@ impl SourceContract {
                 // whichever base the connection configures; the empty
                 // string is the absent-override case the recorded
                 // `… ?? defaultBaseUrl` covers with the class's
-                // international endpoint.
+                // recorded endpoint.
                 let trimmed = configured.trim();
                 if trimmed.is_empty() {
                     return default.to_string();

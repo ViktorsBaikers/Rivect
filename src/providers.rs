@@ -1129,8 +1129,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// are its recorded class-A/class-P plugs speaking the same dialect,
 /// with `litellm` the recorded class-B configured-proxy plug and
 /// `llama.cpp`/`lm-studio` the recorded class-B local-endpoint plugs and
-/// `minimax-code` the recorded class-P plan-key plug on that same
-/// dialect (HZN-008) — never inferred from an
+/// `minimax-code`/`minimax-code-cn` the recorded class-P plan-key plugs
+/// on that same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
@@ -1185,6 +1185,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "llama.cpp" => Some(Dialect::ChatCompletions),
         "lm-studio" => Some(Dialect::ChatCompletions),
         "minimax-code" => Some(Dialect::ChatCompletions),
+        "minimax-code-cn" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

@@ -23269,3 +23269,727 @@ async fn minimax_code_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::minimax-code = NOT_RUN"]
 fn provider_installed_minimax_code() {}
+
+// ----- minimax-code-cn ------------------------------------------------------------
+
+// The `minimax-code-cn` connection's proof legs (HZN-008 class P — the
+// CN plan-key cell): the shared Chat Completions adapter serves the
+// literal id — no copied codec — under its own recorded predicates
+// (DEC-025 row: `ключ подписки → api.minimaxi.com/v1` CC). The
+// configured `endpoint` carries the API base verbatim — an empty one
+// resolves the recorded `api.minimaxi.com/v1` CN default under the
+// same absent-override rule the plan classes bind, never the
+// international sibling's `api.minimax.io` host and never the
+// `minimax.cn` Anthropic divergence (EDGE-007/DEC-007) — and a
+// configured `region` is denied: the contract names none. The
+// recorded contract names no discovery leg — no `/models` call and no
+// vendored roster — so the catalogue opens no wire leg, a listing
+// answer never adds an offer, and the manual model path is the only
+// served route. The recorded subscription key is a plan-scoped
+// `api_key` riding as the plain bearer (DEC-010) — never
+// `ConnKind::Subscription` — and the CN plan's fixed window vs the
+// international plan's rolling window stays a billing fact of the
+// enrolled key, never a substituted host or window.
+
+/// The scoped credential ref the `minimax-code-cn` connection binds.
+const MINIMAX_CODE_CN_REF: &str = "keyring:rivect-test/minimax-code-cn";
+
+/// Fixture `minimax-code-cn` key material — never a real credential,
+/// only ever sent to localhost.
+const MINIMAX_CODE_CN_KEY: &str = "fixture-minimax-code-cn-key";
+
+/// The pinned model id the fixed-pin legs carry — the recorded manual
+/// model path, so the pin is whatever the config declares.
+const MINIMAX_CODE_CN_MODEL: &str = "fixture-minimax-cn-model";
+
+/// One configured `minimax-code-cn` connection pointing at the fixture
+/// peer: the api_key auth class resolves a scoped `SecretRef`
+/// (DEC-011), the dialect comes from the literal connection id
+/// (DEC-007), and the endpoint carries the API base verbatim.
+fn minimax_code_cn_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.minimax-code-cn]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{MINIMAX_CODE_CN_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"minimax-code-cn\", model_id = \"{MINIMAX_CODE_CN_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn minimax_code_cn_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(MINIMAX_CODE_CN_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "minimax-code-cn".to_string(), store.clone())
+        .expect("the shared adapter builds for the minimax-code-cn id");
+    (provider, store)
+}
+
+/// The `minimax-code-cn` provider over the recorded enrolled plan key.
+fn enrolled_minimax_code_cn_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    minimax_code_cn_provider(config, MINIMAX_CODE_CN_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::minimax-code-cn ------------------------------------------
+
+/// A configured `minimax-code-cn` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the api_key pin
+/// under DEC-011, the plan key rides the `Authorization` header —
+/// never the body — and the shared adapter posts exactly the frozen
+/// manifest as a `chat/completions` request — the pinned manual model
+/// id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt
+/// never re-sends.
+#[tokio::test]
+async fn minimax_code_cn_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified minimax-code-cn outcome",
+            Some(json!({"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&minimax_code_cn_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_minimax_code_cn_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/minimax-cn", "goal: prove the wire")
+        .expect("the minimax-code-cn pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/minimax-cn", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified minimax-code-cn outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MINIMAX_CODE_CN_KEY}"),
+        "the plan key bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(MINIMAX_CODE_CN_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], MINIMAX_CODE_CN_MODEL,
+        "the manual pin rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "minimax-code-cn");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            total_tokens: 12,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/minimax-cn", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for
+/// `minimax-code-cn`: a stream ended mid `tool_calls` fragment — a
+/// partial call that never executes — and a finish_reason the dialect
+/// cannot classify are both the unknown terminal, and a rejected send
+/// charges nothing.
+#[tokio::test]
+async fn minimax_code_cn_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_minimax_code_cn_provider(&config),
+        &config,
+        "/world/minimax-cn",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/minimax-cn", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_minimax_code_cn_provider(&config),
+        &config,
+        "/world/minimax-cn",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/minimax-cn", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::minimax-code-cn ---------------------------------------
+
+/// The configured-or-recorded base resolves under the plan classes'
+/// absent-override rule: the required `endpoint` field's empty string
+/// resolves the recorded `https://api.minimaxi.com/v1` CN default —
+/// never the international sibling's `api.minimax.io` host and never
+/// the `minimax.cn` divergence (EDGE-007/DEC-007) — and a configured
+/// base wins verbatim, trailing slashes trimmed. Offline pin: the
+/// adapter's `Debug` surface reports the resolved endpoint, so both
+/// arms are proved without one byte toward any host.
+#[test]
+fn minimax_code_cn_discriminates_the_recorded_default_base() {
+    for endpoint in ["", "   "] {
+        let config = Config::parse_validated(&minimax_code_cn_config(endpoint))
+            .expect("an empty endpoint is valid");
+        let provider = provider_result(
+            config,
+            "minimax-code-cn".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds");
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.minimaxi.com/v1\""),
+            "endpoint {endpoint:?} resolved the recorded CN default: {debug}"
+        );
+        assert!(
+            !debug.contains("api.minimax.io") && !debug.contains("minimax.cn"),
+            "no international host or divergence is substituted: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    // a configured base wins verbatim — trailing slashes are the only
+    // normalization, never a default substitution
+    let config =
+        Config::parse_validated(&minimax_code_cn_config("http://127.0.0.1:9931/plan/v1//"))
+            .expect("a configured base is valid");
+    let provider = provider_result(
+        config,
+        "minimax-code-cn".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the adapter builds");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"http://127.0.0.1:9931/plan/v1\""),
+        "the configured base rides verbatim: {debug}"
+    );
+    assert!(
+        !debug.contains("api.minimaxi.com"),
+        "the recorded default never overrides a configured base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// EDGE-007's boundary leg: the configured base decides the host —
+/// never the connection id. A `minimax-code-cn` row whose `endpoint`
+/// names the international sibling's `api.minimax.io` host keeps it
+/// verbatim rather than being silently rewritten to the recorded CN
+/// host, and the recorded `minimax.cn` Anthropic divergence rides
+/// verbatim the same way: a divergence is a record, never a
+/// substitution (DEC-007).
+#[test]
+fn minimax_code_cn_host_is_never_substituted() {
+    for base in [
+        "https://api.minimax.io/v1",
+        "https://api.minimax.io/v1/",
+        "https://minimax.cn/anthropic/v1",
+    ] {
+        let config =
+            Config::parse_validated(&minimax_code_cn_config(base)).expect("a configured base");
+        let provider = provider_result(
+            config,
+            "minimax-code-cn".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds");
+        let debug = format!("{provider:?}");
+        let trimmed = base.trim_end_matches('/');
+        assert!(
+            debug.contains(&format!("endpoint: \"{trimmed}\"")),
+            "the configured base decides verbatim — never the CN host: {debug}"
+        );
+        assert!(
+            !debug.contains("api.minimaxi.com"),
+            "the recorded CN host is never substituted for a configured base: {debug}"
+        );
+        drop_blocking(provider);
+    }
+}
+
+/// The recorded contract names no discovery leg for `minimax-code-cn`:
+/// the catalogue answers its recorded fixed list — unrecorded, so
+/// empty — with no wire leg and no credential read, a mounted
+/// `/models` listing never adds an offer, a fixed pin sends exactly
+/// the one chat request, and an auto pick denies `UnpinnedModel`
+/// rather than opening discovery — the manual model path is the only
+/// served route (DEC-007, PROH-009 shape).
+#[tokio::test]
+async fn minimax_code_cn_names_no_discovery_leg() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "manual path outcome",
+            Some(json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+
+    // the catalogue is the recorded fixed list alone — no `/models`
+    // request exists on this connection, so no listed id can join it
+    let (provider, catalogue) = catalog_on_thread(
+        provider_result(
+            config.clone(),
+            "minimax-code-cn".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds"),
+    );
+    let models = catalogue.expect("the recorded catalogue answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "the record names no roster — an offer would be invented input"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no discovery leg exists: the listing was never consulted"
+    );
+
+    // a fixed pin sends exactly the one chat request — no `/models`
+    // leg ever opens on the send path either
+    let (broker, manifest) = prepared_with(
+        enrolled_minimax_code_cn_provider(&config),
+        &config,
+        "/world/minimax-cn",
+        "goal: manual model path",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/minimax-cn", manifest);
+    let reply = outcome.expect("the manual pin dispatches");
+    assert_eq!(reply.text, "manual path outcome");
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        ["/v1/chat/completions"],
+        "exactly the one chat request — no discovery leg is attempted"
+    );
+
+    // an auto pick has no catalogue to name a model from: the typed
+    // denial lands without a request, never a discovery attempt
+    let (provider, _store) = enrolled_minimax_code_cn_provider(&config);
+    let mut auto = prepared_manifest(&config);
+    auto.model = rivect::config::ModelAssign::Auto {
+        pool: Some(vec!["minimax-code-cn".to_string()]),
+    };
+    let (provider, denied) = send_on_thread(provider, auto);
+    assert!(
+        matches!(denied, Err(ProviderError::UnpinnedModel { .. })),
+        "an auto pick denies typed — no discovery leg can name a model: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the auto pick's denial opened no leg"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::minimax-code-cn ------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `minimax-code-cn`, through the same shared construction its
+/// siblings use: a configured `region` — the recorded contract names
+/// none — denies `RegionMismatch` with the connection context, a
+/// profile-bound ref whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused plan key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn minimax_code_cn_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+ {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &minimax_code_cn_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "minimax-code-cn".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, MINIMAX_CODE_CN_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "minimax-code-cn");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, MINIMAX_CODE_CN_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.minimax-code-cn]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"minimax-code-cn\", model_id = \"{MINIMAX_CODE_CN_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "minimax-code-cn".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, MINIMAX_CODE_CN_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, MINIMAX_CODE_CN_KEY.as_bytes());
+
+    // a refused plan key is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the plan key
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_minimax_code_cn_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused plan key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused plan key is transport: {err}")
+    };
+    assert_eq!(connection, "minimax-code-cn");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, MINIMAX_CODE_CN_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MINIMAX_CODE_CN_KEY}"),
+        "the admitted grammar reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::minimax-code-cn --------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can never
+/// be a bearer token — denies `CredentialMalformed` on the first send,
+/// and enrolling the recorded plan key at the same scope admits the
+/// retry with that bearer. The retry is the same credential at the
+/// same scope — a plan window, fixed or rolling, is a billing fact of
+/// the enrolled key and never a substitute key class (DEC-007) — no
+/// state is wedged and no plaintext path is taken.
+#[tokio::test]
+async fn minimax_code_cn_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(MINIMAX_CODE_CN_REF, &[0xff, 0xfe]);
+    let provider = provider_result(config.clone(), "minimax-code-cn".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(MINIMAX_CODE_CN_REF, MINIMAX_CODE_CN_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the recorded plan key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {MINIMAX_CODE_CN_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `minimax-code-cn`: CATALOG, AUTH, WIRE and RECOVERY each execute
+/// and report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn minimax_code_cn_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&minimax_code_cn_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the record names no discovery leg and no roster, so the
+    // catalogue answers empty with no wire leg — a mounted answer could
+    // never join it anyway.
+    let (provider, catalogue) = catalog_on_thread(
+        provider_result(
+            config.clone(),
+            "minimax-code-cn".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds"),
+    );
+    let listed = catalogue.expect("catalog answers");
+    let no_wire = server
+        .received_requests()
+        .await
+        .expect("recorded")
+        .is_empty();
+    reported.insert(
+        "CATALOG",
+        if listed.is_empty() && no_wire {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "minimax-code-cn".to_string(), absent)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_minimax_code_cn_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/minimax-cn", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/minimax-cn", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "minimax-code-cn".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    store.enroll(MINIMAX_CODE_CN_REF, MINIMAX_CODE_CN_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_minimax_code_cn`
+    // case's status, as its sibling matrices do: the ignored count is
+    // the explicit NOT_RUN signal, and this literal keeps that row
+    // visible inside the executed set.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::minimax-code-cn -------------------------------------
+
+/// TP-PROVIDER-INSTALLED::minimax-code-cn = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline
+/// slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::minimax-code-cn = NOT_RUN"]
+fn provider_installed_minimax_code_cn() {}
