@@ -3568,3 +3568,86 @@ fn moonshot_api_key_binding_resolves_through_scoped_secret_ref() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class: nanogpt ---------------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on a `nanogpt`
+/// fixture: both recorded credential bindings resolve through the
+/// scoped `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared id keeps the
+/// typed denial, a resolved binding admits the pin offline, and a
+/// divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The
+/// recorded `NANO_GPT_API_KEY` key name proves neither region nor
+/// payment — the name never substitutes a binding (DEC-014), and
+/// the recorded subscription base is a separate configured payment
+/// class, never this binding's hidden fallback (DEC-010). The
+/// per-ID `nanogpt` credential/profile/region proof is the provider
+/// target's
+/// `nanogpt_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn nanogpt_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.nanogpt]\nkind = \"api_key\"\nendpoint = \"https://nano-gpt.com/api/v1\"\ncredential_ref = \"keyring:rivect-test/nanogpt-direct\"\n\
+         [connections.nanogpt-profiled]\nkind = \"api_key\"\nendpoint = \"https://nano-gpt.com/api/v1\"\ncredential_ref = \"keyring:rivect-test/nanogpt-scope\"\nprofile = \"nanogpt-team\"\n\
+         [profiles.nanogpt-team]\ncredential_ref = \"keyring:rivect-test/nanogpt-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "nanogpt")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/nanogpt-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "nanogpt-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/nanogpt-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "nanogpt",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "nanogpt-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/nanogpt-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "nanogpt-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

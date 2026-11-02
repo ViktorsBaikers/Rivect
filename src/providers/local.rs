@@ -2,7 +2,7 @@
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
-//! `minimax-code`/`minimax-code-cn`, `mistral` and `moonshot`
+//! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot` and `nanogpt`
 //! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -119,8 +119,15 @@
 //! from the K2.x `thinking` surface this adapter never constructs:
 //! `low`/`high` ride the body verbatim, an out-of-ladder pin denies
 //! typed, and the recorded `max` has no carrier in the shared effort
-//! vocabulary, so no `max` request is ever built (DEC-014) — a
-//! fallback key name proves neither region nor payment —
+//! vocabulary, so no `max` request is ever constructed (DEC-014) — a
+//! fallback key name proves neither region nor payment — and the
+//! configured-or-recorded `nano-gpt.com/api/v1` base of `nanogpt`,
+//! whose recorded api-key class makes its `/models` listing the whole
+//! catalogue only when the scoped material resolves — a keyless
+//! lookup opens no wire leg — while its `:thinking` suffix variants
+//! collapse into the single base offer they alias and the
+//! subscription base is a separate configured payment class, never a
+//! hidden fallback (DEC-010) —
 //! resolved per literal
 //! id by the contract table, never inherited
 //! across ids. The adapter authors no
@@ -158,7 +165,7 @@ use crate::providers::{
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -784,6 +791,17 @@ const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 /// material's name.
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
+/// The recorded `nanogpt` endpoint — the `nano-gpt.com/api/v1` host
+/// the DEC-025 row's `Rivect/key → nano-gpt.com/api/v1` binding names:
+/// the API root the required `endpoint` field's empty string resolves
+/// under, under the same absent-override rule the plan classes bind.
+/// The recorded explicit routing and price settings are catalogue
+/// metadata with no vendored carrier (D6): this constant carries the
+/// base alone, and the recorded subscription base is a separate
+/// configured payment class — never a kind or fallback this adapter
+/// constructs (DEC-010).
+const NANOGPT_BASE_URL: &str = "https://nano-gpt.com/api/v1";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1050,6 +1068,16 @@ enum EntryRule {
     /// denial of a pinned `reasoning_effort` the pin's model does
     /// not record, never a silently dropped body field.
     Moonshot,
+    /// The `nanogpt` arm: the api-key-gated `/models` listing's rows
+    /// pass the recorded chat-id filter — a `:thinking`-suffixed alias
+    /// (`NANO_GPT_THINKING_SUFFIX_RE`, `:thinking` with or without a
+    /// `:<level>` tail) is never offered; it only marks the base id it
+    /// collapses into, which [`ChatCompletionsProvider::catalog_within`]
+    /// applies after the per-entry pass. The record's explicit routing
+    /// and price settings have no vendored carrier (D6), and the
+    /// subscription base is a separate configured payment class — never
+    /// a fallback this arm constructs (DEC-010).
+    NanoGpt,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1434,6 +1462,27 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::Moonshot,
+        }),
+        // `nanogpt` (HZN-008 class B — the api-key cell, DEC-025 row
+        // `Rivect/key → nano-gpt.com/api/v1`): the configured-or-recorded
+        // base redirects discovery and streaming alike, and the recorded
+        // api-key class gates the `/models` listing on resolved material
+        // — the conditional `fetchDynamicModels` spread exists only when
+        // the key does, so a keyless lookup opens no wire leg and denies
+        // typed. The listing is the whole catalogue: no vendored roster
+        // or price/routing carrier exists (D6), so an empty or failed
+        // answer has no floor to fall back to, and the recorded
+        // `:thinking` aliases collapse into the single base offer under
+        // the recorded chat-id filter. The plain bearer arm carries the
+        // stored material — the recorded subscription base is a separate
+        // configured payment class, never a hidden fallback path this
+        // arm constructs (DEC-010).
+        "nanogpt" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(NANOGPT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::NanoGpt,
         }),
         _ => None,
     }
@@ -1938,6 +1987,14 @@ impl ChatCompletionsProvider {
             .iter()
             .filter_map(|entry| self.catalog_entry(entry))
             .collect();
+        // `nanogpt`'s recorded collapse: the alias rows the entry
+        // filter dropped mark their base offers reasoning-capable —
+        // the record states the mark on the kept model alone, so a
+        // base whose alias was filtered gains `reasoning` and a base
+        // the listing never carried stays absent.
+        if matches!(self.contract.entries, EntryRule::NanoGpt) {
+            mark_nanogpt_thinking_bases(data, &mut models);
+        }
         // The recorded floor unions on top as the offer floor — a
         // seeded or keyless-floor id the listing omitted still offers,
         // carrying the recorded transform surface the listing arm
@@ -1967,7 +2024,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::Firepass
                 | EntryRule::HuggingFace
                 | EntryRule::LiteLlm
-                | EntryRule::Moonshot => Some(CatalogModel {
+                | EntryRule::Moonshot
+                | EntryRule::NanoGpt => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2196,6 +2254,16 @@ impl ChatCompletionsProvider {
             // the recorded price/roster metadata has no vendored
             // carrier (D6).
             EntryRule::Moonshot => Some(CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+            // The recorded chat-id filter: a `:thinking`-suffixed alias
+            // is never an offer — it only marks the base id it aliases,
+            // the mark `catalog_within` applies after this pass. The
+            // record's `exclude-models` consult carries no vendored
+            // roster for this class, so every other non-empty id is
+            // offered.
+            EntryRule::NanoGpt => is_likely_nanogpt_text_id(id).then(|| CatalogModel {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
@@ -2489,8 +2557,8 @@ impl ChatCompletionsProvider {
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm` and `Moonshot` —
-    /// sends the
+    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm`, `Moonshot` and
+    /// `NanoGpt` — sends the
     /// offered id unchanged. Each variant is listed so a future
     /// transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -2505,7 +2573,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Groq
             | EntryRule::HuggingFace
             | EntryRule::LiteLlm
-            | EntryRule::Moonshot => model_id.to_string(),
+            | EntryRule::Moonshot
+            | EntryRule::NanoGpt => model_id.to_string(),
         }
     }
 
@@ -2585,7 +2654,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Firepass
             | EntryRule::Fireworks
             | EntryRule::HuggingFace
-            | EntryRule::LiteLlm => return Ok(()),
+            | EntryRule::LiteLlm
+            | EntryRule::NanoGpt => return Ok(()),
         };
         let EffortAssign::Fixed { value } = &manifest.effort else {
             return Ok(());
@@ -3726,6 +3796,70 @@ fn is_alibaba_token_plan_chat_id(id: &str) -> bool {
     !ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+/// The recorded `nanogpt` `:thinking` suffix
+/// (`NANO_GPT_THINKING_SUFFIX_RE` — `:thinking` with or without a
+/// `:<level>` tail, `:<tail>` carrying no further `:`): the base id an
+/// alias row collapses into, or `None` when the id is no alias —
+/// `:thinking:a:b` fails the recorded tail the same way the regex's
+/// single `:[^:]+` group does.
+fn nanogpt_thinking_base(id: &str) -> Option<&str> {
+    // The recorded regex matches leftmost: the first `:thinking`
+    // whose tail is empty or one colon-free `:level` — `exec`'s
+    // `match.index` names it. A tail that is neither (`x:thinkingx`)
+    // fails there and the scan advances exactly like the regex's.
+    for (index, _) in id.match_indices(":thinking") {
+        let tail = &id[index + ":thinking".len()..];
+        if tail.is_empty() {
+            return Some(&id[..index]);
+        }
+        if let Some(level) = tail.strip_prefix(':')
+            && !level.is_empty()
+            && !level.contains(':')
+        {
+            return Some(&id[..index]);
+        }
+    }
+    None
+}
+
+/// The recorded `nanogpt` chat-id filter
+/// (`isLikelyNanoGptTextModelId`, openai-compat.ts §23): the id is
+/// trimmed and lowered, an empty one is dropped, and a
+/// `:thinking`-suffixed alias is never an offer — it only marks the
+/// base id it collapses into, the mark
+/// [`mark_nanogpt_thinking_bases`] applies on the raw listing. The
+/// record's `exclude-models` consult carries no vendored roster for
+/// this class, so every other non-empty listed id is offered.
+fn is_likely_nanogpt_text_id(id: &str) -> bool {
+    let normalized = id.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    nanogpt_thinking_base(&normalized).is_none()
+}
+
+/// The recorded `nanogpt` alias collapse (openai-compat.ts §23,
+/// `thinkingBaseIds`): a `:thinking` alias row is dropped by the
+/// entry filter, and the kept base offer it names is marked
+/// reasoning-capable — the record states the mark on the served model
+/// alone, so a base the listing omitted stays absent and one already
+/// marked keeps its own declaration.
+fn mark_nanogpt_thinking_bases(data: &[Value], models: &mut [CatalogModel]) {
+    let mut bases = BTreeSet::new();
+    for entry in data {
+        if let Some(id) = entry.get("id").and_then(Value::as_str)
+            && let Some(base) = nanogpt_thinking_base(id)
+        {
+            bases.insert(base.to_string());
+        }
+    }
+    for model in models.iter_mut() {
+        if bases.contains(model.id.as_str()) {
+            model.reasoning = true;
+        }
+    }
 }
 
 impl std::fmt::Debug for ChatCompletionsProvider {
