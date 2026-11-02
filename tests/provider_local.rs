@@ -26701,3 +26701,984 @@ async fn nanogpt_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::nanogpt = NOT_RUN"]
 fn provider_installed_nanogpt() {}
+
+// ----- novita ----------------------------------------------------------------
+
+// The `novita` connection's proof legs (HZN-008 class B — the api-key
+// cell): the shared Chat Completions adapter serves the literal id —
+// no copied codec — under its own recorded predicates (DEC-025 row:
+// `Rivect/key → api.novita.ai/openai/v1` CC). The configured
+// `endpoint` carries the API base verbatim — an empty one resolves
+// the recorded `api.novita.ai/openai/v1` default under the same
+// absent-override rule the plan classes bind — while a configured
+// `region` is denied: the contract names none. The recorded
+// `catalogDiscovery.allowUnauthenticated` makes the `/models`
+// discovery keyless — an absent scope opens the anonymous listing
+// with no `Authorization` header, while a send still denies
+// `CredentialAbsent` — and that listing is authoritative
+// (`dynamicModelsAuthoritative`): no vendored roster or price row
+// exists (D6), so an empty or failed answer has no floor to fall back
+// to, and an entry offers only under the recorded conjunction
+// (active status, non-test id, `chat/completions` endpoint, positive
+// `max_output_tokens`). The recorded login validates against
+// inference, never payment administration — a limited-role key is
+// verified by a model request — and no price or billing fact is
+// borrowed from another id.
+
+/// The scoped credential ref the `novita` connection binds.
+const NOVITA_REF: &str = "keyring:rivect-test/novita";
+
+/// Fixture `novita` key material — never a real credential, only
+/// ever sent to localhost.
+const NOVITA_KEY: &str = "fixture-novita-key";
+
+/// The pinned model id the fixed-pin legs carry — the recorded
+/// default model the class's login validates with.
+const NOVITA_MODEL: &str = "moonshotai/kimi-k2.7-code";
+
+/// One configured `novita` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011),
+/// the dialect comes from the literal connection id (DEC-007), and
+/// the endpoint carries the API base verbatim.
+fn novita_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.novita]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{NOVITA_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"novita\", model_id = \"{NOVITA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// A listing row the recorded filter admits: active (`status: 1`), a
+/// non-test id, the `chat/completions` endpoint and a positive output
+/// cap.
+fn novita_row(id: &str) -> Value {
+    json!({
+        "id": id,
+        "status": 1,
+        "endpoints": ["chat/completions"],
+        "max_output_tokens": 4096,
+    })
+}
+
+fn novita_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(NOVITA_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "novita".to_string(), store.clone())
+        .expect("the shared adapter builds for the novita id");
+    (provider, store)
+}
+
+/// The `novita` provider over the recorded enrolled key.
+fn enrolled_novita_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    novita_provider(config, NOVITA_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::novita ----------------------------------------------
+
+/// A configured `novita` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the scoped material rides the `Authorization` header —
+/// never the body — and the shared adapter posts exactly the frozen
+/// manifest as a `chat/completions` request — the pinned model id
+/// verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt
+/// never re-sends.
+#[tokio::test]
+async fn novita_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified novita outcome",
+            Some(json!({"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&novita_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/novita", "goal: prove the wire")
+        .expect("the novita pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/novita", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified novita outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {NOVITA_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(NOVITA_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], NOVITA_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("high"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "novita");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            total_tokens: 12,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/novita", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success for `novita`: a
+/// stream ended mid `tool_calls` fragment — a partial call that
+/// never executes — and a finish_reason the dialect cannot classify
+/// are both the unknown terminal, and a rejected send charges
+/// nothing.
+#[tokio::test]
+async fn novita_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_novita_provider(&config),
+        &config,
+        "/world/novita",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/novita", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_novita_provider(&config),
+        &config,
+        "/world/novita",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/novita", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::novita -------------------------------------------
+
+/// The configured-or-recorded base resolves under the plan classes'
+/// absent-override rule: the required `endpoint` field's empty
+/// string resolves the recorded `https://api.novita.ai/openai/v1`
+/// default, and a configured base wins verbatim, trailing slashes
+/// trimmed — discovery and streaming follow it alike. Offline pin:
+/// the adapter's `Debug` surface reports the resolved endpoint, so
+/// both arms are proved without one byte toward any host.
+#[test]
+fn novita_discriminates_the_recorded_default_base() {
+    for endpoint in ["", "   "] {
+        let config =
+            Config::parse_validated(&novita_config(endpoint)).expect("an empty endpoint is valid");
+        let provider = provider_result(
+            config,
+            "novita".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the adapter builds");
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("endpoint: \"https://api.novita.ai/openai/v1\""),
+            "endpoint {endpoint:?} resolved the recorded default: {debug}"
+        );
+        drop_blocking(provider);
+    }
+
+    // a configured base wins verbatim — trailing slashes are the only
+    // normalization, never a default substitution
+    let config = Config::parse_validated(&novita_config("http://127.0.0.1:9931/cloud/v1//"))
+        .expect("a configured base is valid");
+    let provider = provider_result(
+        config,
+        "novita".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the adapter builds");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"http://127.0.0.1:9931/cloud/v1\""),
+        "the configured base rides verbatim: {debug}"
+    );
+    assert!(
+        !debug.contains("api.novita.ai"),
+        "the recorded default never overrides a configured base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// The recorded discovery is keyless (`catalogDiscovery.
+/// allowUnauthenticated`, no `requireApiKey`): an absent scope opens
+/// one anonymous `/models` listing with no `Authorization` header,
+/// and that listing answer is the catalogue — while the same absent
+/// scope still denies the send `CredentialAbsent` before any chat
+/// request.
+#[tokio::test]
+async fn novita_keyless_listing_runs_anonymously() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![novita_row(NOVITA_MODEL), novita_row("novita/keyless-peer")],
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, listed) = catalog_on_thread(
+        provider_result(
+            config.clone(),
+            "novita".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+    );
+    let models = listed.expect("the keyless listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [NOVITA_MODEL, "novita/keyless-peer"],
+        "the anonymous listing is the catalogue"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyless lookup is one listing leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the anonymous listing carries no authorization header"
+    );
+
+    // the same absent scope denies the send before any chat request
+    let (provider, outcome) = send_on_thread(
+        provider_result(
+            config.clone(),
+            "novita".to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+        prepared_manifest(&config),
+    );
+    assert!(
+        matches!(outcome, Err(ProviderError::CredentialAbsent { .. })),
+        "the send denies the absent scope typed: {outcome:?}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denied send opens no chat request after the one listing leg"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+}
+
+/// The recorded entry filter is authoritative for `novita`
+/// (`novitaModelManagerOptions`'s `filterModel`): each clause is
+/// discriminated on its own row — a numeric `status` other than `1`
+/// is inactive while an absent or non-numeric status offers; an
+/// `ai_infer_test` id is a test SKU; `endpoints` must carry
+/// `chat/completions` as an array member; and a missing, zero,
+/// negative or unreadable `max_output_tokens` is not a positive
+/// output cap. A row passing every clause offers with no invented
+/// surface, and the price-metadata row keeps [`ModelPrice::Unknown`]
+/// — no figure is borrowed from another id (D6).
+#[tokio::test]
+async fn novita_listing_entry_filter_is_authoritative() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            // admitted: every clause holds
+            novita_row("novita/base"),
+            // admitted: an absent status and a decimal-string cap
+            json!({
+                "id": "novita/absent-status",
+                "endpoints": ["embeddings", "chat/completions"],
+                "max_output_tokens": "8192",
+            }),
+            // admitted: upstream reads a non-numeric status as active
+            json!({
+                "id": "novita/non-numeric-status",
+                "status": "active",
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 1,
+            }),
+            // admitted: a float status of 1 is the active status
+            json!({
+                "id": "novita/float-active",
+                "status": 1.0,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 2048,
+            }),
+            // admitted, but its listing prices never become an offer
+            // surface — the class carries no price mapping (D6)
+            json!({
+                "id": "novita/priced",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 2048,
+                "input_token_price_per_m": 5000,
+                "output_token_price_per_m": 10000,
+            }),
+            // dropped: numeric status 0 is inactive
+            json!({
+                "id": "novita/inactive",
+                "status": 0,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 4096,
+            }),
+            // dropped: any other numeric status is inactive too
+            json!({
+                "id": "novita/suspended",
+                "status": 2,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 4096,
+            }),
+            // dropped: a test SKU, whatever its capability marks
+            json!({
+                "id": "ai_infer_test_probe",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 4096,
+            }),
+            // dropped: the test-SKU prefix reads case-insensitively
+            json!({
+                "id": "AI_INFER_TEST_UPPER",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 4096,
+            }),
+            // dropped: no chat/completions endpoint
+            json!({
+                "id": "novita/embeddings",
+                "status": 1,
+                "endpoints": ["embeddings"],
+                "max_output_tokens": 4096,
+            }),
+            // dropped: an absent endpoints member
+            json!({
+                "id": "novita/no-endpoints",
+                "status": 1,
+                "max_output_tokens": 4096,
+            }),
+            // dropped: a bare string is not the recorded array member
+            json!({
+                "id": "novita/bare-endpoint",
+                "status": 1,
+                "endpoints": "chat/completions",
+                "max_output_tokens": 4096,
+            }),
+            // dropped: a stated zero cap
+            json!({
+                "id": "novita/zero-output",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 0,
+            }),
+            // dropped: a negative cap
+            json!({
+                "id": "novita/negative-output",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": -1,
+            }),
+            // dropped: an absent cap
+            json!({
+                "id": "novita/missing-output",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+            }),
+            // dropped: an unreadable cap
+            json!({
+                "id": "novita/text-output",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": "many",
+            }),
+            // dropped: an empty-string cap
+            json!({
+                "id": "novita/empty-output",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": "",
+            }),
+            // dropped: an empty id names nothing
+            json!({
+                "id": "",
+                "status": 1,
+                "endpoints": ["chat/completions"],
+                "max_output_tokens": 4096,
+            }),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let models = listed.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+
+    // The listing is the whole catalogue: only rows passing every
+    // recorded clause offer, and no floor or alias row appears.
+    assert_eq!(
+        model_ids(&models),
+        [
+            "novita/absent-status",
+            "novita/base",
+            "novita/float-active",
+            "novita/non-numeric-status",
+            "novita/priced",
+        ],
+        "the entry filter admits exactly the recorded conjunction"
+    );
+    for model in &models {
+        assert_eq!(
+            model.price,
+            ModelPrice::Unknown,
+            "no price is mapped, borrowed or invented for {}",
+            model.id
+        );
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "an admitted id carries no invented surface beyond the recorded filter"
+        );
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyed listing is the one leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+}
+
+/// The authoritative listing has no floor: an empty `data` answer
+/// offers nothing, and a failed listing is the leg's typed denial —
+/// never a vendored roster or a substituted success (INV-010).
+#[tokio::test]
+async fn novita_failed_listing_denies_typed_without_a_floor() {
+    // an empty `data` answer is a real answer with no offers
+    let server = MockServer::start().await;
+    mount_models(&server, vec![]).await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("an empty listing still answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        model_ids(&models)
+    );
+
+    // a failed listing keeps its typed denial
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, failed) = catalog_on_thread(provider);
+    let err = failed.expect_err("a failed listing has no floor to answer");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the failed listing is the typed transport denial: {err:?}")
+    };
+    assert_eq!(connection, "novita");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the failed listing keeps its typed denial: {cause}"
+    );
+    drop_blocking(provider);
+}
+
+/// The recorded login validates against inference, never payment
+/// administration: a limited-role key's entitlement is verified by
+/// the model request leg on `/chat/completions`, and the adapter
+/// constructs no billing path at all. A payment endpoint that would
+/// refuse this key is never consulted — no billing answer, denied or
+/// otherwise, stands in for the inference verdict.
+#[tokio::test]
+async fn novita_limited_role_key_is_verified_by_a_model_request() {
+    let server = MockServer::start().await;
+    // The recorded validation comment: a basic team role holds no
+    // billing scope, so the balance endpoint refuses the same key.
+    Mock::given(method("POST"))
+        .and(path("/openapi/v1/billing/balance/detail"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("no billing scope"))
+        .mount(&server)
+        .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "inference-verified",
+            Some(json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let reply = outcome.expect("the model request is the verification");
+    assert_eq!(reply.text, "inference-verified");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "one model request verifies the key — no payment administration leg"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {NOVITA_KEY}"),
+        "the same limited-role key bears the model request"
+    );
+    for request in &requests {
+        assert!(
+            !request.url.path().contains("billing") && !request.url.path().starts_with("/openapi/"),
+            "no payment administration path is ever consulted: {}",
+            request.url.path()
+        );
+    }
+
+    // A key the model endpoint refuses is the typed inference denial —
+    // the same limited-role key is never re-judged through a billing
+    // answer, and the peer's body never reaches the diagnostic.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"insufficient role {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a limited-role refusal is typed, never a success");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the refused model request is transport: {err}")
+    };
+    assert_eq!(connection, "novita");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 403 },
+        "the inference refusal carries the peer's status: {cause}"
+    );
+    assert_no_secret_or_body(&err, NOVITA_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one model request");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+}
+
+// ----- TP-PROVIDER-AUTH::novita ----------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success
+/// for `novita`, through the same shared construction its siblings
+/// use: a configured `region` — the recorded contract names none —
+/// denies `RegionMismatch` with the connection context, a
+/// profile-bound ref whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches
+/// Display or Debug. The recorded `NOVITA_API_KEY` env spelling is
+/// refused at ingress, so no env path substitutes the binding; a
+/// `subscription`-kind declaration names a live grant, never this
+/// api-key class's binding (DEC-010).
+#[tokio::test]
+async fn novita_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    // the recorded env spelling names no admitted store class, and
+    // the refusal never echoes the value
+    let refused = novita_config("http://127.0.0.1:1/v1").replace(
+        &format!("credential_ref = \"{NOVITA_REF}\""),
+        "credential_ref = \"env:NOVITA_API_KEY\"",
+    );
+    let Err(error) = Config::parse_validated(&refused) else {
+        panic!("an env credential reference is refused at ingress")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::UnsupportedCredentialStore { store: refused }
+                if refused.as_str() == "env"
+        ),
+        "the recorded key name is the same store refusal — it selects nothing: {error}"
+    );
+    assert!(
+        !error.to_string().contains("env:NOVITA_API_KEY"),
+        "the refusal never echoes the credential value: {error}"
+    );
+
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &novita_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "novita".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, NOVITA_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "novita");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, NOVITA_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.novita]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"novita\", model_id = \"{NOVITA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "novita".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, NOVITA_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, NOVITA_KEY.as_bytes());
+
+    // a refused key is a typed transport denial: the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, "novita");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, NOVITA_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {NOVITA_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::novita ------------------------------------------
+
+/// A typed denial is recoverable through the same seam: material the
+/// store resolves but the class cannot use — non-UTF-8 bytes can
+/// never be a bearer token — denies `CredentialMalformed` on the
+/// first send, and enrolling the recorded key at the same scope
+/// admits the retry with that bearer. The retry is the same
+/// credential at the same scope — no key class is substituted — no
+/// state is wedged and no plaintext path is taken.
+#[tokio::test]
+async fn novita_typed_denial_recovers_through_the_same_credential_seam() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    store.enroll(NOVITA_REF, &[0xff, 0xfe]);
+    let provider = provider_result(config.clone(), "novita".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    assert!(matches!(
+        denied,
+        Err(ProviderError::CredentialMalformed { .. })
+    ));
+
+    store.enroll(NOVITA_REF, NOVITA_KEY.as_bytes());
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let reply = outcome.expect("the recorded key admits the retry");
+    assert_eq!(reply.text, "recovered");
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the denial opened no leg; the retry is one send"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {NOVITA_KEY}"),
+        "the recovered material bears the wire"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `novita`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN — an
+/// omitted leg fails the suite rather than silently absenting.
+#[tokio::test]
+async fn novita_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![novita_row(NOVITA_MODEL)]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&novita_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: the keyed listing answers the recorded rows under one
+    // `/models` leg bearing the scoped material.
+    let (provider, _store) = enrolled_novita_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    let discovery = server.received_requests().await.expect("recorded");
+    reported.insert(
+        "CATALOG",
+        if listed.iter().any(|model| model.id == NOVITA_MODEL)
+            && discovery.len() == 1
+            && discovery[0].url.path() == "/v1/models"
+            && received_auth(&discovery[0]) == format!("Bearer {NOVITA_KEY}")
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let absent = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "novita".to_string(), absent).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_novita_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/novita", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/novita", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "novita".to_string(), store.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    store.enroll(NOVITA_REF, NOVITA_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_novita`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::novita -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::novita = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::novita = NOT_RUN"]
+fn provider_installed_novita() {}

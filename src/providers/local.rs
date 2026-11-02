@@ -2,8 +2,8 @@
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
-//! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot` and `nanogpt`
-//! connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt` and
+//! `novita` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -127,7 +127,22 @@
 //! lookup opens no wire leg — while its `:thinking` suffix variants
 //! collapse into the single base offer they alias and the
 //! subscription base is a separate configured payment class, never a
-//! hidden fallback (DEC-010) —
+//! hidden fallback (DEC-010) — and the configured-or-recorded
+//! `api.novita.ai/openai/v1` base of `novita`, whose recorded
+//! `dynamicModelsAuthoritative` keyless `/models` discovery is the
+//! whole catalogue — an absent scope rides the anonymous listing
+//! with no `Authorization` header, while the same absent scope
+//! denies a send typed — and whose listing answer passes the
+//! recorded entry
+//! filter: a numeric `status` other than `1`, an `ai_infer_test`
+//! test id, an entry whose `endpoints` omit `chat/completions`, and
+//! a non-positive `max_output_tokens` are each dropped, so an
+//! unfiltered or public listing row never reaches the offer set.
+//! The recorded login validates against inference, never payment
+//! administration — a limited-role key that cannot read billing is
+//! verified by a model request — and no price or billing fact is
+//! borrowed from another id: this class carries no vendored price
+//! row (D6), so an admitted offer keeps [`ModelPrice::Unknown`] —
 //! resolved per literal
 //! id by the contract table, never inherited
 //! across ids. The adapter authors no
@@ -802,6 +817,19 @@ const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 /// constructs (DEC-010).
 const NANOGPT_BASE_URL: &str = "https://nano-gpt.com/api/v1";
 
+/// The recorded `novita` endpoint — the `api.novita.ai/openai/v1` host
+/// the DEC-025 row's `Rivect/key → api.novita.ai/openai/v1` binding
+/// names: the API root the required `endpoint` field's empty string
+/// resolves under, under the same absent-override rule the plan
+/// classes bind. The recorded login validates against inference on
+/// this base rather than the payment administration API, because a
+/// limited team role holds no billing scope while its inference key
+/// is valid; this adapter constructs no payment leg at all. The
+/// recorded entry prices are listing facts in the class's own
+/// 1/10,000-USD units, which this class carries no vendored row for
+/// (D6): no price is borrowed from another connection.
+const NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -860,8 +888,8 @@ enum CatalogRule {
     /// semantic; a descriptor's recorded `defaultModel` is a
     /// catalogue hint, not a product ranking this contract performs.
     Allowlist(&'static [(&'static str, bool)]),
-    /// The recorded credential-optional *discovery* (`kilo`'s
-    /// `catalogDiscovery.allowUnauthenticated` and its
+    /// The recorded credential-optional *discovery* (`kilo`'s and
+    /// `novita`'s `catalogDiscovery.allowUnauthenticated` and the
     /// `fetchOpenAICompatibleModels` call with `apiKey` optional): the
     /// configured endpoint's own `/models` answer contributes its
     /// offers under the per-entry transform, the recorded rows below
@@ -869,7 +897,8 @@ enum CatalogRule {
     /// floor standing — and the `Authorization` header rides only
     /// when the store resolves material. This variant's tolerance is
     /// the catalogue's alone, over an absent *scope* on a class that
-    /// still binds a credential ([`CredentialRule::Kilo`]): the
+    /// still binds a credential ([`CredentialRule::Kilo`],
+    /// [`CredentialRule::Bearer`]): the
     /// recorded keyless catalogue answers, while the same absent
     /// material denies a send. An undeclared *binding* is a different
     /// recorded fact with its own arm ([`CredentialRule::OpenProxy`]),
@@ -1078,6 +1107,20 @@ enum EntryRule {
     /// subscription base is a separate configured payment class — never
     /// a fallback this arm constructs (DEC-010).
     NanoGpt,
+    /// The `novita` arm: the recorded keyless `/models` discovery
+    /// (`catalogDiscovery.allowUnauthenticated`, no `requireApiKey`)
+    /// is authoritative (`dynamicModelsAuthoritative`); an absent
+    /// scope rides this listing anonymously, while the send leg still
+    /// denies `CredentialAbsent`, and each `data[]` entry passes the
+    /// recorded conjunction — a numeric
+    /// `status` other than `1` is inactive, an `ai_infer_test` id is
+    /// a test SKU, `endpoints` must carry `chat/completions` as an
+    /// array member, and `max_output_tokens` must read positive —
+    /// so an unfiltered or public listing row can never widen the
+    /// offer set. No vendored roster or price row exists (D6), and a
+    /// limited-role key is verified by a model request, never by
+    /// payment administration.
+    Novita,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1483,6 +1526,31 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::NanoGpt,
+        }),
+        // `novita` (HZN-008 class B — the api-key cell, DEC-025 row
+        // `Rivect/key → api.novita.ai/openai/v1`): the
+        // configured-or-recorded base redirects discovery and
+        // streaming alike, and the recorded descriptor's
+        // `catalogDiscovery.allowUnauthenticated` — no
+        // `requireApiKey` — makes `/models` a keyless discovery: an
+        // absent scope rides the anonymous listing with no
+        // `Authorization` header, while the same absent scope denies
+        // a send `CredentialAbsent`. The listing is authoritative
+        // (`dynamicModelsAuthoritative`): no vendored roster or price
+        // row exists (D6), so an empty or failed answer has no floor
+        // to fall back to, and every entry must pass the recorded
+        // conjunction (active status, non-test id, `chat/completions`
+        // endpoint, positive `max_output_tokens`) before it offers.
+        // The plain bearer arm carries the stored material — the
+        // recorded login validates against inference, never payment
+        // administration, and no billing or price fact is borrowed
+        // from another id.
+        "novita" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(NOVITA_BASE_URL),
+            catalog: CatalogRule::UnauthenticatedListing(&[]),
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Novita,
         }),
         _ => None,
     }
@@ -2025,7 +2093,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::HuggingFace
                 | EntryRule::LiteLlm
                 | EntryRule::Moonshot
-                | EntryRule::NanoGpt => Some(CatalogModel {
+                | EntryRule::NanoGpt
+                | EntryRule::Novita => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2264,6 +2333,15 @@ impl ChatCompletionsProvider {
             // roster for this class, so every other non-empty id is
             // offered.
             EntryRule::NanoGpt => is_likely_nanogpt_text_id(id).then(|| CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+            // The recorded authority conjunction
+            // (`novitaModelManagerOptions`'s `filterModel`): the
+            // listing is authoritative, so an entry failing any clause
+            // never reaches the offer set, and an admitted id keeps no
+            // surface the class records no vendored row for (D6).
+            EntryRule::Novita => is_likely_novita_chat_entry(id, entry).then(|| CatalogModel {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
@@ -2557,8 +2635,8 @@ impl ChatCompletionsProvider {
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm`, `Moonshot` and
-    /// `NanoGpt` — sends the
+    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm`, `Moonshot`,
+    /// `NanoGpt` and `Novita` — sends the
     /// offered id unchanged. Each variant is listed so a future
     /// transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -2574,7 +2652,8 @@ impl ChatCompletionsProvider {
             | EntryRule::HuggingFace
             | EntryRule::LiteLlm
             | EntryRule::Moonshot
-            | EntryRule::NanoGpt => model_id.to_string(),
+            | EntryRule::NanoGpt
+            | EntryRule::Novita => model_id.to_string(),
         }
     }
 
@@ -2655,7 +2734,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Fireworks
             | EntryRule::HuggingFace
             | EntryRule::LiteLlm
-            | EntryRule::NanoGpt => return Ok(()),
+            | EntryRule::NanoGpt
+            | EntryRule::Novita => return Ok(()),
         };
         let EffortAssign::Fixed { value } = &manifest.effort else {
             return Ok(());
@@ -3860,6 +3940,33 @@ fn mark_nanogpt_thinking_bases(data: &[Value], models: &mut [CatalogModel]) {
             model.reasoning = true;
         }
     }
+}
+
+/// The recorded `novita` entry filter (`novitaModelManagerOptions`'s
+/// `filterModel`, openai-compat.ts §5.5): the recorded roster is
+/// authoritative (`dynamicModelsAuthoritative`), so an entry reaches
+/// the offer set only when upstream's whole conjunction holds —
+/// `status` is absent, non-numeric or exactly the active `1` (every
+/// other numeric status is inactive), the id is not an
+/// `ai_infer_test` test SKU, `endpoints` carries `chat/completions`
+/// as an array member, and `max_output_tokens` reads positive under
+/// the shared token-count read. Dropping a clause would admit rows
+/// the recorded source never offers.
+fn is_likely_novita_chat_entry(id: &str, entry: &Value) -> bool {
+    let active = entry
+        .get("status")
+        .is_none_or(|status| status.as_f64().is_none_or(|status| status == 1.0));
+    active
+        && !id.to_lowercase().starts_with("ai_infer_test")
+        && entry
+            .get("endpoints")
+            .and_then(Value::as_array)
+            .is_some_and(|endpoints| {
+                endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.as_str() == Some("chat/completions"))
+            })
+        && positive_count(entry.get("max_output_tokens")).is_some()
 }
 
 impl std::fmt::Debug for ChatCompletionsProvider {
