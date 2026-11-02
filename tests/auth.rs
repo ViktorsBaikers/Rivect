@@ -3487,3 +3487,84 @@ fn mistral_env_chain_resolves_through_the_scoped_secret_ref_seam() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class: moonshot ---------------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on a `moonshot`
+/// fixture: both recorded credential bindings resolve through the
+/// scoped `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared id keeps the
+/// typed denial, a resolved binding admits the pin offline, and a
+/// divergent profile scope is the mismatch. Resolution is
+/// binding-level: the store is read at send, never here. The
+/// recorded `KIMI_API_KEY` fallback key name proves neither region
+/// nor payment — the name never substitutes a binding (DEC-014).
+/// The per-ID `moonshot` credential/profile/region proof is the
+/// provider target's
+/// `moonshot_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn moonshot_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.moonshot]\nkind = \"api_key\"\nendpoint = \"https://api.moonshot.ai/v1\"\ncredential_ref = \"keyring:rivect-test/moonshot-direct\"\n\
+         [connections.moonshot-profiled]\nkind = \"api_key\"\nendpoint = \"https://api.moonshot.ai/v1\"\ncredential_ref = \"keyring:rivect-test/moonshot-scope\"\nprofile = \"moonshot-team\"\n\
+         [profiles.moonshot-team]\ncredential_ref = \"keyring:rivect-test/moonshot-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "moonshot")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/moonshot-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "moonshot-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/moonshot-team");
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "moonshot",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "moonshot-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/moonshot-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "moonshot-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

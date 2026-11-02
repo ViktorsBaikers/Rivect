@@ -2,7 +2,7 @@
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
-//! `minimax-code`/`minimax-code-cn` and `mistral`
+//! `minimax-code`/`minimax-code-cn`, `mistral` and `moonshot`
 //! connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -111,6 +111,16 @@
 //! env/credential-chain class resolves through the scoped `SecretRef`
 //! seam the same way `groq`'s does: an `env:`/`file:`/plaintext ref
 //! is refused at ingress, traversal stays substrate debt (DEC-006) —
+//! and the configured-or-recorded `api.moonshot.ai/v1` base of
+//! `moonshot`, whose `requireApiKey` `/models` listing and the send
+//! leg alike follow the configured base — never the recorded default
+//! when one is configured — and whose recorded K3 top-level
+//! `reasoning_effort` ladder (`low`/`high`) is a distinct predicate
+//! from the K2.x `thinking` surface this adapter never constructs:
+//! `low`/`high` ride the body verbatim, an out-of-ladder pin denies
+//! typed, and the recorded `max` has no carrier in the shared effort
+//! vocabulary, so no `max` request is ever built (DEC-014) — a
+//! fallback key name proves neither region nor payment —
 //! resolved per literal
 //! id by the contract table, never inherited
 //! across ids. The adapter authors no
@@ -763,6 +773,28 @@ const MINIMAX_CODE_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 /// seam alone and this constant carries the base alone.
 const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
 
+/// The recorded `moonshot` endpoint — the `api.moonshot.ai/v1` host
+/// the DEC-025 row's `Rivect/key → configured MOONSHOT base, default
+/// api.moonshot.ai/v1` binding names: the API root the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The configured base
+/// redirects discovery and streaming alike, and the recorded
+/// `KIMI_API_KEY` fallback key name proves neither region nor
+/// payment — no region or billing class is ever inferred from the
+/// material's name.
+const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+
+/// The recorded per-model K3 effort ladder the pinned `moonshot`
+/// rows state (`reasoning_effort` `low`/`high`): a level a model
+/// does not name is a parameter its wire contract rejects, so a pin
+/// carrying it denies typed rather than dropping `reasoning_effort`
+/// from the body. A model absent here records no effort surface, so
+/// every pinned level denies for it. The recorded `max` level has no
+/// landing in our enum and never maps onto a lower one, so no `max`
+/// request is ever constructed (DEC-014).
+const MOONSHOT_EFFORTS: &[(&str, &[EffortLevel])] =
+    &[("kimi-k3", &[EffortLevel::Low, EffortLevel::High])];
+
 /// The recorded endpoint rule a literal id binds (HZN-008): the
 /// dialect is shared across connection ids — how a configured
 /// endpoint becomes the API root is not.
@@ -1010,6 +1042,14 @@ enum EntryRule {
     /// fall-through yields is the OpenAI-compatible listing form, so it
     /// carries its id alone — the metadata leg is the rich source.
     LiteLlm,
+    /// The `moonshot` arm: the `requireApiKey` `/models` listing's
+    /// rows are offered id-only — the recorded price/roster metadata
+    /// has no vendored carrier (D6) — while the arm's live duty is
+    /// the recorded K3 effort ladder [`MOONSHOT_EFFORTS`] states:
+    /// [`ChatCompletionsProvider::check_parameters`] owns the typed
+    /// denial of a pinned `reasoning_effort` the pin's model does
+    /// not record, never a silently dropped body field.
+    Moonshot,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1371,6 +1411,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
+        }),
+        // `moonshot` (HZN-008 class B — the api-key cell, DEC-025 row
+        // `Rivect/key → configured MOONSHOT base, default
+        // api.moonshot.ai/v1`): the configured-or-recorded base
+        // redirects discovery and streaming alike, and the recorded
+        // `requireApiKey` `/models` listing is the whole catalogue —
+        // ids ride verbatim, no vendored roster or price surface is
+        // carried (D4/D6), so an empty or failed answer has no floor
+        // to fall back to. The plain bearer arm carries the stored
+        // material — the recorded `KIMI_API_KEY` fallback key name
+        // proves neither region nor payment, and a configured `region`
+        // denies as always. The recorded K3 effort ladder is a
+        // distinct predicate from the K2.x `thinking` surface the
+        // adapter never constructs: `low`/`high` ride
+        // `reasoning_effort` verbatim, an out-of-ladder pin denies
+        // typed, and the recorded `max` has no carrier — no `max`
+        // request is ever constructed (DEC-014).
+        "moonshot" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(MOONSHOT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Moonshot,
         }),
         _ => None,
     }
@@ -1903,7 +1966,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::AlibabaTokenPlan
                 | EntryRule::Firepass
                 | EntryRule::HuggingFace
-                | EntryRule::LiteLlm => Some(CatalogModel {
+                | EntryRule::LiteLlm
+                | EntryRule::Moonshot => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2125,6 +2189,13 @@ impl ChatCompletionsProvider {
             // `/models` row the recorded fall-through yields is the
             // OpenAI-compatible listing form and names its id alone.
             EntryRule::LiteLlm => Some(CatalogModel {
+                id: id.to_string(),
+                ..CatalogModel::default()
+            }),
+            // The `requireApiKey` listing's rows carry the id alone —
+            // the recorded price/roster metadata has no vendored
+            // carrier (D6).
+            EntryRule::Moonshot => Some(CatalogModel {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
@@ -2418,7 +2489,8 @@ impl ChatCompletionsProvider {
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek`, `Groq`, `HuggingFace` and `LiteLlm` — sends the
+    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm` and `Moonshot` —
+    /// sends the
     /// offered id unchanged. Each variant is listed so a future
     /// transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -2432,7 +2504,8 @@ impl ChatCompletionsProvider {
             | EntryRule::DeepSeek
             | EntryRule::Groq
             | EntryRule::HuggingFace
-            | EntryRule::LiteLlm => model_id.to_string(),
+            | EntryRule::LiteLlm
+            | EntryRule::Moonshot => model_id.to_string(),
         }
     }
 
@@ -2480,30 +2553,44 @@ impl ChatCompletionsProvider {
         body
     }
 
-    /// The recorded parameter predicate (HZN-008 `groq` row): a pinned
+    /// The recorded parameter predicate (HZN-008): a pinned
     /// `reasoning_effort` rides the body only where the pin's model
     /// records that level — every other level, and every model with no
-    /// recorded effort surface, is a parameter this class rejects. The
-    /// denial is typed and lands before the request body exists: a
-    /// fixed pin denies before any wire leg, while an auto pin — whose
-    /// model the non-authoritative listing resolved first — denies
-    /// before the chat request leg. The value is never dropped from the
-    /// body behind the caller's back. The class's other recorded-rejected
-    /// parameters (logprobs, logit_bias, top_logprobs, `messages[].name`,
-    /// `n`, temperature) are never constructed by this adapter, so none
-    /// can be dropped.
+    /// recorded effort surface, is a parameter that class rejects. The
+    /// predicate is per-arm, not per-connection: every arm whose
+    /// contract records an effort ladder — `groq`'s per-model table
+    /// and `moonshot`'s K3 ladder (DEC-014) — denies the unrecorded
+    /// pin typed, while an arm that records no ladder applies no
+    /// effort predicate at all. The denial lands before the request
+    /// body exists: a fixed pin denies before any wire leg, while an
+    /// auto pin — whose model the listing resolved first — denies
+    /// before the chat request leg. The value is never dropped from
+    /// the body behind the caller's back. The classes' other
+    /// recorded-rejected parameters (`groq`'s logprobs, logit_bias,
+    /// top_logprobs, `messages[].name`, `n`, temperature) are never
+    /// constructed by this adapter, so none can be dropped.
     fn check_parameters(
         &self,
         manifest: &RequestManifest,
         model_id: &str,
     ) -> Result<(), ProviderError> {
-        if !matches!(self.contract.entries, EntryRule::Groq) {
-            return Ok(());
-        }
+        let ladder = match self.contract.entries {
+            EntryRule::Groq => GROQ_EFFORTS,
+            EntryRule::Moonshot => MOONSHOT_EFFORTS,
+            EntryRule::IdsOnly
+            | EntryRule::Aiand
+            | EntryRule::Aimlapi
+            | EntryRule::AlibabaTokenPlan
+            | EntryRule::DeepSeek
+            | EntryRule::Firepass
+            | EntryRule::Fireworks
+            | EntryRule::HuggingFace
+            | EntryRule::LiteLlm => return Ok(()),
+        };
         let EffortAssign::Fixed { value } = &manifest.effort else {
             return Ok(());
         };
-        let recorded = GROQ_EFFORTS
+        let recorded = ladder
             .iter()
             .any(|(model, levels)| *model == model_id && levels.contains(value));
         if recorded {
