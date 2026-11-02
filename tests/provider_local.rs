@@ -21003,10 +21003,10 @@ fn provider_installed_litellm() {}
 // absent-binding form: an unbound declaration rides headerless, a
 // declared binding that cannot resolve denies typed, and a scoped key
 // bears the wire. The manual model path is the supported route — no
-// automatic discovery and no base-URL merging is built or claimed
-// (DEC-008/PROH-009), so a fixed pin opens exactly one request — and
-// the class's `/models` listing is its own catalogue rule alone, never
-// paid entitlement.
+// automatic discovery, no catalogue wire leg and no base-URL merging is
+// built or claimed (DEC-008/PROH-009/D7): the catalogue answers no
+// offers, a mounted `/models` listing is never consulted, and a fixed
+// pin opens exactly one request carrying its own model.
 
 /// The scoped credential ref a server-keyed `llama.cpp` connection binds.
 const LLAMA_CPP_REF: &str = "keyring:rivect-test/llama.cpp";
@@ -21189,12 +21189,11 @@ async fn llama_cpp_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// all: the declaration binds no `credential_ref`, DEC-011 eligibility
 /// admits the pin, the send reaches the peer with no `Authorization`
 /// header — never an empty or dummy bearer — and its reply is one
-/// outcome charged as one physical usage. The catalogue leg rides the
-/// same keyless form.
+/// outcome charged as one physical usage. The recorded contract opens
+/// no catalogue wire leg at all.
 #[tokio::test]
 async fn llama_cpp_keyless_local_mode_sends_no_credential() {
     let server = MockServer::start().await;
-    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
     mount_chat(
         &server,
         completed_stream(
@@ -21205,17 +21204,6 @@ async fn llama_cpp_keyless_local_mode_sends_no_credential() {
     .await;
     let config =
         Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
-
-    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&config));
-    let models = catalogue.expect("the keyless catalogue answers headerless");
-    drop_blocking(provider);
-    assert_eq!(model_ids(&models), [LLAMA_CPP_LISTED]);
-    let requests = server.received_requests().await.expect("recorded");
-    assert_eq!(requests.len(), 1, "the catalogue leg is one listing");
-    assert!(
-        requests[0].headers.get("authorization").is_none(),
-        "the keyless local mode sends no Authorization header on the catalogue leg"
-    );
 
     let (broker, manifest) = prepared_with(
         (
@@ -21233,21 +21221,24 @@ async fn llama_cpp_keyless_local_mode_sends_no_credential() {
     drop_blocking(broker);
 
     let requests = server.received_requests().await.expect("recorded");
-    assert_eq!(requests.len(), 2, "the listing leg then the one send");
-    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        request_paths(&requests),
+        ["/v1/chat/completions"],
+        "the send opens exactly one chat request — no `/models` egress"
+    );
     assert!(
-        requests[1].headers.get("authorization").is_none(),
+        requests[0].headers.get("authorization").is_none(),
         "no binding means no Authorization header — never a fabricated key"
     );
 }
 
 /// The recorded server-key mode of the same class: the enrolled scoped
-/// `SecretRef` material is the bearer the send and the catalogue leg
-/// both carry — one keyed form, never a mixed one.
+/// `SecretRef` material is the bearer the send carries — one keyed
+/// form, never a mixed one — and the recorded contract opens no
+/// catalogue wire leg at all.
 #[tokio::test]
 async fn llama_cpp_server_key_mode_sends_the_scoped_bearer() {
     let server = MockServer::start().await;
-    mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
     mount_chat(
         &server,
         completed_stream(
@@ -21259,11 +21250,6 @@ async fn llama_cpp_server_key_mode_sends_the_scoped_bearer() {
     let config =
         Config::parse_validated(&llama_cpp_config(&server_uri_v1(&server))).expect("valid");
 
-    let (provider, catalogue) = catalog_on_thread(enrolled_llama_cpp_provider(&config).0);
-    let models = catalogue.expect("the keyed catalogue answers");
-    drop_blocking(provider);
-    assert_eq!(model_ids(&models), [LLAMA_CPP_LISTED]);
-
     let (provider, _store) = enrolled_llama_cpp_provider(&config);
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let reply = outcome.expect("the server key admits the send");
@@ -21273,14 +21259,13 @@ async fn llama_cpp_server_key_mode_sends_the_scoped_bearer() {
     let requests = server.received_requests().await.expect("recorded");
     assert_eq!(
         request_paths(&requests),
-        ["/v1/models", "/v1/chat/completions"],
-        "the keyed listing leg then the send"
+        ["/v1/chat/completions"],
+        "the send opens exactly one chat request — no `/models` egress"
     );
-    assert!(
-        requests
-            .iter()
-            .all(|request| received_auth(request) == format!("Bearer {LLAMA_CPP_KEY}")),
-        "the enrolled server key bears every leg of the same class"
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {LLAMA_CPP_KEY}"),
+        "the enrolled server key bears the send"
     );
 }
 
@@ -21415,14 +21400,14 @@ fn llama_cpp_discriminates_the_recorded_default_base() {
     drop_blocking(provider);
 }
 
-/// The manual model path is the supported route: a fixed pin sends
-/// exactly one request, the chat leg, and never a `GET …/models` — no
-/// automatic discovery and no base-URL merging exists on this
-/// connection (DEC-008/PROH-009). A mounted listing leaves that count
-/// unchanged, so a discovery leg added anywhere on the send path reds
-/// here.
+/// The recorded contract names no discovery leg for `llama.cpp`: the
+/// catalogue answers no offers — unrecorded, so empty — with no wire
+/// leg and no credential read, a mounted `/models` listing is never
+/// consulted and never adds an offer, and a fixed pin still sends its
+/// own model as the one chat request — the manual model path is the
+/// only served route (DEC-008/PROH-009/D7).
 #[tokio::test]
-async fn llama_cpp_discovery_is_never_attempted() {
+async fn llama_cpp_catalog_opens_no_wire_leg() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
     mount_chat(
@@ -21435,6 +21420,28 @@ async fn llama_cpp_discovery_is_never_attempted() {
     .await;
     let config =
         Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
+
+    // the catalogue is the recorded fixed list alone — unrecorded, so
+    // empty; no `/models` request exists on this connection, so the
+    // mounted listing can never add an offer
+    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&config));
+    let models = catalogue.expect("the recorded catalogue answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "the record names no roster — an offer would be invented input"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no discovery leg exists: the listing was never consulted"
+    );
+
+    // a fixed pin sends exactly the one chat request, its own model —
+    // no `/models` leg opens on the send path either
     let (broker, manifest) = prepared_with(
         (
             keyless_llama_cpp_provider(&config),
@@ -21455,69 +21462,7 @@ async fn llama_cpp_discovery_is_never_attempted() {
         ["/v1/chat/completions"],
         "exactly the one chat request — no discovery leg is attempted"
     );
-    assert!(
-        !request_paths(&requests)
-            .iter()
-            .any(|path| path.ends_with("/models")),
-        "no `/models` request is sent on this connection"
-    );
-}
-
-/// A `/models` HTTP 200 is never paid entitlement for `llama.cpp`
-/// (INV-010): the class's own catalogue rule is the configured base's
-/// listing under ids-only offers, so a listed id is offered as served
-/// with no price or capability mark, and the fixed pin's send still
-/// posts its own model — never the listed id as a substitute.
-#[tokio::test]
-async fn llama_cpp_local_listing_is_never_paid_entitlement() {
-    let server = MockServer::start().await;
-    mount_models(&server, vec![json!({"id": "listed-entitlement-claim"})]).await;
-    let config =
-        Config::parse_validated(&llama_cpp_keyless_config(&server_uri_v1(&server))).expect("valid");
-
-    let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&config));
-    let models = catalogue.expect("the local listing answers");
-    drop_blocking(provider);
-    assert_eq!(
-        model_ids(&models),
-        ["listed-entitlement-claim"],
-        "the class's own catalogue rule decides the offer — no seed floor joins it"
-    );
-    for model in &models {
-        assert_eq!(
-            model,
-            &CatalogModel {
-                id: model.id.clone(),
-                ..CatalogModel::default()
-            },
-            "{} keeps the ids-only surface — a local answer confers no price or capability",
-            model.id
-        );
-    }
-    assert_eq!(
-        server.received_requests().await.expect("recorded").len(),
-        1,
-        "the listing leg is one request, never a paid-access check"
-    );
-
-    let (provider, outcome) = send_on_thread(
-        keyless_llama_cpp_provider(&config),
-        prepared_manifest(&config),
-    );
-    let err = outcome.expect_err("a 200 listing never releases the pin");
-    let ProviderError::Transport { connection, cause } = &err else {
-        panic!("the unmounted request leg is the typed transport denial: {err:?}");
-    };
-    assert_eq!(connection, "llama.cpp");
-    assert!(
-        cause.class() == TransportClass::HttpStatus { code: 404 },
-        "the request leg answers the peer's status: {cause}"
-    );
-    drop_blocking(provider);
-    let requests = server.received_requests().await.expect("recorded");
-    assert_eq!(requests.len(), 2, "the listing leg plus the request leg");
-    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
-    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
     assert_eq!(
         body["model"],
         json!(LLAMA_CPP_MODEL),
@@ -21684,27 +21629,25 @@ async fn llama_cpp_provider_legs_matrix_executes_all_expected_legs() {
         .expect("the keyless row is valid");
     let mut reported = BTreeMap::new();
 
-    // CATALOG: the configured base's listing is the whole offer surface —
-    // no seed floor — and no offer carries a price or capability mark the
-    // class does not record.
+    // CATALOG: the recorded contract names no discovery leg — the
+    // catalogue answers no offers, the mounted `/models` listing is
+    // never consulted, and no offer can carry a price or capability
+    // mark the class does not record.
     let (provider, catalogue) = catalog_on_thread(keyless_llama_cpp_provider(&keyless));
     let listed = catalogue.expect("catalog answers");
+    let requests = server.received_requests().await.expect("recorded");
+    let no_listing_leg = !request_paths(&requests)
+        .iter()
+        .any(|path| path.ends_with("/models"));
+    drop_blocking(provider);
     reported.insert(
         "CATALOG",
-        if model_ids(&listed) == [LLAMA_CPP_LISTED]
-            && listed.iter().all(|model| {
-                model.price == ModelPrice::Unknown
-                    && !model.vision
-                    && !model.reasoning
-                    && model.efforts.is_empty()
-            })
-        {
+        if listed.is_empty() && no_listing_leg {
             "PASS"
         } else {
             "FAIL"
         },
     );
-    drop_blocking(provider);
 
     // AUTH: the one class carries both recorded forms — the server key
     // bears the chat request, the keyless declaration sends headerless.

@@ -87,13 +87,15 @@
 //! resolve denies typed, and a scoped key sends the bearer — neither
 //! form invents a catalogue — and the configured `llama.cpp` local base
 //! verbatim, or the recorded `http://127.0.0.1:8080` default when the
-//! field is empty, whose catalogue is that base's own `/models` listing
-//! and whose recorded optional auth shares the same absent-binding form
-//! (no discovery beyond the listing leg, no base-URL merging), and the
-//! configured `lm-studio` local base under the same shape with its own
-//! recorded default `http://127.0.0.1:1234/v1` — neither local class
-//! borrows the other's base (EDGE-006) — and the configured-or-recorded
-//! `api.minimax.io/v1` international base of `minimax-code`, whose plan
+//! field is empty, whose recorded contract opens no `/models` leg: the
+//! catalogue is empty and the recorded manual model path is the only
+//! served route, with no base-URL merging (DEC-008/PROH-009/D7), while
+//! its recorded optional auth shares the same absent-binding form, and
+//! the configured `lm-studio` local base under the same local-endpoint
+//! shape with its own recorded default `http://127.0.0.1:1234/v1` —
+//! neither local class borrows the other's base (EDGE-006) — and the
+//! configured-or-recorded `api.minimax.io/v1` international base of
+//! `minimax-code`, whose plan
 //! key rides as the plain bearer — a plan-scoped key is a billing fact
 //! of the connection, never a connection kind and never a PAYG
 //! substitute (DEC-007/DEC-010) — and `minimax-code-cn`'s own recorded
@@ -1396,19 +1398,20 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // `llama.cpp` (HZN-008 class B — the local-endpoint cell): the
         // configured local base verbatim, or the recorded default
         // `http://127.0.0.1:8080` when the required `endpoint` field is
-        // empty. The catalogue is the configured base's own `/models`
-        // listing under ids-only offers — a local listing answer proves
-        // no paid entitlement — and no discovery is attempted beyond
-        // that leg: the recorded manual model path is the supported
-        // route, with no base-URL merging (DEC-008/PROH-009). The
-        // recorded auth is optional beside the server-key mode, so the
-        // credential arm is the absent-binding form: an unbound
+        // empty. The recorded contract names no discovery leg — no
+        // `/models` call and no vendored roster — so the catalogue is
+        // the recorded fixed list alone, which this class leaves
+        // unrecorded: the lookup opens no wire leg and resolves no
+        // credential, and the recorded manual model path is the only
+        // served route, with no base-URL merging (DEC-008/PROH-009/D7).
+        // The recorded auth is optional beside the server-key mode, so
+        // the credential arm is the absent-binding form: an unbound
         // declaration rides headerless, a declared binding that cannot
         // resolve denies typed, and a scoped key rides as the bearer.
         "llama.cpp" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(LLAMA_CPP_BASE_URL),
-            catalog: CatalogRule::Listing,
+            catalog: CatalogRule::Allowlist(&[]),
             credential: CredentialRule::OpenProxy,
             entries: EntryRule::IdsOnly,
         }),
@@ -1418,12 +1421,13 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // is empty — its own base, never `llama.cpp`'s `:8080`
         // (EDGE-006). The catalogue is that base's own `/models`
         // listing under ids-only offers, so a listing answer proves no
-        // paid access; the recorded `/models` response also carries the
-        // loaded-context metadata, which has no carrier on
-        // [`CatalogModel`] and is not synthesized, and no discovery or
-        // base-URL merging is built beyond the listing leg (D8: the
-        // recorded extra `/v1/responses` path is a different connection
-        // class and stays unbuilt). The local class records no account
+        // paid access; the recorded loaded-context metadata rides the
+        // native `/api/v0/models` probe, and this band builds no
+        // native-endpoint seam to fetch it, so it is neither read nor
+        // synthesized (D9), and no discovery or base-URL merging is
+        // built beyond the listing leg (D8: the recorded extra
+        // `/v1/responses` path is a different connection class and
+        // stays unbuilt). The local class records no account
         // or org predicate — no shared external account exists — so
         // none is asserted. The recorded auth is optional beside the
         // server-key mode, so the credential arm is the absent-binding
@@ -3974,7 +3978,7 @@ fn mark_nanogpt_thinking_bases(data: &[Value], models: &mut [CatalogModel]) {
         if let Some(id) = entry.get("id").and_then(Value::as_str)
             && let Some(base) = nanogpt_thinking_base(id)
         {
-            bases.insert(base.to_string());
+            bases.insert(base);
         }
     }
     for model in models.iter_mut() {
@@ -3997,7 +4001,8 @@ fn mark_nanogpt_thinking_bases(data: &[Value], models: &mut [CatalogModel]) {
 fn is_likely_novita_chat_entry(id: &str, entry: &Value) -> bool {
     let active = entry
         .get("status")
-        .is_none_or(|status| status.as_f64().is_none_or(|status| status == 1.0));
+        .and_then(Value::as_f64)
+        .is_none_or(|status| status == 1.0);
     active
         && !id.to_lowercase().starts_with("ai_infer_test")
         && entry

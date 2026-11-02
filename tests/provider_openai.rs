@@ -4162,21 +4162,9 @@ fn meta_config(endpoint: &str) -> String {
     )
 }
 
-/// The same construction seam as `provider_result`, named for the
-/// `meta` fixture the legs below read.
-fn meta_provider_result(
-    config: Config,
-    connection: String,
-    store: Arc<support::MapStore>,
-) -> Result<OpenAiProvider, ProviderError> {
-    std::thread::spawn(move || OpenAiProvider::new(&config, &connection, store))
-        .join()
-        .expect("the provider thread joins")
-}
-
 fn meta_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
-    let provider = meta_provider_result(config.clone(), "meta".to_string(), store.clone())
+    let provider = provider_result(config.clone(), "meta".to_string(), store.clone())
         .expect("the shared adapter builds for the meta id");
     (provider, store)
 }
@@ -4307,7 +4295,7 @@ async fn meta_valid_control_yields_one_outcome_and_one_physical_usage() {
 fn meta_dialect_is_keyed_on_the_literal_connection_id() {
     let config = Config::parse_validated(&meta_config("http://127.0.0.1:1/v1")).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
-    let err = meta_provider_result(config.clone(), "meta-plus".to_string(), store)
+    let err = provider_result(config.clone(), "meta-plus".to_string(), store)
         .expect_err("a different literal id is not this dialect");
     assert!(matches!(err, ProviderError::DialectMismatch { .. }));
 
@@ -4544,7 +4532,7 @@ async fn meta_request_carries_no_reasoning_artifact_include() {
     ))
     .expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
-    let provider = meta_provider_result(openai.clone(), "openai".to_string(), store)
+    let provider = provider_result(openai.clone(), "openai".to_string(), store)
         .expect("the shared adapter builds for openai too");
     let manifest = {
         let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
@@ -4584,7 +4572,7 @@ async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_witho
         "kind = \"api_key\"\nregion = \"eu-1\"",
     ))
     .expect("valid");
-    let err = meta_provider_result(
+    let err = provider_result(
         regioned,
         "meta".to_string(),
         Arc::new(support::MapStore::seeded(
@@ -4611,7 +4599,7 @@ async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_witho
         server_uri_v1(&server)
     ))
     .expect("valid");
-    let err = meta_provider_result(
+    let err = provider_result(
         mismatched,
         "meta".to_string(),
         Arc::new(support::MapStore::seeded(
@@ -4629,7 +4617,7 @@ async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_witho
     // a bound ref with no material at its own scope — the sibling
     // scope's material stays sealed behind the typed denial
     let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
-    let provider = meta_provider_result(
+    let provider = provider_result(
         config.clone(),
         "meta".to_string(),
         Arc::new(support::MapStore::seeded(
@@ -4655,7 +4643,7 @@ async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_witho
         .mount(&server)
         .await;
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
-    let provider = meta_provider_result(config.clone(), "meta".to_string(), store).expect("builds");
+    let provider = provider_result(config.clone(), "meta".to_string(), store).expect("builds");
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("a refused token is a typed transport denial");
     let ProviderError::Transport { connection, cause } = &err else {
@@ -4675,8 +4663,8 @@ async fn meta_wrong_credential_profile_or_region_denies_with_typed_context_witho
     let server = MockServer::start().await;
     let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[(META_REF, SECRET)]));
-    let provider = meta_provider_result(config.clone(), "meta".to_string(), store)
-        .expect("the adapter builds");
+    let provider =
+        provider_result(config.clone(), "meta".to_string(), store).expect("the adapter builds");
     assert!(
         !format!("{provider:?}").contains(SECRET),
         "provider Debug never carries credential material"
@@ -4745,7 +4733,7 @@ async fn meta_typed_denial_recovers_through_the_same_credential_seam() {
     .await;
     let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
-    let provider = meta_provider_result(config.clone(), "meta".to_string(), store.clone())
+    let provider = provider_result(config.clone(), "meta".to_string(), store.clone())
         .expect("binding resolves");
     let manifest = prepared_manifest(&config);
 
@@ -4991,7 +4979,7 @@ async fn meta_provider_legs_matrix_executes_all_expected_legs() {
     // AUTH: an empty store denies at send with the typed verdict.
     let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
     let provider =
-        meta_provider_result(config.clone(), "meta".to_string(), empty).expect("binding resolves");
+        provider_result(config.clone(), "meta".to_string(), empty).expect("binding resolves");
     let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
     reported.insert(
         "AUTH",
@@ -5025,7 +5013,7 @@ async fn meta_provider_legs_matrix_executes_all_expected_legs() {
     // through the same credential seam.
     let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
     let provider =
-        meta_provider_result(config.clone(), "meta".to_string(), empty.clone()).expect("resolves");
+        provider_result(config.clone(), "meta".to_string(), empty.clone()).expect("resolves");
     let manifest = prepared_manifest(&config);
     let (provider, denied) = send_on_thread(provider, manifest.clone());
     let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
