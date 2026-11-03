@@ -1176,9 +1176,11 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `mistral` the recorded class-B env-chain plug,
 /// `moonshot`, `nanogpt`, `novita`, `nvidia`, `qianfan`,
 /// `qwen-portal`, `siliconflow`, `siliconflow-cn`, `synthetic`,
-/// `together`, `venice` and `xiaomi` the recorded class-B api-key plugs —
-/// `venice` over its host's public catalogue and `xiaomi` on its recorded
-/// PAYG literal, never a token-plan cluster — and
+/// `together`, `venice`, `xiaomi` and `xiaomi-token-plan-ams` the
+/// recorded class-B api-key plugs — `venice` over its host's public
+/// catalogue, `xiaomi` on its recorded PAYG literal and
+/// `xiaomi-token-plan-ams` on the pinned AMS token-plan literal, never
+/// another cluster — and
 /// `minimax-code`/`minimax-code-cn` the recorded class-P plan-key plugs
 /// on that same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
@@ -1262,6 +1264,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "vllm" => Some(Dialect::ChatCompletions),
         "wafer-serverless" => Some(Dialect::ChatCompletions),
         "xiaomi" => Some(Dialect::ChatCompletions),
+        "xiaomi-token-plan-ams" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
