@@ -5299,3 +5299,691 @@ async fn xiaomi_token_plan_ams_provider_legs_matrix_executes_all_expected_legs()
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-ams = NOT_RUN"]
 fn provider_installed_xiaomi_token_plan_ams() {}
+
+// ----- xiaomi-token-plan-cn --------------------------------------------------
+
+// The `xiaomi-token-plan-cn` connection's proof legs (HZN-008 class B —
+// the token-plan api-key cell): the shared Chat Completions adapter serves
+// the literal id under its own recorded predicates. The configured
+// `endpoint` carries the API base verbatim, an empty one resolves the
+// pinned CN literal `https://token-plan-cn.xiaomimimo.com/v1`, and a
+// configured `region` is denied: the contract names none. The PAYG base and
+// the AMS/SGP token-plan bases are separate literals, and this arm never
+// selects one — not from a key prefix, not from a profile, and never by
+// probing another cluster (PROH-010): the configured base is the only host
+// a leg opens a wire toward. The `/models` listing is the whole catalogue
+// under ids-only offers, and the plain bearer carries the CN key.
+
+/// The literal connection id this class serves.
+const XIAOMI_CN: &str = "xiaomi-token-plan-cn";
+
+/// The scoped credential ref the declaration binds.
+const XIAOMI_CN_REF: &str = "keyring:rivect-test/xiaomi-token-plan-cn";
+
+/// Fixture CN key material — never a real credential, only ever sent to a
+/// loopback fixture.
+const XIAOMI_CN_KEY: &str = "fixture-xiaomi-cn-token-plan-key";
+
+/// A fixture key shaped like the PAYG class: the class records no key-class
+/// sniffing, so this prefix selects no base.
+const XIAOMI_CN_PAYG_SHAPED_KEY: &str = "sk-fixture-payg-key";
+
+/// The pinned model id the fixed-pin legs carry — a listed id.
+const XIAOMI_CN_MODEL: &str = "mimo-v2-flash";
+
+/// One `xiaomi-token-plan-cn` connection pointing at the fixture peer: the
+/// api-key class binds its scoped key, so the declaration carries the ref
+/// the send must resolve.
+fn xiaomi_cn_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-cn]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{XIAOMI_CN_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-cn\", model_id = \"{XIAOMI_CN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The adapter over an explicit store — the seam the recovery leg enrolls
+/// into after its typed denial.
+fn xiaomi_cn_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let provider = provider_result(config.clone(), XIAOMI_CN.to_string(), store.clone())
+        .expect("the shared adapter builds for the xiaomi-token-plan-cn id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the recorded CN key, or an empty
+/// store for the absent-binding leg.
+fn xiaomi_cn_provider(
+    config: &Config,
+    material: Option<&str>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = match material {
+        None => Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Some(material) => {
+            Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(XIAOMI_CN_REF, material)],
+            ))
+        }
+    };
+    xiaomi_cn_provider_with(config, store)
+}
+
+// ----- TP-PROVIDER-WIRE::xiaomi-token-plan-cn --------------------------------
+
+/// A configured `xiaomi-token-plan-cn` connection returns a verified model
+/// outcome through the standard Broker: the api-key pin prepares offline, the
+/// adapter posts exactly the frozen manifest as a `chat/completions` request —
+/// model id verbatim, system+user messages, `stream` and the shared
+/// `stream_options.include_usage` member — under the resolved bearer, never a
+/// `reasoning_effort` for auto effort — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the reported
+/// usage.
+#[tokio::test]
+async fn xiaomi_token_plan_cn_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified cn outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections[XIAOMI_CN].credential_ref.as_deref(),
+        Some(XIAOMI_CN_REF),
+        "the recorded api-key class binds its scoped ref"
+    );
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: prove the wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-cn", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified cn outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XIAOMI_CN_KEY}"),
+        "the resolved CN key bears the wire"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], XIAOMI_CN_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the shared Chat Completions body asks for the usage report"
+    );
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, XIAOMI_CN);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::xiaomi-token-plan-cn -----------------------------
+
+/// The configured base's `/models` listing is the whole catalogue and the
+/// configured base is the only host any leg contacts: the listing and the send
+/// both ride the configured peer, a stand-in for another cluster receives
+/// nothing, and a PAYG-shaped key resolves the CN literal rather than
+/// selecting another family host (PROH-010). A failed listing is the typed
+/// denial on its one attempt — never a fallback to another cluster.
+#[tokio::test]
+async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
+    // a family stand-in: mounted and answering, but never configured, so any
+    // byte it sees would be an unrecorded cross-cluster probe
+    let sibling = MockServer::start().await;
+    mount_models(&sibling, vec![json!({"id": "family-sibling"})]).await;
+    mount_chat(&sibling, completed_stream("sibling", None)).await;
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": XIAOMI_CN_MODEL})]).await;
+    mount_chat(&server, completed_stream("cn", None)).await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("the CN listing answers"),
+        vec![CatalogModel {
+            id: XIAOMI_CN_MODEL.to_string(),
+            ..CatalogModel::default()
+        }],
+        "the listing is offered id-only under the recorded transform"
+    );
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the configured CN base serves the send");
+    drop_blocking(provider);
+
+    let primary = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        primary.len(),
+        2,
+        "one listing and one chat request on the configured base"
+    );
+    assert_eq!(primary[0].url.path(), "/v1/models");
+    assert_eq!(primary[1].url.path(), "/v1/chat/completions");
+    for request in &primary {
+        assert_eq!(received_auth(request), format!("Bearer {XIAOMI_CN_KEY}"));
+    }
+    let sibling_requests = sibling.received_requests().await.expect("recorded");
+    assert!(
+        sibling_requests.is_empty(),
+        "no other cluster was contacted: {sibling_requests:?}"
+    );
+
+    // a PAYG-shaped key selects no base: the empty endpoint still resolves
+    // the CN literal, and no other family host appears anywhere
+    let config = Config::parse_validated(&xiaomi_cn_config("")).expect("valid");
+    let provider = provider_result(
+        config,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(XIAOMI_CN_REF, XIAOMI_CN_PAYG_SHAPED_KEY)],
+        )),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-cn id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://token-plan-cn.xiaomimimo.com/v1\""),
+        "the CN literal is the recorded default: {debug}"
+    );
+    for foreign in ["token-plan-ams", "token-plan-sgp", "://api.xiaomimimo.com"] {
+        assert!(
+            !debug.contains(foreign),
+            "a PAYG-shaped key never selects another family host ({foreign}): {debug}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        sibling.received_requests().await.expect("recorded").is_empty(),
+        "resolving the key opened no probe to the stand-in cluster"
+    );
+
+    // a failed listing is a typed denial on its one attempt: no fallback
+    // to a sibling cluster, and nothing accounted
+    let failing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&failing))).expect("valid");
+    let (provider, _store) = xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY));
+    let (provider, denied) = catalog_on_thread(provider);
+    let ProviderError::Transport { connection, cause } =
+        denied.expect_err("a failed listing denies typed instead of inventing a floor")
+    else {
+        panic!("a failed listing is the typed transport denial")
+    };
+    assert_eq!(connection, XIAOMI_CN);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 500 },
+        "the peer's status is the context: {cause}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        failing.received_requests().await.expect("recorded").len(),
+        1,
+        "the failed listing is one attempt, never a cross-cluster retry"
+    );
+    assert!(
+        sibling.received_requests().await.expect("recorded").is_empty(),
+        "the failed leg never reached another cluster"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::xiaomi-token-plan-cn --------------------------------
+
+/// Wrong, absent or unresolvable credential, or a configured region, never
+/// produce a false success for `xiaomi-token-plan-cn`: a configured `region` —
+/// the recorded contract names none — denies `RegionMismatch` with the
+/// connection context, a profile-bound ref whose scope disagrees with the
+/// binding denies `CredentialProfileMismatch`, an unseeded binding denies
+/// `CredentialAbsent` before any wire leg, and a refused key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor the
+/// offered credential material or the peer's body, reaches Display or Debug.
+#[tokio::test]
+async fn xiaomi_token_plan_cn_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+{
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling scope
+    // holds real material so the no-secret assertion proves no cross-scope
+    // leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &xiaomi_cn_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XIAOMI_CN_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, XIAOMI_CN);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, XIAOMI_CN_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-cn]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-cn\", model_id = \"{XIAOMI_CN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XIAOMI_CN_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, XIAOMI_CN_KEY.as_bytes());
+
+    // an unresolvable binding denies before opening a chat leg
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xiaomi_cn_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let err = denied.expect_err("an unseeded binding denies typed");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the absent CN key is the typed denial: {err}"
+    );
+    assert_no_secret_or_body(&err, XIAOMI_CN_KEY.as_bytes());
+    drop_blocking(provider);
+    assert!(
+        server.received_requests().await.expect("recorded").is_empty(),
+        "the three denied legs opened no wire leg"
+    );
+
+    // a refused key is a typed transport denial: the wire never coerces a
+    // wrong credential into success, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, XIAOMI_CN);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, XIAOMI_CN_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XIAOMI_CN_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::xiaomi-token-plan-cn ----------------------------
+
+/// Hostile stream input never reports success for `xiaomi-token-plan-cn`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are each the
+/// unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn xiaomi_token_plan_cn_rejects_partial_tool_block_and_unknown_terminal() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-cn", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-cn", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::xiaomi-token-plan-cn -----------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `xiaomi-token-plan-cn` to the shared Chat Completions dialect, an empty
+/// endpoint resolves its own pinned CN `token-plan-cn.xiaomimimo.com/v1`
+/// base — never the PAYG or AMS/SGP literal or a sibling class's default — a
+/// configured base stays verbatim, and loopback never serves the reserved id.
+#[test]
+fn xiaomi_token_plan_cn_default_base_is_the_cn_literal() {
+    assert_eq!(
+        rivect::providers::dialect_for(XIAOMI_CN),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&xiaomi_cn_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-cn id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://token-plan-cn.xiaomimimo.com/v1\""),
+        "an empty endpoint resolves the pinned CN base: {debug}"
+    );
+    for foreign in ["token-plan-ams", "token-plan-sgp", "://api.xiaomimimo.com", "127.0.0.1"] {
+        assert!(
+            !debug.contains(foreign),
+            "xiaomi-token-plan-cn never borrows another family or sibling base ({foreign}): {debug}"
+        );
+    }
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured = Config::parse_validated(&xiaomi_cn_config(
+        "https://gateway.example.test/xiaomi-cn/v1/",
+    ))
+    .expect("the trailing-slash config is valid");
+    let provider = provider_result(
+        configured,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-cn id");
+    assert!(
+        format!("{provider:?}")
+            .contains("endpoint: \"https://gateway.example.test/xiaomi-cn/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-cn]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-cn\", model_id = \"{XIAOMI_CN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(XIAOMI_CN).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(XIAOMI_CN, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = provider_result(
+        local,
+        XIAOMI_CN.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::xiaomi-token-plan-cn ------------------------------
+
+/// The legs matrix enforces the recorded expected set for
+/// `xiaomi-token-plan-cn`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({"id": XIAOMI_CN_MODEL, "context_length": 131072})],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_cn_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the keyed listing under the ids-only transform — a stated
+    // `context_length` maps nothing for this class.
+    let (provider, _store) = xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == XIAOMI_CN_MODEL
+                && model.context_window.is_none())
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let (provider, _store) = xiaomi_cn_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider(&config, Some(XIAOMI_CN_KEY)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-cn", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry through
+    // the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/xiaomi-cn", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(XIAOMI_CN_REF, XIAOMI_CN_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        xiaomi_cn_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xiaomi-cn",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/xiaomi-cn", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::xiaomi-token-plan-cn ---------------------------
+
+/// TP-PROVIDER-INSTALLED::xiaomi-token-plan-cn = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline slice never
+/// runs — a real CN request needs its own fresh authorization.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-cn = NOT_RUN"]
+fn provider_installed_xiaomi_token_plan_cn() {}

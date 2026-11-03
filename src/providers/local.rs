@@ -5,7 +5,8 @@
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
 //! `siliconflow-cn`, `synthetic`, `together`, `venice`, `vllm`,
-//! `wafer-serverless`, `xiaomi` and `xiaomi-token-plan-ams`
+//! `wafer-serverless`, `xiaomi`, `xiaomi-token-plan-ams` and
+//! `xiaomi-token-plan-cn`
 //! connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
@@ -259,6 +260,11 @@
 //! selected by the configured endpoint alone (PROH-010) — under the
 //! same ids-only listing and plain bearer, with the recorded sign-in
 //! ladder remaining recorded knowledge rather than runtime behaviour.
+//! The configured-or-recorded `https://token-plan-cn.xiaomimimo.com/v1`
+//! base of `xiaomi-token-plan-cn` is the pinned CN token-plan literal —
+//! never the PAYG base or the AMS/SGP token-plan regions, selected by
+//! the configured endpoint alone (PROH-010) — under the same ids-only
+//! listing and plain bearer.
 //! The adapter authors no async code — [`Provider::send`] is a blocking
 //! single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -1099,6 +1105,17 @@ const XIAOMI_PAYG_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 /// selected by the configured endpoint alone. The class records no
 /// region selector, so a configured `region` denies typed.
 const XIAOMI_TOKEN_PLAN_AMS_BASE_URL: &str = "https://token-plan-ams.xiaomimimo.com/v1";
+
+/// The recorded default API root of a `xiaomi-token-plan-cn`
+/// connection (`https://token-plan-cn.xiaomimimo.com/v1` in the
+/// traceability per-ID row): the pinned CN token-plan literal the
+/// required `endpoint` field's empty string resolves under. The PAYG
+/// base and the AMS/SGP token-plan bases are their own literals, never
+/// a fallback or probe target from here (PROH-010), and `SecretRef`
+/// bytes state no key class this arm could sniff — the base is
+/// selected by the configured endpoint alone. The class records no
+/// region selector, so a configured `region` denies typed.
+const XIAOMI_TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -2147,6 +2164,25 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "xiaomi-token-plan-ams" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(XIAOMI_TOKEN_PLAN_AMS_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
+        // `xiaomi-token-plan-cn` (HZN-008 class B — the token-plan
+        // api-key cell): the configured-or-recorded
+        // `https://token-plan-cn.xiaomimimo.com/v1` CN literal — never
+        // the PAYG base or the AMS/SGP token-plan regions, selected
+        // neither by key material (opaque `SecretRef` bytes state no
+        // class) nor by probing another cluster (PROH-010) — the
+        // configured base's own `/models` listing under ids-only offers,
+        // and the api key riding the plain bearer. The class records no
+        // seed or vendored price row, so an empty or failed answer has no
+        // floor to fall back to, and the recorded sign-in ladder is
+        // recorded knowledge, never runtime behaviour. A configured
+        // `region` denies: the contract names none.
+        "xiaomi-token-plan-cn" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(XIAOMI_TOKEN_PLAN_CN_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
