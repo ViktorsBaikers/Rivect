@@ -21013,3 +21013,4 @@ include!("provider_local/band2.rs");
 
 // Band-3 tests keep their root names; the split restores the duplicate scanner's per-file coverage.
 include!("provider_local/band3.rs");
+include!("provider_local/band4.rs");

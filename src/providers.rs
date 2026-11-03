@@ -7,6 +7,30 @@
 //! diagnostics and manifests, and [`CredentialStore`] is the only path
 //! between a native secret store and an adapter — secret bytes never
 //! leave the store boundary (INV-001).
+//!
+//! # Recorded connection contract (band 4)
+//!
+//! Each row is the literal id's recorded source class (HZN-008): the
+//! dialect, default base, credential class and region fact its arm
+//! binds. The required `endpoint` field's empty string is the sentinel
+//! for the row's recorded default base, never "no host"; none of the
+//! ten records a `region` field, so a configured `region` denies typed.
+//! An id whose arm has not landed has no dialect and denies
+//! `DialectMismatch` — a row is the recorded target, not a built-state
+//! claim.
+//!
+//! | id | dialect | recorded default base | credential class | region |
+//! | --- | --- | --- | --- | --- |
+//! | `venice` | Chat Completions | `https://api.venice.ai/api/v1` | `api_key` bearer — its public listing is wire-keyless, not config-keyless | none |
+//! | `vllm` | Chat Completions | `http://127.0.0.1:8000/v1` | open proxy — absent binding or server key; `kind = "local"` is the shipped headerless form | none |
+//! | `wafer-serverless` | Chat Completions | `https://pass.wafer.ai/v1` | `api_key` bearer | none |
+//! | `xai` | Responses | `https://api.x.ai/v1` | `api_key` bearer | none |
+//! | `xai-oauth` | Responses | `https://api.x.ai/v1` | `api_key` bearer (device-code token; live login stays deferred) | none |
+//! | `xiaomi` | Chat Completions | `https://api.xiaomimimo.com/v1` | `api_key` bearer (PAYG literal) | none |
+//! | `xiaomi-token-plan-ams` | Chat Completions | `https://token-plan-ams.xiaomimimo.com/v1` | `api_key` bearer (token-plan literal) | none |
+//! | `xiaomi-token-plan-cn` | Chat Completions | `https://token-plan-cn.xiaomimimo.com/v1` | `api_key` bearer (token-plan literal) | none |
+//! | `xiaomi-token-plan-sgp` | Chat Completions | `https://token-plan-sgp.xiaomimimo.com/v1` | `api_key` bearer (token-plan literal) | none |
+//! | `yolo-auto` | Chat Completions | `https://yolo-auto.com/v1` | `api_key` bearer | none |
 
 use crate::config::{Config, ConnKind, Connection, ModelAssign, Profile};
 use crate::model::RequestManifest;
@@ -1144,7 +1168,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
 /// are its recorded class-A/class-P plugs speaking the same dialect,
 /// with `litellm` the recorded class-B configured-proxy plug,
-/// `llama.cpp`/`lm-studio` the recorded class-B local-endpoint plugs,
+/// `llama.cpp`/`lm-studio`/`vllm` the recorded class-B local-endpoint
+/// plugs,
 /// `mistral` the recorded class-B env-chain plug,
 /// `moonshot`, `nanogpt`, `novita`, `nvidia`, `qianfan`,
 /// `qwen-portal`, `siliconflow`, `siliconflow-cn`, `synthetic` and
@@ -1226,6 +1251,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "siliconflow-cn" => Some(Dialect::ChatCompletions),
         "synthetic" => Some(Dialect::ChatCompletions),
         "together" => Some(Dialect::ChatCompletions),
+        "vllm" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }
@@ -1309,8 +1335,8 @@ impl Provider for LoopbackProvider {
 /// Whether a literal connection id records the credential-optional
 /// absent-binding form: the open proxy (`litellm`) — a configured proxy
 /// that serves with or without a key — and the local-endpoint class
-/// (`llama.cpp`, `lm-studio`, `ollama`) — a local server whose recorded
-/// auth is optional beside its server-key mode. Both admit a
+/// (`llama.cpp`, `lm-studio`, `ollama`, `vllm`) — a local server whose
+/// recorded auth is optional beside its server-key mode. Both admit a
 /// declaration that omits `credential_ref`, an absent binding sends no
 /// `Authorization` header — never a dummy key — and the pin stays
 /// offline-usable. The catalogue-only `openrouter` is the exception
@@ -1320,13 +1346,16 @@ impl Provider for LoopbackProvider {
 /// requires its scoped binding at ingress and at eligibility.
 ///
 /// Its contract-side twin for the CC local-endpoint ids (`litellm`,
-/// `llama.cpp`, `lm-studio`) is `CredentialRule::OpenProxy` in the
-/// local adapter's per-id table, the arm that carries the class's wire
-/// form; `ollama`'s contract side is the Responses adapter's
+/// `llama.cpp`, `lm-studio`, `vllm`) is `CredentialRule::OpenProxy` in
+/// the local adapter's per-id table, the arm that carries the class's
+/// wire form; `ollama`'s contract side is the Responses adapter's
 /// `Option<SecretRef>` arm.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
-    matches!(connection, "litellm" | "llama.cpp" | "lm-studio" | "ollama")
+    matches!(
+        connection,
+        "litellm" | "llama.cpp" | "lm-studio" | "ollama" | "vllm"
+    )
 }
 
 /// Whether a literal connection id records the absent-binding form at

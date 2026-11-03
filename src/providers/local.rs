@@ -4,7 +4,7 @@
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
-//! `siliconflow-cn`, `synthetic` and `together` connections' adapter —
+//! `siliconflow-cn`, `synthetic`, `together` and `vllm` connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -208,7 +208,16 @@
 //! (DEC-005), and the key-gated `/models` listing is the whole catalogue
 //! with no entry filter — every parseable id is an offer, each `data[]`
 //! row mapping the id plus `context_length` and `max_completion_tokens`
-//! when stated (DEC-020) — with no seed floor. The adapter authors no
+//! when stated (DEC-020) — with no seed floor. The configured-or-recorded
+//! `http://127.0.0.1:8000/v1` base of `vllm` is its own recorded local
+//! host — never `llama.cpp`'s `:8080` or `lm-studio`'s `:1234`
+//! (EDGE-006) — whose `/models` listing maps vLLM's `max_model_len` as
+//! the context window and carries the display-only Qwen reasoning mark;
+//! its recorded auth is optional beside the server-key mode, so the
+//! same absent-binding form rides headerless, a scoped key rides as the
+//! bearer, and the listing states no effort ladder: a pinned
+//! `reasoning_effort` denies typed rather than being dropped. The
+//! adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -994,6 +1003,15 @@ const SYNTHETIC_FALLBACK_MAX_TOKENS: u64 = 8192;
 /// [`ModelPrice::Unknown`].
 const TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 
+/// The recorded default API root of a `vllm` connection
+/// (`127.0.0.1:8000/v1` in the traceability per-ID row): the host the
+/// required `endpoint` field's empty string resolves under, under the
+/// same absent-override rule the local-endpoint class binds. It is its
+/// own recorded host — never `llama.cpp`'s `http://127.0.0.1:8080` or
+/// `lm-studio`'s `http://127.0.0.1:1234/v1` (EDGE-006) — and carries
+/// no region selector, so a configured `region` denies typed.
+const VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1025,7 +1043,7 @@ enum EndpointRule {
     ConfiguredElseDefault,
     /// The configured-or-recorded base resolution the plan providers
     /// (`alibaba-coding-plan`, `alibaba-token-plan`) and the
-    /// local-endpoint class (`llama.cpp`, `lm-studio`) share: the configured origin
+    /// local-endpoint class (`llama.cpp`, `lm-studio`, `vllm`) share: the configured origin
     /// verbatim under the recorded ingress normalization —
     /// trimmed, all trailing slashes stripped, as the login hook's
     /// custom-origin input is normalized — with the required field's
@@ -1146,9 +1164,10 @@ enum CredentialRule {
     /// `litellm`'s recorded credential-optional auth class (HZN-008
     /// class B, `auth/litellm.kdl` `login "api-key"` against a
     /// user-configured proxy) and `llama.cpp`'s recorded optional auth
-    /// beside its server-key mode (`auth/llama.cpp.kdl`) and
+    /// beside its server-key mode (`auth/llama.cpp.kdl`),
     /// `lm-studio`'s recorded optional auth over its local base
-    /// (`auth/lm-studio.kdl`): the recorded
+    /// (`auth/lm-studio.kdl`) and `vllm`'s configured local mode with
+    /// or without a server key: the recorded
     /// absent-binding form. A declaration that binds nothing is admitted
     /// and rides headerless on *every* leg — the host's own
     /// unauthenticated path, never a dummy key — while a declaration that
@@ -1330,6 +1349,15 @@ enum EntryRule {
     /// default figure. Unknown keys are ignored and absent values
     /// stay at their empty surface.
     Synthetic,
+    /// The `vllm` transform: the listing's own `max_model_len` is the
+    /// served context window (vLLM's field, never the shared
+    /// `context_length`), and a Qwen `major.minor` at or above 3.8 in
+    /// the offered id carries the display-only reasoning mark the
+    /// recorded Qwen chat template uses. The listing states no effort
+    /// ladder, so the mark is display-only: a pinned
+    /// `reasoning_effort` is denied typed at the send seam rather than
+    /// silently dropped.
+    Vllm,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1917,6 +1945,27 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::GenericMetadata,
+        }),
+        // `vllm` (HZN-008 class B — the local-server cell): the
+        // configured local base verbatim, or the recorded default
+        // `http://127.0.0.1:8000/v1` when the required `endpoint` field
+        // is empty — its own host, never `llama.cpp`'s `:8080` or
+        // `lm-studio`'s `:1234` (EDGE-006). The configured base's own
+        // `/models` listing is the catalogue, each row mapping vLLM's
+        // `max_model_len` as the context window and carrying the
+        // display-only Qwen reasoning mark; the recorded auth is
+        // optional beside the server-key mode, so the credential arm is
+        // the absent-binding form: an unbound declaration rides
+        // headerless, a declared binding that cannot resolve denies
+        // typed, and a scoped key rides as the bearer. The listing
+        // states no effort ladder, so a pinned effort denies at the
+        // send seam rather than being dropped.
+        "vllm" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(VLLM_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::OpenProxy,
+            entries: EntryRule::Vllm,
         }),
         _ => None,
     }
@@ -2626,7 +2675,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::NanoGpt
                 | EntryRule::Novita
                 | EntryRule::SiliconFlow
-                | EntryRule::Synthetic => Some(CatalogModel {
+                | EntryRule::Synthetic
+                | EntryRule::Vllm => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2895,6 +2945,10 @@ impl ChatCompletionsProvider {
             // pricing fields, with invalid or partial prices staying
             // unknown.
             EntryRule::Synthetic => Some(synthetic_entry(id, entry)),
+            // The recorded vLLM listing surface: `max_model_len` is the
+            // window carrier and a Qwen ≥3.8 id carries the
+            // display-only reasoning mark.
+            EntryRule::Vllm => Some(vllm_entry(id, entry)),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -3186,7 +3240,8 @@ impl ChatCompletionsProvider {
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `GenericMetadata`, `Aiand`, `Aimlapi`,
     /// `AlibabaTokenPlan`, `DeepSeek`, `Groq`, `HuggingFace`,
-    /// `LiteLlm`, `Moonshot`, `NanoGpt`, `Novita` and `SiliconFlow` —
+    /// `LiteLlm`, `Moonshot`, `NanoGpt`, `Novita`, `SiliconFlow`,
+    /// `Synthetic` and `Vllm` —
     /// sends the offered id unchanged. Each variant is listed so a
     /// future transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -3207,7 +3262,8 @@ impl ChatCompletionsProvider {
             | EntryRule::NanoGpt
             | EntryRule::Novita
             | EntryRule::SiliconFlow
-            | EntryRule::Synthetic => model_id.to_string(),
+            | EntryRule::Synthetic
+            | EntryRule::Vllm => model_id.to_string(),
         }
     }
 
@@ -3270,7 +3326,10 @@ impl ChatCompletionsProvider {
     /// the body behind the caller's back. The classes' other
     /// recorded-rejected parameters (`groq`'s logprobs, logit_bias,
     /// top_logprobs, `messages[].name`, `n`, temperature) are never
-    /// constructed by this adapter, so none can be dropped.
+    /// constructed by this adapter, so none can be dropped. `vllm`
+    /// records no effort ladder either: the listing that could state
+    /// the chat-template surface is not visible at the send seam, so
+    /// every pinned level denies typed.
     fn check_parameters(
         &self,
         manifest: &RequestManifest,
@@ -3279,6 +3338,10 @@ impl ChatCompletionsProvider {
         let ladder = match self.contract.entries {
             EntryRule::Groq => GROQ_EFFORTS,
             EntryRule::Moonshot => MOONSHOT_EFFORTS,
+            // The listing that could state the effort surface is not
+            // visible at the send seam, so no level is recorded: every
+            // pinned effort denies typed rather than being dropped.
+            EntryRule::Vllm => &[],
             EntryRule::IdsOnly
             | EntryRule::GenericMetadata
             | EntryRule::Aiand
@@ -3942,6 +4005,51 @@ fn generic_metadata_entry(id: &str, entry: &Value) -> CatalogModel {
         max_output_tokens: positive_count(entry.get("max_completion_tokens")),
         ..CatalogModel::default()
     }
+}
+
+/// The recorded `vllm` listing transform: vLLM's own `max_model_len`
+/// is the served context window — the compatible listing states no
+/// `context_length` — and a Qwen `major.minor` at or above 3.8 in the
+/// offered id carries the display-only reasoning mark the recorded
+/// Qwen chat template implies. The listing states no effort ladder, so
+/// the mark is display-only; [`ChatCompletionsProvider::check_parameters`]
+/// denies a pinned level instead of dropping it.
+fn vllm_entry(id: &str, entry: &Value) -> CatalogModel {
+    CatalogModel {
+        id: id.to_string(),
+        reasoning: vllm_qwen_reasoning(id),
+        context_window: positive_count(entry.get("max_model_len")),
+        ..CatalogModel::default()
+    }
+}
+
+/// Whether a listed id names a Qwen version at or above 3.8 (HZN-14-03):
+/// every case-insensitive `qwen` occurrence is followed by a
+/// `major.minor` pair, and only a pair that high marks reasoning. A
+/// bare major (`Qwen3-…`) states no 3.8 surface and marks nothing.
+fn vllm_qwen_reasoning(id: &str) -> bool {
+    let lowered = id.to_ascii_lowercase();
+    let mut rest = lowered.as_str();
+    while let Some(found) = rest.find("qwen") {
+        let version = &rest[found + "qwen".len()..];
+        let major_len = version
+            .find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(version.len());
+        if let Some(minor_text) = version[major_len..].strip_prefix('.') {
+            let minor_len = minor_text
+                .find(|ch: char| !ch.is_ascii_digit())
+                .unwrap_or(minor_text.len());
+            if let (Ok(major), Ok(minor)) = (
+                version[..major_len].parse::<u64>(),
+                minor_text[..minor_len].parse::<u64>(),
+            ) && (major, minor) >= (3, 8)
+            {
+                return true;
+            }
+        }
+        rest = version;
+    }
+    false
 }
 
 /// `toPositiveNumber(_, 0)` inside a `usd` entry: a finite

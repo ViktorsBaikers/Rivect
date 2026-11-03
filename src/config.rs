@@ -2170,9 +2170,10 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
                 // The recorded credential-optional classes serve with or
                 // without a key — the open proxy (`litellm`), the
                 // local-endpoint class (`llama.cpp`, `lm-studio`,
-                // `ollama`) and the catalogue-only `openrouter` — so an
-                // absent `credential_ref` is their recorded form, never a
-                // dummy key. Every other kind still states the binding.
+                // `ollama`, `vllm`) and the catalogue-only `openrouter` —
+                // so an absent `credential_ref` is their recorded form,
+                // never a dummy key. Every other kind still states the
+                // binding.
                 if connection.credential_ref.is_none()
                     && !(connection.kind == ConnKind::ApiKey && admit_absent_binding(name))
                 {

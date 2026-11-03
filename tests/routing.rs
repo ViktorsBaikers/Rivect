@@ -5254,6 +5254,124 @@ fn lm_studio_keyless_local_connection_is_offline_eligible() {
     );
 }
 
+/// `vllm` is a served Chat-Completions id under the recorded local-server
+/// class: the dialect map routes the literal id, and the recorded local
+/// mode is offline-eligible without a key on both shipped headerless
+/// declarations — the unbound `api_key` row and the `local` row — while a
+/// scoped server key stays eligible and a declared-but-unresolvable
+/// binding keeps the typed live-grant denial rather than a silent keyless
+/// fallback.
+#[test]
+fn vllm_keyless_connection_is_offline_eligible() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8000/v1\"\n\
+         [connections.vllm-local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:8000/v1\"\n\
+         [connections.vllm-keyed]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8000/v1\"\ncredential_ref = \"keyring:rivect/vllm-scope\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"vllm\", model_id = \"Qwen/Qwen3.8-27B\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("vllm"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+    assert_eq!(
+        config.connections["vllm"].credential_ref, None,
+        "the keyless api_key row binds no credential"
+    );
+
+    let keyless = ModelAssign::Fixed(FixedModel {
+        connection: "vllm".to_string(),
+        model_id: "Qwen/Qwen3.8-27B".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyless, &config.connections, &config.profiles)
+            .is_ok(),
+        "the unbound local mode is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "vllm",
+    ));
+
+    let local = ModelAssign::Fixed(FixedModel {
+        connection: "vllm-local".to_string(),
+        model_id: "Qwen/Qwen3.8-27B".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&local, &config.connections, &config.profiles).is_ok(),
+        "the shipped kind=local headerless form is the same leg"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "vllm-local",
+    ));
+
+    // the eligible-but-unbound connection prepares through the real
+    // Broker — eligibility reads the same predicate config admission does
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("main", &config, "/world/vllm", "goal: keyless local")
+        .expect("the unbound local connection prepares");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "vllm" && fixed.model_id == "Qwen/Qwen3.8-27B"),
+        "the prepared manifest pins the local connection and model: {:?}",
+        manifest.model
+    );
+
+    let keyed = ModelAssign::Fixed(FixedModel {
+        connection: "vllm-keyed".to_string(),
+        model_id: "Qwen/Qwen3.8-27B".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyed, &config.connections, &config.profiles).is_ok(),
+        "a scoped server key is usable on the same class"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "vllm-keyed",
+    ));
+
+    // a row whose declared binding cannot resolve is the typed live-grant
+    // denial at eligibility: the keyless form is the *undeclared* binding,
+    // never an unresolvable one
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8000/v1\"\nprofile = \"vllm\"\n\
+         [profiles.vllm]\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"vllm\", model_id = \"Qwen/Qwen3.8-27B\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &keyless,
+                &unresolvable.connections,
+                &unresolvable.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &unresolvable.connections,
+            &unresolvable.profiles,
+            "vllm",
+        ),
+        "only the undeclared binding is the keyless local form"
+    );
+}
+
 /// `ollama` is a served Responses id whose credential is optional: the
 /// dialect map routes the literal id, and a fixed pin is
 /// offline-eligible on both keyless declarations — `api_key` with no

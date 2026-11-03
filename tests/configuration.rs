@@ -4626,6 +4626,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "siliconflow-cn",
         "synthetic",
         "together",
+        "vllm",
     ];
     let mut admitted = Vec::new();
     for id in band {
@@ -4640,8 +4641,15 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     }
     assert_eq!(
         admitted,
-        ["llama.cpp", "lm-studio", "litellm", "ollama", "openrouter"],
-        "the absent-binding admission is those five literal ids, not the band"
+        [
+            "llama.cpp",
+            "lm-studio",
+            "litellm",
+            "ollama",
+            "openrouter",
+            "vllm"
+        ],
+        "the absent-binding admission is those six literal ids, not the band"
     );
 
     let error = Config::parse_validated(&open_proxy_row(
@@ -4759,4 +4767,118 @@ fn openrouter_joins_the_absent_binding_admission_without_widening_others() {
             "{lookalike} wrong rejection: {error}"
         );
     }
+}
+
+/// `vllm` joins the absent-binding admission as the literal id (DEC-003):
+/// the recorded local mode serves with or without a server key, so the
+/// unbound `api_key` row and the shipped `kind = "local"` headerless row
+/// are both admitted, while a scoped key or a profile binding stays
+/// admitted and every key-gated sibling keeps the required
+/// `credential_ref`. The relaxation is the id, never the band.
+#[test]
+fn vllm_credential_ref_grammar_admits_the_absent_binding_and_rejects_unknown_keys() {
+    let keyless = Config::parse_validated(&open_proxy_row_for("vllm"))
+        .expect("the keyless vllm row is admitted");
+    assert_eq!(keyless.connections["vllm"].kind, ConnKind::ApiKey);
+    assert_eq!(
+        keyless.connections["vllm"].credential_ref, None,
+        "the recorded local mode binds no credential — never a materialized dummy"
+    );
+
+    // the shipped optional-binding `kind = "local"` headerless form
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:8000/v1\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"vllm\", model_id = \"Qwen/Qwen3.8-27B\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the local vllm declaration is admitted");
+    assert_eq!(local.connections["vllm"].kind, ConnKind::Local);
+    assert_eq!(local.connections["vllm"].credential_ref, None);
+
+    // a `local` declaration cannot carry a credential — the headerless
+    // form is the kind's whole grammar
+    let error = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:8000/v1\"\ncredential_ref = \"keyring:rivect/vllm\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"vllm\", model_id = \"Qwen/Qwen3.8-27B\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect_err("a local declaration cannot carry a credential");
+    assert!(
+        matches!(&error.issue, ConfigIssue::LocalCredentialsForbidden),
+        "wrong rejection: {error}"
+    );
+
+    // the recorded server-key half: a scoped key, alone or through a
+    // declared profile, stays admitted
+    let bound = Config::parse_validated(&open_proxy_row_for("vllm").replace(
+        "[connections.\"vllm\"]",
+        "[connections.\"vllm\"]\ncredential_ref = \"keyring:rivect/vllm\"",
+    ))
+    .expect("the bound vllm row is admitted");
+    assert_eq!(
+        bound.connections["vllm"].credential_ref.as_deref(),
+        Some("keyring:rivect/vllm")
+    );
+    let profiled = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:8000/v1\"\nprofile = \"vllm-team\"\n\
+         [profiles.vllm-team]\ncredential_ref = \"keyring:rivect/vllm-team\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"vllm\", model_id = \"Qwen/Qwen3.8-27B\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the profile-bound vllm row is admitted");
+    assert_eq!(
+        profiled.connections["vllm"].profile.as_deref(),
+        Some("vllm-team")
+    );
+    assert_eq!(
+        profiled.profiles["vllm-team"].credential_ref.as_deref(),
+        Some("keyring:rivect/vllm-team")
+    );
+
+    // key-gated siblings stay key-gated — the admission is the id
+    for id in ["openai", "together", "ollama-cloud"] {
+        let error = Config::parse_validated(&open_proxy_row_for(id))
+            .expect_err("a sibling id still requires its binding");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{id} wrong rejection: {error}"
+        );
+    }
+
+    // a name merely resembling the literal id is a different connection
+    for lookalike in ["vllm-local", "vllm-server", "vllm-api", "vLLM"] {
+        let error = Config::parse_validated(&open_proxy_row_for(lookalike))
+            .expect_err("a lookalike id is not the recorded class");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{lookalike} wrong rejection: {error}"
+        );
+    }
+
+    // an unknown key beside the admitted row is still refused with the
+    // connection csv, and a present value still carries the scoped grammar
+    let error = Config::parse_validated(&open_proxy_row_for("vllm").replace(
+        "[connections.\"vllm\"]",
+        "[connections.\"vllm\"]\nbogus = 1",
+    ))
+    .expect_err("an unknown connection key is still refused");
+    assert!(
+        matches!(&error.issue, ConfigIssue::UnknownKey { key, .. } if key == "bogus"),
+        "wrong rejection: {error}"
+    );
+    let error = Config::parse_validated(&open_proxy_row_for("vllm").replace(
+        "[connections.\"vllm\"]",
+        "[connections.\"vllm\"]\ncredential_ref = \"not a scoped ref\"",
+    ))
+    .expect_err("a present value carries the scoped-secret grammar");
+    assert!(
+        matches!(&error.issue, ConfigIssue::SecretRefExpected { key } if key == "connections.vllm.credential_ref"),
+        "wrong rejection: {error}"
+    );
 }
