@@ -4,8 +4,8 @@
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
-//! `siliconflow-cn`, `synthetic`, `together`, `venice`, `vllm` and
-//! `wafer-serverless` connections' adapter —
+//! `siliconflow-cn`, `synthetic`, `together`, `venice`, `vllm`,
+//! `wafer-serverless` and `xiaomi` connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -243,6 +243,15 @@
 //! `provider` thinking shape, tools mark and `zdr_supported` flag have
 //! no manifest carrier (residuals), and the recorded reasoning control
 //! is not `reasoning_effort`: a pinned effort denies typed. The
+//! configured-or-recorded `https://api.xiaomimimo.com/v1` base of
+//! `xiaomi` is the recorded PAYG literal — never one of the three
+//! token-plan clusters, selected neither by `SecretRef` material
+//! (opaque bytes state no key class) nor by probing (PROH-010) — and
+//! its keyed `/models` listing is the whole catalogue offered id-only,
+//! with the api key riding the plain bearer. The class records no seed
+//! or vendored price row, so an empty or failed answer has no floor to
+//! fall back to; its recorded `exclude-models` roster has no carrier
+//! here (residual), and a configured `region` denies typed. The
 //! adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -1061,6 +1070,17 @@ const WAFER_BASE_URL: &str = "https://pass.wafer.ai/v1";
 /// are clamped to (`WAFER_MAX_TOKENS_CAP`): the cap follows the stated
 /// context window and never invents one.
 const WAFER_MAX_TOKENS_CAP: u64 = 65536;
+
+/// The recorded default API root of a `xiaomi` connection
+/// (`https://api.xiaomimimo.com/v1` in the traceability per-ID row): the
+/// PAYG literal the required `endpoint` field's empty string resolves
+/// under. The three token-plan bases (`xiaomi-token-plan-ams|cn|sgp`)
+/// are their own literals, never a fallback or probe target from here
+/// (PROH-010), and `SecretRef` bytes state no key class this arm could
+/// sniff — the base is selected by the configured endpoint alone. The
+/// class records no region selector, so a configured `region` denies
+/// typed.
+const XIAOMI_PAYG_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -2074,6 +2094,25 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::Wafer,
+        }),
+        // `xiaomi` (HZN-008 class B — the PAYG api-key cell): the
+        // configured-or-recorded `https://api.xiaomimimo.com/v1` PAYG
+        // literal — never one of the three token-plan regions, selected
+        // neither by key material (opaque `SecretRef` bytes state no
+        // class) nor by probing another cluster (PROH-010) — the
+        // configured base's own `/models` listing under ids-only offers,
+        // and the api key riding the plain bearer. The class records no
+        // seed or vendored price row, so an empty or failed answer has no
+        // floor to fall back to; its recorded `exclude-models` roster has
+        // no carrier here (residual), and the recorded sign-in ladder is
+        // recorded knowledge, never runtime behaviour. A configured
+        // `region` denies: the contract names none.
+        "xiaomi" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(XIAOMI_PAYG_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
         }),
         _ => None,
     }
