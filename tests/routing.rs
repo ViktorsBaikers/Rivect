@@ -5204,6 +5204,126 @@ fn lm_studio_keyless_local_connection_is_offline_eligible() {
     );
 }
 
+/// `ollama` is a served Responses id whose credential is optional: the
+/// dialect map routes the literal id, and a fixed pin is
+/// offline-eligible on both keyless declarations — `api_key` with no
+/// binding and `local` — while a bound profile stays eligible and a
+/// declared-but-unresolvable binding keeps the typed live-grant denial.
+#[test]
+fn ollama_keyless_local_connection_is_offline_eligible() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"\"\n\
+         [connections.ollama-local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434/v1\"\n\
+         [connections.ollama-keyed]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\ncredential_ref = \"keyring:rivect/ol\"\nprofile = \"ollama-team\"\n\
+         [profiles.ollama-team]\ncredential_ref = \"keyring:rivect/ollama-team\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"ollama\", model_id = \"llama3.2:3b\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("ollama"),
+        Some(Dialect::Responses),
+        "the literal id routes to the shared Responses dialect"
+    );
+    assert_eq!(
+        config.connections["ollama"].credential_ref, None,
+        "the keyless api_key row binds no credential"
+    );
+
+    let keyless = ModelAssign::Fixed(FixedModel {
+        connection: "ollama".to_string(),
+        model_id: "llama3.2:3b".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyless, &config.connections, &config.profiles)
+            .is_ok(),
+        "the keyless api_key form is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama",
+    ));
+
+    let local = ModelAssign::Fixed(FixedModel {
+        connection: "ollama-local".to_string(),
+        model_id: "llama3.2:3b".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&local, &config.connections, &config.profiles).is_ok(),
+        "the local declaration is the same keyless leg"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-local",
+    ));
+
+    let keyed = ModelAssign::Fixed(FixedModel {
+        connection: "ollama-keyed".to_string(),
+        model_id: "llama3.2:3b".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&keyed, &config.connections, &config.profiles).is_ok(),
+        "a scoped key is usable on the same class"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-keyed",
+    ));
+
+    // the eligible keyless pin prepares through the real Broker with
+    // the literal connection and model frozen
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("main", &config, "/world/ollama", "goal: local")
+        .expect("the keyless ollama pin prepares");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "ollama" && fixed.model_id == "llama3.2:3b"),
+        "the prepared manifest pins the local connection and model: {:?}",
+        manifest.model
+    );
+
+    // a declared binding that cannot resolve is the typed live-grant
+    // denial at eligibility — only the undeclared binding is keyless
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\nprofile = \"ollama\"\n\
+         [profiles.ollama]\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"ollama\", model_id = \"llama3.2:3b\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    let unresolvable_pin = ModelAssign::Fixed(FixedModel {
+        connection: "ollama".to_string(),
+        model_id: "llama3.2:3b".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &unresolvable_pin,
+                &unresolvable.connections,
+                &unresolvable.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "an unresolvable declared binding is the live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &unresolvable.connections,
+            &unresolvable.profiles,
+            "ollama",
+        ),
+        "only the undeclared binding is the keyless local form"
+    );
+}
+
 /// `meta` is a served Responses-dialect id, not a reserved one: the
 /// dialect map routes the literal id and the api_key pin is
 /// offline-eligible at the binding level — an undeclared id is the

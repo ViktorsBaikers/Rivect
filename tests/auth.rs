@@ -3122,6 +3122,145 @@ fn litellm_open_proxy_and_scoped_key_resolve_through_the_scoped_secret_ref_seam(
     );
 }
 
+// ----- api-key class, credential optional: ollama ---------------------
+
+/// The local `ollama` class joins the credential-optional seam as two
+/// admissible declarations of the same keyless leg — `api_key` with no
+/// binding and `local` with no credential — both offline-eligible with
+/// no materialized ref, while a bound connection or profile keeps the
+/// scoped `SecretRef` precedence and a declared-but-unresolvable
+/// binding stays the typed denial.
+#[test]
+fn ollama_keyless_and_bound_catalog_forms_share_the_scoped_seam() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\n\
+         [connections.ollama-local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434/v1\"\n\
+         [connections.ollama-keyed]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\ncredential_ref = \"keyring:rivect-test/ollama-direct\"\n\
+         [connections.ollama-profiled]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\ncredential_ref = \"keyring:rivect-test/ollama-scope\"\nprofile = \"ollama-team\"\n\
+         [profiles.ollama-team]\ncredential_ref = \"keyring:rivect-test/ollama-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    // the adopted `api_key` form binds nothing and still reads usable
+    assert_eq!(
+        config.connections["ollama"].kind,
+        rivect::config::ConnKind::ApiKey
+    );
+    assert_eq!(config.connections["ollama"].credential_ref, None);
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama",
+    ));
+    assert!(
+        matches!(
+            resolve_credential(&config, "ollama"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "the keyless form materializes no ref"
+    );
+
+    // the recorded `local` form is the same keyless leg
+    assert_eq!(
+        config.connections["ollama-local"].kind,
+        rivect::config::ConnKind::Local
+    );
+    assert_eq!(config.connections["ollama-local"].credential_ref, None);
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-local",
+    ));
+
+    // the bound forms resolve through DEC-013 precedence
+    let resolved = resolve_credential(&config, "ollama-keyed")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/ollama-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-keyed",
+    ));
+
+    let resolved = resolve_credential(&config, "ollama-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/ollama-team");
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-profiled",
+    ));
+
+    // a declared profile with no ref is not the absent binding: it
+    // stays unresolved and ineligible
+    let unresolvable = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\nprofile = \"ollama\"\n\
+         [profiles.ollama]\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            resolve_credential(&unresolvable, "ollama"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "only an absent binding is the keyless form"
+    );
+    assert!(!rivect::providers::offline_usable(
+        &unresolvable.connections,
+        &unresolvable.profiles,
+        "ollama",
+    ));
+
+    // an undeclared id is the typed denial, never a plaintext path
+    assert!(matches!(
+        resolve_credential(&config, "undeclared"),
+        Err(ProviderError::UnknownConnection { .. })
+    ));
+
+    // a profile-bound ref whose trailing scope segment disagrees with
+    // the profile name is the named mismatch — the optional class
+    // admits an absent binding, never a divergent one
+    let mismatched = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:11434/v1\"\nprofile = \"ollama-team\"\n\
+         [profiles.ollama-team]\ncredential_ref = \"keyring:rivect-test/other-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "ollama"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is the named mismatch"
+    );
+
+    // a non-scoped binding is refused by the seam itself: ingress
+    // rejects it first, and a hand-built map proves the second layer
+    // holds — `store:scope` is the only admitted shape
+    let mut tampered = Config::parse_validated(toml).expect("config parses");
+    tampered
+        .connections
+        .get_mut("ollama")
+        .expect("declared")
+        .credential_ref = Some("plaintext-token".to_string());
+    assert!(
+        matches!(
+            resolve_credential(&tampered, "ollama"),
+            Err(ProviderError::CredentialUnresolved {
+                cause: Some(SecretRefError::NotScoped),
+                ..
+            })
+        ),
+        "a non-scoped binding is the typed unresolved denial"
+    );
+}
+
 // ----- api-key class: meta ----------------------------------------------------
 
 /// The api-key class leg (AC-040f) for the band's Responses-dialect

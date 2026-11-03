@@ -1,12 +1,14 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
-//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,meta}): the configured
-//! literal `openai` and `meta` connections each return a verified
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama}):
+//! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
-//! wiremock fixtures, no OMP, no user adapter, no real host. The SSE
-//! legs pin the shared parser's WHATWG §9.2.5–9.2.6 conformance.
-//! TP-PROVIDER-INSTALLED::{openai,meta} stays NOT_RUN — the ignored
-//! named cases carry that status explicitly.
+//! wiremock fixtures, no OMP, no user adapter, no real host. `ollama`
+//! is the credential-optional local class whose catalogue carries the
+//! bounded native discovery overlay. The SSE legs pin the shared
+//! parser's WHATWG §9.2.5–9.2.6 conformance.
+//! TP-PROVIDER-INSTALLED::{openai,meta,ollama} stays NOT_RUN — the
+//! ignored named cases carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,20 +20,20 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::Config;
+use rivect::config::{Config, ConnKind};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
 use rivect::providers::{
-    CatalogModel, Provider, ProviderError, StoreKind, TransportCause, TransportClass,
+    CatalogModel, Dialect, Provider, ProviderError, StoreKind, TransportCause, TransportClass,
 };
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
@@ -365,6 +367,22 @@ fn assert_id_only_surface(provider: OpenAiProvider, expected: &[&str]) {
     );
 }
 
+/// Every record carries its id alone: the literal id's catalogue rule
+/// left the shared metadata at its default.
+fn assert_default_records(models: &[CatalogModel]) {
+    for model in models {
+        assert_eq!(
+            model,
+            &CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            },
+            "`{}` keeps the default record — no entry rule",
+            model.id
+        );
+    }
+}
+
 /// The rich catalogue mirrors the id-only answer for every Responses
 /// id: `openai` keeps its filtered sample, `abliteration` and `meta`
 /// keep their authoritative listing plus static seed, and the new
@@ -430,6 +448,159 @@ async fn responses_catalogue_keeps_the_id_only_surface() {
     let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
     let (provider, _store) = meta_provider(&config);
     assert_id_only_surface(provider, &META_FLOOR);
+}
+
+/// The rich catalogue carries each Responses id's recorded entry rule:
+/// `ollama` maps the native metadata onto the offers its own listing
+/// named, while `openai`, `abliteration` and `meta` carry the default
+/// record for every id and never probe the native overlay. The gate is
+/// the literal `ollama` id, so a widened gate shows up as a
+/// `/api/tags` request on a connection that records no native
+/// discovery.
+#[tokio::test]
+async fn responses_catalogue_carries_the_recorded_entry_rule() {
+    // ollama: the entry rule rides the listed offers, and an id the
+    // native probe never answered for stays at the default.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "enriched"}, {"id": "listing-only"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .and(body_partial_json(json!({"model": "enriched"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": ["thinking", "vision"],
+            "num_ctx": 4096,
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "enriched".to_string(),
+                reasoning: true,
+                vision: true,
+                context_window: Some(4096),
+                max_output_tokens: Some(8_192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "listing-only".to_string(),
+                ..CatalogModel::default()
+            },
+        ],
+        "the native entry rule rides the listed offers only"
+    );
+
+    // openai: the sample filter plus the default record, no native probe.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-5.2"}, {"id": "dall-e-3"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, ids, models) = catalogue_surfaces(openai_provider(&config).0);
+    drop_blocking(provider);
+    assert_eq!(ids, vec!["gpt-5.2".to_string()]);
+    assert_default_records(&models);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        count_path(&requests, "/api/tags"),
+        0,
+        "`openai` records no native discovery — the overlay never runs"
+    );
+
+    // abliteration: the static floor plus the default record, no
+    // native probe.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.abliteration]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"abliteration\", model_id = \"abliterated-model\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CREDENTIAL_REF, SECRET)],
+    ));
+    let provider = provider_result(config, "abliteration".to_string(), store)
+        .expect("the shared adapter builds for the abliteration id");
+    let (provider, ids, models) = catalogue_surfaces(provider);
+    drop_blocking(provider);
+    assert_eq!(
+        ids,
+        vec![
+            "abliterated-model".to_string(),
+            "abliterated-model-large".to_string(),
+            "abliterated-model-large-v2".to_string(),
+        ],
+        "the authoritative floor keeps its ids and the default record"
+    );
+    assert_default_records(&models);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        count_path(&requests, "/api/tags"),
+        0,
+        "`abliteration` records no native discovery — the overlay never runs"
+    );
+
+    // meta: the static floor plus the default record, no native probe.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&meta_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, ids, models) = catalogue_surfaces(meta_provider(&config).0);
+    drop_blocking(provider);
+    assert_eq!(ids.len(), META_FLOOR.len());
+    assert_default_records(&models);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        count_path(&requests, "/api/tags"),
+        0,
+        "`meta` records no native discovery — the overlay never runs"
+    );
 }
 
 /// The listing payload is bounded like the stream: a body past the
@@ -5215,6 +5386,1265 @@ async fn meta_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::meta = NOT_RUN"]
 fn provider_installed_meta() {}
+
+// ----- ollama ------------------------------------------------------------
+//
+// The local `ollama` id records the OpenAI Responses surface under its
+// `/v1` base with an optional credential and a bounded native discovery
+// overlay (DEC-009/DEC-011/DEC-012). The configured base serves both the
+// listing and the inference leg; `/models` is the offer set, while the
+// unauthenticated native `/api/tags` + `/api/show` chain only enriches
+// ids the listing already named — it never adds an offer, never runs
+// past 32 ids or one 250 ms advisory phase, and a failed probe leaves
+// the listing-only entry.
+
+const OLLAMA_REF: &str = "keyring:rivect-test/ollama";
+
+const OLLAMA_MODEL: &str = "llama3.2:3b";
+
+/// One keyless `api_key` declaration for `ollama` — the adopted
+/// absent-binding form; no `credential_ref` member.
+fn ollama_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama\", model_id = \"{OLLAMA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same declaration with a scoped binding — the optional class's
+/// authenticated half.
+fn ollama_bound_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{OLLAMA_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama\", model_id = \"{OLLAMA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The class's recorded `local` declaration — the second keyless form,
+/// carrying no credential at all.
+fn ollama_local_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"local\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama\", model_id = \"{OLLAMA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn ollama_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "ollama".to_string(), store.clone())
+        .expect("the shared adapter builds for the keyless ollama id");
+    (provider, store)
+}
+
+/// The same adapter under an explicit whole-call deadline, so the
+/// advisory overlay's share of the budget is exercised deterministically.
+fn ollama_provider_with_deadline(
+    config: &Config,
+    deadline: Duration,
+) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let handle = Arc::clone(&store);
+    let config = config.clone();
+    let provider = std::thread::spawn(move || {
+        OpenAiProvider::with_deadline(&config, "ollama", handle, deadline)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the shared adapter builds under the short deadline");
+    (provider, store)
+}
+
+fn ollama_bound_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(OLLAMA_REF, SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "ollama".to_string(), store.clone())
+        .expect("the shared adapter builds for the bound ollama id");
+    (provider, store)
+}
+
+/// The rich catalogue result on a plain OS thread: the blocking client
+/// cannot be built or dropped inside a tokio context, and the provider
+/// comes back for a blocking drop.
+fn ollama_catalog_result(
+    provider: OpenAiProvider,
+) -> (OpenAiProvider, Result<Vec<CatalogModel>, ProviderError>) {
+    std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins")
+}
+
+/// The rich catalogue on a plain OS thread: the blocking client cannot
+/// be dropped inside a tokio context.
+fn ollama_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
+    let (provider, outcome) = ollama_catalog_result(provider);
+    drop_blocking(provider);
+    outcome.expect("the ollama catalogue answers")
+}
+
+/// A catalogue that spends its whole-call budget either denies the
+/// typed deadline or answers inside it: a late listing-only answer is
+/// exactly the unbounded overlay the shared budget exists to prevent.
+fn assert_catalogue_inside_the_deadline(
+    outcome: Result<Vec<CatalogModel>, ProviderError>,
+    elapsed: Duration,
+    deadline: Duration,
+) {
+    match outcome {
+        Err(ProviderError::Transport {
+            cause: TransportCause::Deadline { budget },
+            ..
+        }) => assert_eq!(budget, deadline, "the denial names the whole-call budget"),
+        Ok(models) => assert!(
+            elapsed < deadline,
+            "a catalogue must answer inside its {deadline:?} budget, not after {elapsed:?}: {} offers",
+            models.len()
+        ),
+        Err(other) => panic!("a stalled native peer is the typed deadline, not {other:?}"),
+    }
+}
+
+fn request_paths(requests: &[Request]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request.url.path())
+        .collect::<Vec<_>>()
+}
+
+fn count_path(requests: &[Request], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.url.path() == path)
+        .count()
+}
+
+// ----- TP-PROVIDER-WIRE::ollama -------------------------------------
+
+/// A configured `ollama` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the keyless local pin,
+/// the shared adapter posts the frozen manifest as a Responses request
+/// under the configured `/v1` base — no `Authorization` header, since
+/// the absent binding is the recorded unauthenticated form — and the
+/// one physical send is charged exactly once with the reported usage.
+#[tokio::test]
+async fn ollama_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified local outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 13, "output_tokens": 5, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        ollama_provider(&config),
+        &config,
+        "/world/ollama",
+        "goal: prove the local wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/ollama", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified local outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the absent binding sends no Authorization header — never a fabricated key"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], OLLAMA_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the local peer returns no encrypted reasoning artifact — the include is never requested: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "ollama");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            total_tokens: 18,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(18));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/ollama", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::ollama ----------------------------------
+
+/// The keyless discovery leg sends no credential on either the
+/// configured `/models` listing or the unauthenticated native probes:
+/// no header exists to fabricate, and the listing's ids are the offers.
+#[tokio::test]
+async fn ollama_keyless_listing_omits_the_authorization_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id": "qwen3:8b", "object": "model"},
+                {"id": OLLAMA_MODEL, "object": "model"},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{"name": OLLAMA_MODEL, "model": OLLAMA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![OLLAMA_MODEL, "qwen3:8b"],
+        "the listing is the offer set, sorted"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/v1/models"), 1);
+    assert_eq!(count_path(&requests, "/api/tags"), 1);
+    assert_eq!(count_path(&requests, "/api/show"), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.headers.get("authorization").is_none()),
+        "no leg fabricates an Authorization header for the keyless form: {:?}",
+        request_paths(&requests)
+    );
+}
+
+/// The bound form resolves its scoped key for the listing and the send
+/// (`Authorization: Bearer`), while the native discovery probes stay
+/// unauthenticated — the recorded native base never receives the key.
+#[tokio::test]
+async fn ollama_bound_key_sends_the_bearer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{"id": OLLAMA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream("bound local outcome", Vec::new(), None),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&ollama_bound_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_bound_provider(&config).0);
+    assert_eq!(models.len(), 1);
+    let (provider, _store) = ollama_bound_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the bound send completes");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let bearer = format!("Bearer {SECRET}");
+    for request in &requests {
+        let auth = request.headers.get("authorization");
+        match request.url.path() {
+            "/v1/models" => assert_eq!(
+                auth.and_then(|value| value.to_str().ok()),
+                Some(bearer.as_str()),
+                "the listing carries the scoped bearer"
+            ),
+            "/v1/responses" => assert_eq!(
+                auth.and_then(|value| value.to_str().ok()),
+                Some(bearer.as_str()),
+                "the send carries the scoped bearer"
+            ),
+            "/api/tags" | "/api/show" => assert!(
+                auth.is_none(),
+                "the native discovery probe is unauthenticated: {}",
+                request.url.path()
+            ),
+            other => panic!("unexpected request path {other}"),
+        }
+    }
+}
+
+/// Native metadata enriches only ids the listing already offered:
+/// `/api/tags` naming an id the listing omitted never adds an offer,
+/// `capabilities` maps thinking/vision, and the first positive context
+/// key follows `model_info.*.context_length`, then `num_ctx`, then
+/// `context_window`.
+#[tokio::test]
+async fn ollama_native_metadata_enriches_listing_offers_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {"id": "alpha"},
+                {"id": "beta"},
+                {"id": "num-ctx"},
+                {"id": "window"},
+                {"id": "zero-first"},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "models": [{"name": "gamma"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .and(body_partial_json(json!({"model": "alpha"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": ["completion", "thinking", "vision"],
+            "model_info": {"llama.context_length": 4096},
+            "num_ctx": 2048,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .and(body_partial_json(json!({"model": "num-ctx"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "num_ctx": 2048,
+            "context_window": 1024,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .and(body_partial_json(json!({"model": "window"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "context_window": 3072,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .and(body_partial_json(json!({"model": "zero-first"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model_info": {"a.context_length": 0, "b.context_length": 4096},
+            "num_ctx": 2048,
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "num-ctx", "window", "zero-first"],
+        "a native-only id is never offered"
+    );
+    let alpha = &models[0];
+    assert!(alpha.reasoning, "`thinking` capability maps to reasoning");
+    assert!(alpha.vision, "`vision` capability maps to vision");
+    assert_eq!(
+        alpha.context_window,
+        Some(4096),
+        "model_info.*.context_length outranks num_ctx"
+    );
+    assert_eq!(alpha.max_output_tokens, Some(8192));
+    assert_eq!(
+        models[1],
+        CatalogModel {
+            id: "beta".to_string(),
+            ..CatalogModel::default()
+        },
+        "an id the native probe cannot enrich stays listing-only"
+    );
+    assert_eq!(
+        models[2].context_window,
+        Some(2048),
+        "num_ctx outranks context_window"
+    );
+    assert_eq!(
+        models[3].context_window,
+        Some(3072),
+        "context_window is the last recorded key"
+    );
+    assert_eq!(
+        models[4].context_window,
+        Some(4096),
+        "the first positive model_info key wins — a zero never masks the next"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/v1/models"), 1);
+    assert_eq!(count_path(&requests, "/api/tags"), 1);
+    assert_eq!(count_path(&requests, "/api/show"), 5);
+    assert!(
+        request_paths(&requests)
+            .iter()
+            .all(|path| *path != "/v1/api/tags"),
+        "the native base carries no trailing /v1"
+    );
+}
+
+/// A failed native probe is non-fatal: a `/api/tags` failure skips the
+/// show fanout entirely, and a failing `/api/show` leaves that id
+/// listing-only — the catalogue still answers its `/models` offers.
+#[tokio::test]
+async fn ollama_native_metadata_failures_are_non_fatal() {
+    // the tags leg fails: no show runs and the listing stands alone
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "alpha".to_string(),
+            ..CatalogModel::default()
+        }],
+        "a failed tags leg leaves the listing-only entry"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/api/show"), 0);
+
+    // the show leg fails per id: the entry stays listing-only
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "alpha".to_string(),
+            ..CatalogModel::default()
+        }],
+        "a failed show leaves the listing-only entry"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/api/show"), 1);
+
+    // a malformed show payload is the same non-fatal probe failure
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "alpha".to_string(),
+            ..CatalogModel::default()
+        }],
+        "an unreadable show payload is never an enrichment"
+    );
+
+    // a show body past the catalogue byte bound is a read-loop error,
+    // not an enrichment and not a catalogue denial
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(1024 * 1024 + 1)))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "alpha".to_string(),
+            ..CatalogModel::default()
+        }],
+        "an over-bound show body is never an enrichment"
+    );
+}
+
+/// The advisory phase is bounded twice, deterministically: a fast peer
+/// still probes at most 32 listed ids, and a stalled native peer under
+/// a short whole-call deadline never yields a catalogue past that
+/// deadline — the typed deadline denial (or an answer inside the
+/// deadline), never the unbounded listing-only answer a phase with its
+/// own clock would produce.
+#[tokio::test]
+async fn ollama_native_metadata_phase_budget_bounds_the_fanout() {
+    // at most 32 ids are probed even when the listing offers more
+    let server = MockServer::start().await;
+    let ids: Vec<Value> = (0..40)
+        .map(|index| json!({"id": format!("model-{index:02}")}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": ids})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(models.len(), 40, "every listing offer stands");
+    let requests = server.received_requests().await.expect("recorded");
+    let shows = count_path(&requests, "/api/show");
+    assert!(
+        shows <= 32,
+        "the probe fanout never passes 32 listed ids, got {shows}"
+    );
+
+    // a stalled `/api/tags` peer spends the whole call's remainder: the
+    // catalogue answers the typed deadline, never a late listing-only
+    // answer the recorded 250 ms advisory phase would have produced
+    let deadline = Duration::from_millis(250);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "slow"}]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(json!({"models": []})),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = ollama_provider_with_deadline(&config, deadline);
+    let started = Instant::now();
+    let (provider, outcome) = ollama_catalog_result(provider);
+    let elapsed = started.elapsed();
+    drop_blocking(provider);
+    assert_catalogue_inside_the_deadline(outcome, elapsed, deadline);
+
+    // the same bound on the show fanout: a fast tags leg followed by a
+    // stalled first probe still answers inside the call's deadline
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "slow-show"}, {"id": "next"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(json!({})),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = ollama_provider_with_deadline(&config, deadline);
+    let started = Instant::now();
+    let (provider, outcome) = ollama_catalog_result(provider);
+    let elapsed = started.elapsed();
+    drop_blocking(provider);
+    assert_catalogue_inside_the_deadline(outcome, elapsed, deadline);
+}
+
+/// The 250 ms advisory phase is a bound of its own, not whatever the
+/// whole-call budget leaves: under a long whole-call deadline a peer
+/// whose `/api/tags` answers after one second still leaves every entry
+/// listing-only and fans out no `/api/show` — a phase riding the
+/// whole-call clock would have spent that second, probed the ids and
+/// enriched the record.
+#[tokio::test]
+async fn ollama_native_phase_budget_is_shorter_than_the_whole_call_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "slow-tags"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_json(json!({"models": [{"name": "slow-tags"}]})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": ["thinking", "vision"],
+            "model_info": {"slow.context_length": 65536},
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = ollama_provider_with_deadline(&config, Duration::from_secs(5));
+    let models = ollama_catalog(provider);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "slow-tags".to_string(),
+            ..CatalogModel::default()
+        }],
+        "the expired phase leaves the listing-only record, never the late enrichment"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/api/tags"), 1);
+    assert_eq!(
+        count_path(&requests, "/api/show"),
+        0,
+        "an expired phase never fans the show probes out"
+    );
+}
+
+/// The phase's 250 ms clock is a total, never a per-request reset: two
+/// sorted ids under a long whole-call deadline each face a `/api/show`
+/// that answers after 150 ms, so the first probe spends the phase's
+/// bulk and the second is clipped to the remainder and times out — the
+/// first entry enriched, the second listing-only. A per-request reset
+/// would hand the second probe a fresh 250 ms and enrich both.
+#[tokio::test]
+async fn ollama_native_probe_clip_is_the_phase_total_not_a_per_request_reset() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "beta"}, {"id": "alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(json!({
+                    "capabilities": ["thinking", "vision"],
+                    "model_info": {"qwen.context_length": 4096},
+                })),
+        )
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = ollama_provider_with_deadline(&config, Duration::from_secs(5));
+    let models = ollama_catalog(provider);
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "alpha".to_string(),
+                reasoning: true,
+                vision: true,
+                context_window: Some(4096),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "beta".to_string(),
+                ..CatalogModel::default()
+            },
+        ],
+        "the second probe never gets a fresh phase clock"
+    );
+}
+
+/// Defaults apply when the native metadata answers without a context
+/// key: 128000 context and 8192 max output, with the capability marks
+/// still derived from `capabilities`.
+#[tokio::test]
+async fn ollama_default_context_and_max_apply_when_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "solo"}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "capabilities": [],
+            "model_info": {"solo.context_length": 0},
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: "solo".to_string(),
+            reasoning: false,
+            vision: false,
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            ..CatalogModel::default()
+        }],
+        "a zero context is not positive; the recorded defaults apply"
+    );
+}
+
+/// The configured base is the API base for both legs under this
+/// adapter's normalization: the declaration is trimmed of whitespace
+/// and of every trailing slash, so a whitespace-padded value reaches
+/// the resolved base rather than a malformed URL — listing, inference
+/// and the native probes all land there. The native base is one
+/// trailing `/v1` stripped, never a re-inferred suffix. The
+/// empty-after-trim arm resolves the recorded local default on the
+/// resolution rule itself (`src/providers/openai.rs`), since the
+/// recorded default host is a live local server this offline suite
+/// never contacts.
+#[tokio::test]
+async fn ollama_configured_base_applies_to_listing_and_inference() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OLLAMA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream("configured base", Vec::new(), None),
+    )
+    .await;
+    let padded = format!("  {}/  ", server_uri_v1(&server));
+    let config = Config::parse_validated(&ollama_config(&padded)).expect("valid");
+    let models = ollama_catalog(ollama_provider(&config).0);
+    assert_eq!(models.len(), 1);
+    let (provider, _store) = ollama_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the configured base serves inference");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/v1/models"), 1);
+    assert_eq!(count_path(&requests, "/v1/responses"), 1);
+    assert_eq!(count_path(&requests, "/api/tags"), 1);
+    assert_eq!(count_path(&requests, "/api/show"), 1);
+    assert_eq!(
+        count_path(&requests, "/v1/api/tags"),
+        0,
+        "the native base strips exactly one trailing /v1"
+    );
+}
+
+/// The recorded `local` declaration is the same keyless leg on the
+/// Responses surface: the shared adapter builds for the literal id,
+/// claims to serve it, and both legs — the `/models` listing and the
+/// `/responses` send — reach the configured base with no
+/// `Authorization` header at all.
+#[tokio::test]
+async fn ollama_local_kind_form_serves_both_legs_without_a_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OLLAMA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream("local kind outcome", Vec::new(), None),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_local_config(&server_uri_v1(&server)))
+        .expect("the local declaration is admitted");
+    assert_eq!(config.connections["ollama"].kind, ConnKind::Local);
+
+    let (provider, _store) = ollama_provider(&config);
+    assert!(
+        provider.serves("ollama", &config.connections["ollama"]),
+        "the adapter claims the literal id it was built for"
+    );
+    assert!(
+        !provider.serves("openai", &config.connections["ollama"]),
+        "and only that id — a sibling pin is a dialect it does not speak"
+    );
+    let models = ollama_catalog(provider);
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: OLLAMA_MODEL.to_string(),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            ..CatalogModel::default()
+        }],
+        "the local form lists its offers through the same seam, overlay included"
+    );
+
+    let (provider, _store) = ollama_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the local-kind send completes");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/v1/models"), 1);
+    assert_eq!(count_path(&requests, "/v1/responses"), 1);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.headers.get("authorization").is_none()),
+        "the local declaration binds no credential, so no leg fabricates a header: {:?}",
+        request_paths(&requests)
+    );
+}
+
+/// A typed negative control for the local Responses surface: a partial
+/// tool item, an EOF without a terminal, and an unclassifiable terminal
+/// status each deny typed and account nothing.
+#[tokio::test]
+async fn ollama_adverse_wire_input_never_reports_success() {
+    // a stream ending mid output item is a typed violation
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "call_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""}, "output_index": 0}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        ollama_provider(&config),
+        &config,
+        "/world/ollama",
+        "goal: partial item",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/ollama", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a stream ended mid output item is a typed violation: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // EOF without a terminal is the unknown terminal
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        format!(
+            "{}{}",
+            sse_block(
+                "response.output_item.added",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}, "output_index": 0}),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        ollama_provider(&config),
+        &config,
+        "/world/ollama",
+        "goal: no terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/ollama", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF without a terminal is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a completed terminal whose status the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"status": "esoteric", "output": []}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        ollama_provider(&config),
+        &config,
+        "/world/ollama",
+        "goal: unknown status",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/ollama", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal status is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth label:
+/// `ollama` records the Responses surface, an unreserved sibling builds
+/// no adapter, the Chat-Completions adapter refuses `ollama`, and a
+/// `local` declaration of the reserved literal is never fixture-served.
+#[test]
+fn ollama_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("ollama"),
+        Some(Dialect::Responses),
+        "the literal id records the Responses dialect"
+    );
+    let config = Config::parse_validated(&ollama_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "ollama-cloud".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let built = config.clone();
+    let err = std::thread::spawn(move || ChatCompletionsProvider::new(&built, "ollama", store))
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("the CC adapter refuses the Responses id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "a CC arm for `ollama` is a dialect mismatch, not a served connection"
+    );
+
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"ollama\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("ollama").expect("declared");
+    assert!(
+        !loopback.serves("ollama", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `ollama`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn ollama_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OLLAMA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the listing plus the bounded native overlay.
+    let models = ollama_catalog(ollama_provider(&config).0);
+    reported.insert(
+        "CATALOG",
+        if models
+            .iter()
+            .map(|model| model.id.as_str())
+            .eq(std::iter::once(OLLAMA_MODEL))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: a bound ref with no store material denies typed.
+    let bound =
+        Config::parse_validated(&ollama_bound_config(&server_uri_v1(&server))).expect("valid");
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(bound.clone(), "ollama".to_string(), empty).expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&bound));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        ollama_provider(&config),
+        &config,
+        "/world/ollama",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/ollama", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(bound.clone(), "ollama".to_string(), empty.clone()).expect("resolves");
+    let manifest = prepared_manifest(&bound);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(OLLAMA_REF, SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::ollama --------------------------------
+
+/// TP-PROVIDER-INSTALLED::ollama = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::ollama = NOT_RUN"]
+fn provider_installed_ollama() {}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 

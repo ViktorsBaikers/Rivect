@@ -4589,9 +4589,9 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         );
     }
 
-    // band-1's fixed set plus every band-2 id: each declared without a
-    // binding — only the credential-optional classes are admitted, so
-    // the relaxation is literal ids, never the band
+    // band-1's fixed set plus every band-2 and band-3 id: each declared
+    // without a binding — only the credential-optional classes are
+    // admitted, so the relaxation is literal ids, never the band
     let band = [
         "coreweave",
         "deepinfra",
@@ -4613,6 +4613,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "nanogpt",
         "novita",
         "nvidia",
+        "ollama",
     ];
     let mut admitted = Vec::new();
     for id in band {
@@ -4627,8 +4628,8 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     }
     assert_eq!(
         admitted,
-        ["llama.cpp", "lm-studio", "litellm"],
-        "the absent-binding admission is those three literal ids, not the band"
+        ["llama.cpp", "lm-studio", "litellm", "ollama"],
+        "the absent-binding admission is those four literal ids, not the band"
     );
 
     let error = Config::parse_validated(&open_proxy_row(
@@ -4650,4 +4651,48 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         matches!(&error.issue, ConfigIssue::SecretRefExpected { key } if key == "connections.litellm.credential_ref"),
         "wrong rejection: {error}"
     );
+}
+
+/// `ollama` joins the credential-optional admission as the literal id
+/// — the keyless `api_key` row and the `local` row are both admitted,
+/// while the sibling `ollama-cloud` and every other id still require
+/// their bound `credential_ref`. The relaxation is the id, never the
+/// band.
+#[test]
+fn ollama_joins_the_credential_optional_class_without_widening_others() {
+    let keyless = Config::parse_validated(&open_proxy_row_for("ollama"))
+        .expect("the keyless ollama row is admitted");
+    assert_eq!(keyless.connections["ollama"].kind, ConnKind::ApiKey);
+    assert_eq!(keyless.connections["ollama"].credential_ref, None);
+
+    let bound = Config::parse_validated(&open_proxy_row_for("ollama").replace(
+        "[connections.\"ollama\"]",
+        "[connections.\"ollama\"]\ncredential_ref = \"keyring:rivect/ollama\"",
+    ))
+    .expect("the bound ollama row is admitted");
+    assert_eq!(
+        bound.connections["ollama"].credential_ref.as_deref(),
+        Some("keyring:rivect/ollama")
+    );
+
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"local\"\nendpoint = \"\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"ollama\", model_id = \"llama3.2:3b\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the local ollama declaration is admitted");
+    assert_eq!(local.connections["ollama"].kind, ConnKind::Local);
+    assert_eq!(local.connections["ollama"].credential_ref, None);
+
+    // the neighbouring native-cloud id is key-gated, not widened
+    for id in ["ollama-cloud", "openai"] {
+        let error = Config::parse_validated(&open_proxy_row_for(id))
+            .expect_err("a sibling id still requires its binding");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{id} wrong rejection: {error}"
+        );
+    }
 }

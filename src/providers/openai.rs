@@ -1,9 +1,11 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
-//! the literal connection ids `openai`, `abliteration` and `meta`
-//! record this dialect. Dialect selection keys on the literal
-//! connection id, never an auth label or a catalogue answer, and
-//! `openai-codex` is a distinct literal id with its own recorded
-//! class. The adapter authors no async code — [`Provider::send`] is
+//! the literal connection ids `openai`, `abliteration`, `meta` and
+//! `ollama` record this dialect. `ollama` is the local endpoint whose
+//! credential is optional (DEC-009) and whose catalogue carries a
+//! bounded native discovery overlay (DEC-012). Dialect selection keys
+//! on the literal connection id, never an auth label or a catalogue
+//! answer, and `openai-codex` is a distinct literal id with its own
+//! recorded class. The adapter authors no async code — [`Provider::send`] is
 //! a blocking single-shot seam and Tokio appears only inside reqwest's
 //! blocking client plus the dev-dependency test harness — and
 //! `store: false` is sent verbatim on
@@ -24,8 +26,8 @@ use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply,
     STREAM_CHUNK_BYTES, SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for,
-    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
-    wire_body,
+    read_catalog_body, read_chunk, resolve_optional_credential_in, sse, transport,
+    transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -42,6 +44,27 @@ use std::time::{Duration, Instant};
 /// in flight answers to the client's per-call backstop instead, so
 /// the worst case is the deadline plus one backstop-bounded call.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The recorded local `ollama` base (DEC-011): an empty configured
+/// endpoint resolves here, and the configured value otherwise wins
+/// after this adapter's trim — every trailing slash and surrounding
+/// whitespace stripped.
+const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
+
+/// The most listed ids one native discovery phase probes (DEC-012).
+const NATIVE_DISCOVERY_MAX_IDS: usize = 32;
+
+/// The one advisory budget the native `/api/tags` + `/api/show`
+/// overlay shares (DEC-012): an expired phase leaves the remaining
+/// listing-only entries rather than extending the catalogue leg.
+const NATIVE_DISCOVERY_BUDGET: Duration = Duration::from_millis(250);
+
+/// The per-entry defaults when the native metadata carries no positive
+/// context key (DEC-012).
+const OLLAMA_DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// The per-entry max output default (DEC-012).
+const OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
 
 /// The recorded source sample of Responses-capable model ids the
 /// `openai` connection's catalogue surface filters `/models` to
@@ -135,7 +158,27 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: true,
             reasoning_artifact: false,
         }),
+        "ollama" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            reasoning_artifact: false,
+        }),
         _ => None,
+    }
+}
+
+/// The connection's API base (DEC-011): the configured endpoint is
+/// trimmed of surrounding whitespace and of every trailing slash —
+/// this adapter's own normalization, not a rule the other adapters
+/// share — and the empty result resolves the recorded local default on
+/// `ollama` alone. Every other id keeps the trimmed value verbatim; no
+/// id's base is ever inferred.
+fn endpoint_for(connection: &str, configured: &str) -> String {
+    let configured = configured.trim().trim_end_matches('/');
+    if configured.is_empty() && connection == "ollama" {
+        OLLAMA_DEFAULT_ENDPOINT.to_string()
+    } else {
+        configured.to_string()
     }
 }
 
@@ -181,12 +224,16 @@ pub struct OpenAiProvider {
     /// from the literal id at build and never re-keyed — the dialect
     /// is shared, the contract is not.
     contract: SourceContract,
-    /// The configured endpoint base, trailing slashes trimmed.
+    /// The configured endpoint base under DEC-011 — trimmed, every
+    /// trailing slash stripped, and the recorded local default on
+    /// `ollama` when that leaves nothing.
     endpoint: String,
     /// The scoped credential binding resolved under DEC-013
-    /// precedence — material is read from the store per send so a
-    /// rotation is honoured without rebuilding the adapter.
-    credential: SecretRef,
+    /// precedence — `None` on the recorded absent-binding form, where
+    /// no header rides the catalogue or send legs (DEC-009). Material
+    /// is read from the store per send so a rotation is honoured
+    /// without rebuilding the adapter.
+    credential: Option<SecretRef>,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
     /// The one budget the whole send — credential resolution, the
@@ -208,6 +255,23 @@ pub struct OpenAiProvider {
     blob_owner: BTreeMap<String, BlobClaim>,
 }
 
+/// The listed entries one native discovery phase probes (DEC-012): the
+/// leading [`NATIVE_DISCOVERY_MAX_IDS`] offers, never the whole
+/// listing.
+fn probe_targets_mut(models: &mut [CatalogModel]) -> &mut [CatalogModel] {
+    let probed = models.len().min(NATIVE_DISCOVERY_MAX_IDS);
+    &mut models[..probed]
+}
+
+/// What the advisory phase has left (DEC-012): `None` once the budget
+/// is spent, so every native request is clipped to the phase's total
+/// clock instead of opening a fresh one per request.
+fn phase_remaining(budget: Duration, phase: Instant) -> Option<Duration> {
+    budget
+        .checked_sub(phase.elapsed())
+        .filter(|left| !left.is_zero())
+}
+
 impl OpenAiProvider {
     /// Builds the adapter for one connection id: the id must record
     /// the Responses dialect (DEC-007), the connection must be
@@ -219,8 +283,9 @@ impl OpenAiProvider {
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the Responses source class; [`ProviderError::UnknownConnection`]
     /// for an undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; [`resolve_credential`]'s typed denials for a
-    /// missing, malformed or mismatched binding;
+    /// configured region; `resolve_optional_credential_in`'s typed
+    /// denials for a missing, malformed or mismatched binding on a
+    /// required id (the local optional class resolves `None`);
     /// [`ProviderError::Transport`] when the HTTP client cannot be
     /// built.
     pub fn new(
@@ -276,7 +341,11 @@ impl OpenAiProvider {
                 region: region.clone(),
             });
         }
-        let credential = resolve_credential(config, connection)?;
+        // The local `ollama` class admits the absent binding; every
+        // required Responses id resolves through the same precedence
+        // and keeps its typed denial when nothing binds (DEC-009).
+        let credential =
+            resolve_optional_credential_in(&config.connections, &config.profiles, connection)?;
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
         // names itself the send's deadline, while reqwest's timer only
@@ -286,10 +355,11 @@ impl OpenAiProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| transport(connection, err))?;
+        let endpoint = endpoint_for(connection, &conn.endpoint);
         Ok(Self {
             connection: connection.to_string(),
             contract,
-            endpoint: conn.endpoint.trim_end_matches('/').to_string(),
+            endpoint,
             credential,
             store,
             client,
@@ -301,7 +371,8 @@ impl OpenAiProvider {
 
     /// The model catalogue for this connection (HZN-008): the ids of
     /// [`catalog_models`](Self::catalog_models) in the same
-    /// deterministic sorted order, from one physical `/models` fetch.
+    /// deterministic sorted order, carrying the literal id's recorded
+    /// rule and any bounded discovery overlay.
     ///
     /// # Errors
     /// [`Self::catalog_models`]'s typed denials.
@@ -317,8 +388,10 @@ impl OpenAiProvider {
     /// id's recorded rule — `openai` filters the listing to the
     /// recorded Responses-capable sample, `abliteration` and `meta`
     /// treat the listing as authoritative and merge their static
-    /// source seeds on top — each id carrying the shared
-    /// [`CatalogModel`], returned in deterministic sorted order.
+    /// source seeds on top, and `ollama` enriches the listing's own
+    /// offers from the bounded native discovery overlay (DEC-012) —
+    /// each id carrying the shared [`CatalogModel`], returned in
+    /// deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -335,26 +408,42 @@ impl OpenAiProvider {
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
-        Ok(self
-            .catalog_within(&token, started)?
+        let ids = self.catalog_within(token.as_deref(), started)?;
+        let mut models: Vec<CatalogModel> = ids
             .into_iter()
             .map(|id| CatalogModel {
                 id,
                 ..CatalogModel::default()
             })
-            .collect())
+            .collect();
+        // The overlay is advisory: it enriches the listing's own
+        // offers and never extends or replaces them (DEC-012) — and it
+        // spends the caller's clock like every other leg, so a peer
+        // answering past the whole-call budget is the typed deadline,
+        // never a late catalogue.
+        if self.connection == "ollama" {
+            self.enrich_native(&mut models, started);
+            check_deadline(&self.connection, self.deadline, started)?;
+        }
+        Ok(models)
     }
 
     /// The catalogue leg under the caller's clock and credential —
     /// a send passes its own `started` so the lookup spends the same
     /// whole-request budget instead of opening a second, unaccounted
-    /// one.
-    fn catalog_within(&self, token: &str, started: Instant) -> Result<Vec<String>, ProviderError> {
+    /// one. An absent token on the recorded optional class sends no
+    /// `Authorization` header.
+    fn catalog_within(
+        &self,
+        token: Option<&str>,
+        started: Instant,
+    ) -> Result<Vec<String>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut response = self
-            .client
-            .get(format!("{}/models", self.endpoint))
-            .bearer_auth(token)
+        let mut request = self.client.get(format!("{}/models", self.endpoint));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let mut response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
@@ -372,8 +461,8 @@ impl OpenAiProvider {
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
-        // while `abliteration` and `meta` treat the listing as
-        // authoritative: every non-empty id offers, and the recorded
+        // while `abliteration`, `meta` and `ollama` treat the listing
+        // as authoritative: every non-empty id offers, and a recorded
         // seed merges on top as the offer floor.
         let mut ids: Vec<String> = data
             .iter()
@@ -398,13 +487,124 @@ impl OpenAiProvider {
     }
 
     /// Reads the credential material for this send — the only place
-    /// secret bytes cross the store boundary. A non-UTF-8 secret
-    /// cannot be a bearer token: typed denial, never a mangled header.
-    fn secret(&self) -> Result<String, ProviderError> {
-        let material = self.store.resolve(&self.credential)?;
-        String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
-            connection: self.connection.clone(),
-        })
+    /// secret bytes cross the store boundary. The absent binding
+    /// resolves `None` and sends no header (DEC-009); a non-UTF-8
+    /// secret cannot be a bearer token: typed denial, never a mangled
+    /// header.
+    fn secret(&self) -> Result<Option<String>, ProviderError> {
+        let Some(credential) = &self.credential else {
+            return Ok(None);
+        };
+        let material = self.store.resolve(credential)?;
+        let token =
+            String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            })?;
+        Ok(Some(token))
+    }
+
+    /// The bounded native discovery overlay (DEC-012): the configured
+    /// base minus one trailing `/v1` answers `/api/tags`, then
+    /// `/api/show` per listed id under one advisory phase — at most 32
+    /// ids and the smaller of the recorded 250 ms and the whole
+    /// call's remainder. Each request is clipped to what the phase has
+    /// left, so the phase is a total bound rather than a per-request
+    /// one. Every failure is non-fatal — the entry keeps its
+    /// listing-only surface — while the phase's own spend stays
+    /// inside the caller's clock, so a peer answering past it is the
+    /// typed deadline rather than a late catalogue.
+    fn enrich_native(&self, models: &mut [CatalogModel], started: Instant) {
+        let Some(budget) = self
+            .deadline
+            .checked_sub(started.elapsed())
+            .map(|left| left.min(NATIVE_DISCOVERY_BUDGET))
+            .filter(|left| !left.is_zero())
+        else {
+            return;
+        };
+        let native_base = self.endpoint.strip_suffix("/v1").unwrap_or(&self.endpoint);
+        let phase = Instant::now();
+        if !self.native_tags(native_base, budget, phase) {
+            return;
+        }
+        for model in probe_targets_mut(models) {
+            if phase_remaining(budget, phase).is_none() {
+                break;
+            }
+            if let Some(metadata) = self.native_show(native_base, &model.id, budget, phase) {
+                model.reasoning = metadata.reasoning;
+                model.vision = metadata.vision;
+                model.context_window = Some(metadata.context_window);
+                model.max_output_tokens = Some(metadata.max_output_tokens);
+            }
+        }
+    }
+
+    /// The native liveness probe: unauthenticated, part of the same
+    /// advisory phase. A non-success or unreadable answer skips the
+    /// show fanout.
+    fn native_tags(&self, native_base: &str, budget: Duration, phase: Instant) -> bool {
+        let Some(remaining) = phase_remaining(budget, phase) else {
+            return false;
+        };
+        let started = Instant::now();
+        let mut response = match self
+            .client
+            .get(format!("{native_base}/api/tags"))
+            .timeout(remaining)
+            .send()
+        {
+            Ok(response) => response,
+            Err(_err) => return false,
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        read_catalog_body(&self.connection, remaining, &mut response, started).is_ok()
+    }
+
+    /// One unauthenticated `/api/show` probe for a listed id, bounded
+    /// by the advisory phase. Any failure leaves the id listing-only.
+    fn native_show(
+        &self,
+        native_base: &str,
+        id: &str,
+        budget: Duration,
+        phase: Instant,
+    ) -> Option<NativeMetadata> {
+        let remaining = phase_remaining(budget, phase)?;
+        let started = Instant::now();
+        let body = match serde_json::to_vec(&json!({ "model": id })) {
+            Ok(body) => body,
+            Err(_err) => return None,
+        };
+        let mut response = match self
+            .client
+            .post(format!("{native_base}/api/show"))
+            .timeout(remaining)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+        {
+            Ok(response) => response,
+            Err(_err) => return None,
+        };
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = match read_catalog_body(&self.connection, remaining, &mut response, started) {
+            Ok(body) => body,
+            Err(_err) => return None,
+        };
+        let payload: Value = match serde_json::from_slice(&body) {
+            Ok(payload) => payload,
+            Err(_err) => return None,
+        };
+        if payload.is_object() {
+            Some(NativeMetadata::from_show(&payload))
+        } else {
+            None
+        }
     }
 
     /// The frozen manifest as the Responses wire request (AC-013):
@@ -871,6 +1071,58 @@ fn payload_reason(response: &Value) -> String {
     "unclassified".to_string()
 }
 
+/// The recorded per-entry surface one successful `/api/show` probe
+/// contributes (DEC-012): capability marks plus the first positive
+/// context key, with the recorded defaults when the metadata carries
+/// none.
+struct NativeMetadata {
+    reasoning: bool,
+    vision: bool,
+    context_window: u64,
+    max_output_tokens: u64,
+}
+
+impl NativeMetadata {
+    fn from_show(payload: &Value) -> Self {
+        let capabilities = payload.get("capabilities").and_then(Value::as_array);
+        let declares = |name: &str| {
+            capabilities
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(name)))
+        };
+        Self {
+            reasoning: declares("thinking"),
+            vision: declares("vision"),
+            context_window: native_context_window(payload).unwrap_or(OLLAMA_DEFAULT_CONTEXT_WINDOW),
+            max_output_tokens: OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+}
+
+/// The first positive context key the recorded class maps, in its
+/// stated order: a `model_info.*.context_length` member (sorted for
+/// determinism), then `num_ctx`, then `context_window`.
+fn native_context_window(payload: &Value) -> Option<u64> {
+    if let Some(info) = payload.get("model_info").and_then(Value::as_object) {
+        let mut keys: Vec<&String> = info
+            .keys()
+            .filter(|key| key.ends_with(".context_length"))
+            .collect();
+        keys.sort();
+        for key in keys {
+            if let Some(tokens) = info.get(key).and_then(positive_tokens) {
+                return Some(tokens);
+            }
+        }
+    }
+    ["num_ctx", "context_window"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(positive_tokens))
+}
+
+fn positive_tokens(value: &Value) -> Option<u64> {
+    value.as_u64().filter(|tokens| *tokens > 0)
+}
+
 impl std::fmt::Debug for OpenAiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The scoped ref is the visible token — the store and its
@@ -939,7 +1191,7 @@ impl Provider for OpenAiProvider {
                 if pool.len() == 1 && pool[0] == self.connection =>
             {
                 let model_id = self
-                    .catalog_within(&token, started)?
+                    .catalog_within(token.as_deref(), started)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| ProviderError::UnpinnedModel {
@@ -967,17 +1219,69 @@ impl Provider for OpenAiProvider {
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
         check_deadline(&self.connection, self.deadline, started)?;
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/responses", self.endpoint))
-            .bearer_auth(&token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body_bytes)
+            .body(body_bytes);
+        // The absent binding sends no header; a bound one sends the
+        // same material the catalogue leg carried (DEC-009).
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
             return Err(transport_status(&self.connection, response.status()));
         }
         self.read_stream(manifest, response, started)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DEC-011's endpoint rule: the configured base is trimmed and
+    /// loses every trailing slash, and the empty result resolves the
+    /// recorded local default on `ollama` alone — a sibling id keeps
+    /// its own (absent) value and never borrows the local host.
+    #[test]
+    fn endpoint_rule_trims_before_resolving_the_local_default() {
+        assert_eq!(endpoint_for("ollama", "   "), OLLAMA_DEFAULT_ENDPOINT);
+        assert_eq!(endpoint_for("ollama", ""), OLLAMA_DEFAULT_ENDPOINT);
+        assert_eq!(endpoint_for("ollama", " / "), OLLAMA_DEFAULT_ENDPOINT);
+        assert_eq!(
+            endpoint_for("ollama", "  http://127.0.0.1:9/v1/  "),
+            "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(
+            endpoint_for("openai", " https://api.openai.com/v1/// "),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(endpoint_for("openai", "   "), "");
+        assert_eq!(
+            endpoint_for("openai", " https://api.openai.com/v1/ "),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    /// DEC-012's fanout bound: a phase probes the listing's leading 32
+    /// entries, never more — and never probes past a shorter listing.
+    #[test]
+    fn probe_targets_stop_at_the_recorded_maximum() {
+        let mut models: Vec<CatalogModel> = (0..40)
+            .map(|index| CatalogModel {
+                id: format!("model-{index:02}"),
+                ..CatalogModel::default()
+            })
+            .collect();
+        let probed = probe_targets_mut(&mut models);
+        assert_eq!(probed.len(), 32, "40 listed ids probe the leading 32");
+        assert_eq!(probed[0].id, "model-00");
+        assert_eq!(probed[31].id, "model-31");
+        let mut short = models[..7].to_vec();
+        assert_eq!(probe_targets_mut(&mut short).len(), 7);
     }
 }

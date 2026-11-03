@@ -1122,11 +1122,13 @@ fn parse_scoped(connection: &str, key: &str, raw: &str) -> Result<SecretRef, Pro
 const ADMITTED_READ: &str = "performing the admitted read";
 const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision";
 
-/// The recorded wire dialect of a connection id (DEC-007/DEC-025):
+/// The recorded dialect of a connection id (DEC-007/DEC-025):
 /// keyed by the literal id's source class — `openai` speaks the
 /// OpenAI Responses API, `abliteration` is its recorded class-A
-/// exception speaking the same dialect and `meta` its recorded
-/// class-B plug on `api.meta.ai/v1` (HZN-008), `google` speaks
+/// exception speaking the same dialect, `meta` its recorded
+/// class-B plug on `api.meta.ai/v1` (HZN-008), and `ollama` its
+/// recorded local Responses plug with the optional credential
+/// (DEC-009); `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `custom-chat-completions` speaks the OpenAI-compatible Chat
 /// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
@@ -1174,6 +1176,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "openai" => Some(Dialect::Responses),
         "abliteration" => Some(Dialect::Responses),
         "meta" => Some(Dialect::Responses),
+        "ollama" => Some(Dialect::Responses),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         "aiand" => Some(Dialect::ChatCompletions),
@@ -1282,18 +1285,18 @@ impl Provider for LoopbackProvider {
 /// Whether a literal connection id records the credential-optional
 /// absent-binding form: the open proxy (`litellm`) — a configured proxy
 /// that serves with or without a key — and the local-endpoint class
-/// (`llama.cpp`, `lm-studio`) — a local server whose recorded auth is
-/// optional beside its server-key mode. Both admit a declaration that
-/// omits `credential_ref`, an absent binding sends no `Authorization`
-/// header — never a dummy key — and the pin stays offline-usable. Every
-/// other `api_key` id requires its scoped binding at ingress and at
-/// eligibility.
+/// (`llama.cpp`, `lm-studio`, `ollama`) — a local server whose recorded
+/// auth is optional beside its server-key mode. Both admit a
+/// declaration that omits `credential_ref`, an absent binding sends no
+/// `Authorization` header — never a dummy key — and the pin stays
+/// offline-usable. Every other `api_key` id requires its scoped binding
+/// at ingress and at eligibility.
 ///
 /// Its contract-side twin is `CredentialRule::OpenProxy` in the local
 /// adapter's per-id table, the arm that carries the class's wire form.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
-    matches!(connection, "litellm" | "llama.cpp" | "lm-studio")
+    matches!(connection, "litellm" | "llama.cpp" | "lm-studio" | "ollama")
 }
 
 /// [`resolve_credential_in`] under the recorded absent-binding form: a

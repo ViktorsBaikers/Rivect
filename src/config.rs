@@ -2169,10 +2169,10 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             ConnKind::ApiKey | ConnKind::Subscription => {
                 // The recorded credential-optional classes serve with or
                 // without a key — the open proxy (`litellm`) and the
-                // local-endpoint class (`llama.cpp`, `lm-studio`) — so an absent
-                // `credential_ref` is their recorded unauthenticated
-                // form, never a dummy key. Every other kind still states
-                // the binding.
+                // local-endpoint class (`llama.cpp`, `lm-studio`,
+                // `ollama`) — so an absent `credential_ref` is their
+                // recorded unauthenticated form, never a dummy key.
+                // Every other kind still states the binding.
                 if connection.credential_ref.is_none()
                     && !(connection.kind == ConnKind::ApiKey && open_proxy_connection(name))
                 {
