@@ -102,7 +102,7 @@ fn assert_headerless(request: &Request) {
 /// `reasoning_effort` member — the SSE stream validates its terminal, and
 /// the one physical send is charged once with the provider's reported usage.
 #[tokio::test]
-async fn vllm_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_vllm_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -205,7 +205,7 @@ async fn vllm_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// store cannot resolve denies `CredentialAbsent` before any wire leg,
 /// never a silent fallback to the headerless form.
 #[tokio::test]
-async fn vllm_bound_key_rides_as_bearer() {
+async fn band4_vllm_bound_key_rides_as_bearer() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -278,7 +278,7 @@ async fn vllm_bound_key_rides_as_bearer() {
 /// nothing. The unbound declaration lists headerless; no seed floor is
 /// invented.
 #[tokio::test]
-async fn vllm_catalog_maps_max_model_len_and_qwen_reasoning() {
+async fn band4_vllm_catalog_maps_max_model_len_and_qwen_reasoning() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -349,7 +349,7 @@ async fn vllm_catalog_maps_max_model_len_and_qwen_reasoning() {
 /// visible at the send seam — so the denial lands typed before the body
 /// exists: never a request carrying a silently dropped `reasoning_effort`.
 #[tokio::test]
-async fn vllm_pinned_effort_denies_not_dropped() {
+async fn band4_vllm_pinned_effort_denies_not_dropped() {
     let server = MockServer::start().await;
     mount_chat(&server, completed_stream("never reached", None)).await;
     let config = Config::parse_validated(
@@ -405,7 +405,7 @@ async fn vllm_pinned_effort_denies_not_dropped() {
 /// denial carrying the peer's status alone — no error, nor the offered
 /// credential material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn vllm_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_vllm_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // a configured region is denied — never ignored — while a sibling
@@ -500,7 +500,7 @@ async fn vllm_wrong_credential_profile_or_region_denies_with_typed_context_witho
 /// finish_reason the dialect cannot classify are each the unknown terminal,
 /// and a rejected send charges nothing.
 #[tokio::test]
-async fn vllm_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_vllm_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -584,7 +584,7 @@ async fn vllm_rejects_partial_tool_block_and_unknown_terminal() {
 /// enrolling the scoped key and building again yields one verified outcome
 /// and exactly one accounted physical request.
 #[tokio::test]
-async fn vllm_typed_denial_recovers_after_correct_binding() {
+async fn band4_vllm_typed_denial_recovers_after_correct_binding() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -648,7 +648,7 @@ async fn vllm_typed_denial_recovers_after_correct_binding() {
 /// own recorded local base — never the `llama.cpp` or `lm-studio` default
 /// (EDGE-006) — and loopback never serves the reserved id.
 #[test]
-fn vllm_default_base_is_its_own_recorded_host() {
+fn band4_vllm_default_base_is_its_own_recorded_host() {
     assert_eq!(
         rivect::providers::dialect_for(VLLM),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -724,7 +724,7 @@ fn vllm_default_base_is_its_own_recorded_host() {
 /// AUTH, WIRE and RECOVERY each execute and report inside this run, and
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn vllm_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_vllm_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -851,7 +851,7 @@ async fn vllm_provider_legs_matrix_executes_all_expected_legs() {
 /// live-environment leg this offline slice never runs.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::vllm = NOT_RUN"]
-fn provider_installed_vllm() {}
+fn band4_provider_installed_vllm() {}
 
 // ----- venice ----------------------------------------------------------------
 
@@ -934,7 +934,7 @@ fn venice_provider(
 /// terminal, and the one physical send is charged once with the reported
 /// usage.
 #[tokio::test]
-async fn venice_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_venice_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -1016,7 +1016,7 @@ async fn venice_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// `stream_options.include_usage`, so the predicate is narrow rather than a
 /// shared removal.
 #[tokio::test]
-async fn venice_request_body_omits_stream_options() {
+async fn band4_venice_request_body_omits_stream_options() {
     let venice_server = MockServer::start().await;
     mount_chat(&venice_server, completed_stream("venice body", None)).await;
     let config =
@@ -1085,7 +1085,7 @@ async fn venice_request_body_omits_stream_options() {
 /// denies a send `CredentialAbsent` without opening a chat leg. An empty
 /// listing has no floor to fall back to: no offer is invented.
 #[tokio::test]
-async fn venice_catalog_is_public_and_never_entitlement() {
+async fn band4_venice_catalog_is_public_and_never_entitlement() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -1189,7 +1189,7 @@ async fn venice_catalog_is_public_and_never_entitlement() {
 /// the offered credential material or the peer's body, reaches Display or
 /// Debug.
 #[tokio::test]
-async fn venice_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_venice_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // a configured region is denied — never ignored — while a sibling scope
@@ -1281,7 +1281,7 @@ async fn venice_wrong_credential_profile_or_region_denies_with_typed_context_wit
 /// finish_reason the dialect cannot classify are each the unknown terminal,
 /// and a rejected send charges nothing.
 #[tokio::test]
-async fn venice_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_venice_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -1364,7 +1364,7 @@ async fn venice_rejects_partial_tool_block_and_unknown_terminal() {
 /// key and building again yields one verified outcome and exactly one
 /// accounted physical request.
 #[tokio::test]
-async fn venice_typed_denial_recovers_after_correct_binding() {
+async fn band4_venice_typed_denial_recovers_after_correct_binding() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -1428,7 +1428,7 @@ async fn venice_typed_denial_recovers_after_correct_binding() {
 /// class's default — a configured base stays verbatim, and loopback never
 /// serves the reserved id.
 #[test]
-fn venice_discriminates_the_recorded_default_base() {
+fn band4_venice_discriminates_the_recorded_default_base() {
     assert_eq!(
         rivect::providers::dialect_for(VENICE),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -1503,7 +1503,7 @@ fn venice_discriminates_the_recorded_default_base() {
 /// AUTH, WIRE and RECOVERY each execute and report inside this run, and
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn venice_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_venice_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -1627,7 +1627,7 @@ async fn venice_provider_legs_matrix_executes_all_expected_legs() {
 /// live-environment leg this offline slice never runs.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::venice = NOT_RUN"]
-fn provider_installed_venice() {}
+fn band4_provider_installed_venice() {}
 
 // ----- xai-oauth -------------------------------------------------------------
 
@@ -1729,7 +1729,7 @@ fn xai_oauth_catalog_on_thread(
 /// encrypted reasoning artifact riding `include` — and the one physical
 /// send is charged once with the provider's reported usage.
 #[tokio::test]
-async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xai_oauth_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -1814,7 +1814,7 @@ async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// empty listing offers nothing. The listing leg authenticates with the
 /// resolved device-code token.
 #[tokio::test]
-async fn xai_oauth_catalog_is_the_authoritative_listing() {
+async fn band4_xai_oauth_catalog_is_the_authoritative_listing() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -1822,6 +1822,8 @@ async fn xai_oauth_catalog_is_the_authoritative_listing() {
             json!({"id": "grok-4", "context_length": 131072, "reasoning": true}),
             json!({"id": "grok-3"}),
             json!({"id": "grok-imagine-1.0"}),
+            json!({"id": "grok-stt-1"}),
+            json!({"id": "grok-voice-1"}),
         ],
     )
     .await;
@@ -1832,7 +1834,7 @@ async fn xai_oauth_catalog_is_the_authoritative_listing() {
     assert_eq!(
         model_ids(&models),
         vec!["grok-3", "grok-4"],
-        "the recorded non-chat image family is never offered: {models:?}"
+        "the recorded non-chat image/STT/voice families are never offered: {models:?}"
     );
     assert!(
         models.iter().all(|model| *model
@@ -1878,7 +1880,7 @@ async fn xai_oauth_catalog_is_the_authoritative_listing() {
 /// selected-list answer, and neither the token nor the peer body reaches
 /// the diagnostic.
 #[tokio::test]
-async fn xai_oauth_failed_listing_denies_without_a_fabricated_floor() {
+async fn band4_xai_oauth_failed_listing_denies_without_a_fabricated_floor() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -1914,7 +1916,7 @@ async fn xai_oauth_failed_listing_denies_without_a_fabricated_floor() {
 /// wire body exists, never a request carrying a silently dropped
 /// `reasoning.effort`.
 #[tokio::test]
-async fn xai_oauth_suppressed_model_rejects_a_pinned_effort() {
+async fn band4_xai_oauth_suppressed_model_rejects_a_pinned_effort() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -1968,6 +1970,57 @@ async fn xai_oauth_suppressed_model_rejects_a_pinned_effort() {
     );
 }
 
+/// A pinned effort on an id outside the recorded suppression residue is
+/// admissible: `grok-4` with fixed `high` sends `reasoning.effort` verbatim
+/// and accounts the one physical request.
+#[tokio::test]
+async fn band4_xai_oauth_admissible_pinned_effort_rides_the_reasoning_dial() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "admissible effort",
+            Vec::new(),
+            Some(json!({"input_tokens": 4, "output_tokens": 3, "total_tokens": 7})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(
+        &xai_oauth_config(&server_uri_v1(&server)).replace(
+            "effort = { mode = \"auto\" }",
+            "effort = { mode = \"fixed\", value = \"high\" }",
+        ),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: admissible effort",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest);
+    assert!(
+        matches!(&outcome, Ok(reply) if reply.text == "admissible effort"),
+        "the admissible pin dispatches: {outcome:?}"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "the pinned effort is one physical request");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], XAI_OAUTH_MODEL);
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high"}),
+        "the admissible pinned level rides the reasoning dial: {body}"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+}
+
 // ----- TP-PROVIDER-AUTH::xai-oauth -------------------------------------------
 
 /// Wrong credential/profile/region never produce a false success for
@@ -1978,7 +2031,7 @@ async fn xai_oauth_suppressed_model_rejects_a_pinned_effort() {
 /// the peer refuses is the typed transport denial — no error, nor the
 /// offered device-code token or the peer body, reaches Display or Debug.
 #[tokio::test]
-async fn xai_oauth_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_xai_oauth_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // the required binding cannot be absent: the ingress names the member
@@ -2106,7 +2159,7 @@ async fn xai_oauth_wrong_credential_profile_or_region_denies_with_typed_context_
 /// the typed stream violation, an unclassifiable completion status is the
 /// unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn xai_oauth_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xai_oauth_tool_block_and_unknown_terminal() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -2189,7 +2242,7 @@ async fn xai_oauth_rejects_partial_tool_block_and_unknown_terminal() {
 /// configured base stays verbatim, and loopback never serves the reserved
 /// id.
 #[test]
-fn xai_oauth_discriminates_the_recorded_default_base() {
+fn band4_xai_oauth_discriminates_the_recorded_default_base() {
     assert_eq!(
         rivect::providers::dialect_for(XAI_OAUTH),
         Some(rivect::providers::Dialect::Responses)
@@ -2257,7 +2310,7 @@ fn xai_oauth_discriminates_the_recorded_default_base() {
 /// run, and INSTALLED reports NOT_RUN — the live device-code transition and
 /// the `grok.com` accounting origin are never claimed.
 #[tokio::test]
-async fn xai_oauth_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xai_oauth_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -2381,7 +2434,7 @@ async fn xai_oauth_provider_legs_matrix_executes_all_expected_legs() {
 /// stay out of scope.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xai-oauth = NOT_RUN"]
-fn provider_installed_xai_oauth() {}
+fn band4_provider_installed_xai_oauth() {}
 
 // ----- xai -------------------------------------------------------------------
 
@@ -2481,7 +2534,7 @@ fn xai_catalog_on_thread(
 /// contract does not name — and the one physical send is charged once with
 /// the provider's reported usage.
 #[tokio::test]
-async fn xai_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xai_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -2564,7 +2617,7 @@ async fn xai_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// listing offers nothing. The listing leg authenticates with the
 /// resolved api key.
 #[tokio::test]
-async fn xai_catalog_is_the_authoritative_listing() {
+async fn band4_xai_catalog_is_the_authoritative_listing() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -2624,7 +2677,7 @@ async fn xai_catalog_is_the_authoritative_listing() {
 /// `reasoning.effort`. A non-suppressed id keeps the same pin — the
 /// positive effort ladder is a residual, not an invented allowlist.
 #[tokio::test]
-async fn xai_suppressed_model_rejects_a_pinned_effort() {
+async fn band4_xai_suppressed_model_rejects_a_pinned_effort() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -2728,7 +2781,7 @@ async fn xai_suppressed_model_rejects_a_pinned_effort() {
 /// peer refuses is the typed transport denial — no error, nor the offered
 /// key or the peer body, reaches Display or Debug.
 #[tokio::test]
-async fn xai_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_xai_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // the required binding cannot be absent: the ingress names the member
@@ -2854,7 +2907,7 @@ async fn xai_wrong_credential_profile_or_region_denies_with_typed_context_withou
 /// the typed stream violation, an unclassifiable completion status is the
 /// unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn xai_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xai_tool_block_and_unknown_terminal() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -2933,7 +2986,7 @@ async fn xai_rejects_partial_tool_block_and_unknown_terminal() {
 /// the scoped key is enrolled, the corrected binding returns one outcome
 /// and exactly one accounted physical request.
 #[tokio::test]
-async fn xai_typed_denial_recovers_after_correct_binding() {
+async fn band4_xai_typed_denial_recovers_after_correct_binding() {
     let server = MockServer::start().await;
     mount_responses(
         &server,
@@ -3006,7 +3059,7 @@ async fn xai_typed_denial_recovers_after_correct_binding() {
 /// `api.x.ai/v1` base — never a sibling class's default — a configured
 /// base stays verbatim, and loopback never serves the reserved id.
 #[test]
-fn xai_discriminates_the_recorded_default_base() {
+fn band4_xai_discriminates_the_recorded_default_base() {
     assert_eq!(
         rivect::providers::dialect_for(XAI),
         Some(rivect::providers::Dialect::Responses)
@@ -3073,7 +3126,7 @@ fn xai_discriminates_the_recorded_default_base() {
 /// AUTH, WIRE and RECOVERY each execute and report inside this run, and
 /// INSTALLED reports NOT_RUN — no live xAI call is ever claimed.
 #[tokio::test]
-async fn xai_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xai_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3195,7 +3248,7 @@ async fn xai_provider_legs_matrix_executes_all_expected_legs() {
 /// live-environment leg this offline slice never runs.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xai = NOT_RUN"]
-fn provider_installed_xai() {}
+fn band4_provider_installed_xai() {}
 
 // ----- wafer-serverless ------------------------------------------------------
 
@@ -3283,7 +3336,7 @@ fn wafer_provider(
 /// login metadata, so the declaration's class is the recorded api key,
 /// never a subscription form.
 #[tokio::test]
-async fn wafer_serverless_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_wafer_serverless_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -3381,7 +3434,7 @@ async fn wafer_serverless_valid_control_yields_one_outcome_and_one_physical_usag
 /// never a default — and the envelope's thinking shape, tools mark and
 /// ZDR flag land nowhere because no manifest carrier exists.
 #[tokio::test]
-async fn wafer_serverless_catalog_maps_the_envelope() {
+async fn band4_wafer_serverless_catalog_maps_the_envelope() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -3522,7 +3575,7 @@ async fn wafer_serverless_catalog_maps_the_envelope() {
 /// `reasoning_effort`: a pinned effort denies typed before any wire leg
 /// and charges nothing — it is never silently dropped from the body.
 #[tokio::test]
-async fn wafer_serverless_pinned_effort_denies_not_dropped() {
+async fn band4_wafer_serverless_pinned_effort_denies_not_dropped() {
     let server = MockServer::start().await;
     mount_chat(&server, completed_stream("never reached", None)).await;
     let config = Config::parse_validated(
@@ -3582,7 +3635,7 @@ async fn wafer_serverless_pinned_effort_denies_not_dropped() {
 /// status alone — no error, nor the offered credential material or the
 /// peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn wafer_serverless_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+async fn band4_wrong_credential_wafer_serverless_profile_or_region_denies_with_typed_context_without_secrets()
 {
     let server = MockServer::start().await;
 
@@ -3704,7 +3757,7 @@ async fn wafer_serverless_wrong_credential_profile_or_region_denies_with_typed_c
 /// executes — and a finish_reason the dialect cannot classify are each
 /// the unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn wafer_serverless_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_wafer_serverless_tool_block_and_unknown_terminal() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -3787,7 +3840,7 @@ async fn wafer_serverless_rejects_partial_tool_block_and_unknown_terminal() {
 /// sibling class's default — a configured base stays verbatim, and
 /// loopback never serves the reserved id.
 #[test]
-fn wafer_serverless_discriminates_the_recorded_default_base() {
+fn band4_wafer_serverless_discriminates_the_recorded_default_base() {
     assert_eq!(
         rivect::providers::dialect_for(WAFER),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -3864,7 +3917,7 @@ fn wafer_serverless_discriminates_the_recorded_default_base() {
 /// `wafer-serverless`: CATALOG, AUTH, WIRE and RECOVERY each execute and
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn wafer_serverless_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_wafer_serverless_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4000,7 +4053,7 @@ async fn wafer_serverless_provider_legs_matrix_executes_all_expected_legs() {
 /// never runs.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::wafer-serverless = NOT_RUN"]
-fn provider_installed_wafer_serverless() {}
+fn band4_provider_installed_wafer_serverless() {}
 
 // ----- xiaomi ----------------------------------------------------------------
 
@@ -4084,7 +4137,7 @@ fn xiaomi_provider(
 /// terminal, and the one physical send is charged once with the reported
 /// usage.
 #[tokio::test]
-async fn xiaomi_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xiaomi_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -4171,7 +4224,7 @@ async fn xiaomi_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// listing is the typed denial on its one attempt — never a fallback to
 /// another cluster.
 #[tokio::test]
-async fn xiaomi_never_probes_another_region() {
+async fn band4_xiaomi_never_probes_another_region() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_MODEL})]).await;
     mount_chat(&server, completed_stream("payg", None)).await;
@@ -4266,7 +4319,7 @@ async fn xiaomi_never_probes_another_region() {
 /// denial carrying the peer's status alone — no error, nor the offered
 /// credential material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn xiaomi_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_xiaomi_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // a configured region is denied — never ignored — while a sibling scope
@@ -4373,7 +4426,7 @@ async fn xiaomi_wrong_credential_profile_or_region_denies_with_typed_context_wit
 /// finish_reason the dialect cannot classify are each the unknown terminal,
 /// and a rejected send charges nothing.
 #[tokio::test]
-async fn xiaomi_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xiaomi_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -4458,7 +4511,7 @@ async fn xiaomi_rejects_partial_tool_block_and_unknown_terminal() {
 /// sibling class's default — a configured base stays verbatim, and loopback
 /// never serves the reserved id.
 #[test]
-fn xiaomi_default_base_is_the_payg_literal() {
+fn band4_xiaomi_default_base_is_the_payg_literal() {
     assert_eq!(
         rivect::providers::dialect_for(XIAOMI),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -4534,7 +4587,7 @@ fn xiaomi_default_base_is_the_payg_literal() {
 /// AUTH, WIRE and RECOVERY each execute and report inside this run, and
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn xiaomi_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xiaomi_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4659,7 +4712,7 @@ async fn xiaomi_provider_legs_matrix_executes_all_expected_legs() {
 /// needs its own fresh authorization.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi = NOT_RUN"]
-fn provider_installed_xiaomi() {}
+fn band4_provider_installed_xiaomi() {}
 
 // ----- xiaomi-token-plan-ams -------------------------------------------------
 
@@ -4746,7 +4799,7 @@ fn xiaomi_ams_provider(
 /// terminal, and the one physical send is charged once with the reported
 /// usage.
 #[tokio::test]
-async fn xiaomi_token_plan_ams_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xiaomi_token_plan_ams_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -4833,7 +4886,7 @@ async fn xiaomi_token_plan_ams_valid_control_yields_one_outcome_and_one_physical
 /// listing is the typed denial on its one attempt — never a fallback to
 /// another cluster.
 #[tokio::test]
-async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
+async fn band4_xiaomi_token_plan_ams_never_retries_another_cluster() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_AMS_MODEL})]).await;
     mount_chat(&server, completed_stream("ams", None)).await;
@@ -4933,7 +4986,7 @@ async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
 /// transport denial carrying the peer's status alone — no error, nor the
 /// offered credential material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn xiaomi_token_plan_ams_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+async fn band4_wrong_credential_xiaomi_token_plan_ams_profile_or_region_denies_with_typed_context_without_secrets()
 {
     let server = MockServer::start().await;
 
@@ -5041,7 +5094,7 @@ async fn xiaomi_token_plan_ams_wrong_credential_profile_or_region_denies_with_ty
 /// executes — and a finish_reason the dialect cannot classify are each the
 /// unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn xiaomi_token_plan_ams_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xiaomi_token_plan_ams_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -5126,7 +5179,7 @@ async fn xiaomi_token_plan_ams_rejects_partial_tool_block_and_unknown_terminal()
 /// base — never the PAYG or CN/SGP literal or a sibling class's default — a
 /// configured base stays verbatim, and loopback never serves the reserved id.
 #[test]
-fn xiaomi_token_plan_ams_default_base_is_the_ams_literal() {
+fn band4_xiaomi_token_plan_ams_default_base_is_the_ams_literal() {
     assert_eq!(
         rivect::providers::dialect_for(XIAOMI_AMS),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -5206,7 +5259,7 @@ fn xiaomi_token_plan_ams_default_base_is_the_ams_literal() {
 /// `xiaomi-token-plan-ams`: CATALOG, AUTH, WIRE and RECOVERY each execute and
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn xiaomi_token_plan_ams_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xiaomi_token_plan_ams_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5331,7 +5384,7 @@ async fn xiaomi_token_plan_ams_provider_legs_matrix_executes_all_expected_legs()
 /// runs — a real AMS request needs its own fresh authorization.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-ams = NOT_RUN"]
-fn provider_installed_xiaomi_token_plan_ams() {}
+fn band4_provider_installed_xiaomi_token_plan_ams() {}
 
 // ----- xiaomi-token-plan-cn --------------------------------------------------
 
@@ -5418,7 +5471,7 @@ fn xiaomi_cn_provider(
 /// terminal, and the one physical send is charged once with the reported
 /// usage.
 #[tokio::test]
-async fn xiaomi_token_plan_cn_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xiaomi_token_plan_cn_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -5504,7 +5557,7 @@ async fn xiaomi_token_plan_cn_valid_control_yields_one_outcome_and_one_physical_
 /// rather than selecting another family host (PROH-010). A failed listing is
 /// the typed denial on its one attempt — never a fallback to another cluster.
 #[tokio::test]
-async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
+async fn band4_xiaomi_token_plan_cn_never_retries_another_cluster() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_CN_MODEL})]).await;
     mount_chat(&server, completed_stream("cn", None)).await;
@@ -5601,7 +5654,7 @@ async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
 /// transport denial carrying the peer's status alone — no error, nor the
 /// offered credential material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn xiaomi_token_plan_cn_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+async fn band4_wrong_credential_xiaomi_token_plan_cn_profile_or_region_denies_with_typed_context_without_secrets()
 {
     let server = MockServer::start().await;
 
@@ -5709,7 +5762,7 @@ async fn xiaomi_token_plan_cn_wrong_credential_profile_or_region_denies_with_typ
 /// executes — and a finish_reason the dialect cannot classify are each the
 /// unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn xiaomi_token_plan_cn_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xiaomi_token_plan_cn_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -5794,7 +5847,7 @@ async fn xiaomi_token_plan_cn_rejects_partial_tool_block_and_unknown_terminal() 
 /// base — never the PAYG or AMS/SGP literal or a sibling class's default — a
 /// configured base stays verbatim, and loopback never serves the reserved id.
 #[test]
-fn xiaomi_token_plan_cn_default_base_is_the_cn_literal() {
+fn band4_xiaomi_token_plan_cn_default_base_is_the_cn_literal() {
     assert_eq!(
         rivect::providers::dialect_for(XIAOMI_CN),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -5874,7 +5927,7 @@ fn xiaomi_token_plan_cn_default_base_is_the_cn_literal() {
 /// `xiaomi-token-plan-cn`: CATALOG, AUTH, WIRE and RECOVERY each execute and
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5999,7 +6052,7 @@ async fn xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() 
 /// runs — a real CN request needs its own fresh authorization.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-cn = NOT_RUN"]
-fn provider_installed_xiaomi_token_plan_cn() {}
+fn band4_provider_installed_xiaomi_token_plan_cn() {}
 
 // ----- xiaomi-token-plan-sgp -------------------------------------------------
 
@@ -6089,7 +6142,7 @@ fn xiaomi_sgp_provider(
 /// terminal, and the one physical send is charged once with the reported
 /// usage.
 #[tokio::test]
-async fn xiaomi_token_plan_sgp_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_xiaomi_token_plan_sgp_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -6177,7 +6230,7 @@ async fn xiaomi_token_plan_sgp_valid_control_yields_one_outcome_and_one_physical
 /// listing is the typed denial on its one attempt, with no sibling base tried
 /// or walked.
 #[tokio::test]
-async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
+async fn band4_xiaomi_token_plan_sgp_never_retries_another_cluster() {
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_SGP_MODEL})]).await;
     mount_chat(&server, completed_stream("sgp", None)).await;
@@ -6274,7 +6327,7 @@ async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
 /// transport denial carrying the peer's status alone — no error, nor the
 /// offered credential material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn xiaomi_token_plan_sgp_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+async fn band4_wrong_credential_xiaomi_token_plan_sgp_profile_or_region_denies_with_typed_context_without_secrets()
 {
     let server = MockServer::start().await;
 
@@ -6382,7 +6435,7 @@ async fn xiaomi_token_plan_sgp_wrong_credential_profile_or_region_denies_with_ty
 /// executes — and a finish_reason the dialect cannot classify are each the
 /// unknown terminal, and a rejected send charges nothing.
 #[tokio::test]
-async fn xiaomi_token_plan_sgp_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_xiaomi_token_plan_sgp_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -6467,7 +6520,7 @@ async fn xiaomi_token_plan_sgp_rejects_partial_tool_block_and_unknown_terminal()
 /// base — never the PAYG or AMS/CN literal or a sibling class's default — a
 /// configured base stays verbatim, and loopback never serves the reserved id.
 #[test]
-fn xiaomi_token_plan_sgp_default_base_is_the_sgp_literal() {
+fn band4_xiaomi_token_plan_sgp_default_base_is_the_sgp_literal() {
     assert_eq!(
         rivect::providers::dialect_for(XIAOMI_SGP),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -6547,7 +6600,7 @@ fn xiaomi_token_plan_sgp_default_base_is_the_sgp_literal() {
 /// `xiaomi-token-plan-sgp`: CATALOG, AUTH, WIRE and RECOVERY each execute and
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -6672,7 +6725,7 @@ async fn xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs()
 /// runs — a real SGP request needs its own fresh authorization.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-sgp = NOT_RUN"]
-fn provider_installed_xiaomi_token_plan_sgp() {}
+fn band4_provider_installed_xiaomi_token_plan_sgp() {}
 
 // ----- yolo-auto -------------------------------------------------------------
 
@@ -6756,7 +6809,7 @@ fn yolo_provider(
 /// stream validates its terminal, and the one physical send is charged once
 /// with the reported usage.
 #[tokio::test]
-async fn yolo_auto_valid_control_yields_one_outcome_and_one_physical_usage() {
+async fn band4_valid_control_yolo_auto_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -6849,7 +6902,7 @@ async fn yolo_auto_valid_control_yields_one_outcome_and_one_physical_usage() {
 /// (`ModelPrice::Usd{0.0,0.0}`) even when the wire entry states a nonzero
 /// pricing object, and an empty answer keeps the seed floor.
 #[tokio::test]
-async fn yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
+async fn band4_yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -6893,14 +6946,8 @@ async fn yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
             );
             assert_eq!(
                 model.efforts,
-                vec![
-                    EffortLevel::Minimal,
-                    EffortLevel::Low,
-                    EffortLevel::Medium,
-                    EffortLevel::High,
-                    EffortLevel::Xhigh,
-                ],
-                "the pinned seed states its recorded effort dial"
+                vec![EffortLevel::Low, EffortLevel::High],
+                "the pinned seed advertises only the wire-accepted effort dial"
             );
         } else {
             assert!(
@@ -6954,6 +7001,60 @@ async fn yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
         "the seed floor keeps its recorded window"
     );
     drop_blocking(provider);
+
+    // a failed listing answers the recorded seed floor — the class's one
+    // vendored row, never an invented offer — on its one attempted leg
+    let failed_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failed_server)
+        .await;
+    let failed_config =
+        Config::parse_validated(&yolo_config(&server_uri_v1(&failed_server))).expect("valid");
+    let (provider, _store) = yolo_provider(&failed_config, Some(YOLO_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the failed listing answers the recorded seed floor");
+    assert_eq!(
+        model_ids(&models),
+        vec![YOLO_SEED_MODEL],
+        "the seed floor stands alone, with no fabricated offer"
+    );
+    assert!(
+        models[0].reasoning,
+        "the seed floor keeps its reasoning mark"
+    );
+    assert!(models[0].vision, "the seed floor keeps its image mark");
+    assert_eq!(
+        models[0].context_window,
+        Some(131_072),
+        "the seed floor keeps its recorded window"
+    );
+    assert_eq!(
+        models[0].efforts,
+        vec![EffortLevel::Low, EffortLevel::High],
+        "the seed floor advertises only the wire-accepted effort dial"
+    );
+    assert_eq!(
+        models[0].price, flat_rate,
+        "the seed floor keeps the provider-wide flat rate"
+    );
+    drop_blocking(provider);
+
+    let requests = failed_server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the failed listing is the one attempted leg"
+    );
+    assert_eq!(
+        requests[0].url.path(),
+        "/v1/models",
+        "no sibling id is contacted"
+    );
 }
 
 // ----- TP-PROVIDER-RECOVERY::yolo-auto (effort gate) -------------------------
@@ -6964,7 +7065,7 @@ async fn yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
 /// manifest carrier and denies typed before the body or any wire leg — never
 /// a silently dropped or invented wire value.
 #[tokio::test]
-async fn yolo_auto_pinned_effort_outside_the_recorded_dial_denies() {
+async fn band4_yolo_auto_pinned_effort_outside_the_recorded_dial_denies() {
     let server = MockServer::start().await;
     mount_chat(
         &server,
@@ -7061,7 +7162,7 @@ async fn yolo_auto_pinned_effort_outside_the_recorded_dial_denies() {
 /// carrying the peer's status alone — no error, nor the offered credential
 /// material or the peer's body, reaches Display or Debug.
 #[tokio::test]
-async fn yolo_auto_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+async fn band4_wrong_credential_yolo_auto_profile_or_region_denies_with_typed_context_without_secrets() {
     let server = MockServer::start().await;
 
     // a configured region is denied — never ignored — while a sibling scope
@@ -7168,7 +7269,7 @@ async fn yolo_auto_wrong_credential_profile_or_region_denies_with_typed_context_
 /// finish_reason the dialect cannot classify are each the unknown terminal,
 /// and a rejected send charges nothing.
 #[tokio::test]
-async fn yolo_auto_rejects_partial_tool_block_and_unknown_terminal() {
+async fn band4_rejects_partial_yolo_auto_tool_block_and_unknown_terminal() {
     // a complete content delta plus an unterminated tool-call fragment,
     // then EOF — no finish_reason and no [DONE]
     let server = MockServer::start().await;
@@ -7253,7 +7354,7 @@ async fn yolo_auto_rejects_partial_tool_block_and_unknown_terminal() {
 /// default — a configured base stays verbatim, and loopback never serves the
 /// reserved id.
 #[test]
-fn yolo_auto_discriminates_the_recorded_default_base() {
+fn band4_yolo_auto_discriminates_the_recorded_default_base() {
     assert_eq!(
         rivect::providers::dialect_for(YOLO),
         Some(rivect::providers::Dialect::ChatCompletions)
@@ -7331,7 +7432,7 @@ fn yolo_auto_discriminates_the_recorded_default_base() {
 /// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this run,
 /// and INSTALLED reports NOT_RUN.
 #[tokio::test]
-async fn yolo_auto_provider_legs_matrix_executes_all_expected_legs() {
+async fn band4_yolo_auto_provider_legs_matrix_executes_all_expected_legs() {
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -7457,7 +7558,7 @@ async fn yolo_auto_provider_legs_matrix_executes_all_expected_legs() {
 /// request needs its own fresh authorization.
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::yolo-auto = NOT_RUN"]
-fn provider_installed_yolo_auto() {}
+fn band4_provider_installed_yolo_auto() {}
 
 // ----- band-4 aggregate leg matrices -----------------------------------------
 
