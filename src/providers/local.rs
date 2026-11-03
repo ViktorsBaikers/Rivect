@@ -3,9 +3,9 @@
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
-//! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow` and
-//! `siliconflow-cn` connections' adapter — the OpenAI-compatible Chat
-//! Completions dialect
+//! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
+//! `siliconflow-cn` and `synthetic` connections' adapter — the
+//! OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -188,7 +188,20 @@
 //! host and credential: the id-keyed region split (EDGE-007) never
 //! substitutes either host for the other, and the distinct recorded
 //! `SILICONFLOW_CN_API_KEY` env name is class metadata, not a second
-//! ingress. The adapter authors no
+//! ingress. The configured-or-recorded
+//! `https://api.synthetic.new/openai/v1` base of `synthetic` carries
+//! the pinned code's `/openai/v1` root — never the docs' `/v1` — over
+//! the class's own nonstandard listing surface: capabilities arrive in
+//! `supported_features`, modalities in `input_modalities`, the output
+//! cap in `max_output_length` (then `max_tokens`, then the recorded
+//! 8192 fallback, as this adapter carries no bundled reference), the
+//! accepted effort vocabulary in `reasoning_parameters.efforts`
+//! (representable levels only: `none` is the thinking-off router state
+//! and `max` names no level our vocabulary transmits, DEC-008), and
+//! per-token USD prices in `pricing` as `$`-prefixed decimals scaled
+//! to per-1M figures. A partial or unreadable price stays
+//! [`ModelPrice::Unknown`], never a default figure; absent keys stay at
+//! their empty surface. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -939,6 +952,28 @@ const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
 /// models.dev hydration a runtime residual (D2).
 const SILICONFLOW_CN_BASE_URL: &str = "https://api.siliconflow.cn/v1";
 
+/// The recorded default API root of a `synthetic` connection
+/// (`https://api.synthetic.new/openai/v1`): the pinned code's
+/// `openai/v1` root the required `endpoint` field's empty string
+/// resolves under, under the same absent-override rule the plan
+/// classes bind — never the documentation's bare `/v1`, because the
+/// pinned code binds. The recorded `SYNTHETIC_API_KEY` env name is
+/// live-ingress metadata, never an environment read this adapter
+/// constructs (DEC-011), and the class records no region selector —
+/// the base itself carries the API version. The recorded
+/// `hf:zai-org/GLM-5.2` default is a catalogue hint, never a seeded
+/// offer or ranking (DEC-014/D11), and the recorded Anthropic-format
+/// sibling (`/anthropic/v1/messages`) is a different connection class
+/// this arm never constructs (D7).
+const SYNTHETIC_BASE_URL: &str = "https://api.synthetic.new/openai/v1";
+
+/// The recorded output-cap fallback a `synthetic` route advertises no
+/// `max_output_length` or `max_tokens` for (`SYNTHETIC_FALLBACK_MAX_TOKENS`):
+/// a cap low enough that verbose models stop on `length`, which is
+/// exactly the recorded placeholder's stated trade-off. This adapter
+/// carries no bundled reference, so the chain ends here.
+const SYNTHETIC_FALLBACK_MAX_TOKENS: u64 = 8192;
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1257,6 +1292,24 @@ enum EntryRule {
     /// the listing states and no borrowed price. Both region ids share
     /// this transform; their hosts and credentials stay per-id.
     SiliconFlow,
+    /// The `synthetic` arm: the key-gated authoritative `/models`
+    /// listing's nonstandard record shape — capabilities arrive in
+    /// `supported_features` (only `reasoning` has a carrier; `tools`
+    /// stays a capability this record surface does not carry),
+    /// modalities in `input_modalities` (`image` marks vision), the
+    /// output cap in `max_output_length`, then the generic
+    /// `max_tokens`, then the recorded 8192 fallback because this
+    /// adapter carries no bundled reference, and the accepted effort
+    /// vocabulary in `reasoning_parameters.efforts`. Only levels our
+    /// effort enum names land: `none` is the thinking-off router
+    /// state, never a user effort, and `max` names no representable
+    /// level (DEC-008), so neither is coerced onto a neighbour. Per-token
+    /// USD prices in `pricing.prompt`/`pricing.completion` are
+    /// `$`-prefixed decimals scaled to per-1M figures; a partial or
+    /// unreadable price stays [`ModelPrice::Unknown`], never a
+    /// default figure. Unknown keys are ignored and absent values
+    /// stay at their empty surface.
+    Synthetic,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1801,6 +1854,26 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::SiliconFlow,
+        }),
+        // `synthetic` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://api.synthetic.new/openai/v1`
+        // base — the pinned code's `openai/v1` root, never the docs'
+        // bare `/v1` — redirects discovery and streaming alike, and
+        // the recorded api-key class gates the authoritative `/models`
+        // listing on resolved material: a keyless lookup opens no wire
+        // leg and denies typed. The class's nonstandard entry surface
+        // ([`EntryRule::Synthetic`]) maps capabilities, modalities,
+        // the output-cap chain, the representable effort vocabulary
+        // and per-token USD prices; an empty or failed answer has no
+        // seed or vendored price floor to fall back to. A configured
+        // `region` denies: the contract names none, and the recorded
+        // Anthropic-format sibling is outside this arm (D7).
+        "synthetic" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(SYNTHETIC_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Synthetic,
         }),
         _ => None,
     }
@@ -2481,7 +2554,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::Moonshot
                 | EntryRule::NanoGpt
                 | EntryRule::Novita
-                | EntryRule::SiliconFlow => Some(CatalogModel {
+                | EntryRule::SiliconFlow
+                | EntryRule::Synthetic => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2745,6 +2819,11 @@ impl ChatCompletionsProvider {
             // an admitted row carries its stated limits under the
             // recorded clamp.
             EntryRule::SiliconFlow => siliconflow_entry(id, entry),
+            // The recorded Synthetic transform: the class's nonstandard
+            // capability, modality, output-cap, effort and per-token
+            // pricing fields, with invalid or partial prices staying
+            // unknown.
+            EntryRule::Synthetic => Some(synthetic_entry(id, entry)),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -3056,7 +3135,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Moonshot
             | EntryRule::NanoGpt
             | EntryRule::Novita
-            | EntryRule::SiliconFlow => model_id.to_string(),
+            | EntryRule::SiliconFlow
+            | EntryRule::Synthetic => model_id.to_string(),
         }
     }
 
@@ -3141,7 +3221,8 @@ impl ChatCompletionsProvider {
             | EntryRule::LmStudio
             | EntryRule::NanoGpt
             | EntryRule::Novita
-            | EntryRule::SiliconFlow => return Ok(()),
+            | EntryRule::SiliconFlow
+            | EntryRule::Synthetic => return Ok(()),
         };
         let EffortAssign::Fixed { value } = &manifest.effort else {
             return Ok(());
@@ -4364,6 +4445,121 @@ fn siliconflow_entry(id: &str, entry: &Value) -> Option<CatalogModel> {
         model.max_output_tokens = Some(max_output_tokens.min(context_window));
     }
     Some(model)
+}
+
+/// The recorded Synthetic string-list read (`toSyntheticStringList`):
+/// an array contributes its string members in wire order; any other
+/// shape, or an absent key, reads as no members.
+fn synthetic_string_list(value: Option<&Value>) -> Vec<&str> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// The recorded Synthetic per-token→per-1M conversion
+/// (`toSyntheticCostPerMillion`): a JSON number or a string whose
+/// trimmed form may carry one leading `$`, finite and non-negative,
+/// scaled to per-1M tokens. The scale settles on a millionth of a
+/// dollar per million tokens, so decimal scaling never drifts
+/// (`4.5e-7` scales to `0.45`, not `0.44999999999999996`). Any other
+/// shape — absent, unreadable, infinite, negative, or a finite figure
+/// whose per-1M scale overflows — is no figure.
+fn synthetic_cost_per_million(value: Option<&Value>) -> Option<f64> {
+    let parsed = value
+        .and_then(|value| {
+            value.as_f64().or_else(|| {
+                value.as_str().and_then(|text| {
+                    let text = text.trim();
+                    text.strip_prefix('$').unwrap_or(text).parse().ok()
+                })
+            })
+        })
+        .filter(|number| number.is_finite() && *number >= 0.0)?;
+    let scaled = (parsed * 1e12).round() / 1e6;
+    scaled.is_finite().then_some(scaled)
+}
+
+/// The recorded Synthetic price rule (`resolveSyntheticCost`): both
+/// `pricing.prompt` and `pricing.completion` must state a usable
+/// per-token figure — a partial answer keeps [`ModelPrice::Unknown`]
+/// rather than borrowing a bundled reference or defaulting to zero.
+/// A stated zero is a real figure, so a free route prices as USD zero,
+/// never as unknown.
+fn synthetic_price(entry: &Value) -> ModelPrice {
+    let Some(pricing) = entry.get("pricing") else {
+        return ModelPrice::Unknown;
+    };
+    let (Some(input_per_1m), Some(output_per_1m)) = (
+        synthetic_cost_per_million(pricing.get("prompt")),
+        synthetic_cost_per_million(pricing.get("completion")),
+    ) else {
+        return ModelPrice::Unknown;
+    };
+    ModelPrice::Usd {
+        input_per_1m,
+        output_per_1m,
+    }
+}
+
+/// The recorded Synthetic listing transform (`syntheticModelManagerOptions`
+/// at the pinned commit): `supported_features` names the reasoning
+/// capability, `input_modalities` names image input, the output cap
+/// falls from `max_output_length` through `max_tokens` to the recorded
+/// 8192 placeholder (no bundled reference exists here), and
+/// `reasoning_parameters.efforts` maps only levels our vocabulary
+/// carries — `none` is the thinking-off router state and `max` has no
+/// carrier, so neither lands (DEC-008). Reasoning is the wire's own
+/// answer: a stated effort vocabulary decides it — a `none`-only
+/// vocabulary is the off-switch, never a dial the feature mark would
+/// claim — and only a wire stating no vocabulary falls back to
+/// `supported_features` naming `reasoning`. The recorded source never
+/// re-adds a dial from a reference this adapter does not carry.
+/// `tools` is an ignored feature: the shared catalogue record
+/// carries no tool field. `context_length` maps the input window when
+/// stated; a `max_output_length`/`max_tokens` fallback never borrows
+/// the window. Unknown keys — including the generic
+/// `supports_reasoning`, `supports_vision`, `cost` and `price`
+/// fields — are ignored.
+fn synthetic_entry(id: &str, entry: &Value) -> CatalogModel {
+    let features = synthetic_string_list(entry.get("supported_features"));
+    let modalities = synthetic_string_list(entry.get("input_modalities"));
+    let wire_efforts = entry
+        .get("reasoning_parameters")
+        .filter(|parameters| parameters.is_object())
+        .map(|parameters| synthetic_string_list(parameters.get("efforts")))
+        .unwrap_or_default();
+    let efforts: Vec<EffortLevel> = wire_efforts
+        .iter()
+        .filter_map(|effort| aiand_effort(effort))
+        .collect();
+    // A route with at least one representable tier exposes a real
+    // reasoning dial; a vocabulary naming only `none`/unrecognized
+    // values is the off-switch, never a dial with one stop, and a
+    // stated vocabulary overrides the `supported_features` mark rather
+    // than resurrecting a dial the wire states none for. Only a wire
+    // stating no vocabulary at all leaves `supported_features` as the
+    // answer. `tools` lands nowhere — no shared field carries a tool
+    // surface, so the feature neither offers one nor implies reasoning.
+    let reasoning = if wire_efforts.is_empty() {
+        features.contains(&"reasoning")
+    } else {
+        !efforts.is_empty()
+    };
+    CatalogModel {
+        id: id.to_string(),
+        reasoning,
+        vision: modalities.contains(&"image"),
+        efforts,
+        effort_default: None,
+        context_window: positive_count(entry.get("context_length")),
+        max_output_tokens: Some(
+            positive_count(entry.get("max_output_length"))
+                .or_else(|| positive_count(entry.get("max_tokens")))
+                .unwrap_or(SYNTHETIC_FALLBACK_MAX_TOKENS),
+        ),
+        price: synthetic_price(entry),
+    }
 }
 
 /// The recorded `nanogpt` `:thinking` suffix

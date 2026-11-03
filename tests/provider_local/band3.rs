@@ -5259,3 +5259,1007 @@ async fn siliconflow_cn_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::siliconflow-cn = NOT_RUN"]
 fn provider_installed_siliconflow_cn() {}
+
+// ----- synthetic -------------------------------------------------------------
+
+// The `synthetic` connection's proof legs (HZN-008 class B — the
+// api-key cell): the shared Chat Completions adapter serves the literal
+// id — no copied codec — under its own recorded predicates. The
+// configured `endpoint` carries the API base verbatim, and an empty one
+// resolves the pinned code's `https://api.synthetic.new/openai/v1`
+// root — never the docs' bare `/v1`. A configured `region` is denied:
+// the contract names none. The api-key class gates the authoritative
+// `/models` listing on resolved material, the listing is the whole
+// catalogue — no seed, no fallback floor — and its nonstandard entry
+// surface maps `supported_features`, `input_modalities`,
+// `max_output_length`/`max_tokens`, `reasoning_parameters.efforts` and
+// per-token USD `pricing`. The recorded Anthropic-format sibling is a
+// different connection class this arm never constructs (D7).
+
+/// The literal connection id this class serves.
+const SYNTHETIC: &str = "synthetic";
+
+/// The scoped credential ref the connection binds.
+const SYNTHETIC_REF: &str = "keyring:rivect-test/synthetic";
+
+/// Fixture `synthetic` key material — never a real credential, only
+/// ever sent to localhost.
+const SYNTHETIC_KEY: &str = "fixture-synthetic-key";
+
+/// The pinned model id the fixed-pin legs carry — the recorded default
+/// hint, a listed id when the catalogue answers it.
+const SYNTHETIC_MODEL: &str = "hf:zai-org/GLM-5.2";
+
+/// One configured `synthetic` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn synthetic_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.synthetic]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{SYNTHETIC_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"synthetic\", model_id = \"{SYNTHETIC_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// A `synthetic` config pinning a specific model and effort — the
+/// unrepresentable-effort ingress leg needs the raw wire value.
+fn synthetic_pin_config(endpoint: &str, model: &str, effort: &str) -> String {
+    synthetic_config(endpoint)
+        .replace(SYNTHETIC_MODEL, model)
+        .replace("value = \"high\"", &format!("value = \"{effort}\""))
+}
+
+/// The pinned code's `/openai/v1` API root over the fixture peer.
+fn synthetic_uri(server: &MockServer) -> String {
+    format!("{}/openai/v1", server.uri())
+}
+
+fn synthetic_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(SYNTHETIC_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), SYNTHETIC.to_string(), store.clone())
+        .expect("the shared adapter builds for the synthetic id");
+    (provider, store)
+}
+
+/// The `synthetic` provider over the recorded enrolled key.
+fn enrolled_synthetic_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    synthetic_provider(config, SYNTHETIC_KEY)
+}
+
+async fn mount_synthetic_chat(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_synthetic_models(server: &MockServer, entries: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": entries})),
+        )
+        .mount(server)
+        .await;
+}
+
+// ----- TP-PROVIDER-WIRE::synthetic -------------------------------------------
+
+/// A configured `synthetic` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the scoped material rides the `Authorization` header —
+/// never the body — and the shared adapter posts exactly the frozen
+/// manifest as a `chat/completions` request under the pinned
+/// `/openai/v1` root — the pinned model id verbatim, system+user
+/// messages, `stream` with `stream_options.include_usage` and the
+/// pinned effort as `reasoning_effort` verbatim — the SSE stream
+/// validates its finish_reason/`[DONE]` terminal, the one physical send
+/// is charged once with the provider's reported usage, and the spent
+/// attempt never re-sends.
+#[tokio::test]
+async fn synthetic_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_synthetic_chat(
+        &server,
+        completed_stream(
+            "verified synthetic outcome",
+            Some(json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/synthetic", "goal: prove the wire")
+        .expect("the synthetic pin passes eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/synthetic", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified synthetic outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — a fixed pin
+    // opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/openai/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {SYNTHETIC_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SYNTHETIC_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], SYNTHETIC_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("high"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, SYNTHETIC);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/synthetic", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the replay added no physical request"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::synthetic ----------------------------------------
+
+/// The listing's nonstandard record shape maps exactly:
+/// `supported_features` naming `reasoning` reasons when the wire states
+/// no effort vocabulary, a stated vocabulary decides on its own — a
+/// route with a real tier exposes a dial — and `tools` is ignored
+/// because the shared record carries no tool field. `input_modalities`
+/// names image input, a
+/// stated `max_output_length` wins over `max_tokens` (a zero falls
+/// through) and the chain ends at the recorded 8192 placeholder,
+/// `context_length` carries the window, and per-token `$` prices scale
+/// to per-1M USD. Unknown keys — the generic `supports_reasoning`,
+/// `supports_vision`, `max_completion_tokens`, `cost` and `price`
+/// fields — are ignored, so nothing is borrowed from another class's
+/// shape.
+#[tokio::test]
+async fn synthetic_catalog_maps_recorded_fields() {
+    let server = MockServer::start().await;
+    mount_synthetic_models(
+        &server,
+        vec![
+            json!({
+                "id": "synthetic-effort-only",
+                "reasoning_parameters": {"efforts": ["medium"]},
+            }),
+            json!({
+                "id": "synthetic-feature-only",
+                "supported_features": ["reasoning"],
+            }),
+            json!({"id": "synthetic-fallback", "max_tokens": 4096}),
+            json!({
+                "id": "synthetic-both-caps",
+                "max_output_length": 65536,
+                "max_tokens": 4096,
+            }),
+            json!({"id": "synthetic-zero-cap", "max_output_length": 0, "max_tokens": 4096}),
+            json!({
+                "id": "synthetic-full",
+                "supported_features": ["reasoning", "tools"],
+                "input_modalities": ["text", "image"],
+                "context_length": 262144,
+                "max_output_length": 65536,
+                "reasoning_parameters": {"efforts": ["none", "low", "high", "max", "turbo"]},
+                "pricing": {"prompt": "$0.00000045", "completion": "$0.0000018"},
+            }),
+            json!({
+                "id": "synthetic-ignored-keys",
+                "supports_reasoning": true,
+                "supports_vision": true,
+                "max_completion_tokens": 1234,
+                "cost": {"input": 1.5, "output": 3.0},
+                "price": 0.7,
+            }),
+            json!({
+                "id": "synthetic-tools-only",
+                "supported_features": ["tools"],
+                "input_modalities": ["text"],
+            }),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&synthetic_config(&format!("  {}/openai/v1/  ", server.uri())))
+            .expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "synthetic-both-caps".to_string(),
+                max_output_tokens: Some(65536),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-effort-only".to_string(),
+                reasoning: true,
+                efforts: vec![EffortLevel::Medium],
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-fallback".to_string(),
+                max_output_tokens: Some(4096),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-feature-only".to_string(),
+                reasoning: true,
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-full".to_string(),
+                reasoning: true,
+                vision: true,
+                efforts: vec![EffortLevel::Low, EffortLevel::High],
+                context_window: Some(262144),
+                max_output_tokens: Some(65536),
+                price: ModelPrice::Usd {
+                    input_per_1m: 0.45,
+                    output_per_1m: 1.8,
+                },
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-ignored-keys".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-tools-only".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-zero-cap".to_string(),
+                max_output_tokens: Some(4096),
+                ..CatalogModel::default()
+            },
+        ],
+        "every recorded field lands on its carrier and unknown keys stay ignored"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyed listing is the one leg");
+    assert_eq!(
+        requests[0].url.path(),
+        "/openai/v1/models",
+        "the configured base wins, trailing slashes trimmed"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {SYNTHETIC_KEY}"),
+        "the listing runs only under the resolved material"
+    );
+}
+
+/// The recorded price rule is all-or-unknown: both `pricing.prompt` and
+/// `pricing.completion` must state a usable per-token figure, so a
+/// missing half, an unreadable string, a negative figure, a non-finite
+/// one (`NaN`/`inf`, or a per-token value whose per-1M scale overflows)
+/// or a non-object shape keeps [`ModelPrice::Unknown`] — never a zero
+/// the accounting could release and never a figure borrowed from another
+/// field. A stated zero is a real figure, so a free route prices as USD
+/// zero.
+#[tokio::test]
+async fn synthetic_invalid_pricing_stays_unknown() {
+    let server = MockServer::start().await;
+    mount_synthetic_models(
+        &server,
+        vec![
+            json!({"id": "synthetic-price-absent"}),
+            json!({
+                "id": "synthetic-price-borrowed",
+                "cost": {"input": 1.5, "output": 3.0},
+                "price": 0.7,
+            }),
+            json!({
+                "id": "synthetic-price-free",
+                "pricing": {"prompt": "$0", "completion": "$0"},
+            }),
+            json!({
+                "id": "synthetic-price-negative",
+                "pricing": {"prompt": "$-0.000001", "completion": "$0.000001"},
+            }),
+            json!({
+                "id": "synthetic-price-partial",
+                "pricing": {"prompt": "$0.000001"},
+            }),
+            json!({"id": "synthetic-price-shape", "pricing": "$0.000001"}),
+            json!({
+                "id": "synthetic-price-unreadable",
+                "pricing": {"prompt": "$n/a", "completion": "$0.000001"},
+            }),
+            json!({
+                "id": "synthetic-price-bare-string",
+                "pricing": {"prompt": "0.00000045", "completion": "0.0000018"},
+            }),
+            json!({
+                "id": "synthetic-price-valid",
+                "pricing": {"prompt": "$0.00000045", "completion": 0.0000018},
+            }),
+            json!({
+                "id": "synthetic-price-nan",
+                "pricing": {"prompt": "NaN", "completion": "$0.000001"},
+            }),
+            json!({
+                "id": "synthetic-price-infinite",
+                "pricing": {"prompt": "inf", "completion": "$0.000001"},
+            }),
+            json!({
+                "id": "synthetic-price-overflow",
+                "pricing": {"prompt": 1e300, "completion": "$0.000001"},
+            }),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+
+    let expected = [
+        ("synthetic-price-absent", ModelPrice::Unknown),
+        ("synthetic-price-bare-string", ModelPrice::Usd { input_per_1m: 0.45, output_per_1m: 1.8 }),
+        ("synthetic-price-borrowed", ModelPrice::Unknown),
+        ("synthetic-price-free", ModelPrice::Usd { input_per_1m: 0.0, output_per_1m: 0.0 }),
+        ("synthetic-price-infinite", ModelPrice::Unknown),
+        ("synthetic-price-nan", ModelPrice::Unknown),
+        ("synthetic-price-negative", ModelPrice::Unknown),
+        ("synthetic-price-overflow", ModelPrice::Unknown),
+        ("synthetic-price-partial", ModelPrice::Unknown),
+        ("synthetic-price-shape", ModelPrice::Unknown),
+        ("synthetic-price-unreadable", ModelPrice::Unknown),
+        ("synthetic-price-valid", ModelPrice::Usd { input_per_1m: 0.45, output_per_1m: 1.8 }),
+    ];
+    assert_eq!(models.len(), expected.len(), "every row is offered");
+    for (model, (id, price)) in models.iter().zip(expected) {
+        assert_eq!(model.id, id);
+        assert_eq!(
+            model.price, price,
+            "invalid or partial pricing stays unknown, never a default figure: {id}"
+        );
+    }
+}
+
+/// The recorded effort vocabulary maps only levels our shared enum
+/// carries: `none` is the thinking-off router state and `max` names no
+/// representable tier, so neither lands in the catalogue and neither is
+/// coerced onto a neighbour. A stated vocabulary with no representable
+/// level stays non-reasoning — no dial with one stop — and a
+/// `supported_features` mark does not resurrect it; only a wire stating
+/// no vocabulary falls back to the feature mark. The ingress refuses
+/// both values in a pin, so no request is ever constructed from an
+/// unrepresentable level (DEC-008).
+#[tokio::test]
+async fn synthetic_unrepresentable_efforts_never_land() {
+    let server = MockServer::start().await;
+    mount_synthetic_models(
+        &server,
+        vec![
+            json!({
+                "id": "synthetic-efforts-all",
+                "reasoning_parameters": {
+                    "efforts": ["minimal", "low", "medium", "high", "xhigh", "none", "max", "turbo"],
+                },
+            }),
+            json!({"id": "synthetic-efforts-max-only", "reasoning_parameters": {"efforts": ["max"]}}),
+            json!({"id": "synthetic-efforts-non-array", "reasoning_parameters": {"efforts": "high"}}),
+            json!({"id": "synthetic-efforts-none-only", "reasoning_parameters": {"efforts": ["none"]}}),
+            json!({"id": "synthetic-efforts-shape", "reasoning_parameters": ["high"]}),
+            json!({
+                "id": "synthetic-feature-none-only",
+                "supported_features": ["reasoning"],
+                "reasoning_parameters": {"efforts": ["none"]},
+            }),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "synthetic-efforts-all".to_string(),
+                reasoning: true,
+                efforts: vec![
+                    EffortLevel::Minimal,
+                    EffortLevel::Low,
+                    EffortLevel::Medium,
+                    EffortLevel::High,
+                    EffortLevel::Xhigh,
+                ],
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-efforts-max-only".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-efforts-non-array".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-efforts-none-only".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-efforts-shape".to_string(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "synthetic-feature-none-only".to_string(),
+                reasoning: false,
+                efforts: Vec::new(),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+        ],
+        "none and max never land; only representable levels survive"
+    );
+
+    // the recorded max/none have no carrier in the shared vocabulary:
+    // the config carriers refuse the value at ingress, so no request is
+    // ever constructed from them
+    for effort in ["none", "max"] {
+        let Err(error) = Config::parse_validated(&synthetic_pin_config(
+            &synthetic_uri(&server),
+            SYNTHETIC_MODEL,
+            effort,
+        )) else {
+            panic!("{effort} names no effort level this adapter can transmit")
+        };
+        assert!(
+            matches!(
+                &error.issue,
+                ConfigIssue::UnsupportedEffortValue { value } if value == effort
+            ),
+            "the refusal is the typed unsupported-effort value: {error}"
+        );
+    }
+}
+
+/// The key-gated listing is the whole catalogue: an absent scope denies
+/// `CredentialAbsent` before any request, an empty answer offers nothing
+/// — the class records no seed floor — and a failed answer keeps the
+/// leg's typed denial. No floor answers in either case.
+#[tokio::test]
+async fn synthetic_catalog_is_the_keyed_listing() {
+    // an absent scope denies before any request — the listing never
+    // runs keyless, even where a `/models` answer would serve rows
+    let server = MockServer::start().await;
+    mount_synthetic_models(&server, vec![json!({"id": SYNTHETIC_MODEL})]).await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, denied) = catalog_on_thread(
+        provider_result(
+            config,
+            SYNTHETIC.to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+    );
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "the keyless listing denies before the wire: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the keyless lookup opened no listing leg"
+    );
+
+    // an empty `data` answer is a real answer with no offers — the
+    // class records no floor, so nothing fills it
+    let server = MockServer::start().await;
+    mount_synthetic_models(&server, vec![]).await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("an empty listing still answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        model_ids(&models)
+    );
+
+    // a failed listing is the leg's typed denial — no floor answers
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openai/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, failed) = catalog_on_thread(provider);
+    let err = failed.expect_err("a failed listing has no floor to answer");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the failed listing is the typed transport denial: {err:?}")
+    };
+    assert_eq!(connection, SYNTHETIC);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the failed listing keeps its typed denial: {cause}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-AUTH::synthetic -------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `synthetic`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn synthetic_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &synthetic_config(&synthetic_uri(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        SYNTHETIC.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(SILICONFLOW_REF, SILICONFLOW_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, SYNTHETIC);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, SILICONFLOW_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.synthetic]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"synthetic\", model_id = \"{SYNTHETIC_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        synthetic_uri(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        SYNTHETIC.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(SYNTHETIC_REF, SYNTHETIC_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, SYNTHETIC_KEY.as_bytes());
+
+    // a refused key is a typed transport denial: the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the synthetic bearer
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, SYNTHETIC);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, SYNTHETIC_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/openai/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {SYNTHETIC_KEY}"),
+        "the admitted synthetic bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// Hostile stream input never reports success for `synthetic`: a stream
+/// ended mid `tool_calls` fragment — a partial call that never executes
+/// — and a finish_reason the dialect cannot classify are each the
+/// unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn synthetic_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_synthetic_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_synthetic_provider(&config),
+        &config,
+        "/world/synthetic",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/synthetic", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_synthetic_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_synthetic_provider(&config),
+        &config,
+        "/world/synthetic",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/synthetic", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::synthetic ----------------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `synthetic` to the shared Chat Completions dialect, the Responses
+/// adapter refuses it, the Chat Completions adapter refuses a Responses
+/// and a native sibling id, and loopback never serves the reserved id.
+/// An empty endpoint resolves the pinned code's `/openai/v1` root —
+/// never the docs' bare `/v1`.
+#[test]
+fn synthetic_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for(SYNTHETIC),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the pinned code's
+    // base — proved on the adapter's `Debug` surface, no byte toward
+    // the host
+    let config = Config::parse_validated(&synthetic_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config.clone(),
+        SYNTHETIC.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the synthetic id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://api.synthetic.new/openai/v1\""),
+        "an empty endpoint resolves the pinned code's base: {debug}"
+    );
+    assert!(
+        !debug.contains("\"https://api.synthetic.new/v1\""),
+        "the docs' bare /v1 host is never constructed: {debug}"
+    );
+    drop_blocking(provider);
+
+    // the Responses adapter refuses the Chat Completions id
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = std::thread::spawn({
+        let config = config.clone();
+        let store = store.clone();
+        move || OpenAiProvider::new(&config, SYNTHETIC, store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("the Responses adapter refuses the Chat Completions id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "the Responses adapter refuses the id: {err}"
+    );
+
+    // the Chat Completions adapter refuses every sibling id
+    for id in ["openrouter", "ollama-cloud", "google"] {
+        let err = provider_result(config.clone(), id.to_string(), store.clone())
+            .expect_err("a sibling id is not this contract");
+        assert!(
+            matches!(err, ProviderError::DialectMismatch { .. }),
+            "{id} is refused typed: {err}"
+        );
+    }
+
+    // loopback never serves the reserved id
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.synthetic]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"synthetic\", model_id = \"{SYNTHETIC_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(SYNTHETIC).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(SYNTHETIC, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // the adapter serves only its own literal id
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let entry = config.connections.get(SYNTHETIC).expect("declared");
+    assert!(provider.serves(SYNTHETIC, entry));
+    assert!(!provider.serves("siliconflow", entry));
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-MATRIX::synthetic -----------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `synthetic`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn synthetic_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_synthetic_models(
+        &server,
+        vec![json!({
+            "id": SYNTHETIC_MODEL,
+            "supported_features": ["reasoning", "tools"],
+            "reasoning_parameters": {"efforts": ["high"]},
+        })],
+    )
+    .await;
+    mount_synthetic_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&synthetic_config(&synthetic_uri(&server))).expect("valid");
+
+    // CATALOG: the keyed listing under the recorded transform.
+    let (provider, _store) = enrolled_synthetic_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(&catalog, Ok(models) if model_ids(models) == vec![SYNTHETIC_MODEL]) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), SYNTHETIC.to_string(), empty.clone())
+        .expect("the binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        enrolled_synthetic_provider(&config),
+        &config,
+        "/world/synthetic",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/synthetic", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let provider = provider_result(config.clone(), SYNTHETIC.to_string(), empty.clone())
+        .expect("the binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(SYNTHETIC_REF, SYNTHETIC_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::synthetic --------------------------------------
+
+/// TP-PROVIDER-INSTALLED::synthetic = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::synthetic = NOT_RUN"]
+fn provider_installed_synthetic() {}
