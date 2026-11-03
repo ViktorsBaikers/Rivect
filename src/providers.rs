@@ -1142,8 +1142,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `llama.cpp`/`lm-studio` the recorded class-B local-endpoint plugs,
 /// `mistral` the recorded class-B env-chain plug,
 /// `moonshot`, `nanogpt`, `novita`, `nvidia`, `qianfan`,
-/// `qwen-portal`, `siliconflow`, `siliconflow-cn` and `synthetic` the
-/// recorded class-B api-key plugs and
+/// `qwen-portal`, `siliconflow`, `siliconflow-cn`, `synthetic` and
+/// `together` the recorded class-B api-key plugs and
 /// `minimax-code`/`minimax-code-cn` the recorded class-P plan-key plugs
 /// on that same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
@@ -1220,6 +1220,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "siliconflow" => Some(Dialect::ChatCompletions),
         "siliconflow-cn" => Some(Dialect::ChatCompletions),
         "synthetic" => Some(Dialect::ChatCompletions),
+        "together" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

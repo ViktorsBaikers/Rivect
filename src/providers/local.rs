@@ -4,8 +4,8 @@
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
-//! `siliconflow-cn` and `synthetic` connections' adapter — the
-//! OpenAI-compatible Chat Completions dialect
+//! `siliconflow-cn`, `synthetic` and `together` connections' adapter —
+//! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -201,7 +201,14 @@
 //! per-token USD prices in `pricing` as `$`-prefixed decimals scaled
 //! to per-1M figures. A partial or unreadable price stays
 //! [`ModelPrice::Unknown`], never a default figure; absent keys stay at
-//! their empty surface. The adapter authors no
+//! their empty surface. The configured-or-recorded
+//! `https://api.together.xyz/v1` base of `together` carries the same
+//! api-key class: the pinned `.xyz` host binds, while the documentation's
+//! `.ai` alias and the US endpoint alias are never substituted
+//! (DEC-005), and the key-gated `/models` listing is the whole catalogue
+//! with no entry filter — every parseable id is an offer, each `data[]`
+//! row mapping the id plus `context_length` and `max_completion_tokens`
+//! when stated (DEC-020) — with no seed floor. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -973,6 +980,17 @@ const SYNTHETIC_BASE_URL: &str = "https://api.synthetic.new/openai/v1";
 /// exactly the recorded placeholder's stated trade-off. This adapter
 /// carries no bundled reference, so the chain ends here.
 const SYNTHETIC_FALLBACK_MAX_TOKENS: u64 = 8192;
+
+/// The recorded default API root of a `together` connection
+/// (`https://api.together.xyz/v1`): the pinned `.xyz` host the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The documentation's
+/// `.ai` alias and the US endpoint alias are never substituted
+/// (DEC-005), and the class records no region selector — the base
+/// itself carries the API version. The class records no per-model
+/// price or roster row (D2), so an offered id keeps
+/// [`ModelPrice::Unknown`].
+const TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -1874,6 +1892,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::Synthetic,
+        }),
+        // `together` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://api.together.xyz/v1` base —
+        // the pinned `.xyz` host, never the documentation's `.ai`
+        // alias or the US endpoint alias (DEC-005) — redirects
+        // discovery and streaming alike, and the recorded api-key
+        // class gates the `/models` listing on resolved material: a
+        // keyless lookup opens no wire leg and denies typed. The
+        // listing is the whole catalogue under no entry filter — every
+        // parseable `data[]` id is an offer, each row mapping the id
+        // plus `context_length` and `max_completion_tokens` when
+        // present (DEC-020) — and the class records no vendored
+        // roster or seed, so an empty or failed answer has no floor to
+        // fall back to. The plain bearer arm carries the stored
+        // material, and a configured `region` denies: the contract
+        // names none. The recorded models-endpoint validation stays
+        // the live probe; this adapter constructs no chat probe.
+        "together" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(TOGETHER_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::GenericMetadata,
         }),
         _ => None,
     }
