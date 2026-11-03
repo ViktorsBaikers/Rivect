@@ -3,7 +3,7 @@
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
-//! `novita` and `nvidia` connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `novita`, `nvidia` and `qianfan` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -157,7 +157,14 @@
 //! validation is optional (`optional=#true`): a `401`/`403` from the
 //! validation/model request is the typed hard denial, while any other
 //! non-success proves neither access nor denial and is never reported
-//! as success or as entitlement. The adapter authors no
+//! as success or as entitlement. The configured-or-recorded
+//! `https://qianfan.baidubce.com/v2` base of `qianfan` carries the
+//! recorded api-key class: its key-gated `/models` listing is the
+//! whole catalogue, each `data[]` row mapping the id plus
+//! `context_length` and `max_completion_tokens` when stated, and the
+//! recorded `deepseek-v3.2` default is a catalogue hint — never a
+//! seeded offer or a ranking the sorted-first auto pick follows
+//! (DEC-014/D11). The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -859,6 +866,15 @@ const NOVITA_BASE_URL: &str = "https://api.novita.ai/openai/v1";
 /// neither access nor denial.
 const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 
+/// The recorded default API root of a `qianfan` connection
+/// (`https://qianfan.baidubce.com/v2`): the host the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The class records no
+/// region selector — the base itself carries the API version — and no
+/// per-model price or roster row, so an offered id keeps
+/// [`ModelPrice::Unknown`] and an unlisted id is never seeded.
+const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1033,6 +1049,13 @@ enum EntryRule {
     /// Every id with a non-whitespace body verbatim — the generic
     /// class records no per-model metadata surface.
     IdsOnly,
+    /// The recorded generic listing surface some classes state beside
+    /// the id: `data[].id` with `context_length` and
+    /// `max_completion_tokens` mapped when the entry carries a
+    /// positive value (DEC-020). An absent or unreadable value stays
+    /// `None` — no default figure, no borrowed sibling field — and no
+    /// class using this rule records a seed floor.
+    GenericMetadata,
     /// The org-scoped `aiand` transform: `capabilities` names the
     /// reasoning and image-input surface, `reasoning_efforts` maps
     /// onto the effort ladder, and the org's billing currency decides
@@ -1615,6 +1638,27 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
+        }),
+        // `qianfan` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://qianfan.baidubce.com/v2` base
+        // redirects discovery and streaming alike, and the recorded
+        // api-key class gates the `/models` listing on resolved material
+        // — a keyless lookup opens no wire leg and denies typed. The
+        // listing is the whole catalogue: `data[]` rows carry the id
+        // plus `context_length` and `max_completion_tokens` when
+        // present (DEC-020), and the class records no vendored roster or
+        // seed, so an empty or failed answer has no floor to fall back
+        // to. The recorded `deepseek-v3.2` default is a catalogue hint,
+        // never a seeded offer and never a ranking — the auto pick stays
+        // the adapter's uniform sorted-first listed id (DEC-014/D11).
+        // The plain bearer arm carries the stored material, and a
+        // configured `region` denies: the contract names none.
+        "qianfan" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(QIANFAN_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::GenericMetadata,
         }),
         _ => None,
     }
@@ -2284,6 +2328,7 @@ impl ChatCompletionsProvider {
                 EntryRule::Fireworks => fireworks_entry(id),
                 EntryRule::Groq => Some(groq_entry(id)),
                 EntryRule::IdsOnly
+                | EntryRule::GenericMetadata
                 | EntryRule::Aiand
                 | EntryRule::Aimlapi
                 | EntryRule::AlibabaTokenPlan
@@ -2485,6 +2530,7 @@ impl ChatCompletionsProvider {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
+            EntryRule::GenericMetadata => Some(generic_metadata_entry(id, entry)),
             EntryRule::Aiand => Some(aiand_entry(id, entry)),
             // `filterModel` runs on the mapped model's id — verbatim
             // `entry.id` here, the mapped id `mapWithBundledReference`
@@ -2840,9 +2886,9 @@ impl ChatCompletionsProvider {
     /// recorded `p` version separator (`toFireworksWireModelId`);
     /// `firepass` sends `accounts/fireworks/routers/<id>` for every
     /// pinned router id (`toFirepassWireModelId`); every verbatim
-    /// transform — `IdsOnly`, `Aiand`, `Aimlapi`, `AlibabaTokenPlan`,
-    /// `DeepSeek`, `Groq`, `HuggingFace`, `LiteLlm`, `Moonshot`,
-    /// `NanoGpt` and `Novita` — sends the
+    /// transform — `IdsOnly`, `GenericMetadata`, `Aiand`, `Aimlapi`,
+    /// `AlibabaTokenPlan`, `DeepSeek`, `Groq`, `HuggingFace`,
+    /// `LiteLlm`, `Moonshot`, `NanoGpt` and `Novita` — sends the
     /// offered id unchanged. Each variant is listed so a future
     /// transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -2850,6 +2896,7 @@ impl ChatCompletionsProvider {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
             EntryRule::Fireworks => fireworks_wire_model_id(model_id),
             EntryRule::IdsOnly
+            | EntryRule::GenericMetadata
             | EntryRule::Aiand
             | EntryRule::Aimlapi
             | EntryRule::AlibabaTokenPlan
@@ -2933,6 +2980,7 @@ impl ChatCompletionsProvider {
             EntryRule::Groq => GROQ_EFFORTS,
             EntryRule::Moonshot => MOONSHOT_EFFORTS,
             EntryRule::IdsOnly
+            | EntryRule::GenericMetadata
             | EntryRule::Aiand
             | EntryRule::Aimlapi
             | EntryRule::AlibabaTokenPlan
@@ -3577,6 +3625,21 @@ fn positive_count(value: Option<&Value>) -> Option<u64> {
                 .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
         })
         .filter(|count| *count > 0)
+}
+
+/// The recorded generic listing transform (DEC-020): the id plus the two
+/// limits a row can state — `context_length` on the window carrier and
+/// `max_completion_tokens` on the maximum-output carrier — each read as a
+/// positive whole count. An absent, zero or unreadable value stays
+/// `None`: the class records no default figure, and neither carrier is
+/// ever borrowed from the other.
+fn generic_metadata_entry(id: &str, entry: &Value) -> CatalogModel {
+    CatalogModel {
+        id: id.to_string(),
+        context_window: positive_count(entry.get("context_length")),
+        max_output_tokens: positive_count(entry.get("max_completion_tokens")),
+        ..CatalogModel::default()
+    }
 }
 
 /// `toPositiveNumber(_, 0)` inside a `usd` entry: a finite

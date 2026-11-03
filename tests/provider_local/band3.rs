@@ -1982,3 +1982,771 @@ async fn ollama_cloud_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::ollama-cloud = NOT_RUN"]
 fn provider_installed_ollama_cloud() {}
+
+// ----- qianfan ---------------------------------------------------------------
+
+// The `qianfan` connection's proof legs (HZN-008 class B — the api-key
+// cell): the shared Chat Completions adapter serves the literal id — no
+// copied codec — under its own recorded predicates. The configured
+// `endpoint` carries the API base verbatim, an empty one resolves the
+// recorded `https://qianfan.baidubce.com/v2` default, and a configured
+// `region` is denied: the contract names none. The api-key class gates
+// the `/models` listing on resolved material, the listing is the whole
+// catalogue — no seed, no fallback floor — and its `data[]` rows carry
+// the id plus `context_length` and `max_completion_tokens` when present.
+// The recorded `deepseek-v3.2` default is a catalogue hint, never a
+// seeded offer and never a ranking: the auto pick stays sorted-first
+// (DEC-014/D11).
+
+/// The literal connection id this class serves.
+const QIANFAN: &str = "qianfan";
+
+/// The scoped credential ref the connection binds.
+const QIANFAN_REF: &str = "keyring:rivect-test/qianfan";
+
+/// Fixture `qianfan` key material — never a real credential, only ever
+/// sent to localhost.
+const QIANFAN_KEY: &str = "fixture-qianfan-key";
+
+/// The pinned model id the fixed-pin legs carry — a listed id.
+const QIANFAN_MODEL: &str = "deepseek-v3.2";
+
+/// One configured `qianfan` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn qianfan_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{QIANFAN_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"qianfan\", model_id = \"{QIANFAN_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded `/v2` API root over the fixture peer.
+fn qianfan_uri(server: &MockServer) -> String {
+    format!("{}/v2", server.uri())
+}
+
+fn qianfan_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(QIANFAN_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), QIANFAN.to_string(), store.clone())
+        .expect("the shared adapter builds for the qianfan id");
+    (provider, store)
+}
+
+/// The `qianfan` provider over the recorded enrolled key.
+fn enrolled_qianfan_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    qianfan_provider(config, QIANFAN_KEY)
+}
+
+async fn mount_qianfan_chat(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/v2/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_qianfan_models(server: &MockServer, entries: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/v2/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": entries})),
+        )
+        .mount(server)
+        .await;
+}
+
+// ----- TP-PROVIDER-WIRE::qianfan ---------------------------------------------
+
+/// A configured `qianfan` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the scoped material rides the `Authorization` header —
+/// never the body — and the shared adapter posts exactly the frozen
+/// manifest as a `chat/completions` request — the pinned model id
+/// verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, the one physical send is charged
+/// once with the provider's reported usage, and the spent attempt
+/// never re-sends.
+#[tokio::test]
+async fn qianfan_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_qianfan_chat(
+        &server,
+        completed_stream(
+            "verified qianfan outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/qianfan", "goal: prove the wire")
+        .expect("the qianfan pin passes eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/qianfan", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified qianfan outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — a fixed pin
+    // opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v2/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {QIANFAN_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(QIANFAN_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], QIANFAN_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("high"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, QIANFAN);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/qianfan", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::qianfan ------------------------------------------
+
+/// The `qianfan` catalogue maps the recorded generic fields: every
+/// `data[]` id is an offer, and an entry's `context_length` and
+/// `max_completion_tokens` land on their own carriers when stated — an
+/// absent key stays `None` (no default figure), never borrowed from the
+/// other field. The configured base wins under the recorded trim, so
+/// the route is the `/v2` root the contract names.
+#[tokio::test]
+async fn qianfan_catalog_maps_the_recorded_fields() {
+    let server = MockServer::start().await;
+    mount_qianfan_models(
+        &server,
+        vec![
+            json!({"id": "qianfan-both", "context_length": 131072, "max_completion_tokens": 8192}),
+            json!({"id": "qianfan-context-only", "context_length": 32768}),
+            json!({"id": "qianfan-max-only", "max_completion_tokens": 4096}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&qianfan_config(&format!("  {}/v2/  ", server.uri())))
+        .expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyed catalogue answers");
+    drop_blocking(provider);
+
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "qianfan-both".to_string(),
+                context_window: Some(131072),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "qianfan-context-only".to_string(),
+                context_window: Some(32768),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "qianfan-max-only".to_string(),
+                max_output_tokens: Some(4096),
+                ..CatalogModel::default()
+            },
+        ],
+        "each stated limit lands on its own carrier and an absent one stays None"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyed listing is the one leg");
+    assert_eq!(
+        requests[0].url.path(),
+        "/v2/models",
+        "the configured base wins, trailing slashes trimmed"
+    );
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {QIANFAN_KEY}"),
+        "the listing runs only under the resolved material"
+    );
+}
+
+/// The key-gated listing is the whole catalogue: an absent scope denies
+/// `CredentialAbsent` before any request, an empty answer offers nothing —
+/// the recorded `deepseek-v3.2` default is a hint, never a seeded floor —
+/// and a failed answer keeps the leg's typed denial. No floor answers in
+/// either case.
+#[tokio::test]
+async fn qianfan_catalog_is_the_keyed_listing_without_a_floor() {
+    // an absent scope denies before any request — the listing never
+    // runs keyless, even where a `/models` answer would serve rows
+    let server = MockServer::start().await;
+    mount_qianfan_models(&server, vec![json!({"id": QIANFAN_MODEL})]).await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (provider, denied) = catalog_on_thread(
+        provider_result(
+            config,
+            QIANFAN.to_string(),
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        )
+        .expect("the binding resolves"),
+    );
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "the keyless listing denies before the wire: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the keyless lookup opened no listing leg"
+    );
+
+    // an empty `data` answer is a real answer with no offers — the
+    // recorded default is a hint, so no seed fills it
+    let server = MockServer::start().await;
+    mount_qianfan_models(&server, vec![]).await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("an empty listing still answers");
+    drop_blocking(provider);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        model_ids(&models)
+    );
+
+    // a failed listing is the leg's typed denial — no floor answers
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let (provider, failed) = catalog_on_thread(provider);
+    let err = failed.expect_err("a failed listing has no floor to answer");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the failed listing is the typed transport denial: {err:?}")
+    };
+    assert_eq!(connection, QIANFAN);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the failed listing keeps its typed denial: {cause}"
+    );
+    drop_blocking(provider);
+}
+
+/// The auto pick is the uniform sorted-first listed id: the recorded
+/// `deepseek-v3.2` default rides the listing without outranking it, and
+/// no unlisted id becomes an offer — the send names the sorted-first
+/// id verbatim.
+#[tokio::test]
+async fn qianfan_auto_pick_is_the_sorted_first_listed_id() {
+    let server = MockServer::start().await;
+    mount_qianfan_models(
+        &server,
+        vec![
+            json!({"id": "zzz-last"}),
+            json!({"id": QIANFAN_MODEL}),
+            json!({"id": "aardvark-first"}),
+        ],
+    )
+    .await;
+    mount_qianfan_chat(
+        &server,
+        completed_stream(
+            "auto picked",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"{QIANFAN_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"qianfan\"] }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        qianfan_uri(&server)
+    ))
+    .expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/qianfan", "goal: auto pick")
+        .expect("the single-member pool pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/qianfan", manifest);
+    let reply = outcome.expect("the auto pick dispatches");
+    assert_eq!(reply.text, "auto picked");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the catalogue leg and the send are the only egress"
+    );
+    assert_eq!(requests[0].url.path(), "/v2/models");
+    assert_eq!(requests[1].url.path(), "/v2/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("aardvark-first"),
+        "the sorted-first listed id names the wire model — the recorded default never outranks it"
+    );
+}
+
+/// Hostile stream input never reports success for `qianfan`: a stream
+/// ended mid `tool_calls` fragment — a partial call that never executes —
+/// and a finish_reason the dialect cannot classify are each the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn qianfan_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_qianfan_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_qianfan_provider(&config),
+        &config,
+        "/world/qianfan",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/qianfan", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_qianfan_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_qianfan_provider(&config),
+        &config,
+        "/world/qianfan",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/qianfan", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-AUTH::qianfan ---------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `qianfan`, through the same shared construction its siblings use: a
+/// configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn qianfan_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &qianfan_config(&qianfan_uri(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        QIANFAN.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, QIANFAN_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, QIANFAN);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, QIANFAN_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"qianfan\", model_id = \"{QIANFAN_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"high\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        qianfan_uri(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        QIANFAN.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, QIANFAN_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, QIANFAN_KEY.as_bytes());
+
+    // a refused key is a typed transport denial: the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v2/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, QIANFAN);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, QIANFAN_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v2/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {QIANFAN_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-DIALECT::qianfan ------------------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `qianfan` to the shared Chat Completions dialect, the Responses
+/// adapter refuses it, the Chat Completions adapter refuses a Responses
+/// and a native sibling id, and loopback never serves the reserved id.
+/// An empty endpoint resolves the recorded base.
+#[test]
+fn qianfan_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for(QIANFAN),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&qianfan_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config.clone(),
+        QIANFAN.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the qianfan id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://qianfan.baidubce.com/v2\""),
+        "an empty endpoint resolves the recorded base: {debug}"
+    );
+    drop_blocking(provider);
+
+    // the Responses adapter refuses the Chat Completions id
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = std::thread::spawn({
+        let config = config.clone();
+        let store = store.clone();
+        move || OpenAiProvider::new(&config, QIANFAN, store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("the Responses adapter refuses the Chat Completions id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "the Responses adapter refuses the id: {err}"
+    );
+
+    // the Chat Completions adapter refuses every sibling id
+    for id in ["openrouter", "ollama-cloud", "google"] {
+        let err = provider_result(config.clone(), id.to_string(), store.clone())
+            .expect_err("a sibling id is not this contract");
+        assert!(
+            matches!(err, ProviderError::DialectMismatch { .. }),
+            "{id} is refused typed: {err}"
+        );
+    }
+
+    // loopback never serves the reserved id
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"qianfan\", model_id = \"{QIANFAN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(QIANFAN).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(QIANFAN, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // the adapter serves only its own literal id
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let entry = config.connections.get(QIANFAN).expect("declared");
+    assert!(provider.serves(QIANFAN, entry));
+    assert!(!provider.serves("deepseek", entry));
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-MATRIX::qianfan -------------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `qianfan`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn qianfan_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_qianfan_models(
+        &server,
+        vec![
+            json!({"id": QIANFAN_MODEL, "context_length": 131072, "max_completion_tokens": 8192}),
+        ],
+    )
+    .await;
+    mount_qianfan_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&qianfan_config(&qianfan_uri(&server))).expect("valid");
+
+    // CATALOG: the keyed listing under the generic metadata transform.
+    let (provider, _store) = enrolled_qianfan_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(&catalog, Ok(models) if model_ids(models) == vec![QIANFAN_MODEL]) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), QIANFAN.to_string(), empty.clone())
+        .expect("the binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        enrolled_qianfan_provider(&config),
+        &config,
+        "/world/qianfan",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/qianfan", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let provider = provider_result(config.clone(), QIANFAN.to_string(), empty.clone())
+        .expect("the binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(QIANFAN_REF, QIANFAN_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::qianfan ----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::qianfan = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::qianfan = NOT_RUN"]
+fn provider_installed_qianfan() {}
