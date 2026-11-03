@@ -852,3 +852,779 @@ async fn vllm_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::vllm = NOT_RUN"]
 fn provider_installed_vllm() {}
+
+// ----- venice ----------------------------------------------------------------
+
+// The `venice` connection's proof legs (HZN-008 class B — the
+// public-catalogue cell): the shared Chat Completions adapter serves the
+// literal id under its own recorded predicates. The configured `endpoint`
+// carries the API base verbatim, an empty one resolves the recorded
+// `https://api.venice.ai/api/v1` default, and a configured `region` is
+// denied: the contract names none. The `/models` catalogue is public: the
+// listing rides headerless when the store resolves no material, and that
+// answer is never authentication — the same absent material denies a send
+// `CredentialAbsent` before any chat leg. The model-request key is the
+// plain bearer; it is distinct from the administrative key, but `SecretRef`
+// material carries no class label, so that discrimination is a residual.
+// The class's recorded request names no `stream_options` usage-report
+// member, so its body never asks for one and the reported usage may stay
+// unknown; every other Chat Completions id keeps the shared body.
+
+/// The literal connection id this class serves.
+const VENICE: &str = "venice";
+
+/// The scoped credential ref the declaration binds.
+const VENICE_REF: &str = "keyring:rivect-test/venice";
+
+/// Fixture model-request key material — never a real credential, only ever
+/// sent to a loopback fixture.
+const VENICE_KEY: &str = "fixture-venice-model-key";
+
+/// The pinned model id the fixed-pin legs carry — a listed id.
+const VENICE_MODEL: &str = "venice-uncensored";
+
+/// One `venice` connection pointing at the fixture peer: the api-key class
+/// binds its scoped model-request key, so the declaration carries the ref
+/// the send must resolve.
+fn venice_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.venice]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{VENICE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"venice\", model_id = \"{VENICE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The adapter over an explicit store — the seam the recovery leg enrolls
+/// into after its typed denial.
+fn venice_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let provider = provider_result(config.clone(), VENICE.to_string(), store.clone())
+        .expect("the shared adapter builds for the venice id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the recorded model-request key, or
+/// an empty store for the keyless catalogue leg.
+fn venice_provider(
+    config: &Config,
+    material: Option<&str>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = match material {
+        None => Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Some(material) => {
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[(VENICE_REF, material)]))
+        }
+    };
+    venice_provider_with(config, store)
+}
+
+// ----- TP-PROVIDER-WIRE::venice ----------------------------------------------
+
+/// A configured `venice` connection returns a verified model outcome through
+/// the standard Broker: the api_key pin prepares offline, the adapter posts
+/// exactly the frozen manifest as a `chat/completions` request — model id
+/// verbatim, system+user messages, `stream` — under the resolved bearer,
+/// never a `stream_options` member the class does not request and never a
+/// `reasoning_effort` for auto effort — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the reported
+/// usage.
+#[tokio::test]
+async fn venice_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified venice outcome",
+            Some(json!({"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections[VENICE].credential_ref.as_deref(),
+        Some(VENICE_REF),
+        "the recorded api-key class binds its scoped ref"
+    );
+    let (broker, manifest) = prepared_with(
+        venice_provider(&config, Some(VENICE_KEY)),
+        &config,
+        "/world/venice",
+        "goal: prove the wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified venice outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {VENICE_KEY}"),
+        "the resolved model-request key bears the wire"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], VENICE_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert!(
+        body.get("stream_options").is_none(),
+        "the recorded class names no usage report, so the body asks for none"
+    );
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, VENICE);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 12,
+            completion_tokens: 5,
+            total_tokens: 17,
+        }
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded request body is the shared Chat Completions envelope minus
+/// the usage-report member only on `venice`: a sibling CC id's body keeps
+/// `stream_options.include_usage`, so the predicate is narrow rather than a
+/// shared removal.
+#[tokio::test]
+async fn venice_request_body_omits_stream_options() {
+    let venice_server = MockServer::start().await;
+    mount_chat(&venice_server, completed_stream("venice body", None)).await;
+    let config =
+        Config::parse_validated(&venice_config(&server_uri_v1(&venice_server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        venice_provider(&config, Some(VENICE_KEY)),
+        &config,
+        "/world/venice",
+        "goal: body shape",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest.clone());
+    outcome.expect("the venice send dispatches");
+    assert_eq!(broker.accounted_requests(), 1, "the send is charged once");
+    assert_eq!(
+        broker
+            .accounting_record(&manifest.attempt_id)
+            .expect("the send is accounted")
+            .usage,
+        UsageDelta::Unknown,
+        "a class that never asked for the report charges what the peer stated, else unknown"
+    );
+    drop_blocking(broker);
+    let requests = venice_server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert!(
+        body.get("stream_options").is_none(),
+        "venice sends no stream_options member: {body}"
+    );
+
+    // the sibling generic class keeps the shared usage-report request
+    let sibling_server = MockServer::start().await;
+    mount_chat(&sibling_server, completed_stream("sibling body", None)).await;
+    let sibling =
+        Config::parse_validated(&local_config(&server_uri_v1(&sibling_server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        local_provider(&sibling),
+        &sibling,
+        "/world/local",
+        "goal: body shape",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/local", manifest);
+    outcome.expect("the sibling send dispatches");
+    drop_blocking(broker);
+    let requests = sibling_server
+        .received_requests()
+        .await
+        .expect("the mock recorded the sibling send");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "every other Chat Completions id keeps the recorded usage request"
+    );
+}
+
+// ----- TP-PROVIDER-CATALOG::venice -------------------------------------------
+
+/// The public `/models` catalogue: the listing rides headerless when the
+/// store resolves no material, each `data[]` row maps the id plus the
+/// generic `context_length`/`max_completion_tokens` limits when stated, and
+/// a listing answer is never authentication — the same keyless declaration
+/// denies a send `CredentialAbsent` without opening a chat leg. An empty
+/// listing has no floor to fall back to: no offer is invented.
+#[tokio::test]
+async fn venice_catalog_is_public_and_never_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "venice-uncensored", "context_length": 131072, "max_completion_tokens": 8192}),
+            json!({"id": "venice-roleplay", "context_length": 32768}),
+            json!({"id": "venice-bare"}),
+            json!({"id": "venice-zero", "context_length": 0, "max_completion_tokens": "4096"}),
+            json!({"id": "   "}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = venice_provider(&config, None);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the keyless catalogue answers");
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "venice-bare".to_string(),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "venice-roleplay".to_string(),
+                context_window: Some(32768),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "venice-uncensored".to_string(),
+                context_window: Some(131072),
+                max_output_tokens: Some(8192),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "venice-zero".to_string(),
+                max_output_tokens: Some(4096),
+                ..CatalogModel::default()
+            },
+        ],
+        "the generic limits map when stated; a zero or whitespace id offers nothing"
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1, "the listing is the one catalogue leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_headerless(&requests[0]);
+
+    // the wire leg's tolerance is not an ingress tolerance: the recorded
+    // class is not config-keyless, so an unbound declaration is refused
+    let unbound = venice_config(&server_uri_v1(&server))
+        .replace(&format!("credential_ref = \"{VENICE_REF}\"\n"), "");
+    let err = Config::parse_validated(&unbound)
+        .expect_err("the recorded class requires its scoped binding at ingress");
+    assert!(
+        matches!(err.issue, ConfigIssue::CredentialRefRequired { .. }),
+        "the unbound declaration is the typed ingress denial: {err}"
+    );
+
+    // the public listing confers no authentication: the same keyless
+    // declaration cannot send
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let err = denied.expect_err("a keyless send is denied, never entitlemented by the listing");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the absent model-request key is the typed denial: {err}"
+    );
+    assert_no_secret_or_body(&err, VENICE_KEY.as_bytes());
+    drop_blocking(provider);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the denied send opened no chat leg"
+    );
+
+    // an empty listing has no recorded floor: the catalogue answers empty
+    let empty = MockServer::start().await;
+    mount_models(&empty, Vec::new()).await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&empty))).expect("valid");
+    let (provider, _store) = venice_provider(&config, None);
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("an empty listing is an empty catalogue, not a denial"),
+        Vec::new(),
+        "no floor is invented for the seedless class"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-AUTH::venice ----------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `venice`: a configured `region` — the recorded contract names none —
+/// denies `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused model-request key lands the
+/// typed transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display or
+/// Debug.
+#[tokio::test]
+async fn venice_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling scope
+    // holds real material so the no-secret assertion proves no cross-scope
+    // leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &venice_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        VENICE.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, VENICE_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, VENICE);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, VENICE_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.venice]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"venice\", model_id = \"{VENICE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        VENICE.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, VENICE_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, VENICE_KEY.as_bytes());
+
+    // a refused key is a typed transport denial: the wire never coerces a
+    // wrong credential into success, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = venice_provider(&config, Some(VENICE_KEY));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, VENICE);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, VENICE_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {VENICE_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::venice ------------------------------------------
+
+/// Hostile stream input never reports success for `venice`: a stream ended
+/// mid `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are each the unknown terminal,
+/// and a rejected send charges nothing.
+#[tokio::test]
+async fn venice_rejects_partial_tool_block_and_unknown_terminal() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        venice_provider(&config, Some(VENICE_KEY)),
+        &config,
+        "/world/venice",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        venice_provider(&config, Some(VENICE_KEY)),
+        &config,
+        "/world/venice",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+/// The recorded Bearer recovery: a bound scope the store cannot resolve
+/// denies `CredentialAbsent` with no chat leg sent and nothing accounted —
+/// the public catalogue leg is not a substitute — and enrolling the scoped
+/// key and building again yields one verified outcome and exactly one
+/// accounted physical request.
+#[tokio::test]
+async fn venice_typed_denial_recovers_after_correct_binding() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "recovered venice outcome",
+            Some(json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+
+    let (broker, manifest) = prepared_with(
+        venice_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/venice",
+        "goal: recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/venice", manifest);
+    assert!(
+        matches!(
+            denied,
+            Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+        ),
+        "the unresolved binding denies typed: {denied:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "the denial charges nothing"
+    );
+    drop_blocking(broker);
+
+    store.enroll(VENICE_REF, VENICE_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        venice_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/venice",
+        "goal: recovery",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest);
+    let reply = outcome.expect("the corrected binding dispatches");
+    assert_eq!(reply.text, "recovered venice outcome");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "only the corrected send reached the wire");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {VENICE_KEY}"),
+        "the corrected binding bears the wire"
+    );
+}
+
+// ----- TP-PROVIDER-DIALECT::venice -------------------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `venice` to the shared Chat Completions dialect, an empty endpoint
+/// resolves its own recorded `api.venice.ai/api/v1` base — never a sibling
+/// class's default — a configured base stays verbatim, and loopback never
+/// serves the reserved id.
+#[test]
+fn venice_discriminates_the_recorded_default_base() {
+    assert_eq!(
+        rivect::providers::dialect_for(VENICE),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&venice_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config,
+        VENICE.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the venice id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://api.venice.ai/api/v1\""),
+        "an empty endpoint resolves the recorded base: {debug}"
+    );
+    assert!(
+        !debug.contains("127.0.0.1") && !debug.contains("api.together.xyz"),
+        "venice never borrows a sibling class's base: {debug}"
+    );
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured = Config::parse_validated(&venice_config("https://api.venice.ai/api/v1/"))
+        .expect("the trailing-slash config is valid");
+    let provider = provider_result(
+        configured,
+        VENICE.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the venice id");
+    assert!(
+        format!("{provider:?}").contains("endpoint: \"https://api.venice.ai/api/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.venice]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"venice\", model_id = \"{VENICE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(VENICE).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(VENICE, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = provider_result(
+        local,
+        VENICE.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::venice --------------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `venice`: CATALOG,
+/// AUTH, WIRE and RECOVERY each execute and report inside this run, and
+/// INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn venice_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({"id": VENICE_MODEL, "context_length": 131072})],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&venice_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the keyless listing under the generic entry transform.
+    let (provider, _store) = venice_provider(&config, None);
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == VENICE_MODEL
+                && model.context_window == Some(131072))
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed — the public
+    // catalogue is never authentication.
+    let (provider, _store) = venice_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        venice_provider(&config, Some(VENICE_KEY)),
+        &config,
+        "/world/venice",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/venice", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry through
+    // the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        venice_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/venice",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/venice", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(VENICE_REF, VENICE_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        venice_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/venice",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/venice", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::venice -----------------------------------------
+
+/// TP-PROVIDER-INSTALLED::venice = NOT_RUN: the installed-provider proof is a
+/// live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::venice = NOT_RUN"]
+fn provider_installed_venice() {}

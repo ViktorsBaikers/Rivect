@@ -4,7 +4,8 @@
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
-//! `siliconflow-cn`, `synthetic`, `together` and `vllm` connections' adapter —
+//! `siliconflow-cn`, `synthetic`, `together`, `venice` and `vllm`
+//! connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -209,6 +210,17 @@
 //! with no entry filter — every parseable id is an offer, each `data[]`
 //! row mapping the id plus `context_length` and `max_completion_tokens`
 //! when stated (DEC-020) — with no seed floor. The configured-or-recorded
+//! `https://api.venice.ai/api/v1` base of `venice` carries the recorded
+//! public catalogue: its `/models` listing rides headerless whenever the
+//! store resolves no material — the discovery tolerance alone, never a
+//! send, so the same absent material denies `CredentialAbsent` — and a
+//! listing answer is never authentication; each row maps the id plus the
+//! generic `context_length`/`max_completion_tokens` limits when stated,
+//! the plain bearer carries the model-request key (a class distinct from
+//! the administrative key, though `SecretRef` material states no class —
+//! a residual), and the recorded request names no
+//! `stream_options.include_usage` member, so its body never asks for a
+//! usage report and the charged usage may stay unknown. The configured-or-recorded
 //! `http://127.0.0.1:8000/v1` base of `vllm` is its own recorded local
 //! host — never `llama.cpp`'s `:8080` or `lm-studio`'s `:1234`
 //! (EDGE-006) — whose `/models` listing maps vLLM's `max_model_len` as
@@ -226,7 +238,8 @@
 //! openai-shared.ts): `POST {endpoint}/chat/completions` under a
 //! `Bearer` authorization, the body carrying `model`, `messages`
 //! (`system` for the instructions, `user` for the inputs), `stream`
-//! with `stream_options.include_usage`, the declared tool surface as
+//! with `stream_options.include_usage` — every arm but `venice`, whose
+//! recorded request names no usage-report member — the declared tool surface as
 //! `{"type": "function", "function": {…}}` entries and the pinned
 //! effort as `reasoning_effort` verbatim — the manifest's frozen
 //! effort is the explicit capability surface, never inferred from the
@@ -1002,6 +1015,15 @@ const SYNTHETIC_FALLBACK_MAX_TOKENS: u64 = 8192;
 /// price or roster row (D2), so an offered id keeps
 /// [`ModelPrice::Unknown`].
 const TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
+
+/// The recorded default API root of a `venice` connection
+/// (`https://api.venice.ai/api/v1` in the traceability per-ID row): the
+/// host the required `endpoint` field's empty string resolves under,
+/// under the same absent-override rule the plan classes bind. The host's
+/// `/models` listing is public and rides keyless, which is never
+/// authentication; the class records no region selector, so a configured
+/// `region` denies typed.
+const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 
 /// The recorded default API root of a `vllm` connection
 /// (`127.0.0.1:8000/v1` in the traceability per-ID row): the host the
@@ -1943,6 +1965,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(TOGETHER_BASE_URL),
             catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::GenericMetadata,
+        }),
+        // `venice` (HZN-008 class B — the public-catalogue cell): the
+        // configured-or-recorded `https://api.venice.ai/api/v1` base,
+        // the host's public `/models` listing under the recorded
+        // generic entry transform — `context_length` and
+        // `max_completion_tokens` mapped when stated — and the plain
+        // bearer model-request key. The listing rides keyless when the
+        // store resolves no material, and that tolerance is the
+        // catalogue's alone: the same absent material denies a send
+        // `CredentialAbsent`, since a public catalogue is not
+        // authentication and a listing answer confers no entitlement.
+        // The class records neither a seed nor a vendored price row, so
+        // an empty or failed answer has no floor to fall back to. The
+        // model-request key is a class distinct from the administrative
+        // key, but `SecretRef` material states no class — that
+        // discrimination is a residual. A configured `region` denies:
+        // the contract names none.
+        "venice" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(VENICE_BASE_URL),
+            catalog: CatalogRule::UnauthenticatedListing(&[]),
             credential: CredentialRule::Bearer,
             entries: EntryRule::GenericMetadata,
         }),
@@ -3267,6 +3312,16 @@ impl ChatCompletionsProvider {
         }
     }
 
+    /// Whether this class asks the peer for the recorded
+    /// `stream_options.include_usage` usage report. Every arm does except
+    /// `venice`: its recorded request names no `stream_options` member,
+    /// so a body carrying one would send a parameter the class does not
+    /// request — and its reported usage may legitimately stay
+    /// [`UsageDelta::Unknown`].
+    fn requests_usage_report(&self) -> bool {
+        self.connection != "venice"
+    }
+
     /// The frozen manifest as the Chat Completions wire request:
     /// `model`, `messages` — the instructions as the `system` message
     /// when they carry text, the inputs as `user` — `stream` with the
@@ -3274,7 +3329,10 @@ impl ChatCompletionsProvider {
     /// surface as function tools, and the pinned effort as
     /// `reasoning_effort` verbatim. The manifest's frozen effort is
     /// the only capability surface: nothing else — no sampling
-    /// knobs, no provider options — is invented.
+    /// knobs, no provider options — is invented. The recorded usage
+    /// request rides every arm but `venice`
+    /// ([`Self::requests_usage_report`]), whose body names no
+    /// `stream_options` member at all.
     fn request_body(&self, manifest: &RequestManifest, model_id: &str) -> Value {
         let mut messages = Vec::with_capacity(2);
         if !manifest.instructions.is_empty() {
@@ -3285,8 +3343,10 @@ impl ChatCompletionsProvider {
             "model": model_id,
             "messages": messages,
             "stream": true,
-            "stream_options": { "include_usage": true },
         });
+        if self.requests_usage_report() {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let EffortAssign::Fixed { value } = &manifest.effort {
             body["reasoning_effort"] = json!(value.name());
         }
