@@ -1,12 +1,15 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
 //! the literal connection ids `openai`, `abliteration`, `meta`,
-//! `ollama`, `openrouter` and `sakana` record this dialect. `ollama`
+//! `ollama`, `openrouter`, `sakana` and `xai-oauth` record this
+//! dialect. `ollama`
 //! is the local endpoint whose credential is optional (DEC-009) and
 //! whose catalogue carries a bounded native discovery overlay
 //! (DEC-012); `openrouter` rides the recorded paste-key form behind a
 //! catalogue-only keyless listing (DEC-003/DEC-010); `sakana` rides a
 //! key-gated authoritative listing whose in-source Fugu entries are
-//! mapping references, never offers (DEC-004). Dialect selection keys
+//! mapping references, never offers (DEC-004); `xai-oauth` rides the
+//! authoritative xAI listing with the device-code-produced token
+//! resolved at the scoped credential seam. Dialect selection keys
 //! on the literal connection id, never an auth label or a catalogue
 //! answer, and `openai-codex` is a distinct literal id with its own
 //! recorded class. The adapter authors no async code — [`Provider::send`] is
@@ -66,6 +69,11 @@ const OPENROUTER_DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 /// resolves here, and a configured value otherwise wins after this
 /// adapter's trim.
 const SAKANA_DEFAULT_ENDPOINT: &str = "https://api.sakana.ai/v1";
+
+/// The recorded `xai-oauth` base: an empty configured endpoint resolves
+/// here, and a configured value otherwise wins after this adapter's
+/// trim. The device-code token is the credential, not a host selector.
+const XAI_OAUTH_DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 
 /// The recorded `openrouter` paste-key prefix (DEC-003): the bare
 /// `sk-or-…` key the paste form stores at the scoped credential seam.
@@ -127,13 +135,16 @@ const META_MUSE_MODELS: &[&str] = &[
 
 /// How one listed `/models` entry becomes an offered
 /// [`CatalogModel`]: the id alone under the contract's filter, the
-/// entry's own tool-capable surfaces (`openrouter`, DEC-010), or the
-/// recorded `sakana` listing rule (DEC-004).
+/// entry's own tool-capable surfaces (`openrouter`, DEC-010), the
+/// recorded `sakana` listing rule (DEC-004), or the id-only
+/// `xai-oauth` listing whose selected-list floor is a residual — no
+/// vendored ids are retained, so the listing alone offers.
 #[derive(Clone, Copy)]
 enum EntryRule {
     IdsOnly,
     OpenRouterTools,
     Sakana,
+    XaiOAuth,
 }
 
 /// The predicates the recorded source class binds to a literal
@@ -222,6 +233,15 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::Sakana,
             reasoning_artifact: false,
         }),
+        // The xAI OAuth listing is authoritative and no vendored
+        // selected list is retained, so the listing alone offers and
+        // the recorded contract states no replay artifact for the id.
+        "xai-oauth" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::XaiOAuth,
+            reasoning_artifact: false,
+        }),
         _ => None,
     }
 }
@@ -230,8 +250,8 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// trimmed of surrounding whitespace and of every trailing slash —
 /// this adapter's own normalization, not a rule the other adapters
 /// share — and the empty result resolves the recorded base on `ollama`,
-/// `openrouter` and `sakana` alone. Every other id keeps the trimmed
-/// value verbatim; no id's base is ever inferred.
+/// `openrouter`, `sakana` and `xai-oauth` alone. Every other id keeps
+/// the trimmed value verbatim; no id's base is ever inferred.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
     if configured.is_empty() {
@@ -239,6 +259,7 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
             "ollama" => OLLAMA_DEFAULT_ENDPOINT.to_string(),
             "openrouter" => OPENROUTER_DEFAULT_ENDPOINT.to_string(),
             "sakana" => SAKANA_DEFAULT_ENDPOINT.to_string(),
+            "xai-oauth" => XAI_OAUTH_DEFAULT_ENDPOINT.to_string(),
             _ => configured.to_string(),
         }
     } else {
@@ -484,8 +505,10 @@ impl OpenAiProvider {
     /// `openrouter` offers only the listing's tool-capable entries with
     /// their recorded surfaces mapped (DEC-010), and `sakana` offers the
     /// authoritative listing's entries with the recorded Fugu mapping
-    /// (DEC-004) — each id carrying the shared [`CatalogModel`],
-    /// returned in deterministic sorted order.
+    /// (DEC-004), and `xai-oauth` offers the authoritative xAI listing
+    /// as id-only entries with no vendored selected-list floor — each id
+    /// carrying the shared [`CatalogModel`], returned in deterministic
+    /// sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -548,10 +571,10 @@ impl OpenAiProvider {
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
-        // while `abliteration`, `meta`, `ollama`, `openrouter` and
-        // `sakana` treat the listing as authoritative: every offered entry
-        // answers, and a seed the arm carries merges on top as the offer
-        // floor.
+        // while `abliteration`, `meta`, `ollama`, `openrouter`,
+        // `sakana` and `xai-oauth` treat the listing as authoritative:
+        // every offered entry answers, and a seed the arm carries merges
+        // on top as the offer floor.
         let mut models: Vec<CatalogModel> = data
             .iter()
             .filter_map(|entry| self.catalog_entry(entry))
@@ -574,12 +597,14 @@ impl OpenAiProvider {
     /// `supported_parameters` declares `tools` and maps that entry's own
     /// surfaces (DEC-010); `EntryRule::Sakana` maps the recorded listing
     /// rule (DEC-004); `EntryRule::IdsOnly` offers the id alone under the
-    /// contract's filter.
+    /// contract's filter; `EntryRule::XaiOAuth` shares that id-only offer
+    /// under its authoritative listing, since no vendored selected list
+    /// is retained.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         match self.contract.entry {
             EntryRule::OpenRouterTools => openrouter_model(entry),
             EntryRule::Sakana => sakana_model(entry),
-            EntryRule::IdsOnly => {
+            EntryRule::IdsOnly | EntryRule::XaiOAuth => {
                 let id = entry.get("id").and_then(Value::as_str)?;
                 let offered = if self.contract.authoritative_models {
                     !id.is_empty()
@@ -1504,10 +1529,11 @@ mod tests {
 
     /// DEC-011's endpoint rule: the configured base is trimmed and
     /// loses every trailing slash, and the empty result resolves the
-    /// recorded base on `ollama`, `openrouter` and `sakana` alone — a
-    /// sibling id keeps its own (absent) value and never borrows
-    /// another's host. The `ollama` and `sakana` defaults are pinned as
-    /// literals, not only through the consts they resolve.
+    /// recorded base on `ollama`, `openrouter`, `sakana` and
+    /// `xai-oauth` alone — a sibling id keeps its own (absent) value
+    /// and never borrows another's host. The `ollama`, `sakana` and
+    /// `xai-oauth` defaults are pinned as literals, not only through
+    /// the consts they resolve.
     #[test]
     fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
         assert_eq!(endpoint_for("ollama", "   "), "http://127.0.0.1:11434/v1");
@@ -1527,6 +1553,12 @@ mod tests {
         assert_eq!(
             endpoint_for("sakana", " https://api.sakana.ai/v1/ "),
             "https://api.sakana.ai/v1"
+        );
+        assert_eq!(endpoint_for("xai-oauth", ""), "https://api.x.ai/v1");
+        assert_eq!(endpoint_for("xai-oauth", " / "), XAI_OAUTH_DEFAULT_ENDPOINT);
+        assert_eq!(
+            endpoint_for("xai-oauth", " https://api.x.ai/v1/// "),
+            "https://api.x.ai/v1"
         );
         assert_eq!(
             endpoint_for("openrouter", " https://openrouter.ai/api/v1/ "),

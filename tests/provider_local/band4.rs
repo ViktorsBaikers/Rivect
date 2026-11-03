@@ -1628,3 +1628,686 @@ async fn venice_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::venice = NOT_RUN"]
 fn provider_installed_venice() {}
+
+// ----- xai-oauth -------------------------------------------------------------
+
+// The `xai-oauth` connection's proof legs: the shared Responses adapter
+// serves the literal id under its own recorded contract. The
+// device-code-produced token is supplied as the scoped `SecretRef`
+// material — the live login, refresh, revocation, and the separate
+// `grok.com` accounting origin stay NOT_RUN — the configured `endpoint`
+// carries the API base verbatim and an empty one resolves the recorded
+// `https://api.x.ai/v1` default, while a configured `region` is denied:
+// the contract names none. The xAI `/models` listing is authoritative and
+// no vendored selected list is retained, so the listing alone offers ids
+// and a failed listing denies typed with no fabricated floor.
+
+/// The literal connection id this class serves.
+const XAI_OAUTH: &str = "xai-oauth";
+
+/// The scoped credential ref carrying the device-code-produced token.
+const XAI_OAUTH_REF: &str = "keyring:rivect-test/xai-oauth";
+
+/// Fixture device-code-produced token material — never a live token, only
+/// ever sent to localhost.
+const XAI_OAUTH_KEY: &str = "fixture-xai-oauth-device-token";
+
+/// The pinned model id the fixed-pin legs carry.
+const XAI_OAUTH_MODEL: &str = "grok-4";
+
+/// One configured `xai-oauth` connection pointing at the fixture peer: the
+/// api_key auth class resolves the device-code token through the scoped
+/// `SecretRef` seam, and the dialect comes from the literal connection id.
+fn xai_oauth_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.xai-oauth]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{XAI_OAUTH_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xai-oauth\", model_id = \"{XAI_OAUTH_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The shared Responses adapter over an explicit store — the seam the
+/// recovery leg enrolls into after its typed denial.
+fn xai_oauth_provider_result(
+    config: Config,
+    store: Arc<support::MapStore>,
+) -> Result<OpenAiProvider, ProviderError> {
+    std::thread::spawn(move || OpenAiProvider::new(&config, XAI_OAUTH, store))
+        .join()
+        .expect("the provider thread joins")
+}
+
+fn xai_oauth_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let provider = xai_oauth_provider_result(config.clone(), Arc::clone(&store))
+        .expect("the shared adapter builds for the xai-oauth id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the device-code token.
+fn xai_oauth_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(XAI_OAUTH_REF, XAI_OAUTH_KEY)],
+    ));
+    xai_oauth_provider_with(config, store)
+}
+
+/// A bare catalogue lookup on a plain OS thread: reqwest's blocking client
+/// must not run inside the tokio context.
+fn xai_oauth_catalog_on_thread(
+    provider: OpenAiProvider,
+) -> (
+    OpenAiProvider,
+    Result<Vec<CatalogModel>, ProviderError>,
+) {
+    std::thread::spawn(move || {
+        let catalog = provider.catalog_models();
+        (provider, catalog)
+    })
+    .join()
+    .expect("the catalog thread joins")
+}
+
+// ----- TP-PROVIDER-WIRE::xai-oauth -------------------------------------------
+
+/// A configured `xai-oauth` connection returns a verified model outcome
+/// through the standard Broker: the resolved device-code token rides the
+/// bearer, the adapter posts exactly the frozen manifest as a Responses
+/// request — `store: false`, `stream: true`, model and instructions
+/// verbatim, auto effort emitting no reasoning member and no
+/// `include` artifact the recorded contract does not name — and the one
+/// physical send is charged once with the provider's reported usage.
+#[tokio::test]
+async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified xai-oauth outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 11, "output_tokens": 7, "total_tokens": 18})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: prove the wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified xai-oauth outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XAI_OAUTH_KEY}"),
+        "the resolved device-code token rides the bearer"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(XAI_OAUTH_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], XAI_OAUTH_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the recorded contract names no replay artifact — none is requested: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert!(
+        body.get("reasoning").is_none(),
+        "auto effort emits no reasoning member: {body}"
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, XAI_OAUTH);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        }
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::xai-oauth ----------------------------------------
+
+/// The xAI `/models` listing is authoritative: every listed id offers as
+/// an id-only entry and no vendored selected list adds a floor, so an
+/// empty listing offers nothing. The listing leg authenticates with the
+/// resolved device-code token.
+#[tokio::test]
+async fn xai_oauth_catalog_is_the_authoritative_listing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({"id": "grok-4", "context_length": 131072, "reasoning": true}),
+            json!({"id": "grok-3"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xai_oauth_provider(&config);
+    let (provider, catalog) = xai_oauth_catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    assert_eq!(model_ids(&models), vec!["grok-3", "grok-4"]);
+    assert!(
+        models.iter().all(|model| *model
+            == CatalogModel {
+                id: model.id.clone(),
+                ..CatalogModel::default()
+            }),
+        "the listing offers ids only, with no mapped surfaces or vendored floor: {models:?}"
+    );
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1, "one catalogue leg");
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XAI_OAUTH_KEY}"),
+        "the listing leg resolves the scoped token"
+    );
+
+    // an empty authoritative listing offers nothing: no retained selected
+    // list is vendored to fabricate a floor
+    let empty_server = MockServer::start().await;
+    mount_models(&empty_server, Vec::new()).await;
+    let config =
+        Config::parse_validated(&xai_oauth_config(&server_uri_v1(&empty_server))).expect("valid");
+    let (provider, _store) = xai_oauth_provider(&config);
+    let (provider, catalog) = xai_oauth_catalog_on_thread(provider);
+    let models = catalog.expect("the empty listing answers");
+    assert!(
+        models.is_empty(),
+        "an empty authoritative listing offers no fabricated floor: {models:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// A failed xAI listing denies typed with no fabricated floor: the
+/// non-success status is the typed transport denial, never a vendored
+/// selected-list answer, and neither the token nor the peer body reaches
+/// the diagnostic.
+#[tokio::test]
+async fn xai_oauth_failed_listing_denies_without_a_fabricated_floor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xai_oauth_provider(&config);
+    let (provider, catalog) = xai_oauth_catalog_on_thread(provider);
+    let err = catalog.expect_err("a failed listing denies typed");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a failed listing is the typed transport denial: {err}")
+    };
+    assert_eq!(connection, XAI_OAUTH);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, XAI_OAUTH_KEY.as_bytes());
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1, "the refusal is the one catalogue leg");
+}
+
+// ----- TP-PROVIDER-AUTH::xai-oauth -------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `xai-oauth`: an absent binding is refused at the config ingress, a
+/// configured `region` denies `RegionMismatch`, a profile-bound ref whose
+/// scope disagrees denies `CredentialProfileMismatch`, a scoped ref with
+/// no resolvable material denies `CredentialAbsent`, and a resolved token
+/// the peer refuses is the typed transport denial — no error, nor the
+/// offered device-code token or the peer body, reaches Display or Debug.
+#[tokio::test]
+async fn xai_oauth_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // the required binding cannot be absent: the ingress names the member
+    let absent = xai_oauth_config(&server_uri_v1(&server)).replace(
+        &format!("credential_ref = \"{XAI_OAUTH_REF}\"\n"),
+        "",
+    );
+    let err = Config::parse_validated(&absent).expect_err("the required binding cannot be absent");
+    assert!(
+        matches!(err.issue, ConfigIssue::CredentialRefRequired { .. }),
+        "the absent binding is the typed ingress denial: {err}"
+    );
+
+    // a configured region is denied — never ignored — with a sibling scope
+    // holding material so the no-secret assertion proves no cross-scope leak
+    let regioned = Config::parse_validated(
+        &xai_oauth_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = xai_oauth_provider_result(
+        regioned,
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XAI_OAUTH_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, XAI_OAUTH);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, XAI_OAUTH_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xai-oauth]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"xai-oauth\", model_id = \"{XAI_OAUTH_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = xai_oauth_provider_result(
+        mismatched,
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XAI_OAUTH_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, XAI_OAUTH_KEY.as_bytes());
+
+    // a bound scope the store cannot resolve denies before any wire leg
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xai_oauth_provider_with(
+        &config,
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XAI_OAUTH_KEY)],
+        )),
+    );
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let Err(denied) = denied else {
+        panic!("an unresolvable token never produces a reply")
+    };
+    assert!(
+        matches!(&denied, ProviderError::CredentialAbsent { .. }),
+        "the unresolved binding denies typed: {denied}"
+    );
+    assert_no_secret_or_body(&denied, XAI_OAUTH_KEY.as_bytes());
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock recorded no send")
+            .is_empty(),
+        "the credential denial sends no byte"
+    );
+
+    // a resolved token the peer refuses is a typed transport denial: the
+    // wire never coerces a wrong credential into success
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xai_oauth_provider(&config);
+    let (provider, refused) = send_on_thread(provider, prepared_manifest(&config));
+    let refused = refused.expect_err("a refused token is the typed transport denial");
+    let ProviderError::Transport { connection, cause } = &refused else {
+        panic!("a refused token is transport: {refused}")
+    };
+    assert_eq!(connection, XAI_OAUTH);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&refused, XAI_OAUTH_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XAI_OAUTH_KEY}"),
+        "the resolved token reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::xai-oauth ---------------------------------------
+
+/// Hostile Responses input never reports success for `xai-oauth`: a stream
+/// ended mid function-call item — a partial call that never executes — is
+/// the typed stream violation, an unclassifiable completion status is the
+/// unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn xai_oauth_rejects_partial_tool_block_and_unknown_terminal() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({
+                "item": {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": "read_file",
+                    "arguments": "",
+                },
+                "output_index": 0,
+            }),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "EOF mid function-call item is the stream violation — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a completion status the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"id": "resp_1", "status": "mystery", "output": []}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::xai-oauth ----------------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `xai-oauth` to the shared Responses dialect, an empty endpoint resolves
+/// the recorded `api.x.ai/v1` base — never a sibling class's default — a
+/// configured base stays verbatim, and loopback never serves the reserved
+/// id.
+#[test]
+fn xai_oauth_discriminates_the_recorded_default_base() {
+    assert_eq!(
+        rivect::providers::dialect_for(XAI_OAUTH),
+        Some(rivect::providers::Dialect::Responses)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&xai_oauth_config("")).expect("the fixture config is valid");
+    let (provider, _store) = xai_oauth_provider(&config);
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://api.x.ai/v1\""),
+        "an empty endpoint resolves the recorded base: {debug}"
+    );
+    assert!(
+        !debug.contains("api.openai.com")
+            && !debug.contains("api.sakana.ai")
+            && !debug.contains("openrouter.ai")
+            && !debug.contains("127.0.0.1"),
+        "xai-oauth never borrows a sibling class's base: {debug}"
+    );
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured = Config::parse_validated(&xai_oauth_config("https://api.x.ai/v1///"))
+        .expect("the trailing-slash config is valid");
+    let (provider, _store) = xai_oauth_provider(&configured);
+    assert!(
+        format!("{provider:?}").contains("endpoint: \"https://api.x.ai/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xai-oauth]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xai-oauth\", model_id = \"{XAI_OAUTH_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(XAI_OAUTH).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(XAI_OAUTH, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = xai_oauth_provider_result(
+        local,
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::xai-oauth -----------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `xai-oauth`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — the live device-code transition and
+/// the `grok.com` accounting origin are never claimed.
+#[tokio::test]
+async fn xai_oauth_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": XAI_OAUTH_MODEL})]).await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xai_oauth_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative listing under the id-only entry rule.
+    let (provider, _store) = xai_oauth_provider(&config);
+    let (provider, catalog) = xai_oauth_catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == XAI_OAUTH_MODEL)
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let (provider, _store) = xai_oauth_provider_with(
+        &config,
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    );
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xai-oauth",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/xai-oauth", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(XAI_OAUTH_REF, XAI_OAUTH_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xai-oauth",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/xai-oauth", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::xai-oauth --------------------------------------
+
+/// TP-PROVIDER-INSTALLED::xai-oauth = NOT_RUN: the installed-provider proof
+/// is a live-environment leg this offline slice never runs; the live
+/// device-code login, refresh, revocation and `grok.com` accounting origin
+/// stay out of scope.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xai-oauth = NOT_RUN"]
+fn provider_installed_xai_oauth() {}
