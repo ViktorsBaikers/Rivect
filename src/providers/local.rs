@@ -3,7 +3,7 @@
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
-//! `novita`, `nvidia` and `qianfan` connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `novita`, `nvidia`, `qianfan` and `qwen-portal` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -164,7 +164,16 @@
 //! `context_length` and `max_completion_tokens` when stated, and the
 //! recorded `deepseek-v3.2` default is a catalogue hint — never a
 //! seeded offer or a ranking the sorted-first auto pick follows
-//! (DEC-014/D11). The adapter authors no
+//! (DEC-014/D11). The configured-or-recorded
+//! `https://portal.qwen.ai/v1` base of `qwen-portal` carries the same
+//! api-key class: its key-gated `/models` listing is the whole
+//! catalogue, each `data[]` row mapping the id plus `context_length`
+//! and `max_completion_tokens` when stated, and the recorded
+//! `coder-model` default is a hint — never a seeded offer or a
+//! ranking. The paste api-key alternative resolves at the scoped
+//! `SecretRef` seam, while the recorded Qwen OAuth free-tier lifecycle
+//! (refresh, quota, revocation) is a bounded residual (D6/DEC-002)
+//! this adapter never constructs. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -874,6 +883,19 @@ const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 /// per-model price or roster row, so an offered id keeps
 /// [`ModelPrice::Unknown`] and an unlisted id is never seeded.
 const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
+
+/// The recorded default API root of a `qwen-portal` connection
+/// (`https://portal.qwen.ai/v1`): the host the required `endpoint`
+/// field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The paste api-key
+/// alternative (`QWEN_OAUTH_TOKEN`/`QWEN_PORTAL_API_KEY` names) is
+/// live-ingress metadata, never an environment read this adapter
+/// constructs (DEC-011); the recorded Qwen OAuth free-tier lifecycle
+/// (token refresh, quota, revocation) is a bounded residual owned by
+/// position 19 (D6/DEC-002), so this class records no lifecycle leg
+/// and claims no entitlement. The recorded `coder-model` default is a
+/// catalogue hint, never a seeded offer or ranking (DEC-014/D11).
+const QWEN_PORTAL_BASE_URL: &str = "https://portal.qwen.ai/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -1656,6 +1678,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "qianfan" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(QIANFAN_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::GenericMetadata,
+        }),
+        // `qwen-portal` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://portal.qwen.ai/v1` base
+        // redirects discovery and streaming alike, and the recorded
+        // api-key class gates the `/models` listing on resolved material
+        // — a keyless lookup opens no wire leg and denies typed. The
+        // listing is the whole catalogue: `data[]` rows carry the id
+        // plus `context_length` and `max_completion_tokens` when
+        // present (DEC-020), and the class records no vendored roster or
+        // seed, so an empty or failed answer has no floor to fall back
+        // to. The recorded `coder-model` default is a catalogue hint,
+        // never a seeded offer and never a ranking — the auto pick stays
+        // the adapter's uniform sorted-first listed id (DEC-014/D11).
+        // The plain bearer arm carries the pasted key; the recorded
+        // Qwen OAuth free-tier lifecycle (refresh, quota, revocation)
+        // is a bounded residual (D6/DEC-002), never constructed here,
+        // and a configured `region` denies: the contract names none.
+        "qwen-portal" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(QWEN_PORTAL_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::GenericMetadata,
