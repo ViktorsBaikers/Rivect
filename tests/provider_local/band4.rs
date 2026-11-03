@@ -5987,3 +5987,727 @@ async fn xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() 
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-cn = NOT_RUN"]
 fn provider_installed_xiaomi_token_plan_cn() {}
+
+// ----- xiaomi-token-plan-sgp -------------------------------------------------
+
+// The `xiaomi-token-plan-sgp` connection's proof legs (HZN-008 class B —
+// the token-plan api-key cell): the shared Chat Completions adapter serves
+// the literal id under its own recorded predicates. The configured
+// `endpoint` carries the API base verbatim, an empty one resolves the
+// pinned SG literal `https://token-plan-sgp.xiaomimimo.com/v1`, and a
+// configured `region` is denied: the contract names none. The PAYG base and
+// the AMS/CN token-plan bases are separate literals, and this arm never
+// selects one — not from a key prefix, not from a profile, and never by
+// probing another cluster (PROH-010): the configured base is the only host
+// a leg opens a wire toward. The recorded family sign-in ladder starts at
+// SGP, but its existence is recorded knowledge, not runtime behaviour: a
+// write to a sibling base is never replayed as a probe. The `/models`
+// listing is the whole catalogue under ids-only offers, and the plain
+// bearer carries the SGP key.
+
+/// The literal connection id this class serves.
+const XIAOMI_SGP: &str = "xiaomi-token-plan-sgp";
+
+/// The scoped credential ref the declaration binds.
+const XIAOMI_SGP_REF: &str = "keyring:rivect-test/xiaomi-token-plan-sgp";
+
+/// Fixture SGP key material — never a real credential, only ever sent to a
+/// loopback fixture.
+const XIAOMI_SGP_KEY: &str = "fixture-xiaomi-sgp-token-plan-key";
+
+/// A fixture key shaped like the PAYG class: the class records no key-class
+/// sniffing, so this prefix selects no base.
+const XIAOMI_SGP_PAYG_SHAPED_KEY: &str = "sk-fixture-payg-key";
+
+/// The pinned model id the fixed-pin legs carry — a listed id.
+const XIAOMI_SGP_MODEL: &str = "mimo-v2-flash";
+
+/// One `xiaomi-token-plan-sgp` connection pointing at the fixture peer: the
+/// api-key class binds its scoped key, so the declaration carries the ref
+/// the send must resolve.
+fn xiaomi_sgp_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-sgp]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{XIAOMI_SGP_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-sgp\", model_id = \"{XIAOMI_SGP_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The adapter over an explicit store — the seam the recovery leg enrolls
+/// into after its typed denial.
+fn xiaomi_sgp_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let provider = provider_result(config.clone(), XIAOMI_SGP.to_string(), store.clone())
+        .expect("the shared adapter builds for the xiaomi-token-plan-sgp id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the recorded SGP key, or an empty
+/// store for the absent-binding leg.
+fn xiaomi_sgp_provider(
+    config: &Config,
+    material: Option<&str>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = match material {
+        None => Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Some(material) => {
+            Arc::new(support::MapStore::seeded(
+                STORE_KIND,
+                &[(XIAOMI_SGP_REF, material)],
+            ))
+        }
+    };
+    xiaomi_sgp_provider_with(config, store)
+}
+
+// ----- TP-PROVIDER-WIRE::xiaomi-token-plan-sgp -------------------------------
+
+/// A configured `xiaomi-token-plan-sgp` connection returns a verified model
+/// outcome through the standard Broker: the api-key pin prepares offline, the
+/// adapter posts exactly the frozen manifest as a `chat/completions` request —
+/// model id verbatim, system+user messages, `stream` and the shared
+/// `stream_options.include_usage` member — under the resolved bearer, never a
+/// `reasoning_effort` for auto effort — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the reported
+/// usage.
+#[tokio::test]
+async fn xiaomi_token_plan_sgp_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified sgp outcome",
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections[XIAOMI_SGP].credential_ref.as_deref(),
+        Some(XIAOMI_SGP_REF),
+        "the recorded api-key class binds its scoped ref"
+    );
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: prove the wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-sgp", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified sgp outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XIAOMI_SGP_KEY}"),
+        "the resolved SGP key bears the wire"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], XIAOMI_SGP_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the shared Chat Completions body asks for the usage report"
+    );
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, XIAOMI_SGP);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 9,
+            completion_tokens: 4,
+            total_tokens: 13,
+        }
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::xiaomi-token-plan-sgp ----------------------------
+
+/// The configured base's `/models` listing is the whole catalogue and the
+/// configured base is the only host any leg contacts: the listing and the send
+/// both ride the configured peer, stand-ins for the AMS and CN clusters receive
+/// nothing, and a PAYG-shaped key resolves the SGP literal rather than
+/// selecting another family host (PROH-010). The recorded family ladder starts
+/// at SGP but is never inherited as a probe: a failed listing is the typed
+/// denial on its one attempt, with no sibling base tried or walked.
+#[tokio::test]
+async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
+    // family stand-ins: mounted and answering but never configured, so any
+    // byte they see would be an unrecorded cross-cluster probe
+    let ams_sibling = MockServer::start().await;
+    mount_models(&ams_sibling, vec![json!({"id": "family-ams-sibling"})]).await;
+    mount_chat(&ams_sibling, completed_stream("ams", None)).await;
+    let cn_sibling = MockServer::start().await;
+    mount_models(&cn_sibling, vec![json!({"id": "family-cn-sibling"})]).await;
+    mount_chat(&cn_sibling, completed_stream("cn", None)).await;
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": XIAOMI_SGP_MODEL})]).await;
+    mount_chat(&server, completed_stream("sgp", None)).await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+
+    let (provider, _store) = xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("the SGP listing answers"),
+        vec![CatalogModel {
+            id: XIAOMI_SGP_MODEL.to_string(),
+            ..CatalogModel::default()
+        }],
+        "the listing is offered id-only under the recorded transform"
+    );
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the configured SGP base serves the send");
+    drop_blocking(provider);
+
+    let primary = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        primary.len(),
+        2,
+        "one listing and one chat request on the configured base"
+    );
+    assert_eq!(primary[0].url.path(), "/v1/models");
+    assert_eq!(primary[1].url.path(), "/v1/chat/completions");
+    for request in &primary {
+        assert_eq!(received_auth(request), format!("Bearer {XIAOMI_SGP_KEY}"));
+    }
+    let ams_requests = ams_sibling.received_requests().await.expect("recorded");
+    assert!(
+        ams_requests.is_empty(),
+        "the AMS stand-in received nothing: {ams_requests:?}"
+    );
+    let cn_requests = cn_sibling.received_requests().await.expect("recorded");
+    assert!(
+        cn_requests.is_empty(),
+        "the CN stand-in received nothing: {cn_requests:?}"
+    );
+
+    // a PAYG-shaped key selects no base: the empty endpoint still resolves
+    // the SGP literal, and no family host or ladder rung appears anywhere
+    let config = Config::parse_validated(&xiaomi_sgp_config("")).expect("valid");
+    let provider = provider_result(
+        config,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(XIAOMI_SGP_REF, XIAOMI_SGP_PAYG_SHAPED_KEY)],
+        )),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-sgp id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://token-plan-sgp.xiaomimimo.com/v1\""),
+        "the SGP literal is the recorded default: {debug}"
+    );
+    for foreign in ["token-plan-ams", "token-plan-cn", "://api.xiaomimimo.com"] {
+        assert!(
+            !debug.contains(foreign),
+            "a PAYG-shaped key never selects another family host ({foreign}): {debug}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        ams_sibling
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "resolving the key opened no probe to the AMS stand-in"
+    );
+    assert!(
+        cn_sibling
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "resolving the key opened no probe to the CN stand-in"
+    );
+
+    // a failed listing is a typed denial on its one attempt: no walk down a
+    // sibling ladder rung, and nothing accounted
+    let failing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&failing))).expect("valid");
+    let (provider, _store) = xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY));
+    let (provider, denied) = catalog_on_thread(provider);
+    let ProviderError::Transport { connection, cause } =
+        denied.expect_err("a failed listing denies typed instead of inventing a floor")
+    else {
+        panic!("a failed listing is the typed transport denial")
+    };
+    assert_eq!(connection, XIAOMI_SGP);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 500 },
+        "the peer's status is the context: {cause}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        failing.received_requests().await.expect("recorded").len(),
+        1,
+        "the failed listing is one attempt, never a cross-cluster retry"
+    );
+    assert!(
+        ams_sibling
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the failed leg never reached the AMS cluster"
+    );
+    assert!(
+        cn_sibling
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the failed leg never reached the CN cluster"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::xiaomi-token-plan-sgp -------------------------------
+
+/// Wrong, absent or unresolvable credential, or a configured region, never
+/// produce a false success for `xiaomi-token-plan-sgp`: a configured `region` —
+/// the recorded contract names none — denies `RegionMismatch` with the
+/// connection context, a profile-bound ref whose scope disagrees with the
+/// binding denies `CredentialProfileMismatch`, an unseeded binding denies
+/// `CredentialAbsent` before any wire leg, and a refused key lands the typed
+/// transport denial carrying the peer's status alone — no error, nor the
+/// offered credential material or the peer's body, reaches Display or Debug.
+#[tokio::test]
+async fn xiaomi_token_plan_sgp_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+{
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling scope
+    // holds real material so the no-secret assertion proves no cross-scope
+    // leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &xiaomi_sgp_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XIAOMI_SGP_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, XIAOMI_SGP);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, XIAOMI_SGP_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-sgp]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-sgp\", model_id = \"{XIAOMI_SGP_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, XIAOMI_SGP_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, XIAOMI_SGP_KEY.as_bytes());
+
+    // an unresolvable binding denies before opening a chat leg
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = xiaomi_sgp_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let err = denied.expect_err("an unseeded binding denies typed");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the absent SGP key is the typed denial: {err}"
+    );
+    assert_no_secret_or_body(&err, XIAOMI_SGP_KEY.as_bytes());
+    drop_blocking(provider);
+    assert!(
+        server.received_requests().await.expect("recorded").is_empty(),
+        "the three denied legs opened no wire leg"
+    );
+
+    // a refused key is a typed transport denial: the wire never coerces a
+    // wrong credential into success, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, XIAOMI_SGP);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, XIAOMI_SGP_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {XIAOMI_SGP_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::xiaomi-token-plan-sgp ---------------------------
+
+/// Hostile stream input never reports success for `xiaomi-token-plan-sgp`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are each the
+/// unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn xiaomi_token_plan_sgp_rejects_partial_tool_block_and_unknown_terminal() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-sgp", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-sgp", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::xiaomi-token-plan-sgp ----------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `xiaomi-token-plan-sgp` to the shared Chat Completions dialect, an empty
+/// endpoint resolves its own pinned SG `token-plan-sgp.xiaomimimo.com/v1`
+/// base — never the PAYG or AMS/CN literal or a sibling class's default — a
+/// configured base stays verbatim, and loopback never serves the reserved id.
+#[test]
+fn xiaomi_token_plan_sgp_default_base_is_the_sgp_literal() {
+    assert_eq!(
+        rivect::providers::dialect_for(XIAOMI_SGP),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&xiaomi_sgp_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-sgp id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://token-plan-sgp.xiaomimimo.com/v1\""),
+        "an empty endpoint resolves the pinned SG base: {debug}"
+    );
+    for foreign in ["token-plan-ams", "token-plan-cn", "://api.xiaomimimo.com", "127.0.0.1"] {
+        assert!(
+            !debug.contains(foreign),
+            "xiaomi-token-plan-sgp never borrows another family or sibling base ({foreign}): {debug}"
+        );
+    }
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured = Config::parse_validated(&xiaomi_sgp_config(
+        "https://gateway.example.test/xiaomi-sgp/v1/",
+    ))
+    .expect("the trailing-slash config is valid");
+    let provider = provider_result(
+        configured,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the xiaomi-token-plan-sgp id");
+    assert!(
+        format!("{provider:?}")
+            .contains("endpoint: \"https://gateway.example.test/xiaomi-sgp/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.xiaomi-token-plan-sgp]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"xiaomi-token-plan-sgp\", model_id = \"{XIAOMI_SGP_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(XIAOMI_SGP).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(XIAOMI_SGP, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = provider_result(
+        local,
+        XIAOMI_SGP.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::xiaomi-token-plan-sgp -----------------------------
+
+/// The legs matrix enforces the recorded expected set for
+/// `xiaomi-token-plan-sgp`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({"id": XIAOMI_SGP_MODEL, "context_length": 131072})],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&xiaomi_sgp_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the keyed listing under the ids-only transform — a stated
+    // `context_length` maps nothing for this class.
+    let (provider, _store) = xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == XIAOMI_SGP_MODEL
+                && model.context_window.is_none())
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let (provider, _store) = xiaomi_sgp_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider(&config, Some(XIAOMI_SGP_KEY)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xiaomi-sgp", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry through
+    // the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/xiaomi-sgp", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(XIAOMI_SGP_REF, XIAOMI_SGP_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        xiaomi_sgp_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/xiaomi-sgp",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/xiaomi-sgp", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::xiaomi-token-plan-sgp --------------------------
+
+/// TP-PROVIDER-INSTALLED::xiaomi-token-plan-sgp = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline slice never
+/// runs — a real SGP request needs its own fresh authorization.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-sgp = NOT_RUN"]
+fn provider_installed_xiaomi_token_plan_sgp() {}
