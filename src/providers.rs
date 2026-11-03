@@ -1259,6 +1259,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "together" => Some(Dialect::ChatCompletions),
         "venice" => Some(Dialect::ChatCompletions),
         "vllm" => Some(Dialect::ChatCompletions),
+        "wafer-serverless" => Some(Dialect::ChatCompletions),
         _ => None,
     }
 }

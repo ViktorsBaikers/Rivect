@@ -3125,3 +3125,808 @@ async fn xai_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xai = NOT_RUN"]
 fn provider_installed_xai() {}
+
+// ----- wafer-serverless ------------------------------------------------------
+
+// The `wafer-serverless` connection's proof legs (HZN-008 class B — the
+// api-key cell): the shared Chat Completions adapter serves the literal
+// id under its own recorded predicates. The configured `endpoint`
+// carries the API base verbatim, an empty one resolves the recorded
+// `https://pass.wafer.ai/v1` default, and a configured `region` is
+// denied: the contract names none. The descriptor's `oauthProvider`
+// row is abstract login metadata, never an OAuth class — the recorded
+// auth is the api key riding the plain bearer. The authoritative
+// `/v1/models` listing carries the `wafer` envelope: `context_length`
+// (with the recorded top-level `max_model_len` fallback), the
+// `capabilities` reasoning/vision marks, and the per-million cents
+// price converted to the public Serverless USD rate
+// (`cents × 125 / 10000`). The envelope's upstream `provider` thinking
+// shape (`thinking`/`enable_thinking`/`reasoning_effort`), the
+// tools-capability mark and the `zdr_supported` flag have no manifest
+// carrier — residuals, never fabricated fields — and the recorded
+// reasoning control is not `reasoning_effort`, so a pinned effort
+// denies typed rather than being dropped at the send seam.
+
+/// The literal connection id this class serves.
+const WAFER: &str = "wafer-serverless";
+
+/// The scoped credential ref the declaration binds.
+const WAFER_REF: &str = "keyring:rivect-test/wafer-serverless";
+
+/// Fixture api-key material — never a real credential, only ever sent to
+/// localhost.
+const WAFER_KEY: &str = "fixture-wafer-serverless-key";
+
+/// The pinned model id the fixed-pin legs carry — a listed id.
+const WAFER_MODEL: &str = "glm-4.6";
+
+/// One `wafer-serverless` connection pointing at the fixture peer: the
+/// api-key class binds its scoped model-request key, and auto effort
+/// keeps the pinned-effort denial out of the control leg.
+fn wafer_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.wafer-serverless]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{WAFER_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"wafer-serverless\", model_id = \"{WAFER_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The adapter over an explicit store — the seam the recovery leg enrolls
+/// into after its typed denial.
+fn wafer_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let provider = provider_result(config.clone(), WAFER.to_string(), store.clone())
+        .expect("the shared adapter builds for the wafer-serverless id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the recorded api key.
+fn wafer_provider(
+    config: &Config,
+    material: Option<&str>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = match material {
+        None => Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Some(material) => {
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[(WAFER_REF, material)]))
+        }
+    };
+    wafer_provider_with(config, store)
+}
+
+// ----- TP-PROVIDER-WIRE::wafer-serverless ------------------------------------
+
+/// A configured `wafer-serverless` connection returns a verified model
+/// outcome through the standard Broker: the api_key pin prepares
+/// offline, the adapter posts exactly the frozen manifest as a
+/// `chat/completions` request — model id verbatim, system+user
+/// messages, `stream` with the shared `stream_options.include_usage`,
+/// auto effort emitting no `reasoning_effort` member — the SSE stream
+/// validates its terminal, and the one physical send is charged once
+/// with the reported usage. The descriptor's `oauthProvider` row is
+/// login metadata, so the declaration's class is the recorded api key,
+/// never a subscription form.
+#[tokio::test]
+async fn wafer_serverless_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified wafer outcome",
+            Some(json!({"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections[WAFER].kind,
+        rivect::config::ConnKind::ApiKey,
+        "the descriptor's oauthProvider metadata is not an OAuth class: the recorded auth is api-key"
+    );
+    assert_eq!(
+        config.connections[WAFER].credential_ref.as_deref(),
+        Some(WAFER_REF),
+        "the recorded api-key class binds its scoped ref"
+    );
+    let (broker, manifest) = prepared_with(
+        wafer_provider(&config, Some(WAFER_KEY)),
+        &config,
+        "/world/wafer",
+        "goal: prove the wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/wafer", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified wafer outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {WAFER_KEY}"),
+        "the resolved api key bears the wire"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(WAFER_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"], WAFER_MODEL,
+        "the pinned id rides the wire verbatim"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the shared Chat Completions envelope keeps the usage report"
+    );
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, WAFER);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 10,
+            completion_tokens: 6,
+            total_tokens: 16,
+        }
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::wafer-serverless ---------------------------------
+
+/// The authoritative `/v1/models` listing maps the `wafer` envelope
+/// fields the entry actually states: `context_length` (falling back to
+/// the recorded top-level `max_model_len`), the reasoning and vision
+/// capability marks, the output cap at the recorded 65536 ceiling, and
+/// the per-million cents price converted to the public Serverless USD
+/// rate. A field the entry does not state stays empty or `Unknown` —
+/// never a default — and the envelope's thinking shape, tools mark and
+/// ZDR flag land nowhere because no manifest carrier exists.
+#[tokio::test]
+async fn wafer_serverless_catalog_maps_the_envelope() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({
+                "id": WAFER_MODEL,
+                "wafer": {
+                    "context_length": 200000,
+                    "provider": "zai",
+                    "capabilities": {"reasoning": true, "vision": false, "tools": true},
+                    "pricing": {
+                        "input_cents_per_million": 160,
+                        "output_cents_per_million": 320,
+                        "cache_read_cents_per_million": 40,
+                    },
+                    "display_name": "GLM 4.6",
+                    "zdr_supported": true,
+                },
+            }),
+            json!({
+                "id": "qwen-vl",
+                "wafer": {
+                    "context_length": 32768,
+                    "capabilities": {"vision": true},
+                },
+            }),
+            json!({"id": "context-capped", "wafer": {"context_length": 131072}}),
+            json!({"id": "legacy-window", "max_model_len": 65536}),
+            json!({"id": "bare"}),
+            json!({
+                "id": "string-cents",
+                "wafer": {"pricing": {
+                    "input_cents_per_million": "80",
+                    "output_cents_per_million": "160",
+                }},
+            }),
+            json!({
+                "id": "partial-price",
+                "wafer": {"pricing": {"input_cents_per_million": 80}},
+            }),
+            json!({"id": "   "}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = wafer_provider(&config, Some(WAFER_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "bare".to_string(),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "context-capped".to_string(),
+                context_window: Some(131072),
+                max_output_tokens: Some(65536),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: WAFER_MODEL.to_string(),
+                reasoning: true,
+                context_window: Some(200000),
+                max_output_tokens: Some(65536),
+                price: ModelPrice::Usd {
+                    input_per_1m: 2.0,
+                    output_per_1m: 4.0,
+                },
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "legacy-window".to_string(),
+                context_window: Some(65536),
+                max_output_tokens: Some(65536),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "partial-price".to_string(),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "qwen-vl".to_string(),
+                vision: true,
+                context_window: Some(32768),
+                max_output_tokens: Some(32768),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "string-cents".to_string(),
+                price: ModelPrice::Usd {
+                    input_per_1m: 1.0,
+                    output_per_1m: 2.0,
+                },
+                ..CatalogModel::default()
+            },
+        ],
+        "the envelope maps only the fields each entry states"
+    );
+    assert!(
+        models
+            .iter()
+            .all(|model| model.efforts.is_empty() && model.effort_default.is_none()),
+        "the upstream thinking shape has no manifest carrier: no effort dial is invented"
+    );
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1, "the listing is the one catalogue leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {WAFER_KEY}"),
+        "the api-key listing leg resolves the scoped key"
+    );
+
+    // the authoritative listing is seedless: an empty answer has no floor
+    let empty = MockServer::start().await;
+    mount_models(&empty, Vec::new()).await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&empty))).expect("valid");
+    let (provider, _store) = wafer_provider(&config, Some(WAFER_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("an empty listing is an empty catalogue, not a denial"),
+        Vec::new(),
+        "no floor is invented for the seedless class"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-RECOVERY::wafer-serverless --------------------------------
+
+/// The recorded reasoning control is the upstream `thinking` shape, not
+/// `reasoning_effort`: a pinned effort denies typed before any wire leg
+/// and charges nothing — it is never silently dropped from the body.
+#[tokio::test]
+async fn wafer_serverless_pinned_effort_denies_not_dropped() {
+    let server = MockServer::start().await;
+    mount_chat(&server, completed_stream("never reached", None)).await;
+    let config = Config::parse_validated(
+        &wafer_config(&server_uri_v1(&server)).replace(
+            "effort = { mode = \"auto\" }",
+            "effort = { mode = \"fixed\", value = \"medium\" }",
+        ),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        wafer_provider(&config, Some(WAFER_KEY)),
+        &config,
+        "/world/wafer",
+        "goal: pinned effort",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/wafer", manifest);
+    let err = match outcome {
+        Err(ModelError::Provider(err)) => err,
+        other => panic!("the pinned effort is a typed denial, not a reply: {other:?}"),
+    };
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = &err
+    else {
+        panic!("the pinned effort is the typed unsupported parameter: {err:?}")
+    };
+    assert_eq!(connection, WAFER);
+    assert_eq!(*parameter, "reasoning_effort");
+    assert_eq!(model, WAFER_MODEL);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected parameter charges nothing"
+    );
+    drop_blocking(broker);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::wafer-serverless ------------------------------------
+
+/// Wrong, absent or unresolvable credential, or a configured region,
+/// never produce a false success for `wafer-serverless`: an unbound
+/// declaration is refused at ingress, a bound scope the store cannot
+/// resolve denies `CredentialAbsent` with no wire leg, a configured
+/// `region` denies `RegionMismatch`, a profile-bound ref whose scope
+/// disagrees with the binding denies `CredentialProfileMismatch`, and a
+/// refused api key lands the typed transport denial carrying the peer's
+/// status alone — no error, nor the offered credential material or the
+/// peer's body, reaches Display or Debug.
+#[tokio::test]
+async fn wafer_serverless_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets()
+{
+    let server = MockServer::start().await;
+
+    // the recorded api-key class requires its scoped binding at ingress
+    let unbound = wafer_config(&server_uri_v1(&server))
+        .replace(&format!("credential_ref = \"{WAFER_REF}\"\n"), "");
+    let err = Config::parse_validated(&unbound)
+        .expect_err("the recorded class requires its scoped binding at ingress");
+    assert!(
+        matches!(err.issue, ConfigIssue::CredentialRefRequired { .. }),
+        "the unbound declaration is the typed ingress denial: {err}"
+    );
+
+    // a bound scope the store cannot resolve denies before any wire leg
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = wafer_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let err = denied.expect_err("the unresolved binding denies typed");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the absent api key is the typed denial: {err}"
+    );
+    assert_no_secret_or_body(&err, WAFER_KEY.as_bytes());
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the unresolved binding opened no wire leg"
+    );
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &wafer_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        WAFER.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, WAFER_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, WAFER);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, WAFER_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.wafer-serverless]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"wafer-serverless\", model_id = \"{WAFER_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        WAFER.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, WAFER_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, WAFER_KEY.as_bytes());
+
+    // a refused key is a typed transport denial: the wire never coerces a
+    // wrong credential into success, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = wafer_provider(&config, Some(WAFER_KEY));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, WAFER);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, WAFER_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {WAFER_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::wafer-serverless (adverse wire) ------------------
+
+/// Hostile stream input never reports success for `wafer-serverless`: a
+/// stream ended mid `tool_calls` fragment — a partial call that never
+/// executes — and a finish_reason the dialect cannot classify are each
+/// the unknown terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn wafer_serverless_rejects_partial_tool_block_and_unknown_terminal() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        wafer_provider(&config, Some(WAFER_KEY)),
+        &config,
+        "/world/wafer",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/wafer", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        wafer_provider(&config, Some(WAFER_KEY)),
+        &config,
+        "/world/wafer",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/wafer", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::wafer-serverless ----------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `wafer-serverless` to the shared Chat Completions dialect, an empty
+/// endpoint resolves its own recorded `pass.wafer.ai/v1` base — never a
+/// sibling class's default — a configured base stays verbatim, and
+/// loopback never serves the reserved id.
+#[test]
+fn wafer_serverless_discriminates_the_recorded_default_base() {
+    assert_eq!(
+        rivect::providers::dialect_for(WAFER),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&wafer_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config,
+        WAFER.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the wafer-serverless id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://pass.wafer.ai/v1\""),
+        "an empty endpoint resolves the recorded base: {debug}"
+    );
+    assert!(
+        !debug.contains("127.0.0.1")
+            && !debug.contains("api.venice.ai")
+            && !debug.contains("api.x.ai"),
+        "wafer-serverless never borrows a sibling class's base: {debug}"
+    );
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured = Config::parse_validated(&wafer_config("https://pass.wafer.ai/v1/"))
+        .expect("the trailing-slash config is valid");
+    let provider = provider_result(
+        configured,
+        WAFER.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the wafer-serverless id");
+    assert!(
+        format!("{provider:?}").contains("endpoint: \"https://pass.wafer.ai/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.wafer-serverless]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"wafer-serverless\", model_id = \"{WAFER_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(WAFER).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(WAFER, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = provider_result(
+        local,
+        WAFER.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::wafer-serverless -----------------------------------
+
+/// The legs matrix enforces the recorded expected set for
+/// `wafer-serverless`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn wafer_serverless_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![json!({
+            "id": WAFER_MODEL,
+            "wafer": {
+                "context_length": 200000,
+                "capabilities": {"reasoning": true},
+                "pricing": {"input_cents_per_million": 160, "output_cents_per_million": 320},
+            },
+        })],
+    )
+    .await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&wafer_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative keyed listing under the envelope transform.
+    let (provider, _store) = wafer_provider(&config, Some(WAFER_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == WAFER_MODEL
+                && model.reasoning
+                && model.context_window == Some(200000)
+                && model.price == ModelPrice::Usd {
+                    input_per_1m: 2.0,
+                    output_per_1m: 4.0,
+                })
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let (provider, _store) = wafer_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        wafer_provider(&config, Some(WAFER_KEY)),
+        &config,
+        "/world/wafer",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/wafer", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry through
+    // the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        wafer_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/wafer",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/wafer", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(WAFER_REF, WAFER_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        wafer_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/wafer",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/wafer", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::wafer-serverless --------------------------------
+
+/// TP-PROVIDER-INSTALLED::wafer-serverless = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline slice
+/// never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::wafer-serverless = NOT_RUN"]
+fn provider_installed_wafer_serverless() {}

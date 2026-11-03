@@ -4,8 +4,8 @@
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
-//! `siliconflow-cn`, `synthetic`, `together`, `venice` and `vllm`
-//! connections' adapter —
+//! `siliconflow-cn`, `synthetic`, `together`, `venice`, `vllm` and
+//! `wafer-serverless` connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
@@ -229,6 +229,20 @@
 //! same absent-binding form rides headerless, a scoped key rides as the
 //! bearer, and the listing states no effort ladder: a pinned
 //! `reasoning_effort` denies typed rather than being dropped. The
+//! configured-or-recorded `https://pass.wafer.ai/v1` base of
+//! `wafer-serverless` carries its authoritative `/models` listing: the
+//! nested `wafer` envelope maps the `context_length` window (falling
+//! back to the recorded top-level `max_model_len`), the
+//! `capabilities.reasoning`/`capabilities.vision` marks, the output cap
+//! clamped to the recorded 65536 ceiling, and the per-million cents
+//! price converted to the public Serverless USD rate
+//! (`cents × 125 / 10000`); a field the entry does not state stays
+//! empty or [`ModelPrice::Unknown`], never a default. The descriptor's
+//! `oauthProvider` row is login metadata, not an OAuth class — the
+//! api key rides the plain bearer — while the envelope's upstream
+//! `provider` thinking shape, tools mark and `zdr_supported` flag have
+//! no manifest carrier (residuals), and the recorded reasoning control
+//! is not `reasoning_effort`: a pinned effort denies typed. The
 //! adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -1034,6 +1048,20 @@ const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 /// no region selector, so a configured `region` denies typed.
 const VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
+/// The recorded default API root of a `wafer-serverless` connection
+/// (`https://pass.wafer.ai/v1` in the traceability per-ID row): the
+/// host the required `endpoint` field's empty string resolves under.
+/// The host's `/models` listing is authoritative and carries the nested
+/// `wafer` envelope; the descriptor's `oauthProvider` row is abstract
+/// login metadata, not an OAuth class. The class records no region
+/// selector, so a configured `region` denies typed.
+const WAFER_BASE_URL: &str = "https://pass.wafer.ai/v1";
+
+/// The recorded output ceiling a `wafer-serverless` entry's max tokens
+/// are clamped to (`WAFER_MAX_TOKENS_CAP`): the cap follows the stated
+/// context window and never invents one.
+const WAFER_MAX_TOKENS_CAP: u64 = 65536;
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1380,6 +1408,20 @@ enum EntryRule {
     /// `reasoning_effort` is denied typed at the send seam rather than
     /// silently dropped.
     Vllm,
+    /// The `wafer-serverless` transform: the entry's nested `wafer`
+    /// envelope is authoritative for the fields it states —
+    /// `context_length` maps the context window (falling back to the
+    /// recorded top-level `max_model_len`), `capabilities.reasoning`
+    /// and `capabilities.vision` map their marks, the output cap is the
+    /// window clamped to [`WAFER_MAX_TOKENS_CAP`], and the per-million
+    /// cents price converts to the public Serverless USD rate
+    /// (`cents × 125 / 10000`). A field the envelope does not state
+    /// stays empty or [`ModelPrice::Unknown`], never a default. The
+    /// envelope's upstream `provider` thinking shape, `capabilities.tools`
+    /// mark and `zdr_supported` flag have no manifest carrier —
+    /// residuals. The listing states no `reasoning_effort` surface, so
+    /// a pinned effort denies typed rather than being dropped.
+    Wafer,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -2011,6 +2053,27 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::OpenProxy,
             entries: EntryRule::Vllm,
+        }),
+        // `wafer-serverless` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://pass.wafer.ai/v1` base, whose
+        // authoritative `/models` listing carries the nested `wafer`
+        // envelope fields the class records — the context window with
+        // its recorded `max_model_len` fallback, the reasoning/vision
+        // marks, the 65536 output ceiling and the cents→USD price rule —
+        // and the api key riding the plain bearer. The descriptor's
+        // `oauthProvider` row is abstract login metadata, not an OAuth
+        // class, so `kind = "api_key"` is the recorded auth. The
+        // envelope's upstream `provider` thinking shape, tools mark and
+        // `zdr_supported` flag have no manifest carrier (residuals), and
+        // the recorded reasoning control is not `reasoning_effort`: a
+        // pinned effort denies typed rather than being dropped. A
+        // configured `region` denies: the contract names none.
+        "wafer-serverless" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(WAFER_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Wafer,
         }),
         _ => None,
     }
@@ -2721,7 +2784,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::Novita
                 | EntryRule::SiliconFlow
                 | EntryRule::Synthetic
-                | EntryRule::Vllm => Some(CatalogModel {
+                | EntryRule::Vllm
+                | EntryRule::Wafer => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2994,6 +3058,9 @@ impl ChatCompletionsProvider {
             // window carrier and a Qwen ≥3.8 id carries the
             // display-only reasoning mark.
             EntryRule::Vllm => Some(vllm_entry(id, entry)),
+            // The recorded wafer envelope maps only the fields each
+            // entry states; absent surfaces stay empty or unknown.
+            EntryRule::Wafer => Some(wafer_entry(id, entry)),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -3308,7 +3375,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Novita
             | EntryRule::SiliconFlow
             | EntryRule::Synthetic
-            | EntryRule::Vllm => model_id.to_string(),
+            | EntryRule::Vllm
+            | EntryRule::Wafer => model_id.to_string(),
         }
     }
 
@@ -3401,7 +3469,7 @@ impl ChatCompletionsProvider {
             // The listing that could state the effort surface is not
             // visible at the send seam, so no level is recorded: every
             // pinned effort denies typed rather than being dropped.
-            EntryRule::Vllm => &[],
+            EntryRule::Vllm | EntryRule::Wafer => &[],
             EntryRule::IdsOnly
             | EntryRule::GenericMetadata
             | EntryRule::Aiand
@@ -4110,6 +4178,70 @@ fn vllm_qwen_reasoning(id: &str) -> bool {
         rest = version;
     }
     false
+}
+
+/// The recorded `wafer-serverless` listing transform: the entry's nested
+/// `wafer` envelope is authoritative for the fields it states —
+/// `context_length` (with the recorded top-level `max_model_len`
+/// fallback), `capabilities.reasoning`/`capabilities.vision`, the
+/// output cap clamped to [`WAFER_MAX_TOKENS_CAP`], and the per-million
+/// cents price under the public Serverless rate. An absent envelope or
+/// field stays empty or [`ModelPrice::Unknown`], never a default; the
+/// envelope's upstream `provider` thinking shape, `capabilities.tools`
+/// mark and `zdr_supported` flag have no manifest carrier.
+fn wafer_entry(id: &str, entry: &Value) -> CatalogModel {
+    let envelope = entry.get("wafer").filter(|value| value.is_object());
+    let capabilities = envelope
+        .and_then(|envelope| envelope.get("capabilities"))
+        .filter(|value| value.is_object());
+    let capability = |name: &str| {
+        capabilities
+            .and_then(|capabilities| capabilities.get(name))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let context_window = envelope
+        .and_then(|envelope| positive_count(envelope.get("context_length")))
+        .or_else(|| positive_count(entry.get("max_model_len")));
+    CatalogModel {
+        id: id.to_string(),
+        reasoning: capability("reasoning"),
+        vision: capability("vision"),
+        context_window,
+        max_output_tokens: context_window.map(|window| window.min(WAFER_MAX_TOKENS_CAP)),
+        price: envelope.map(wafer_price).unwrap_or_default(),
+        ..CatalogModel::default()
+    }
+}
+
+/// The recorded wafer price rule: both per-million cents figures must be
+/// stated — a partial or unreadable answer keeps [`ModelPrice::Unknown`]
+/// rather than defaulting the missing half to zero — and the public
+/// Serverless rate is `cents × 125 / 10000` USD per 1M tokens.
+fn wafer_price(envelope: &Value) -> ModelPrice {
+    let pricing = envelope.get("pricing").filter(|value| value.is_object());
+    let (Some(input_cents), Some(output_cents)) = (
+        wafer_cents(pricing.and_then(|pricing| pricing.get("input_cents_per_million"))),
+        wafer_cents(pricing.and_then(|pricing| pricing.get("output_cents_per_million"))),
+    ) else {
+        return ModelPrice::Unknown;
+    };
+    ModelPrice::Usd {
+        input_per_1m: (input_cents * 125.0) / 10000.0,
+        output_per_1m: (output_cents * 125.0) / 10000.0,
+    }
+}
+
+/// The recorded wafer cents figure: a finite non-negative number or its
+/// decimal string; a stated zero is a real figure, anything else is absent.
+fn wafer_cents(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+        .filter(|number| number.is_finite() && *number >= 0.0)
 }
 
 /// `toPositiveNumber(_, 0)` inside a `usd` entry: a finite
