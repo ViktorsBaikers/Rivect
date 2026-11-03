@@ -1,10 +1,12 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
 //! the literal connection ids `openai`, `abliteration`, `meta`,
-//! `ollama` and `openrouter` record this dialect. `ollama` is the local
-//! endpoint whose credential is optional (DEC-009) and whose catalogue
-//! carries a bounded native discovery overlay (DEC-012); `openrouter`
-//! rides the recorded paste-key form behind a catalogue-only keyless
-//! listing (DEC-003/DEC-010). Dialect selection keys
+//! `ollama`, `openrouter` and `sakana` record this dialect. `ollama`
+//! is the local endpoint whose credential is optional (DEC-009) and
+//! whose catalogue carries a bounded native discovery overlay
+//! (DEC-012); `openrouter` rides the recorded paste-key form behind a
+//! catalogue-only keyless listing (DEC-003/DEC-010); `sakana` rides a
+//! key-gated authoritative listing whose in-source Fugu entries are
+//! mapping references, never offers (DEC-004). Dialect selection keys
 //! on the literal connection id, never an auth label or a catalogue
 //! answer, and `openai-codex` is a distinct literal id with its own
 //! recorded class. The adapter authors no async code — [`Provider::send`] is
@@ -22,7 +24,9 @@
 //! `Authorization` header per send — never into config, manifests,
 //! diagnostics or this type's `Debug` (INV-001/INV-006).
 
-use crate::config::{Config, ConnKind, Connection, EffortAssign, FixedModel, ModelAssign};
+use crate::config::{
+    Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
+};
 use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
@@ -57,6 +61,11 @@ const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
 /// endpoint resolves here, and a configured value otherwise wins after
 /// this adapter's trim.
 const OPENROUTER_DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1";
+
+/// The recorded `sakana` base (DEC-004): an empty configured endpoint
+/// resolves here, and a configured value otherwise wins after this
+/// adapter's trim.
+const SAKANA_DEFAULT_ENDPOINT: &str = "https://api.sakana.ai/v1";
 
 /// The recorded `openrouter` paste-key prefix (DEC-003): the bare
 /// `sk-or-…` key the paste form stores at the scoped credential seam.
@@ -117,12 +126,14 @@ const META_MUSE_MODELS: &[&str] = &[
 ];
 
 /// How one listed `/models` entry becomes an offered
-/// [`CatalogModel`]: the id alone under the contract's filter, or the
-/// entry's own tool-capable surfaces (`openrouter`, DEC-010).
+/// [`CatalogModel`]: the id alone under the contract's filter, the
+/// entry's own tool-capable surfaces (`openrouter`, DEC-010), or the
+/// recorded `sakana` listing rule (DEC-004).
 #[derive(Clone, Copy)]
 enum EntryRule {
     IdsOnly,
     OpenRouterTools,
+    Sakana,
 }
 
 /// The predicates the recorded source class binds to a literal
@@ -201,6 +212,16 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::OpenRouterTools,
             reasoning_artifact: false,
         }),
+        // The listing is authoritative and carries its own entry rule
+        // (DEC-004): the recorded in-source Fugu entries are mapping
+        // references, so no seed merges an offer, and the record states
+        // no replay artifact for the id.
+        "sakana" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::Sakana,
+            reasoning_artifact: false,
+        }),
         _ => None,
     }
 }
@@ -208,15 +229,16 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// The connection's API base (DEC-011): the configured endpoint is
 /// trimmed of surrounding whitespace and of every trailing slash —
 /// this adapter's own normalization, not a rule the other adapters
-/// share — and the empty result resolves the recorded base on `ollama`
-/// and `openrouter` alone. Every other id keeps the trimmed value
-/// verbatim; no id's base is ever inferred.
+/// share — and the empty result resolves the recorded base on `ollama`,
+/// `openrouter` and `sakana` alone. Every other id keeps the trimmed
+/// value verbatim; no id's base is ever inferred.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
     if configured.is_empty() {
         match connection {
             "ollama" => OLLAMA_DEFAULT_ENDPOINT.to_string(),
             "openrouter" => OPENROUTER_DEFAULT_ENDPOINT.to_string(),
+            "sakana" => SAKANA_DEFAULT_ENDPOINT.to_string(),
             _ => configured.to_string(),
         }
     } else {
@@ -450,8 +472,10 @@ impl OpenAiProvider {
     /// source seeds on top, `ollama` enriches the listing's own
     /// offers from the bounded native discovery overlay (DEC-012), and
     /// `openrouter` offers only the listing's tool-capable entries with
-    /// their recorded surfaces mapped (DEC-010) — each id carrying the
-    /// shared [`CatalogModel`], returned in deterministic sorted order.
+    /// their recorded surfaces mapped (DEC-010), and `sakana` offers the
+    /// authoritative listing's entries with the recorded Fugu mapping
+    /// (DEC-004) — each id carrying the shared [`CatalogModel`],
+    /// returned in deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -514,9 +538,9 @@ impl OpenAiProvider {
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
-        // while `abliteration`, `meta`, `ollama` and `openrouter`
-        // treat the listing as authoritative: every offered entry
-        // answers, and a recorded seed merges on top as the offer
+        // while `abliteration`, `meta`, `ollama`, `openrouter` and
+        // `sakana` treat the listing as authoritative: every offered entry
+        // answers, and a seed the arm carries merges on top as the offer
         // floor.
         let mut models: Vec<CatalogModel> = data
             .iter()
@@ -538,11 +562,13 @@ impl OpenAiProvider {
     /// One listed entry under the literal id's recorded entry rule:
     /// `EntryRule::OpenRouterTools` offers only an entry whose
     /// `supported_parameters` declares `tools` and maps that entry's own
-    /// surfaces (DEC-010); `EntryRule::IdsOnly` offers the id alone under
-    /// the contract's filter.
+    /// surfaces (DEC-010); `EntryRule::Sakana` maps the recorded listing
+    /// rule (DEC-004); `EntryRule::IdsOnly` offers the id alone under the
+    /// contract's filter.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         match self.contract.entry {
             EntryRule::OpenRouterTools => openrouter_model(entry),
+            EntryRule::Sakana => sakana_model(entry),
             EntryRule::IdsOnly => {
                 let id = entry.get("id").and_then(Value::as_str)?;
                 let offered = if self.contract.authoritative_models {
@@ -1259,6 +1285,40 @@ fn openrouter_model(entry: &Value) -> Option<CatalogModel> {
     })
 }
 
+/// One `sakana` listing entry under the recorded catalogue rule
+/// (DEC-004): the listing alone names offers, with no chat filter and
+/// no seeded roster — the recorded in-source Fugu entries are mapping
+/// references, so an id only offers when the listing names it. A
+/// `fugu*` id maps the recorded reasoning ladder to its one
+/// representable level (`high`; `max` is outside the shared
+/// vocabulary, DEC-008); vision comes from the entry's declared
+/// capabilities, and the stated limits land only when positive.
+/// Unknown stays `None`; the recorded request-side clamp is upstream
+/// behaviour this adapter never carries (D3).
+fn sakana_model(entry: &Value) -> Option<CatalogModel> {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    let capabilities = entry.get("capabilities").and_then(Value::as_array);
+    let vision = capabilities
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("vision")));
+    let fugu = id.starts_with("fugu");
+    Some(CatalogModel {
+        id: id.to_string(),
+        reasoning: fugu,
+        vision,
+        efforts: if fugu {
+            vec![EffortLevel::High]
+        } else {
+            Vec::new()
+        },
+        context_window: entry.get("context_length").and_then(positive_tokens),
+        max_output_tokens: entry.get("max_completion_tokens").and_then(positive_tokens),
+        ..CatalogModel::default()
+    })
+}
+
 /// The entry's stated per-token USD figures, scaled to the shared
 /// per-1M record. Both members must carry a readable non-negative
 /// number — a partial or invalid pair is not a figure, so the price
@@ -1434,8 +1494,10 @@ mod tests {
 
     /// DEC-011's endpoint rule: the configured base is trimmed and
     /// loses every trailing slash, and the empty result resolves the
-    /// recorded base on `ollama` and `openrouter` alone — a sibling id
-    /// keeps its own (absent) value and never borrows another's host.
+    /// recorded base on `ollama`, `openrouter` and `sakana` alone — a
+    /// sibling id keeps its own (absent) value and never borrows
+    /// another's host. The `sakana` default is pinned as a literal, not
+    /// only through the const it resolves.
     #[test]
     fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
         assert_eq!(endpoint_for("ollama", "   "), OLLAMA_DEFAULT_ENDPOINT);
@@ -1449,6 +1511,12 @@ mod tests {
         assert_eq!(
             endpoint_for("openrouter", "  "),
             OPENROUTER_DEFAULT_ENDPOINT
+        );
+        assert_eq!(endpoint_for("sakana", ""), "https://api.sakana.ai/v1");
+        assert_eq!(endpoint_for("sakana", " / "), SAKANA_DEFAULT_ENDPOINT);
+        assert_eq!(
+            endpoint_for("sakana", " https://api.sakana.ai/v1/ "),
+            "https://api.sakana.ai/v1"
         );
         assert_eq!(
             endpoint_for("openrouter", " https://openrouter.ai/api/v1/ "),

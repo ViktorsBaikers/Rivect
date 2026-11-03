@@ -1,5 +1,5 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
-//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter}):
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,sakana}):
 //! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
@@ -8,7 +8,7 @@
 //! bounded native discovery overlay; `openrouter` is the catalogue-only
 //! keyless class behind the recorded paste-key form. The SSE legs pin
 //! the shared parser's WHATWG §9.2.5–9.2.6 conformance.
-//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter} stays
+//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana} stays
 //! NOT_RUN — the ignored named cases carry that status explicitly.
 
 #![allow(
@@ -21,7 +21,7 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::{Config, ConnKind};
+use rivect::config::{Config, ConnKind, EffortLevel};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
@@ -7650,6 +7650,754 @@ async fn openrouter_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::openrouter = NOT_RUN"]
 fn provider_installed_openrouter() {}
+
+// ----- sakana -------------------------------------------------------------
+//
+// `sakana` records the OpenAI Responses transport over a key-gated
+// authoritative `GET /models` listing (DEC-004): an empty configured
+// endpoint resolves `https://api.sakana.ai/v1`, the listing alone names
+// offers — the recorded in-source Fugu entries are mapping references,
+// never a roster — and a `fugu*` id maps the one representable
+// reasoning level (`max` is outside the shared vocabulary, DEC-008).
+// The recorded request-side clamp is upstream-only (D3), so this
+// adapter carries no such field.
+
+const SAKANA_REF: &str = "keyring:rivect-test/sakana";
+
+const SAKANA_MODEL: &str = "fugu-ultra";
+
+/// Fixture key material — never a real credential, only ever sent to
+/// localhost.
+const SAKANA_SECRET: &str = "fixture-sakana-key";
+
+/// One configured `sakana` connection pointing at the fixture peer:
+/// the api_key class resolves a scoped `SecretRef`, and the dialect
+/// comes from the literal connection id (DEC-004).
+fn sakana_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.sakana]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{SAKANA_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"sakana\", model_id = \"{SAKANA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn sakana_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(SAKANA_REF, SAKANA_SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "sakana".to_string(), store.clone())
+        .expect("the shared adapter builds for the sakana id");
+    (provider, store)
+}
+
+/// The rich catalogue on a plain OS thread: the blocking client cannot
+/// be dropped inside a tokio context.
+fn sakana_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    drop_blocking(provider);
+    outcome.expect("the sakana catalogue answers")
+}
+
+// ----- TP-PROVIDER-WIRE::sakana -------------------------------------
+
+/// A configured `sakana` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the bound pin, the
+/// shared adapter posts exactly the frozen manifest as a Responses
+/// request — `store: false`, `stream: true`, pinned model,
+/// instructions, tool surface and pinned effort verbatim, no
+/// unrecorded reasoning artifact — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the
+/// provider's reported usage.
+#[tokio::test]
+async fn sakana_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified sakana outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 19, "output_tokens": 7, "total_tokens": 26})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: prove the sakana wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified sakana outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {SAKANA_SECRET}")
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], SAKANA_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the record states no replay artifact — the include is never requested: {body}"
+    );
+    assert!(
+        body.get("max_output_tokens").is_none(),
+        "the recorded request-side clamp is upstream-only — no token cap rides the request: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "sakana");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 19,
+            completion_tokens: 7,
+            total_tokens: 26,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(26));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/sakana", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::sakana ----------------------------------
+
+/// The key-gated `GET /models` listing is the whole catalogue
+/// (DEC-004): the bound bearer rides the one listing leg, every
+/// non-empty string id offers in sorted order — a malformed entry
+/// never invents one and a repeated id offers once — an empty answer
+/// has no floor to fall back to, and a failed answer keeps the leg's
+/// typed denial.
+#[tokio::test]
+async fn sakana_catalog_is_the_keyed_authoritative_listing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "sakana-beta"},
+                {"id": "sakana-alpha"},
+                {"id": "sakana-alpha"},
+                {"id": ""},
+                {"owned_by": "nobody"},
+                {"id": 7},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let models = sakana_catalog(sakana_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sakana-alpha", "sakana-beta"],
+        "the authoritative listing names the offers, sorted and deduplicated"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the keyed listing is the one leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {SAKANA_SECRET}"),
+        "the listing runs only under the resolved material"
+    );
+
+    // an empty `data` answer is a real answer with no offers — the
+    // recorded Fugu entries are mapping references, never a floor
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let models = sakana_catalog(sakana_provider(&config).0);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // a failed listing is the leg's typed denial — no floor answers
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let provider = sakana_provider(&config).0;
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    let err = outcome.expect_err("a failed listing has no floor to answer");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the failed listing is the typed transport denial: {err:?}")
+    };
+    assert_eq!(connection, "sakana");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the failed listing keeps its typed denial: {cause}"
+    );
+    drop_blocking(provider);
+}
+
+/// The listing is key-gated (DEC-004, AC-040e): a bound ref with no
+/// material at its scope denies the catalogue typed before any wire
+/// leg, so an unauthenticated caller never receives offers.
+#[tokio::test]
+async fn sakana_catalog_without_material_denies_before_any_wire() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config, "sakana".to_string(), store)
+        .expect("the binding resolves; the store is read at the listing");
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    let err = outcome.expect_err("an absent scope is never a listing");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/sakana"),
+        "the absent scope is the typed credential denial: {err:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+}
+
+/// The recorded in-source Fugu entries are mapping references, never
+/// offers (DEC-004): the catalogue is exactly the listing's ids — no
+/// Fugu reference is seeded — while every offered `fugu*` id maps the
+/// recorded reasoning ladder to its single representable level (`max`
+/// is outside the shared vocabulary, DEC-008). Vision comes from the
+/// entry's declared capabilities, the stated limits land only when
+/// positive — zero or negative never becomes a figure — and no chat
+/// capability filters an entry.
+#[tokio::test]
+async fn sakana_fugu_entries_are_mapping_references_not_offers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {
+                    "id": "fugu-ultra",
+                    "capabilities": ["completion", "vision"],
+                    "context_length": 200000,
+                    "max_completion_tokens": 32768,
+                },
+                {"id": "fugu-mini"},
+                {"id": "fugu-zero", "context_length": 0, "max_completion_tokens": -1},
+                {"id": "sakana-text", "capabilities": ["completion", "vision"]},
+                {"id": "plain", "capabilities": ["completion"]},
+                {"id": ""},
+                {"id": 7},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let models = sakana_catalog(sakana_provider(&config).0);
+    assert_eq!(
+        models,
+        vec![
+            CatalogModel {
+                id: "fugu-mini".to_string(),
+                reasoning: true,
+                efforts: vec![EffortLevel::High],
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "fugu-ultra".to_string(),
+                reasoning: true,
+                vision: true,
+                efforts: vec![EffortLevel::High],
+                context_window: Some(200_000),
+                max_output_tokens: Some(32_768),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "fugu-zero".to_string(),
+                reasoning: true,
+                efforts: vec![EffortLevel::High],
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "plain".to_string(),
+                ..CatalogModel::default()
+            },
+            CatalogModel {
+                id: "sakana-text".to_string(),
+                vision: true,
+                ..CatalogModel::default()
+            },
+        ],
+        "the listing alone names offers; a `fugu*` id maps high only and capabilities carry vision"
+    );
+}
+
+/// The configured base is the API base for both legs under this
+/// adapter's normalization: the declaration is trimmed of whitespace
+/// and of every trailing slash, and the resolved base serves the
+/// listing and the inference POST alike. The empty-after-trim arm
+/// resolves the recorded `https://api.sakana.ai/v1` default on the
+/// resolution rule itself (`src/providers/openai.rs`), since that host
+/// is a live peer this offline suite never contacts.
+#[tokio::test]
+async fn sakana_configured_base_applies_to_listing_and_inference() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": SAKANA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream("configured base", Vec::new(), None),
+    )
+    .await;
+    let padded = format!("  {}/  ", server_uri_v1(&server));
+    let config = Config::parse_validated(&sakana_config(&padded)).expect("valid");
+    let models = sakana_catalog(sakana_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![SAKANA_MODEL],
+        "the configured base serves the listing"
+    );
+    let (provider, _store) = sakana_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    outcome.expect("the configured base serves inference");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/v1/models"), 1);
+    assert_eq!(count_path(&requests, "/v1/responses"), 1);
+}
+
+// ----- TP-PROVIDER-AUTH/ADVERSE::sakana -----------------------------
+
+/// A typed negative control for the sakana Responses surface: a partial
+/// tool item, an EOF without a terminal, and an unclassifiable terminal
+/// status each deny typed and account nothing; a resolver with no
+/// material at the bound scope denies `CredentialAbsent`; and a refused
+/// bearer is the typed status denial that renders neither the
+/// credential nor the peer's body.
+#[tokio::test]
+async fn sakana_adverse_wire_input_never_reports_success() {
+    // a stream ending mid output item is a typed violation
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "call_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""}, "output_index": 0}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: partial item",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a stream ended mid output item is a typed violation: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // EOF without a terminal is the unknown terminal
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        format!(
+            "{}{}",
+            sse_block(
+                "response.output_item.added",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}, "output_index": 0}),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: no terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF without a terminal is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a completed terminal whose status the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"status": "esoteric", "output": []}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: unknown status",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal status is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a bound ref with no material at its scope denies before any wire
+    // leg — the sibling scope's material stays sealed behind the denial
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(NEIGHBOR_REF, SAKANA_SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "sakana".to_string(), store)
+        .expect("the binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("an absent scope is never success");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/sakana"),
+        "the absent scope is the typed credential denial: {err:?}"
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(SAKANA_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+
+    // a refused bearer is the typed status denial, and the error renders
+    // neither the credential nor the peer's body
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(BODY_MARKER))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: refused bearer",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest);
+    let err = outcome.expect_err("a refused bearer is never success");
+    assert_eq!(broker.accounted_requests(), 0);
+    let ModelError::Provider(provider_err) = &err else {
+        panic!("the refused bearer is the typed transport denial: {err:?}");
+    };
+    assert_no_secret_or_body(provider_err);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(SAKANA_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
+    let ProviderError::Transport { connection, cause } = provider_err else {
+        panic!("the refused bearer is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "sakana");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the peer's own status is the denial's context: {cause}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth label:
+/// `sakana` records the Responses surface, an unrouted sibling builds
+/// no adapter, the Chat-Completions adapter refuses `sakana`, a `local`
+/// declaration of the reserved literal is never fixture-served, and a
+/// configured region is the typed denial.
+#[test]
+fn sakana_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("sakana"),
+        Some(Dialect::Responses),
+        "the literal id records the Responses dialect"
+    );
+    let config = Config::parse_validated(&sakana_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "openai-codex".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let built = config.clone();
+    let err = std::thread::spawn(move || ChatCompletionsProvider::new(&built, "sakana", store))
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("the CC adapter refuses the Responses id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "a CC arm for `sakana` is a dialect mismatch, not a served connection"
+    );
+
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.sakana]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"sakana\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("sakana").expect("declared");
+    assert!(
+        !loopback.serves("sakana", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a configured region is outside the recorded endpoint contract
+    let regional = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.sakana]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{SAKANA_REF}\"\nregion = \"eu\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"sakana\", model_id = \"{SAKANA_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(regional, "sakana".to_string(), store)
+        .expect_err("a configured region is never silently ignored");
+    assert!(
+        matches!(&err, ProviderError::RegionMismatch { connection, region }
+            if connection == "sakana" && region == "eu"),
+        "a configured region is the typed denial: {err:?}"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `sakana`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside
+/// this run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn sakana_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": SAKANA_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&sakana_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the keyed listing answers its offers.
+    let models = sakana_catalog(sakana_provider(&config).0);
+    reported.insert(
+        "CATALOG",
+        if models
+            .iter()
+            .map(|model| model.id.as_str())
+            .eq(std::iter::once(SAKANA_MODEL))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "sakana".to_string(), empty.clone()).expect("resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        sakana_provider(&config),
+        &config,
+        "/world/sakana",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/sakana", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "sakana".to_string(), empty.clone()).expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(SAKANA_REF, SAKANA_SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::sakana --------------------------------
+
+/// TP-PROVIDER-INSTALLED::sakana = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::sakana = NOT_RUN"]
+fn provider_installed_sakana() {}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 
