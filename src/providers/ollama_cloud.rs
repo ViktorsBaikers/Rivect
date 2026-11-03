@@ -12,7 +12,9 @@
 //! crosses only from the [`CredentialStore`] into the `Authorization`
 //! header and never enters diagnostics (INV-001).
 
-use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
+use crate::config::{
+    Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
+};
 use crate::model::RequestManifest;
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply,
@@ -363,7 +365,12 @@ impl OllamaCloudProvider {
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the native dialect; [`ProviderError::UnknownConnection`] for an
     /// undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; `resolve_credential_in`'s typed denials for
+    /// configured region; [`ProviderError::LocalProfileDeclared`] for a
+    /// `local` declaration that binds a `profile`;
+    /// [`ProviderError::CredentialUnresolved`] for a `local`
+    /// declaration — the class requires its binding, so the kind is
+    /// denied before any credential resolves —
+    /// `resolve_credential_in`'s typed denials for
     /// a missing, malformed or mismatched binding;
     /// [`ProviderError::Transport`] when the HTTP client cannot be
     /// built.
@@ -414,8 +421,25 @@ impl OllamaCloudProvider {
                 region: region.clone(),
             });
         }
-        // The class requires its binding: an unbound declaration is the
-        // typed unresolved denial at build, before any wire leg exists.
+        // The class requires its binding: an unbound declaration and a
+        // `local` declaration that names a locally served endpoint are
+        // both the typed unresolved denial at build, before any wire
+        // leg exists — the profile member must not turn the row into a
+        // credentialled sender (DEC-009/DEC-010). A `local` row that
+        // binds a `profile` is the contradictory half and is named as
+        // such first (DEC-023).
+        if conn.kind == ConnKind::Local && conn.profile.is_some() {
+            return Err(ProviderError::LocalProfileDeclared {
+                connection: connection.to_string(),
+            });
+        }
+        if conn.kind == ConnKind::Local {
+            return Err(ProviderError::CredentialUnresolved {
+                connection: connection.to_string(),
+                scope: format!("connections.{connection}.kind"),
+                cause: None,
+            });
+        }
         let credential = resolve_credential_in(&config.connections, &config.profiles, connection)?;
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
@@ -632,7 +656,8 @@ impl OllamaCloudProvider {
     /// dialect can classify. Each frame is one newline-terminated JSON
     /// object; the first terminal frame closes the stream — a `done`
     /// verdict or the peer's own error — and a stream that ends mid
-    /// frame or before its terminal is never success.
+    /// frame is a wire violation while a clean end before the terminal
+    /// is the unknown terminal; neither is ever success.
     fn read_stream(
         &self,
         manifest: &RequestManifest,
@@ -683,10 +708,9 @@ impl OllamaCloudProvider {
             if !pending.is_empty() {
                 return Err(violation(&self.connection, "stream ended mid jsonl frame"));
             }
-            return Err(violation(
-                &self.connection,
-                "stream ended before the done frame",
-            ));
+            return Err(ProviderError::UnknownTerminal {
+                connection: self.connection.clone(),
+            });
         }
         match state.terminal {
             Some(Terminal::Completed) => self.complete(manifest, state),

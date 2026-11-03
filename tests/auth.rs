@@ -177,6 +177,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::StoreUnavailable { .. } => "StoreUnavailable",
         ProviderError::StoreAmbiguous { .. } => "StoreAmbiguous",
         ProviderError::CredentialUnresolved { .. } => "CredentialUnresolved",
+        ProviderError::LocalProfileDeclared { .. } => "LocalProfileDeclared",
         ProviderError::CredentialProfileMismatch { .. } => "CredentialProfileMismatch",
         ProviderError::CredentialOutsideNamespace { .. } => "CredentialOutsideNamespace",
         ProviderError::CredentialOccupied { .. } => "CredentialOccupied",

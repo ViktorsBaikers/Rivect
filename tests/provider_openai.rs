@@ -961,6 +961,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::StoreUnavailable { .. }) => "StoreUnavailable",
         Some(ProviderError::StoreAmbiguous { .. }) => "StoreAmbiguous",
         Some(ProviderError::CredentialUnresolved { .. }) => "CredentialUnresolved",
+        Some(ProviderError::LocalProfileDeclared { .. }) => "LocalProfileDeclared",
         Some(ProviderError::CredentialProfileMismatch { .. }) => "CredentialProfileMismatch",
         Some(ProviderError::CredentialOutsideNamespace { .. }) => "CredentialOutsideNamespace",
         Some(ProviderError::CredentialOccupied { .. }) => "CredentialOccupied",
@@ -1799,6 +1800,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         StoreUnavailable,
         StoreAmbiguous,
         CredentialUnresolved,
+        LocalProfileDeclared,
         CredentialProfileMismatch,
         CredentialOutsideNamespace,
         CredentialOccupied,
@@ -1824,6 +1826,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::StoreUnavailable { .. } => ProviderVariant::StoreUnavailable,
             ProviderError::StoreAmbiguous { .. } => ProviderVariant::StoreAmbiguous,
             ProviderError::CredentialUnresolved { .. } => ProviderVariant::CredentialUnresolved,
+            ProviderError::LocalProfileDeclared { .. } => ProviderVariant::LocalProfileDeclared,
             ProviderError::CredentialProfileMismatch { .. } => {
                 ProviderVariant::CredentialProfileMismatch
             }
@@ -3071,9 +3074,9 @@ async fn wrong_credential_profile_or_region_denies_with_typed_context_without_se
 
 /// A `local` declaration of the shipped `openai` id that binds a
 /// `profile` is the same contradiction: the kind says local endpoint
-/// while the profile reaches real material. The adapter denies by
-/// declaration kind before any credential resolution, so the seeded key
-/// is never read and no wire leg runs.
+/// while the profile reaches real material. The adapter names the
+/// contradictory profile binding before any credential resolution, so
+/// the seeded key is never read and no wire leg runs.
 #[tokio::test]
 async fn openai_local_profile_declaration_never_sends() {
     let server = MockServer::start().await;
@@ -3096,16 +3099,15 @@ async fn openai_local_profile_declaration_never_sends() {
     let err = provider_result(config, "openai".to_string(), store)
         .expect_err("the local declaration never resolves the profile's material");
     match &err {
-        ProviderError::CredentialUnresolved {
-            connection,
-            scope,
-            cause,
-        } => {
+        ProviderError::LocalProfileDeclared { connection } => {
             assert_eq!(connection, "openai");
-            assert_eq!(scope, "connections.openai.kind");
-            assert!(cause.is_none(), "the kind denial names no ref");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("profile") && rendered.contains("openai"),
+                "the denial names the profile member and the connection: {rendered}"
+            );
         }
-        other => panic!("the local profile form is the typed unresolved denial, not {other:?}"),
+        other => panic!("the local profile form is the named profile denial, not {other:?}"),
     }
     assert_no_secret_or_body(&err);
 
@@ -6076,9 +6078,9 @@ async fn ollama_native_metadata_phase_budget_bounds_the_fanout() {
     assert_eq!(models.len(), 40, "every listing offer stands");
     let requests = server.received_requests().await.expect("recorded");
     let shows = count_path(&requests, "/api/show");
-    assert!(
-        shows <= 32,
-        "the probe fanout never passes 32 listed ids, got {shows}"
+    assert_eq!(
+        shows, 32,
+        "a 40-id listing probes exactly the leading 32, got {shows}"
     );
 
     // a stalled `/api/tags` peer spends the whole call's remainder: the
@@ -6176,7 +6178,17 @@ async fn ollama_native_phase_budget_is_shorter_than_the_whole_call_deadline() {
         .await;
     let config = Config::parse_validated(&ollama_config(&server_uri_v1(&server))).expect("valid");
     let (provider, _store) = ollama_provider_with_deadline(&config, Duration::from_secs(5));
+    let started = Instant::now();
     let models = ollama_catalog(provider);
+    let elapsed = started.elapsed();
+    // No clock seam records the phase timeout itself, so the clipped
+    // one-second peer is the only observable discriminator: the 250 ms
+    // phase answers near its budget, while a phase riding the
+    // whole-call deadline would spend the full second.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "the 250 ms phase clips the one-second tags peer, got {elapsed:?}"
+    );
     assert_eq!(
         models,
         vec![CatalogModel {
@@ -6417,6 +6429,83 @@ async fn ollama_local_kind_form_serves_both_legs_without_a_header() {
             .all(|request| request.headers.get("authorization").is_none()),
         "the local declaration binds no credential, so no leg fabricates a header: {:?}",
         request_paths(&requests)
+    );
+}
+
+/// A `local` declaration of `ollama` that also binds a `profile` is
+/// contradictory: the kind names a locally served endpoint while the
+/// profile reaches real material. The adapter names the contradictory
+/// profile binding before any credential resolution, so the seeded key
+/// is never read and no wire leg runs (DEC-009/DEC-010).
+#[tokio::test]
+async fn ollama_local_profile_declaration_never_sends() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.ollama]\nkind = \"local\"\nendpoint = \"{}\"\nprofile = \"p1\"\n\
+         [profiles.p1]\ncredential_ref = \"keyring:rivect-test/p1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama\", model_id = \"{OLLAMA_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("the contradictory declaration is admitted at ingress");
+    assert_eq!(config.connections["ollama"].profile.as_deref(), Some("p1"));
+
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[("keyring:rivect-test/p1", SECRET)],
+    ));
+    let err = provider_result(config, "ollama".to_string(), store)
+        .expect_err("the local declaration never resolves the profile's material");
+    match &err {
+        ProviderError::LocalProfileDeclared { connection } => {
+            assert_eq!(connection, "ollama");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("profile") && rendered.contains("ollama"),
+                "the denial names the profile member and the connection: {rendered}"
+            );
+        }
+        other => panic!("the local profile form is the named profile denial, not {other:?}"),
+    }
+    assert!(
+        !format!("{err} {err:?}").contains(SECRET),
+        "the denial never renders the seeded material: {err}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// The optional-credential class still denies a configured region: the
+/// recorded endpoint contract names none, so the build is the typed
+/// mismatch before any wire leg and the denial renders no material.
+#[tokio::test]
+async fn ollama_configured_region_denies_before_any_wire() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(
+        &ollama_bound_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(OLLAMA_REF, SECRET)],
+    ));
+    let err = provider_result(config, "ollama".to_string(), store)
+        .expect_err("a configured region is denied, never ignored");
+    assert!(
+        matches!(&err, ProviderError::RegionMismatch { connection, region }
+            if connection == "ollama" && region == "eu"),
+        "a configured region is the typed mismatch: {err}"
+    );
+    assert_no_secret_or_body(&err);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests.is_empty(),
+        "the denial lands before any wire leg: {requests:?}"
     );
 }
 
@@ -7230,9 +7319,9 @@ async fn openrouter_local_declaration_never_sends() {
 
 /// A `local` declaration of the reserved literal that binds a `profile`
 /// is contradictory: the kind says local endpoint while the profile
-/// reaches real `sk-or-…` material. The adapter denies by declaration
-/// kind before any credential resolution, so the seeded key is never
-/// read and no wire leg runs.
+/// reaches real `sk-or-…` material. The adapter names the contradictory
+/// profile binding before any credential resolution, so the seeded key
+/// is never read and no wire leg runs.
 #[tokio::test]
 async fn openrouter_local_profile_declaration_never_sends() {
     let server = MockServer::start().await;
@@ -7258,16 +7347,15 @@ async fn openrouter_local_profile_declaration_never_sends() {
     let err = provider_result(config, "openrouter".to_string(), store)
         .expect_err("the local declaration never resolves the profile's material");
     match &err {
-        ProviderError::CredentialUnresolved {
-            connection,
-            scope,
-            cause,
-        } => {
+        ProviderError::LocalProfileDeclared { connection } => {
             assert_eq!(connection, "openrouter");
-            assert_eq!(scope, "connections.openrouter.kind");
-            assert!(cause.is_none(), "the kind denial names no ref");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("profile") && rendered.contains("openrouter"),
+                "the denial names the profile member and the connection: {rendered}"
+            );
         }
-        other => panic!("the local profile form is the typed unresolved denial, not {other:?}"),
+        other => panic!("the local profile form is the named profile denial, not {other:?}"),
     }
     assert!(
         !format!("{err} {err:?}").contains(OPENROUTER_SECRET),
@@ -7276,6 +7364,47 @@ async fn openrouter_local_profile_declaration_never_sends() {
 
     let requests = server.received_requests().await.expect("recorded");
     assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// The profile binding's trailing scope segment is the binding itself
+/// (DEC-013): a ref whose scope names another profile denies
+/// `CredentialProfileMismatch` at build, renders no seeded material
+/// and never reaches the wire.
+#[tokio::test]
+async fn openrouter_profile_mismatch_never_sends() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(OPENROUTER_REF, OPENROUTER_SECRET)],
+    ));
+    let err = provider_result(config, "openrouter".to_string(), store)
+        .expect_err("a divergent scope is a profile mismatch");
+    assert!(
+        matches!(
+            &err,
+            ProviderError::CredentialProfileMismatch { connection, profile }
+                if connection == "openrouter" && profile == "work"
+        ),
+        "a divergent scope is the typed profile mismatch: {err:?}"
+    );
+    // This path denies at build, before the store is read, so no
+    // seeded material can reach the render; redaction is proven on the
+    // resolving 401 leg instead.
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests.is_empty(),
+        "the denial lands before any wire leg: {requests:?}"
+    );
 }
 
 /// A `/models` HTTP 200 is never entitlement: the listing genuinely

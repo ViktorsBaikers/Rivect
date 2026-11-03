@@ -227,6 +227,11 @@ pub enum ProviderError {
         #[source]
         cause: Option<SecretRefError>,
     },
+    /// A `local` declaration names a locally served endpoint; a `profile`
+    /// binding is the contradictory half — the message names it so the
+    /// operator fixes the right member (DEC-023).
+    #[error("connection {connection} is local and must not carry a profile")]
+    LocalProfileDeclared { connection: String },
     /// DEC-014: a profile-bound ref whose trailing scope segment is not the
     /// bound profile's name — scope and binding cannot diverge.
     #[error(
@@ -1314,8 +1319,11 @@ impl Provider for LoopbackProvider {
 /// send/eligibility answer stays false. Every other `api_key` id
 /// requires its scoped binding at ingress and at eligibility.
 ///
-/// Its contract-side twin is `CredentialRule::OpenProxy` in the local
-/// adapter's per-id table, the arm that carries the class's wire form.
+/// Its contract-side twin for the CC local-endpoint ids (`litellm`,
+/// `llama.cpp`, `lm-studio`) is `CredentialRule::OpenProxy` in the
+/// local adapter's per-id table, the arm that carries the class's wire
+/// form; `ollama`'s contract side is the Responses adapter's
+/// `Option<SecretRef>` arm.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
     matches!(connection, "litellm" | "llama.cpp" | "lm-studio" | "ollama")

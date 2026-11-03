@@ -347,9 +347,11 @@ impl OpenAiProvider {
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the Responses source class; [`ProviderError::UnknownConnection`]
     /// for an undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; [`ProviderError::CredentialUnresolved`] for a
-    /// `local` declaration of a reserved id that is not an open proxy —
-    /// denied by declaration kind before any credential resolves —
+    /// configured region; [`ProviderError::LocalProfileDeclared`] for a
+    /// `local` declaration that binds a `profile`;
+    /// [`ProviderError::CredentialUnresolved`] for a `local`
+    /// declaration of a reserved id that is not an open proxy — denied
+    /// by declaration kind before any credential resolves —
     /// `resolve_admitted_credential_in`'s typed
     /// denials for a malformed or mismatched binding on a required id
     /// (the admitted absent-binding class resolves `None`);
@@ -408,11 +410,19 @@ impl OpenAiProvider {
                 region: region.clone(),
             });
         }
-        // A `local` declaration names a locally served endpoint; the
-        // reserved Responses ids are not that class, and a `profile`
-        // binding must not turn one into a credentialled sender
-        // (DEC-009/DEC-010). Denied by declaration kind before any
-        // credential resolution; the open-proxy `ollama` stays admitted.
+        // A `local` declaration names a locally served endpoint that
+        // binds no credential; a `profile` member is the contradictory
+        // half of the declaration — it must not turn the row into a
+        // credentialled sender (DEC-009/DEC-010, DEC-023). The profile
+        // half is named first so the operator fixes the right member;
+        // the reserved Responses ids still deny the kind itself before
+        // any credential resolution, and an open-proxy `ollama` that
+        // binds no profile stays admitted.
+        if conn.kind == ConnKind::Local && conn.profile.is_some() {
+            return Err(ProviderError::LocalProfileDeclared {
+                connection: connection.to_string(),
+            });
+        }
         if conn.kind == ConnKind::Local && !open_proxy_connection(connection) {
             return Err(ProviderError::CredentialUnresolved {
                 connection: connection.to_string(),
@@ -1496,11 +1506,11 @@ mod tests {
     /// loses every trailing slash, and the empty result resolves the
     /// recorded base on `ollama`, `openrouter` and `sakana` alone — a
     /// sibling id keeps its own (absent) value and never borrows
-    /// another's host. The `sakana` default is pinned as a literal, not
-    /// only through the const it resolves.
+    /// another's host. The `ollama` and `sakana` defaults are pinned as
+    /// literals, not only through the consts they resolve.
     #[test]
     fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
-        assert_eq!(endpoint_for("ollama", "   "), OLLAMA_DEFAULT_ENDPOINT);
+        assert_eq!(endpoint_for("ollama", "   "), "http://127.0.0.1:11434/v1");
         assert_eq!(endpoint_for("ollama", ""), OLLAMA_DEFAULT_ENDPOINT);
         assert_eq!(endpoint_for("ollama", " / "), OLLAMA_DEFAULT_ENDPOINT);
         assert_eq!(

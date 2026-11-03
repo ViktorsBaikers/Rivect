@@ -4617,7 +4617,15 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "novita",
         "nvidia",
         "ollama",
+        "ollama-cloud",
         "openrouter",
+        "qianfan",
+        "qwen-portal",
+        "sakana",
+        "siliconflow",
+        "siliconflow-cn",
+        "synthetic",
+        "together",
     ];
     let mut admitted = Vec::new();
     for id in band {

@@ -231,7 +231,9 @@
 //! `Authorization` header per send — never into config, manifests,
 //! diagnostics or this type's `Debug` (INV-001/INV-006).
 
-use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign};
+use crate::config::{
+    Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
+};
 use crate::model::RequestManifest;
 use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseEvent, SseParser};
@@ -2231,6 +2233,11 @@ impl ChatCompletionsProvider {
     /// the Chat Completions source class or its own contract arm;
     /// [`ProviderError::UnknownConnection`] for an undeclared id;
     /// [`ProviderError::RegionMismatch`] for a configured region;
+    /// [`ProviderError::LocalProfileDeclared`] for a `local`
+    /// declaration that binds a `profile` on such a contract;
+    /// [`ProviderError::CredentialUnresolved`] for a `local`
+    /// declaration on a contract that requires its binding — denied by
+    /// declaration kind before any credential resolves —
     /// [`resolve_credential`]'s typed denials for a missing, malformed
     /// or mismatched binding; [`ProviderError::Transport`] when the
     /// HTTP client cannot be built.
@@ -2285,6 +2292,29 @@ impl ChatCompletionsProvider {
             return Err(ProviderError::RegionMismatch {
                 connection: connection.to_string(),
                 region: region.clone(),
+            });
+        }
+        // A `local` declaration names a locally served endpoint that
+        // binds no credential; a contract that requires its binding
+        // cannot honour that kind, and a `profile` member is the
+        // contradictory half that must not turn the row into a
+        // credentialled sender (DEC-009/DEC-010, DEC-023). The profile
+        // half is named first so the operator fixes the right member;
+        // the kind itself is denied before any credential resolution,
+        // and an optional-binding contract keeps its profile form.
+        if conn.kind == ConnKind::Local
+            && !contract.binds_optional_credential()
+            && conn.profile.is_some()
+        {
+            return Err(ProviderError::LocalProfileDeclared {
+                connection: connection.to_string(),
+            });
+        }
+        if conn.kind == ConnKind::Local && !contract.binds_optional_credential() {
+            return Err(ProviderError::CredentialUnresolved {
+                connection: connection.to_string(),
+                scope: format!("connections.{connection}.kind"),
+                cause: None,
             });
         }
         let credential = if contract.binds_optional_credential() {
@@ -4473,7 +4503,7 @@ fn is_likely_siliconflow_chat_id(id: &str) -> bool {
 /// stated limits, and the recorded `min(maxTokens, context)` clamp caps
 /// the maximum output at the window where both exist. An absent, zero
 /// or unreadable value stays `None` — no default figure and no borrowed
-/// sibling field — and no vendored roster or price row exists (D2/D6),
+/// sibling field — and no vendored roster or price row exists (D2),
 /// so an admitted offer keeps [`ModelPrice::Unknown`].
 fn siliconflow_entry(id: &str, entry: &Value) -> Option<CatalogModel> {
     if !is_likely_siliconflow_chat_id(id) {

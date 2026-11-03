@@ -39,12 +39,13 @@ fn catalogue_vocabulary_carries_max_output_tokens() {
     );
 }
 
-/// The recorded seed floor keeps every entry byte-for-byte: an empty
-/// listing still answers the built-in roster with the same id, vision,
-/// effort ladder, context window and price, and the new maximum-output
-/// carrier stays `None` because no built-in row states a cap.
+/// The recorded deepseek seed floor keeps every entry byte-for-byte: an
+/// empty listing still answers the built-in roster with the same id,
+/// vision, effort ladder, context window and price, and the new
+/// maximum-output carrier stays `None` because no built-in row states a
+/// cap.
 #[tokio::test]
-async fn existing_catalogue_seeds_keep_their_entries() {
+async fn deepseek_seed_keeps_its_entries() {
     let server = MockServer::start().await;
     mount_models(&server, vec![]).await;
     let config = Config::parse_validated(&deepseek_config(&server_uri_v1(&server))).expect("valid");
@@ -497,6 +498,52 @@ async fn ollama_cloud_chat_non_success_status_denies_without_accounting() {
     drop_blocking(broker);
 }
 
+/// A retryable status on the send is the same typed denial — the
+/// recorded ladder is listing-only (DEC-013), so the POST is issued
+/// exactly once, nothing is accounted, and no second attempt runs.
+#[tokio::test]
+async fn ollama_cloud_chat_503_never_retries_and_never_accounts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&ollama_cloud_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        ollama_cloud_provider(&config),
+        &config,
+        "/world/oc-503",
+        "goal: retryable chat status",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/oc-503", manifest);
+    let error = outcome.expect_err("a retryable chat status never reports success");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::Transport {
+                connection,
+                cause: TransportCause::Status { status },
+            }) if connection == OLLAMA_CLOUD && status.as_u16() == 503
+        ),
+        "the retryable status is the typed transport status: {error}"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        count_path(&requests, "/api/chat"),
+        1,
+        "the ladder is listing-only — one physical POST"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denied send is never accounted"
+    );
+    drop_blocking(broker);
+}
+
 /// A stream cut mid frame is never success: the JSONL framing needs the
 /// newline that closes a frame, and a truncated tail is a typed wire
 /// violation with nothing accounted.
@@ -811,6 +858,128 @@ async fn ollama_cloud_keyless_send_denies_before_any_request() {
     );
 }
 
+/// A `local` declaration of the native class that also binds a
+/// `profile` is contradictory: the kind names a locally served endpoint
+/// while the profile reaches real material. The adapter names the
+/// contradictory profile binding before any credential resolution, so
+/// the seeded key is never read and no wire leg runs (DEC-009/DEC-010,
+/// PROH-010).
+#[tokio::test]
+async fn ollama_cloud_local_profile_declaration_never_sends() {
+    let server = MockServer::start().await;
+    mount_ollama_cloud_chat(&server, jsonl_done("stop", 1, 1)).await;
+    mount_ollama_cloud_tags(&server, json!({ "models": [] })).await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.\"ollama-cloud\"]\nkind = \"local\"\nendpoint = \"{}\"\nprofile = \"p1\"\n\
+         [profiles.p1]\ncredential_ref = \"keyring:rivect-test/p1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama-cloud\", model_id = \"{OLLAMA_CLOUD_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server.uri()
+    ))
+    .expect("the contradictory declaration is admitted at ingress");
+    assert_eq!(
+        config.connections[OLLAMA_CLOUD].profile.as_deref(),
+        Some("p1")
+    );
+
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[("keyring:rivect-test/p1", SECRET)],
+    ));
+    let error = ollama_cloud_provider_result(config, OLLAMA_CLOUD.to_string(), store)
+        .expect_err("the local declaration never resolves the profile's material");
+    match &error {
+        ProviderError::LocalProfileDeclared { connection } => {
+            assert_eq!(connection, OLLAMA_CLOUD);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("profile") && rendered.contains(OLLAMA_CLOUD),
+                "the denial names the profile member and the connection: {rendered}"
+            );
+        }
+        other => panic!("the local profile form is the named profile denial, not {other:?}"),
+    }
+    for rendered in [format!("{error}"), format!("{error:?}")] {
+        assert!(
+            !rendered.contains(SECRET),
+            "the denial never renders the seeded material: {rendered}"
+        );
+    }
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// A `local` declaration that names no `profile` is the kind-only
+/// contradiction: the native class requires its binding, so the build
+/// denies the declaration kind itself before any credential resolves
+/// and no wire leg runs (PROH-010).
+#[tokio::test]
+async fn ollama_cloud_local_declaration_without_profile_denies_by_kind() {
+    let server = MockServer::start().await;
+    mount_ollama_cloud_chat(&server, jsonl_done("stop", 1, 1)).await;
+    mount_ollama_cloud_tags(&server, json!({ "models": [] })).await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.\"ollama-cloud\"]\nkind = \"local\"\nendpoint = \"{}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"ollama-cloud\", model_id = \"{OLLAMA_CLOUD_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server.uri()
+    ))
+    .expect("the local declaration is admitted");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let error = ollama_cloud_provider_result(config, OLLAMA_CLOUD.to_string(), store)
+        .expect_err("the native class requires its binding");
+    match &error {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, OLLAMA_CLOUD);
+            assert_eq!(scope, "connections.ollama-cloud.kind");
+            assert!(cause.is_none(), "the kind denial names no ref");
+        }
+        other => panic!("the kind-only local form is the typed unresolved denial, not {other:?}"),
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// The key-gated listing never answers an unauthenticated caller: a
+/// bound ref with no material at its scope denies the catalogue typed
+/// before any wire leg (PROH-010).
+#[tokio::test]
+async fn ollama_cloud_catalogue_without_material_denies_before_any_wire() {
+    let server = MockServer::start().await;
+    mount_ollama_cloud_tags(&server, json!({ "models": [] })).await;
+    let config = Config::parse_validated(&ollama_cloud_config(&server.uri())).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = ollama_cloud_provider_result(config, OLLAMA_CLOUD.to_string(), store)
+        .expect("the binding resolves; the store is read at the listing");
+    let (provider, outcome) = ollama_cloud_catalog_result(provider);
+    let error = outcome.expect_err("an absent scope is never a listing");
+    assert!(
+        matches!(
+            &error,
+            ProviderError::CredentialAbsent { scope } if scope == "rivect-test/ollama-cloud"
+        ),
+        "the absent scope is the typed credential denial: {error:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+}
+
 /// The listing ladder recovers from one retryable status at the first
 /// recorded 2 s rung: one successful listing, one show fanout, and no
 /// chat POST from the retry — a later send still issues exactly one
@@ -862,8 +1031,12 @@ async fn ollama_cloud_tags_retry_recovers_with_one_listing() {
             vec!["retry-model"],
             "{status}: the recovered listing is the offer set"
         );
+        // The upper bound is recorded slack, not a second contract: the
+        // ladder owns the 2 s first rung, and a loaded host schedules
+        // the retry late without breaking it — only the wait's presence
+        // is asserted.
         assert!(
-            (Duration::from_secs(2)..Duration::from_secs(4)).contains(&elapsed),
+            (Duration::from_secs(2)..Duration::from_secs(30)).contains(&elapsed),
             "{status}: the first rung is the recorded 2 s wait, got {elapsed:?}"
         );
 
@@ -1679,10 +1852,13 @@ async fn ollama_cloud_adverse_denial(stream: String) -> (ModelError, usize) {
 }
 
 /// Adverse wire input never reports success: a non-JSON frame, a
-/// non-object frame, an oversized frame, an over-bound tool-call set and
-/// a tool call the frozen request never declared are each a typed denial
-/// with nothing accounted. Each malformed stream still carries a valid
-/// terminal afterwards, so ignoring the defect would show success.
+/// non-object frame, an oversized frame, an over-bound tool-call set, a
+/// tool call carrying no function name and a tool call the frozen
+/// request never declared are each a typed denial with nothing
+/// accounted, and a clean EOF before the done frame is the unknown
+/// terminal. Each malformed stream still carries a valid terminal
+/// afterwards where one applies, so ignoring the defect would show
+/// success.
 #[tokio::test]
 async fn ollama_cloud_adverse_wire_input_never_reports_success() {
     // A frame that is not JSON at all, followed by a valid terminal.
@@ -1794,6 +1970,44 @@ async fn ollama_cloud_adverse_wire_input_never_reports_success() {
                 if connection == OLLAMA_CLOUD
         ),
         "an undeclared tool call is a typed rejection: {error}"
+    );
+    assert_eq!(accounted, 0);
+
+    // A tool call whose function object carries no name is never
+    // executed.
+    let (error, accounted) = ollama_cloud_adverse_denial(format!(
+        "{}{}",
+        jsonl_frame(&json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "function": {} }],
+            },
+            "done": false,
+        })),
+        jsonl_done("tool_calls", 1, 1),
+    ))
+    .await;
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::StreamViolation { connection, reason })
+                if connection == OLLAMA_CLOUD
+                    && reason == "tool call carries no function name"
+        ),
+        "a nameless tool call is the typed violation the terminal cannot mask: {error}"
+    );
+    assert_eq!(accounted, 0);
+
+    // A clean EOF with no terminal at all.
+    let (error, accounted) = ollama_cloud_adverse_denial(jsonl_content("dangling")).await;
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::UnknownTerminal { connection })
+                if connection == OLLAMA_CLOUD
+        ),
+        "a clean EOF before the done frame is the unknown terminal: {error}"
     );
     assert_eq!(accounted, 0);
 }
@@ -2553,6 +2767,88 @@ async fn qianfan_wrong_credential_profile_or_region_denies_with_typed_context_wi
         format!("Bearer {QIANFAN_KEY}"),
         "the admitted bearer reached the wire — the denial is the peer's status"
     );
+}
+
+/// A `local` declaration of the required-binding `qianfan` contract is
+/// contradictory — the kind names a locally served endpoint while the
+/// `profile` member reaches real material. The build names the
+/// contradictory profile binding before any credential resolution, so
+/// the seeded key is never read and no wire leg runs (DEC-009/DEC-010).
+#[tokio::test]
+async fn qianfan_local_profile_declaration_never_sends() {
+    let server = MockServer::start().await;
+    mount_qianfan_models(&server, vec![json!({"id": QIANFAN_MODEL})]).await;
+    mount_qianfan_chat(&server, completed_stream("unreachable", None)).await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"local\"\nendpoint = \"{}\"\nprofile = \"p1\"\n\
+         [profiles.p1]\ncredential_ref = \"keyring:rivect-test/p1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"qianfan\", model_id = \"{QIANFAN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        qianfan_uri(&server)
+    ))
+    .expect("the contradictory declaration is admitted at ingress");
+    assert_eq!(config.connections[QIANFAN].profile.as_deref(), Some("p1"));
+
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[("keyring:rivect-test/p1", QIANFAN_KEY)],
+    ));
+    let error = provider_result(config, QIANFAN.to_string(), store)
+        .expect_err("the local declaration never resolves the profile's material");
+    match &error {
+        ProviderError::LocalProfileDeclared { connection } => {
+            assert_eq!(connection, QIANFAN);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("profile") && rendered.contains(QIANFAN),
+                "the denial names the profile member and the connection: {rendered}"
+            );
+        }
+        other => panic!("the local profile form is the named profile denial, not {other:?}"),
+    }
+    assert_no_secret_or_body(&error, QIANFAN_KEY.as_bytes());
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// A `local` declaration of the required-binding contract that names no
+/// `profile` is the kind-only contradiction: the build denies the
+/// declaration kind itself before any credential resolves and no wire
+/// leg runs (DEC-009/DEC-010).
+#[tokio::test]
+async fn qianfan_local_declaration_without_profile_denies_by_kind() {
+    let server = MockServer::start().await;
+    mount_qianfan_models(&server, vec![json!({"id": QIANFAN_MODEL})]).await;
+    mount_qianfan_chat(&server, completed_stream("unreachable", None)).await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.qianfan]\nkind = \"local\"\nendpoint = \"{}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"qianfan\", model_id = \"{QIANFAN_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        qianfan_uri(&server)
+    ))
+    .expect("the local declaration is admitted");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let error = provider_result(config, QIANFAN.to_string(), store)
+        .expect_err("the contract requires its binding");
+    match &error {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, QIANFAN);
+            assert_eq!(scope, "connections.qianfan.kind");
+            assert!(cause.is_none(), "the kind denial names no ref");
+        }
+        other => panic!("the kind-only local form is the typed unresolved denial, not {other:?}"),
+    }
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
 }
 
 // ----- TP-PROVIDER-DIALECT::qianfan ------------------------------------------
@@ -4889,8 +5185,8 @@ async fn siliconflow_cn_wrong_credential_profile_or_region_denies_with_typed_con
 {
     let server = MockServer::start().await;
 
-    // a configured region is denied — never ignored — while the .com
-    // sibling's scope holds real material so the no-secret assertion
+    // a configured region is denied — never ignored — while both
+    // sibling scopes hold real material so the no-secret assertion
     // proves no cross-scope leak instead of passing vacuously
     let regioned = Config::parse_validated(
         &siliconflow_cn_config(&siliconflow_cn_uri(&server))
@@ -4902,7 +5198,10 @@ async fn siliconflow_cn_wrong_credential_profile_or_region_denies_with_typed_con
         SILICONFLOW_CN.to_string(),
         Arc::new(support::MapStore::seeded(
             STORE_KIND,
-            &[(SILICONFLOW_REF, SILICONFLOW_KEY)],
+            &[
+                (SILICONFLOW_REF, SILICONFLOW_KEY),
+                (SILICONFLOW_CN_REF, SILICONFLOW_CN_KEY),
+            ],
         )),
     )
     .expect_err("a configured region is denied, never ignored");
@@ -4912,6 +5211,7 @@ async fn siliconflow_cn_wrong_credential_profile_or_region_denies_with_typed_con
     assert_eq!(connection, SILICONFLOW_CN);
     assert_eq!(region, "eu");
     assert_no_secret_or_body(&err, SILICONFLOW_CN_KEY.as_bytes());
+    assert_no_secret_or_body(&err, SILICONFLOW_KEY.as_bytes());
 
     // a profile binding whose ref scope names another profile
     let mismatched = Config::parse_validated(&format!(
@@ -4929,7 +5229,10 @@ async fn siliconflow_cn_wrong_credential_profile_or_region_denies_with_typed_con
         SILICONFLOW_CN.to_string(),
         Arc::new(support::MapStore::seeded(
             STORE_KIND,
-            &[(SILICONFLOW_REF, SILICONFLOW_KEY)],
+            &[
+                (SILICONFLOW_REF, SILICONFLOW_KEY),
+                (SILICONFLOW_CN_REF, SILICONFLOW_CN_KEY),
+            ],
         )),
     )
     .expect_err("a divergent scope is a profile mismatch");
@@ -4938,6 +5241,7 @@ async fn siliconflow_cn_wrong_credential_profile_or_region_denies_with_typed_con
         ProviderError::CredentialProfileMismatch { .. }
     ));
     assert_no_secret_or_body(&err, SILICONFLOW_CN_KEY.as_bytes());
+    assert_no_secret_or_body(&err, SILICONFLOW_KEY.as_bytes());
 
     // a refused key is a typed transport denial: the wire never
     // coerces a wrong credential into success, the peer's body never

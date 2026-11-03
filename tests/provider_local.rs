@@ -879,6 +879,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::StoreUnavailable { .. }) => "StoreUnavailable",
         Some(ProviderError::StoreAmbiguous { .. }) => "StoreAmbiguous",
         Some(ProviderError::CredentialUnresolved { .. }) => "CredentialUnresolved",
+        Some(ProviderError::LocalProfileDeclared { .. }) => "LocalProfileDeclared",
         Some(ProviderError::CredentialProfileMismatch { .. }) => "CredentialProfileMismatch",
         Some(ProviderError::CredentialOutsideNamespace { .. }) => "CredentialOutsideNamespace",
         Some(ProviderError::CredentialOccupied { .. }) => "CredentialOccupied",
@@ -1723,6 +1724,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         StoreUnavailable,
         StoreAmbiguous,
         CredentialUnresolved,
+        LocalProfileDeclared,
         CredentialProfileMismatch,
         CredentialOutsideNamespace,
         CredentialOccupied,
@@ -1748,6 +1750,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::StoreUnavailable { .. } => ProviderVariant::StoreUnavailable,
             ProviderError::StoreAmbiguous { .. } => ProviderVariant::StoreAmbiguous,
             ProviderError::CredentialUnresolved { .. } => ProviderVariant::CredentialUnresolved,
+            ProviderError::LocalProfileDeclared { .. } => ProviderVariant::LocalProfileDeclared,
             ProviderError::CredentialProfileMismatch { .. } => {
                 ProviderVariant::CredentialProfileMismatch
             }
