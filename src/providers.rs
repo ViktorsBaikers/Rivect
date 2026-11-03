@@ -1160,9 +1160,10 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// recorded local Responses plug with the optional credential
 /// (DEC-009), `openrouter` its catalogue-only-keyless Responses
 /// plug behind the recorded paste-key form (DEC-003), `sakana` its
-/// key-gated authoritative Responses plug (DEC-004), and `xai-oauth`
-/// its authoritative-listing Responses plug carrying the
-/// device-code-produced token at the scoped seam; `google` speaks
+/// key-gated authoritative Responses plug (DEC-004), and `xai`/
+/// `xai-oauth` their authoritative-listing Responses plugs — the latter
+/// carrying the device-code-produced token at the scoped seam; `google`
+/// speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `ollama-cloud` its recorded native `ollama-chat` JSONL dialect
 /// (DEC-001), `custom-chat-completions` speaks the OpenAI-compatible
@@ -1222,6 +1223,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "ollama" => Some(Dialect::Responses),
         "openrouter" => Some(Dialect::Responses),
         "sakana" => Some(Dialect::Responses),
+        "xai" => Some(Dialect::Responses),
         "xai-oauth" => Some(Dialect::Responses),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),

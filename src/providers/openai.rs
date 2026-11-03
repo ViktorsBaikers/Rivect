@@ -1,15 +1,17 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
 //! the literal connection ids `openai`, `abliteration`, `meta`,
-//! `ollama`, `openrouter`, `sakana` and `xai-oauth` record this
+//! `ollama`, `openrouter`, `sakana`, `xai` and `xai-oauth` record this
 //! dialect. `ollama`
 //! is the local endpoint whose credential is optional (DEC-009) and
 //! whose catalogue carries a bounded native discovery overlay
 //! (DEC-012); `openrouter` rides the recorded paste-key form behind a
 //! catalogue-only keyless listing (DEC-003/DEC-010); `sakana` rides a
 //! key-gated authoritative listing whose in-source Fugu entries are
-//! mapping references, never offers (DEC-004); `xai-oauth` rides the
-//! authoritative xAI listing with the device-code-produced token
-//! resolved at the scoped credential seam. Dialect selection keys
+//! mapping references, never offers (DEC-004); `xai` and `xai-oauth`
+//! ride the authoritative xAI listing — the latter with the
+//! device-code-produced token resolved at the scoped credential seam,
+//! the former rejecting the listing's recorded negative effort residue.
+//! Dialect selection keys
 //! on the literal connection id, never an auth label or a catalogue
 //! answer, and `openai-codex` is a distinct literal id with its own
 //! recorded class. The adapter authors no async code — [`Provider::send`] is
@@ -69,6 +71,10 @@ const OPENROUTER_DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 /// resolves here, and a configured value otherwise wins after this
 /// adapter's trim.
 const SAKANA_DEFAULT_ENDPOINT: &str = "https://api.sakana.ai/v1";
+
+/// The recorded `xai` base: an empty configured endpoint resolves here,
+/// and a configured value otherwise wins after this adapter's trim.
+const XAI_DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 
 /// The recorded `xai-oauth` base: an empty configured endpoint resolves
 /// here, and a configured value otherwise wins after this adapter's
@@ -136,14 +142,16 @@ const META_MUSE_MODELS: &[&str] = &[
 /// How one listed `/models` entry becomes an offered
 /// [`CatalogModel`]: the id alone under the contract's filter, the
 /// entry's own tool-capable surfaces (`openrouter`, DEC-010), the
-/// recorded `sakana` listing rule (DEC-004), or the id-only
-/// `xai-oauth` listing whose selected-list floor is a residual — no
-/// vendored ids are retained, so the listing alone offers.
+/// recorded `sakana` listing rule (DEC-004), the id-only `xai` listing
+/// whose recorded negative effort residue bounds a pinned effort, or
+/// the id-only `xai-oauth` listing whose selected-list floor is a
+/// residual — no vendored ids are retained, so the listing alone offers.
 #[derive(Clone, Copy)]
 enum EntryRule {
     IdsOnly,
     OpenRouterTools,
     Sakana,
+    Xai,
     XaiOAuth,
 }
 
@@ -168,7 +176,9 @@ struct SourceContract {
     authoritative_models: bool,
     /// The per-id catalogue entry rule: `IdsOnly` offers the entry's
     /// id under `authoritative_models`/`seed`; `OpenRouterTools` offers
-    /// only a tool-capable entry with its declared surfaces mapped.
+    /// only a tool-capable entry with its declared surfaces mapped;
+    /// `Xai` shares that id-only offer under its recorded effort
+    /// suppression, and `XaiOAuth` under its selected-list residual.
     entry: EntryRule,
     /// `true` — the request asks for the `reasoning.encrypted_content`
     /// artifact the replay contract carries (SRC-019/D-006); `false`
@@ -233,6 +243,15 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::Sakana,
             reasoning_artifact: false,
         }),
+        // The xAI listing is authoritative and carries no vendored
+        // floor; its recorded negative effort residue bounds a pinned
+        // effort, and the contract states no replay artifact for the id.
+        "xai" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::Xai,
+            reasoning_artifact: false,
+        }),
         // The xAI OAuth listing is authoritative and no vendored
         // selected list is retained, so the listing alone offers and
         // the recorded contract states no replay artifact for the id.
@@ -250,8 +269,8 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// trimmed of surrounding whitespace and of every trailing slash —
 /// this adapter's own normalization, not a rule the other adapters
 /// share — and the empty result resolves the recorded base on `ollama`,
-/// `openrouter`, `sakana` and `xai-oauth` alone. Every other id keeps
-/// the trimmed value verbatim; no id's base is ever inferred.
+/// `openrouter`, `sakana`, `xai` and `xai-oauth` alone. Every other id
+/// keeps the trimmed value verbatim; no id's base is ever inferred.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
     if configured.is_empty() {
@@ -259,6 +278,7 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
             "ollama" => OLLAMA_DEFAULT_ENDPOINT.to_string(),
             "openrouter" => OPENROUTER_DEFAULT_ENDPOINT.to_string(),
             "sakana" => SAKANA_DEFAULT_ENDPOINT.to_string(),
+            "xai" => XAI_DEFAULT_ENDPOINT.to_string(),
             "xai-oauth" => XAI_OAUTH_DEFAULT_ENDPOINT.to_string(),
             _ => configured.to_string(),
         }
@@ -505,10 +525,10 @@ impl OpenAiProvider {
     /// `openrouter` offers only the listing's tool-capable entries with
     /// their recorded surfaces mapped (DEC-010), and `sakana` offers the
     /// authoritative listing's entries with the recorded Fugu mapping
-    /// (DEC-004), and `xai-oauth` offers the authoritative xAI listing
-    /// as id-only entries with no vendored selected-list floor — each id
-    /// carrying the shared [`CatalogModel`], returned in deterministic
-    /// sorted order.
+    /// (DEC-004), and `xai`/`xai-oauth` offer the authoritative xAI
+    /// listing as id-only entries with no vendored selected-list floor —
+    /// each id carrying the shared [`CatalogModel`], returned in
+    /// deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -572,9 +592,9 @@ impl OpenAiProvider {
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
         // while `abliteration`, `meta`, `ollama`, `openrouter`,
-        // `sakana` and `xai-oauth` treat the listing as authoritative:
-        // every offered entry answers, and a seed the arm carries merges
-        // on top as the offer floor.
+        // `sakana`, `xai` and `xai-oauth` treat the listing as
+        // authoritative: every offered entry answers, and a seed the
+        // arm carries merges on top as the offer floor.
         let mut models: Vec<CatalogModel> = data
             .iter()
             .filter_map(|entry| self.catalog_entry(entry))
@@ -597,14 +617,14 @@ impl OpenAiProvider {
     /// `supported_parameters` declares `tools` and maps that entry's own
     /// surfaces (DEC-010); `EntryRule::Sakana` maps the recorded listing
     /// rule (DEC-004); `EntryRule::IdsOnly` offers the id alone under the
-    /// contract's filter; `EntryRule::XaiOAuth` shares that id-only offer
-    /// under its authoritative listing, since no vendored selected list
-    /// is retained.
+    /// contract's filter; `EntryRule::Xai` and `EntryRule::XaiOAuth` share
+    /// that id-only offer under their authoritative listings, since no
+    /// vendored selected list is retained.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         match self.contract.entry {
             EntryRule::OpenRouterTools => openrouter_model(entry),
             EntryRule::Sakana => sakana_model(entry),
-            EntryRule::IdsOnly | EntryRule::XaiOAuth => {
+            EntryRule::IdsOnly | EntryRule::Xai | EntryRule::XaiOAuth => {
                 let id = entry.get("id").and_then(Value::as_str)?;
                 let offered = if self.contract.authoritative_models {
                     !id.is_empty()
@@ -645,6 +665,29 @@ impl OpenAiProvider {
             });
         }
         Ok(Some(token.to_string()))
+    }
+
+    /// The recorded xAI negative effort suppression (HZN-008): the
+    /// listing's residue ids reject the `reasoning.effort` dial, so a
+    /// pinned effort on one denies typed before the body exists. The
+    /// positive effort ladder is a residual, so an id outside the
+    /// residue keeps the pin.
+    fn check_effort(
+        &self,
+        manifest: &RequestManifest,
+        model_id: &str,
+    ) -> Result<(), ProviderError> {
+        if !matches!(self.contract.entry, EntryRule::Xai)
+            || !matches!(&manifest.effort, EffortAssign::Fixed { .. })
+            || !xai_suppresses_effort(model_id)
+        {
+            return Ok(());
+        }
+        Err(ProviderError::UnsupportedParameter {
+            connection: self.connection.clone(),
+            parameter: "reasoning_effort",
+            model: model_id.to_string(),
+        })
     }
 
     /// The bounded native discovery overlay (DEC-012): the configured
@@ -1267,6 +1310,17 @@ fn positive_tokens(value: &Value) -> Option<u64> {
     value.as_u64().filter(|tokens| *tokens > 0)
 }
 
+/// The recorded xAI effort residue (HZN-008): the listing's
+/// `*reasoning`, `grok-build*`, `grok-code-fast*` and `*composer*` ids
+/// reject the `reasoning.effort` dial. Every other id keeps the pin —
+/// the recorded positive ladder is a residual, never an allowlist.
+fn xai_suppresses_effort(model_id: &str) -> bool {
+    model_id.ends_with("reasoning")
+        || model_id.starts_with("grok-build")
+        || model_id.starts_with("grok-code-fast")
+        || model_id.contains("composer")
+}
+
 /// The recorded `openrouter` paste-key grammar (DEC-003): `sk-or-`,
 /// then one or more base characters. Another product's `sk-…` token, a
 /// JSON blob or empty material is not the recorded paste form.
@@ -1425,7 +1479,8 @@ impl Provider for OpenAiProvider {
     /// fixed model id and no single-member auto pool naming this
     /// connection, [`ProviderError::DialectMismatch`] when the pin
     /// names a different connection, the credential seam's typed
-    /// denials, [`ProviderError::Transport`],
+    /// denials, [`ProviderError::UnsupportedParameter`] for a pinned
+    /// effort the xAI residue suppresses, [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
     /// [`ProviderError::StreamViolation`] — including a serialized
@@ -1497,6 +1552,9 @@ impl Provider for OpenAiProvider {
                 connection: fixed.connection,
             });
         }
+        // The recorded xAI residue rejects the effort dial: the denial
+        // lands before the body exists, never a silently dropped pin.
+        self.check_effort(manifest, &fixed.model_id)?;
         let body = self.request_body(manifest, &fixed);
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
@@ -1529,10 +1587,10 @@ mod tests {
 
     /// DEC-011's endpoint rule: the configured base is trimmed and
     /// loses every trailing slash, and the empty result resolves the
-    /// recorded base on `ollama`, `openrouter`, `sakana` and
+    /// recorded base on `ollama`, `openrouter`, `sakana`, `xai` and
     /// `xai-oauth` alone — a sibling id keeps its own (absent) value
-    /// and never borrows another's host. The `ollama`, `sakana` and
-    /// `xai-oauth` defaults are pinned as literals, not only through
+    /// and never borrows another's host. The `ollama`, `sakana`, `xai`
+    /// and `xai-oauth` defaults are pinned as literals, not only through
     /// the consts they resolve.
     #[test]
     fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
@@ -1553,6 +1611,12 @@ mod tests {
         assert_eq!(
             endpoint_for("sakana", " https://api.sakana.ai/v1/ "),
             "https://api.sakana.ai/v1"
+        );
+        assert_eq!(endpoint_for("xai", ""), "https://api.x.ai/v1");
+        assert_eq!(endpoint_for("xai", " / "), XAI_DEFAULT_ENDPOINT);
+        assert_eq!(
+            endpoint_for("xai", " https://api.x.ai/v1/// "),
+            "https://api.x.ai/v1"
         );
         assert_eq!(endpoint_for("xai-oauth", ""), "https://api.x.ai/v1");
         assert_eq!(endpoint_for("xai-oauth", " / "), XAI_OAUTH_DEFAULT_ENDPOINT);
@@ -1577,6 +1641,35 @@ mod tests {
             endpoint_for("openai", " https://api.openai.com/v1/ "),
             "https://api.openai.com/v1"
         );
+    }
+
+    /// The xAI effort residue is the recorded negative list alone: the
+    /// suffix/prefix/contains classes suppress, and an id outside them
+    /// keeps the pin — the positive ladder stays a residual.
+    #[test]
+    fn xai_effort_suppression_is_the_recorded_negative_residue() {
+        for suppressed in [
+            "grok-4.20-0309-reasoning",
+            "grok-build-0.1",
+            "grok-code-fast-1",
+            "grok-composer-2.5-fast",
+        ] {
+            assert!(
+                xai_suppresses_effort(suppressed),
+                "{suppressed} is in the suppression residue"
+            );
+        }
+        for admitted in [
+            "grok-4.3",
+            "grok-4.6",
+            "grok-3-mini",
+            "grok-4.20-multi-agent-0309",
+        ] {
+            assert!(
+                !xai_suppresses_effort(admitted),
+                "{admitted} is outside the suppression residue"
+            );
+        }
     }
 
     /// DEC-012's fanout bound: a phase probes the listing's leading 32
