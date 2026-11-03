@@ -6,7 +6,7 @@
 //! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow`,
 //! `siliconflow-cn`, `synthetic`, `together`, `venice`, `vllm`,
 //! `wafer-serverless`, `xiaomi`, `xiaomi-token-plan-ams`,
-//! `xiaomi-token-plan-cn` and `xiaomi-token-plan-sgp`
+//! `xiaomi-token-plan-cn`, `xiaomi-token-plan-sgp` and `yolo-auto`
 //! connections' adapter —
 //! the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
@@ -270,7 +270,21 @@
 //! the PAYG base or the AMS/CN token-plan regions, selected by the
 //! configured endpoint alone (PROH-010) — under the same ids-only
 //! listing and plain bearer, with the recorded family ladder staying
-//! recorded knowledge rather than a runtime probe.
+//! recorded knowledge rather than a runtime probe. The
+//! configured-or-recorded `https://yolo-auto.com/v1` base of
+//! `yolo-auto` carries the authoritative flat-rate `/models` listing:
+//! every offered id states USD zero per million — a real figure, never
+//! [`ModelPrice::Unknown`] and never a borrowed sibling price — because
+//! the rate is provider-wide, with the api key riding the plain
+//! bearer. The bundled seed/reference index that would add per-id
+//! reasoning or window metadata has no vendored carrier (residual), so
+//! a listed id carries no mark beyond its id; the recorded no-store and
+//! `developer`-role refusals and the qwen3.8-versus-pinned-seed
+//! divergence stay residuals with no manifest carrier. The effort
+//! dial's `low`/`high` wire values ride verbatim; the recorded remap
+//! (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) has no manifest
+//! carrier, so those pins deny typed rather than sending an unrecorded
+//! wire value.
 //! The adapter authors no async code — [`Provider::send`] is a blocking
 //! single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -1136,6 +1150,24 @@ const XIAOMI_TOKEN_PLAN_CN_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.co
 /// region selector, so a configured `region` denies typed.
 const XIAOMI_TOKEN_PLAN_SGP_BASE_URL: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
 
+/// The recorded default API root of a `yolo-auto` connection
+/// (`YOLO_AUTO_BASE_URL`): the host the required `endpoint` field's
+/// empty string resolves under. The flat rate is provider-wide — every
+/// offered id states USD zero per million — so no per-entry price or
+/// seed row is borrowed from another id, and a configured `region`
+/// denies typed because the contract names none.
+const YOLO_AUTO_BASE_URL: &str = "https://yolo-auto.com/v1";
+
+/// The recorded `yolo-auto` effort wire dial: the provider-wide
+/// `effortMap` sends `low`/`high`/`max`, so only the levels that map
+/// leaves unchanged can ride `reasoning_effort` verbatim. `minimal`,
+/// `medium` and `xhigh` are remapped upstream (`minimal`→`low`,
+/// `medium`→`high`, `xhigh`→`max`) — a remap with no manifest carrier
+/// — so a pin carrying one denies typed rather than sending an
+/// unrecorded wire value; the recorded `max` level has no landing in
+/// our enum.
+const YOLO_AUTO_EFFORTS: &[EffortLevel] = &[EffortLevel::Low, EffortLevel::High];
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1496,6 +1528,20 @@ enum EntryRule {
     /// residuals. The listing states no `reasoning_effort` surface, so
     /// a pinned effort denies typed rather than being dropped.
     Wafer,
+    /// The `yolo-auto` transform: the authoritative `/models` listing
+    /// supplies the offer set and the provider-wide flat rate states
+    /// USD zero per million for every offered id — a stated zero, never
+    /// [`ModelPrice::Unknown`] and never a borrowed sibling price. The
+    /// bundled reference/seed index that would add reasoning or window
+    /// metadata has no vendored carrier here (residual), so an offered
+    /// id carries no other mark; the recorded no-store and
+    /// `developer`-role refusals have no manifest carrier either and
+    /// are never constructed as body fields. The recorded
+    /// `reasoning_effort` dial rides only the levels the effort remap
+    /// leaves unchanged — [`ChatCompletionsProvider::check_parameters`]
+    /// denies the remapped ones typed rather than sending an
+    /// unrecorded wire value.
+    YoloAuto,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -2226,6 +2272,24 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
+        // `yolo-auto` (HZN-008 class B — the flat-rate api-key cell):
+        // the configured-or-recorded `https://yolo-auto.com/v1` base,
+        // whose `/models` answer is authoritative — the bundled seed
+        // and reference index have no vendored carrier here, and the
+        // recorded qwen3.8-versus-pinned-seed divergence stays a
+        // residual — and whose provider-wide flat rate states USD zero
+        // for every offered id, the api key riding the plain bearer.
+        // The recorded no-store and `developer`-role refusals and the
+        // effort remap have no manifest carrier (residuals), so no such
+        // body field is invented. A configured `region` denies: the
+        // contract names none.
+        "yolo-auto" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(YOLO_AUTO_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::YoloAuto,
+        }),
         _ => None,
     }
 }
@@ -2921,6 +2985,7 @@ impl ChatCompletionsProvider {
                 EntryRule::DeepSeek => deepseek_entry(id),
                 EntryRule::Fireworks => fireworks_entry(id),
                 EntryRule::Groq => Some(groq_entry(id)),
+                EntryRule::YoloAuto => Some(yolo_auto_entry(id)),
                 EntryRule::IdsOnly
                 | EntryRule::GenericMetadata
                 | EntryRule::Aiand
@@ -3212,6 +3277,10 @@ impl ChatCompletionsProvider {
             // The recorded wafer envelope maps only the fields each
             // entry states; absent surfaces stay empty or unknown.
             EntryRule::Wafer => Some(wafer_entry(id, entry)),
+            // The recorded flat-rate transform: the authoritative
+            // listing supplies the offer set and every entry states the
+            // provider-wide USD zero, never a borrowed or unknown price.
+            EntryRule::YoloAuto => Some(yolo_auto_entry(id)),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -3504,7 +3573,7 @@ impl ChatCompletionsProvider {
     /// transform — `IdsOnly`, `GenericMetadata`, `Aiand`, `Aimlapi`,
     /// `AlibabaTokenPlan`, `DeepSeek`, `Groq`, `HuggingFace`,
     /// `LiteLlm`, `Moonshot`, `NanoGpt`, `Novita`, `SiliconFlow`,
-    /// `Synthetic` and `Vllm` —
+    /// `Synthetic`, `Vllm`, `Wafer` and `YoloAuto` —
     /// sends the offered id unchanged. Each variant is listed so a
     /// future transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -3527,7 +3596,8 @@ impl ChatCompletionsProvider {
             | EntryRule::SiliconFlow
             | EntryRule::Synthetic
             | EntryRule::Vllm
-            | EntryRule::Wafer => model_id.to_string(),
+            | EntryRule::Wafer
+            | EntryRule::YoloAuto => model_id.to_string(),
         }
     }
 
@@ -3608,19 +3678,33 @@ impl ChatCompletionsProvider {
     /// constructed by this adapter, so none can be dropped. `vllm`
     /// records no effort ladder either: the listing that could state
     /// the chat-template surface is not visible at the send seam, so
-    /// every pinned level denies typed.
+    /// every pinned level denies typed. `yolo-auto` records its dial
+    /// provider-wide rather than per model: only the levels the
+    /// recorded effort remap leaves unchanged ride verbatim, and a
+    /// remapped level — whose wire value the remap would produce —
+    /// denies typed because that remap has no manifest carrier.
     fn check_parameters(
         &self,
         manifest: &RequestManifest,
         model_id: &str,
     ) -> Result<(), ProviderError> {
-        let ladder = match self.contract.entries {
-            EntryRule::Groq => GROQ_EFFORTS,
-            EntryRule::Moonshot => MOONSHOT_EFFORTS,
+        let EffortAssign::Fixed { value } = &manifest.effort else {
+            return Ok(());
+        };
+        let records = |ladder: &[(&str, &[EffortLevel])]| {
+            ladder
+                .iter()
+                .any(|(model, levels)| *model == model_id && levels.contains(value))
+        };
+        let recorded = match self.contract.entries {
+            // The recorded dial is provider-wide, not per model.
+            EntryRule::YoloAuto => YOLO_AUTO_EFFORTS.contains(value),
+            EntryRule::Groq => records(GROQ_EFFORTS),
+            EntryRule::Moonshot => records(MOONSHOT_EFFORTS),
             // The listing that could state the effort surface is not
             // visible at the send seam, so no level is recorded: every
             // pinned effort denies typed rather than being dropped.
-            EntryRule::Vllm | EntryRule::Wafer => &[],
+            EntryRule::Vllm | EntryRule::Wafer => false,
             EntryRule::IdsOnly
             | EntryRule::GenericMetadata
             | EntryRule::Aiand
@@ -3637,12 +3721,6 @@ impl ChatCompletionsProvider {
             | EntryRule::SiliconFlow
             | EntryRule::Synthetic => return Ok(()),
         };
-        let EffortAssign::Fixed { value } = &manifest.effort else {
-            return Ok(());
-        };
-        let recorded = ladder
-            .iter()
-            .any(|(model, levels)| *model == model_id && levels.contains(value));
         if recorded {
             return Ok(());
         }
@@ -4329,6 +4407,26 @@ fn vllm_qwen_reasoning(id: &str) -> bool {
         rest = version;
     }
     false
+}
+
+/// The recorded `yolo-auto` listing transform: the authoritative
+/// `/models` answer supplies the offer set, and the provider-wide flat
+/// rate states USD zero per million for every offered id — a stated
+/// zero, never [`ModelPrice::Unknown`] and never a figure borrowed
+/// from another id's row. The bundled reference index that would add a
+/// per-id reasoning mark, window or effort surface has no vendored
+/// carrier here (residual), so an offered id carries its id alone; the
+/// recorded no-store and `developer`-role refusals are body compat the
+/// manifest cannot carry and this adapter never constructs.
+fn yolo_auto_entry(id: &str) -> CatalogModel {
+    CatalogModel {
+        id: id.to_string(),
+        price: ModelPrice::Usd {
+            input_per_1m: 0.0,
+            output_per_1m: 0.0,
+        },
+        ..CatalogModel::default()
+    }
 }
 
 /// The recorded `wafer-serverless` listing transform: the entry's nested

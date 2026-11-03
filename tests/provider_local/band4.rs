@@ -6711,3 +6711,1110 @@ async fn xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs()
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::xiaomi-token-plan-sgp = NOT_RUN"]
 fn provider_installed_xiaomi_token_plan_sgp() {}
+
+// ----- yolo-auto -------------------------------------------------------------
+
+// The `yolo-auto` connection's proof legs (HZN-008 class B — the flat-rate
+// api-key cell): the shared Chat Completions adapter serves the literal id
+// under its own recorded predicates. The configured `endpoint` carries the
+// API base verbatim and an empty one resolves the recorded
+// `https://yolo-auto.com/v1` default; a configured `region` is denied because
+// the contract names none. The authoritative `/models` listing is the whole
+// catalogue — the bundled seed/reference index and the recorded
+// qwen3.8-versus-pinned-seed divergence have no vendored carrier here — and
+// every offered id states the provider-wide flat rate
+// (`ModelPrice::Usd{0.0,0.0}`), never a borrowed or unknown price. The
+// recorded no-store and `developer`-role refusals are never fabricated as
+// body fields, and the effort dial's `low`/`high` wire values ride verbatim
+// while the remapped `minimal`/`medium`/`xhigh` levels deny typed.
+
+/// The literal connection id this class serves.
+const YOLO: &str = "yolo-auto";
+
+/// The scoped credential ref the fixture connection binds.
+const YOLO_REF: &str = "keyring:rivect-test/yolo-auto";
+
+/// Fixture api-key material — never a real credential, only ever sent to
+/// localhost.
+const YOLO_KEY: &str = "fixture-yolo-auto-api-key";
+
+/// The pinned model id the fixed-pin legs carry — the current listed id,
+/// not the retained record's pinned seed.
+const YOLO_MODEL: &str = "qwen3.8-27b";
+
+/// One configured `yolo-auto` connection pointing at the fixture peer: the
+/// api_key class resolves its scoped ref, the dialect comes from the literal
+/// connection id, and auto effort exercises no pinned dial on the wire.
+fn yolo_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.yolo-auto]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{YOLO_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"yolo-auto\", model_id = \"{YOLO_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The adapter over an explicit store — the seam the recovery leg enrolls
+/// into after its typed denial.
+fn yolo_provider_with(
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let provider = provider_result(config.clone(), YOLO.to_string(), store.clone())
+        .expect("the shared adapter builds for the yolo-auto id");
+    (provider, store)
+}
+
+/// The adapter over a store seeded with the recorded api key.
+fn yolo_provider(
+    config: &Config,
+    material: Option<&str>,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = match material {
+        None => Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        Some(material) => Arc::new(support::MapStore::seeded(STORE_KIND, &[(YOLO_REF, material)])),
+    };
+    yolo_provider_with(config, store)
+}
+
+// ----- TP-PROVIDER-WIRE::yolo-auto -------------------------------------------
+
+/// A configured `yolo-auto` connection returns a verified model outcome
+/// through the standard Broker: the api-key pin prepares offline, the adapter
+/// posts exactly the frozen manifest as a `chat/completions` request — model
+/// id verbatim, system+user messages, `stream` with the shared
+/// `stream_options.include_usage` member, auto effort emitting no
+/// `reasoning_effort` — under the resolved bearer, and carries neither the
+/// `store` member nor a `developer` role the recorded class refuses; the SSE
+/// stream validates its terminal, and the one physical send is charged once
+/// with the reported usage.
+#[tokio::test]
+async fn yolo_auto_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified yolo outcome",
+            Some(json!({"prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+    assert_eq!(
+        config.connections[YOLO].credential_ref.as_deref(),
+        Some(YOLO_REF),
+        "the recorded api-key class binds its scoped ref"
+    );
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&config, Some(YOLO_KEY)),
+        &config,
+        "/world/yolo",
+        "goal: prove the wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified yolo outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {YOLO_KEY}"),
+        "the resolved api key bears the wire"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], YOLO_MODEL);
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the shared Chat Completions body asks for the usage report"
+    );
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+    assert!(
+        body.get("store").is_none(),
+        "the recorded no-store refusal is honoured by never constructing the member"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains("\"developer\""),
+        "the recorded developer-role refusal is honoured by never constructing the role"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, YOLO);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 8,
+            completion_tokens: 5,
+            total_tokens: 13,
+        }
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::yolo-auto ----------------------------------------
+
+/// The configured base's `/models` listing is the whole catalogue: the listed
+/// ids and only them are offered — no seed floor stands in for the retained
+/// record's pinned seed, so an empty answer offers nothing — and every offered
+/// id states the provider-wide flat rate (`ModelPrice::Usd{0.0,0.0}`) even
+/// when the wire entry states a nonzero pricing object, with no reasoning,
+/// vision, window or effort mark borrowed from another class.
+#[tokio::test]
+async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing() {
+    let server = MockServer::start().await;
+    mount_models(
+        &server,
+        vec![
+            json!({
+                "id": YOLO_MODEL,
+                "pricing": {"prompt": "0.001", "completion": "0.002"},
+            }),
+            json!({"id": "deepseek-flash-v4"}),
+            json!({"id": "served-by-another-class"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = yolo_provider(&config, Some(YOLO_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative listing answers");
+    let mut offered = model_ids(&models);
+    offered.sort_unstable();
+    assert_eq!(
+        offered,
+        vec!["deepseek-flash-v4", YOLO_MODEL, "served-by-another-class"],
+        "the listing's own ids are the whole offer set — no seed floor"
+    );
+    let flat_rate = ModelPrice::Usd {
+        input_per_1m: 0.0,
+        output_per_1m: 0.0,
+    };
+    for model in &models {
+        assert_eq!(
+            model.price, flat_rate,
+            "every offered id states the flat rate, never a wire or borrowed price: {}",
+            model.id
+        );
+        assert!(
+            !model.reasoning,
+            "no reasoning mark is invented: {}",
+            model.id
+        );
+        assert!(!model.vision, "no image mark is invented: {}", model.id);
+        assert_eq!(
+            model.context_window, None,
+            "the retained seed's window is never borrowed: {}",
+            model.id
+        );
+        assert!(
+            model.efforts.is_empty(),
+            "no effort dial is invented: {}",
+            model.id
+        );
+    }
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1, "the listing is the one catalogue leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {YOLO_KEY}"),
+        "the required api-key class lists under the resolved bearer"
+    );
+
+    // the authoritative listing stands alone: an empty answer offers nothing
+    let empty_server = MockServer::start().await;
+    mount_models(&empty_server, vec![]).await;
+    let empty_config =
+        Config::parse_validated(&yolo_config(&server_uri_v1(&empty_server))).expect("valid");
+    let (provider, _store) = yolo_provider(&empty_config, Some(YOLO_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("the empty listing answers").len(),
+        0,
+        "no vendored seed floor stands in for the listed ids"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-RECOVERY::yolo-auto (effort gate) -------------------------
+
+/// The recorded effort dial is the provider-wide `effortMap`: the identity
+/// wire values (`low`/`high`) ride `reasoning_effort` verbatim, while a
+/// remapped level (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) has no
+/// manifest carrier and denies typed before the body or any wire leg — never
+/// a silently dropped or invented wire value.
+#[tokio::test]
+async fn yolo_auto_pinned_effort_outside_the_recorded_dial_denies() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "identity effort",
+            Some(json!({"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4})),
+        ),
+    )
+    .await;
+
+    // the identity-mapped level rides the body verbatim
+    let config = Config::parse_validated(
+        &yolo_config(&server_uri_v1(&server)).replace(
+            "effort = { mode = \"auto\" }",
+            "effort = { mode = \"fixed\", value = \"high\" }",
+        ),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&config, Some(YOLO_KEY)),
+        &config,
+        "/world/yolo",
+        "goal: identity effort",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest);
+    assert!(
+        matches!(&outcome, Ok(reply) if reply.text == "identity effort"),
+        "the recorded wire value is admissible: {outcome:?}"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "the admissible pin is one physical request");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("high"),
+        "the identity-mapped level rides verbatim"
+    );
+    drop_blocking(broker);
+
+    // a remapped level denies before the body exists
+    let denied = Config::parse_validated(
+        &yolo_config(&server_uri_v1(&server)).replace(
+            "effort = { mode = \"auto\" }",
+            "effort = { mode = \"fixed\", value = \"xhigh\" }",
+        ),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&denied, Some(YOLO_KEY)),
+        &denied,
+        "/world/yolo",
+        "goal: remapped effort",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest);
+    let err = match outcome {
+        Err(ModelError::Provider(err)) => err,
+        other => panic!("the remapped pin is a typed denial, not a reply: {other:?}"),
+    };
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = &err
+    else {
+        panic!("the remapped pin is the typed unsupported parameter: {err:?}")
+    };
+    assert_eq!(connection, YOLO);
+    assert_eq!(*parameter, "reasoning_effort");
+    assert_eq!(model, YOLO_MODEL);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected parameter charges nothing"
+    );
+    drop_blocking(broker);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the denial lands before any further wire leg"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::yolo-auto -------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `yolo-auto`: a configured `region` — the recorded contract names none —
+/// denies `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, an unseeded binding denies `CredentialAbsent`
+/// before any wire leg, and a refused key lands the typed transport denial
+/// carrying the peer's status alone — no error, nor the offered credential
+/// material or the peer's body, reaches Display or Debug.
+#[tokio::test]
+async fn yolo_auto_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling scope
+    // holds real material so the no-secret assertion proves no cross-scope
+    // leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &yolo_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        YOLO.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, YOLO_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, YOLO);
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, YOLO_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.yolo-auto]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"yolo-auto\", model_id = \"{YOLO_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        YOLO.to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, YOLO_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, YOLO_KEY.as_bytes());
+
+    // an unresolvable binding denies before opening a chat leg
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = yolo_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    let err = denied.expect_err("an unseeded binding denies typed");
+    assert!(
+        matches!(err, ProviderError::CredentialAbsent { .. }),
+        "the absent api key is the typed denial: {err}"
+    );
+    assert_no_secret_or_body(&err, YOLO_KEY.as_bytes());
+    drop_blocking(provider);
+    assert!(
+        server.received_requests().await.expect("recorded").is_empty(),
+        "the three denied legs opened no wire leg"
+    );
+
+    // a refused key is a typed transport denial: the wire never coerces a
+    // wrong credential into success, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = yolo_provider(&config, Some(YOLO_KEY));
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, YOLO);
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, YOLO_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {YOLO_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::yolo-auto ---------------------------------------
+
+/// Hostile stream input never reports success for `yolo-auto`: a stream ended
+/// mid `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are each the unknown terminal,
+/// and a rejected send charges nothing.
+#[tokio::test]
+async fn yolo_auto_rejects_partial_tool_block_and_unknown_terminal() {
+    // a complete content delta plus an unterminated tool-call fragment,
+    // then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&config, Some(YOLO_KEY)),
+        &config,
+        "/world/yolo",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&config, Some(YOLO_KEY)),
+        &config,
+        "/world/yolo",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-DIALECT::yolo-auto ----------------------------------------
+
+/// The dialect is keyed on the literal connection id: the map routes
+/// `yolo-auto` to the shared Chat Completions dialect, an empty endpoint
+/// resolves its own `https://yolo-auto.com/v1` base — never a sibling class's
+/// default — a configured base stays verbatim, and loopback never serves the
+/// reserved id.
+#[test]
+fn yolo_auto_discriminates_the_recorded_default_base() {
+    assert_eq!(
+        rivect::providers::dialect_for(YOLO),
+        Some(rivect::providers::Dialect::ChatCompletions)
+    );
+
+    // the required endpoint's empty string resolves the recorded base —
+    // proved on the adapter's `Debug` surface, no byte toward the host
+    let config = Config::parse_validated(&yolo_config("")).expect("the fixture config is valid");
+    let provider = provider_result(
+        config,
+        YOLO.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the yolo-auto id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://yolo-auto.com/v1\""),
+        "an empty endpoint resolves the recorded yolo base: {debug}"
+    );
+    for foreign in ["api.venice.ai", "xiaomimimo", "wafer.ai", "127.0.0.1"] {
+        assert!(
+            !debug.contains(foreign),
+            "yolo-auto never borrows another class or sibling base ({foreign}): {debug}"
+        );
+    }
+    drop_blocking(provider);
+
+    // a configured base wins verbatim, trailing slashes trimmed
+    let configured =
+        Config::parse_validated(&yolo_config("https://gateway.example.test/yolo/v1/"))
+            .expect("the trailing-slash config is valid");
+    let provider = provider_result(
+        configured,
+        YOLO.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the yolo-auto id");
+    assert!(
+        format!("{provider:?}").contains("endpoint: \"https://gateway.example.test/yolo/v1\""),
+        "the configured base is normalized, not replaced"
+    );
+    drop_blocking(provider);
+
+    // loopback never serves the reserved id, and the required-binding
+    // contract denies the credential-free kind
+    let local = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.yolo-auto]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"yolo-auto\", model_id = \"{YOLO_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the local declaration is admitted");
+    let entry = local.connections.get(YOLO).expect("declared");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    assert!(
+        !loopback.serves(YOLO, entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+    let err = provider_result(
+        local,
+        YOLO.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a local declaration cannot satisfy the required binding");
+    assert!(
+        matches!(err, ProviderError::CredentialUnresolved { .. }),
+        "the kind denial is typed: {err}"
+    );
+}
+
+// ----- TP-PROVIDER-MATRIX::yolo-auto -----------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `yolo-auto`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this run,
+/// and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn yolo_auto_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": YOLO_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&yolo_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative listing under the flat-rate transform — a
+    // stated `context_length` maps nothing for this class.
+    let (provider, _store) = yolo_provider(&config, Some(YOLO_KEY));
+    let (provider, catalog) = catalog_on_thread(provider);
+    reported.insert(
+        "CATALOG",
+        if matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == YOLO_MODEL
+                && model.context_window.is_none()
+                && model.price
+                    == ModelPrice::Usd {
+                        input_per_1m: 0.0,
+                        output_per_1m: 0.0,
+                    })
+        ) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: a bound ref with no store material denies typed.
+    let (provider, _store) = yolo_provider(&config, None);
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        yolo_provider(&config, Some(YOLO_KEY)),
+        &config,
+        "/world/yolo",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/yolo", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry through
+    // the same credential seam.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let (broker, manifest) = prepared_with(
+        yolo_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/yolo",
+        "goal: matrix recovery",
+    );
+    let (broker, denied) = dispatch(broker, "/world/yolo", manifest);
+    let denied_ok = matches!(
+        denied,
+        Err(ModelError::Provider(ProviderError::CredentialAbsent { .. }))
+    );
+    drop_blocking(broker);
+    store.enroll(YOLO_REF, YOLO_KEY.as_bytes());
+    let (broker, manifest) = prepared_with(
+        yolo_provider_with(&config, Arc::clone(&store)),
+        &config,
+        "/world/yolo",
+        "goal: matrix recovery",
+    );
+    let (broker, retried) = dispatch(broker, "/world/yolo", manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::yolo-auto --------------------------------------
+
+/// TP-PROVIDER-INSTALLED::yolo-auto = NOT_RUN: the installed-provider proof
+/// is a live-environment leg this offline slice never runs — a real flat-rate
+/// request needs its own fresh authorization.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::yolo-auto = NOT_RUN"]
+fn provider_installed_yolo_auto() {}
+
+// ----- band-4 aggregate leg matrices -----------------------------------------
+
+/// The exact carried band-4 id set, in recorded order.
+fn assert_band4_id_set() {
+    let ids: Vec<&str> = BAND4_CONNECTIONS
+        .iter()
+        .map(|connection| connection.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            VENICE, VLLM, WAFER, XAI, XAI_OAUTH, XIAOMI, XIAOMI_AMS, XIAOMI_CN, XIAOMI_SGP, YOLO,
+        ],
+        "the aggregate matrices cover exactly the ten carried ids"
+    );
+}
+
+/// One landed band-4 id's aggregate-leg seam: the config its catalog/wire and
+/// auth/recovery legs bind, the adapter class, and the scoped material the
+/// fixture store enrolls.
+struct Band4Connection {
+    id: &'static str,
+    config: fn(&str) -> String,
+    auth_config: fn(&str) -> String,
+    model: &'static str,
+    credential_ref: &'static str,
+    material: &'static str,
+    responses: bool,
+}
+
+/// The ten landed band-4 ids and the existing per-id helpers their aggregate
+/// legs drive — no per-id test body is duplicated.
+const BAND4_CONNECTIONS: [Band4Connection; 10] = [
+    Band4Connection {
+        id: VENICE,
+        config: venice_config,
+        auth_config: venice_config,
+        model: VENICE_MODEL,
+        credential_ref: VENICE_REF,
+        material: VENICE_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: VLLM,
+        config: vllm_config,
+        auth_config: vllm_bound_config,
+        model: VLLM_MODEL,
+        credential_ref: VLLM_REF,
+        material: VLLM_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: WAFER,
+        config: wafer_config,
+        auth_config: wafer_config,
+        model: WAFER_MODEL,
+        credential_ref: WAFER_REF,
+        material: WAFER_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: XAI,
+        config: xai_config,
+        auth_config: xai_config,
+        model: XAI_MODEL,
+        credential_ref: XAI_REF,
+        material: XAI_KEY,
+        responses: true,
+    },
+    Band4Connection {
+        id: XAI_OAUTH,
+        config: xai_oauth_config,
+        auth_config: xai_oauth_config,
+        model: XAI_OAUTH_MODEL,
+        credential_ref: XAI_OAUTH_REF,
+        material: XAI_OAUTH_KEY,
+        responses: true,
+    },
+    Band4Connection {
+        id: XIAOMI,
+        config: xiaomi_config,
+        auth_config: xiaomi_config,
+        model: XIAOMI_MODEL,
+        credential_ref: XIAOMI_REF,
+        material: XIAOMI_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: XIAOMI_AMS,
+        config: xiaomi_ams_config,
+        auth_config: xiaomi_ams_config,
+        model: XIAOMI_AMS_MODEL,
+        credential_ref: XIAOMI_AMS_REF,
+        material: XIAOMI_AMS_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: XIAOMI_CN,
+        config: xiaomi_cn_config,
+        auth_config: xiaomi_cn_config,
+        model: XIAOMI_CN_MODEL,
+        credential_ref: XIAOMI_CN_REF,
+        material: XIAOMI_CN_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: XIAOMI_SGP,
+        config: xiaomi_sgp_config,
+        auth_config: xiaomi_sgp_config,
+        model: XIAOMI_SGP_MODEL,
+        credential_ref: XIAOMI_SGP_REF,
+        material: XIAOMI_SGP_KEY,
+        responses: false,
+    },
+    Band4Connection {
+        id: YOLO,
+        config: yolo_config,
+        auth_config: yolo_config,
+        model: YOLO_MODEL,
+        credential_ref: YOLO_REF,
+        material: YOLO_KEY,
+        responses: false,
+    },
+];
+
+/// One aggregate leg's adapter under its recorded codec.
+enum Band4Provider {
+    Chat(ChatCompletionsProvider),
+    Responses(OpenAiProvider),
+}
+
+impl Band4Provider {
+    /// The bare catalogue lookup on a plain OS thread.
+    fn catalog(self) -> (Self, Result<Vec<CatalogModel>, ProviderError>) {
+        match self {
+            Self::Chat(provider) => {
+                let (provider, outcome) = catalog_on_thread(provider);
+                (Self::Chat(provider), outcome)
+            }
+            Self::Responses(provider) => {
+                let (provider, outcome) = xai_catalog_on_thread(provider);
+                (Self::Responses(provider), outcome)
+            }
+        }
+    }
+
+    /// One blocking send on a plain OS thread.
+    fn send(
+        self,
+        manifest: RequestManifest,
+    ) -> (
+        Self,
+        Result<rivect::providers::ProviderReply, ProviderError>,
+    ) {
+        match self {
+            Self::Chat(provider) => {
+                let (provider, outcome) = send_on_thread(provider, manifest);
+                (Self::Chat(provider), outcome)
+            }
+            Self::Responses(provider) => {
+                let (provider, outcome) = send_on_thread(provider, manifest);
+                (Self::Responses(provider), outcome)
+            }
+        }
+    }
+
+    /// Drops the retained adapter off the tokio context.
+    fn finish(self) {
+        match self {
+            Self::Chat(provider) => drop_blocking(provider),
+            Self::Responses(provider) => drop_blocking(provider),
+        }
+    }
+}
+
+/// The aggregate leg's adapter under the id's existing per-id constructor.
+fn band4_provider(
+    connection: &Band4Connection,
+    config: &Config,
+    store: Arc<support::MapStore>,
+) -> Band4Provider {
+    match connection.id {
+        VENICE => Band4Provider::Chat(venice_provider_with(config, store).0),
+        VLLM => Band4Provider::Chat(vllm_provider_with(config, store).0),
+        WAFER => Band4Provider::Chat(wafer_provider_with(config, store).0),
+        XAI => Band4Provider::Responses(xai_provider_with(config, store).0),
+        XAI_OAUTH => Band4Provider::Responses(xai_oauth_provider_with(config, store).0),
+        XIAOMI => Band4Provider::Chat(xiaomi_provider_with(config, store).0),
+        XIAOMI_AMS => Band4Provider::Chat(xiaomi_ams_provider_with(config, store).0),
+        XIAOMI_CN => Band4Provider::Chat(xiaomi_cn_provider_with(config, store).0),
+        XIAOMI_SGP => Band4Provider::Chat(xiaomi_sgp_provider_with(config, store).0),
+        YOLO => Band4Provider::Chat(yolo_provider_with(config, store).0),
+        other => panic!("every carried band-4 id has an adapter seam: {other}"),
+    }
+}
+
+/// The id's recorded-wire peer on the fixture server.
+async fn mount_band4_wire(connection: &Band4Connection, server: &MockServer) {
+    if connection.responses {
+        mount_responses(server, responses_completed_stream("band4", Vec::new(), None)).await;
+    } else {
+        mount_chat(server, completed_stream("band4", None)).await;
+    }
+}
+
+fn band4_pass(passed: bool) -> &'static str {
+    if passed { "PASS" } else { "FAIL" }
+}
+
+#[tokio::test]
+async fn band4_catalog_wire_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    assert_band4_id_set();
+    let mut reported: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    for connection in &BAND4_CONNECTIONS {
+        let server = MockServer::start().await;
+        mount_models(&server, vec![json!({"id": connection.model})]).await;
+        mount_band4_wire(connection, &server).await;
+        let config = Config::parse_validated(&(connection.config)(&server_uri_v1(&server)))
+            .expect("the fixture config is valid");
+        let store = Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(connection.credential_ref, connection.material)],
+        ));
+
+        let (provider, catalog) = band4_provider(connection, &config, store).catalog();
+        let catalog_ok = matches!(
+            &catalog,
+            Ok(models) if models.iter().any(|model| model.id == connection.model)
+        );
+        let (provider, reply) = provider.send(prepared_manifest(&config));
+        let wire_ok = matches!(&reply, Ok(reply) if reply.text == "band4");
+        provider.finish();
+
+        reported.insert(
+            format!("TP-PROVIDER-CATALOG::{}", connection.id),
+            band4_pass(catalog_ok),
+        );
+        reported.insert(
+            format!("TP-PROVIDER-WIRE::{}", connection.id),
+            band4_pass(wire_ok),
+        );
+        reported.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+
+    let mut expected = BTreeMap::new();
+    for connection in &BAND4_CONNECTIONS {
+        expected.insert(format!("TP-PROVIDER-CATALOG::{}", connection.id), "PASS");
+        expected.insert(format!("TP-PROVIDER-WIRE::{}", connection.id), "PASS");
+        expected.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+    assert_eq!(expected.len(), 30, "ten ids times catalog, wire and installed");
+    assert_eq!(
+        reported, expected,
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn band4_auth_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    assert_band4_id_set();
+    let mut reported: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    for connection in &BAND4_CONNECTIONS {
+        let config = Config::parse_validated(&(connection.auth_config)("http://127.0.0.1:1/v1"))
+            .expect("the fixture config is valid");
+        let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+        let (provider, denied) =
+            band4_provider(connection, &config, store).send(prepared_manifest(&config));
+        let auth_ok = matches!(&denied, Err(ProviderError::CredentialAbsent { .. }));
+        provider.finish();
+
+        reported.insert(
+            format!("TP-PROVIDER-AUTH::{}", connection.id),
+            band4_pass(auth_ok),
+        );
+        reported.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+
+    let mut expected = BTreeMap::new();
+    for connection in &BAND4_CONNECTIONS {
+        expected.insert(format!("TP-PROVIDER-AUTH::{}", connection.id), "PASS");
+        expected.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+    assert_eq!(expected.len(), 20, "ten ids times auth and installed");
+    assert_eq!(
+        reported, expected,
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn band4_recovery_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    assert_band4_id_set();
+    let mut reported: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    for connection in &BAND4_CONNECTIONS {
+        let server = MockServer::start().await;
+        mount_band4_wire(connection, &server).await;
+        let config = Config::parse_validated(&(connection.auth_config)(&server_uri_v1(&server)))
+            .expect("the fixture config is valid");
+        let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+
+        let (provider, denied) =
+            band4_provider(connection, &config, Arc::clone(&store))
+                .send(prepared_manifest(&config));
+        let denied_ok = matches!(&denied, Err(ProviderError::CredentialAbsent { .. }));
+        store.enroll(connection.credential_ref, connection.material.as_bytes());
+        let (provider, retried) = provider.send(prepared_manifest(&config));
+        let recovered = matches!(&retried, Ok(reply) if reply.text == "band4");
+        provider.finish();
+
+        reported.insert(
+            format!("TP-PROVIDER-RECOVERY::{}", connection.id),
+            band4_pass(denied_ok && recovered),
+        );
+        reported.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+
+    let mut expected = BTreeMap::new();
+    for connection in &BAND4_CONNECTIONS {
+        expected.insert(format!("TP-PROVIDER-RECOVERY::{}", connection.id), "PASS");
+        expected.insert(
+            format!("TP-PROVIDER-INSTALLED::{}", connection.id),
+            "NOT_RUN",
+        );
+    }
+    assert_eq!(expected.len(), 20, "ten ids times recovery and installed");
+    assert_eq!(
+        reported, expected,
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
