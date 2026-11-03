@@ -4569,3 +4569,117 @@ fn sakana_api_key_binding_resolves_through_scoped_secret_ref() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class: siliconflow -----------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on a `siliconflow`
+/// fixture: both recorded credential bindings resolve through the scoped
+/// `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — an undeclared id keeps the
+/// typed denial, a resolved binding admits the pin offline, and a
+/// divergent profile scope is the mismatch. Resolution is binding-level:
+/// the store is read at send, never here. The recorded
+/// `SILICONFLOW_API_KEY` env name is class metadata, never an
+/// environment store this build admits; the scoped seam is the offline
+/// form. The class has no keyless form: an unbound declaration the
+/// ingress admits stays unresolved and the api_key ingress refuses a
+/// declaration that binds nothing. The per-ID `siliconflow`
+/// credential/profile/region proof is the provider target's
+/// `siliconflow_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn siliconflow_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.siliconflow]\nkind = \"api_key\"\nendpoint = \"https://api.siliconflow.com/v1\"\ncredential_ref = \"keyring:rivect-test/siliconflow-direct\"\n\
+         [connections.siliconflow-profiled]\nkind = \"api_key\"\nendpoint = \"https://api.siliconflow.com/v1\"\ncredential_ref = \"keyring:rivect-test/siliconflow-scope\"\nprofile = \"siliconflow-team\"\n\
+         [profiles.siliconflow-team]\ncredential_ref = \"keyring:rivect-test/siliconflow-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "siliconflow")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/siliconflow-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "siliconflow-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/siliconflow-team");
+
+    // an undeclared id is the typed denial, never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "siliconflow",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "siliconflow-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // the class has no keyless form: an unbound declaration the ingress
+    // admits stays unresolved
+    let unbound = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.siliconflow]\nkind = \"local\"\nendpoint = \"https://api.siliconflow.com/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a local declaration parses");
+    assert!(
+        matches!(
+            resolve_credential(&unbound, "siliconflow"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "the api-key class requires its binding"
+    );
+
+    // the api_key ingress refuses a declaration that binds nothing
+    let keyless = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.siliconflow]\nkind = \"api_key\"\nendpoint = \"https://api.siliconflow.com/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect_err("a keyless api_key row is refused");
+    assert!(
+        matches!(
+            &keyless.issue,
+            ConfigIssue::CredentialRefRequired { kind }
+                if *kind == rivect::config::ConnKind::ApiKey
+        ),
+        "the ingress denial names the missing binding: {keyless}"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/siliconflow-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "siliconflow-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

@@ -3,7 +3,7 @@
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
-//! `novita`, `nvidia`, `qianfan` and `qwen-portal` connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `novita`, `nvidia`, `qianfan`, `qwen-portal` and `siliconflow` connections' adapter — the OpenAI-compatible Chat Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -173,7 +173,15 @@
 //! ranking. The paste api-key alternative resolves at the scoped
 //! `SecretRef` seam, while the recorded Qwen OAuth free-tier lifecycle
 //! (refresh, quota, revocation) is a bounded residual (D6/DEC-002)
-//! this adapter never constructs. The adapter authors no
+//! this adapter never constructs. The configured-or-recorded
+//! `https://api.siliconflow.com/v1` base of `siliconflow` carries the
+//! same api-key class under its own authoritative listing: the recorded
+//! exclusion list drops the embedding, reranker and image/audio/video
+//! generator ids, each admitted `data[]` row maps the id plus
+//! `context_length` and `max_completion_tokens` when stated under the
+//! recorded `min(maxTokens, context)` clamp, and the recorded
+//! models.dev hydration is a runtime residual (D2) this adapter never
+//! claims. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -897,6 +905,19 @@ const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 /// catalogue hint, never a seeded offer or ranking (DEC-014/D11).
 const QWEN_PORTAL_BASE_URL: &str = "https://portal.qwen.ai/v1";
 
+/// The recorded default API root of a `siliconflow` connection
+/// (`https://api.siliconflow.com/v1`): the host the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule the plan classes bind. The recorded
+/// `SILICONFLOW_API_KEY` env name is live-ingress metadata, never an
+/// environment read this adapter constructs (DEC-011), and the class
+/// records no region selector — the base itself carries the region.
+/// The recorded `zai-org/GLM-5.1` default is a catalogue hint, never a
+/// seeded offer or ranking (DEC-014/D11), and the recorded models.dev
+/// metadata hydration is a runtime residual (D2) this adapter does not
+/// carry.
+const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1205,6 +1226,16 @@ enum EntryRule {
     /// limited-role key is verified by a model request, never by
     /// payment administration.
     Novita,
+    /// The `siliconflow`/`siliconflow-cn` arm: the key-gated
+    /// authoritative `/models` listing drops the recorded non-chat
+    /// families ([`SILICONFLOW_EXCLUDED_SUBSTRINGS`]) and maps a
+    /// listed `context_length`/`max_completion_tokens` under the
+    /// recorded `min(maxTokens, context)` clamp. The recorded
+    /// models.dev hydration is a runtime-only enrichment this offline
+    /// adapter does not carry (D2), so an admitted id keeps the limits
+    /// the listing states and no borrowed price. Both region ids share
+    /// this transform; their hosts and credentials stay per-id.
+    SiliconFlow,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1704,6 +1735,29 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::GenericMetadata,
+        }),
+        // `siliconflow` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://api.siliconflow.com/v1` base
+        // redirects discovery and streaming alike, and the recorded
+        // api-key class gates the `/models` listing on resolved material
+        // — a keyless lookup opens no wire leg and denies typed. The
+        // listing is authoritative (`dynamicModelsAuthoritative`): the
+        // recorded exclusion list drops embeddings, rerankers and
+        // image/audio/video generators, and an admitted `data[]` row
+        // maps the id plus `context_length` and `max_completion_tokens`
+        // when present under the recorded `min(maxTokens, context)`
+        // clamp (DEC-020). The class records no vendored roster, seed or
+        // price row (D2), so an empty or failed answer has no floor to
+        // fall back to. The recorded `zai-org/GLM-5.1` default is a
+        // catalogue hint, never a seeded offer and never a ranking — the
+        // auto pick stays the sorted-first listed id (DEC-014/D11) — and
+        // a configured `region` denies: the contract names none.
+        "siliconflow" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(SILICONFLOW_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::SiliconFlow,
         }),
         _ => None,
     }
@@ -2383,7 +2437,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::LmStudio
                 | EntryRule::Moonshot
                 | EntryRule::NanoGpt
-                | EntryRule::Novita => Some(CatalogModel {
+                | EntryRule::Novita
+                | EntryRule::SiliconFlow => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -2642,6 +2697,11 @@ impl ChatCompletionsProvider {
                 id: id.to_string(),
                 ..CatalogModel::default()
             }),
+            // The recorded SiliconFlow filter and mapping: the
+            // authoritative listing drops the non-chat families, and
+            // an admitted row carries its stated limits under the
+            // recorded clamp.
+            EntryRule::SiliconFlow => siliconflow_entry(id, entry),
             // Unreached: this class binds the static allowlist, so no
             // listing leg runs. A listed id would prove no access the
             // class records, so the transform admits nothing.
@@ -2933,9 +2993,9 @@ impl ChatCompletionsProvider {
     /// pinned router id (`toFirepassWireModelId`); every verbatim
     /// transform — `IdsOnly`, `GenericMetadata`, `Aiand`, `Aimlapi`,
     /// `AlibabaTokenPlan`, `DeepSeek`, `Groq`, `HuggingFace`,
-    /// `LiteLlm`, `Moonshot`, `NanoGpt` and `Novita` — sends the
-    /// offered id unchanged. Each variant is listed so a future
-    /// transform cannot ship verbatim ids silently.
+    /// `LiteLlm`, `Moonshot`, `NanoGpt`, `Novita` and `SiliconFlow` —
+    /// sends the offered id unchanged. Each variant is listed so a
+    /// future transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
         match self.contract.entries {
             EntryRule::Firepass => firepass_wire_model_id(model_id),
@@ -2952,7 +3012,8 @@ impl ChatCompletionsProvider {
             | EntryRule::LmStudio
             | EntryRule::Moonshot
             | EntryRule::NanoGpt
-            | EntryRule::Novita => model_id.to_string(),
+            | EntryRule::Novita
+            | EntryRule::SiliconFlow => model_id.to_string(),
         }
     }
 
@@ -3036,7 +3097,8 @@ impl ChatCompletionsProvider {
             | EntryRule::LiteLlm
             | EntryRule::LmStudio
             | EntryRule::NanoGpt
-            | EntryRule::Novita => return Ok(()),
+            | EntryRule::Novita
+            | EntryRule::SiliconFlow => return Ok(()),
         };
         let EffortAssign::Fixed { value } = &manifest.effort else {
             return Ok(());
@@ -4194,6 +4256,71 @@ fn is_alibaba_token_plan_chat_id(id: &str) -> bool {
     !ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
+}
+
+/// The recorded `siliconflow`/`siliconflow-cn` exclusion list
+/// (`exclude-models provider="siliconflow"`, runtime/behavior.kdl):
+/// the provider's `/v1/models` roster interleaves embeddings,
+/// rerankers and image/audio/video generators with no per-model type
+/// field, so the text-chat transport can tell them apart only by name.
+/// Both region ids record the same list. A dropped id is never an
+/// offer; a chat id outside these recorded families survives.
+const SILICONFLOW_EXCLUDED_SUBSTRINGS: &[&str] = &[
+    "embedding",
+    "reranker",
+    "bge-",
+    "bce-",
+    "stable-diffusion",
+    "image",
+    "flux",
+    "kolors",
+    "sensevoice",
+    "cosyvoice",
+    "fish-speech",
+    "indextts",
+    "sovits",
+    "whisper",
+    "hunyuanvideo",
+    "wan2",
+    "ltx-video",
+    "speech",
+    "moderator",
+    "tts",
+];
+
+/// The recorded SiliconFlow chat-id filter
+/// (`isLikelySiliconFlowChatModelId` → `isExcludedModel`,
+/// openai-compat.ts §6.6): the id is trimmed and lowered, then dropped
+/// when the recorded exclusion list names one of its lowercase
+/// substrings. Every other non-empty listed id is offered.
+fn is_likely_siliconflow_chat_id(id: &str) -> bool {
+    let normalized = id.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    !SILICONFLOW_EXCLUDED_SUBSTRINGS
+        .iter()
+        .any(|family| normalized.contains(family))
+}
+
+/// The recorded SiliconFlow listing transform: the id must pass the
+/// recorded chat-id filter, then [`generic_metadata_entry`] maps the two
+/// stated limits, and the recorded `min(maxTokens, context)` clamp caps
+/// the maximum output at the window where both exist. An absent, zero
+/// or unreadable value stays `None` — no default figure and no borrowed
+/// sibling field — and no vendored roster or price row exists (D2/D6),
+/// so an admitted offer keeps [`ModelPrice::Unknown`].
+fn siliconflow_entry(id: &str, entry: &Value) -> Option<CatalogModel> {
+    if !is_likely_siliconflow_chat_id(id) {
+        return None;
+    }
+    let mut model = generic_metadata_entry(id, entry);
+    if let (Some(max_output_tokens), Some(context_window)) =
+        (model.max_output_tokens, model.context_window)
+    {
+        model.max_output_tokens = Some(max_output_tokens.min(context_window));
+    }
+    Some(model)
 }
 
 /// The recorded `nanogpt` `:thinking` suffix
