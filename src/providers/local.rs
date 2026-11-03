@@ -3,7 +3,9 @@
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
-//! `novita`, `nvidia`, `qianfan`, `qwen-portal` and `siliconflow` connections' adapter — the OpenAI-compatible Chat Completions dialect
+//! `novita`, `nvidia`, `qianfan`, `qwen-portal`, `siliconflow` and
+//! `siliconflow-cn` connections' adapter — the OpenAI-compatible Chat
+//! Completions dialect
 //! (DEC-007/DEC-025, HZN-008 class S, class A, class P and class B).
 //! Dialect selection keys on the literal connection id, never an auth
 //! label, an endpoint shape or a catalogue answer: every compatible
@@ -181,7 +183,12 @@
 //! `context_length` and `max_completion_tokens` when stated under the
 //! recorded `min(maxTokens, context)` clamp, and the recorded
 //! models.dev hydration is a runtime residual (D2) this adapter never
-//! claims. The adapter authors no
+//! claims. The configured-or-recorded `https://api.siliconflow.cn/v1`
+//! base of `siliconflow-cn` carries the same transform under its own
+//! host and credential: the id-keyed region split (EDGE-007) never
+//! substitutes either host for the other, and the distinct recorded
+//! `SILICONFLOW_CN_API_KEY` env name is class metadata, not a second
+//! ingress. The adapter authors no
 //! async code — [`Provider::send`] is a blocking single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
 //! dev-dependency test harness.
@@ -917,6 +924,20 @@ const QWEN_PORTAL_BASE_URL: &str = "https://portal.qwen.ai/v1";
 /// metadata hydration is a runtime residual (D2) this adapter does not
 /// carry.
 const SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.com/v1";
+
+/// The recorded default API root of a `siliconflow-cn` connection
+/// (`https://api.siliconflow.cn/v1`): the distinct CN host the required
+/// `endpoint` field's empty string resolves under, under the same
+/// absent-override rule `siliconflow` binds. The id-keyed region split
+/// (EDGE-007) keeps the hosts, the recorded `SILICONFLOW_CN_API_KEY`
+/// env name and the credential scopes per id: neither host is ever
+/// substituted for the other, and the env name is live-ingress
+/// metadata, never an environment read this adapter constructs
+/// (DEC-011). The class records no region selector — the base itself
+/// carries the region — and the shared exclusion list and
+/// `min(maxTokens, context)` clamp apply unchanged, with the recorded
+/// models.dev hydration a runtime residual (D2).
+const SILICONFLOW_CN_BASE_URL: &str = "https://api.siliconflow.cn/v1";
 
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
@@ -1755,6 +1776,28 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "siliconflow" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(SILICONFLOW_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::SiliconFlow,
+        }),
+        // `siliconflow-cn` (HZN-008 class B — the api-key cell): the
+        // configured-or-recorded `https://api.siliconflow.cn/v1` CN host
+        // redirects discovery and streaming alike. The split from
+        // `siliconflow` is id-keyed (EDGE-007): distinct host, distinct
+        // recorded `SILICONFLOW_CN_API_KEY` env name behind the same
+        // scoped seam, and never a substitution of either host or
+        // credential for the other. The recorded api-key class gates the
+        // authoritative `/models` listing on resolved material — a
+        // keyless lookup opens no wire leg and denies typed — and the
+        // shared exclusion transform ([`EntryRule::SiliconFlow`]) drops
+        // the recorded non-chat families and maps the stated limits
+        // under the recorded clamp. The class records no vendored
+        // roster, seed or price row (D2), so an empty or failed answer
+        // has no floor to fall back to. A configured `region` denies:
+        // the contract names none.
+        "siliconflow-cn" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(SILICONFLOW_CN_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::SiliconFlow,
