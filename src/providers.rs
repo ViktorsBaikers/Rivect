@@ -1127,9 +1127,10 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// keyed by the literal id's source class — `openai` speaks the
 /// OpenAI Responses API, `abliteration` is its recorded class-A
 /// exception speaking the same dialect, `meta` its recorded
-/// class-B plug on `api.meta.ai/v1` (HZN-008), and `ollama` its
+/// class-B plug on `api.meta.ai/v1` (HZN-008), `ollama` its
 /// recorded local Responses plug with the optional credential
-/// (DEC-009); `google` speaks
+/// (DEC-009), and `openrouter` its catalogue-only-keyless Responses
+/// plug behind the recorded paste-key form (DEC-003); `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `ollama-cloud` its recorded native `ollama-chat` JSONL dialect
 /// (DEC-001), `custom-chat-completions` speaks the OpenAI-compatible
@@ -1184,6 +1185,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "abliteration" => Some(Dialect::Responses),
         "meta" => Some(Dialect::Responses),
         "ollama" => Some(Dialect::Responses),
+        "openrouter" => Some(Dialect::Responses),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
@@ -1297,8 +1299,11 @@ impl Provider for LoopbackProvider {
 /// auth is optional beside its server-key mode. Both admit a
 /// declaration that omits `credential_ref`, an absent binding sends no
 /// `Authorization` header — never a dummy key — and the pin stays
-/// offline-usable. Every other `api_key` id requires its scoped binding
-/// at ingress and at eligibility.
+/// offline-usable. The catalogue-only `openrouter` is the exception
+/// this predicate excludes: [`admit_absent_binding`] admits its unbound
+/// declaration at ingress for the keyless `GET /models`, while this
+/// send/eligibility answer stays false. Every other `api_key` id
+/// requires its scoped binding at ingress and at eligibility.
 ///
 /// Its contract-side twin is `CredentialRule::OpenProxy` in the local
 /// adapter's per-id table, the arm that carries the class's wire form.
@@ -1307,12 +1312,48 @@ pub(crate) fn open_proxy_connection(connection: &str) -> bool {
     matches!(connection, "litellm" | "llama.cpp" | "lm-studio" | "ollama")
 }
 
-/// [`resolve_credential_in`] under the recorded absent-binding form: a
-/// connection of that class whose declaration binds no credential at all
+/// Whether a literal connection id records the absent-binding form at
+/// ingress (DEC-009/DEC-010): the credential-optional classes
+/// [`open_proxy_connection`] names, plus `openrouter` — whose keyless
+/// `GET /models` is reachable only when the declaration may omit its
+/// `credential_ref`. This is the ingress predicate alone:
+/// [`open_proxy_connection`] stays the send/eligibility answer, so an
+/// unbound `openrouter` row is admitted here and still not
+/// send-eligible.
+#[must_use]
+pub(crate) fn admit_absent_binding(connection: &str) -> bool {
+    open_proxy_connection(connection) || connection == "openrouter"
+}
+
+/// The [`resolve_credential_in`] leg the two absent-binding classes
+/// share: a declaration `absent` names that binds no credential at all
 /// resolves `None`, while every other binding resolves the scoped
 /// [`SecretRef`] unchanged. A bound-but-malformed or
 /// profile-mismatched reference keeps its typed denial — the absent
 /// binding is the only admitted form.
+///
+/// # Errors
+/// [`resolve_credential_in`]'s typed denials for every binding the
+/// declaration does carry.
+fn resolve_absent_binding_in(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+    absent: fn(&str) -> bool,
+) -> Result<Option<SecretRef>, ProviderError> {
+    let unbound = connections
+        .get(connection)
+        .is_some_and(|conn| conn.profile.is_none() && conn.credential_ref.is_none());
+    if unbound && absent(connection) {
+        return Ok(None);
+    }
+    resolve_credential_in(connections, profiles, connection).map(Some)
+}
+
+/// [`resolve_absent_binding_in`] under the send/eligibility predicate:
+/// a connection of that class whose declaration binds no credential at
+/// all resolves `None`; an unbound `openrouter` connection does not —
+/// it lists keylessly and never sends.
 ///
 /// # Errors
 /// [`resolve_credential_in`]'s typed denials for every binding the
@@ -1322,13 +1363,25 @@ pub(crate) fn resolve_optional_credential_in(
     profiles: &BTreeMap<String, Profile>,
     connection: &str,
 ) -> Result<Option<SecretRef>, ProviderError> {
-    let unbound = connections
-        .get(connection)
-        .is_some_and(|conn| conn.profile.is_none() && conn.credential_ref.is_none());
-    if unbound && open_proxy_connection(connection) {
-        return Ok(None);
-    }
-    resolve_credential_in(connections, profiles, connection).map(Some)
+    resolve_absent_binding_in(connections, profiles, connection, open_proxy_connection)
+}
+
+/// [`resolve_absent_binding_in`] under the config-ingress admission
+/// (DEC-010): a declaration the ingress predicate
+/// [`admit_absent_binding`] names resolves `None` when it binds no
+/// credential at all, so the keyless catalogue leg builds. Eligibility
+/// keeps the narrower [`open_proxy_connection`] answer — an unbound
+/// `openrouter` connection lists here and never sends.
+///
+/// # Errors
+/// [`resolve_credential_in`]'s typed denials for every binding the
+/// declaration does carry.
+pub(crate) fn resolve_admitted_credential_in(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+) -> Result<Option<SecretRef>, ProviderError> {
+    resolve_absent_binding_in(connections, profiles, connection, admit_absent_binding)
 }
 
 /// Connection eligibility for offline dispatch (DEC-011): local
@@ -1367,7 +1420,9 @@ pub fn offline_eligible(
 /// confers — it stays grant-gated until the subscription machinery
 /// lands. Ranking filters candidates with this; [`offline_eligible`]
 /// keeps the typed rejection vocabulary for the single-candidate
-/// fixed path.
+/// fixed path. A `local` declaration of a dialect-reserved id ranks
+/// here and its dispatch still denies typed — ranking says the pin is
+/// usable without a live grant, never that the send succeeds.
 #[must_use]
 pub fn offline_usable(
     connections: &BTreeMap<String, Connection>,

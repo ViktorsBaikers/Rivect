@@ -25,8 +25,9 @@ mod support;
 
 use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
 use rivect::model::{InputOrigin, RequestManifest};
+use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::{
-    CredentialStore, Dialect, FlightedStore, KeyringBackend, ProviderError, SecretRef,
+    CredentialStore, Dialect, FlightedStore, KeyringBackend, Provider, ProviderError, SecretRef,
     SecretRefError, StoreKind, native_store, resolve_credential,
 };
 use serde_json::{Value, json};
@@ -4093,4 +4094,106 @@ fn nvidia_api_key_binding_resolves_through_scoped_secret_ref() {
         ),
         "profile/scope disagreement is CredentialProfileMismatch"
     );
+}
+
+// ----- api-key class, paste key: openrouter ------------------------------------
+
+/// The `openrouter` paste-key form (DEC-003) resolves at the scoped
+/// `SecretRef` seam: the binding resolves through DEC-013 precedence,
+/// the adapter accepts exactly the recorded `sk-or-…` grammar, and a
+/// PAYG `sk-…` token, a JSON blob, an empty `sk-or-` rest or a byte
+/// outside the recorded alphabet denies `CredentialMalformed` before
+/// any wire leg — the material never enters the diagnostic.
+#[test]
+fn openrouter_paste_key_grammar_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"keyring:rivect-test/openrouter\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"openrouter\", model_id = \"vendor/model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "openrouter")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/openrouter");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // No model pin is this case's point: the send seam resolves the
+    // credential first, so an admitted key reaches `UnpinnedModel`
+    // while rejected material stops at the grammar gate.
+    let manifest = RequestManifest {
+        attempt_id: "openrouter-paste-key".to_string(),
+        purpose: "main".to_string(),
+        world: "openrouter-world".to_string(),
+        model: ModelAssign::Auto { pool: None },
+        effort: EffortAssign::Auto,
+        instructions: "paste-key fixture".to_string(),
+        tools: Vec::new(),
+        output_reserve: 1024,
+        inputs: "goal: fixture".to_string(),
+        inputs_digest: "inputs-digest".to_string(),
+        epoch_id: "epoch-1".to_string(),
+        mutation_reason: None,
+        epoch_cost: None,
+        input_origin: InputOrigin::Human,
+        cost_bound: 1,
+    };
+
+    // the recorded paste-key form passes the seam
+    let store = Arc::new(support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/openrouter", "sk-or-fixture-paste-key")],
+    ));
+    let mut provider = OpenAiProvider::new(&config, "openrouter", store)
+        .expect("the adapter builds for the bound paste-key id");
+    let outcome = provider.send(&manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::UnpinnedModel { .. })),
+        "the paste key passes the grammar gate and the send stops at the unpinned model: {outcome:?}"
+    );
+
+    // surrounding whitespace is trimmed before the grammar gate — the
+    // paste form's own normalization
+    let store = Arc::new(support::MapStore::seeded(
+        NATIVE_KIND,
+        &[(
+            "keyring:rivect-test/openrouter",
+            "  sk-or-fixture-paste-key\n",
+        )],
+    ));
+    let mut provider = OpenAiProvider::new(&config, "openrouter", store)
+        .expect("the adapter builds for the bound id");
+    let outcome = provider.send(&manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::UnpinnedModel { .. })),
+        "a trimmed paste key passes the grammar gate: {outcome:?}"
+    );
+
+    // any other material is the typed malformed denial before the wire
+    for material in [
+        SECRET_CANARY,
+        "sk-fixture-payg-key",
+        "{\"token\":\"sk-or-fixture-paste-key\"}",
+        "sk-or-",
+        "sk-or-fixture key",
+        "sk-or-fixture-kéy",
+    ] {
+        let store = Arc::new(support::MapStore::seeded(
+            NATIVE_KIND,
+            &[("keyring:rivect-test/openrouter", material)],
+        ));
+        let mut provider = OpenAiProvider::new(&config, "openrouter", store)
+            .expect("the adapter builds for the bound id");
+        let err = provider
+            .send(&manifest)
+            .expect_err("material outside the paste-key grammar denies");
+        assert!(
+            matches!(&err, ProviderError::CredentialMalformed { connection } if connection == "openrouter"),
+            "the paste-key grammar is the typed malformed denial: {err:?}"
+        );
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains(material),
+            "the denial never renders the material: {rendered}"
+        );
+    }
 }

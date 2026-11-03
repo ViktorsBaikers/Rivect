@@ -1,8 +1,10 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
-//! the literal connection ids `openai`, `abliteration`, `meta` and
-//! `ollama` record this dialect. `ollama` is the local endpoint whose
-//! credential is optional (DEC-009) and whose catalogue carries a
-//! bounded native discovery overlay (DEC-012). Dialect selection keys
+//! the literal connection ids `openai`, `abliteration`, `meta`,
+//! `ollama` and `openrouter` record this dialect. `ollama` is the local
+//! endpoint whose credential is optional (DEC-009) and whose catalogue
+//! carries a bounded native discovery overlay (DEC-012); `openrouter`
+//! rides the recorded paste-key form behind a catalogue-only keyless
+//! listing (DEC-003/DEC-010). Dialect selection keys
 //! on the literal connection id, never an auth label or a catalogue
 //! answer, and `openai-codex` is a distinct literal id with its own
 //! recorded class. The adapter authors no async code — [`Provider::send`] is
@@ -20,14 +22,14 @@
 //! `Authorization` header per send — never into config, manifests,
 //! diagnostics or this type's `Debug` (INV-001/INV-006).
 
-use crate::config::{Config, Connection, EffortAssign, FixedModel, ModelAssign};
+use crate::config::{Config, ConnKind, Connection, EffortAssign, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply,
+    CatalogModel, CredentialStore, Dialect, ModelPrice, Provider, ProviderError, ProviderReply,
     STREAM_CHUNK_BYTES, SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for,
-    read_catalog_body, read_chunk, resolve_optional_credential_in, sse, transport,
-    transport_status, violation, wire_body,
+    open_proxy_connection, read_catalog_body, read_chunk, resolve_admitted_credential_in, sse,
+    transport, transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -50,6 +52,15 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 /// after this adapter's trim — every trailing slash and surrounding
 /// whitespace stripped.
 const OLLAMA_DEFAULT_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
+
+/// The recorded `openrouter` base (DEC-003): an empty configured
+/// endpoint resolves here, and a configured value otherwise wins after
+/// this adapter's trim.
+const OPENROUTER_DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/v1";
+
+/// The recorded `openrouter` paste-key prefix (DEC-003): the bare
+/// `sk-or-…` key the paste form stores at the scoped credential seam.
+const OPENROUTER_KEY_PREFIX: &str = "sk-or-";
 
 /// The most listed ids one native discovery phase probes (DEC-012).
 const NATIVE_DISCOVERY_MAX_IDS: usize = 32;
@@ -105,6 +116,15 @@ const META_MUSE_MODELS: &[&str] = &[
     "muse-spark-1.3-contributor",
 ];
 
+/// How one listed `/models` entry becomes an offered
+/// [`CatalogModel`]: the id alone under the contract's filter, or the
+/// entry's own tool-capable surfaces (`openrouter`, DEC-010).
+#[derive(Clone, Copy)]
+enum EntryRule {
+    IdsOnly,
+    OpenRouterTools,
+}
+
 /// The predicates the recorded source class binds to a literal
 /// Responses id (HZN-008): the dialect is shared across connection
 /// ids — the catalogue rule and the reasoning-artifact surface are
@@ -124,6 +144,10 @@ struct SourceContract {
     /// recorded Muse roster); `false` — the listing filters to `seed`
     /// (`openai`: the recorded sample is the offer set).
     authoritative_models: bool,
+    /// The per-id catalogue entry rule: `IdsOnly` offers the entry's
+    /// id under `authoritative_models`/`seed`; `OpenRouterTools` offers
+    /// only a tool-capable entry with its declared surfaces mapped.
+    entry: EntryRule,
     /// `true` — the request asks for the `reasoning.encrypted_content`
     /// artifact the replay contract carries (SRC-019/D-006); `false`
     /// — the recorded peer compat marks the gateway as never
@@ -146,21 +170,35 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "openai" => Some(SourceContract {
             seed: RESPONSES_MODELS,
             authoritative_models: false,
+            entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
         }),
         "abliteration" => Some(SourceContract {
             seed: ABLITERATION_MODELS,
             authoritative_models: true,
+            entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
         }),
         "meta" => Some(SourceContract {
             seed: META_MUSE_MODELS,
             authoritative_models: true,
+            entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
         }),
         "ollama" => Some(SourceContract {
             seed: &[],
             authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+        }),
+        // The listing is authoritative and carries its own entry rule
+        // (DEC-010): the keyless `/models` answer offers only what the
+        // adapter can honour, and the record states no replay artifact
+        // for the id.
+        "openrouter" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::OpenRouterTools,
             reasoning_artifact: false,
         }),
         _ => None,
@@ -170,13 +208,17 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// The connection's API base (DEC-011): the configured endpoint is
 /// trimmed of surrounding whitespace and of every trailing slash —
 /// this adapter's own normalization, not a rule the other adapters
-/// share — and the empty result resolves the recorded local default on
-/// `ollama` alone. Every other id keeps the trimmed value verbatim; no
-/// id's base is ever inferred.
+/// share — and the empty result resolves the recorded base on `ollama`
+/// and `openrouter` alone. Every other id keeps the trimmed value
+/// verbatim; no id's base is ever inferred.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
-    if configured.is_empty() && connection == "ollama" {
-        OLLAMA_DEFAULT_ENDPOINT.to_string()
+    if configured.is_empty() {
+        match connection {
+            "ollama" => OLLAMA_DEFAULT_ENDPOINT.to_string(),
+            "openrouter" => OPENROUTER_DEFAULT_ENDPOINT.to_string(),
+            _ => configured.to_string(),
+        }
     } else {
         configured.to_string()
     }
@@ -283,9 +325,12 @@ impl OpenAiProvider {
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the Responses source class; [`ProviderError::UnknownConnection`]
     /// for an undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; `resolve_optional_credential_in`'s typed
-    /// denials for a missing, malformed or mismatched binding on a
-    /// required id (the local optional class resolves `None`);
+    /// configured region; [`ProviderError::CredentialUnresolved`] for a
+    /// `local` declaration of a reserved id that is not an open proxy —
+    /// denied by declaration kind before any credential resolves —
+    /// `resolve_admitted_credential_in`'s typed
+    /// denials for a malformed or mismatched binding on a required id
+    /// (the admitted absent-binding class resolves `None`);
     /// [`ProviderError::Transport`] when the HTTP client cannot be
     /// built.
     pub fn new(
@@ -341,11 +386,25 @@ impl OpenAiProvider {
                 region: region.clone(),
             });
         }
-        // The local `ollama` class admits the absent binding; every
-        // required Responses id resolves through the same precedence
-        // and keeps its typed denial when nothing binds (DEC-009).
+        // A `local` declaration names a locally served endpoint; the
+        // reserved Responses ids are not that class, and a `profile`
+        // binding must not turn one into a credentialled sender
+        // (DEC-009/DEC-010). Denied by declaration kind before any
+        // credential resolution; the open-proxy `ollama` stays admitted.
+        if conn.kind == ConnKind::Local && !open_proxy_connection(connection) {
+            return Err(ProviderError::CredentialUnresolved {
+                connection: connection.to_string(),
+                scope: format!("connections.{connection}.kind"),
+                cause: None,
+            });
+        }
+        // The admitted absent-binding classes — the open proxy, the
+        // local endpoint and the catalogue-only `openrouter` — resolve
+        // `None` for a declaration that binds nothing; every required
+        // Responses id resolves through the same precedence and keeps
+        // its typed denial when nothing binds (DEC-009/DEC-010).
         let credential =
-            resolve_optional_credential_in(&config.connections, &config.profiles, connection)?;
+            resolve_admitted_credential_in(&config.connections, &config.profiles, connection)?;
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
         // names itself the send's deadline, while reqwest's timer only
@@ -388,10 +447,11 @@ impl OpenAiProvider {
     /// id's recorded rule — `openai` filters the listing to the
     /// recorded Responses-capable sample, `abliteration` and `meta`
     /// treat the listing as authoritative and merge their static
-    /// source seeds on top, and `ollama` enriches the listing's own
-    /// offers from the bounded native discovery overlay (DEC-012) —
-    /// each id carrying the shared [`CatalogModel`], returned in
-    /// deterministic sorted order.
+    /// source seeds on top, `ollama` enriches the listing's own
+    /// offers from the bounded native discovery overlay (DEC-012), and
+    /// `openrouter` offers only the listing's tool-capable entries with
+    /// their recorded surfaces mapped (DEC-010) — each id carrying the
+    /// shared [`CatalogModel`], returned in deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -408,14 +468,7 @@ impl OpenAiProvider {
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
-        let ids = self.catalog_within(token.as_deref(), started)?;
-        let mut models: Vec<CatalogModel> = ids
-            .into_iter()
-            .map(|id| CatalogModel {
-                id,
-                ..CatalogModel::default()
-            })
-            .collect();
+        let mut models = self.catalog_within(token.as_deref(), started)?;
         // The overlay is advisory: it enriches the listing's own
         // offers and never extends or replaces them (DEC-012) — and it
         // spends the caller's clock like every other leg, so a peer
@@ -437,7 +490,7 @@ impl OpenAiProvider {
         &self,
         token: Option<&str>,
         started: Instant,
-    ) -> Result<Vec<String>, ProviderError> {
+    ) -> Result<Vec<CatalogModel>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
         let mut request = self.client.get(format!("{}/models", self.endpoint));
         if let Some(token) = token {
@@ -461,36 +514,57 @@ impl OpenAiProvider {
         // The catalogue rule is the literal id's recorded contract
         // (HZN-008): `openai` filters the listing to the recorded
         // sample — ids the dialect does not serve are never offered —
-        // while `abliteration`, `meta` and `ollama` treat the listing
-        // as authoritative: every non-empty id offers, and a recorded
-        // seed merges on top as the offer floor.
-        let mut ids: Vec<String> = data
+        // while `abliteration`, `meta`, `ollama` and `openrouter`
+        // treat the listing as authoritative: every offered entry
+        // answers, and a recorded seed merges on top as the offer
+        // floor.
+        let mut models: Vec<CatalogModel> = data
             .iter()
-            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-            .filter(|id| {
-                if self.contract.authoritative_models {
-                    !id.is_empty()
-                } else {
-                    self.contract.seed.contains(id)
-                }
-            })
-            .map(str::to_string)
+            .filter_map(|entry| self.catalog_entry(entry))
             .collect();
         if self.contract.authoritative_models {
-            ids.extend(self.contract.seed.iter().map(|id| (*id).to_string()));
-            ids.sort();
-            ids.dedup();
+            models.extend(self.contract.seed.iter().map(|id| CatalogModel {
+                id: (*id).to_string(),
+                ..CatalogModel::default()
+            }));
+            models.sort_by(|a, b| a.id.cmp(&b.id));
+            models.dedup_by(|a, b| a.id == b.id);
         } else {
-            ids.sort();
+            models.sort_by(|a, b| a.id.cmp(&b.id));
         }
-        Ok(ids)
+        Ok(models)
+    }
+
+    /// One listed entry under the literal id's recorded entry rule:
+    /// `EntryRule::OpenRouterTools` offers only an entry whose
+    /// `supported_parameters` declares `tools` and maps that entry's own
+    /// surfaces (DEC-010); `EntryRule::IdsOnly` offers the id alone under
+    /// the contract's filter.
+    fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
+        match self.contract.entry {
+            EntryRule::OpenRouterTools => openrouter_model(entry),
+            EntryRule::IdsOnly => {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                let offered = if self.contract.authoritative_models {
+                    !id.is_empty()
+                } else {
+                    self.contract.seed.contains(&id)
+                };
+                offered.then(|| CatalogModel {
+                    id: id.to_string(),
+                    ..CatalogModel::default()
+                })
+            }
+        }
     }
 
     /// Reads the credential material for this send — the only place
     /// secret bytes cross the store boundary. The absent binding
     /// resolves `None` and sends no header (DEC-009); a non-UTF-8
     /// secret cannot be a bearer token: typed denial, never a mangled
-    /// header.
+    /// header. `openrouter` admits the recorded paste-key grammar only
+    /// (DEC-003): material outside `sk-or-…` denies typed here, before
+    /// any wire leg.
     fn secret(&self) -> Result<Option<String>, ProviderError> {
         let Some(credential) = &self.credential else {
             return Ok(None);
@@ -500,7 +574,16 @@ impl OpenAiProvider {
             String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
             })?;
-        Ok(Some(token))
+        if self.connection != "openrouter" {
+            return Ok(Some(token));
+        }
+        let token = token.trim();
+        if !is_openrouter_paste_key(token) {
+            return Err(ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            });
+        }
+        Ok(Some(token.to_string()))
     }
 
     /// The bounded native discovery overlay (DEC-012): the configured
@@ -1123,6 +1206,98 @@ fn positive_tokens(value: &Value) -> Option<u64> {
     value.as_u64().filter(|tokens| *tokens > 0)
 }
 
+/// The recorded `openrouter` paste-key grammar (DEC-003): `sk-or-`,
+/// then one or more base characters. Another product's `sk-…` token, a
+/// JSON blob or empty material is not the recorded paste form.
+fn is_openrouter_paste_key(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix(OPENROUTER_KEY_PREFIX) else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'-')
+        })
+}
+
+/// One `openrouter` listing entry under the recorded catalogue rule
+/// (DEC-010): only an entry whose `supported_parameters` declares
+/// `tools` is offered — the surface this adapter's request can honour
+/// — and the entry's declared capabilities map onto the shared record.
+/// An absent or invalid field stays empty or unknown; the listing never
+/// supplies a default figure.
+fn openrouter_model(entry: &Value) -> Option<CatalogModel> {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    let declares = |name: &str| {
+        entry
+            .get("supported_parameters")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(name)))
+    };
+    if !declares("tools") {
+        return None;
+    }
+    Some(CatalogModel {
+        id: id.to_string(),
+        reasoning: declares("reasoning"),
+        vision: entry
+            .pointer("/architecture/input_modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.as_str() == Some("image"))
+            }),
+        context_window: entry.get("context_length").and_then(positive_tokens),
+        max_output_tokens: entry
+            .pointer("/top_provider/max_completion_tokens")
+            .and_then(positive_tokens),
+        price: openrouter_price(entry),
+        ..CatalogModel::default()
+    })
+}
+
+/// The entry's stated per-token USD figures, scaled to the shared
+/// per-1M record. Both members must carry a readable non-negative
+/// number — a partial or invalid pair is not a figure, so the price
+/// stays [`ModelPrice::Unknown`] rather than releasing a default.
+fn openrouter_price(entry: &Value) -> ModelPrice {
+    let Some(pricing) = entry.get("pricing") else {
+        return ModelPrice::Unknown;
+    };
+    let (Some(prompt), Some(completion)) = (
+        pricing.get("prompt").and_then(price_per_token),
+        pricing.get("completion").and_then(price_per_token),
+    ) else {
+        return ModelPrice::Unknown;
+    };
+    let input_per_1m = prompt * 1_000_000.0;
+    let output_per_1m = completion * 1_000_000.0;
+    // A finite per-token figure can still overflow the 1M scale; a
+    // non-finite product is not a price either.
+    if !input_per_1m.is_finite() || !output_per_1m.is_finite() {
+        return ModelPrice::Unknown;
+    }
+    ModelPrice::Usd {
+        input_per_1m,
+        output_per_1m,
+    }
+}
+
+/// One per-token price member: the listing states a decimal string (a
+/// JSON number is admitted too). A non-numeric, negative or non-finite
+/// member is not a price.
+fn price_per_token(value: &Value) -> Option<f64> {
+    let price = match value {
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        Value::Number(number) => number.as_f64()?,
+        _ => return None,
+    };
+    (price.is_finite() && price >= 0.0).then_some(price)
+}
+
 impl std::fmt::Debug for OpenAiProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The scoped ref is the visible token — the store and its
@@ -1177,6 +1352,19 @@ impl Provider for OpenAiProvider {
         // must deny it here rather than on the far side.
         check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
+        // The catalogue-only absence (DEC-010): a declaration the
+        // ingress admitted without a binding — the unbound `api_key`
+        // form — lists keylessly, but a send needs a bound credential.
+        // The denial lands here — before the auto-pool catalogue leg
+        // and the post — so an unbound `openrouter` connection issues
+        // no wire request and no fabricated header.
+        if token.is_none() && !open_proxy_connection(&self.connection) {
+            return Err(ProviderError::CredentialUnresolved {
+                connection: self.connection.clone(),
+                scope: format!("connections.{}.credential_ref", self.connection),
+                cause: None,
+            });
+        }
         // A fixed pin names connection and model verbatim. A
         // single-member auto pool naming this connection is an
         // explicit pick of it — the pick pins the connection, and the
@@ -1194,6 +1382,7 @@ impl Provider for OpenAiProvider {
                     .catalog_within(token.as_deref(), started)?
                     .into_iter()
                     .next()
+                    .map(|model| model.id)
                     .ok_or_else(|| ProviderError::UnpinnedModel {
                         connection: self.connection.clone(),
                     })?;
@@ -1245,16 +1434,29 @@ mod tests {
 
     /// DEC-011's endpoint rule: the configured base is trimmed and
     /// loses every trailing slash, and the empty result resolves the
-    /// recorded local default on `ollama` alone — a sibling id keeps
-    /// its own (absent) value and never borrows the local host.
+    /// recorded base on `ollama` and `openrouter` alone — a sibling id
+    /// keeps its own (absent) value and never borrows another's host.
     #[test]
-    fn endpoint_rule_trims_before_resolving_the_local_default() {
+    fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
         assert_eq!(endpoint_for("ollama", "   "), OLLAMA_DEFAULT_ENDPOINT);
         assert_eq!(endpoint_for("ollama", ""), OLLAMA_DEFAULT_ENDPOINT);
         assert_eq!(endpoint_for("ollama", " / "), OLLAMA_DEFAULT_ENDPOINT);
         assert_eq!(
             endpoint_for("ollama", "  http://127.0.0.1:9/v1/  "),
             "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(endpoint_for("openrouter", ""), OPENROUTER_DEFAULT_ENDPOINT);
+        assert_eq!(
+            endpoint_for("openrouter", "  "),
+            OPENROUTER_DEFAULT_ENDPOINT
+        );
+        assert_eq!(
+            endpoint_for("openrouter", " https://openrouter.ai/api/v1/ "),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            endpoint_for("openrouter", " https://openrouter.ai/api/v1/// "),
+            "https://openrouter.ai/api/v1"
         );
         assert_eq!(
             endpoint_for("openai", " https://api.openai.com/v1/// "),

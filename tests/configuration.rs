@@ -4579,6 +4579,9 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "llama-cpp",
         "llama",
         "lm-studio-local",
+        "open-router",
+        "openrouter-api",
+        "OpenRouter",
     ] {
         let row = open_proxy_row_for(lookalike);
         let error =
@@ -4614,6 +4617,7 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "novita",
         "nvidia",
         "ollama",
+        "openrouter",
     ];
     let mut admitted = Vec::new();
     for id in band {
@@ -4628,8 +4632,8 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
     }
     assert_eq!(
         admitted,
-        ["llama.cpp", "lm-studio", "litellm", "ollama"],
-        "the absent-binding admission is those four literal ids, not the band"
+        ["llama.cpp", "lm-studio", "litellm", "ollama", "openrouter"],
+        "the absent-binding admission is those five literal ids, not the band"
     );
 
     let error = Config::parse_validated(&open_proxy_row(
@@ -4693,6 +4697,58 @@ fn ollama_joins_the_credential_optional_class_without_widening_others() {
         assert!(
             matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
             "{id} wrong rejection: {error}"
+        );
+    }
+}
+
+/// `openrouter` joins the absent-binding admission as the literal id
+/// (DEC-010) — its keyless catalogue is unreachable otherwise — while
+/// its scoped binding stays admitted and every sibling id keeps the
+/// required `credential_ref`. The relaxation is the id, never the band.
+#[test]
+fn openrouter_joins_the_absent_binding_admission_without_widening_others() {
+    let keyless = Config::parse_validated(&open_proxy_row_for("openrouter"))
+        .expect("the keyless openrouter row is admitted");
+    assert_eq!(keyless.connections["openrouter"].kind, ConnKind::ApiKey);
+    assert_eq!(keyless.connections["openrouter"].credential_ref, None);
+
+    let bound = Config::parse_validated(&open_proxy_row_for("openrouter").replace(
+        "[connections.\"openrouter\"]",
+        "[connections.\"openrouter\"]\ncredential_ref = \"keyring:rivect/openrouter\"",
+    ))
+    .expect("the bound openrouter row is admitted");
+    assert_eq!(
+        bound.connections["openrouter"].credential_ref.as_deref(),
+        Some("keyring:rivect/openrouter")
+    );
+
+    // the key-gated siblings stay key-gated — the admission is the id
+    for id in ["openai", "ollama-cloud", "meta"] {
+        let error = Config::parse_validated(&open_proxy_row_for(id))
+            .expect_err("a sibling id still requires its binding");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{id} wrong rejection: {error}"
+        );
+    }
+
+    // a subscription declaration is never the catalogue-only form
+    let subscription =
+        open_proxy_row_for("openrouter").replace("kind = \"api_key\"", "kind = \"subscription\"");
+    let error = Config::parse_validated(&subscription)
+        .expect_err("a subscription id still requires its binding");
+    assert!(
+        matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::Subscription),
+        "wrong rejection: {error}"
+    );
+
+    // a name merely resembling the literal id is a different connection
+    for lookalike in ["open-router", "openrouter-api", "OpenRouter"] {
+        let error = Config::parse_validated(&open_proxy_row_for(lookalike))
+            .expect_err("a lookalike id is not the recorded class");
+        assert!(
+            matches!(&error.issue, ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::ApiKey),
+            "{lookalike} wrong rejection: {error}"
         );
     }
 }

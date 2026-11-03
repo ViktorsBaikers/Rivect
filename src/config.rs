@@ -7,7 +7,7 @@
 use crate::contracts::ErrorCode;
 use crate::executor::{FileIdentity, Unattested, WriteIdentity};
 use crate::identity::{IdentityError, IdentityKind, IdentityMigration, IdentityRebind};
-use crate::providers::{SecretRef, SecretRefError, open_proxy_connection};
+use crate::providers::{SecretRef, SecretRefError, admit_absent_binding};
 use crate::state::{StoreError, TaskStore};
 use serde::Serialize;
 use serde_json::Value;
@@ -2168,13 +2168,13 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
         match connection.kind {
             ConnKind::ApiKey | ConnKind::Subscription => {
                 // The recorded credential-optional classes serve with or
-                // without a key — the open proxy (`litellm`) and the
+                // without a key — the open proxy (`litellm`), the
                 // local-endpoint class (`llama.cpp`, `lm-studio`,
-                // `ollama`) — so an absent `credential_ref` is their
-                // recorded unauthenticated form, never a dummy key.
-                // Every other kind still states the binding.
+                // `ollama`) and the catalogue-only `openrouter` — so an
+                // absent `credential_ref` is their recorded form, never a
+                // dummy key. Every other kind still states the binding.
                 if connection.credential_ref.is_none()
-                    && !(connection.kind == ConnKind::ApiKey && open_proxy_connection(name))
+                    && !(connection.kind == ConnKind::ApiKey && admit_absent_binding(name))
                 {
                     return Err(ConfigError::schema(
                         format!("{key}.credential_ref"),

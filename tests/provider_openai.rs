@@ -1,14 +1,15 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
-//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama}):
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter}):
 //! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
 //! wiremock fixtures, no OMP, no user adapter, no real host. `ollama`
 //! is the credential-optional local class whose catalogue carries the
-//! bounded native discovery overlay. The SSE legs pin the shared
-//! parser's WHATWG §9.2.5–9.2.6 conformance.
-//! TP-PROVIDER-INSTALLED::{openai,meta,ollama} stays NOT_RUN — the
-//! ignored named cases carry that status explicitly.
+//! bounded native discovery overlay; `openrouter` is the catalogue-only
+//! keyless class behind the recorded paste-key form. The SSE legs pin
+//! the shared parser's WHATWG §9.2.5–9.2.6 conformance.
+//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter} stays
+//! NOT_RUN — the ignored named cases carry that status explicitly.
 
 #![allow(
     clippy::unwrap_used,
@@ -26,7 +27,8 @@ use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
 use rivect::providers::{
-    CatalogModel, Dialect, Provider, ProviderError, StoreKind, TransportCause, TransportClass,
+    CatalogModel, Dialect, ModelPrice, Provider, ProviderError, StoreKind, TransportCause,
+    TransportClass,
 };
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -3065,6 +3067,50 @@ async fn wrong_credential_profile_or_region_denies_with_typed_context_without_se
         !format!("{:?}", world.runtime).contains(SECRET),
         "runtime Debug never carries credential material"
     );
+}
+
+/// A `local` declaration of the shipped `openai` id that binds a
+/// `profile` is the same contradiction: the kind says local endpoint
+/// while the profile reaches real material. The adapter denies by
+/// declaration kind before any credential resolution, so the seeded key
+/// is never read and no wire leg runs.
+#[tokio::test]
+async fn openai_local_profile_declaration_never_sends() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai]\nkind = \"local\"\nendpoint = \"{}\"\nprofile = \"p1\"\n\
+         [profiles.p1]\ncredential_ref = \"keyring:rivect-test/p1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openai\", model_id = \"gpt-5.2\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("the contradictory declaration is admitted at ingress");
+    assert_eq!(config.connections["openai"].profile.as_deref(), Some("p1"));
+
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[("keyring:rivect-test/p1", SECRET)],
+    ));
+    let err = provider_result(config, "openai".to_string(), store)
+        .expect_err("the local declaration never resolves the profile's material");
+    match &err {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, "openai");
+            assert_eq!(scope, "connections.openai.kind");
+            assert!(cause.is_none(), "the kind denial names no ref");
+        }
+        other => panic!("the local profile form is the typed unresolved denial, not {other:?}"),
+    }
+    assert_no_secret_or_body(&err);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
 }
 
 /// Material the store resolves but the dialect cannot use — non-UTF-8
@@ -6645,6 +6691,965 @@ async fn ollama_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::ollama = NOT_RUN"]
 fn provider_installed_ollama() {}
+
+// ----- openrouter --------------------------------------------------------
+//
+// `openrouter` records the OpenAI Responses transport behind the
+// paste-key form (DEC-003): an empty configured endpoint resolves
+// `https://openrouter.ai/api/v1`, the keyless `GET /models` lists only
+// tool-capable entries and maps their recorded surfaces (DEC-010), and
+// an unbound send denies before any wire leg even though the same
+// declaration lists keylessly. `models` HTTP 200 is never entitlement.
+
+const OPENROUTER_REF: &str = "keyring:rivect-test/openrouter";
+
+const OPENROUTER_MODEL: &str = "vendor/tool-model";
+
+/// Fixture paste-key material — shaped like the recorded `sk-or-…` form,
+/// never a real credential, only ever sent to localhost.
+const OPENROUTER_SECRET: &str = "sk-or-fixture-paste-key";
+
+/// One keyless `api_key` declaration for `openrouter` — the adopted
+/// absent-binding form; no `credential_ref` member.
+fn openrouter_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same declaration with a scoped binding — the paste-key half.
+fn openrouter_bound_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{OPENROUTER_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn openrouter_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "openrouter".to_string(), store.clone())
+        .expect("the shared adapter builds for the keyless openrouter id");
+    (provider, store)
+}
+
+fn openrouter_bound_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(OPENROUTER_REF, OPENROUTER_SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "openrouter".to_string(), store.clone())
+        .expect("the shared adapter builds for the bound openrouter id");
+    (provider, store)
+}
+
+/// The rich catalogue on a plain OS thread: the blocking client cannot
+/// be dropped inside a tokio context.
+fn openrouter_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    drop_blocking(provider);
+    outcome.expect("the openrouter catalogue answers")
+}
+
+// ----- TP-PROVIDER-WIRE::openrouter ---------------------------------
+
+/// A configured `openrouter` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the bound pin,
+/// the shared adapter posts exactly the frozen manifest as a Responses
+/// request — `store: false`, `stream: true`, pinned model,
+/// instructions, tool surface and pinned effort verbatim, no
+/// unrecorded reasoning artifact — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the
+/// provider's reported usage.
+#[tokio::test]
+async fn openrouter_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified openrouter outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 17, "output_tokens": 6, "total_tokens": 23})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: prove the openrouter wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified openrouter outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {OPENROUTER_SECRET}")
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], OPENROUTER_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the record states no replay artifact — the include is never requested: {body}"
+    );
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "openrouter");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 17,
+            completion_tokens: 6,
+            total_tokens: 23,
+        }
+    );
+    let explain = broker.sent_cost_explain(&manifest);
+    assert_eq!(explain.bound, manifest.cost_bound);
+    assert_eq!(explain.confirmed, Some(23));
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/openrouter", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::openrouter ------------------------------
+
+/// The keyless `GET /models` filters to entries whose
+/// `supported_parameters` declares `tools`: an entry without the
+/// capability is never offered — nor is a non-string id or a
+/// non-array parameter list — the listing is sorted, and no credential
+/// header rides the unbound request.
+#[tokio::test]
+async fn openrouter_catalog_filters_to_tool_capable_entries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "vendor/tools", "supported_parameters": ["tools", "reasoning"]},
+                {"id": "vendor/text-only", "supported_parameters": ["temperature", "top_p"]},
+                {"id": "vendor/absent-parameters"},
+                {"id": "vendor/tools-again", "supported_parameters": ["tools"]},
+                {"id": "", "supported_parameters": ["tools"]},
+                {"id": 7, "supported_parameters": ["tools"]},
+                {"id": "vendor/non-array", "supported_parameters": "tools"},
+                {"id": "vendor/non-string", "supported_parameters": [7, null]},
+                {"id": "vendor/mixed", "supported_parameters": [7, "tools"]},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_config(&server_uri_v1(&server))).expect("valid");
+    let models = openrouter_catalog(openrouter_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["vendor/mixed", "vendor/tools", "vendor/tools-again"],
+        "only tool-capable, non-empty string ids are offered, sorted"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.headers.get("authorization").is_none()),
+        "the keyless listing fabricates no Authorization header"
+    );
+}
+
+/// The surviving entry's own surfaces map onto the shared record:
+/// `reasoning` from `supported_parameters`, `vision` from
+/// `architecture.input_modalities`, `context_length`, the top
+/// provider's `max_completion_tokens`, and the per-token USD pricing
+/// scaled to 1M. A JSON number is admitted like the decimal string,
+/// while an absent, non-numeric, negative or partial pair is not a
+/// figure — the listing never supplies a default.
+#[tokio::test]
+async fn openrouter_catalog_maps_reasoning_context_and_price() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {
+                    "id": "vendor/rich",
+                    "supported_parameters": ["tools", "reasoning"],
+                    "architecture": {"input_modalities": ["text", "image"]},
+                    "context_length": 128000,
+                    "top_provider": {"max_completion_tokens": 16384},
+                    "pricing": {"prompt": "0.0000025", "completion": "0.00001"},
+                },
+                {
+                    "id": "vendor/invalid",
+                    "supported_parameters": ["tools"],
+                    "architecture": {"input_modalities": ["text"]},
+                    "context_length": 0,
+                    "top_provider": {"max_completion_tokens": null},
+                    "pricing": {"prompt": "not-a-price", "completion": "0.00001"},
+                },
+                {
+                    "id": "vendor/numeric-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": 0.000001, "completion": 0.000002},
+                },
+                {
+                    "id": "vendor/negative-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "-0.000001", "completion": "0.000002"},
+                },
+                {
+                    "id": "vendor/partial-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "0.000001"},
+                },
+                {
+                    "id": "vendor/nan-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "NaN", "completion": "0.000001"},
+                },
+                {
+                    "id": "vendor/infinite-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "0.000001", "completion": "inf"},
+                },
+                {
+                    "id": "vendor/overflow-price",
+                    "supported_parameters": ["tools"],
+                    "pricing": {"prompt": "1e303", "completion": "0.000001"},
+                },
+                {"id": "vendor/absent", "supported_parameters": ["tools"]},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_config(&server_uri_v1(&server))).expect("valid");
+    let models = openrouter_catalog(openrouter_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "vendor/absent",
+            "vendor/infinite-price",
+            "vendor/invalid",
+            "vendor/nan-price",
+            "vendor/negative-price",
+            "vendor/numeric-price",
+            "vendor/overflow-price",
+            "vendor/partial-price",
+            "vendor/rich",
+        ],
+        "every tool-capable entry offers, in sorted order"
+    );
+    let offered = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .expect("the fixture entry is offered")
+    };
+    let id_only = |id: &str| CatalogModel {
+        id: id.to_string(),
+        ..CatalogModel::default()
+    };
+
+    let rich = offered("vendor/rich");
+    assert!(rich.reasoning, "`reasoning` is a declared parameter");
+    assert!(rich.vision, "`image` is a declared input modality");
+    assert_eq!(rich.context_window, Some(128_000));
+    assert_eq!(rich.max_output_tokens, Some(16_384));
+    let ModelPrice::Usd {
+        input_per_1m,
+        output_per_1m,
+    } = rich.price
+    else {
+        panic!(
+            "the stated per-token pair maps to a USD price: {:?}",
+            rich.price
+        );
+    };
+    assert!(
+        (input_per_1m - 2.5).abs() < 1e-9,
+        "2.5e-6 per token is 2.5 per 1M, got {input_per_1m}"
+    );
+    assert!(
+        (output_per_1m - 10.0).abs() < 1e-9,
+        "1e-5 per token is 10 per 1M, got {output_per_1m}"
+    );
+
+    let ModelPrice::Usd {
+        input_per_1m,
+        output_per_1m,
+    } = offered("vendor/numeric-price").price
+    else {
+        panic!("the JSON-number pair is a price");
+    };
+    assert!(
+        (input_per_1m - 1.0).abs() < 1e-9 && (output_per_1m - 2.0).abs() < 1e-9,
+        "1e-6 and 2e-6 per token are 1 and 2 per 1M, got {input_per_1m}/{output_per_1m}"
+    );
+
+    assert_eq!(
+        offered("vendor/invalid"),
+        &id_only("vendor/invalid"),
+        "an invalid context/max/price pair stays empty and unknown"
+    );
+    for id in [
+        "vendor/negative-price",
+        "vendor/partial-price",
+        "vendor/nan-price",
+        "vendor/infinite-price",
+    ] {
+        assert_eq!(
+            offered(id),
+            &id_only(id),
+            "a negative, partial or non-finite pair releases no figure"
+        );
+    }
+    assert_eq!(
+        offered("vendor/overflow-price"),
+        &id_only("vendor/overflow-price"),
+        "a finite per-token figure whose 1M scale is not finite releases no price"
+    );
+    assert_eq!(
+        offered("vendor/absent"),
+        &id_only("vendor/absent"),
+        "absent surfaces are never defaulted to a figure"
+    );
+}
+
+/// The keyless catalogue requests no credential material: a sibling
+/// scope holding real material never reaches the request and no header
+/// is fabricated, while the tool-capable listing still answers.
+#[tokio::test]
+async fn openrouter_keyless_listing_never_requests_material() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OPENROUTER_MODEL, "supported_parameters": ["tools"]}],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(NEIGHBOR_REF, OPENROUTER_SECRET)],
+    ));
+    let provider = provider_result(config, "openrouter".to_string(), store)
+        .expect("the keyless adapter builds");
+    let models = openrouter_catalog(provider);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![OPENROUTER_MODEL],
+        "the unbound listing answers its offers"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "the keyless catalogue requests no material — never a fabricated key"
+    );
+}
+
+/// A bound `openrouter` declaration sends the paste key as the
+/// catalogue bearer: the keyless form is the absent binding, never a
+/// blanket no-header rule.
+#[tokio::test]
+async fn openrouter_bound_listing_carries_the_paste_key_bearer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OPENROUTER_MODEL, "supported_parameters": ["tools"]}],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let models = openrouter_catalog(openrouter_bound_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![OPENROUTER_MODEL],
+        "the bound listing answers its offers"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {OPENROUTER_SECRET}"),
+        "the bound catalogue carries its paste key as the bearer"
+    );
+}
+
+/// A keyless declaration is catalogue-only (DEC-010): the unbound send
+/// denies typed before any wire leg and issues neither a catalogue GET
+/// nor a POST.
+#[tokio::test]
+async fn openrouter_keyless_send_denies_without_a_binding() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&openrouter_config(&server_uri_v1(&server))).expect("valid");
+    // The frozen pin is the same one the bound form would send; only
+    // the declaration the adapter was built from is keyless.
+    let bound =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let manifest = prepared_manifest(&bound);
+    let (provider, _store) = openrouter_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    match outcome.expect_err("the unbound send denies") {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, "openrouter");
+            assert_eq!(scope, "connections.openrouter.credential_ref");
+            assert!(cause.is_none(), "the unbound declaration named no ref");
+        }
+        other => panic!("the unbound send is the typed unresolved denial, not {other:?}"),
+    }
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(
+        requests.is_empty(),
+        "the denial lands before any wire leg: {requests:?}"
+    );
+}
+
+/// An `openrouter` declaration of `kind = "local"` is the reserved
+/// dialect id, not the fixture class (DEC-010): ingress admits the form
+/// and ranking may keep it, but the adapter denies
+/// `CredentialUnresolved` by declaration kind at build — neither the
+/// catalogue GET nor the POST runs.
+#[tokio::test]
+async fn openrouter_local_declaration_never_sends() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"local\"\nendpoint = \"{}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("the local declaration is admitted at ingress");
+    assert_eq!(config.connections["openrouter"].kind, ConnKind::Local);
+    assert!(
+        rivect::providers::offline_usable(&config.connections, &config.profiles, "openrouter"),
+        "the local class ranks like any local row"
+    );
+
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config, "openrouter".to_string(), store)
+        .expect_err("the reserved dialect id builds no adapter");
+    match &err {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, "openrouter");
+            assert_eq!(scope, "connections.openrouter.kind");
+            assert!(cause.is_none(), "the declaration bound no credential");
+        }
+        other => panic!("the local declaration is the typed unresolved denial, not {other:?}"),
+    }
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// A `local` declaration of the reserved literal that binds a `profile`
+/// is contradictory: the kind says local endpoint while the profile
+/// reaches real `sk-or-…` material. The adapter denies by declaration
+/// kind before any credential resolution, so the seeded key is never
+/// read and no wire leg runs.
+#[tokio::test]
+async fn openrouter_local_profile_declaration_never_sends() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"local\"\nendpoint = \"{}\"\nprofile = \"p1\"\n\
+         [profiles.p1]\ncredential_ref = \"keyring:rivect-test/p1\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("the contradictory declaration is admitted at ingress");
+    assert_eq!(
+        config.connections["openrouter"].profile.as_deref(),
+        Some("p1")
+    );
+
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[("keyring:rivect-test/p1", OPENROUTER_SECRET)],
+    ));
+    let err = provider_result(config, "openrouter".to_string(), store)
+        .expect_err("the local declaration never resolves the profile's material");
+    match &err {
+        ProviderError::CredentialUnresolved {
+            connection,
+            scope,
+            cause,
+        } => {
+            assert_eq!(connection, "openrouter");
+            assert_eq!(scope, "connections.openrouter.kind");
+            assert!(cause.is_none(), "the kind denial names no ref");
+        }
+        other => panic!("the local profile form is the typed unresolved denial, not {other:?}"),
+    }
+    assert!(
+        !format!("{err} {err:?}").contains(OPENROUTER_SECRET),
+        "the denial never renders the seeded material: {err}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert!(requests.is_empty(), "no wire leg ran: {requests:?}");
+}
+
+/// A `/models` HTTP 200 is never entitlement: the listing genuinely
+/// answers the pinned id, yet the send rides only its request leg and
+/// the unmounted peer's status is the typed denial — the 200 answer
+/// releases nothing.
+#[tokio::test]
+async fn openrouter_models_http_200_is_never_entitlement() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OPENROUTER_MODEL, "supported_parameters": ["tools"]}],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let models = openrouter_catalog(openrouter_bound_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![OPENROUTER_MODEL],
+        "the 200 listing answers the pinned id"
+    );
+
+    let (provider, _store) = openrouter_bound_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a 200 catalogue never releases the pin");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("the unmounted request leg is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "openrouter");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 404 },
+        "the request leg answers the peer's status, never a listing-granted success: {cause}"
+    );
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        vec!["/v1/models", "/v1/responses"],
+        "the listing leg plus the request leg — the 200 grants no send"
+    );
+}
+
+/// A typed negative control for the openrouter Responses surface: a
+/// partial tool item, an EOF without a terminal and an unclassifiable
+/// terminal status each deny typed and account nothing; a refused
+/// bearer is the typed status denial and renders no secret.
+#[tokio::test]
+async fn openrouter_adverse_wire_input_never_reports_success() {
+    // a stream ending mid output item is a typed violation
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "call_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""}, "output_index": 0}),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: partial item",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "a stream ended mid output item is a typed violation: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // EOF without a terminal is the unknown terminal
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        format!(
+            "{}{}",
+            sse_block(
+                "response.output_item.added",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+            ),
+            sse_block(
+                "response.output_item.done",
+                &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}, "output_index": 0}),
+            ),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: no terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF without a terminal is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a completed terminal whose status the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"status": "esoteric", "output": []}}),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: unknown status",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal status is never success: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a refused bearer is the typed status denial, and the error renders
+    // neither the credential nor the peer's body
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string("fixture-401-body-marker-never-in-errors"),
+        )
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: refused bearer",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest);
+    let err = outcome.expect_err("a refused bearer is never success");
+    assert_eq!(broker.accounted_requests(), 0);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(OPENROUTER_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
+    assert!(
+        !rendered.contains("fixture-401-body-marker-never-in-errors"),
+        "the denial renders no peer body: {rendered}"
+    );
+    let ModelError::Provider(ProviderError::Transport { connection, cause }) = &err else {
+        panic!("the refused bearer is the typed transport denial: {err:?}");
+    };
+    assert_eq!(connection, "openrouter");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the peer's own status is the denial's context: {cause}"
+    );
+    drop_blocking(broker);
+}
+
+/// The dialect keys on the literal connection id, never an auth label:
+/// `openrouter` records the Responses surface, an unrouted sibling
+/// builds no adapter, the Chat-Completions adapter refuses
+/// `openrouter`, a `local` declaration of the reserved literal is never
+/// fixture-served, and a configured region is the typed denial.
+#[test]
+fn openrouter_dialect_is_keyed_on_the_literal_connection_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("openrouter"),
+        Some(Dialect::Responses),
+        "the literal id records the Responses dialect"
+    );
+    let config =
+        Config::parse_validated(&openrouter_bound_config("http://127.0.0.1:1/v1")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config.clone(), "openai-codex".to_string(), store)
+        .expect_err("a different literal id is not this dialect");
+    assert!(matches!(err, ProviderError::DialectMismatch { .. }));
+
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let built = config.clone();
+    let err = std::thread::spawn(move || ChatCompletionsProvider::new(&built, "openrouter", store))
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("the CC adapter refuses the Responses id");
+    assert!(
+        matches!(err, ProviderError::DialectMismatch { .. }),
+        "a CC arm for `openrouter` is a dialect mismatch, not a served connection"
+    );
+
+    let local = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"openrouter\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let loopback = rivect::providers::LoopbackProvider::new();
+    let entry = local.connections.get("openrouter").expect("declared");
+    assert!(
+        !loopback.serves("openrouter", entry),
+        "a literal id the dialect map reserves is never local-fixture served"
+    );
+
+    // a configured region is outside the recorded endpoint contract
+    let regional = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"{OPENROUTER_REF}\"\nregion = \"eu\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"openrouter\", model_id = \"{OPENROUTER_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(regional, "openrouter".to_string(), store)
+        .expect_err("a configured region is never silently ignored");
+    assert!(
+        matches!(&err, ProviderError::RegionMismatch { connection, region }
+            if connection == "openrouter" && region == "eu"),
+        "a configured region is the typed denial: {err:?}"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for `openrouter`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn openrouter_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": OPENROUTER_MODEL, "supported_parameters": ["tools"]}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&openrouter_bound_config(&server_uri_v1(&server))).expect("valid");
+    let keyless =
+        Config::parse_validated(&openrouter_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the keyless listing answers its tool-capable offers.
+    let models = openrouter_catalog(openrouter_provider(&keyless).0);
+    reported.insert(
+        "CATALOG",
+        if models
+            .iter()
+            .map(|model| model.id.as_str())
+            .eq(std::iter::once(OPENROUTER_MODEL))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "openrouter".to_string(), empty.clone()).expect("resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        openrouter_bound_provider(&config),
+        &config,
+        "/world/openrouter",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/openrouter", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider =
+        provider_result(config.clone(), "openrouter".to_string(), empty.clone()).expect("resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(OPENROUTER_REF, OPENROUTER_SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::openrouter ----------------------------
+
+/// TP-PROVIDER-INSTALLED::openrouter = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::openrouter = NOT_RUN"]
+fn provider_installed_openrouter() {}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 

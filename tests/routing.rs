@@ -6252,3 +6252,73 @@ fn nvidia_offline_eligibility_is_binding_level_typed() {
         "the absent binding is the local-endpoint predicate's alone: {error}"
     );
 }
+
+/// `openrouter` is admitted at ingress without a binding for its keyless
+/// catalogue, but it is not send-eligible: the eligibility predicate
+/// keeps the open-proxy class alone, so the fixed pin is the typed
+/// live-grant denial and the real Broker refuses it at prepare. The same
+/// literal id with its scoped binding is send-eligible.
+#[test]
+fn openrouter_unbound_connection_is_not_send_eligible() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"https://openrouter.ai/api/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"openrouter\", model_id = \"vendor/tool-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the keyless catalogue row is admitted at ingress");
+    assert_eq!(
+        config.connections["openrouter"].credential_ref, None,
+        "the admitted row binds no credential"
+    );
+    assert_eq!(
+        rivect::providers::dialect_for("openrouter"),
+        Some(Dialect::Responses),
+        "the literal id routes to the shared Responses dialect"
+    );
+
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "openrouter".to_string(),
+        model_id: "vendor/tool-model".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "the absent binding is not a send grant"
+    );
+    assert!(
+        !rivect::providers::offline_usable(&config.connections, &config.profiles, "openrouter"),
+        "keyless catalogue admission never widens send eligibility"
+    );
+
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let err = broker
+        .prepare("main", &config, "/world/openrouter", "goal: keyless send")
+        .expect_err("the unbound pin never prepares");
+    assert!(
+        matches!(
+            err,
+            ModelError::Provider(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "the real admission path refuses it: {err:?}"
+    );
+
+    // the same literal id with its scoped binding is send-eligible
+    let bound = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"https://openrouter.ai/api/v1\"\ncredential_ref = \"keyring:rivect/openrouter\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"openrouter\", model_id = \"vendor/tool-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the bound row is admitted");
+    assert!(
+        rivect::providers::offline_usable(&bound.connections, &bound.profiles, "openrouter"),
+        "a bound openrouter row is send-eligible"
+    );
+}
