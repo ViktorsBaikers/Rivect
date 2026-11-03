@@ -3261,6 +3261,127 @@ fn ollama_keyless_and_bound_catalog_forms_share_the_scoped_seam() {
     );
 }
 
+// ----- api-key class: ollama-cloud -------------------------------------------
+
+/// The `ollama-cloud` api-key class leg (AC-040f): the required bearer
+/// resolves through the scoped `SecretRef`/DEC-013 precedence — the
+/// connection's own `credential_ref`, and a bound profile's ref where
+/// the scope's trailing segment names that profile — an undeclared id
+/// keeps the typed denial, a resolved binding admits the pin offline,
+/// and a divergent profile scope is the mismatch. The class has no
+/// keyless form (PROH-010): an unbound declaration stays unresolved,
+/// a non-scoped binding is refused by the seam itself, and the api_key
+/// ingress refuses a declaration that binds nothing.
+#[test]
+fn ollama_cloud_api_key_binding_resolves_through_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.\"ollama-cloud\"]\nkind = \"api_key\"\nendpoint = \"https://ollama.com\"\ncredential_ref = \"keyring:rivect-test/oc-direct\"\n\
+         [connections.oc-profiled]\nkind = \"api_key\"\nendpoint = \"https://ollama.com\"\ncredential_ref = \"keyring:rivect-test/oc-scope\"\nprofile = \"oc-team\"\n\
+         [profiles.oc-team]\ncredential_ref = \"keyring:rivect-test/oc-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "ollama-cloud")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/oc-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "oc-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/oc-team");
+
+    // an undeclared id is the typed denial, never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "ollama-cloud",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "oc-profiled",
+    ));
+
+    // the class has no keyless form: an unbound declaration the ingress
+    // admits stays unresolved
+    let unbound = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"ollama-cloud\"]\nkind = \"local\"\nendpoint = \"https://ollama.com\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a local declaration parses");
+    assert!(
+        matches!(
+            resolve_credential(&unbound, "ollama-cloud"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "the native class requires its binding"
+    );
+
+    // the api_key ingress refuses a declaration that binds nothing
+    let keyless = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"ollama-cloud\"]\nkind = \"api_key\"\nendpoint = \"https://ollama.com\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect_err("a keyless api_key row is refused");
+    assert!(
+        matches!(
+            &keyless.issue,
+            ConfigIssue::CredentialRefRequired { kind }
+                if *kind == rivect::config::ConnKind::ApiKey
+        ),
+        "the ingress denial names the missing binding: {keyless}"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/oc-team\"",
+        "keyring:rivect-test/other-team\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "oc-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+
+    // a non-scoped binding is refused by the seam itself: `store:scope`
+    // is the only admitted shape
+    let mut tampered = Config::parse_validated(toml).expect("config parses");
+    tampered
+        .connections
+        .get_mut("ollama-cloud")
+        .expect("declared")
+        .credential_ref = Some("plaintext-token".to_string());
+    assert!(
+        matches!(
+            resolve_credential(&tampered, "ollama-cloud"),
+            Err(ProviderError::CredentialUnresolved {
+                cause: Some(SecretRefError::NotScoped),
+                ..
+            })
+        ),
+        "a non-scoped binding is the typed unresolved denial"
+    );
+}
+
 // ----- api-key class: meta ----------------------------------------------------
 
 /// The api-key class leg (AC-040f) for the band's Responses-dialect

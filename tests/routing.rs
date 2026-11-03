@@ -4393,6 +4393,56 @@ fn a_reserved_connection_denies_with_the_unserved_dialect_truth() {
     );
 }
 
+/// The native `ollama-chat` dialect's unserved truth (DEC-001): the
+/// literal `ollama-cloud` id is reserved by the dialect map, so a
+/// dispatch through an adapter that does not serve it denies with the
+/// build truth — the display names the recorded dialect, and no byte
+/// reaches the wire.
+#[test]
+fn ollama_cloud_dialect_unserved_display_names_ollama_chat() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"ollama-cloud\"]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11439\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n\
+         [models.purposes.relay]\n\
+         model = { mode = \"fixed\", connection = \"ollama-cloud\", model_id = \"native-model\" }\n\
+         fallback = { mode = \"off\" }\n",
+    )
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(Vec::new(), 0);
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/native-reserved",
+            "goal: native reserved",
+        )
+        .expect("the declared reserved candidate ranks");
+    let error = broker
+        .dispatch("/world/native-reserved", &manifest)
+        .expect_err("the reserved native id denies before any send");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::DialectUnserved { connection, dialect })
+                if connection == "ollama-cloud" && *dialect == Dialect::OllamaChat
+        ),
+        "the denial is the typed build truth: {error}"
+    );
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert_eq!(
+        source.to_string(),
+        "connection ollama-cloud is reserved for dialect ollama-chat; no installed adapter serves it in this build",
+        "the display names the recorded native dialect"
+    );
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "the reserved native id never reached the wire"
+    );
+}
+
 // ----- band-1 connection legs ---------------------------------------------------
 
 /// `coreweave` is a served Chat-Completions id, not a reserved one:

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 pub mod gemini;
 pub mod local;
+pub mod ollama_cloud;
 pub mod openai;
 pub mod sse;
 
@@ -1130,8 +1131,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// recorded local Responses plug with the optional credential
 /// (DEC-009); `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
-/// `custom-chat-completions` speaks the OpenAI-compatible Chat
-/// Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
+/// `ollama-cloud` its recorded native `ollama-chat` JSONL dialect
+/// (DEC-001), `custom-chat-completions` speaks the OpenAI-compatible
+/// Chat Completions dialect and `aiand`/`aimlapi`/`alibaba-coding-plan`/
 /// `alibaba-token-plan`/`coreweave`/`deepinfra`/`deepseek`/`firepass`/`fireworks`/`gmi-cloud`/`groq`/`huggingface`/`kilo`
 /// are its recorded class-A/class-P plugs speaking the same dialect,
 /// with `litellm` the recorded class-B configured-proxy plug,
@@ -1156,6 +1158,10 @@ pub enum Dialect {
     /// compatible host wired under the literal `custom-chat-completions`
     /// id shares (HZN-008 class S).
     ChatCompletions,
+    /// The native Ollama Cloud chat API (`POST {endpoint}/api/chat`,
+    /// newline-delimited JSON) — the recorded dialect of the literal
+    /// `ollama-cloud` id (DEC-001), never SSE and never shared.
+    OllamaChat,
 }
 
 impl std::fmt::Display for Dialect {
@@ -1164,6 +1170,7 @@ impl std::fmt::Display for Dialect {
             Self::Responses => "responses",
             Self::Gemini => "gemini",
             Self::ChatCompletions => "chat-completions",
+            Self::OllamaChat => "ollama-chat",
         })
     }
 }
@@ -1177,6 +1184,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "abliteration" => Some(Dialect::Responses),
         "meta" => Some(Dialect::Responses),
         "ollama" => Some(Dialect::Responses),
+        "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         "aiand" => Some(Dialect::ChatCompletions),
