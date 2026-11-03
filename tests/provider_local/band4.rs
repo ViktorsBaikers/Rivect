@@ -1638,9 +1638,10 @@ fn provider_installed_venice() {}
 // `grok.com` accounting origin stay NOT_RUN — the configured `endpoint`
 // carries the API base verbatim and an empty one resolves the recorded
 // `https://api.x.ai/v1` default, while a configured `region` is denied:
-// the contract names none. The xAI `/models` listing is authoritative and
-// no vendored selected list is retained, so the listing alone offers ids
-// and a failed listing denies typed with no fabricated floor.
+// the contract names none. The xAI `/models` listing is authoritative,
+// drops the recorded non-chat image/STT/voice families, and no vendored
+// selected list is retained, so the listing alone offers chat ids and a
+// failed listing denies typed with no fabricated floor.
 
 /// The literal connection id this class serves.
 const XAI_OAUTH: &str = "xai-oauth";
@@ -1654,6 +1655,10 @@ const XAI_OAUTH_KEY: &str = "fixture-xai-oauth-device-token";
 
 /// The pinned model id the fixed-pin legs carry.
 const XAI_OAUTH_MODEL: &str = "grok-4";
+
+/// A curated listing id the recorded residue suppresses: the dial is
+/// unsupported.
+const XAI_OAUTH_SUPPRESSED_MODEL: &str = "grok-4.20-0309-reasoning";
 
 /// One configured `xai-oauth` connection pointing at the fixture peer: the
 /// api_key auth class resolves the device-code token through the scoped
@@ -1720,9 +1725,9 @@ fn xai_oauth_catalog_on_thread(
 /// through the standard Broker: the resolved device-code token rides the
 /// bearer, the adapter posts exactly the frozen manifest as a Responses
 /// request — `store: false`, `stream: true`, model and instructions
-/// verbatim, auto effort emitting no reasoning member and no
-/// `include` artifact the recorded contract does not name — and the one
-/// physical send is charged once with the provider's reported usage.
+/// verbatim, auto effort emitting no reasoning member and the recorded
+/// encrypted reasoning artifact riding `include` — and the one physical
+/// send is charged once with the provider's reported usage.
 #[tokio::test]
 async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
     let server = MockServer::start().await;
@@ -1767,9 +1772,10 @@ async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["model"], XAI_OAUTH_MODEL);
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
-    assert!(
-        body.get("include").is_none(),
-        "the recorded contract names no replay artifact — none is requested: {body}"
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "the recorded compat requests the encrypted reasoning artifact: {body}"
     );
     assert_eq!(body["instructions"], manifest.instructions);
     assert!(
@@ -1802,8 +1808,9 @@ async fn xai_oauth_valid_control_yields_one_outcome_and_one_physical_usage() {
 
 // ----- TP-PROVIDER-CATALOG::xai-oauth ----------------------------------------
 
-/// The xAI `/models` listing is authoritative: every listed id offers as
-/// an id-only entry and no vendored selected list adds a floor, so an
+/// The xAI `/models` listing is authoritative: every listed chat id offers
+/// as an id-only entry, the recording's non-chat image/STT/voice families
+/// are never offered, and no vendored selected list adds a floor, so an
 /// empty listing offers nothing. The listing leg authenticates with the
 /// resolved device-code token.
 #[tokio::test]
@@ -1814,6 +1821,7 @@ async fn xai_oauth_catalog_is_the_authoritative_listing() {
         vec![
             json!({"id": "grok-4", "context_length": 131072, "reasoning": true}),
             json!({"id": "grok-3"}),
+            json!({"id": "grok-imagine-1.0"}),
         ],
     )
     .await;
@@ -1821,7 +1829,11 @@ async fn xai_oauth_catalog_is_the_authoritative_listing() {
     let (provider, _store) = xai_oauth_provider(&config);
     let (provider, catalog) = xai_oauth_catalog_on_thread(provider);
     let models = catalog.expect("the authoritative listing answers");
-    assert_eq!(model_ids(&models), vec!["grok-3", "grok-4"]);
+    assert_eq!(
+        model_ids(&models),
+        vec!["grok-3", "grok-4"],
+        "the recorded non-chat image family is never offered: {models:?}"
+    );
     assert!(
         models.iter().all(|model| *model
             == CatalogModel {
@@ -1895,6 +1907,65 @@ async fn xai_oauth_failed_listing_denies_without_a_fabricated_floor() {
         .await
         .expect("the mock recorded the listing");
     assert_eq!(requests.len(), 1, "the refusal is the one catalogue leg");
+}
+
+/// A pinned effort on a curated id the recorded suppression residue names
+/// is a parameter the contract rejects: the denial lands typed before the
+/// wire body exists, never a request carrying a silently dropped
+/// `reasoning.effort`.
+#[tokio::test]
+async fn xai_oauth_suppressed_model_rejects_a_pinned_effort() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream("never reached", Vec::new(), None),
+    )
+    .await;
+    let config = Config::parse_validated(
+        &xai_oauth_config(&server_uri_v1(&server))
+            .replace(XAI_OAUTH_MODEL, XAI_OAUTH_SUPPRESSED_MODEL)
+            .replace(
+                "effort = { mode = \"auto\" }",
+                "effort = { mode = \"fixed\", value = \"high\" }",
+            ),
+    )
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        xai_oauth_provider(&config),
+        &config,
+        "/world/xai-oauth",
+        "goal: suppressed effort",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/xai-oauth", manifest);
+    let err = match outcome {
+        Err(ModelError::Provider(err)) => err,
+        other => panic!("the pinned effort is a typed denial, not a reply: {other:?}"),
+    };
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = &err
+    else {
+        panic!("the pinned effort is the typed unsupported parameter: {err:?}")
+    };
+    assert_eq!(connection, XAI_OAUTH);
+    assert_eq!(*parameter, "reasoning_effort");
+    assert_eq!(model, XAI_OAUTH_SUPPRESSED_MODEL);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected parameter charges nothing"
+    );
+    drop_blocking(broker);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
 }
 
 // ----- TP-PROVIDER-AUTH::xai-oauth -------------------------------------------
@@ -4095,18 +4166,12 @@ async fn xiaomi_valid_control_yields_one_outcome_and_one_physical_usage() {
 
 /// The configured base's `/models` listing is the whole catalogue and the
 /// configured base is the only host any leg contacts: the listing and the send
-/// both ride the configured peer, a stand-in for another cluster receives
-/// nothing, and a token-plan-shaped key resolves the PAYG literal rather than
-/// selecting a token-plan host (PROH-010). A failed listing is the typed
-/// denial on its one attempt — never a fallback to another cluster.
+/// both ride the configured peer, and a token-plan-shaped key resolves the
+/// PAYG literal rather than selecting a token-plan host (PROH-010). A failed
+/// listing is the typed denial on its one attempt — never a fallback to
+/// another cluster.
 #[tokio::test]
 async fn xiaomi_never_probes_another_region() {
-    // a token-plan stand-in: mounted and answering, but never configured, so
-    // any byte it sees would be an unrecorded cross-cluster probe
-    let sibling = MockServer::start().await;
-    mount_models(&sibling, vec![json!({"id": "token-plan-sibling"})]).await;
-    mount_chat(&sibling, completed_stream("sibling", None)).await;
-
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_MODEL})]).await;
     mount_chat(&server, completed_stream("payg", None)).await;
@@ -4137,11 +4202,6 @@ async fn xiaomi_never_probes_another_region() {
     for request in &primary {
         assert_eq!(received_auth(request), format!("Bearer {XIAOMI_KEY}"));
     }
-    let sibling_requests = sibling.received_requests().await.expect("recorded");
-    assert!(
-        sibling_requests.is_empty(),
-        "no other cluster was contacted: {sibling_requests:?}"
-    );
 
     // a token-plan-shaped key selects no base: the empty endpoint still
     // resolves the PAYG literal, and no token-plan host appears anywhere
@@ -4165,10 +4225,6 @@ async fn xiaomi_never_probes_another_region() {
         "a token-plan-shaped key never selects a cluster: {debug}"
     );
     drop_blocking(provider);
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "resolving the key opened no probe to the stand-in cluster"
-    );
 
     // a failed listing is a typed denial on its one attempt: no fallback
     // to a sibling cluster, and nothing accounted
@@ -4196,10 +4252,6 @@ async fn xiaomi_never_probes_another_region() {
         failing.received_requests().await.expect("recorded").len(),
         1,
         "the failed listing is one attempt, never a cross-cluster retry"
-    );
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "the failed leg never reached another cluster"
     );
 }
 
@@ -4776,18 +4828,12 @@ async fn xiaomi_token_plan_ams_valid_control_yields_one_outcome_and_one_physical
 
 /// The configured base's `/models` listing is the whole catalogue and the
 /// configured base is the only host any leg contacts: the listing and the send
-/// both ride the configured peer, a stand-in for another cluster receives
-/// nothing, and a PAYG-shaped key resolves the AMS literal rather than
-/// selecting another family host (PROH-010). A failed listing is the typed
-/// denial on its one attempt — never a fallback to another cluster.
+/// both ride the configured peer, and a PAYG-shaped key resolves the AMS
+/// literal rather than selecting another family host (PROH-010). A failed
+/// listing is the typed denial on its one attempt — never a fallback to
+/// another cluster.
 #[tokio::test]
 async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
-    // a family stand-in: mounted and answering, but never configured, so any
-    // byte it sees would be an unrecorded cross-cluster probe
-    let sibling = MockServer::start().await;
-    mount_models(&sibling, vec![json!({"id": "family-sibling"})]).await;
-    mount_chat(&sibling, completed_stream("sibling", None)).await;
-
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_AMS_MODEL})]).await;
     mount_chat(&server, completed_stream("ams", None)).await;
@@ -4821,11 +4867,6 @@ async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
             format!("Bearer {XIAOMI_AMS_KEY}")
         );
     }
-    let sibling_requests = sibling.received_requests().await.expect("recorded");
-    assert!(
-        sibling_requests.is_empty(),
-        "no other cluster was contacted: {sibling_requests:?}"
-    );
 
     // a PAYG-shaped key selects no base: the empty endpoint still resolves
     // the AMS literal, and no other family host appears anywhere
@@ -4851,10 +4892,6 @@ async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
         );
     }
     drop_blocking(provider);
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "resolving the key opened no probe to the stand-in cluster"
-    );
 
     // a failed listing is a typed denial on its one attempt: no fallback
     // to a sibling cluster, and nothing accounted
@@ -4882,10 +4919,6 @@ async fn xiaomi_token_plan_ams_never_retries_another_cluster() {
         failing.received_requests().await.expect("recorded").len(),
         1,
         "the failed listing is one attempt, never a cross-cluster retry"
-    );
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "the failed leg never reached another cluster"
     );
 }
 
@@ -5467,18 +5500,11 @@ async fn xiaomi_token_plan_cn_valid_control_yields_one_outcome_and_one_physical_
 
 /// The configured base's `/models` listing is the whole catalogue and the
 /// configured base is the only host any leg contacts: the listing and the send
-/// both ride the configured peer, a stand-in for another cluster receives
-/// nothing, and a PAYG-shaped key resolves the CN literal rather than
-/// selecting another family host (PROH-010). A failed listing is the typed
-/// denial on its one attempt — never a fallback to another cluster.
+/// both ride the configured peer, and a PAYG-shaped key resolves the CN literal
+/// rather than selecting another family host (PROH-010). A failed listing is
+/// the typed denial on its one attempt — never a fallback to another cluster.
 #[tokio::test]
 async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
-    // a family stand-in: mounted and answering, but never configured, so any
-    // byte it sees would be an unrecorded cross-cluster probe
-    let sibling = MockServer::start().await;
-    mount_models(&sibling, vec![json!({"id": "family-sibling"})]).await;
-    mount_chat(&sibling, completed_stream("sibling", None)).await;
-
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_CN_MODEL})]).await;
     mount_chat(&server, completed_stream("cn", None)).await;
@@ -5509,11 +5535,6 @@ async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
     for request in &primary {
         assert_eq!(received_auth(request), format!("Bearer {XIAOMI_CN_KEY}"));
     }
-    let sibling_requests = sibling.received_requests().await.expect("recorded");
-    assert!(
-        sibling_requests.is_empty(),
-        "no other cluster was contacted: {sibling_requests:?}"
-    );
 
     // a PAYG-shaped key selects no base: the empty endpoint still resolves
     // the CN literal, and no other family host appears anywhere
@@ -5539,10 +5560,6 @@ async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
         );
     }
     drop_blocking(provider);
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "resolving the key opened no probe to the stand-in cluster"
-    );
 
     // a failed listing is a typed denial on its one attempt: no fallback
     // to a sibling cluster, and nothing accounted
@@ -5570,10 +5587,6 @@ async fn xiaomi_token_plan_cn_never_retries_another_cluster() {
         failing.received_requests().await.expect("recorded").len(),
         1,
         "the failed listing is one attempt, never a cross-cluster retry"
-    );
-    assert!(
-        sibling.received_requests().await.expect("recorded").is_empty(),
-        "the failed leg never reached another cluster"
     );
 }
 
@@ -6158,22 +6171,13 @@ async fn xiaomi_token_plan_sgp_valid_control_yields_one_outcome_and_one_physical
 
 /// The configured base's `/models` listing is the whole catalogue and the
 /// configured base is the only host any leg contacts: the listing and the send
-/// both ride the configured peer, stand-ins for the AMS and CN clusters receive
-/// nothing, and a PAYG-shaped key resolves the SGP literal rather than
-/// selecting another family host (PROH-010). The recorded family ladder starts
-/// at SGP but is never inherited as a probe: a failed listing is the typed
-/// denial on its one attempt, with no sibling base tried or walked.
+/// both ride the configured peer, and a PAYG-shaped key resolves the SGP
+/// literal rather than selecting another family host (PROH-010). The recorded
+/// family ladder starts at SGP but is never inherited as a probe: a failed
+/// listing is the typed denial on its one attempt, with no sibling base tried
+/// or walked.
 #[tokio::test]
 async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
-    // family stand-ins: mounted and answering but never configured, so any
-    // byte they see would be an unrecorded cross-cluster probe
-    let ams_sibling = MockServer::start().await;
-    mount_models(&ams_sibling, vec![json!({"id": "family-ams-sibling"})]).await;
-    mount_chat(&ams_sibling, completed_stream("ams", None)).await;
-    let cn_sibling = MockServer::start().await;
-    mount_models(&cn_sibling, vec![json!({"id": "family-cn-sibling"})]).await;
-    mount_chat(&cn_sibling, completed_stream("cn", None)).await;
-
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": XIAOMI_SGP_MODEL})]).await;
     mount_chat(&server, completed_stream("sgp", None)).await;
@@ -6204,16 +6208,6 @@ async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
     for request in &primary {
         assert_eq!(received_auth(request), format!("Bearer {XIAOMI_SGP_KEY}"));
     }
-    let ams_requests = ams_sibling.received_requests().await.expect("recorded");
-    assert!(
-        ams_requests.is_empty(),
-        "the AMS stand-in received nothing: {ams_requests:?}"
-    );
-    let cn_requests = cn_sibling.received_requests().await.expect("recorded");
-    assert!(
-        cn_requests.is_empty(),
-        "the CN stand-in received nothing: {cn_requests:?}"
-    );
 
     // a PAYG-shaped key selects no base: the empty endpoint still resolves
     // the SGP literal, and no family host or ladder rung appears anywhere
@@ -6239,22 +6233,6 @@ async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
         );
     }
     drop_blocking(provider);
-    assert!(
-        ams_sibling
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "resolving the key opened no probe to the AMS stand-in"
-    );
-    assert!(
-        cn_sibling
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "resolving the key opened no probe to the CN stand-in"
-    );
 
     // a failed listing is a typed denial on its one attempt: no walk down a
     // sibling ladder rung, and nothing accounted
@@ -6282,22 +6260,6 @@ async fn xiaomi_token_plan_sgp_never_retries_another_cluster() {
         failing.received_requests().await.expect("recorded").len(),
         1,
         "the failed listing is one attempt, never a cross-cluster retry"
-    );
-    assert!(
-        ams_sibling
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "the failed leg never reached the AMS cluster"
-    );
-    assert!(
-        cn_sibling
-            .received_requests()
-            .await
-            .expect("recorded")
-            .is_empty(),
-        "the failed leg never reached the CN cluster"
     );
 }
 
@@ -6719,11 +6681,11 @@ fn provider_installed_xiaomi_token_plan_sgp() {}
 // under its own recorded predicates. The configured `endpoint` carries the
 // API base verbatim and an empty one resolves the recorded
 // `https://yolo-auto.com/v1` default; a configured `region` is denied because
-// the contract names none. The authoritative `/models` listing is the whole
-// catalogue — the bundled seed/reference index and the recorded
-// qwen3.8-versus-pinned-seed divergence have no vendored carrier here — and
-// every offered id states the provider-wide flat rate
-// (`ModelPrice::Usd{0.0,0.0}`), never a borrowed or unknown price. The
+// the contract names none. The authoritative `/models` listing merges over
+// the recorded pinned `deepseek-flash-v4` seed row — the wider reference
+// index and the recorded qwen3.8-versus-pinned-seed divergence have no
+// vendored carrier here — and every offered id states the provider-wide flat
+// rate (`ModelPrice::Usd{0.0,0.0}`), never a borrowed or unknown price. The
 // recorded no-store and `developer`-role refusals are never fabricated as
 // body fields, and the effort dial's `low`/`high` wire values ride verbatim
 // while the remapped `minimal`/`medium`/`xhigh` levels deny typed.
@@ -6741,6 +6703,9 @@ const YOLO_KEY: &str = "fixture-yolo-auto-api-key";
 /// The pinned model id the fixed-pin legs carry — the current listed id,
 /// not the retained record's pinned seed.
 const YOLO_MODEL: &str = "qwen3.8-27b";
+
+/// The retained record's pinned seed row: the only vendored offer floor.
+const YOLO_SEED_MODEL: &str = "deepseek-flash-v4";
 
 /// One configured `yolo-auto` connection pointing at the fixture peer: the
 /// api_key class resolves its scoped ref, the dialect comes from the literal
@@ -6876,14 +6841,15 @@ async fn yolo_auto_valid_control_yields_one_outcome_and_one_physical_usage() {
 
 // ----- TP-PROVIDER-CATALOG::yolo-auto ----------------------------------------
 
-/// The configured base's `/models` listing is the whole catalogue: the listed
-/// ids and only them are offered — no seed floor stands in for the retained
-/// record's pinned seed, so an empty answer offers nothing — and every offered
-/// id states the provider-wide flat rate (`ModelPrice::Usd{0.0,0.0}`) even
-/// when the wire entry states a nonzero pricing object, with no reasoning,
-/// vision, window or effort mark borrowed from another class.
+/// The recorded pinned seed row merges over the authoritative `/models`
+/// listing: `deepseek-flash-v4` offers even when the listing omits it,
+/// carrying its recorded reasoning mark, image-input mark, 131072-token
+/// window and effort dial, while another listed id carries its id alone.
+/// Every offered id states the provider-wide flat rate
+/// (`ModelPrice::Usd{0.0,0.0}`) even when the wire entry states a nonzero
+/// pricing object, and an empty answer keeps the seed floor.
 #[tokio::test]
-async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing() {
+async fn yolo_auto_catalog_merges_the_recorded_seed_row_and_flat_rate() {
     let server = MockServer::start().await;
     mount_models(
         &server,
@@ -6892,7 +6858,6 @@ async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing()
                 "id": YOLO_MODEL,
                 "pricing": {"prompt": "0.001", "completion": "0.002"},
             }),
-            json!({"id": "deepseek-flash-v4"}),
             json!({"id": "served-by-another-class"}),
         ],
     )
@@ -6905,8 +6870,8 @@ async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing()
     offered.sort_unstable();
     assert_eq!(
         offered,
-        vec!["deepseek-flash-v4", YOLO_MODEL, "served-by-another-class"],
-        "the listing's own ids are the whole offer set — no seed floor"
+        vec![YOLO_SEED_MODEL, YOLO_MODEL, "served-by-another-class"],
+        "the listing's own ids plus the recorded seed floor"
     );
     let flat_rate = ModelPrice::Usd {
         input_per_1m: 0.0,
@@ -6918,22 +6883,43 @@ async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing()
             "every offered id states the flat rate, never a wire or borrowed price: {}",
             model.id
         );
-        assert!(
-            !model.reasoning,
-            "no reasoning mark is invented: {}",
-            model.id
-        );
-        assert!(!model.vision, "no image mark is invented: {}", model.id);
-        assert_eq!(
-            model.context_window, None,
-            "the retained seed's window is never borrowed: {}",
-            model.id
-        );
-        assert!(
-            model.efforts.is_empty(),
-            "no effort dial is invented: {}",
-            model.id
-        );
+        if model.id == YOLO_SEED_MODEL {
+            assert!(model.reasoning, "the pinned seed states reasoning");
+            assert!(model.vision, "the pinned seed states image input");
+            assert_eq!(
+                model.context_window,
+                Some(131_072),
+                "the pinned seed states its recorded window"
+            );
+            assert_eq!(
+                model.efforts,
+                vec![
+                    EffortLevel::Minimal,
+                    EffortLevel::Low,
+                    EffortLevel::Medium,
+                    EffortLevel::High,
+                    EffortLevel::Xhigh,
+                ],
+                "the pinned seed states its recorded effort dial"
+            );
+        } else {
+            assert!(
+                !model.reasoning,
+                "no reasoning mark is borrowed: {}",
+                model.id
+            );
+            assert!(!model.vision, "no image mark is borrowed: {}", model.id);
+            assert_eq!(
+                model.context_window, None,
+                "no window is borrowed: {}",
+                model.id
+            );
+            assert!(
+                model.efforts.is_empty(),
+                "no effort dial is borrowed: {}",
+                model.id
+            );
+        }
     }
     drop_blocking(provider);
 
@@ -6949,17 +6935,23 @@ async fn yolo_auto_catalog_is_the_authoritative_listing_with_flat_rate_pricing()
         "the required api-key class lists under the resolved bearer"
     );
 
-    // the authoritative listing stands alone: an empty answer offers nothing
+    // the recorded seed row stands alone: an empty answer keeps that floor
     let empty_server = MockServer::start().await;
     mount_models(&empty_server, vec![]).await;
     let empty_config =
         Config::parse_validated(&yolo_config(&server_uri_v1(&empty_server))).expect("valid");
     let (provider, _store) = yolo_provider(&empty_config, Some(YOLO_KEY));
     let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the empty listing answers");
     assert_eq!(
-        catalog.expect("the empty listing answers").len(),
-        0,
-        "no vendored seed floor stands in for the listed ids"
+        model_ids(&models),
+        vec![YOLO_SEED_MODEL],
+        "the recorded seed floor stands in for the omitted listing"
+    );
+    assert_eq!(
+        models[0].context_window,
+        Some(131_072),
+        "the seed floor keeps its recorded window"
     );
     drop_blocking(provider);
 }
@@ -7672,6 +7664,36 @@ async fn mount_band4_wire(connection: &Band4Connection, server: &MockServer) {
     }
 }
 
+/// The id's adverse-wire peer on the fixture server: a Chat Completions
+/// stream ending mid `tool_calls` fragment, or a Responses completion the
+/// dialect cannot classify — each a frame the adapter must reject typed,
+/// never a usable reply.
+async fn mount_band4_adverse(connection: &Band4Connection, server: &MockServer) {
+    if connection.responses {
+        mount_responses(
+            server,
+            sse_block(
+                "response.completed",
+                &json!({"response": {"id": "resp_1", "status": "mystery", "output": []}}),
+            ),
+        )
+        .await;
+    } else {
+        mount_chat(
+            server,
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        )
+        .await;
+    }
+}
+
 fn band4_pass(passed: bool) -> &'static str {
     if passed { "PASS" } else { "FAIL" }
 }
@@ -7794,9 +7816,22 @@ async fn band4_recovery_legs_matrix_executes_all_expected_legs() {
         let recovered = matches!(&retried, Ok(reply) if reply.text == "band4");
         provider.finish();
 
+        // The recovered adapter still rejects an adverse frame typed — the
+        // AC-046e adverse-wire leg: a partial tool call (Chat Completions)
+        // or an unclassifiable completion (Responses) never becomes a reply.
+        let adverse = MockServer::start().await;
+        mount_band4_adverse(connection, &adverse).await;
+        let adverse_config =
+            Config::parse_validated(&(connection.config)(&server_uri_v1(&adverse)))
+                .expect("the fixture config is valid");
+        let (provider, rejected) = band4_provider(connection, &adverse_config, Arc::clone(&store))
+            .send(prepared_manifest(&adverse_config));
+        let adverse_ok = matches!(&rejected, Err(ProviderError::UnknownTerminal { .. }));
+        provider.finish();
+
         reported.insert(
             format!("TP-PROVIDER-RECOVERY::{}", connection.id),
-            band4_pass(denied_ok && recovered),
+            band4_pass(denied_ok && recovered && adverse_ok),
         );
         reported.insert(
             format!("TP-PROVIDER-INSTALLED::{}", connection.id),

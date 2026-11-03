@@ -276,11 +276,14 @@
 //! every offered id states USD zero per million — a real figure, never
 //! [`ModelPrice::Unknown`] and never a borrowed sibling price — because
 //! the rate is provider-wide, with the api key riding the plain
-//! bearer. The bundled seed/reference index that would add per-id
-//! reasoning or window metadata has no vendored carrier (residual), so
-//! a listed id carries no mark beyond its id; the recorded no-store and
-//! `developer`-role refusals and the qwen3.8-versus-pinned-seed
-//! divergence stay residuals with no manifest carrier. The effort
+//! bearer. The recorded pinned seed row (`deepseek-flash-v4`) merges as
+//! the offer floor with its recorded reasoning mark, image-input mark,
+//! 131072-token window and effort dial, while the wider reference index
+//! that would enrich every listed id has no vendored carrier (residual),
+//! so another listed id carries no mark beyond its id; the recorded
+//! no-store and `developer`-role refusals and the
+//! qwen3.8-versus-pinned-seed divergence stay residuals with no manifest
+//! carrier. The effort
 //! dial's `low`/`high` wire values ride verbatim; the recorded remap
 //! (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) has no manifest
 //! carrier, so those pins deny typed rather than sending an unrecorded
@@ -1168,6 +1171,26 @@ const YOLO_AUTO_BASE_URL: &str = "https://yolo-auto.com/v1";
 /// our enum.
 const YOLO_AUTO_EFFORTS: &[EffortLevel] = &[EffortLevel::Low, EffortLevel::High];
 
+/// The recorded pinned `yolo-auto` seed row: the bundled static model
+/// spec the class ships so generation and the first boot offer a model
+/// before the authoritative `/models` answer, and the recorded default
+/// model. It is the only vendored row; no other listed id borrows it.
+const YOLO_AUTO_SEED_MODEL: &str = "deepseek-flash-v4";
+
+/// The pinned seed row's recorded context window in tokens.
+const YOLO_AUTO_SEED_CONTEXT_WINDOW: u64 = 131_072;
+
+/// The pinned seed row's recorded `thinking` ladder in wire order. The
+/// recorded `max` level names no level our enum carries and never maps
+/// onto a lower one, so it does not land.
+const YOLO_AUTO_SEED_EFFORTS: &[EffortLevel] = &[
+    EffortLevel::Minimal,
+    EffortLevel::Low,
+    EffortLevel::Medium,
+    EffortLevel::High,
+    EffortLevel::Xhigh,
+];
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1529,18 +1552,20 @@ enum EntryRule {
     /// a pinned effort denies typed rather than being dropped.
     Wafer,
     /// The `yolo-auto` transform: the authoritative `/models` listing
-    /// supplies the offer set and the provider-wide flat rate states
-    /// USD zero per million for every offered id — a stated zero, never
-    /// [`ModelPrice::Unknown`] and never a borrowed sibling price. The
-    /// bundled reference/seed index that would add reasoning or window
-    /// metadata has no vendored carrier here (residual), so an offered
-    /// id carries no other mark; the recorded no-store and
-    /// `developer`-role refusals have no manifest carrier either and
-    /// are never constructed as body fields. The recorded
-    /// `reasoning_effort` dial rides only the levels the effort remap
-    /// leaves unchanged — [`ChatCompletionsProvider::check_parameters`]
-    /// denies the remapped ones typed rather than sending an
-    /// unrecorded wire value.
+    /// supplies the offer set and the recorded pinned seed row
+    /// (`deepseek-flash-v4`) merges as the offer floor with its recorded
+    /// reasoning mark, image-input mark, 131072-token window and effort
+    /// dial. The provider-wide flat rate states USD zero per million for
+    /// every offered id — a stated zero, never [`ModelPrice::Unknown`]
+    /// and never a borrowed sibling price. The wider reference index that
+    /// would enrich every listed id has no vendored carrier here
+    /// (residual), so another offered id carries no other mark; the
+    /// recorded no-store and `developer`-role refusals have no manifest
+    /// carrier either and are never constructed as body fields. The
+    /// recorded `reasoning_effort` dial rides only the levels the effort
+    /// remap leaves unchanged — [`ChatCompletionsProvider::check_parameters`]
+    /// denies the remapped ones typed rather than sending an unrecorded
+    /// wire value.
     YoloAuto,
 }
 
@@ -2274,9 +2299,10 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         }),
         // `yolo-auto` (HZN-008 class B — the flat-rate api-key cell):
         // the configured-or-recorded `https://yolo-auto.com/v1` base,
-        // whose `/models` answer is authoritative — the bundled seed
-        // and reference index have no vendored carrier here, and the
-        // recorded qwen3.8-versus-pinned-seed divergence stays a
+        // whose `/models` answer is authoritative and whose recorded
+        // pinned seed row (`deepseek-flash-v4`) merges as the offer floor
+        // — the wider bundled reference index has no vendored carrier,
+        // and the recorded qwen3.8-versus-pinned-seed divergence stays a
         // residual — and whose provider-wide flat rate states USD zero
         // for every offered id, the api key riding the plain bearer.
         // The recorded no-store and `developer`-role refusals and the
@@ -2284,7 +2310,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         // body field is invented. A configured `region` denies: the
         // contract names none.
         "yolo-auto" => Some(SourceContract {
-            seed: &[],
+            seed: &[YOLO_AUTO_SEED_MODEL],
             endpoint: EndpointRule::PlanBaseOrDefault(YOLO_AUTO_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
@@ -4413,20 +4439,30 @@ fn vllm_qwen_reasoning(id: &str) -> bool {
 /// `/models` answer supplies the offer set, and the provider-wide flat
 /// rate states USD zero per million for every offered id — a stated
 /// zero, never [`ModelPrice::Unknown`] and never a figure borrowed
-/// from another id's row. The bundled reference index that would add a
-/// per-id reasoning mark, window or effort surface has no vendored
-/// carrier here (residual), so an offered id carries its id alone; the
-/// recorded no-store and `developer`-role refusals are body compat the
-/// manifest cannot carry and this adapter never constructs.
+/// from another id's row. The recorded pinned seed row
+/// (`deepseek-flash-v4`) carries its own reasoning mark, image-input
+/// mark, 131072-token window and effort dial whether it arrives from
+/// the listing or the floor; the wider reference index that would
+/// enrich every listed id has no vendored carrier here (residual), so
+/// another offered id carries its id alone. The recorded no-store and
+/// `developer`-role refusals are body compat the manifest cannot carry
+/// and this adapter never constructs.
 fn yolo_auto_entry(id: &str) -> CatalogModel {
-    CatalogModel {
+    let mut model = CatalogModel {
         id: id.to_string(),
         price: ModelPrice::Usd {
             input_per_1m: 0.0,
             output_per_1m: 0.0,
         },
         ..CatalogModel::default()
+    };
+    if id == YOLO_AUTO_SEED_MODEL {
+        model.reasoning = true;
+        model.vision = true;
+        model.efforts = YOLO_AUTO_SEED_EFFORTS.to_vec();
+        model.context_window = Some(YOLO_AUTO_SEED_CONTEXT_WINDOW);
     }
+    model
 }
 
 /// The recorded `wafer-serverless` listing transform: the entry's nested

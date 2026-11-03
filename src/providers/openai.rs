@@ -145,7 +145,8 @@ const META_MUSE_MODELS: &[&str] = &[
 /// recorded `sakana` listing rule (DEC-004), the id-only `xai` listing
 /// whose recorded negative effort residue bounds a pinned effort, or
 /// the id-only `xai-oauth` listing whose selected-list floor is a
-/// residual — no vendored ids are retained, so the listing alone offers.
+/// residual — no vendored ids are retained, so the listing alone offers
+/// minus the recorded non-chat families.
 #[derive(Clone, Copy)]
 enum EntryRule {
     IdsOnly,
@@ -253,13 +254,15 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
         }),
         // The xAI OAuth listing is authoritative and no vendored
-        // selected list is retained, so the listing alone offers and
-        // the recorded contract states no replay artifact for the id.
+        // selected list is retained, so the listing alone offers — minus
+        // the recorded non-chat image/STT/voice families the chat picker
+        // never shows — and the recorded compat asks for the encrypted
+        // reasoning artifact the replay contract carries.
         "xai-oauth" => Some(SourceContract {
             seed: &[],
             authoritative_models: true,
             entry: EntryRule::XaiOAuth,
-            reasoning_artifact: false,
+            reasoning_artifact: true,
         }),
         _ => None,
     }
@@ -525,10 +528,11 @@ impl OpenAiProvider {
     /// `openrouter` offers only the listing's tool-capable entries with
     /// their recorded surfaces mapped (DEC-010), and `sakana` offers the
     /// authoritative listing's entries with the recorded Fugu mapping
-    /// (DEC-004), and `xai`/`xai-oauth` offer the authoritative xAI
-    /// listing as id-only entries with no vendored selected-list floor —
-    /// each id carrying the shared [`CatalogModel`], returned in
-    /// deterministic sorted order.
+    /// (DEC-004), and `xai` offers the authoritative xAI listing as
+    /// id-only entries with no vendored selected-list floor while
+    /// `xai-oauth` offers the same listing minus its recorded non-chat
+    /// image/STT/voice families — each id carrying the shared
+    /// [`CatalogModel`], returned in deterministic sorted order.
     ///
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
@@ -617,14 +621,22 @@ impl OpenAiProvider {
     /// `supported_parameters` declares `tools` and maps that entry's own
     /// surfaces (DEC-010); `EntryRule::Sakana` maps the recorded listing
     /// rule (DEC-004); `EntryRule::IdsOnly` offers the id alone under the
-    /// contract's filter; `EntryRule::Xai` and `EntryRule::XaiOAuth` share
-    /// that id-only offer under their authoritative listings, since no
-    /// vendored selected list is retained.
+    /// contract's filter; `EntryRule::Xai` shares that id-only offer under
+    /// its authoritative listing, since no vendored selected list is
+    /// retained; `EntryRule::XaiOAuth` offers the same id-only listing
+    /// minus its recorded non-chat image/STT/voice families.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         match self.contract.entry {
             EntryRule::OpenRouterTools => openrouter_model(entry),
             EntryRule::Sakana => sakana_model(entry),
-            EntryRule::IdsOnly | EntryRule::Xai | EntryRule::XaiOAuth => {
+            EntryRule::XaiOAuth => {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                (!id.is_empty() && !xai_oauth_excludes(id)).then(|| CatalogModel {
+                    id: id.to_string(),
+                    ..CatalogModel::default()
+                })
+            }
+            EntryRule::IdsOnly | EntryRule::Xai => {
                 let id = entry.get("id").and_then(Value::as_str)?;
                 let offered = if self.contract.authoritative_models {
                     !id.is_empty()
@@ -670,14 +682,15 @@ impl OpenAiProvider {
     /// The recorded xAI negative effort suppression (HZN-008): the
     /// listing's residue ids reject the `reasoning.effort` dial, so a
     /// pinned effort on one denies typed before the body exists. The
-    /// positive effort ladder is a residual, so an id outside the
-    /// residue keeps the pin.
+    /// suppression bounds both xAI listings — the paid key and the OAuth
+    /// device-code surface — and the positive effort ladder is a
+    /// residual, so an id outside the residue keeps the pin.
     fn check_effort(
         &self,
         manifest: &RequestManifest,
         model_id: &str,
     ) -> Result<(), ProviderError> {
-        if !matches!(self.contract.entry, EntryRule::Xai)
+        if !matches!(self.contract.entry, EntryRule::Xai | EntryRule::XaiOAuth)
             || !matches!(&manifest.effort, EffortAssign::Fixed { .. })
             || !xai_suppresses_effort(model_id)
         {
@@ -1308,6 +1321,16 @@ fn native_context_window(payload: &Value) -> Option<u64> {
 
 fn positive_tokens(value: &Value) -> Option<u64> {
     value.as_u64().filter(|tokens| *tokens > 0)
+}
+
+/// The recorded xAI OAuth non-chat prefixes (HZN-008): `/models` also
+/// lists image, speech-to-text and voice entries whose dedicated tool
+/// surfaces carry their own model strings, so the chat picker never
+/// offers them. The paid `xai` record states no such filter.
+fn xai_oauth_excludes(model_id: &str) -> bool {
+    ["grok-imagine-", "grok-stt-", "grok-voice-"]
+        .iter()
+        .any(|prefix| model_id.starts_with(prefix))
 }
 
 /// The recorded xAI effort residue (HZN-008): the listing's

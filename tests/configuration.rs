@@ -4592,9 +4592,9 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         );
     }
 
-    // band-1's fixed set plus every band-2 and band-3 id: each declared
-    // without a binding — only the credential-optional classes are
-    // admitted, so the relaxation is literal ids, never the band
+    // band-1's fixed set plus every band-2, band-3 and band-4 id: each
+    // declared without a binding — only the credential-optional classes
+    // are admitted, so the relaxation is literal ids, never the band
     let band = [
         "coreweave",
         "deepinfra",
@@ -4627,6 +4627,11 @@ fn litellm_credential_ref_grammar_admits_the_open_proxy_and_rejects_unknown_keys
         "synthetic",
         "together",
         "vllm",
+        "xiaomi",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-sgp",
+        "yolo-auto",
     ];
     let mut admitted = Vec::new();
     for id in band {
