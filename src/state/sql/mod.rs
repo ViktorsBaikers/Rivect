@@ -449,6 +449,43 @@ pub fn settlement_cohort_rows(count: usize) -> String {
     )
 }
 
+// ----- bounded work (AC-083a) -----
+
+/// One worker's recorded bounds. The scope and the work row open in one
+/// transaction, so a half-open budget cannot exist; a stopped row is never
+/// reopened, which is what makes an explicit stop terminal.
+pub const INSERT_WORK_BUDGET: &str =
+    "INSERT INTO work_budgets (task_id, deadline_unix_seconds, send_bound, state)
+             VALUES (?1, ?2, ?3, 'open')";
+/// Whether the task already recorded a worker, and in which state: the
+/// refusal a second open reports names the terminal state it found.
+pub const WORK_BUDGET_STATE: &str = "SELECT state FROM work_budgets WHERE task_id = ?1";
+/// The bound the dispatch transaction enforces (AC-083a): the scope's send
+/// bound beside the settled sends it has already recorded. One statement, so
+/// the count and the refusal read the same rows.
+pub const WORK_BUDGET_SEND_STATE: &str = "SELECT w.state, w.send_bound,
+             (SELECT COUNT(*) FROM budget_reservations r
+              JOIN usage_settlements s ON s.attempt_id = r.reservation_id
+              WHERE r.scope = w.task_id AND s.state = 'settled')
+             FROM work_budgets w WHERE w.task_id = ?1";
+/// One worker's bounds beside the shared ledger it spends from. The unit
+/// bound is the scope's own limit and the settled-send count walks this
+/// scope's reservations into the settlement rows they named, so no counter
+/// is stored here, no second ledger exists, and the read is bounded by the
+/// rows this worker's own sends left.
+pub const WORK_BUDGET_ROW: &str =
+    "SELECT w.task_id, w.deadline_unix_seconds, w.send_bound, w.state, w.stop_reason,
+             b.limit_units, b.spent, b.reserved,
+             (SELECT COUNT(*) FROM budget_reservations r
+              JOIN usage_settlements s ON s.attempt_id = r.reservation_id
+              WHERE r.scope = w.task_id AND s.state = 'settled')
+             FROM work_budgets w JOIN budget_scopes b ON b.scope = w.task_id
+             WHERE w.task_id = ?1";
+/// The terminal transition, conditional on the row still being open: a
+/// second stop matches nothing, so a stopped worker is never reopened.
+pub const STOP_WORK_BUDGET: &str = "UPDATE work_budgets SET state = 'stopped', stop_reason = ?2
+             WHERE task_id = ?1 AND state = 'open'";
+
 // ----- plan selection, plan obligations, plan revisions, gate holds -----
 
 pub const PLAN_SELECTION: &str =

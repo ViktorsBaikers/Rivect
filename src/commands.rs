@@ -161,6 +161,10 @@ pub struct Runtime {
     /// bound did not fit waits on a named resolution instead of spinning,
     /// and a status read serves only its own session's records.
     pub(crate) budget_waiting: BTreeMap<(String, String), BudgetWait>,
+    /// The wall clock the work-bound check reads (AC-083a): seconds since
+    /// the Unix epoch. The default is the system clock; a proof injects a
+    /// fixed one so a recorded deadline is deterministic.
+    pub work_clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// The one index seam this runtime shares with every action handler:
     /// the pinned project root and the capped worker that parses it
     /// (AC-036c, DEC-031). One root, one worker program, one helper, one
@@ -994,6 +998,15 @@ pub struct PausedAttempt {
     pub served_question_id: Option<QuestionId>,
 }
 
+/// The wall clock the work-bound check reads by default (AC-083a): seconds
+/// since the Unix epoch. A clock that cannot reach the epoch reads zero, so
+/// a deadline is never compared against a wrapped figure.
+fn system_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 impl Runtime {
     pub fn open(data_root: &Path, provider: Box<dyn Provider>) -> Result<Self, OpenError> {
         #[cfg(target_os = "linux")]
@@ -1306,6 +1319,7 @@ impl Runtime {
             economy: EconomySnapshot::empty(data_root),
             cache_rate: CacheRate::default(),
             budget_waiting: BTreeMap::new(),
+            work_clock: Box::new(system_seconds),
             index: IndexSeam {
                 root: data_root.to_path_buf(),
                 watch_refusal: None,
@@ -1824,6 +1838,8 @@ const METHODS: &[&str] = &[
     "command.describe",
     "command.execute",
     "artifact.read",
+    "long_work.start",
+    "long_work.stop",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -3520,6 +3536,8 @@ fn handle_method(
             RpcResponse::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
         }
         "task.submit" => submit_task(rt, ingress, params, id),
+        "long_work.start" => long_work_start(rt, &params, id),
+        "long_work.stop" => long_work_stop(rt, &params, id),
         "task.snapshot" => {
             let Some(_session) = session_param(&params) else {
                 return missing_session(id);
@@ -5160,6 +5178,90 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
             },
         ),
     }
+}
+
+/// `long_work.start` (AC-083a): records one worker's deadline and bounds on
+/// the task's own ledger scope. `deadline_seconds` is a request-relative
+/// duration; the recorded absolute deadline is served back as
+/// `deadline_unix_seconds`. The unit bound opens the shared ledger's scope,
+/// and no second ledger or grant is created.
+fn long_work_start(rt: &mut Runtime, params: &Value, id: Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let Some(deadline_seconds) = params.get("deadline_seconds").and_then(Value::as_u64) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "deadline_seconds",
+            },
+        );
+    };
+    let Some(send_bound) = params.get("send_bound").and_then(Value::as_u64) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "send_bound",
+            },
+        );
+    };
+    let Some(unit_bound) = params.get("unit_bound").and_then(Value::as_u64) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "unit_bound",
+            },
+        );
+    };
+    let deadline = (rt.work_clock)().saturating_add(deadline_seconds);
+    match rt
+        .owner
+        .store
+        .open_work_budget(&task, deadline, send_bound, unit_bound)
+    {
+        Ok(budget) => RpcResponse::ok(id, work_budget_result(&budget)),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// `long_work.stop` (AC-083a): marks the worker stopped terminally. It
+/// deletes no settlement and grants no right, so the shared ledger stays
+/// exactly as the settled sends left it.
+fn long_work_stop(rt: &mut Runtime, params: &Value, id: Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    match rt
+        .owner
+        .store
+        .stop_work_budget(&task, crate::state::WORK_STOPPED_REASON)
+    {
+        Ok(budget) => RpcResponse::ok(id, work_budget_result(&budget)),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// One worker's recorded bounds as the wire serves them: the ledger's own
+/// figures ride beside the row, never recomputed by the caller.
+fn work_budget_result(budget: &crate::state::WorkBudget) -> Value {
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "task_id": budget.task_id,
+        "deadline_unix_seconds": budget.deadline_unix_seconds,
+        "send_bound": budget.send_bound,
+        "unit_bound": budget.unit_bound,
+        "settled_sends": budget.settled_sends,
+        "spent_units": budget.spent,
+        "reserved_units": budget.reserved,
+        "state": budget.state.as_str(),
+        "stop_reason": budget.stop_reason,
+    })
 }
 
 /// A denied answer attempt that never reaches `answer_question` still

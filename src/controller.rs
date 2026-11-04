@@ -11,12 +11,14 @@ use crate::contracts::{
     QuestionOption, SessionId, TaskId, TaskSnapshot,
 };
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
-use crate::model::{ModelError, PendingFallback, RankingFacts, RecordedFacts, RequestManifest};
+use crate::model::{
+    LedgerError, ModelError, PendingFallback, RankingFacts, RecordedFacts, RequestManifest,
+};
 use crate::policy::PolicyError;
 use crate::providers::{ProviderError, ProviderReply};
 use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
-use crate::state::{ConflictCause, InvalidCause, StoreError};
+use crate::state::{ConflictCause, InvalidCause, StoreError, WorkBudgetState};
 use crate::supervisor::{Observation, OperationClass};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -56,6 +58,13 @@ pub enum StepOutcome {
     /// The native workflow is off or the task carries an off pause nothing
     /// has displaced yet, so this step never dispatched (AC-024).
     Paused {
+        snapshot: TaskSnapshot,
+    },
+    /// The worker reached its recorded deadline, settled-send bound or
+    /// ledger-unit bound, or was stopped explicitly: the step never
+    /// dispatched, the row is terminal, and nothing renews it (AC-083a).
+    WorkStopped {
+        reason: String,
         snapshot: TaskSnapshot,
     },
 }
@@ -138,7 +147,8 @@ fn step_snapshot(outcome: &StepOutcome) -> TaskSnapshot {
         | StepOutcome::OutcomeUnknown { snapshot, .. }
         | StepOutcome::Waiting { snapshot }
         | StepOutcome::NoAction { snapshot }
-        | StepOutcome::Paused { snapshot } => snapshot.clone(),
+        | StepOutcome::Paused { snapshot }
+        | StepOutcome::WorkStopped { snapshot, .. } => snapshot.clone(),
     }
 }
 
@@ -266,6 +276,11 @@ pub fn output_settlement(outcome: &StepOutcome) -> Option<OutputSettlement> {
         StepOutcome::EffectDenied { reason, .. } => Some(OutputSettlement::Failed {
             cause: reason.clone(),
         }),
+        // A terminal stop ends the run without completing it: the stream is
+        // failed by the bound that ended it, never left streaming.
+        StepOutcome::WorkStopped { reason, .. } => Some(OutputSettlement::Failed {
+            cause: reason.clone(),
+        }),
         StepOutcome::Waiting { .. } | StepOutcome::NoAction { .. } | StepOutcome::Paused { .. } => {
             None
         }
@@ -293,6 +308,7 @@ pub fn step_outcome_observation(
         StepOutcome::Waiting { .. } => "waiting".to_string(),
         StepOutcome::NoAction { .. } => "no action".to_string(),
         StepOutcome::Paused { .. } => "paused".to_string(),
+        StepOutcome::WorkStopped { reason, .. } => format!("work stopped: {reason}"),
     };
     Observation::failure(
         task.clone(),
@@ -377,6 +393,27 @@ pub(crate) const SCHEDULER_DRAIN_LIMIT: usize = 8;
 /// The step then marks them unresolved (never stale) and fails through
 /// the supervisor's Err feed.
 pub const APPLICABILITY_UNKNOWN_OPTION: &str = "applicability-unknown";
+
+/// The three recorded bounds a step checks before dispatch, and the reason
+/// each one records on the row when it ends the worker. The explicit stop's
+/// reason is shared with the ingress (`state::WORK_STOPPED_REASON`), so a
+/// stopped row names the same cause wherever it was read.
+const WORK_DEADLINE_REACHED: &str = "work deadline reached";
+const WORK_SEND_BOUND_REACHED: &str = "work send bound reached";
+const WORK_UNIT_BOUND_REACHED: &str = "work unit bound reached";
+
+/// The scope a dispatch refusal names when a worker's send bound was already
+/// filled. One classifier for every dispatch arm — primary, auto fallback and
+/// manual substitute — so the same ledger refusal always maps to the same
+/// terminal stop.
+fn work_send_bound_scope(error: &ModelError) -> Option<String> {
+    match error {
+        ModelError::Ledger(LedgerError::Store(StoreError::Conflict(
+            ConflictCause::WorkSendBoundReached { task_id, .. },
+        ))) => Some(task_id.clone()),
+        _ => None,
+    }
+}
 
 impl Runtime {
     pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
@@ -533,6 +570,12 @@ impl Runtime {
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(Some(StepOutcome::NoAction { snapshot }));
         }
+        // The recorded work bound is checked before every dispatch (AC-083a):
+        // a reached deadline, send bound or ledger sum ends the worker
+        // terminally, and so does a stop already recorded.
+        if let Some(stopped) = self.work_budget_gate(task_id)? {
+            return Ok(Some(stopped));
+        }
         if let Some(paused) = self.off_gate(session_id, task_id)? {
             return Ok(Some(paused));
         }
@@ -582,6 +625,120 @@ impl Runtime {
         }
         self.owner.store.materialize_obligations(task_id)?;
         Ok(None)
+    }
+
+    /// The recorded bounds of one long-running worker (AC-083a), checked
+    /// before any dispatch. The walk follows the task's scheduler scope chain
+    /// — its own ledger scope and every node-carrying ancestor — so a
+    /// delegated child cannot spend past a parent's recorded bound. For each
+    /// open row the injectable clock, the settled sends the shared ledger
+    /// counted and its own unit sum are checked; a reached bound, or a stop
+    /// already recorded, ends that worker terminally. The row moves `open` to
+    /// `stopped` once and no later step renews it. The read is the existing
+    /// ledger and settlement rows, so a second counter never exists.
+    fn work_budget_gate(
+        &mut self,
+        task_id: &TaskId,
+    ) -> Result<Option<StepOutcome>, ControllerError> {
+        let mut chain = self.budget_scopes(task_id)?;
+        if chain.is_empty() {
+            // A task the scheduler never submitted still answers for its own
+            // recorded row, so a budget never becomes invisible.
+            chain.push(task_id.0.clone());
+        }
+        for scope in chain {
+            let scope_task = TaskId(scope);
+            let Some(budget) = self.owner.store.work_budget(&scope_task)? else {
+                continue;
+            };
+            let reason = match budget.state {
+                WorkBudgetState::Stopped => Some(
+                    budget
+                        .stop_reason
+                        .clone()
+                        .unwrap_or_else(|| crate::state::WORK_STOPPED_REASON.to_string()),
+                ),
+                WorkBudgetState::Open => {
+                    if (self.work_clock)() >= budget.deadline_unix_seconds {
+                        Some(WORK_DEADLINE_REACHED.to_string())
+                    } else if budget.settled_sends >= budget.send_bound {
+                        Some(WORK_SEND_BOUND_REACHED.to_string())
+                    } else if budget.spent.saturating_add(budget.reserved) >= budget.unit_bound {
+                        Some(WORK_UNIT_BOUND_REACHED.to_string())
+                    } else {
+                        None
+                    }
+                }
+            };
+            let Some(reason) = reason else {
+                continue;
+            };
+            if budget.state == WorkBudgetState::Open {
+                self.stop_reached_work_budget(&scope_task, &reason)?;
+            }
+            let snapshot = self.owner.store.snapshot(task_id)?;
+            return Ok(Some(StepOutcome::WorkStopped { reason, snapshot }));
+        }
+        Ok(None)
+    }
+
+    /// The terminal stop a dispatch refusal or the gate records (AC-083a):
+    /// the named scope's open work row moves to stopped, and the step answers
+    /// the stop with the dispatching task's snapshot.
+    fn stop_at_work_bound(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        scope: &str,
+        reason: &str,
+    ) -> Result<StepOutcome, ControllerError> {
+        self.stop_reached_work_budget(&TaskId(scope.to_string()), reason)?;
+        self.clear_budget_wait(session_id, task_id);
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        Ok(StepOutcome::WorkStopped {
+            reason: reason.to_string(),
+            snapshot,
+        })
+    }
+
+    /// The unit-bound stop a refused dispatch earns when the exhausted scope
+    /// is a worker's own ledger scope: the budget cannot fund the frozen
+    /// bound, so the worker stops instead of waiting for a resolution that
+    /// never comes. `None` leaves the ordinary waiting outcome in place.
+    fn unit_bound_stop(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        scope: &str,
+    ) -> Result<Option<StepOutcome>, ControllerError> {
+        let scope_task = TaskId(scope.to_string());
+        let Some(budget) = self.owner.store.work_budget(&scope_task)? else {
+            return Ok(None);
+        };
+        if budget.state != WorkBudgetState::Open {
+            return Ok(None);
+        }
+        Ok(Some(self.stop_at_work_bound(
+            session_id,
+            task_id,
+            scope,
+            WORK_UNIT_BOUND_REACHED,
+        )?))
+    }
+
+    /// Moves one scope's work row to stopped once. A row another path already
+    /// stopped is the state this call wanted, so it is not an error; every
+    /// other store refusal propagates.
+    fn stop_reached_work_budget(
+        &mut self,
+        task_id: &TaskId,
+        reason: &str,
+    ) -> Result<(), ControllerError> {
+        match self.owner.store.stop_work_budget(task_id, reason) {
+            Ok(_) => Ok(()),
+            Err(StoreError::Conflict(ConflictCause::WorkBudgetStopped { .. })) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The one off gate of the native path (AC-024/REQ-017): an explicit
@@ -668,13 +825,28 @@ impl Runtime {
             self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest))?;
             let reply = match sent {
                 Ok(reply) => reply,
-                // The substitute never entered a send: the task waits on
-                // the named budget resolution, keeping its pause.
-                Err(ModelError::BudgetExhausted { .. }) => {
+                // The substitute never entered a send: a worker's own scope
+                // that cannot fund it stops at its unit bound; any other
+                // scope leaves the task waiting on the named resolution.
+                Err(ModelError::BudgetExhausted { scope }) => {
+                    if let Some(outcome) = self.unit_bound_stop(session_id, task_id, &scope)? {
+                        return Ok(Err(outcome));
+                    }
                     let snapshot = self.owner.store.snapshot(task_id)?;
                     return Ok(Err(StepOutcome::Waiting { snapshot }));
                 }
-                Err(source) => return Err(source.into()),
+                Err(source) => {
+                    if let Some(scope) = work_send_bound_scope(&source) {
+                        let outcome = self.stop_at_work_bound(
+                            session_id,
+                            task_id,
+                            &scope,
+                            WORK_SEND_BOUND_REACHED,
+                        )?;
+                        return Ok(Err(outcome));
+                    }
+                    return Err(source.into());
+                }
             };
             self.provider_calls += 1;
             self.paused_attempts.remove(&task_id.0);
@@ -716,6 +888,9 @@ impl Runtime {
             // before any attempt exists, and the task waits on the named
             // resolution exactly like the dispatch-time refusal.
             Err(ModelError::BudgetExhausted { scope }) => {
+                if let Some(outcome) = self.unit_bound_stop(session_id, task_id, &scope)? {
+                    return Ok(Err(outcome));
+                }
                 self.record_budget_wait(
                     session_id,
                     task_id,
@@ -734,7 +909,13 @@ impl Runtime {
         };
         // The refusal is known here, so the admission and its frozen inputs
         // are dropped before the fallible projection refresh can return early.
-        if matches!(sent, Err(ModelError::BudgetExhausted { .. })) {
+        let refused_attempt = matches!(sent, Err(ModelError::BudgetExhausted { .. }))
+            || sent
+                .as_ref()
+                .err()
+                .and_then(work_send_bound_scope)
+                .is_some();
+        if refused_attempt {
             self.broker.cancel_attempt(&manifest.attempt_id);
         }
         self.note_send_outcome(session_id, task_id, &sent, Some(&manifest))?;
@@ -747,10 +928,13 @@ impl Runtime {
                 self.tombstone_paused(task_id);
                 self.read_target_from_reply(task_id, reply, Some(manifest.attempt_id))
             }
-            // The frozen bound did not fit an open scope: the attempt
-            // never entered a send, and the task waits on the named
-            // resolution instead of spinning on the same refusal.
-            Err(ModelError::BudgetExhausted { .. }) => {
+            // The frozen bound did not fit an open scope: a worker's own
+            // scope that can never fund it stops at its unit bound; any other
+            // scope leaves the task waiting on the named resolution.
+            Err(ModelError::BudgetExhausted { scope }) => {
+                if let Some(outcome) = self.unit_bound_stop(session_id, task_id, &scope)? {
+                    return Ok(Err(outcome));
+                }
                 let snapshot = self.owner.store.snapshot(task_id)?;
                 Ok(Err(StepOutcome::Waiting { snapshot }))
             }
@@ -758,7 +942,18 @@ impl Runtime {
                 self.pause_on_fallback_choice(session_id, task_id, manifest)
             }
             Err(source) => {
-                // Every dispatch error leaves the primary's admission
+                // A bound filled by an earlier leg of this same dispatch ends
+                // the worker terminally: a fallback leg never sends past it.
+                if let Some(scope) = work_send_bound_scope(&source) {
+                    let outcome = self.stop_at_work_bound(
+                        session_id,
+                        task_id,
+                        &scope,
+                        WORK_SEND_BOUND_REACHED,
+                    )?;
+                    return Ok(Err(outcome));
+                }
+                // Every other dispatch error leaves the primary's admission
                 // live — the task pauses on a still-retryable attempt
                 // that no question served, so nothing can answer it
                 // into a dispatch.

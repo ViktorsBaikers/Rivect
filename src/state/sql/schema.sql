@@ -295,3 +295,16 @@ WHEN OLD.state = 'dispatched' AND NEW.state <> 'settled'
 BEGIN
     SELECT RAISE(ABORT, 'a dispatched settlement only closes settled');
 END;
+-- Bounded work (AC-083a): one row per long-running worker's recorded
+-- deadline, settled-send bound and terminal state. The unit bound is the
+-- shared ledger's own `budget_scopes` limit for the same task scope and
+-- the settled-send count reads `usage_settlements`, so this table keeps no
+-- counter of its own. Additive and ignored by a build without it: no
+-- generation bump.
+CREATE TABLE IF NOT EXISTS work_budgets (
+    task_id TEXT PRIMARY KEY,
+    deadline_unix_seconds INTEGER NOT NULL,
+    send_bound INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    stop_reason TEXT
+) STRICT;

@@ -54,6 +54,8 @@ pub enum Missing {
     Reservation(String),
     #[error("usage settlement {0}")]
     Settlement(String),
+    #[error("work budget {0}")]
+    WorkBudget(String),
     #[error("obligation")]
     Obligation,
     #[error("learning delta {0}")]
@@ -135,6 +137,18 @@ pub enum ConflictCause {
     SettlementAlreadyRecorded { attempt_id: String },
     #[error("usage settlement {attempt_id} is {state}, not dispatched")]
     SettlementNotDispatched { attempt_id: String, state: String },
+    #[error("work budget for task {task_id} is already {state}")]
+    WorkBudgetExists { task_id: String, state: String },
+    #[error("work budget for task {task_id} is already stopped")]
+    WorkBudgetStopped { task_id: String },
+    #[error(
+        "work send bound {send_bound} reached for task {task_id} at {settled_sends} settled sends"
+    )]
+    WorkSendBoundReached {
+        task_id: String,
+        settled_sends: u64,
+        send_bound: u64,
+    },
     #[error("task has no plan selection")]
     PlanSelectionMissing,
     #[error("plan facts do not match the current selection revision {revision}")]
@@ -184,6 +198,8 @@ pub enum InvalidCause {
     EventCursorOutOfRange,
     #[error("budget units {0} exceed the storable range")]
     BudgetUnitsOutOfRange(u64),
+    #[error("work budget {field} {value} exceeds the storable range")]
+    WorkBudgetBoundOutOfRange { field: &'static str, value: u64 },
     #[error("budget reservation must name at least one scope")]
     EmptyBudgetScopes,
     #[error("confirmed cost {confirmed} exceeds reservation bound {bound}")]
@@ -6683,6 +6699,173 @@ impl TaskStore {
         }
     }
 
+    // ----- bounded work (AC-083a) -----
+
+    /// Opens one worker's recorded bounds (AC-083a, DEC-015): the unit
+    /// bound becomes the shared ledger's limit for the task's own scope and
+    /// the work row records the absolute deadline and the settled-send
+    /// bound in the same `IMMEDIATE` transaction, so a half-open worker
+    /// cannot exist. The ingress is the only producer: an open row refuses a
+    /// second open (a stopped one too), and a scope that was already opened
+    /// cannot be re-limited.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for a task this store does not hold,
+    /// [`StoreError::Conflict`] with `WorkBudgetExists` or
+    /// `BudgetScopeExists` on a replay, and [`StoreError::InvalidInput`]
+    /// for an unstorable bound.
+    pub fn open_work_budget(
+        &mut self,
+        task_id: &TaskId,
+        deadline_unix_seconds: u64,
+        send_bound: u64,
+        unit_bound: u64,
+    ) -> Result<WorkBudget> {
+        let stored_deadline = work_bound_i64("deadline_unix_seconds", deadline_unix_seconds)?;
+        let stored_sends = work_bound_i64("send_bound", send_bound)?;
+        let stored_units = work_bound_i64("unit_bound", unit_bound)?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let task_exists: Option<String> = tx
+            .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
+            .optional()
+            .map_err(storage)?;
+        if task_exists.is_none() {
+            return Err(StoreError::missing_task(&task_id.0));
+        }
+        let recorded: Option<String> = tx
+            .query_row(sql::WORK_BUDGET_STATE, params![task_id.0], |row| row.get(0))
+            .optional()
+            .map_err(storage)?;
+        if let Some(state) = recorded {
+            return Err(StoreError::Conflict(ConflictCause::WorkBudgetExists {
+                task_id: task_id.0.clone(),
+                state,
+            }));
+        }
+        let scope_open: bool = tx
+            .query_row(sql::BUDGET_SCOPE_EXISTS, params![task_id.0], |row| {
+                row.get(0)
+            })
+            .map_err(storage)?;
+        if scope_open {
+            return Err(StoreError::Conflict(ConflictCause::BudgetScopeExists {
+                scope: task_id.0.clone(),
+            }));
+        }
+        tx.execute(sql::INSERT_BUDGET_SCOPE, params![task_id.0, stored_units])
+            .map_err(storage)?;
+        tx.execute(
+            sql::INSERT_WORK_BUDGET,
+            params![task_id.0, stored_deadline, stored_sends],
+        )
+        .map_err(storage)?;
+        let budget = Self::work_budget_on(&tx, task_id)?;
+        tx.commit().map_err(storage)?;
+        budget.ok_or_else(|| StoreError::NotFound(Missing::WorkBudget(task_id.0.clone())))
+    }
+
+    /// Stops one worker terminally (AC-083a): the row moves `open` to
+    /// `stopped` once and keeps the reason, so no later step renews it and
+    /// a second open is refused. The shared ledger is untouched — a stop
+    /// deletes no settlement and releases no spent unit.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with a task cause for a task this store does
+    /// not hold, with a work-budget cause for a task that recorded no
+    /// worker, and [`StoreError::Conflict`] with `WorkBudgetStopped` when it
+    /// already stopped.
+    pub fn stop_work_budget(&mut self, task_id: &TaskId, reason: &str) -> Result<WorkBudget> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let task_exists: Option<String> = tx
+            .query_row(sql::TASK_LIFECYCLE, params![task_id.0], |row| row.get(0))
+            .optional()
+            .map_err(storage)?;
+        if task_exists.is_none() {
+            return Err(StoreError::missing_task(&task_id.0));
+        }
+        let stopped = tx
+            .execute(sql::STOP_WORK_BUDGET, params![task_id.0, reason])
+            .map_err(storage)?;
+        let budget = Self::work_budget_on(&tx, task_id)?;
+        let Some(budget) = budget else {
+            return Err(StoreError::NotFound(Missing::WorkBudget(task_id.0.clone())));
+        };
+        if stopped == 0 {
+            return Err(StoreError::Conflict(ConflictCause::WorkBudgetStopped {
+                task_id: task_id.0.clone(),
+            }));
+        }
+        tx.commit().map_err(storage)?;
+        Ok(budget)
+    }
+
+    /// One worker's recorded bounds beside the shared ledger they spend
+    /// from: the unit bound is the scope's limit and the settled-send count
+    /// is the settlement rows whose reservation landed at this scope, so
+    /// the read carries no counter of its own. `None` for a task with no
+    /// recorded worker.
+    ///
+    /// # Errors
+    /// The storage failure of that read, and a corrupt state or negative
+    /// ledger column.
+    pub fn work_budget(&self, task_id: &TaskId) -> Result<Option<WorkBudget>> {
+        Self::work_budget_on(self.conn()?, task_id)
+    }
+
+    /// The one-row read shared by the public read and the in-transaction
+    /// open/stop, so an open or a stop returns the row it just wrote without
+    /// a second connection.
+    fn work_budget_on(conn: &Connection, task_id: &TaskId) -> Result<Option<WorkBudget>> {
+        let row = conn
+            .query_row(sql::WORK_BUDGET_ROW, params![task_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .optional()
+            .map_err(storage)?;
+        row.map(
+            |(
+                task_id,
+                deadline_unix_seconds,
+                send_bound,
+                state,
+                stop_reason,
+                unit_bound,
+                spent,
+                reserved,
+                settled_sends,
+            )| {
+                Ok(WorkBudget {
+                    task_id,
+                    deadline_unix_seconds: unsigned(deadline_unix_seconds)?,
+                    send_bound: unsigned(send_bound)?,
+                    unit_bound: unsigned(unit_bound)?,
+                    spent: unsigned(spent)?,
+                    reserved: unsigned(reserved)?,
+                    settled_sends: unsigned(settled_sends)?,
+                    state: WorkBudgetState::from_db(&state)?,
+                    stop_reason,
+                })
+            },
+        )
+        .transpose()
+    }
+
     // ----- usage settlements (AC-057) -----
 
     /// Begins one dispatched child attempt (AC-057, DEC-012): the frozen
@@ -6729,6 +6912,34 @@ impl TaskStore {
                 .map_err(storage)?;
             if exists && !open.contains(scope) {
                 open.push(scope);
+            }
+        }
+        // The send bound is enforced here, in the dispatch transaction, not
+        // only at the step gate (AC-083a): a fallback leg or a delegated child
+        // dispatches inside the same step the gate already admitted, and a
+        // second send must not pass a bound the first one filled. A scope
+        // whose worker row is open refuses at its recorded bound; the refusal
+        // names the scope so the controller stops that worker.
+        for scope in &open {
+            let recorded = tx
+                .query_row(sql::WORK_BUDGET_SEND_STATE, params![scope], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .optional()
+                .map_err(storage)?;
+            if let Some((state, send_bound, settled)) = recorded
+                && WorkBudgetState::from_db(&state)? == WorkBudgetState::Open
+                && settled >= send_bound
+            {
+                return Err(StoreError::Conflict(ConflictCause::WorkSendBoundReached {
+                    task_id: (*scope).to_string(),
+                    settled_sends: unsigned(settled)?,
+                    send_bound: unsigned(send_bound)?,
+                }));
             }
         }
         for scope in &open {
@@ -8135,6 +8346,62 @@ impl BudgetReservationState {
     }
 }
 
+/// The reason an explicit stop records: the caller's own stop, distinct from
+/// the three bounds a step can reach. The ingress and the step gate share the
+/// spelling, so a stopped row always names the same cause.
+pub const WORK_STOPPED_REASON: &str = "stopped";
+
+/// One long-running worker's recorded bounds beside the shared ledger it
+/// spends from (AC-083a): the absolute deadline, the settled-send bound, the
+/// ledger's own unit bound and sum, and the terminal state. `settled_sends`
+/// counts the settlement rows whose reservation landed at this task's
+/// scope, so the bound adds no counter of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkBudget {
+    pub task_id: String,
+    /// The recorded deadline, absolute: seconds since the Unix epoch.
+    pub deadline_unix_seconds: u64,
+    pub send_bound: u64,
+    /// The shared ledger's limit for this task's scope: the unit bound is
+    /// recorded there, never in a second ledger.
+    pub unit_bound: u64,
+    pub spent: u64,
+    pub reserved: u64,
+    pub settled_sends: u64,
+    pub state: WorkBudgetState,
+    /// The bound or stop that ended the worker; `None` while it is open.
+    pub stop_reason: Option<String>,
+}
+
+/// The two worker states: an open row is bounded work in progress, and a
+/// stopped row is terminal — it never reopens, and a fresh request is a new
+/// task's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBudgetState {
+    Open,
+    Stopped,
+}
+
+impl WorkBudgetState {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// A column value off the recorded set is a corrupted row: the read
+    /// fails instead of guessing a lifecycle.
+    fn from_db(raw: &str) -> Result<Self> {
+        match raw {
+            "open" => Ok(Self::Open),
+            "stopped" => Ok(Self::Stopped),
+            _ => Err(corrupt_column("work budget state", raw)),
+        }
+    }
+}
+
 /// One settlement row as the status projection and the proofs read it
 /// (AC-057): the physical child attempt, the attempt it fell back from,
 /// the frozen bound, the provider bins and exactness, the wire retries,
@@ -8478,6 +8745,15 @@ fn budget_units_i64(units: u64) -> Result<i64> {
         )),
     }
 }
+
+/// One worker bound is u64 in the API and i64 in SQLite; the field name
+/// rides the refusal so a caller learns which bound was unstorable.
+fn work_bound_i64(field: &'static str, value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_overflow| {
+        StoreError::InvalidInput(InvalidCause::WorkBudgetBoundOutOfRange { field, value })
+    })
+}
+
 /// Ledger columns are written non-negative; a negative value is corrupt
 /// storage, never a wrapping grant of `u64::MAX`.
 fn unsigned(value: i64) -> Result<u64> {
