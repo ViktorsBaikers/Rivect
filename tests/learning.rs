@@ -27,7 +27,9 @@ use rivect::config::Config;
 use rivect::contracts::{ErrorCode, ObligationApplicability, SessionId};
 use rivect::learning::{
     ConditionFact, ConditionFacts, CorpusCase, DEFINITION_MAX_BYTES, DeltaCandidate, DeltaChange,
-    DeltaError, DeltaPayload, DeltaState, LearningDefinition, LearningDelta, PredicateEffect,
+    DeltaError, DeltaPayload, DeltaState, FeedbackCause, FeedbackOutcome, FeedbackRecord,
+    FeedbackReward, FeedbackVerdict, LearningDefinition, LearningDelta, PredicateEffect,
+    VersionEvidence,
 };
 use rivect::model::{Broker, EpochMutationReason};
 use rivect::providers::LoopbackProvider;
@@ -1577,5 +1579,280 @@ fn corpus_composition_measures_the_shipped_base_p19() {
             .expect("row read")
             .state,
         DeltaState::Inactive
+    );
+}
+
+// ----- routing feedback: causes, versions and repair attribution (AC-052) -----
+
+/// Non-secret version evidence: the build, the policy generation, the base
+/// version and the model/connection the attempt ran against.
+fn evidence() -> VersionEvidence {
+    VersionEvidence {
+        build: "rivect 0.1.0".to_string(),
+        policy_generation: Some("a".repeat(64)),
+        base_version: Some(2),
+        model: Some("fixture-model".to_string()),
+        connection: Some("local".to_string()),
+    }
+}
+
+/// One observed, failed attempt: the row every feedback case starts from.
+fn feedback(attempt_id: &str) -> FeedbackRecord {
+    FeedbackRecord {
+        attempt_id: attempt_id.to_string(),
+        parent_attempt_id: None,
+        purpose: SUBJECT_PURPOSE.to_string(),
+        connection: "local".to_string(),
+        model_id: Some("fixture-model".to_string()),
+        outcome: FeedbackOutcome::Fail,
+        cause: FeedbackCause::None,
+        version_evidence: evidence(),
+        repair_of: None,
+        verdict: FeedbackVerdict::Fail,
+        reward: FeedbackReward::None,
+        observed: true,
+    }
+}
+
+/// The row a late repair appends: its own outcome and PASS, its own cost
+/// attribution, and the attempt it repaired.
+fn repair_row(attempt_id: &str, repaired: &str) -> FeedbackRecord {
+    FeedbackRecord {
+        attempt_id: attempt_id.to_string(),
+        outcome: FeedbackOutcome::Pass,
+        cause: FeedbackCause::Repair,
+        repair_of: Some(repaired.to_string()),
+        verdict: FeedbackVerdict::Pass,
+        reward: FeedbackReward::Repair,
+        ..feedback(attempt_id)
+    }
+}
+
+#[test]
+fn sdk_docs_setup_and_repair_causes_are_distinguished() {
+    let root = temp_root("feedback-causes");
+    let mut store = open_store(&root);
+    let cheap = store
+        .record_feedback(&feedback("attempt-cheap"))
+        .expect("the repaired attempt records");
+
+    // Each cause class lands as its own recorded value: an SDK fault, stale
+    // documentation, a setup fault and an unattributed result are four
+    // different rows, and the recorder cannot collapse them into one class.
+    for (attempt, cause) in [
+        ("attempt-sdk", FeedbackCause::Sdk),
+        ("attempt-docs", FeedbackCause::Docs),
+        ("attempt-setup", FeedbackCause::Setup),
+        ("attempt-none", FeedbackCause::None),
+    ] {
+        let recorded = store
+            .record_feedback(&FeedbackRecord {
+                cause,
+                ..feedback(attempt)
+            })
+            .expect("the row records");
+        assert_eq!(recorded.cause, cause, "{attempt} keeps its own cause");
+        assert_eq!(recorded.cause.as_str(), cause.as_str());
+    }
+    let repair = store
+        .record_feedback(&repair_row("attempt-repair", &cheap.attempt_id))
+        .expect("the repair records");
+    assert_eq!(repair.cause, FeedbackCause::Repair);
+    assert_eq!(repair.repair_of.as_deref(), Some("attempt-cheap"));
+    assert_ne!(
+        store.feedback("attempt-sdk").expect("row").cause,
+        store.feedback("attempt-docs").expect("row").cause
+    );
+
+    // The vocabulary is closed: an outage is not a cause class, and a repair
+    // naming no repaired attempt is refused instead of reading as one.
+    assert_eq!(FeedbackCause::parse("outage"), None);
+    let refused = store
+        .record_feedback(&FeedbackRecord {
+            cause: FeedbackCause::Repair,
+            ..feedback("attempt-unattributed")
+        })
+        .expect_err("a repair without attribution is refused");
+    assert!(
+        matches!(
+            refused,
+            StoreError::Delta(DeltaError::FeedbackRepairAttribution { .. })
+        ),
+        "{refused}"
+    );
+    assert_eq!(refused.code(), ErrorCode::InvalidInput);
+}
+
+#[test]
+fn version_evidence_is_recorded_without_secrets() {
+    let root = temp_root("feedback-evidence");
+    let mut store = open_store(&root);
+    let row = store
+        .record_feedback(&feedback("attempt-version"))
+        .expect("the row records");
+    assert_eq!(
+        row.version_evidence,
+        evidence(),
+        "every version fact survives"
+    );
+    assert_eq!(row.version_evidence.base_version, Some(2));
+
+    // A credential reference in any version field is refused before the row
+    // is appended: evidence is version data, never store material (INV-011).
+    let mut forged = feedback("attempt-secret");
+    forged.version_evidence.connection = Some("keyring:rivect/local".to_string());
+    let refused = store
+        .record_feedback(&forged)
+        .expect_err("a credential reference never enters version evidence");
+    assert!(
+        matches!(
+            refused,
+            StoreError::Delta(DeltaError::FeedbackCredentialReference { .. })
+        ),
+        "{refused}"
+    );
+    let missing = store
+        .feedback("attempt-secret")
+        .expect_err("the refused row never landed");
+    assert!(
+        matches!(
+            missing,
+            StoreError::Delta(DeltaError::FeedbackMissing { .. })
+        ),
+        "a missing feedback row is not a missing attempt: {missing}"
+    );
+    assert_eq!(missing.code(), ErrorCode::NotFound);
+    let mut forged = feedback("attempt-secret-build");
+    forged.version_evidence.build = "built from keyring:rivect/build".to_string();
+    assert!(
+        store.record_feedback(&forged).is_err(),
+        "the build field is version data too"
+    );
+}
+
+#[test]
+fn unobserved_variant_gets_no_trial_reward() {
+    let root = temp_root("feedback-unobserved");
+    let mut store = open_store(&root);
+    let variant = store
+        .record_feedback(&FeedbackRecord {
+            observed: false,
+            outcome: FeedbackOutcome::Unknown,
+            verdict: FeedbackVerdict::Unobserved,
+            ..feedback("attempt-unobserved")
+        })
+        .expect("the unobserved variant records");
+    assert!(!variant.observed);
+    assert_eq!(variant.verdict, FeedbackVerdict::Unobserved);
+    assert_eq!(variant.reward, FeedbackReward::None);
+
+    // It never becomes a trial: the store appends no second row for the same
+    // alternative, and no unobserved row may carry a trial's reward or a
+    // pass verdict.
+    let replay = store
+        .record_feedback(&variant)
+        .expect_err("one row per attempt");
+    assert!(
+        matches!(
+            replay,
+            StoreError::Delta(DeltaError::FeedbackAlreadyRecorded { .. })
+        ),
+        "{replay}"
+    );
+    assert_eq!(replay.code(), ErrorCode::Conflict);
+    let rewarded = store
+        .record_feedback(&FeedbackRecord {
+            reward: FeedbackReward::Repair,
+            cause: FeedbackCause::Repair,
+            repair_of: Some("attempt-cheap".to_string()),
+            ..variant.clone()
+        })
+        .expect_err("an unobserved row earns no reward");
+    assert!(
+        matches!(
+            rewarded,
+            StoreError::Delta(DeltaError::FeedbackObservationMismatch { .. })
+        ),
+        "{rewarded}"
+    );
+    let claimed = store
+        .record_feedback(&FeedbackRecord {
+            attempt_id: "attempt-unobserved-pass".to_string(),
+            verdict: FeedbackVerdict::Pass,
+            ..variant.clone()
+        })
+        .expect_err("an unobserved row claims no pass");
+    assert!(
+        matches!(
+            claimed,
+            StoreError::Delta(DeltaError::FeedbackObservationMismatch { .. })
+        ),
+        "{claimed}"
+    );
+    // The observation marker couples to the outcome too: a row that measured
+    // nothing may not report a pass or a fail.
+    for outcome in [FeedbackOutcome::Pass, FeedbackOutcome::Fail] {
+        let measured = store
+            .record_feedback(&FeedbackRecord {
+                attempt_id: format!("attempt-unobserved-{}", outcome.as_str()),
+                outcome,
+                ..variant.clone()
+            })
+            .expect_err("an unobserved row reports an unknown outcome");
+        assert!(
+            matches!(
+                measured,
+                StoreError::Delta(DeltaError::FeedbackUnobservedOutcome { .. })
+            ),
+            "{measured}"
+        );
+        assert_eq!(measured.code(), ErrorCode::InvalidInput);
+    }
+}
+
+#[test]
+fn cheap_result_keeps_its_own_verdict() {
+    let root = temp_root("feedback-verdict");
+    let mut store = open_store(&root);
+    let generation = store.learning_status().expect("status").generation;
+    let cheap = store
+        .record_feedback(&feedback("attempt-cheap"))
+        .expect("the cheap result records");
+    assert_eq!(cheap.verdict, FeedbackVerdict::Fail);
+    let repair = store
+        .record_feedback(&repair_row("attempt-repair", &cheap.attempt_id))
+        .expect("the late repair records");
+
+    // The repair answers the intent and keeps its own PASS; the cheap result
+    // keeps its verdict and inherits no foreign PASS.
+    assert_eq!(repair.verdict, FeedbackVerdict::Pass);
+    let after = store
+        .feedback(&cheap.attempt_id)
+        .expect("the cheap row re-reads");
+    assert_eq!(after, cheap, "the repaired row is byte-for-byte unchanged");
+    assert_eq!(after.verdict, FeedbackVerdict::Fail);
+    assert_eq!(after.reward, FeedbackReward::None);
+    assert_eq!(after.repair_of, None);
+    let repairs = store
+        .feedback_repairs(&cheap.attempt_id)
+        .expect("the attribution reads");
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].attempt_id, "attempt-repair");
+
+    // The oracle is untouched: feedback rows never become an activation input,
+    // so no delta is active and no corpus verdict was written by this seam.
+    let status = store.learning_status().expect("status");
+    assert!(status.active.is_empty());
+    assert!(status.rolled_back.is_empty());
+    assert_eq!(
+        status.generation, generation,
+        "recording feedback moves no generation"
+    );
+    assert!(
+        store
+            .learning_corpus("attempt-cheap")
+            .expect("corpus read")
+            .is_empty(),
+        "a feedback attempt is not a corpus verdict"
     );
 }

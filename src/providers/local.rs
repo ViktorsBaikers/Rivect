@@ -2417,6 +2417,38 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
     }
 }
 
+/// The catalogue rows this build records for one connection without a live
+/// read (DEC-013, AC-096): the recorded allowlist of a fixed-catalogue class,
+/// or the recorded seed ids under the entry transform that states their
+/// capability, window and price. A listing-only class records no row until a
+/// peer answers, and a class whose transform maps a live listing states no
+/// seed — both answer nothing, so the ranker reads an empty answer as the
+/// unknown fact rather than a guessed row.
+#[must_use]
+pub(crate) fn recorded_catalog(connection: &str) -> Vec<CatalogModel> {
+    let Some(contract) = contract_for(connection) else {
+        return Vec::new();
+    };
+    if let CatalogRule::Allowlist(list) = contract.catalog {
+        return allowlist_models(list);
+    }
+    match contract.entries {
+        EntryRule::DeepSeek => contract
+            .seed
+            .iter()
+            .filter_map(|id| deepseek_entry(id))
+            .collect(),
+        EntryRule::Fireworks => contract
+            .seed
+            .iter()
+            .filter_map(|id| fireworks_entry(id))
+            .collect(),
+        EntryRule::Groq => contract.seed.iter().map(|id| groq_entry(id)).collect(),
+        EntryRule::YoloAuto => contract.seed.iter().map(|id| yolo_auto_entry(id)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 impl SourceContract {
     /// Whether the recorded credential arm admits a declaration that
     /// binds no credential at all — the absent-binding form shared by
@@ -2548,6 +2580,26 @@ pub enum ModelPrice {
         /// The stated output-token price per 1M.
         output_per_1m: f64,
     },
+}
+
+impl ModelPrice {
+    /// The stated full cost of one request over `tokens` estimated input
+    /// tokens — both legs at their per-1M figure, scaled by the same estimate.
+    /// `None` is the unknown price: it never releases as a zero, so the ranker
+    /// can never read an unstated price as free.
+    #[must_use]
+    pub(crate) fn full_cost(self, tokens: u64) -> Option<f64> {
+        match self {
+            Self::Unknown => None,
+            Self::Usd {
+                input_per_1m,
+                output_per_1m,
+            } => {
+                let cost = (input_per_1m + output_per_1m) * (tokens as f64) / 1_000_000.0;
+                cost.is_finite().then_some(cost)
+            }
+        }
+    }
 }
 
 /// One catalogued model a Chat Completions connection offers

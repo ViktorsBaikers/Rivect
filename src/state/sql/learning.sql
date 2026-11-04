@@ -77,6 +77,21 @@ CREATE TABLE IF NOT EXISTS procedure_runs (
 CREATE INDEX IF NOT EXISTS idx_procedure_runs_procedure
     ON procedure_runs (procedure_id, procedure_version);
 
+-- Routing feedback (AC-052, REQ-042, DEC-014): one append-only row per
+-- recorded attempt outcome. The cause class is closed (`sdk`, `docs`, `setup`,
+-- `repair`, `none`), `version_evidence` is non-secret JSON, `repair_of` names
+-- the attempt a repair repaired so its cost attributes to the repair, `verdict`
+-- keeps the protected oracle verdict and `observed = 0` is the unobserved
+-- variant that never becomes a trial. No statement updates or deletes a row.
+CREATE TABLE IF NOT EXISTS routing_feedback (
+    attempt_id TEXT PRIMARY KEY, parent_attempt_id TEXT,
+    purpose TEXT NOT NULL, connection TEXT NOT NULL, model_id TEXT,
+    outcome TEXT NOT NULL, cause TEXT NOT NULL, version_evidence TEXT NOT NULL,
+    repair_of TEXT, verdict TEXT NOT NULL, reward TEXT NOT NULL, observed INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_routing_feedback_repair
+    ON routing_feedback (repair_of) WHERE repair_of IS NOT NULL;
+
 -- The steps of a run. A step row is written `prepared` before its effect and
 -- stamped with the attempt that performs it, so the row does not assert on its
 -- own that the effect may have landed: the attempt's own state answers that. A

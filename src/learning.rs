@@ -707,6 +707,292 @@ pub struct LearningStatus {
     pub rolled_back: Vec<LearningDeltaView>,
 }
 
+/// The closed cause class one recorded attempt attributes its outcome to
+/// (AC-052, REQ-042, DEC-014). An adapter fault, stale documentation, a setup
+/// fault and a late repair are different causes: an outage or a documentation
+/// defect never reads as low reasoning quality, and a cause the recorder
+/// cannot name stays [`FeedbackCause::None`] rather than borrowing a class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackCause {
+    /// No cause was attributed — the recorded default.
+    #[default]
+    None,
+    /// The SDK/adapter leg failed or answered something other than what it
+    /// recorded.
+    Sdk,
+    /// The documentation or instructions the attempt followed were wrong.
+    Docs,
+    /// The environment or setup the attempt ran in was wrong.
+    Setup,
+    /// The attempt repaired an earlier attempt and its own attribution names
+    /// which.
+    Repair,
+}
+
+impl FeedbackCause {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Sdk => "sdk",
+            Self::Docs => "docs",
+            Self::Setup => "setup",
+            Self::Repair => "repair",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(Self::None),
+            "sdk" => Some(Self::Sdk),
+            "docs" => Some(Self::Docs),
+            "setup" => Some(Self::Setup),
+            "repair" => Some(Self::Repair),
+            _ => None,
+        }
+    }
+}
+
+/// What one attempt itself reported (AC-052). `Unknown` is an observation
+/// that never reached an outcome; it is not a failure and not a pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackOutcome {
+    Pass,
+    Fail,
+    #[default]
+    Unknown,
+}
+
+impl FeedbackOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// The protected verdict the attempt's result carries (AC-052): the oracle's
+/// own verdict, recorded as the oracle made it. A later repair appends its own
+/// row and never rewrites this one, so a cheap result keeps its verdict and
+/// never inherits a foreign PASS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackVerdict {
+    Pass,
+    Fail,
+    /// No observation stands behind this row: an alternative that was
+    /// considered and never trialled.
+    #[default]
+    Unobserved,
+}
+
+impl FeedbackVerdict {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Unobserved => "unobserved",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "unobserved" => Some(Self::Unobserved),
+            _ => None,
+        }
+    }
+}
+
+/// Where one row's reward attributes (AC-052, PROH-016): `None` unless the row
+/// is the repair itself, so an unobserved alternative never collects a trial's
+/// reward and a cheap result never collects its repair's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackReward {
+    #[default]
+    None,
+    Repair,
+}
+
+impl FeedbackReward {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Repair => "repair",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(Self::None),
+            "repair" => Some(Self::Repair),
+            _ => None,
+        }
+    }
+}
+
+/// The non-secret version evidence one recorded attempt carries (AC-052,
+/// REQ-042): the build, the policy generation, the base version and the model
+/// and connection the attempt ran against. Every field is a version fact — a
+/// credential reference is refused before the row is appended (INV-011).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionEvidence {
+    pub build: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+}
+
+impl VersionEvidence {
+    /// Refuses a version field carrying a credential reference (INV-011).
+    ///
+    /// # Errors
+    ///
+    /// [`DeltaError::FeedbackEmptyField`] for an empty build,
+    /// [`DeltaError::FeedbackCredentialReference`] for a credential reference
+    /// in any field.
+    fn validate(&self, attempt_id: &str) -> Result<(), DeltaError> {
+        if self.build.trim().is_empty() {
+            return Err(DeltaError::FeedbackEmptyField {
+                attempt_id: attempt_id.to_string(),
+                field: "version evidence build",
+            });
+        }
+        let fields = [
+            Some(self.build.as_str()),
+            self.policy_generation.as_deref(),
+            self.model.as_deref(),
+            self.connection.as_deref(),
+        ];
+        if fields
+            .into_iter()
+            .flatten()
+            .any(carries_credential_reference)
+        {
+            return Err(DeltaError::FeedbackCredentialReference {
+                attempt_id: attempt_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One append-only routing-feedback row (AC-052, DEC-014): the attempt and its
+/// outcome, the cause class, the version evidence, the repair attribution, the
+/// protected verdict and the observed marker. The store appends rows and never
+/// updates one, so a late repair cannot rewrite the result it repaired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackRecord {
+    pub attempt_id: String,
+    pub parent_attempt_id: Option<String>,
+    pub purpose: String,
+    pub connection: String,
+    pub model_id: Option<String>,
+    pub outcome: FeedbackOutcome,
+    pub cause: FeedbackCause,
+    pub version_evidence: VersionEvidence,
+    /// The attempt this row repaired; its cost attributes here, never to the
+    /// repaired attempt.
+    pub repair_of: Option<String>,
+    pub verdict: FeedbackVerdict,
+    pub reward: FeedbackReward,
+    /// Whether an observation stands behind this row. `false` is the
+    /// unobserved variant: verdict `unobserved`, reward `none`, no trial.
+    pub observed: bool,
+}
+
+impl FeedbackRecord {
+    /// The typed refusals of one row, checked before it is appended: the
+    /// observation, verdict and reward markers agree, and the repair
+    /// attribution names a different attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`DeltaError`] the row violates.
+    pub(crate) fn validate(&self) -> Result<(), DeltaError> {
+        if self.attempt_id.trim().is_empty() {
+            return Err(DeltaError::FeedbackEmptyAttempt);
+        }
+        for (field, value) in [("purpose", &self.purpose), ("connection", &self.connection)] {
+            if value.trim().is_empty() {
+                return Err(DeltaError::FeedbackEmptyField {
+                    attempt_id: self.attempt_id.clone(),
+                    field,
+                });
+            }
+        }
+        self.version_evidence.validate(&self.attempt_id)?;
+        let observed = if self.observed {
+            "observed"
+        } else {
+            "unobserved"
+        };
+        let verdict = self.verdict.as_str();
+        if self.observed == (self.verdict == FeedbackVerdict::Unobserved) {
+            return Err(DeltaError::FeedbackObservationMismatch {
+                attempt_id: self.attempt_id.clone(),
+                observed,
+                verdict,
+            });
+        }
+        // An unobserved row measured nothing: it may not claim a pass or a
+        // fail the observation never reached.
+        if !self.observed && self.outcome != FeedbackOutcome::Unknown {
+            return Err(DeltaError::FeedbackUnobservedOutcome {
+                attempt_id: self.attempt_id.clone(),
+                outcome: self.outcome.as_str(),
+            });
+        }
+        let repair = self.reward == FeedbackReward::Repair;
+        let attributed = self.repair_of.is_some();
+        if repair != attributed || (self.cause == FeedbackCause::Repair) != attributed {
+            return Err(DeltaError::FeedbackRepairAttribution {
+                attempt_id: self.attempt_id.clone(),
+            });
+        }
+        if self
+            .repair_of
+            .as_deref()
+            .is_some_and(|repaired| repaired == self.attempt_id)
+        {
+            return Err(DeltaError::FeedbackRepairAttribution {
+                attempt_id: self.attempt_id.clone(),
+            });
+        }
+        if !self.observed && self.reward != FeedbackReward::None {
+            return Err(DeltaError::FeedbackObservationMismatch {
+                attempt_id: self.attempt_id.clone(),
+                observed,
+                verdict,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The typed refusals of the learning owner (P-001). Each one names the delta
 /// and the exact condition it failed, so the caller can act without parsing
 /// prose.
@@ -801,6 +1087,36 @@ pub enum DeltaError {
         size: usize,
         limit: usize,
     },
+    #[error("feedback row carries an empty attempt id")]
+    FeedbackEmptyAttempt,
+    #[error("feedback attempt {attempt_id} carries an empty {field}")]
+    FeedbackEmptyField {
+        attempt_id: String,
+        field: &'static str,
+    },
+    #[error("feedback attempt {attempt_id} carries a credential reference in its version evidence")]
+    FeedbackCredentialReference { attempt_id: String },
+    #[error(
+        "feedback attempt {attempt_id} is {observed} with verdict {verdict}: only an observed attempt carries a pass or fail verdict, and only an unobserved one carries an unobserved verdict"
+    )]
+    FeedbackObservationMismatch {
+        attempt_id: String,
+        observed: &'static str,
+        verdict: &'static str,
+    },
+    #[error(
+        "feedback attempt {attempt_id} carries a repair attribution its cause or reward disagrees with"
+    )]
+    FeedbackRepairAttribution { attempt_id: String },
+    #[error("feedback attempt {attempt_id} is unobserved but reports outcome {outcome}")]
+    FeedbackUnobservedOutcome {
+        attempt_id: String,
+        outcome: &'static str,
+    },
+    #[error("feedback attempt {attempt_id} is not recorded")]
+    FeedbackMissing { attempt_id: String },
+    #[error("feedback attempt {attempt_id} is already recorded")]
+    FeedbackAlreadyRecorded { attempt_id: String },
 }
 
 impl DeltaError {
@@ -820,13 +1136,22 @@ impl DeltaError {
             | Self::DuplicateCase { .. }
             | Self::TooManyCases { .. }
             | Self::SelfControl { .. }
-            | Self::UnknownControl { .. } => ErrorCode::InvalidInput,
+            | Self::UnknownControl { .. }
+            | Self::FeedbackEmptyAttempt
+            | Self::FeedbackEmptyField { .. }
+            | Self::FeedbackCredentialReference { .. }
+            | Self::FeedbackObservationMismatch { .. }
+            | Self::FeedbackRepairAttribution { .. }
+            | Self::FeedbackUnobservedOutcome { .. } => ErrorCode::InvalidInput,
+            // A missing feedback row is a missing record, never invalid input.
+            Self::FeedbackMissing { .. } => ErrorCode::NotFound,
             Self::AlreadyRecorded { .. }
             | Self::ActivationRefused { .. }
             | Self::RollbackRefused { .. }
             | Self::CorpusMissing { .. }
             | Self::CorpusRejected { .. }
-            | Self::CompositionExceeded { .. } => ErrorCode::Conflict,
+            | Self::CompositionExceeded { .. }
+            | Self::FeedbackAlreadyRecorded { .. } => ErrorCode::Conflict,
         }
     }
 }

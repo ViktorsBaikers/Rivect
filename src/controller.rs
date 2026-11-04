@@ -11,13 +11,14 @@ use crate::contracts::{
     QuestionOption, SessionId, TaskId, TaskSnapshot,
 };
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
-use crate::model::{ModelError, PendingFallback, RequestManifest};
+use crate::model::{ModelError, PendingFallback, RankingFacts, RecordedFacts, RequestManifest};
 use crate::policy::PolicyError;
 use crate::providers::{ProviderError, ProviderReply};
 use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
 use crate::supervisor::{Observation, OperationClass};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// One bounded scheduler pass over the task tree.
@@ -701,13 +702,30 @@ impl Runtime {
         // as such, so the wire's user channel never reads as a human
         // turn that could move consent.
         let origin = self.owner.store.answer_input_origin(task_id)?;
-        let manifest = self.broker.prepare_authored(
+        let facts = self.ranking_facts(task_id, &inputs)?;
+        let manifest = match self.broker.prepare_with_facts(
             &purpose,
             &self.config_for_broker(),
             &world,
             &inputs,
             origin,
-        )?;
+            &facts,
+        ) {
+            Ok(manifest) => manifest,
+            // The scope chain cannot fund one more bound: the ranking refuses
+            // before any attempt exists, and the task waits on the named
+            // resolution exactly like the dispatch-time refusal.
+            Err(ModelError::BudgetExhausted { scope }) => {
+                self.record_budget_wait(
+                    session_id,
+                    task_id,
+                    format!("budget exhausted at scope {scope}; waiting for its resolution"),
+                );
+                let snapshot = self.owner.store.snapshot(task_id)?;
+                return Ok(Err(StepOutcome::Waiting { snapshot }));
+            }
+            Err(source) => return Err(source.into()),
+        };
         self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
         let scopes = self.budget_scopes(task_id)?;
         let sent = {
@@ -748,6 +766,49 @@ impl Runtime {
                 Err(source.into())
             }
         }
+    }
+
+    /// The task facts `auto` ranks on (AC-096, DEC-013): the recorded
+    /// obligations and criteria of the task snapshot, the context estimate over
+    /// the frozen inputs, and the scope chain with the units each scope still
+    /// holds. The surface scan and the tool modality are undecided here — the
+    /// controller owns no impact label, and no recorded row states a tool
+    /// surface — so both are unknown, never "no risky surface" or "no tools".
+    fn ranking_facts(
+        &self,
+        task_id: &TaskId,
+        inputs: &str,
+    ) -> Result<RankingFacts, ControllerError> {
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        let scope_chain = self.budget_scopes(task_id)?;
+        let mut remaining_units = BTreeMap::new();
+        for scope in &scope_chain {
+            match self.owner.store.budget_status(scope) {
+                Ok(status) => {
+                    let remaining = status
+                        .limit_units
+                        .saturating_sub(status.spent)
+                        .saturating_sub(status.reserved);
+                    remaining_units.insert(scope.clone(), remaining);
+                }
+                // An unopened scope records no units: unknown, never zero, so
+                // it never excludes a candidate it cannot speak for.
+                Err(StoreError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(RankingFacts::Recorded(RecordedFacts {
+            surfaces: None,
+            // No recorded row states a tool modality, so this read step's
+            // requested tool surface is not a recorded fact the ranking may
+            // match on: it stays unknown until a recorded modality exists.
+            tools_required: false,
+            context_tokens_estimate: u64::try_from(inputs.chars().count()).unwrap_or(u64::MAX),
+            obligations: snapshot.obligations.items.len(),
+            criteria: snapshot.criteria.items.len(),
+            remaining_units,
+            scope_chain,
+        }))
     }
 
     /// Records what one broker send did for the controller's own view

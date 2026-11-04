@@ -34,18 +34,22 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
+use rivect::actions::{
+    ActionInput, ActionOutcome, ActionRegistry, BrokerSeam, ContractBasis, PlanRequest,
+    RequestKind, Surface, SurfaceScan,
+};
 use rivect::config::{
     Config, ConfigIssue, ConnKind, EffortAssign, EffortLevel, FixedModel, ModelAssign, Stage,
 };
 use rivect::contracts::{Availability, MODEL_WIRE_MAX_BYTES, OptionId, Question, QuestionOption};
 use rivect::model::{
-    Broker, CallContract, CandidateRejection, EpochMutationReason, ModelError, RejectionCause,
-    RequestManifest,
+    Broker, CallContract, CandidateRejection, EpochMutationReason, InputOrigin, ModelError,
+    RankingFacts, RecordedFacts, RejectionCause, RequestManifest,
 };
 use rivect::providers::{Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::UsageDelta;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1226,7 +1230,7 @@ fn every_purpose_carries_admission_and_single_accounting() {
     }
     assert_eq!(sent.lock().expect("wire log lock").len(), expected.len());
     assert_eq!(broker.accounted_requests(), expected.len());
-    let unique: std::collections::BTreeSet<_> = manifests.iter().map(|m| &m.attempt_id).collect();
+    let unique: BTreeSet<_> = manifests.iter().map(|m| &m.attempt_id).collect();
     assert_eq!(unique.len(), expected.len(), "one attempt id per request");
 
     // a replayed ORIGINAL manifest is never a second physical request:
@@ -6815,4 +6819,907 @@ fn anthropic_subscription_profile_is_not_offline_inference() {
         ),
         "the real admission path refuses it: {err:?}"
     );
+}
+
+// ----- AC-096/AC-096a: recorded task facts rank `auto` -----
+
+const RANK_WORLD: &str = "/world/ranking";
+
+/// The connections whose recorded catalogue rows the ranking legs read:
+/// `deepseek` records three built-in rows (reasoning, a million-token window,
+/// per-model USD prices), `groq` records its static floor (price and effort
+/// marks), `firepass` records two router ids with no window or price, and
+/// `yolo-auto` records one pinned seed row. Every id is declared `local` so
+/// eligibility is never the fact a case accidentally measures; `held` is the
+/// subscription class no scoped reference makes usable offline.
+fn ranking_connections() -> &'static str {
+    "config_version = 1\n\
+     [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+     [connections.deepseek]\nkind = \"local\"\nendpoint = \"https://api.deepseek.com/v1\"\n\
+     [connections.groq]\nkind = \"local\"\nendpoint = \"https://api.groq.com/openai/v1\"\n\
+     [connections.firepass]\nkind = \"local\"\nendpoint = \"https://api.fireworks.ai/inference/v1\"\n\
+     [connections.yolo-auto]\nkind = \"local\"\nendpoint = \"https://yolo-auto.com/v1\"\n\
+     [connections.held]\nkind = \"subscription\"\nendpoint = \"https://subscription.fixture.invalid\"\ncredential_ref = \"keyring:rivect/held\"\n"
+}
+
+/// One config with the named purpose pools over the recorded connections.
+fn ranking_config_text(purposes: &[(&str, &[&str])], effort: &str) -> String {
+    let mut text = format!(
+        "{}\n[models.defaults]\nmodel = {{ mode = \"auto\" }}\neffort = {effort}\nfallback = {{ mode = \"off\" }}\n",
+        ranking_connections()
+    );
+    for (name, pool) in purposes {
+        let listed = pool
+            .iter()
+            .map(|connection| format!("\"{connection}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "[models.purposes.{name}]\nmodel = {{ mode = \"auto\", pool = [{listed}] }}\neffort = {effort}\n"
+        ));
+    }
+    text
+}
+
+fn ranking_config(purposes: &[(&str, &[&str])], effort: &str) -> Config {
+    Config::parse_validated(&ranking_config_text(purposes, effort))
+        .expect("the ranking fixture validates")
+}
+
+fn single_pool_config(pool: &[&str], effort: &str) -> Config {
+    ranking_config(&[("main", pool)], effort)
+}
+
+/// The recorded task facts one case ranks on.
+fn facts(
+    surfaces: Option<&[Surface]>,
+    tools_required: bool,
+    context_tokens_estimate: u64,
+    obligations: usize,
+    criteria: usize,
+) -> RankingFacts {
+    RankingFacts::Recorded(RecordedFacts {
+        surfaces: surfaces.map(|labels| labels.iter().copied().collect()),
+        tools_required,
+        context_tokens_estimate,
+        obligations,
+        criteria,
+        remaining_units: BTreeMap::new(),
+        scope_chain: Vec::new(),
+    })
+}
+
+/// The same facts with one recorded scope holding `remaining` units.
+fn with_scope(mut facts: RankingFacts, scope: &str, remaining: u64) -> RankingFacts {
+    if let RankingFacts::Recorded(recorded) = &mut facts {
+        recorded.scope_chain.push(scope.to_string());
+        recorded
+            .remaining_units
+            .insert(scope.to_string(), remaining);
+    }
+    facts
+}
+
+/// The connection one prepared manifest was admitted on.
+fn admitted(broker: &Broker, manifest: &RequestManifest) -> String {
+    broker
+        .admission(&manifest.attempt_id)
+        .expect("the prepare admitted the attempt")
+        .connection
+        .clone()
+}
+
+/// The basis one prepared manifest froze on its admission.
+fn basis(broker: &Broker, manifest: &RequestManifest) -> String {
+    broker
+        .admission(&manifest.attempt_id)
+        .expect("the prepare admitted the attempt")
+        .ranking_basis
+        .clone()
+        .expect("the recorded ranking froze a basis")
+}
+
+fn fixed(connection: &str, model_id: &str) -> ModelAssign {
+    ModelAssign::Fixed(FixedModel {
+        connection: connection.to_string(),
+        model_id: model_id.to_string(),
+    })
+}
+
+#[test]
+fn auto_ranks_a_tool_task_above_pool_order() {
+    let config = single_pool_config(&["firepass", "deepseek"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    // Unknown facts keep the declared order: the pool's first entry wins.
+    let declared = broker
+        .prepare("main", &config, RANK_WORLD, "goal: tool task")
+        .expect("the declared request prepares");
+    assert_eq!(admitted(&broker, &declared), "firepass");
+
+    // The tool task's own recorded facts rank the context fit above that
+    // order — and an unrecorded tools mark excludes nothing.
+    let task = facts(None, true, 10_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: tool task",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the recorded request prepares");
+    assert_eq!(admitted(&broker, &ranked), "deepseek");
+    assert_eq!(ranked.model, fixed("deepseek", "deepseek-v4-flash"));
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("context fit"),
+        "the basis names it: {decision}"
+    );
+    assert!(
+        decision.contains("firepass/"),
+        "the basis names the candidate it beat: {decision}"
+    );
+}
+
+#[test]
+fn auto_prefers_the_recorded_fit_for_a_risky_surface() {
+    let config = single_pool_config(&["firepass", "groq"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let risky = facts(Some(&[Surface::Auth]), false, 10_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: risk",
+            InputOrigin::Human,
+            &risky,
+        )
+        .expect("the risky request prepares");
+    assert_eq!(admitted(&broker, &ranked), "groq");
+    assert_eq!(ranked.model, fixed("groq", "groq/compound"));
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "the risky surface asks for the high floor"
+    );
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("reasoning fit for risky surface auth"),
+        "the basis names the risk fact: {decision}"
+    );
+
+    // The same pool without a risk fact decides on the recorded price class.
+    let plain = facts(None, false, 10_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: plain",
+            InputOrigin::Human,
+            &plain,
+        )
+        .expect("the plain request prepares");
+    let plain_basis = basis(&broker, &ranked);
+    assert!(
+        !plain_basis.contains("reasoning fit"),
+        "no risk fact, no reasoning basis: {plain_basis}"
+    );
+    assert!(
+        plain_basis.contains("cheapest known full cost"),
+        "the price class decides instead: {plain_basis}"
+    );
+}
+
+#[test]
+fn auto_uses_the_cheapest_known_full_cost_and_unknown_price_is_not_free() {
+    let lean = single_pool_config(&["firepass", "groq"], "{ mode = \"auto\" }");
+    let reversed = single_pool_config(&["groq", "firepass"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 10_000, 0, 1);
+    for config in [&lean, &reversed] {
+        let ranked = broker
+            .prepare_with_facts(
+                "main",
+                config,
+                RANK_WORLD,
+                "goal: cost",
+                InputOrigin::Human,
+                &task,
+            )
+            .expect("the cost request prepares");
+        // The cheapest stated full cost wins in both pool orders: an unknown
+        // price is never read as free, so a `firepass` row never ranks first
+        // by carrying no figure at all.
+        assert_eq!(ranked.model, fixed("groq", "groq/compound"));
+        assert_eq!(admitted(&broker, &ranked), "groq");
+    }
+}
+
+#[test]
+fn single_candidate_changes_only_effort() {
+    let config = single_pool_config(&["yolo-auto"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let declared = broker
+        .prepare("main", &config, RANK_WORLD, "goal: single")
+        .expect("the declared request prepares");
+    assert_eq!(
+        declared.effort,
+        EffortAssign::Auto,
+        "unknown facts keep the resolved effort"
+    );
+
+    // One connection records one model: the facts move the effort and add no
+    // second model to trial.
+    let task = facts(None, false, 4_000, 2, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: single",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the recorded request prepares");
+    assert_eq!(admitted(&broker, &ranked), "yolo-auto");
+    assert_eq!(ranked.model, fixed("yolo-auto", "deepseek-flash-v4"));
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "two obligations ask for the recorded high level"
+    );
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("only eligible connection"),
+        "one candidate, no comparison invented: {decision}"
+    );
+    assert!(
+        decision.contains("two or more obligations"),
+        "the basis names the effort fact: {decision}"
+    );
+    assert_eq!(broker.accounted_requests(), 0, "prepare trialled no model");
+}
+
+#[test]
+fn explicit_pin_is_never_overridden() {
+    // The purpose pins a model and a level; the facts would otherwise rank the
+    // recorded `deepseek` rows first.
+    let config = Config::parse_validated(&format!(
+        "{}\n[models.defaults]\nmodel = {{ mode = \"auto\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n[models.purposes.main]\nmodel = {{ mode = \"fixed\", connection = \"local\", model_id = \"pinned-model\" }}\neffort = {{ mode = \"fixed\", value = \"low\" }}\n",
+        ranking_connections()
+    ))
+    .expect("the pinned fixture validates");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let risky = facts(Some(&[Surface::Auth]), true, 2_000_000, 4, 5);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: pinned",
+            InputOrigin::Human,
+            &risky,
+        )
+        .expect("the pinned request prepares");
+    assert_eq!(ranked.model, fixed("local", "pinned-model"));
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::Low
+        },
+        "the pinned level wins over the risky surface's floor"
+    );
+    assert_eq!(
+        broker
+            .admission(&ranked.attempt_id)
+            .expect("admission")
+            .ranking_basis,
+        None,
+        "a pin is not a ranking and records no basis"
+    );
+}
+
+#[test]
+fn no_eligible_candidate_denies_typed() {
+    let config = single_pool_config(&["held"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    for facts in [
+        RankingFacts::unknown(),
+        facts(Some(&[Surface::Auth]), true, 1_000, 4, 5),
+    ] {
+        let refused = broker
+            .prepare_with_facts(
+                "main",
+                &config,
+                RANK_WORLD,
+                "goal: denied",
+                InputOrigin::Human,
+                &facts,
+            )
+            .expect_err("no candidate survives eligibility");
+        match refused {
+            ModelError::NoEligibleCandidate { purpose, rejected } => {
+                assert_eq!(purpose, "main");
+                assert!(
+                    matches!(
+                        rejected.as_slice(),
+                        [CandidateRejection {
+                            connection,
+                            cause: RejectionCause::LiveGrantRequired { .. },
+                        }] if connection == "held"
+                    ),
+                    "the denial names the candidate and its cause: {rejected:?}"
+                );
+            }
+            other => panic!("expected the typed denial, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn exhausted_scope_excludes_a_candidate() {
+    let config = single_pool_config(&["deepseek"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let drained = with_scope(facts(None, false, 1_000, 0, 1), "task:root", 0);
+    let refused = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: budget",
+            InputOrigin::Human,
+            &drained,
+        )
+        .expect_err("an exhausted scope funds no bound");
+    // The refusal is the same typed waiting signal the send raises, and it
+    // names the scope that holds nothing: no candidate was ranked at all.
+    match refused {
+        ModelError::BudgetExhausted { scope } => assert_eq!(scope, "task:root"),
+        other => panic!("expected the budget exclusion, got {other:?}"),
+    }
+
+    // A scope the facts record nothing about is unknown, never zero.
+    let funded = with_scope(facts(None, false, 1_000, 0, 1), "task:root", 5);
+    broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: budget",
+            InputOrigin::Human,
+            &funded,
+        )
+        .expect("a funded scope admits the candidate");
+    // A chain entry the facts record nothing about is unknown, never zero.
+    let unknown = facts(None, false, 1_000, 0, 1);
+    broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: budget",
+            InputOrigin::Human,
+            &unknown,
+        )
+        .expect("a scope the facts do not record excludes nothing");
+}
+
+#[test]
+fn unknown_fact_is_distinct_from_a_recorded_miss() {
+    // `yolo-auto` records a 131072-token window — below this estimate, so a
+    // recorded miss; `local` records nothing — an unknown fact; `deepseek`
+    // records a fit. The unknown candidate ranks above the recorded miss.
+    let config = single_pool_config(&["yolo-auto", "local", "deepseek"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 200_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: context",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the context request prepares");
+    assert_eq!(ranked.model, fixed("deepseek", "deepseek-v4-flash"));
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("local/unrecorded"),
+        "the unknown fact outranks the recorded miss: {decision}"
+    );
+    assert!(
+        !decision.contains("yolo-auto/"),
+        "the recorded miss never becomes the runner-up: {decision}"
+    );
+}
+
+#[test]
+fn unrecorded_tools_is_not_a_hard_miss() {
+    // Every recorded row here carries `tools == false` — "not recorded", not
+    // "unsupported" — so the tool task still has an eligible candidate.
+    let config = single_pool_config(&["deepseek"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, true, 1_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: tools",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("an unrecorded tools mark denies nothing");
+    assert_eq!(ranked.model, fixed("deepseek", "deepseek-v4-flash"));
+}
+
+#[test]
+fn context_preference_does_not_hard_exclude_an_unknown_estimate() {
+    // `firepass` records neither a window nor an effort ladder: an unknown
+    // estimate (zero), a tool requirement and three criteria demote nothing
+    // into a denial, and the unknown effort keeps the resolved assignment.
+    let config = single_pool_config(&["firepass"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, true, 0, 0, 3);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: unknown estimate",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("an unknown estimate and effort deny nothing");
+    assert_eq!(ranked.model, fixed("firepass", "kimi-k2.6-turbo"));
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Auto,
+        "an unrecorded ladder keeps the resolved effort"
+    );
+}
+
+#[test]
+fn known_cost_decides_before_declaration_order() {
+    // Both candidates record a fitting window and a known price, and the
+    // cheaper one is declared *later*: the basis must name the cost key, never
+    // the declared order.
+    let config = single_pool_config(&["deepseek", "yolo-auto"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 1_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: cost order",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the cost request prepares");
+    assert_eq!(ranked.model, fixed("yolo-auto", "deepseek-flash-v4"));
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("cheaper known full cost"),
+        "the basis names the cost key: {decision}"
+    );
+    assert!(
+        !decision.contains("declared order"),
+        "the declared order did not decide: {decision}"
+    );
+}
+
+#[test]
+fn recorded_window_below_the_estimate_demotes_without_denying() {
+    // `yolo-auto` records a 131072-token window; this estimate exceeds it, so
+    // the row is a recorded miss — demoted, never filtered out of eligibility.
+    let alone = single_pool_config(&["yolo-auto"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 200_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &alone,
+            RANK_WORLD,
+            "goal: miss",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("a recorded miss never denies its candidate");
+    assert_eq!(ranked.model, fixed("yolo-auto", "deepseek-flash-v4"));
+
+    // Beside a fitting candidate the same row loses the fit comparison, so the
+    // demotion is a ranking fact rather than an exclusion.
+    let paired = single_pool_config(&["yolo-auto", "deepseek"], "{ mode = \"auto\" }");
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &paired,
+            RANK_WORLD,
+            "goal: miss",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the fitting candidate is eligible");
+    assert_eq!(ranked.model, fixed("deepseek", "deepseek-v4-flash"));
+}
+
+#[test]
+fn fitting_window_does_not_demote() {
+    // A recorded window equal to the estimate is a fit: a later-declared
+    // fitting candidate is not demoted below it, and the known price decides.
+    let config = single_pool_config(&["yolo-auto", "deepseek"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 131_072, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: boundary",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("a boundary fit is a fit");
+    assert_eq!(ranked.model, fixed("yolo-auto", "deepseek-flash-v4"));
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("cheaper known full cost"),
+        "both fit, so the cost decides: {decision}"
+    );
+}
+
+#[test]
+fn three_criteria_ask_for_the_high_recorded_level() {
+    let config = single_pool_config(&["yolo-auto"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 1_000, 0, 3);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: criteria",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the criteria request prepares");
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "three criteria ask for the medium floor, and the recorded ladder's smallest fit is high"
+    );
+    let decision = basis(&broker, &ranked);
+    assert!(
+        decision.contains("three or more criteria"),
+        "the basis names the effort fact: {decision}"
+    );
+}
+
+#[test]
+fn surface_fact_flips_the_winner_not_the_pool() {
+    // `yolo-auto` records a 131072-token window below this estimate, so
+    // without a risk fact the unknown-fact `firepass` row wins; the risk fact
+    // alone flips the pick to the recorded reasoning fit.
+    let config = single_pool_config(&["firepass", "yolo-auto"], "{ mode = \"auto\" }");
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let plain = facts(None, false, 140_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: surface",
+            InputOrigin::Human,
+            &plain,
+        )
+        .expect("the plain request prepares");
+    assert_eq!(admitted(&broker, &ranked), "firepass");
+    let risky = facts(Some(&[Surface::Auth]), false, 140_000, 0, 1);
+    let ranked = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: surface",
+            InputOrigin::Human,
+            &risky,
+        )
+        .expect("the risky request prepares");
+    assert_eq!(admitted(&broker, &ranked), "yolo-auto");
+}
+
+/// Serves every connection and fails the first send only: the fallback leg's
+/// substitute then reaches the real loopback, so one physical attempt settles
+/// on each side of the chain.
+struct FailFirstProvider {
+    inner: LoopbackProvider,
+    failed: bool,
+}
+
+impl Provider for FailFirstProvider {
+    fn name(&self) -> &'static str {
+        "fail-first"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        if !self.failed {
+            self.failed = true;
+            return Err(ProviderError::ProviderFailed {
+                connection: "yolo-auto".to_string(),
+                reason: "fixture failure".to_string(),
+            });
+        }
+        self.inner.send(manifest)
+    }
+}
+
+#[test]
+fn substitute_settles_without_the_primary_basis() {
+    // The primary ranks on recorded facts and records its basis; the chain's
+    // substitute was chosen by no ranking, so its own row keeps an unknown
+    // basis rather than inheriting the primary's explanation.
+    let config = Config::parse_validated(&format!(
+        "{}\n[models.defaults]\nmodel = {{ mode = \"auto\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"auto\" }}\n[models.purposes.main]\nmodel = {{ mode = \"auto\", pool = [\"yolo-auto\"] }}\nfallback = {{ mode = \"auto\", chain = [ {{ mode = \"fixed\", connection = \"local\", model_id = \"fallback-model\" }} ] }}\n",
+        ranking_connections()
+    ))
+    .expect("the fallback ranking fixture validates");
+    let mut broker = Broker::new(Box::new(FailFirstProvider {
+        inner: LoopbackProvider::new(),
+        failed: false,
+    }));
+    let root = tempfile::TempDir::with_prefix("rivect-ranking-fallback-").expect("fixture root");
+    let mut store =
+        rivect::state::TaskStore::open(&root.path().join("state.db")).expect("the store opens");
+    store
+        .open_budget("ranking-fallback", 10)
+        .expect("the scope opens");
+    let task = facts(None, false, 1_000, 0, 1);
+    let primary = broker
+        .prepare_with_facts(
+            "main",
+            &config,
+            RANK_WORLD,
+            "goal: fallback",
+            InputOrigin::Human,
+            &task,
+        )
+        .expect("the primary prepares");
+    let ranked = basis(&broker, &primary);
+    {
+        let mut ledger =
+            rivect::state::StoreLedger::new(&mut store, vec!["ranking-fallback".to_string()]);
+        broker
+            .dispatch(&mut ledger, RANK_WORLD, &primary)
+            .expect("the chain entry answers");
+    }
+    assert_eq!(
+        store
+            .settlement(&primary.attempt_id)
+            .expect("the primary settled")
+            .ranking_basis,
+        Some(ranked),
+        "the ranked primary keeps its basis"
+    );
+    let substitute = store
+        .settlements_for_parent(&primary.attempt_id)
+        .expect("the substitute rows read")
+        .pop()
+        .expect("the chain entry settled one substitute");
+    assert_eq!(
+        substitute.ranking_basis, None,
+        "no ranking chose the substitute, so it records no basis"
+    );
+}
+
+#[test]
+fn alphabet_and_stage_name_rules_do_not_decide() {
+    // Alphabetically and in pool order `deepseek` precedes `groq`; the
+    // recorded miss at this estimate ranks `groq` first instead.
+    let config = ranking_config(
+        &[
+            ("planning", &["deepseek", "groq"]),
+            ("code", &["deepseek", "groq"]),
+        ],
+        "{ mode = \"auto\" }",
+    );
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let task = facts(None, false, 2_000_000, 0, 1);
+    let mut picks = Vec::new();
+    for purpose in ["planning", "code"] {
+        let ranked = broker
+            .prepare_with_facts(
+                purpose,
+                &config,
+                RANK_WORLD,
+                "goal: purpose",
+                InputOrigin::Human,
+                &task,
+            )
+            .expect("the purpose prepares");
+        assert_eq!(ranked.model, fixed("groq", "groq/compound"));
+        picks.push(ranked.model);
+    }
+    assert_eq!(
+        picks[0], picks[1],
+        "the purpose name decides nothing: the same facts pick the same model"
+    );
+}
+
+/// The scripted challenge reply: one risk per selected risky surface, read
+/// from the manifest inputs so no fixed template can match.
+struct ChallengeProvider {
+    sent: Arc<Mutex<Vec<RequestManifest>>>,
+}
+
+impl Provider for ChallengeProvider {
+    fn name(&self) -> &'static str {
+        "challenge-fixture"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        self.sent.lock().expect("sent lock").push(manifest.clone());
+        let inputs: serde_json::Value =
+            serde_json::from_str(&manifest.inputs).expect("manifest inputs are json");
+        let risks: Vec<serde_json::Value> = inputs["surfaces"]
+            .as_array()
+            .expect("surfaces")
+            .iter()
+            .map(|label| json!({ "surface": label, "text": format!("risk on {label}") }))
+            .collect();
+        Ok(ProviderReply {
+            text: json!({ "risks": risks }).to_string(),
+            tool_calls: Vec::new(),
+            usage: UsageDelta::Unknown,
+            wire_retries: 0,
+        })
+    }
+}
+
+#[test]
+fn action_dispatch_uses_task_facts_for_auto() {
+    // A long goal puts the action's context estimate above `yolo-auto`'s
+    // recorded window, so without the request's risk fact the unknown-fact
+    // `firepass` row wins; the risk fact alone flips the pick to `yolo-auto`.
+    let config_toml = ranking_config_text(
+        &[
+            ("challenge_direction", &["yolo-auto", "firepass"]),
+            ("design_contracts", &["yolo-auto", "firepass"]),
+        ],
+        "{ mode = \"auto\" }",
+    );
+    let mut world = support::open_world("routing-action-facts", Some(&config_toml));
+    let config = world.runtime.config_for_broker();
+    let session = world.open_session("action-facts-session");
+    // The goal is bounded well below a recorded window, so the estimate is
+    // lifted by a wide criterion set: the action's inputs carry all of them.
+    let task = submit_wide_task(&mut world, &session, "action-facts-task", 12_000, 12);
+    let request = PlanRequest {
+        task_id: task.clone(),
+        kind: RequestKind::Audit,
+        surfaces: SurfaceScan::Known(BTreeSet::from([Surface::Auth])),
+        contract: ContractBasis::Absent,
+        parts: Vec::new(),
+        delegation: None,
+        author: None,
+    };
+    ActionRegistry::new()
+        .select(
+            &request,
+            &[],
+            &mut world.runtime.action_context(&session, &config),
+        )
+        .expect("the selection records");
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut broker = Broker::new(Box::new(ChallengeProvider { sent: sent.clone() }));
+    let outcome = {
+        let mut seam = BrokerSeam {
+            broker: &mut broker,
+            world: RANK_WORLD,
+        };
+        ActionRegistry::new().execute_with_seam(
+            ActionInput::ChallengeDirection(request),
+            &mut world.runtime.action_context(&session, &config),
+            Some(&mut seam),
+        )
+    };
+    assert!(
+        matches!(outcome, Ok(ActionOutcome::Challenged { .. })),
+        "the semantic leg answers: {outcome:?}"
+    );
+    let sent = sent.lock().expect("sent lock").clone();
+    assert_eq!(sent.len(), 1, "one physical request");
+    assert!(
+        sent[0].inputs.chars().count() > 131_072,
+        "the action's estimate exceeds the recorded window: {}",
+        sent[0].inputs.chars().count()
+    );
+    assert_eq!(
+        sent[0].model,
+        fixed("yolo-auto", "deepseek-flash-v4"),
+        "the action dispatched the risk-fact pick"
+    );
+
+    // The same facts without the request's surface scan pick the other
+    // connection: the surface is the fact that decided, not the pool order.
+    let snapshot = world
+        .runtime
+        .store()
+        .snapshot(&task)
+        .expect("the snapshot reads");
+    let plain = RankingFacts::Recorded(RecordedFacts {
+        surfaces: None,
+        tools_required: false,
+        context_tokens_estimate: u64::try_from(sent[0].inputs.chars().count()).unwrap_or(u64::MAX),
+        obligations: snapshot.obligations.items.len(),
+        criteria: snapshot.criteria.items.len(),
+        remaining_units: BTreeMap::new(),
+        scope_chain: Vec::new(),
+    });
+    let mut control = Broker::new(Box::new(LoopbackProvider::new()));
+    let plain = control
+        .prepare_with_facts(
+            "challenge_direction",
+            &config,
+            RANK_WORLD,
+            &sent[0].inputs,
+            InputOrigin::Tool,
+            &plain,
+        )
+        .expect("the surface-less control prepares");
+    assert_eq!(
+        admitted(&control, &plain),
+        "firepass",
+        "without the surface fact the unknown-fact row wins"
+    );
+}
+
+/// One task whose contract carries `criteria` criteria of `criterion_len`
+/// characters each, so the action's context estimate crosses a recorded
+/// window while the goal itself stays inside its own bound.
+fn submit_wide_task(
+    world: &mut support::World,
+    session: &rivect::contracts::SessionId,
+    command_id: &str,
+    criterion_len: usize,
+    criteria: usize,
+) -> rivect::contracts::TaskId {
+    let items: Vec<String> = (0..criteria)
+        .map(|index| format!("{} {index}", "y".repeat(criterion_len)))
+        .collect();
+    let request = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": command_id, "session_id": session.0,
+            "kind": "create",
+            "goal": "Bound the recorded surface.",
+            "contract": { "criteria": items, "constraints": [] },
+            "attachments": []
+        }
+    });
+    let response = world.dispatch(&request);
+    rivect::contracts::TaskId(
+        response["result"]["task_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("task.submit failed: {response}"))
+            .to_string(),
+    )
 }

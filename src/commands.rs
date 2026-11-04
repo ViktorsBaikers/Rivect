@@ -719,9 +719,16 @@ impl Runtime {
             let same_attempt = landing.attempt_id == manifest.attempt_id;
             let (model, source) = if same_attempt {
                 match &manifest.model {
-                    config::ModelAssign::Fixed(fixed) => {
-                        (Some(fixed.model_id.clone()), Some("fixed pin".to_string()))
-                    }
+                    config::ModelAssign::Fixed(fixed) => (
+                        Some(fixed.model_id.clone()),
+                        // A ranked model freezes as a fixed pin, so the basis
+                        // is what tells a ranking from an explicit pin.
+                        Some(if landing.ranking_basis.is_some() {
+                            "auto ranked".to_string()
+                        } else {
+                            "fixed pin".to_string()
+                        }),
+                    ),
                     config::ModelAssign::Auto { .. } => (None, Some("auto pool".to_string())),
                     config::ModelAssign::Inherit => (None, Some("inherited".to_string())),
                 }
@@ -746,7 +753,10 @@ impl Runtime {
             economy.source = source;
             economy.effort = Some(effort_text(&manifest.effort));
             economy.purpose = Some(manifest.purpose.clone());
-            economy.ranking_basis = None;
+            // The basis the ranking froze rides the settlement row, so the
+            // status shows the same choosing reason the ledger records rather
+            // than a second explanation the surface invents.
+            economy.ranking_basis = landing.ranking_basis.clone();
             economy.connection = Some(landing.connection);
         }
         // The project is the pinned root the index seam carries — the tree

@@ -4,15 +4,17 @@
 //! eligibility gate before ranking and one admission re-check before
 //! the send, and is accounted exactly once.
 
+use crate::actions::Surface;
 use crate::config::{
     Config, ConfigError, ConnKind, Connection, EffortAssign, EffortLevel, FallbackAssign,
     FixedModel, ModelAssign, Profile, PurposeDef,
 };
 use crate::instructions::{InstructionConflict, InstructionError, InstructionSet};
 use crate::learning::LearningDefinition;
-use crate::providers::{self, Dialect, Provider, ProviderError, ProviderReply};
+use crate::providers::{self, CatalogModel, Dialect, Provider, ProviderError, ProviderReply};
 use crate::resources::UsageDelta;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -356,6 +358,10 @@ pub struct AdmissionRecord {
     pub connection: String,
     pub model_id: Option<String>,
     pub model_source: String,
+    /// The choosing basis the ranking froze on this attempt (AC-096); `None`
+    /// while no recorded basis explains the pick — a pin, or a ranking that
+    /// ran on unknown task facts.
+    pub ranking_basis: Option<String>,
     pub snapshot_version: u64,
     /// The manifest frozen at prepare: the dispatch re-check's
     /// comparison copy.
@@ -653,6 +659,17 @@ pub struct CallContract<'a> {
 /// accounted full-request size includes this reserve, so a request
 /// that fits only without it is rejected.
 const OUTPUT_RESERVE_BYTES: usize = 16 * 1024;
+
+/// The wire parts and authorship one prepare freezes: everything
+/// [`Broker::freeze_manifest`] needs beyond the config and the ranking facts,
+/// so the two public entries differ only in where these came from.
+struct FreezeRequest<'a> {
+    world: &'a str,
+    inputs: &'a str,
+    origin: InputOrigin,
+    instructions: &'a str,
+    tools: &'a [String],
+}
 
 pub struct Broker {
     provider: Box<dyn Provider>,
@@ -955,88 +972,52 @@ impl Broker {
         inputs: &str,
         origin: InputOrigin,
     ) -> Result<RequestManifest, ModelError> {
-        let resolved = config.resolve_purpose(purpose)?;
-        let purpose_def = config.models.purposes.get(purpose);
-        let (connection, model_id) = rank_connection(
+        self.prepare_with_facts(
             purpose,
-            &resolved.model,
-            purpose_def,
-            &config.connections,
-            &config.profiles,
-            &self.entitlements,
-        )?;
+            config,
+            world,
+            inputs,
+            origin,
+            &RankingFacts::unknown(),
+        )
+    }
+
+    /// [`Broker::prepare_authored`] with the task facts `auto` ranks on
+    /// (AC-096, DEC-013): the controller builds the recorded facts from the
+    /// task snapshot and its obligations and passes them here. Facts and
+    /// authorship are different facts of the same request, so the entry
+    /// carries both; unknown facts keep the declared pool order and record no
+    /// basis.
+    ///
+    /// # Errors
+    ///
+    /// The [`Broker::prepare`] refusals.
+    pub fn prepare_with_facts(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        origin: InputOrigin,
+        facts: &RankingFacts,
+    ) -> Result<RequestManifest, ModelError> {
         let instructions = self.assemble_instructions(purpose, MANDATORY_INSTRUCTIONS)?;
         let tools: Vec<String> = DECLARED_TOOLS
             .iter()
             .map(|tool| (*tool).to_string())
             .collect();
-        let accounted = wire_composition(
-            &instructions,
-            &resolved.model,
-            &tools,
-            OUTPUT_RESERVE_BYTES,
-            inputs,
-        )
-        .len()
-            + OUTPUT_RESERVE_BYTES;
-        if accounted > crate::contracts::MODEL_WIRE_MAX_BYTES {
-            return Err(ModelError::RequestTooLarge {
-                limit: crate::contracts::MODEL_WIRE_MAX_BYTES,
-                actual: accounted,
-            });
-        }
-        let (epoch_id, epoch_cost) =
-            self.context_epoch(purpose, &resolved.model, &instructions, &tools);
-        let attempt_id = crate::contracts::AttemptId::generate().0;
-        let manifest = RequestManifest {
-            attempt_id,
-            purpose: purpose.to_string(),
-            world: world.to_string(),
-            model: resolved.model,
-            effort: resolved.effort,
-            instructions,
-            tools,
-            output_reserve: OUTPUT_RESERVE_BYTES,
-            inputs: inputs.to_string(),
-            inputs_digest: hex(&Sha256::digest(inputs.as_bytes())),
-            epoch_id,
-            mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
-            epoch_cost,
-            input_origin: origin,
-            cost_bound: sent_cost_bound(inputs),
-        };
-        // The re-check view tracks the config this prepare ran under —
-        // the walk at dispatch time never reads a staler document. The
-        // observe rides only a prepare that reached the admission: a
-        // purpose resolution, ranking or size rejection above must not
-        // steer the re-check with its caller-supplied config.
-        self.observe_config(config);
-        self.admissions.insert(
-            manifest.attempt_id.clone(),
-            AdmissionRecord {
-                purpose: purpose.to_string(),
-                connection: connection.clone(),
-                model_id,
-                model_source: resolved.model_source,
-                snapshot_version: self.entitlements.version,
-                manifest: manifest.clone(),
-                fallback: resolved.fallback,
-                fallback_source: resolved.fallback_source,
+        self.freeze_manifest(
+            config,
+            purpose,
+            &FreezeRequest {
+                world,
+                inputs,
+                origin,
+                instructions: &instructions,
+                tools: &tools,
             },
-        );
-        // The credential profile the admission binds (AC-047): frozen on
-        // the broker so the status surface can name it `active` — and
-        // only once the admission stands, so a rejected prepare never
-        // moves the pending/active pair.
-        let profile = config
-            .connections
-            .get(&connection)
-            .and_then(|entry| entry.profile.clone());
-        self.bound_profile = Some(ProfileBinding {
-            connection,
-            profile,
-        });
-        Ok(manifest)
+            facts,
+        )
     }
 
     /// Builds the immutable manifest for one call under `contract`: the
@@ -1055,28 +1036,99 @@ impl Broker {
         inputs: &str,
         contract: &CallContract<'_>,
     ) -> Result<RequestManifest, ModelError> {
-        let resolved = config.resolve_purpose(purpose)?;
-        let purpose_def = config.models.purposes.get(purpose);
-        let (connection, model_id) = rank_connection(
+        self.prepare_call_with_facts(
             purpose,
-            &resolved.model,
-            purpose_def,
-            &config.connections,
-            &config.profiles,
-            &self.entitlements,
-        )?;
+            config,
+            world,
+            inputs,
+            contract,
+            &RankingFacts::unknown(),
+        )
+    }
+
+    /// [`Broker::prepare_call`] with the task facts `auto` ranks on
+    /// (AC-096, DEC-013): the action path passes the request's own recorded
+    /// facts, so a semantic leg ranks on its surfaces and obligation shape.
+    ///
+    /// # Errors
+    ///
+    /// The [`Broker::prepare`] refusals.
+    pub fn prepare_call_with_facts(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        contract: &CallContract<'_>,
+        facts: &RankingFacts,
+    ) -> Result<RequestManifest, ModelError> {
         let instructions = self.assemble_instructions(purpose, contract.instructions)?;
         let tools: Vec<String> = contract
             .tools
             .iter()
             .map(|tool| (*tool).to_string())
             .collect();
+        self.freeze_manifest(
+            config,
+            purpose,
+            &FreezeRequest {
+                world,
+                inputs,
+                // A per-call contract's parts are catalogue and action text:
+                // platform bytes, never an operator turn (AC-009).
+                origin: InputOrigin::Tool,
+                instructions: &instructions,
+                tools: &tools,
+            },
+            facts,
+        )
+    }
+
+    /// The one freeze both [`Broker::prepare_with_facts`] and
+    /// [`Broker::prepare_call_with_facts`] run: rank on the facts, pin the
+    /// recorded model and the chosen effort, account the composed wire parts,
+    /// mint the epoch and admit the frozen manifest — so the two entries can
+    /// never diverge on what a prepared request is.
+    fn freeze_manifest(
+        &mut self,
+        config: &Config,
+        purpose: &str,
+        request: &FreezeRequest<'_>,
+        facts: &RankingFacts,
+    ) -> Result<RequestManifest, ModelError> {
+        let resolved = config.resolve_purpose(purpose)?;
+        let purpose_def = config.models.purposes.get(purpose);
+        let choice = rank_connection(
+            purpose,
+            &resolved,
+            purpose_def,
+            &config.connections,
+            &config.profiles,
+            &self.entitlements,
+            facts,
+        )?;
+        // A recorded model freezes as a fixed pin and the ranked effort as a
+        // fixed level; an unrecorded candidate keeps the resolved assignment,
+        // so a caller with unknown facts sees exactly the request it saw
+        // before task facts existed.
+        let model = match &choice.model_id {
+            Some(model_id) => ModelAssign::Fixed(FixedModel {
+                connection: choice.connection.clone(),
+                model_id: model_id.clone(),
+            }),
+            None => resolved.model.clone(),
+        };
+        let effort = match choice.effort {
+            Some(value) => EffortAssign::Fixed { value },
+            None => resolved.effort.clone(),
+        };
+        let connection = choice.connection;
         let accounted = wire_composition(
-            &instructions,
-            &resolved.model,
-            &tools,
+            request.instructions,
+            &model,
+            request.tools,
             OUTPUT_RESERVE_BYTES,
-            inputs,
+            request.inputs,
         )
         .len()
             + OUTPUT_RESERVE_BYTES;
@@ -1087,26 +1139,24 @@ impl Broker {
             });
         }
         let (epoch_id, epoch_cost) =
-            self.context_epoch(purpose, &resolved.model, &instructions, &tools);
+            self.context_epoch(purpose, &model, request.instructions, request.tools);
         let attempt_id = crate::contracts::AttemptId::generate().0;
         let manifest = RequestManifest {
             attempt_id,
             purpose: purpose.to_string(),
-            world: world.to_string(),
-            model: resolved.model,
-            effort: resolved.effort,
-            instructions,
-            tools,
+            world: request.world.to_string(),
+            model,
+            effort,
+            instructions: request.instructions.to_string(),
+            tools: request.tools.to_vec(),
             output_reserve: OUTPUT_RESERVE_BYTES,
-            inputs: inputs.to_string(),
-            inputs_digest: hex(&Sha256::digest(inputs.as_bytes())),
+            inputs: request.inputs.to_string(),
+            inputs_digest: hex(&Sha256::digest(request.inputs.as_bytes())),
             epoch_id,
             mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
             epoch_cost,
-            // A per-call contract's parts are catalogue and action text:
-            // platform bytes, never an operator turn (AC-009).
-            input_origin: InputOrigin::Tool,
-            cost_bound: sent_cost_bound(inputs),
+            input_origin: request.origin,
+            cost_bound: sent_cost_bound(request.inputs),
         };
         // The re-check view tracks the config this prepare ran under —
         // the walk at dispatch time never reads a staler document. The
@@ -1119,8 +1169,9 @@ impl Broker {
             AdmissionRecord {
                 purpose: purpose.to_string(),
                 connection: connection.clone(),
-                model_id,
+                model_id: choice.model_id,
                 model_source: resolved.model_source,
+                ranking_basis: choice.basis,
                 snapshot_version: self.entitlements.version,
                 manifest: manifest.clone(),
                 fallback: resolved.fallback,
@@ -1313,7 +1364,12 @@ impl Broker {
             purpose: manifest.purpose.clone(),
             connection: connection.to_string(),
             parent_attempt_id: parent_attempt_id.map(str::to_string),
-            ranking_basis: None,
+            // The ranking that admitted this attempt froze its basis on the
+            // admission; the settlement row carries it, never the manifest.
+            ranking_basis: self
+                .admissions
+                .get(&manifest.attempt_id)
+                .and_then(|admission| admission.ranking_basis.clone()),
         };
         let ticket = ledger
             .begin_send(&context, manifest)
@@ -1665,6 +1721,10 @@ impl Broker {
                 connection: connection.to_string(),
                 model_id,
                 model_source: format!("{}.{leg}", admission.fallback_source),
+                // No ranking chose this connection: the substitute inherits
+                // the failed primary's basis never, so its settlement records
+                // an unknown basis rather than the primary's explanation.
+                ranking_basis: None,
                 snapshot_version: self.entitlements.version,
                 manifest: substitute.clone(),
                 // A substitute send never spawns its own fallback.
@@ -1866,15 +1926,325 @@ fn epoch_cost(
     }
 }
 
+/// The closed surface set a risky task touches (AC-096, DEC-013). Risk is a
+/// recorded fact from this set — never the request's length, never a purpose
+/// or stage name.
+pub(crate) const RISKY_SURFACES: [Surface; 6] = [
+    Surface::Auth,
+    Surface::PublicApi,
+    Surface::Migration,
+    Surface::Permissions,
+    Surface::Secrets,
+    Surface::Trust,
+];
+
+/// The task facts `auto` ranks on (AC-096, DEC-013). The controller builds the
+/// recorded form from the task snapshot and its obligations and passes it
+/// through [`Broker::prepare_with_facts`]; the entries that carry no task facts
+/// pass [`RankingFacts::unknown`], and their ranking keeps the declared pool
+/// order and records no basis.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RankingFacts {
+    /// No task facts were recorded, so no task feature decides.
+    #[default]
+    Unknown,
+    /// The facts one task snapshot supplies.
+    Recorded(RecordedFacts),
+}
+
+impl RankingFacts {
+    /// The facts a caller with no task snapshot passes.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    fn recorded(&self) -> Option<&RecordedFacts> {
+        match self {
+            Self::Unknown => None,
+            Self::Recorded(facts) => Some(facts),
+        }
+    }
+}
+
+/// The recorded task facts one ranking runs on (AC-096, DEC-013). The purpose
+/// is the ranking call's own argument, so the facts never carry a second copy
+/// of it; `surfaces` is `None` when the impact scan decided nothing — undecided,
+/// never "no risky surface".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedFacts {
+    /// The decided surfaces, or `None` when the scan decided nothing.
+    pub surfaces: Option<BTreeSet<Surface>>,
+    /// The task's requested tool modality — not the declared tool surface.
+    pub tools_required: bool,
+    /// A conservative upper bound over the frozen inputs, in characters.
+    pub context_tokens_estimate: u64,
+    pub obligations: usize,
+    pub criteria: usize,
+    /// The units each scope of the chain still holds. A scope absent from the
+    /// map recorded nothing and never reads as zero.
+    pub remaining_units: BTreeMap<String, u64>,
+    /// The task's scope chain, root first.
+    pub scope_chain: Vec<String>,
+}
+
+impl RecordedFacts {
+    /// The first scope of the chain that holds no remaining units, if any:
+    /// the budget-feasibility gate the ranking runs before it ranks.
+    fn exhausted_scope(&self) -> Option<&str> {
+        self.scope_chain
+            .iter()
+            .map(String::as_str)
+            .find(|scope| self.remaining_units.get(*scope) == Some(&0))
+    }
+
+    /// The first risky surface the task recorded, if any.
+    fn risky_surface(&self) -> Option<Surface> {
+        let surfaces = self.surfaces.as_ref()?;
+        surfaces
+            .iter()
+            .copied()
+            .find(|surface| RISKY_SURFACES.contains(surface))
+    }
+}
+
+/// The one model/effort decision one prepare froze (AC-096): the chosen
+/// connection, the recorded model id — a ranked model freezes
+/// [`ModelAssign::Fixed`] — the effort the task facts chose, and the basis the
+/// settlement records. A choice with no recorded model keeps the resolved
+/// assignment and carries no model id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankingChoice {
+    pub connection: String,
+    pub model_id: Option<String>,
+    pub effort: Option<EffortLevel>,
+    pub basis: Option<String>,
+}
+
+/// The level's position on the effort ladder, for the chooser's comparisons.
+fn effort_rank(level: EffortLevel) -> u8 {
+    match level {
+        EffortLevel::Minimal => 0,
+        EffortLevel::Low => 1,
+        EffortLevel::Medium => 2,
+        EffortLevel::High => 3,
+        EffortLevel::Xhigh => 4,
+    }
+}
+
+/// The smallest level the task facts require (DEC-013): a risky surface asks
+/// for high, two or more obligations or three or more criteria for medium,
+/// and everything else for low.
+fn effort_floor(facts: &RecordedFacts, risky: bool) -> (EffortLevel, &'static str) {
+    if risky {
+        (EffortLevel::High, "the risky surface")
+    } else if facts.obligations >= 2 {
+        (EffortLevel::Medium, "two or more obligations")
+    } else if facts.criteria >= 3 {
+        (EffortLevel::Medium, "three or more criteria")
+    } else {
+        (EffortLevel::Low, "the default level")
+    }
+}
+
+/// The effort one recorded candidate offers for the task facts: the smallest
+/// recorded level satisfying the floor, else the highest recorded, else
+/// nothing — an unrecorded candidate keeps the resolved assignment, and a
+/// fixed pin or an inherited effort never moves.
+fn ranked_effort(
+    facts: &RecordedFacts,
+    risky: bool,
+    row: Option<&CatalogModel>,
+    resolved: &EffortAssign,
+) -> Option<(EffortLevel, &'static str)> {
+    if !matches!(resolved, EffortAssign::Auto) {
+        return None;
+    }
+    let recorded = &row?.efforts;
+    let (floor, reason) = effort_floor(facts, risky);
+    let chosen = recorded
+        .iter()
+        .copied()
+        .filter(|level| effort_rank(*level) >= effort_rank(floor))
+        .min_by_key(|level| effort_rank(*level))
+        .or_else(|| {
+            recorded
+                .iter()
+                .copied()
+                .max_by_key(|level| effort_rank(*level))
+        })?;
+    Some((chosen, reason))
+}
+
+/// One candidate the recorded ranking weighs: a connection with one of its
+/// recorded rows, or the unknown-fact candidate a connection with no recorded
+/// row contributes.
+struct RankedCandidate {
+    connection: String,
+    row: Option<CatalogModel>,
+    /// The three-way facts in ranking order: capability match, context fit,
+    /// price class. `0` is a known match, `1` unknown, `2` a known miss (the
+    /// context class alone reaches `2`); a known price is `0` and an unknown
+    /// price `1`, which is why an unknown price ranks last and never free.
+    class: (u8, u8, u8),
+    /// The stated full cost over the estimate; `None` is the unknown price.
+    cost: Option<f64>,
+    /// The candidate's position in the declared pool order.
+    declaration: usize,
+}
+
+impl RankedCandidate {
+    /// The candidate a connection with no recorded row contributes: every fact
+    /// is unknown, distinct from a recorded miss.
+    fn unknown(connection: &str, declaration: usize) -> Self {
+        Self {
+            connection: connection.to_string(),
+            row: None,
+            class: (1, 1, 1),
+            cost: None,
+            declaration,
+        }
+    }
+
+    fn recorded(
+        connection: &str,
+        declaration: usize,
+        row: CatalogModel,
+        facts: &RecordedFacts,
+        risky: bool,
+    ) -> Self {
+        let capability = if (risky && row.reasoning) || (facts.tools_required && row.tools) {
+            0
+        } else {
+            1
+        };
+        let context = match row.context_window {
+            Some(window) if window >= facts.context_tokens_estimate => 0,
+            Some(_) => 2,
+            None => 1,
+        };
+        let cost = row.price.full_cost(facts.context_tokens_estimate);
+        let price = if cost.is_some() { 0 } else { 1 };
+        Self {
+            connection: connection.to_string(),
+            row: Some(row),
+            class: (capability, context, price),
+            cost,
+            declaration,
+        }
+    }
+
+    /// The deterministic order: capability, context, price, then declaration
+    /// order. The sort is stable, so two rows of one connection keep the order
+    /// the registry records them in.
+    fn order(left: &Self, right: &Self) -> Ordering {
+        left.class
+            .cmp(&right.class)
+            .then_with(|| match (left.cost, right.cost) {
+                (Some(left), Some(right)) => left.total_cmp(&right),
+                _ => Ordering::Equal,
+            })
+            .then_with(|| left.declaration.cmp(&right.declaration))
+    }
+
+    /// `connection/model`, or the connection with its unrecorded model named
+    /// as such.
+    fn label(&self) -> String {
+        match &self.row {
+            Some(row) => format!("{}/{}", self.connection, row.id),
+            None => format!("{}/unrecorded", self.connection),
+        }
+    }
+}
+
+/// Which recorded fact decided the pick over the best candidate of another
+/// connection: the first ranking key the winner is better on, with the
+/// recorded value that decided it. A tie on every key is the declared order.
+fn deciding_criterion(
+    winner: &RankedCandidate,
+    runner_up: &RankedCandidate,
+    facts: &RecordedFacts,
+    risky: Option<Surface>,
+) -> String {
+    if winner.class.0 < runner_up.class.0 {
+        if let Some(surface) = risky
+            && winner.row.as_ref().is_some_and(|row| row.reasoning)
+        {
+            return format!(
+                "a recorded reasoning fit for risky surface {surface}",
+                surface = surface.as_str()
+            );
+        }
+        return "a recorded tool modality".to_string();
+    }
+    if winner.class.1 < runner_up.class.1 {
+        return match winner.class.1 {
+            0 => format!(
+                "a recorded context fit for {estimate} estimated tokens",
+                estimate = facts.context_tokens_estimate
+            ),
+            // The winner's window is unrecorded; that is the winner's own
+            // recorded fact, not the runner-up's miss.
+            _ => "an unrecorded context window".to_string(),
+        };
+    }
+    if winner.class.2 < runner_up.class.2 {
+        return "the cheapest known full cost, where an unknown price ranks last".to_string();
+    }
+    // Two stated prices: the cheaper one decides before declaration order, so
+    // a cheaper candidate declared later is never explained as the pool order.
+    if let (Some(left), Some(right)) = (winner.cost, runner_up.cost)
+        && left < right
+    {
+        return format!(
+            "the cheaper known full cost of {cost:.4} usd over {estimate} estimated tokens",
+            cost = left,
+            estimate = facts.context_tokens_estimate,
+        );
+    }
+    "the declared order".to_string()
+}
+
+/// The basis string one recorded ranking froze: the winner, the best candidate
+/// of another connection it beat, the recorded fact that decided it, and the
+/// effort the facts chose. It names recorded facts alone — no prompt length, no
+/// stage name (PROH-019).
+fn ranked_basis(
+    winner: &RankedCandidate,
+    runner_up: Option<&RankedCandidate>,
+    facts: &RecordedFacts,
+    risky: Option<Surface>,
+    effort: Option<(EffortLevel, &'static str)>,
+) -> String {
+    let mut basis = format!("auto ranked {}", winner.label());
+    match runner_up {
+        Some(runner_up) => {
+            basis.push_str(" over ");
+            basis.push_str(&runner_up.label());
+            basis.push_str(" by ");
+            basis.push_str(&deciding_criterion(winner, runner_up, facts, risky));
+        }
+        None => basis.push_str(" as the only eligible connection"),
+    }
+    if let Some((level, reason)) = effort {
+        basis.push_str("; effort ");
+        basis.push_str(level.name());
+        basis.push_str(" from ");
+        basis.push_str(reason);
+    }
+    basis
+}
+
 /// Candidate enumeration and offline ranking for one assignment
-/// (AC-044): ineligible candidates are filtered out before ranking —
+/// (AC-044, AC-096): ineligible candidates are filtered out before ranking —
 /// unknown to the catalogue, not usable without a separate live grant,
-/// outside the account entitlement or the per-purpose `eligible`
-/// input. Offline ranking is pool order, the declared preference:
-/// priced ranking arrives with the live dialects. An assignment with
-/// no surviving candidate fails closed, and a fixed pin keeps the
-/// precise typed rejection vocabulary of
-/// [`providers::offline_eligible`].
+/// outside the account entitlement, the per-purpose `eligible` input or the
+/// scope chain's remaining budget. With unknown facts the declared pool order
+/// decides; with recorded facts the task's own features rank the recorded
+/// catalogue rows, an unrecorded candidate stays an unknown fact, and a
+/// recorded window below the estimate demotes rather than denies. An
+/// assignment with no surviving candidate fails closed, and a fixed pin keeps
+/// the precise typed rejection vocabulary of [`providers::offline_eligible`].
 ///
 /// # Errors
 ///
@@ -1883,15 +2253,16 @@ fn epoch_cost(
 /// survives the eligibility filter.
 fn rank_connection(
     purpose: &str,
-    assignment: &ModelAssign,
+    resolved: &crate::config::ResolvedPurpose,
     purpose_def: Option<&PurposeDef>,
     connections: &BTreeMap<String, Connection>,
     profiles: &BTreeMap<String, Profile>,
     entitlements: &Entitlements,
-) -> Result<(String, Option<String>), ModelError> {
-    match assignment {
+    facts: &RankingFacts,
+) -> Result<RankingChoice, ModelError> {
+    match &resolved.model {
         ModelAssign::Fixed(fixed) => {
-            providers::offline_eligible(assignment, connections, profiles)?;
+            providers::offline_eligible(&resolved.model, connections, profiles)?;
             // `offline_eligible` already answered the catalogue and
             // live-grant gates, so only the entitlement tail can refuse
             // a fixed pin here.
@@ -1905,7 +2276,12 @@ fn rank_connection(
                     }],
                 });
             }
-            Ok((fixed.connection.clone(), Some(fixed.model_id.clone())))
+            Ok(RankingChoice {
+                connection: fixed.connection.clone(),
+                model_id: Some(fixed.model_id.clone()),
+                effort: None,
+                basis: None,
+            })
         }
         ModelAssign::Auto { pool } => {
             // the purpose-level pool is the more specific file-only
@@ -1917,26 +2293,49 @@ fn rank_connection(
                 Some(pool) => pool.to_vec(),
                 None => connections.keys().cloned().collect(),
             };
-            let mut rejected = Vec::new();
-            let ranked = candidates.into_iter().find(|name| {
-                match rank_rejection(connections, profiles, entitlements, purpose_def, name) {
-                    Some(cause) => {
-                        rejected.push(CandidateRejection {
-                            connection: name.clone(),
-                            cause,
-                        });
-                        false
-                    }
-                    None => true,
-                }
-            });
-            match ranked {
-                Some(connection) => Ok((connection, None)),
-                None => Err(ModelError::NoEligibleCandidate {
-                    purpose: purpose.to_string(),
-                    rejected,
-                }),
+            let recorded = facts.recorded();
+            // The budget-feasibility gate precedes ranking: a scope with no
+            // remaining units can fund no bound, so no candidate of this
+            // request is feasible. The refusal is the same typed waiting
+            // signal `begin_send` raises, so the caller records one waiting
+            // reason instead of a candidate list; the exact bound is still
+            // re-checked by the send.
+            if let Some(scope) = recorded.and_then(RecordedFacts::exhausted_scope) {
+                return Err(ModelError::BudgetExhausted {
+                    scope: scope.to_string(),
+                });
             }
+            let mut rejected = Vec::new();
+            let mut feasible = Vec::new();
+            for name in candidates {
+                if let Some(cause) =
+                    rank_rejection(connections, profiles, entitlements, purpose_def, &name)
+                {
+                    rejected.push(CandidateRejection {
+                        connection: name,
+                        cause,
+                    });
+                    continue;
+                }
+                feasible.push(name);
+            }
+            let Some(recorded) = recorded else {
+                // Unknown facts decide nothing: the declared pool order is
+                // the recorded preference, and no basis claims otherwise.
+                return match feasible.into_iter().next() {
+                    Some(connection) => Ok(RankingChoice {
+                        connection,
+                        model_id: None,
+                        effort: None,
+                        basis: None,
+                    }),
+                    None => Err(ModelError::NoEligibleCandidate {
+                        purpose: purpose.to_string(),
+                        rejected,
+                    }),
+                };
+            };
+            rank_recorded(purpose, &feasible, recorded, &rejected, &resolved.effort)
         }
         // an inherit that survived resolution names no connection and
         // declares no pool: it has no candidate and fails closed
@@ -1945,6 +2344,59 @@ fn rank_connection(
             rejected: Vec::new(),
         }),
     }
+}
+
+/// The recorded-fact ranking over the feasible connections (AC-096): every
+/// connection contributes its recorded rows, or one unknown-fact candidate
+/// when it records none; the deterministic order picks the winner, the effort
+/// chooser sets the level for a single candidate or many, and the basis names
+/// what decided.
+fn rank_recorded(
+    purpose: &str,
+    feasible: &[String],
+    facts: &RecordedFacts,
+    rejected: &[CandidateRejection],
+    resolved_effort: &EffortAssign,
+) -> Result<RankingChoice, ModelError> {
+    let risky = facts.risky_surface();
+    let mut ranked = Vec::new();
+    for (declaration, connection) in feasible.iter().enumerate() {
+        let rows = providers::recorded_models(connection);
+        if rows.is_empty() {
+            ranked.push(RankedCandidate::unknown(connection, declaration));
+        } else {
+            for row in rows {
+                ranked.push(RankedCandidate::recorded(
+                    connection,
+                    declaration,
+                    row,
+                    facts,
+                    risky.is_some(),
+                ));
+            }
+        }
+    }
+    if ranked.is_empty() {
+        return Err(ModelError::NoEligibleCandidate {
+            purpose: purpose.to_string(),
+            rejected: rejected.to_vec(),
+        });
+    }
+    ranked.sort_by(RankedCandidate::order);
+    let winner = &ranked[0];
+    // The basis names the best candidate of another connection: the model
+    // ordering inside the winner's own connection is the registry's, not a
+    // second choosing basis.
+    let runner_up = ranked
+        .iter()
+        .find(|candidate| candidate.connection != winner.connection);
+    let effort = ranked_effort(facts, risky.is_some(), winner.row.as_ref(), resolved_effort);
+    Ok(RankingChoice {
+        connection: winner.connection.clone(),
+        model_id: winner.row.as_ref().map(|row| row.id.clone()),
+        effort: effort.map(|(level, _reason)| level),
+        basis: Some(ranked_basis(winner, runner_up, facts, risky, effort)),
+    })
 }
 
 /// The prepare-time twin of [`Broker::candidate_rejection`] minus the

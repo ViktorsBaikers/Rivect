@@ -25,6 +25,7 @@ use crate::identity::{
 use crate::learning::{
     ConditionFact, CorpusCandidate, CorpusCase, CorpusVerdict, DEFINITION_MAX_BYTES,
     DeltaCandidate, DeltaChange, DeltaError, DeltaPayload, DeltaRecord, DeltaScope, DeltaState,
+    FeedbackCause, FeedbackOutcome, FeedbackRecord, FeedbackReward, FeedbackVerdict,
     LearningDefinition, LearningDelta, LearningDeltaView, LearningStatus, PredicateEffect,
     corpus_verdict,
 };
@@ -634,6 +635,171 @@ impl TaskStore {
             generation,
             active,
             rolled_back,
+        })
+    }
+
+    /// Appends one routing-feedback row (AC-052, DEC-014). The table is
+    /// append-only: an attempt already recorded is refused typed, so a late
+    /// repair never rewrites the result it repaired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Delta`] with the exact violation for a malformed
+    /// row or an already recorded attempt, and [`StoreError::Storage`] when the
+    /// row cannot be written.
+    pub fn record_feedback(&mut self, record: &FeedbackRecord) -> Result<FeedbackRecord> {
+        record.validate()?;
+        let evidence = serde_json::to_string(&record.version_evidence)
+            .map_err(|error| storage(std::io::Error::other(error)))?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        tx.execute(
+            INSERT_ROUTING_FEEDBACK,
+            params![
+                record.attempt_id,
+                record.parent_attempt_id,
+                record.purpose,
+                record.connection,
+                record.model_id,
+                record.outcome.as_str(),
+                record.cause.as_str(),
+                evidence,
+                record.repair_of,
+                record.verdict.as_str(),
+                record.reward.as_str(),
+                i64::from(record.observed)
+            ],
+        )
+        .map_err(storage)?;
+        if tx.changes() == 0 {
+            return Err(StoreError::Delta(DeltaError::FeedbackAlreadyRecorded {
+                attempt_id: record.attempt_id.clone(),
+            }));
+        }
+        tx.commit().map_err(storage)?;
+        self.feedback(&record.attempt_id)
+    }
+
+    /// One recorded feedback row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Delta`] carrying
+    /// [`DeltaError::FeedbackMissing`] — the feedback row is absent, never a
+    /// missing attempt, and its wire code stays `not found` — and
+    /// [`StoreError::Storage`] when the row cannot be decoded.
+    pub fn feedback(&self, attempt_id: &str) -> Result<FeedbackRecord> {
+        feedback_on(self.conn()?, attempt_id)?.ok_or_else(|| {
+            StoreError::Delta(DeltaError::FeedbackMissing {
+                attempt_id: attempt_id.to_string(),
+            })
+        })
+    }
+
+    /// The rows naming `attempt_id` as repaired, oldest first: the cost a late
+    /// repair attributed to itself, never to the repaired attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] when a row cannot be read or decoded.
+    pub fn feedback_repairs(&self, attempt_id: &str) -> Result<Vec<FeedbackRecord>> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(ROUTING_FEEDBACK_REPAIRS).map_err(storage)?;
+        let rows = statement
+            .query_map(params![attempt_id], feedback_from_row)
+            .map_err(storage)?;
+        let mut repairs = Vec::new();
+        for row in rows {
+            repairs.push(row.map_err(storage)?.into_record()?);
+        }
+        Ok(repairs)
+    }
+}
+
+// ----- routing feedback (AC-052, DEC-014) -----
+
+/// The append-only feedback write: `INSERT OR IGNORE` plus the changed-row
+/// count is the duplicate refusal, the same shape the delta candidate's write
+/// uses. No statement updates or deletes a row.
+const INSERT_ROUTING_FEEDBACK: &str = "INSERT OR IGNORE INTO routing_feedback
+             (attempt_id, parent_attempt_id, purpose, connection, model_id, outcome, cause,
+              version_evidence, repair_of, verdict, reward, observed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+const ROUTING_FEEDBACK_ROW: &str = "SELECT attempt_id, parent_attempt_id, purpose, connection,
+             model_id, outcome, cause, version_evidence, repair_of, verdict, reward, observed
+             FROM routing_feedback WHERE attempt_id = ?1";
+const ROUTING_FEEDBACK_REPAIRS: &str =
+    "SELECT attempt_id, parent_attempt_id, purpose, connection, model_id, outcome, cause,
+             version_evidence, repair_of, verdict, reward, observed
+             FROM routing_feedback WHERE repair_of = ?1 ORDER BY rowid";
+
+fn feedback_on(conn: &Connection, attempt_id: &str) -> Result<Option<FeedbackRecord>> {
+    let stored = conn
+        .query_row(ROUTING_FEEDBACK_ROW, params![attempt_id], feedback_from_row)
+        .optional()
+        .map_err(storage)?;
+    stored.map(StoredFeedback::into_record).transpose()
+}
+
+fn feedback_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFeedback> {
+    Ok(StoredFeedback {
+        attempt_id: row.get(0)?,
+        parent_attempt_id: row.get(1)?,
+        purpose: row.get(2)?,
+        connection: row.get(3)?,
+        model_id: row.get(4)?,
+        outcome: row.get(5)?,
+        cause: row.get(6)?,
+        version_evidence: row.get(7)?,
+        repair_of: row.get(8)?,
+        verdict: row.get(9)?,
+        reward: row.get(10)?,
+        observed: row.get(11)?,
+    })
+}
+
+/// One feedback row's raw columns, before the closed vocabularies and the
+/// evidence JSON are decoded — the read-then-decode shape the store's other
+/// strict columns use.
+struct StoredFeedback {
+    attempt_id: String,
+    parent_attempt_id: Option<String>,
+    purpose: String,
+    connection: String,
+    model_id: Option<String>,
+    outcome: String,
+    cause: String,
+    version_evidence: String,
+    repair_of: Option<String>,
+    verdict: String,
+    reward: String,
+    observed: i64,
+}
+
+impl StoredFeedback {
+    fn into_record(self) -> Result<FeedbackRecord> {
+        let closed = |name: &str, raw: &str| corrupt_column(name, raw);
+        Ok(FeedbackRecord {
+            outcome: FeedbackOutcome::parse(&self.outcome)
+                .ok_or_else(|| closed("routing feedback outcome", &self.outcome))?,
+            cause: FeedbackCause::parse(&self.cause)
+                .ok_or_else(|| closed("routing feedback cause", &self.cause))?,
+            verdict: FeedbackVerdict::parse(&self.verdict)
+                .ok_or_else(|| closed("routing feedback verdict", &self.verdict))?,
+            reward: FeedbackReward::parse(&self.reward)
+                .ok_or_else(|| closed("routing feedback reward", &self.reward))?,
+            version_evidence: serde_json::from_str(&self.version_evidence).map_err(
+                |_not_json| closed("routing feedback version evidence", &self.version_evidence),
+            )?,
+            observed: self.observed != 0,
+            attempt_id: self.attempt_id,
+            parent_attempt_id: self.parent_attempt_id,
+            purpose: self.purpose,
+            connection: self.connection,
+            model_id: self.model_id,
+            repair_of: self.repair_of,
         })
     }
 }

@@ -1605,6 +1605,19 @@ pub(crate) fn routed_catalog(connection: &str) -> Option<Vec<CatalogModel>> {
     }
 }
 
+/// The catalogue rows this build records for one connection (DEC-013,
+/// AC-096): the alias table a routed id ships, else the recorded allowlist or
+/// recorded seed rows of its Chat Completions class. An empty answer is the
+/// unknown fact — the ranker never invents a row for a connection that records
+/// none, and no live read happens here.
+#[must_use]
+pub(crate) fn recorded_models(connection: &str) -> Vec<CatalogModel> {
+    match routed_catalog(connection) {
+        Some(rows) => rows,
+        None => local::recorded_catalog(connection),
+    }
+}
+
 pub trait Provider: Send {
     fn name(&self) -> &'static str;
     /// Whether this adapter's dialect serves `connection` — the send

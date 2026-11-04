@@ -18,17 +18,27 @@
 
 mod support;
 
-use rivect::config::{Config, ConnKind, Connection, FixedModel, ModelAssign};
+use rivect::actions::{
+    ActionRegistry, ContractBasis, PlanRequest, RequestKind, Surface, SurfaceScan,
+};
+use rivect::config::{
+    Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
+};
 use rivect::contracts::AnswerSelection;
 use rivect::controller::{SchedulerStep, StepOutcome};
+use rivect::learning::{
+    FeedbackCause, FeedbackOutcome, FeedbackRecord, FeedbackReward, FeedbackVerdict,
+    VersionEvidence,
+};
 use rivect::model::{Broker, ModelError, RequestManifest, SendContext, SendOutcome, SendTicket};
-use rivect::providers::{Provider, ProviderError, ProviderReply};
+use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::{Exactness, UsageDelta};
 use rivect::state::{
     CacheCohort, CacheCohortCounts, CacheRate, ConflictCause, InvalidCause, SettlementState,
     StoreError, StoreLedger, TaskStore,
 };
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2502,4 +2512,335 @@ fn cohort_above_the_statement_batch_sums_every_batch() {
         json!([901, 1802]),
         "cohort batches of 900",
     );
+}
+
+// ----- AC-052/AC-096: repair attribution and recorded-fact ranking -----
+
+/// Non-secret version evidence for one recorded attempt.
+fn feedback_evidence() -> VersionEvidence {
+    VersionEvidence {
+        build: "rivect 0.1.0".to_string(),
+        policy_generation: None,
+        base_version: Some(2),
+        model: Some("fixture-model".to_string()),
+        connection: Some(CONNECTION.to_string()),
+    }
+}
+
+/// One observed, failed attempt row.
+fn feedback_row(attempt_id: &str) -> FeedbackRecord {
+    FeedbackRecord {
+        attempt_id: attempt_id.to_string(),
+        parent_attempt_id: None,
+        purpose: "main".to_string(),
+        connection: CONNECTION.to_string(),
+        model_id: Some("fixture-model".to_string()),
+        outcome: FeedbackOutcome::Fail,
+        cause: FeedbackCause::None,
+        version_evidence: feedback_evidence(),
+        repair_of: None,
+        verdict: FeedbackVerdict::Fail,
+        reward: FeedbackReward::None,
+        observed: true,
+    }
+}
+
+/// The row a late repair appends: its own PASS, its own cost attribution and
+/// the attempt it repaired.
+fn repair_row(attempt_id: &str, repaired: &str) -> FeedbackRecord {
+    FeedbackRecord {
+        attempt_id: attempt_id.to_string(),
+        outcome: FeedbackOutcome::Pass,
+        cause: FeedbackCause::Repair,
+        repair_of: Some(repaired.to_string()),
+        verdict: FeedbackVerdict::Pass,
+        reward: FeedbackReward::Repair,
+        ..feedback_row(attempt_id)
+    }
+}
+
+#[test]
+fn feedback_attributes_a_late_repair_to_the_repair() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-repair-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Exact {
+        prompt_tokens: 3,
+        completion_tokens: 1,
+        total_tokens: 4,
+    })));
+
+    // The cheap attempt: one physical send, one settled row, one charge.
+    let cheap = prepared(&mut broker);
+    let cheap_charge = {
+        let mut ledger = StoreLedger::new(&mut store, vec![SCOPE_A.to_string()]);
+        broker
+            .dispatch(&mut ledger, WORLD, &cheap)
+            .expect("the cheap send settles");
+        store
+            .settlement(&cheap.attempt_id)
+            .expect("the cheap row exists")
+            .charged_units
+            .expect("the cheap bound is charged")
+    };
+
+    // The late repair is a second physical attempt whose larger request pays
+    // its own bound — the cost is attributed to the repair's own row.
+    let repair = broker
+        .prepare(
+            "main",
+            &config(),
+            WORLD,
+            &format!("goal: repair {}", "x".repeat(4096)),
+        )
+        .expect("the repair request prepares");
+    let repair_charge = {
+        let mut ledger = StoreLedger::new(&mut store, vec![SCOPE_A.to_string()]);
+        broker
+            .dispatch(&mut ledger, WORLD, &repair)
+            .expect("the repair send settles");
+        store
+            .settlement(&repair.attempt_id)
+            .expect("the repair row exists")
+            .charged_units
+            .expect("the repair bound is charged")
+    };
+    assert_ne!(
+        cheap_charge, repair_charge,
+        "each attempt pays its own frozen bound"
+    );
+
+    let cheap_row = store
+        .record_feedback(&feedback_row(&cheap.attempt_id))
+        .expect("the cheap result records");
+    let repair = store
+        .record_feedback(&repair_row(&repair.attempt_id, &cheap.attempt_id))
+        .expect("the repair records");
+
+    // The repair attributes itself to the repaired attempt and to its own
+    // cost; the cheap result keeps its verdict and carries no repair cost.
+    assert_eq!(repair.reward, FeedbackReward::Repair);
+    assert_eq!(repair.repair_of.as_deref(), Some(cheap.attempt_id.as_str()));
+    assert_eq!(repair.verdict, FeedbackVerdict::Pass);
+    assert_eq!(
+        store
+            .settlement(&repair.attempt_id)
+            .expect("the repair row re-reads")
+            .charged_units,
+        Some(repair_charge)
+    );
+    let cheap_after = store
+        .feedback(&cheap.attempt_id)
+        .expect("the cheap row re-reads");
+    assert_eq!(cheap_after, cheap_row, "the cheap row is unchanged");
+    assert_eq!(cheap_after.verdict, FeedbackVerdict::Fail);
+    assert_eq!(cheap_after.reward, FeedbackReward::None);
+    assert_eq!(cheap_after.repair_of, None);
+    assert_eq!(
+        store
+            .settlement(&cheap.attempt_id)
+            .expect("the cheap row re-reads")
+            .charged_units,
+        Some(cheap_charge),
+        "the repair's cost never moves onto the repaired attempt"
+    );
+    let repairs = store
+        .feedback_repairs(&cheap.attempt_id)
+        .expect("the attribution reads");
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].attempt_id, repair.attempt_id);
+}
+
+/// The ranking world: `yolo-auto` records one seed row with a low/high effort
+/// ladder, `local` records nothing, and the `main` purpose runs `auto` — so
+/// the controller's own facts decide both the model and the level.
+fn recorded_config_text() -> &'static str {
+    "config_version = 1\n\
+     [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+     [connections.yolo-auto]\nkind = \"local\"\nendpoint = \"https://yolo-auto.com/v1\"\n\
+     [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n\
+     [models.purposes.main]\nmodel = { mode = \"auto\", pool = [\"yolo-auto\"] }\neffort = { mode = \"auto\" }\n"
+}
+
+fn recorded_world(tag: &str) -> (support::World, Arc<std::sync::Mutex<Vec<RequestManifest>>>) {
+    // The real offline loopback answers, and the wrapper serves the recorded
+    // connection and keeps the manifest the provider actually received.
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut world = support::open_world_with(
+        tag,
+        Some(recorded_config_text()),
+        Box::new(RankingProvider {
+            inner: LoopbackProvider::new(),
+            sent: sent.clone(),
+        }),
+        Box::new(support::PlatformWorker::default()),
+    );
+    world.runtime.purpose = "main".to_string();
+    (world, sent)
+}
+
+/// The offline loopback plus one recorded wire log: the ranking world needs a
+/// provider that serves the recorded connection and a manifest the test can
+/// read back.
+struct RankingProvider {
+    inner: LoopbackProvider,
+    sent: Arc<std::sync::Mutex<Vec<RequestManifest>>>,
+}
+
+impl Provider for RankingProvider {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn serves(&self, _connection: &str, _entry: &Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        self.sent.lock().expect("sent lock").push(manifest.clone());
+        self.inner.send(manifest)
+    }
+}
+
+/// One read dispatch through the controller's own path; the provider's
+/// received manifest is exactly what the ranking froze.
+fn dispatch_read(
+    world: &mut support::World,
+    sent: &Arc<std::sync::Mutex<Vec<RequestManifest>>>,
+    session: &rivect::contracts::SessionId,
+    task: &rivect::contracts::TaskId,
+) -> RequestManifest {
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-economy-facts-marker\n").expect("scoped file");
+    let grant = world.runtime.set_read_scope(scope, file.clone());
+    let outcome = world.runtime.run_decision_step(
+        session,
+        task,
+        &support::answer_custom(&format!("read {}", file.display())),
+        &grant,
+        false,
+    );
+    match &outcome {
+        Ok(_) => {}
+        // A task whose selected plan rows are still open refuses completion
+        // *after* the send; the dispatch already happened, which is the fact
+        // this helper returns.
+        Err(rivect::controller::ControllerError::Store(StoreError::Conflict(
+            ConflictCause::CompletionOpen { .. },
+        ))) => {}
+        other => panic!("the controller step runs: {other:?}"),
+    }
+    sent.lock()
+        .expect("sent lock")
+        .last()
+        .cloned()
+        .expect("the broker sent one request")
+}
+
+#[test]
+fn auto_facts_are_built_from_the_task_snapshot() {
+    let (mut world, sent) = recorded_world("economy-facts");
+    let session = world.open_session("bootstrap-economy-facts");
+    let plain = world.create_task(&session, "cmd-economy-facts-plain");
+    let plain = dispatch_read(&mut world, &sent, &session, &plain);
+    assert_eq!(
+        plain.model,
+        ModelAssign::Fixed(FixedModel {
+            connection: "yolo-auto".to_string(),
+            model_id: "deepseek-flash-v4".to_string(),
+        }),
+        "the recorded model freezes as a fixed pin"
+    );
+    assert_eq!(
+        plain.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::Low
+        },
+        "one criterion and no obligations ask for the low level"
+    );
+
+    // The same purpose and connection on a task whose recorded selection left
+    // obligations rank a higher effort: the counts came from the snapshot.
+    let selected = world.create_task(&session, "cmd-economy-facts-selected");
+    let config = world.runtime.config_for_broker();
+    let request = PlanRequest {
+        task_id: selected.clone(),
+        kind: RequestKind::Audit,
+        surfaces: SurfaceScan::Known(BTreeSet::from([Surface::Auth])),
+        contract: ContractBasis::Absent,
+        parts: Vec::new(),
+        delegation: None,
+        author: None,
+    };
+    ActionRegistry::new()
+        .select(
+            &request,
+            &[],
+            &mut world.runtime.action_context(&session, &config),
+        )
+        .expect("the selection records");
+    let attested = world
+        .runtime
+        .store()
+        .snapshot(&selected)
+        .expect("the snapshot reads")
+        .obligations
+        .items
+        .len();
+    assert!(
+        attested >= 2,
+        "the selected task records at least two obligations: {attested}"
+    );
+    let ranked = dispatch_read(&mut world, &sent, &session, &selected);
+    assert_eq!(ranked.model, plain.model, "the same single recorded model");
+    assert_eq!(
+        ranked.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "two or more obligations ask for the recorded high level"
+    );
+}
+
+#[test]
+fn auto_explanation_basis_is_settled_and_visible() {
+    let (mut world, sent) = recorded_world("economy-basis");
+    let session = world.open_session("bootstrap-economy-basis");
+    let task = world.create_task(&session, "cmd-economy-basis");
+    let manifest = dispatch_read(&mut world, &sent, &session, &task);
+
+    let basis = world
+        .runtime
+        .store()
+        .settlement(&manifest.attempt_id)
+        .expect("the send settled one row")
+        .ranking_basis
+        .expect("the settlement carries the basis");
+    assert!(
+        basis.contains("yolo-auto/deepseek-flash-v4"),
+        "the basis names the pick: {basis}"
+    );
+    assert!(
+        basis.contains("effort low from the default level"),
+        "the basis names the effort fact: {basis}"
+    );
+
+    // The status serves the same choosing reason the ledger recorded, from
+    // the controller's own refresh — no test-written projection.
+    let economy = status(&mut world, &session)["economy"].clone();
+    assert_eq!(
+        economy["ranking_basis"],
+        json!(basis),
+        "the projection serves the settled basis: {economy}"
+    );
+    // A ranked model freezes as a fixed assignment, so the served source must
+    // name the ranking, never an explicit pin.
+    assert_eq!(
+        economy["source"],
+        json!("auto ranked"),
+        "the source names the ranking: {economy}"
+    );
+    assert_eq!(economy["model"], json!("deepseek-flash-v4"));
 }

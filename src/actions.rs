@@ -41,7 +41,7 @@ use crate::index::SearchBackend;
 use crate::index::{Completeness, GenerationState, MatchKind, PartialReason, QueryResult};
 use crate::learning::{ConditionFacts, LearningDefinition, PredicateEffect};
 use crate::lsp::SymbolOp;
-use crate::model::{Broker, CallContract, ModelError};
+use crate::model::{Broker, CallContract, ModelError, RankingFacts, RecordedFacts};
 use crate::providers::ProviderReply;
 use crate::state::{
     ConflictCause, PLAN_BLOCKER_OWNER, PlanAssessmentWrite, PlanObligationRecord,
@@ -2528,6 +2528,33 @@ impl Stage<'_> {
         .to_string())
     }
 
+    /// The task facts this semantic leg ranks on (AC-096, DEC-013): the
+    /// request's decided surfaces, the tool modality the call contract
+    /// requests, the context estimate over the frozen inputs, and the task's
+    /// recorded obligation and criterion counts. The plan chain is empty —
+    /// these legs are not scheduler nodes, so they reserve against no tree
+    /// scope and the budget gate records nothing it cannot read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActionError::Store`] when the task snapshot cannot be read.
+    fn ranking_facts(
+        &self,
+        ctx: &ActionContext<'_>,
+        inputs: &str,
+    ) -> Result<RankingFacts, ActionError> {
+        let snapshot = ctx.store.snapshot(&self.request.task_id)?;
+        Ok(RankingFacts::Recorded(RecordedFacts {
+            surfaces: self.request.surfaces.decided().cloned(),
+            tools_required: false,
+            context_tokens_estimate: u64::try_from(inputs.chars().count()).unwrap_or(u64::MAX),
+            obligations: snapshot.obligations.items.len(),
+            criteria: snapshot.criteria.items.len(),
+            remaining_units: BTreeMap::new(),
+            scope_chain: Vec::new(),
+        }))
+    }
+
     /// One Broker call under the stage's purpose. Every outcome but a
     /// reply ends its attempt — a pending manual-fallback choice and its
     /// pause pin die with it and no question is published: that pause is
@@ -2543,26 +2570,30 @@ impl Stage<'_> {
             instructions: self.instructions,
             tools: &[],
         };
-        let sent =
-            match seam
-                .broker
-                .prepare_call(self.action, ctx.config, seam.world, inputs, &contract)
-            {
-                Ok(manifest) => {
-                    // The semantic legs are not scheduler nodes, so their
-                    // settlement records the send without a tree scope to
-                    // reserve against.
-                    let mut ledger = crate::state::StoreLedger::new(&mut *ctx.store, Vec::new());
-                    match seam.broker.dispatch(&mut ledger, seam.world, &manifest) {
-                        Ok(reply) => Ok((manifest.attempt_id, reply)),
-                        Err(source) => {
-                            seam.broker.cancel_attempt(&manifest.attempt_id);
-                            Err(source)
-                        }
+        let facts = self.ranking_facts(ctx, inputs)?;
+        let sent = match seam.broker.prepare_call_with_facts(
+            self.action,
+            ctx.config,
+            seam.world,
+            inputs,
+            &contract,
+            &facts,
+        ) {
+            Ok(manifest) => {
+                // The semantic legs are not scheduler nodes, so their
+                // settlement records the send without a tree scope to
+                // reserve against.
+                let mut ledger = crate::state::StoreLedger::new(&mut *ctx.store, Vec::new());
+                match seam.broker.dispatch(&mut ledger, seam.world, &manifest) {
+                    Ok(reply) => Ok((manifest.attempt_id, reply)),
+                    Err(source) => {
+                        seam.broker.cancel_attempt(&manifest.attempt_id);
+                        Err(source)
                     }
                 }
-                Err(source) => Err(source),
-            };
+            }
+            Err(source) => Err(source),
+        };
         match sent {
             Ok(sent) => Ok(sent),
             Err(source) => {
