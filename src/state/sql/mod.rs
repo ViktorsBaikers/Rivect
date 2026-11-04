@@ -430,15 +430,24 @@ pub const LATEST_SETTLEMENT: &str =
                  completion_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
                  total_tokens, charged_units
                  FROM usage_settlements ORDER BY rowid DESC LIMIT 1";
-/// The status projection's one aggregate: the lifetime settled spend, the
-/// cache legs it carried and the sends still open, in a single statement
-/// so a status refresh never walks the settlement rows.
-pub const SETTLEMENT_TOTALS: &str = "SELECT COUNT(*), SUM(total_tokens), SUM(prompt_tokens),
-                 SUM(cache_read_tokens), SUM(charged_units),
+/// The status projection's one aggregate: the lifetime settled spend and
+/// the sends still open, in a single statement so a status refresh never
+/// walks the settlement rows.
+pub const SETTLEMENT_TOTALS: &str = "SELECT COUNT(*), SUM(total_tokens), SUM(charged_units),
                  (SELECT COUNT(*) FROM usage_settlements WHERE state = 'dispatched'),
                  (SELECT prompt_tokens FROM usage_settlements WHERE state = 'settled'
                   ORDER BY rowid DESC LIMIT 1)
                  FROM usage_settlements WHERE state = 'settled'";
+/// The frozen cohort's rows in one statement: the cache rate sums the
+/// provider legs of exactly the attempts the freeze named, so a status
+/// refresh is one read instead of a read per attempt.
+pub fn settlement_cohort_rows(count: usize) -> String {
+    format!(
+        "SELECT state, prompt_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_settlements WHERE attempt_id IN ({})",
+        task_placeholders(count)
+    )
+}
 
 // ----- plan selection, plan obligations, plan revisions, gate holds -----
 

@@ -1,8 +1,9 @@
 //! Durable settlement and economy projection proof: one row per dispatched
 //! child attempt across replay and restart, the exact provider bins beside
-//! the bound-capped charge, interrupted sends reconciled as unknown, and the
-//! status surface serving unknown-with-source figures from its cache
-//! (AC-057, AC-059, AC-062).
+//! the bound-capped charge, interrupted sends reconciled as unknown, the
+//! status surface serving unknown-with-source figures from its cache, and
+//! the cache-read rate over a frozen cohort (AC-057, AC-059, AC-062,
+//! AC-058 contribution).
 
 #![allow(
     clippy::unwrap_used,
@@ -23,7 +24,10 @@ use rivect::controller::{SchedulerStep, StepOutcome};
 use rivect::model::{Broker, ModelError, RequestManifest, SendContext, SendOutcome, SendTicket};
 use rivect::providers::{Provider, ProviderError, ProviderReply};
 use rivect::resources::{Exactness, UsageDelta};
-use rivect::state::{ConflictCause, SettlementState, StoreError, StoreLedger, TaskStore};
+use rivect::state::{
+    CacheCohort, CacheCohortCounts, CacheRate, ConflictCause, InvalidCause, SettlementState,
+    StoreError, StoreLedger, TaskStore,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1836,4 +1840,666 @@ fn unresolved_substitute_is_not_reported_as_an_answer() {
         "an open row is never reported as answered: {economy}"
     );
     assert_eq!(economy["pending_sends"], json!(1));
+}
+
+// ----- provider cache evidence (AC-058 contribution) -----
+
+/// The frozen cohort a fixture measures: the attempts a candidate freeze
+/// recorded, with the provenance the evidence names.
+fn cache_cohort(attempt_ids: Vec<String>, include_cold: bool) -> CacheCohort {
+    CacheCohort {
+        candidate: "fixture-candidate".to_string(),
+        models: vec!["fixture-model".to_string()],
+        attempt_ids,
+        include_cold,
+        frozen_on: "2026-11-04".to_string(),
+    }
+}
+
+fn economy_status(world: &mut support::World, session: &rivect::contracts::SessionId) -> Value {
+    status(world, session)["economy"].clone()
+}
+
+/// Asserts the served projection carries the expected pair and a named
+/// source fragment, so a test never re-implements the status extraction.
+fn assert_served_cache(
+    world: &mut support::World,
+    session: &rivect::contracts::SessionId,
+    rate: Value,
+    fragment: &str,
+) {
+    let economy = economy_status(world, session);
+    assert_eq!(economy["cache_rate"], rate);
+    let source = economy["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(
+        source.contains(fragment),
+        "expected `{fragment}` in: {source}"
+    );
+}
+
+/// The exact evidence a measured cohort must produce: the frozen cohort
+/// travels with the rate, so a wrong population cannot compare equal.
+fn measured(
+    cohort: &CacheCohort,
+    cache_read_tokens: u64,
+    input_tokens: u64,
+    (measured, censored, cold_excluded): (u64, u64, u64),
+) -> CacheRate {
+    CacheRate::Measured {
+        cohort: cohort.clone(),
+        counts: CacheCohortCounts {
+            measured,
+            censored,
+            cold_excluded,
+        },
+        cache_read_tokens,
+        input_tokens,
+    }
+}
+
+/// A settled provider cache-read leg is the only hit the rate counts: two
+/// requests over identical inputs share one local prefix digest and epoch,
+/// yet the row that reported no cache leg stays censored, so a local hash
+/// never becomes a provider hit.
+#[test]
+fn cache_read_rate_uses_settled_bins_and_never_a_local_hash() {
+    let mut world = support::open_world("economy-cache-bins", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-bins");
+    let reported = settle_through_runtime(
+        &mut world,
+        "cache-bins-warm",
+        UsageDelta::Legs {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(10),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(300),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(410),
+        },
+    );
+    let unreported = settle_through_runtime(
+        &mut world,
+        "cache-bins-local",
+        UsageDelta::Exact {
+            prompt_tokens: 40,
+            completion_tokens: 10,
+            total_tokens: 50,
+        },
+    );
+    // The replay is a local fact: the same prefix digest and epoch, and no
+    // provider cache figure either way.
+    assert_eq!(reported.inputs_digest, unreported.inputs_digest);
+    assert_eq!(reported.epoch_id, unreported.epoch_id);
+
+    let frozen = cache_cohort(
+        vec![reported.attempt_id.clone(), unreported.attempt_id.clone()],
+        false,
+    );
+    world
+        .runtime
+        .freeze_cache_cohort(frozen.clone())
+        .expect("the freeze measures the cohort");
+    let evidence = world
+        .runtime
+        .store()
+        .cache_read_rate(&frozen)
+        .expect("the cohort reads");
+    assert_eq!(
+        evidence,
+        measured(&frozen, 300, 400, (1, 1, 0)),
+        "only the settled reported leg is summed"
+    );
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(
+        economy["cache_rate"],
+        json!([300, 400]),
+        "the status serves the settled numerator and denominator"
+    );
+    let source = economy["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(source.contains("300 cache-read"), "{source}");
+    assert!(source.contains("400 all-input"), "{source}");
+    assert!(source.contains("censored 1"), "{source}");
+}
+
+/// The denominator is all input — prompt + cache read + cache write — never
+/// the provider's own total, which can exclude the cache legs.
+#[test]
+fn cache_rate_exact_numerator_and_denominator_from_fixtures() {
+    let mut world = support::open_world("economy-cache-exact", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-exact");
+    let first = settle_through_runtime(
+        &mut world,
+        "cache-exact-a",
+        UsageDelta::Legs {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(10),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(300),
+            cache_write_tokens: Some(100),
+            total_tokens: Some(510),
+        },
+    );
+    let second = settle_through_runtime(
+        &mut world,
+        "cache-exact-b",
+        UsageDelta::Legs {
+            prompt_tokens: Some(80),
+            completion_tokens: Some(20),
+            reasoning_tokens: Some(30),
+            cache_read_tokens: Some(120),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(200),
+        },
+    );
+    let frozen = cache_cohort(
+        vec![first.attempt_id.clone(), second.attempt_id.clone()],
+        false,
+    );
+    world
+        .runtime
+        .freeze_cache_cohort(frozen.clone())
+        .expect("the freeze measures the cohort");
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(
+        economy["cache_rate"],
+        json!([420, 700]),
+        "sum(cache read) / sum(prompt + cache read + cache write)"
+    );
+    // The provider totals sum to 710; they exclude (or count differently)
+    // the cache legs and are never the denominator.
+    let evidence = world
+        .runtime
+        .store()
+        .cache_read_rate(&frozen)
+        .expect("the cohort reads");
+    assert_eq!(evidence, measured(&frozen, 420, 700, (2, 0, 0)));
+    let source = economy["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(source.contains("420 cache-read"), "{source}");
+    assert!(source.contains("700 all-input"), "{source}");
+    // The observable provenance names the candidate and model set the rate
+    // was frozen over, not just the fixture's own helper fields.
+    assert!(source.contains("fixture-candidate"), "{source}");
+    assert!(source.contains("fixture-model"), "{source}");
+    assert!(source.contains("2026-11-04"), "{source}");
+    assert!(
+        source.contains("prompt + cache read + cache write"),
+        "the row defines all input: {source}"
+    );
+
+    // A reported zero prompt is exact input when the cache read is
+    // positive: the ratio exists and is measured, never unknown.
+    let zero_prompt = settle_through_runtime(
+        &mut world,
+        "cache-exact-zero-prompt",
+        UsageDelta::Legs {
+            prompt_tokens: Some(0),
+            completion_tokens: Some(5),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(40),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(45),
+        },
+    );
+    let zero_cohort = cache_cohort(vec![zero_prompt.attempt_id.clone()], false);
+    world
+        .runtime
+        .freeze_cache_cohort(zero_cohort.clone())
+        .expect("the zero-prompt cohort measures");
+    assert_eq!(
+        economy_status(&mut world, &session)["cache_rate"],
+        json!([40, 40]),
+        "a zero prompt is exact input, not an unknown rate"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&zero_cohort)
+            .expect("the zero-prompt cohort reads"),
+        measured(&zero_cohort, 40, 40, (1, 0, 0))
+    );
+}
+
+/// No frozen cohort is `NOT_RUN`; a cohort the store cannot fully record is
+/// unknown. Neither ever becomes PASS or a number over a shrunken
+/// population.
+#[test]
+fn cache_rate_unavailable_cohort_is_not_run() {
+    let mut world = support::open_world("economy-cache-missing", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-missing");
+    let absent = economy_status(&mut world, &session);
+    assert_eq!(absent["cache_rate"], Value::Null);
+    let source = absent["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(
+        source.contains("NOT_RUN"),
+        "the missing cohort is named: {source}"
+    );
+    assert!(
+        !source.contains("PASS"),
+        "an absent cohort is not PASS: {source}"
+    );
+
+    // A cohort that names a settled attempt and one this store never
+    // recorded is refused at freeze: the measured row is not served as if
+    // the frozen population were complete, and the status stays NOT_RUN.
+    let settled = settle_through_runtime(
+        &mut world,
+        "cache-missing-settled",
+        UsageDelta::Legs {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(1),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(5),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(16),
+        },
+    );
+    let frozen = cache_cohort(
+        vec![
+            settled.attempt_id.clone(),
+            "attempt-never-recorded".to_string(),
+        ],
+        true,
+    );
+    let refused = world
+        .runtime
+        .freeze_cache_cohort(frozen.clone())
+        .expect_err("an unrecorded attempt is not a frozen population");
+    assert!(
+        matches!(
+            refused,
+            StoreError::InvalidInput(InvalidCause::CacheCohortMissing { attempts: 1 })
+        ),
+        "the missing attempt is named: {refused:?}"
+    );
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(economy["cache_rate"], Value::Null);
+    let source = economy["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(
+        source.contains("NOT_RUN"),
+        "a refused freeze keeps the absent cohort: {source}"
+    );
+    assert!(
+        !source.contains("PASS"),
+        "an unavailable cohort is not PASS: {source}"
+    );
+    assert!(matches!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&frozen)
+            .expect_err("the incomplete cohort refuses"),
+        StoreError::InvalidInput(InvalidCause::CacheCohortMissing { attempts: 1 })
+    ));
+
+    // Exact zero legs are still a fact, but a measured cohort with no input
+    // tokens has no ratio: the status serves unknown, never 0/0.
+    let zero = settle_through_runtime(
+        &mut world,
+        "cache-missing-zero",
+        UsageDelta::Legs {
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(0),
+        },
+    );
+    let zeros = cache_cohort(vec![zero.attempt_id.clone()], true);
+    world
+        .runtime
+        .freeze_cache_cohort(zeros.clone())
+        .expect("the zero cohort refreshes as unknown");
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(economy["cache_rate"], Value::Null);
+    let source = economy["cache_source"]
+        .as_str()
+        .expect("the row names its source");
+    assert!(source.contains("no input tokens"), "{source}");
+    let evidence = world
+        .runtime
+        .store()
+        .cache_read_rate(&zeros)
+        .expect("the zero cohort reads");
+    assert!(
+        matches!(
+            evidence,
+            CacheRate::Unknown {
+                counts: CacheCohortCounts {
+                    measured: 1,
+                    censored: 0,
+                    cold_excluded: 0,
+                },
+                ..
+            }
+        ),
+        "the exact zero row is measured, and the ratio is still unknown: {evidence:?}"
+    );
+}
+
+/// A cohort holding an attempt still in flight is refused at freeze: the
+/// population must be a settled set, and a refused freeze leaves the prior
+/// rate and its served evidence untouched. The same holds for an empty
+/// cohort, and a later refresh keeps serving the prior rate.
+#[test]
+fn freeze_refuses_an_unsettled_cohort_and_keeps_the_prior_evidence() {
+    let mut world = support::open_world("economy-cache-unsettled", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-unsettled");
+    let settled = settle_through_runtime(
+        &mut world,
+        "cache-unsettled-settled",
+        UsageDelta::Legs {
+            prompt_tokens: Some(20),
+            completion_tokens: Some(2),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(10),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(32),
+        },
+    );
+    world
+        .runtime
+        .freeze_cache_cohort(cache_cohort(vec![settled.attempt_id.clone()], true))
+        .expect("the settled cohort freezes");
+    let before = economy_status(&mut world, &session);
+    assert_eq!(before["cache_rate"], json!([10, 30]));
+
+    // A started send stays `dispatched` until it settles: it is not a
+    // member a frozen rate may sum or classify as censored.
+    world
+        .runtime
+        .store_writer()
+        .open_budget("cache-unsettled-scope", 10)
+        .expect("the budget scope opens");
+    let pending = world
+        .runtime
+        .broker
+        .prepare(
+            "main",
+            &world.runtime.config_for_broker(),
+            WORLD,
+            "goal: cache unsettled",
+        )
+        .expect("the pending attempt prepares");
+    {
+        let mut writer = world.runtime.store_writer();
+        writer
+            .begin_send(&["cache-unsettled-scope"], &context(), &pending)
+            .expect("the send begins");
+    }
+    let refused = world
+        .runtime
+        .freeze_cache_cohort(cache_cohort(
+            vec![settled.attempt_id.clone(), pending.attempt_id.clone()],
+            true,
+        ))
+        .expect_err("an unsettled attempt refuses the freeze");
+    assert!(
+        matches!(
+            refused,
+            StoreError::InvalidInput(InvalidCause::CacheCohortUnsettled { attempts: 1 })
+        ),
+        "the unsettled attempt is named: {refused:?}"
+    );
+    assert_eq!(
+        economy_status(&mut world, &session),
+        before,
+        "a refused freeze serves the previous cohort and snapshot"
+    );
+
+    // The stored rate is what a later refresh reads: the poisoned cohort
+    // never reached the runtime, so the cached projection cannot show it.
+    world
+        .runtime
+        .refresh_economy(None)
+        .expect("a refused freeze leaves a refresh that still succeeds");
+    assert_served_cache(&mut world, &session, json!([10, 30]), "fixture-candidate");
+    assert_eq!(
+        economy_status(&mut world, &session)["cache_source"],
+        before["cache_source"],
+        "the prior source survives a refresh"
+    );
+
+    // An empty cohort is refused before anything is committed.
+    let empty = world
+        .runtime
+        .freeze_cache_cohort(cache_cohort(Vec::new(), true))
+        .expect_err("an empty cohort is not a frozen population");
+    assert!(
+        matches!(
+            empty,
+            StoreError::InvalidInput(InvalidCause::CacheCohortEmpty)
+        ),
+        "the empty cohort is named: {empty:?}"
+    );
+    assert_served_cache(&mut world, &session, json!([10, 30]), "fixture-candidate");
+    assert_eq!(
+        economy_status(&mut world, &session)["cache_source"],
+        before["cache_source"],
+        "an empty refusal changes neither rate nor source"
+    );
+}
+
+/// A cold-inclusive cohort adds the rows that reported an exact zero cache
+/// read to the denominator beside the warm rows, and counts the rows whose
+/// legs are censored instead of summing them as zero.
+#[test]
+fn cold_inclusive_cohort_includes_censored_rows() {
+    let mut world = support::open_world("economy-cache-cold", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-cold");
+    let warm = settle_through_runtime(
+        &mut world,
+        "cache-cold-warm",
+        UsageDelta::Legs {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(10),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(200),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(310),
+        },
+    );
+    let cold = settle_through_runtime(
+        &mut world,
+        "cache-cold-zero",
+        UsageDelta::Legs {
+            prompt_tokens: Some(50),
+            completion_tokens: Some(5),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(55),
+        },
+    );
+    let censored = settle_through_runtime(&mut world, "cache-cold-censored", UsageDelta::Unknown);
+    let ids = vec![
+        warm.attempt_id.clone(),
+        cold.attempt_id.clone(),
+        censored.attempt_id.clone(),
+    ];
+    let inclusive = cache_cohort(ids.clone(), true);
+    world
+        .runtime
+        .freeze_cache_cohort(inclusive.clone())
+        .expect("the cold-inclusive cohort measures");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&inclusive)
+            .expect("the cohort reads"),
+        measured(&inclusive, 200, 350, (2, 1, 0)),
+        "the exact zero row joins the denominator; the unknown row is counted, not zero"
+    );
+    assert_served_cache(
+        &mut world,
+        &session,
+        json!([200, 350]),
+        "measured 2, censored 1, cold included",
+    );
+
+    // Warm-only keeps the reported zero row out of the warm population; the
+    // censored row is still counted, and the excluded cold count reconciles
+    // measured + censored + excluded to the three frozen attempts.
+    let warm_only = cache_cohort(ids, false);
+    world
+        .runtime
+        .freeze_cache_cohort(warm_only.clone())
+        .expect("the warm cohort measures");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&warm_only)
+            .expect("the warm cohort reads"),
+        measured(&warm_only, 200, 300, (1, 1, 1))
+    );
+    assert_served_cache(
+        &mut world,
+        &session,
+        json!([200, 300]),
+        "measured 1, censored 1, cold excluded 1",
+    );
+}
+
+/// Folded reasoning is its own bin: it never enters the cache numerator or
+/// the input denominator.
+#[test]
+fn cache_rate_ignores_folded_reasoning() {
+    let mut world = support::open_world("economy-cache-reasoning", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-reasoning");
+    let folded = settle_through_runtime(
+        &mut world,
+        "cache-reasoning-folded",
+        UsageDelta::Legs {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(10),
+            reasoning_tokens: Some(900),
+            cache_read_tokens: Some(50),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(960),
+        },
+    );
+    let cold = settle_through_runtime(
+        &mut world,
+        "cache-reasoning-cold",
+        UsageDelta::Legs {
+            prompt_tokens: Some(60),
+            completion_tokens: Some(5),
+            reasoning_tokens: Some(400),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(65),
+        },
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .settlement(&folded.attempt_id)
+            .expect("the folded row settles")
+            .bins
+            .reasoning_tokens,
+        Some(900),
+        "the fixture carries the folded reasoning bin"
+    );
+    let frozen = cache_cohort(
+        vec![folded.attempt_id.clone(), cold.attempt_id.clone()],
+        true,
+    );
+    world
+        .runtime
+        .freeze_cache_cohort(frozen.clone())
+        .expect("the cohort measures");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&frozen)
+            .expect("the cohort reads"),
+        measured(&frozen, 50, 210, (2, 0, 0)),
+        "reasoning tokens are neither cache reads nor input"
+    );
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(economy["cache_rate"], json!([50, 210]));
+}
+
+/// A cohort past one batch is read in named batches: 900 is a conservative
+/// batch under SQLite's 32766-variable ceiling, the 901st attempt is still
+/// summed, and the source names the bound.
+#[test]
+fn cohort_above_the_statement_batch_sums_every_batch() {
+    const ROWS: u64 = 901;
+    let mut world = support::open_world("economy-cache-batch", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-cache-batch");
+    let base = world
+        .runtime
+        .broker
+        .prepare(
+            "main",
+            &world.runtime.config_for_broker(),
+            WORLD,
+            "goal: cache batch",
+        )
+        .expect("the batch request prepares");
+    let usage = UsageDelta::Legs {
+        prompt_tokens: Some(1),
+        completion_tokens: Some(0),
+        reasoning_tokens: None,
+        cache_read_tokens: Some(1),
+        cache_write_tokens: Some(0),
+        total_tokens: Some(2),
+    };
+    let mut ids = Vec::with_capacity(usize::try_from(ROWS).expect("fits"));
+    {
+        let mut writer = world.runtime.store_writer();
+        for index in 0..ROWS {
+            let mut manifest = base.clone();
+            manifest.attempt_id = format!("cache-batch-{index}");
+            let ticket = writer
+                .begin_send(&[], &context(), &manifest)
+                .expect("an unreserved row opens");
+            writer
+                .finish_send(
+                    &ticket,
+                    &SendOutcome::Settled {
+                        usage,
+                        wire_retries: 0,
+                    },
+                )
+                .expect("the row settles");
+            ids.push(manifest.attempt_id.clone());
+        }
+    }
+    let frozen = cache_cohort(ids, false);
+    world
+        .runtime
+        .freeze_cache_cohort(frozen.clone())
+        .expect("the batch cohort freezes");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .cache_read_rate(&frozen)
+            .expect("the batch cohort reads"),
+        measured(&frozen, ROWS, ROWS * 2, (ROWS, 0, 0)),
+        "every batch is summed"
+    );
+    assert_served_cache(
+        &mut world,
+        &session,
+        json!([901, 1802]),
+        "cohort batches of 900",
+    );
 }

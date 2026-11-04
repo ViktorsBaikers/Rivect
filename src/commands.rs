@@ -22,7 +22,7 @@ use crate::policy::Policy;
 use crate::providers::Provider;
 use crate::resources::NotificationQueue;
 use crate::scheduler::{DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP, Scheduler};
-use crate::state::{ConflictCause, StoreError, TaskStore, denial_class};
+use crate::state::{CacheCohort, CacheRate, ConflictCause, StoreError, TaskStore, denial_class};
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -152,6 +152,10 @@ pub struct Runtime {
     /// The cached economy projection (AC-062): refreshed after every
     /// dispatch and at open, so a status read never walks the store.
     pub(crate) economy: EconomySnapshot,
+    /// The provider-cache rate frozen for this evidence run (AC-058): the
+    /// default `NOT_RUN` until a freeze records one, so the status never
+    /// invents a population and a refused freeze cannot poison it.
+    pub(crate) cache_rate: CacheRate,
     /// Controller-side budget waiting records keyed by `(session, task)`
     /// (AC-059): an attempt that never entered a send because the frozen
     /// bound did not fit waits on a named resolution instead of spinning,
@@ -648,26 +652,58 @@ impl Runtime {
         &self.economy
     }
 
+    /// Freezes the eligible provider-cache cohort the status metric reads
+    /// (AC-058). The rate is measured once here, and it enters service only
+    /// with the refreshed projection: a refused population leaves the
+    /// previous rate and snapshot served unchanged, by construction.
+    ///
+    /// # Errors
+    /// The storage failure of the refresh; a cohort that is empty,
+    /// references an attempt this store does not record, or still holds an
+    /// unsettled attempt. Nothing is committed on any failure.
+    pub fn freeze_cache_cohort(&mut self, cohort: CacheCohort) -> Result<(), StoreError> {
+        let rate = self.owner.store.cache_read_rate(&cohort)?;
+        let economy = self.project_economy(None, &rate)?;
+        self.cache_rate = rate;
+        self.economy = economy;
+        Ok(())
+    }
+
     /// Rebuilds the cached economy projection: one aggregate read of the
-    /// settled totals plus the facts of the request that just dispatched.
-    /// The controller calls it after `Broker::dispatch` returns, so the
-    /// projection never reads the store the send is still holding.
+    /// settled totals, the frozen rate already held, and the facts of the
+    /// request that just dispatched. The controller calls it after
+    /// `Broker::dispatch` returns, so the projection never reads the store
+    /// the send is still holding.
     ///
     /// # Errors
     /// The storage failure of the aggregate read; the previous snapshot
     /// stays served.
     pub fn refresh_economy(&mut self, sent: Option<&RequestManifest>) -> Result<(), StoreError> {
+        self.economy = self.project_economy(sent, &self.cache_rate)?;
+        Ok(())
+    }
+
+    /// Builds the projection from the current store and request facts. The
+    /// caller swaps it in only on success, so a failed read never serves a
+    /// half-updated snapshot.
+    fn project_economy(
+        &self,
+        sent: Option<&RequestManifest>,
+        cache: &CacheRate,
+    ) -> Result<EconomySnapshot, StoreError> {
+        let mut economy = self.economy.clone();
         let totals = self.owner.store.settlement_totals()?;
-        self.economy.settled_tokens = totals.total_tokens;
-        self.economy.charged_units = totals.charged_units;
-        self.economy.cache_rate = totals.cache_rate();
-        self.economy.pending_sends = totals.dispatched_count;
-        self.economy.agents = u64::try_from(self.scheduler.running_count()).unwrap_or(u64::MAX);
+        economy.settled_tokens = totals.total_tokens;
+        economy.charged_units = totals.charged_units;
+        economy.cache_rate = cache.numerator_and_denominator();
+        economy.cache_source = cache.source();
+        economy.pending_sends = totals.dispatched_count;
+        economy.agents = u64::try_from(self.scheduler.running_count()).unwrap_or(u64::MAX);
         // Occupancy is the latest settled attempt's reported prompt tokens —
         // a real provider figure, named as such — never the request's bytes
         // relabelled `tok`, and never the lifetime spend beside it.
-        self.economy.context_tokens = totals.latest_prompt_tokens;
-        self.economy.context_source = if totals.latest_prompt_tokens.is_some() {
+        economy.context_tokens = totals.latest_prompt_tokens;
+        economy.context_source = if totals.latest_prompt_tokens.is_some() {
             CONTEXT_SOURCE.to_string()
         } else {
             "unknown: the latest settled attempt reported no prompt tokens".to_string()
@@ -706,17 +742,17 @@ impl Runtime {
                 };
                 (None, Some(source))
             };
-            self.economy.model = model;
-            self.economy.source = source;
-            self.economy.effort = Some(effort_text(&manifest.effort));
-            self.economy.purpose = Some(manifest.purpose.clone());
-            self.economy.ranking_basis = None;
-            self.economy.connection = Some(landing.connection);
+            economy.model = model;
+            economy.source = source;
+            economy.effort = Some(effort_text(&manifest.effort));
+            economy.purpose = Some(manifest.purpose.clone());
+            economy.ranking_basis = None;
+            economy.connection = Some(landing.connection);
         }
         // The project is the pinned root the index seam carries — the tree
         // the runtime serves — never the data root that happens to hold it.
-        self.economy.project = self.index.root.display().to_string();
-        Ok(())
+        economy.project = self.index.root.display().to_string();
+        Ok(economy)
     }
 
     /// The settlement row that answers the current dispatch under
@@ -1258,6 +1294,7 @@ impl Runtime {
             paused_attempts: BTreeMap::new(),
             flights: crate::resources::ReadFlights::new(),
             economy: EconomySnapshot::empty(data_root),
+            cache_rate: CacheRate::default(),
             budget_waiting: BTreeMap::new(),
             index: IndexSeam {
                 root: data_root.to_path_buf(),
@@ -1689,7 +1726,11 @@ pub struct EconomySnapshot {
     pub context_source: String,
     pub settled_tokens: Option<u64>,
     pub charged_units: Option<u64>,
-    pub cache_rate: Option<f64>,
+    /// The exact cache-read numerator and all-input denominator from the
+    /// frozen cohort: `(cache read, prompt + cache read + cache write)`.
+    /// `None` while no cohort is measured, never a rounded ratio.
+    pub cache_rate: Option<(u64, u64)>,
+    /// The cohort provenance and counts, or the `NOT_RUN`/unknown reason.
     pub cache_source: String,
     pub quota_remaining: Option<u64>,
     pub quota_source: String,
@@ -1708,13 +1749,12 @@ const QUOTA_SOURCE: &str = "unknown: no quota endpoint reports remaining units";
 /// Where the occupancy figure comes from: the latest settled attempt's own
 /// reported prompt tokens.
 const CONTEXT_SOURCE: &str = "latest settled attempt's reported prompt tokens";
-/// The cache rate's source until both cache and prompt legs are settled.
-const CACHE_SOURCE: &str = "unknown: settled cache and prompt legs are not both recorded";
 /// The effort's source: the frozen request is the only recorded setting.
 const EFFORT_SOURCE: &str = "sent setting; the endpoint reports no effective effort";
 
 impl EconomySnapshot {
     fn empty(project: &Path) -> Self {
+        let cache = CacheRate::default();
         Self {
             project: project.display().to_string(),
             cwd: std::env::current_dir()
@@ -1731,8 +1771,8 @@ impl EconomySnapshot {
             context_source: CONTEXT_SOURCE.to_string(),
             settled_tokens: None,
             charged_units: None,
-            cache_rate: None,
-            cache_source: CACHE_SOURCE.to_string(),
+            cache_rate: cache.numerator_and_denominator(),
+            cache_source: cache.source(),
             quota_remaining: None,
             quota_source: QUOTA_SOURCE.to_string(),
             reset_at: None,

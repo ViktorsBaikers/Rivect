@@ -193,6 +193,12 @@ pub enum InvalidCause {
         attempt_id: String,
         exactness: &'static str,
     },
+    #[error("cache cohort records no attempts")]
+    CacheCohortEmpty,
+    #[error("cache cohort attempts not recorded in this store: {attempts}")]
+    CacheCohortMissing { attempts: u64 },
+    #[error("cache cohort attempts still unsettled: {attempts}")]
+    CacheCohortUnsettled { attempts: u64 },
 }
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -6997,28 +7003,133 @@ impl TaskStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
                 ))
             })
             .map_err(storage)
             .and_then(
-                |(count, total, prompt, cache_read, charged, dispatched, latest)| -> Result<
-                    SettlementTotals,
-                > {
+                |(count, total, charged, dispatched, latest)| -> Result<SettlementTotals> {
                     Ok(SettlementTotals {
                         settled_count: unsigned(count)?,
                         total_tokens: total.map(unsigned).transpose()?,
-                        prompt_tokens: prompt.map(unsigned).transpose()?,
-                        cache_read_tokens: cache_read.map(unsigned).transpose()?,
                         charged_units: charged.map(unsigned).transpose()?,
                         dispatched_count: unsigned(dispatched)?,
                         latest_prompt_tokens: latest.map(unsigned).transpose()?,
                     })
                 },
             )
+    }
+
+    /// The cache-read rate over one frozen cohort (AC-058): the frozen
+    /// attempts are read in bound batches, so a status refresh never reads
+    /// the store once per row.
+    ///
+    /// A row contributes only when it settled and reported the prompt,
+    /// cache-read and cache-write legs. A row missing one of them is
+    /// censored: it is counted and named, never summed as zero. All input
+    /// is `prompt + cache read + cache write`, because a provider total can
+    /// exclude the cache legs. The population must be a recorded, settled
+    /// set: an empty cohort, an attempt this store does not record and an
+    /// attempt still in flight are typed refusals, so the frozen rate
+    /// cannot change state under a later refresh.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidInput`] with a `CacheCohort*` cause for an
+    /// empty, missing or unsettled population; the storage failure of the
+    /// cohort read; and a corrupt settlement-state or token column.
+    pub fn cache_read_rate(&self, cohort: &CacheCohort) -> Result<CacheRate> {
+        let ids = cohort
+            .attempt_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Err(StoreError::InvalidInput(InvalidCause::CacheCohortEmpty));
+        }
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CACHE_COHORT_CHUNK) {
+            let statement = sql::settlement_cohort_rows(chunk.len());
+            let batch = self
+                .conn()?
+                .prepare(&statement)
+                .map_err(storage)?
+                .query_map(params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(storage)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage)?;
+            rows.extend(batch);
+        }
+        if rows.len() < ids.len() {
+            return Err(StoreError::InvalidInput(InvalidCause::CacheCohortMissing {
+                attempts: u64::try_from(ids.len() - rows.len()).unwrap_or(u64::MAX),
+            }));
+        }
+        let mut counts = CacheCohortCounts::default();
+        let mut cache_read_tokens = 0u64;
+        let mut input_tokens = 0u64;
+        let mut unsettled = 0u64;
+        for (state, prompt, cache_read, cache_write) in rows {
+            if SettlementState::from_db(&state)? == SettlementState::Dispatched {
+                unsettled += 1;
+                continue;
+            }
+            let (Some(prompt), Some(cache_read), Some(cache_write)) = (
+                prompt.map(unsigned).transpose()?,
+                cache_read.map(unsigned).transpose()?,
+                cache_write.map(unsigned).transpose()?,
+            ) else {
+                counts.censored += 1;
+                continue;
+            };
+            if cache_read == 0 && !cohort.include_cold {
+                counts.cold_excluded += 1;
+                continue;
+            }
+            counts.measured += 1;
+            cache_read_tokens = token_total(cache_read_tokens, cache_read)?;
+            input_tokens = token_total(input_tokens, prompt)?;
+            input_tokens = token_total(input_tokens, cache_read)?;
+            input_tokens = token_total(input_tokens, cache_write)?;
+        }
+        if unsettled > 0 {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::CacheCohortUnsettled {
+                    attempts: unsettled,
+                },
+            ));
+        }
+        if counts.measured == 0 {
+            let warm = if cohort.include_cold { "" } else { "warm " };
+            return Ok(CacheRate::Unknown {
+                cohort: cohort.clone(),
+                counts,
+                reason: format!(
+                    "no {warm}frozen cohort attempt settled with prompt, cache-read and cache-write legs"
+                ),
+            });
+        }
+        if input_tokens == 0 {
+            return Ok(CacheRate::Unknown {
+                cohort: cohort.clone(),
+                counts,
+                reason: "the measured cohort reports no input tokens".to_string(),
+            });
+        }
+        Ok(CacheRate::Measured {
+            cohort: cohort.clone(),
+            counts,
+            cache_read_tokens,
+            input_tokens,
+        })
     }
 
     /// Why one settle found no open row: an absent row is a missing
@@ -8071,8 +8182,6 @@ impl SettlementState {
 pub struct SettlementTotals {
     pub settled_count: u64,
     pub total_tokens: Option<u64>,
-    pub prompt_tokens: Option<u64>,
-    pub cache_read_tokens: Option<u64>,
     pub charged_units: Option<u64>,
     /// Rows still `dispatched`: a send in flight or one an interrupted
     /// process left for the next open to reconcile.
@@ -8083,21 +8192,145 @@ pub struct SettlementTotals {
     pub latest_prompt_tokens: Option<u64>,
 }
 
-impl SettlementTotals {
-    /// The cache-read share of the settled prompt tokens: `None` until
-    /// both legs are known, so an unknown rate is never reported as zero.
+/// How many cohort attempts one statement names: SQLite's bound-variable
+/// limit is the ceiling, so a larger frozen cohort is read in batches and
+/// the batches are summed.
+const CACHE_COHORT_CHUNK: usize = 900;
+
+/// The frozen eligible cohort one cache-read measurement is scoped to
+/// (AC-058): the candidate, model set, attempts and warm/cold inclusion are
+/// recorded before any row is summed, so a later read can neither widen
+/// the population nor reclassify a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheCohort {
+    /// The candidate whose freeze fixed this cohort.
+    pub candidate: String,
+    /// The model set the cohort was frozen over.
+    pub models: Vec<String>,
+    /// The physical child attempts eligible at freeze.
+    pub attempt_ids: Vec<String>,
+    /// Whether rows that reported an exact zero cache read (cold) join the
+    /// population beside the warm rows.
+    pub include_cold: bool,
+    /// The date the cohort was frozen.
+    pub frozen_on: String,
+}
+
+/// One cache-read measurement over a frozen cohort (AC-058): the ratio
+/// inputs come only from provider-reported settled legs, and the measured
+/// value carries its own cohort, so a rate is never displayed against a
+/// different population. A cohort that cannot supply an exact rate is a
+/// named unknown, never a rounded number.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CacheRate {
+    /// No cohort is frozen, so the metric never ran.
+    #[default]
+    NotRun,
+    /// A frozen cohort cannot supply an exact rate; the unknown is named
+    /// instead of being rounded or reported as zero.
+    Unknown {
+        cohort: CacheCohort,
+        counts: CacheCohortCounts,
+        reason: String,
+    },
+    /// The exact ratio inputs: provider cache-read tokens over all input
+    /// tokens (prompt + cache read + cache write).
+    Measured {
+        cohort: CacheCohort,
+        counts: CacheCohortCounts,
+        cache_read_tokens: u64,
+        input_tokens: u64,
+    },
+}
+
+/// How one frozen cohort's rows were accounted: measured rows, censored
+/// rows, and the exact-zero rows a warm-only cohort excludes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCohortCounts {
+    pub measured: u64,
+    pub censored: u64,
+    pub cold_excluded: u64,
+}
+
+impl CacheRate {
+    /// The exact numerator and denominator the status serves, `None` while
+    /// the metric has no measured rate.
     #[must_use]
-    pub fn cache_rate(&self) -> Option<f64> {
-        let read = self.cache_read_tokens?;
-        let prompt = self.prompt_tokens?;
-        if prompt == 0 {
-            return None;
+    pub fn numerator_and_denominator(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::NotRun | Self::Unknown { .. } => None,
+            Self::Measured {
+                cache_read_tokens,
+                input_tokens,
+                ..
+            } => Some((*cache_read_tokens, *input_tokens)),
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a token count past f64's exact range is not a rate worth more precision than the display"
-        )]
-        Some(read as f64 / prompt as f64)
+    }
+
+    /// The one line the economy row paints: the ratio inputs with the
+    /// provenance and row accounting they were measured from, or the reason
+    /// there is no rate. `NOT_RUN` is the absent cohort; a cohort that
+    /// cannot be measured stays `unknown`.
+    #[must_use]
+    pub fn source(&self) -> String {
+        match self {
+            Self::NotRun => {
+                "NOT_RUN: no frozen cache cohort is recorded; the provider cache metric never ran"
+                    .to_string()
+            }
+            Self::Unknown {
+                cohort,
+                counts,
+                reason,
+            } => format!(
+                "unknown: {reason} (frozen cohort {} of {} over {}; {}; cohort batches of {CACHE_COHORT_CHUNK})",
+                cohort.candidate,
+                cohort.frozen_on,
+                cohort_models(cohort),
+                counts.source(cohort),
+            ),
+            Self::Measured {
+                cohort,
+                counts,
+                cache_read_tokens,
+                input_tokens,
+            } => format!(
+                "settled frozen cohort {} of {} over {}: {cache_read_tokens} cache-read / {input_tokens} all-input tokens (prompt + cache read + cache write); {}; cohort batches of {CACHE_COHORT_CHUNK}",
+                cohort.candidate,
+                cohort.frozen_on,
+                cohort_models(cohort),
+                counts.source(cohort),
+            ),
+        }
+    }
+}
+
+impl CacheCohortCounts {
+    /// The row accounting with the inclusion policy it was measured under,
+    /// so measured + censored (+ excluded cold) reconciles to the frozen
+    /// population.
+    fn source(&self, cohort: &CacheCohort) -> String {
+        if cohort.include_cold {
+            format!(
+                "measured {}, censored {}, cold included",
+                self.measured, self.censored
+            )
+        } else {
+            format!(
+                "measured {}, censored {}, cold excluded {}",
+                self.measured, self.censored, self.cold_excluded
+            )
+        }
+    }
+}
+
+/// The frozen model set, named in the provenance line; an empty set is
+/// called what it is instead of rendering as a blank.
+fn cohort_models(cohort: &CacheCohort) -> String {
+    if cohort.models.is_empty() {
+        "no model set".to_string()
+    } else {
+        cohort.models.join(", ")
     }
 }
 
@@ -8252,6 +8485,17 @@ fn unsigned(value: i64) -> Result<u64> {
         storage(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("negative ledger column {value}"),
+        ))
+    })
+}
+
+/// A rate sum past `u64` is not a representable total; it never wraps into
+/// a smaller one.
+fn token_total(current: u64, add: u64) -> Result<u64> {
+    current.checked_add(add).ok_or_else(|| {
+        storage(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settled token bins overflow the cohort rate sum",
         ))
     })
 }
@@ -8998,6 +9242,71 @@ mod tests {
     use crate::contracts::TaskId;
     use rusqlite::OptionalExtension as _;
     use rusqlite::params;
+
+    /// The frozen cohort is read in batches: 901 ids produce exactly two
+    /// `SELECT … IN` statements through the armed statement sink.
+    #[test]
+    fn cache_cohort_reads_901_ids_in_two_batched_statements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-cohort-batch-")?;
+        let path = root.path().join("state.db");
+        super::proof::arm();
+        let store = TaskStore::open(&path)?;
+        let (opened, _) = super::proof::take().ok_or("the open armed the sink")?;
+        assert!(!opened.is_empty(), "the armed open records its statements");
+
+        // The fixture writes the rows; the statements counted below are the
+        // product's own cohort read.
+        {
+            let conn = rusqlite::Connection::open(&path)?;
+            let insert = "INSERT INTO usage_settlements
+                 (attempt_id, purpose, connection, cost_bound, state, exactness, wire_retries)
+                 VALUES (?1, 'main', 'local', 0, 'dispatched', 'unknown', 0)";
+            let mut statement = conn.prepare(insert)?;
+            for index in 0..901u64 {
+                statement.execute(params![format!("cohort-batch-{index}")])?;
+            }
+            drop(statement);
+            conn.execute(
+                "UPDATE usage_settlements SET state = 'settled', exactness = 'exact',
+                 prompt_tokens = 1, completion_tokens = 0, cache_read_tokens = 1,
+                 cache_write_tokens = 0, total_tokens = 2 WHERE state = 'dispatched'",
+                [],
+            )?;
+        }
+        let cohort = super::CacheCohort {
+            candidate: "fixture".to_string(),
+            models: vec!["fixture-model".to_string()],
+            attempt_ids: (0..901u64)
+                .map(|index| format!("cohort-batch-{index}"))
+                .collect(),
+            include_cold: false,
+            frozen_on: "2026-11-04".to_string(),
+        };
+        super::proof::arm();
+        let rate = store.cache_read_rate(&cohort)?;
+        let (events, overflow) = super::proof::take().ok_or("the read armed the sink")?;
+        assert!(!overflow, "no sink overflow on the cohort read");
+        let selects = events
+            .iter()
+            .filter(|event| {
+                matches!(event, super::proof::ProofEvent::Stmt(sql)
+                    if sql.starts_with(
+                        "SELECT state, prompt_tokens, cache_read_tokens, cache_write_tokens")
+                        && sql.contains("usage_settlements"))
+            })
+            .count();
+        assert_eq!(selects, 2, "901 ids read as 900 + 1 statements");
+        assert!(matches!(
+            rate,
+            super::CacheRate::Measured {
+                cache_read_tokens: 901,
+                input_tokens: 1802,
+                ..
+            }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn reopening_store_does_not_rewrite_existing_projection()
