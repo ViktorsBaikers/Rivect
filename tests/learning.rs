@@ -253,7 +253,9 @@ fn verified_delta_changes_the_next_request_p1() {
         "nothing learned yet: {}",
         first.instructions
     );
-    let first_reply = broker.dispatch(WORLD, &first).expect("first dispatch");
+    let first_reply = broker
+        .dispatch(&mut rivect::model::NullLedger, WORLD, &first)
+        .expect("first dispatch");
     assert!(!first_reply.text.is_empty(), "the loopback answered");
 
     let definition = verified(
@@ -269,7 +271,9 @@ fn verified_delta_changes_the_next_request_p1() {
     let second = broker
         .prepare("main", &config, WORLD, "goal: explain the selected form")
         .expect("second prepare");
-    let second_reply = broker.dispatch(WORLD, &second).expect("second dispatch");
+    let second_reply = broker
+        .dispatch(&mut rivect::model::NullLedger, WORLD, &second)
+        .expect("second dispatch");
     assert!(!second_reply.text.is_empty(), "the loopback answered");
 
     assert!(
@@ -340,7 +344,7 @@ fn delta_is_used_automatically_p2() {
     let reply = world
         .runtime
         .broker
-        .dispatch(WORLD, &manifest)
+        .dispatch(&mut rivect::model::NullLedger, WORLD, &manifest)
         .expect("dispatch");
     assert!(!reply.text.is_empty(), "the loopback answered");
     assert_eq!(

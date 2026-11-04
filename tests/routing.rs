@@ -241,7 +241,7 @@ fn transmitted_effort_is_never_confirmed_without_provider_data() {
     );
     let frozen = manifest.clone();
     let reply = broker
-        .dispatch("/world/fixture", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/fixture", &manifest)
         .expect("offline dispatch");
     // the loopback really answered: fixture text, no tool calls
     assert!(!reply.text.is_empty(), "dispatch must return a real reply");
@@ -264,7 +264,7 @@ fn transmitted_effort_is_never_confirmed_without_provider_data() {
         .prepare("main", &auto, "/world/fixture", "goal: fixture")
         .expect("manifest");
     let reply = broker
-        .dispatch("/world/fixture", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/fixture", &manifest)
         .expect("offline dispatch");
     assert!(!reply.text.is_empty(), "dispatch must return a real reply");
     assert!(reply.tool_calls.is_empty());
@@ -304,7 +304,7 @@ fn wire_request_is_the_frozen_manifest_and_overflow_rejects() {
     assert!(wire.contains("read_file"));
     assert!(wire.contains("read /scope/allowed.txt"));
     let reply = broker
-        .dispatch("/world/limits", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/limits", &manifest)
         .expect("dispatch the fitting request");
     assert!(!reply.text.is_empty());
     assert_eq!(
@@ -345,7 +345,7 @@ fn dispatch_rejects_a_foreign_execution_world() {
         .prepare("main", &config, "/world/alpha", "goal: fixture")
         .expect("manifest");
     let mismatch = broker
-        .dispatch("/world/beta", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/beta", &manifest)
         .expect_err("a manifest from another execution world must not be sent");
     assert!(
         matches!(
@@ -360,7 +360,7 @@ fn dispatch_rejects_a_foreign_execution_world() {
         "the rejected dispatch never reached the provider"
     );
     broker
-        .dispatch("/world/alpha", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/alpha", &manifest)
         .expect("the frozen world still dispatches");
     assert_eq!(sent.lock().expect("wire log lock").len(), 1);
 }
@@ -835,7 +835,7 @@ fn revoked_right_blocks_the_next_dispatch_p7() {
     // the frozen prefix is never re-sent either: the dispatch refuses
     // typed instead of replaying bytes the revoked grant authorized
     let blocked = broker
-        .dispatch("/world/rights", &frozen)
+        .dispatch(&mut rivect::model::NullLedger, "/world/rights", &frozen)
         .expect_err("a revoked grant never ships the frozen prefix");
     assert!(
         matches!(
@@ -883,7 +883,7 @@ fn pending_config_and_draft_never_rewrite_the_in_flight_request() {
     let _draft_v2 = "goal: fixture\nanswer: draft v2";
     let _pending = &pending_config;
     broker
-        .dispatch("/world/inflight", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/inflight", &manifest)
         .expect("the in-flight dispatch completes on the frozen manifest");
     let recorded = sent
         .lock()
@@ -1059,7 +1059,7 @@ fn ineligible_candidates_are_excluded_before_ranking_and_fail_closed() {
     // the dispatch fails closed instead of sending unguarded
     let (mut other, other_sent) = recording_broker();
     let unadmitted = other
-        .dispatch("/world/pools", &vision)
+        .dispatch(&mut rivect::model::NullLedger, "/world/pools", &vision)
         .expect_err("only broker-ranked manifests dispatch");
     assert!(
         matches!(
@@ -1094,7 +1094,7 @@ fn rights_loss_between_ranking_and_dispatch_re_blocks_the_send() {
     // moved on, so the send is blocked again before any provider call
     broker.set_account_rights(&["reserve".to_string()]);
     let blocked = broker
-        .dispatch("/world/rights", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/rights", &manifest)
         .expect_err("a stale grant must never ship");
     assert!(
         matches!(
@@ -1123,7 +1123,7 @@ fn rights_loss_between_ranking_and_dispatch_re_blocks_the_send() {
 
     assert_eq!(broker.entitlement_version(), 3);
     let still_stale = broker
-        .dispatch("/world/rights", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/rights", &manifest)
         .expect_err("a changed snapshot stays blocking");
     assert!(
         matches!(
@@ -1144,7 +1144,7 @@ fn rights_loss_between_ranking_and_dispatch_re_blocks_the_send() {
         .prepare("main", &config, "/world/rights", "goal: fixture")
         .expect("re-ranking admits the entitled candidate");
     broker
-        .dispatch("/world/rights", &next)
+        .dispatch(&mut rivect::model::NullLedger, "/world/rights", &next)
         .expect("the re-ranked request sends");
     assert_eq!(sent.lock().expect("wire log lock").len(), 1);
     assert_eq!(
@@ -1207,7 +1207,7 @@ fn every_purpose_carries_admission_and_single_accounting() {
         );
         // the real offline loopback answers; no fake LLM call exists
         broker
-            .dispatch("/world/purposes", &manifest)
+            .dispatch(&mut rivect::model::NullLedger, "/world/purposes", &manifest)
             .expect("the brokered dispatch completes");
         let record = broker
             .accounting_record(&manifest.attempt_id)
@@ -1234,7 +1234,7 @@ fn every_purpose_carries_admission_and_single_accounting() {
     // admission — answers the replay with the spent single accounting
     let original = &manifests[0];
     let replayed = broker
-        .dispatch("/world/purposes", original)
+        .dispatch(&mut rivect::model::NullLedger, "/world/purposes", original)
         .expect_err("one physical request per attempt id");
     assert!(
         matches!(
@@ -1257,7 +1257,7 @@ fn every_purpose_carries_admission_and_single_accounting() {
     let mut forged = pending.clone();
     forged.inputs = "goal: main\nread /world/purposes/secret".to_string();
     let mismatched = broker
-        .dispatch("/world/purposes", &forged)
+        .dispatch(&mut rivect::model::NullLedger, "/world/purposes", &forged)
         .expect_err("only the admitted manifest dispatches");
     assert!(
         matches!(
@@ -1273,10 +1273,10 @@ fn every_purpose_carries_admission_and_single_accounting() {
 
     // the genuine pending manifest still spends its own single request
     broker
-        .dispatch("/world/purposes", &pending)
+        .dispatch(&mut rivect::model::NullLedger, "/world/purposes", &pending)
         .expect("the genuine manifest sends");
     let duplicate = broker
-        .dispatch("/world/purposes", &pending)
+        .dispatch(&mut rivect::model::NullLedger, "/world/purposes", &pending)
         .expect_err("one physical request per attempt id");
     assert!(
         matches!(
@@ -1327,7 +1327,7 @@ fn fallback_auto_walks_only_admitted_chain_entries_preserving_primary_pins_and_s
     );
 
     let reply = broker
-        .dispatch("/world/fallback", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/fallback", &manifest)
         .expect("the admitted reserve answers the fallback");
     assert!(!reply.text.is_empty());
 
@@ -1545,6 +1545,22 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         !world.runtime.paused_attempts.contains_key(&task.0),
         "the answered pause is consumed"
     );
+    // The served economy names the connection that actually answered: the
+    // prepared primary's model stays unknown with a source that says so.
+    let status = world.dispatch(&support::corpus_status(&session));
+    let economy = &status["result"]["economy"];
+    assert_eq!(economy["connection"], json!("reserve"));
+    assert!(
+        economy["model"].is_null(),
+        "the unsent primary's model is not named: {economy}"
+    );
+    assert!(
+        economy["source"]
+            .as_str()
+            .expect("the projection names its source")
+            .contains("fallback answered via reserve"),
+        "the source names the answering connection: {economy}"
+    );
 
     // a replayed answer is refused typed — the completed task is
     // terminal, the spent question never dispatches a second
@@ -1568,6 +1584,119 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         "the replay added no send"
     );
     assert_eq!(world.runtime.broker.accounted_requests(), 1);
+}
+
+/// AC-045/DEC-012: a manual pick whose frozen bound no longer fits the
+/// task's scope waits on the named budget resolution — the substitute is
+/// never sent, the pause stays live, and the status surface serves the
+/// reason the refusal recorded.
+#[test]
+fn budget_refused_manual_pick_waits_and_names_the_gate() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-budget",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-budget-boot");
+    let task = world.create_task(&session, "manual-budget-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "manual-budget-first",
+        &task,
+        &question,
+        "steps",
+        json!(4201),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4202),
+    ));
+    let served_question: Question =
+        serde_json::from_value(current["result"]["question"].clone()).expect("served question");
+    let bound = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained")
+        .manifest
+        .cost_bound;
+    // The scope exists and cannot fit the frozen bound: one unit less than
+    // the pick's own reservation.
+    world
+        .runtime
+        .store_writer()
+        .open_budget(&task.0, bound.saturating_sub(1))
+        .expect("the scope cannot fit the frozen bound");
+
+    let picked = world.dispatch(&support::corpus_answer_option(
+        &session,
+        "manual-budget-pick",
+        &task,
+        &served_question,
+        "reserve",
+        json!(4203),
+    ));
+    assert!(
+        picked.get("error").is_none(),
+        "the answer commits and the step waits on the budget: {picked}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the refused substitute never crosses the wire"
+    );
+    assert_eq!(
+        world.runtime.broker.accounted_requests(),
+        0,
+        "the refused substitute spends nothing"
+    );
+    assert!(
+        world.runtime.paused_attempts.contains_key(&task.0),
+        "the pause stays live on the budget refusal"
+    );
+
+    let status = world.dispatch(&support::corpus_status(&session));
+    let waiting = status["result"]["budget_waiting"]
+        .as_array()
+        .expect("the status serves the waiting list");
+    let entry = waiting
+        .iter()
+        .find(|entry| entry["task_id"].as_str() == Some(task.0.as_str()))
+        .expect("the status serves the refused task");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .expect("the entry names its reason")
+            .contains(&task.0),
+        "the served reason names the refused scope: {entry}"
+    );
 }
 
 /// AC-045b: a manual pick is re-checked against the CURRENT eligibility
@@ -1778,7 +1907,11 @@ fn task_cancel_tombstones_the_paused_broker_attempt() {
     let late = world
         .runtime
         .broker
-        .dispatch(&manifest.world.clone(), &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            &manifest.world.clone(),
+            &manifest,
+        )
         .expect_err("a late dispatch of the cancelled attempt is refused");
     assert!(
         matches!(&late, ModelError::AttemptCancelled { attempt_id }
@@ -2620,7 +2753,7 @@ fn fallback_off_never_substitutes_and_leaves_the_task_paused() {
         .prepare("relay", &config, "/world/off", "goal: off")
         .expect("manifest");
     let error = broker
-        .dispatch("/world/off", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/off", &manifest)
         .expect_err("off never substitutes");
     assert!(
         matches!(
@@ -2648,7 +2781,7 @@ fn fallback_off_never_substitutes_and_leaves_the_task_paused() {
 
     // the paused attempt retries the same frozen manifest
     let reply = broker
-        .dispatch("/world/off", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/off", &manifest)
         .expect("the paused attempt retries the same manifest");
     assert!(!reply.text.is_empty());
     assert_eq!(sent.lock().expect("wire log lock").len(), 2);
@@ -2706,7 +2839,7 @@ fn fallback_candidate_failing_eligibility_or_egress_never_receives_the_request()
     broker.set_config(&edited);
 
     broker
-        .dispatch("/world/eligible", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/eligible", &manifest)
         .expect("the admitted reserve answers after every rejection");
 
     let sent = sent.lock().expect("wire log lock");
@@ -2740,7 +2873,7 @@ fn adapter_inner_retries_spend_the_shared_outer_cap_and_never_resurrect_a_cancel
         .prepare("relay", &config, "/world/retry", "goal: shared cap")
         .expect("manifest");
     broker
-        .dispatch("/world/retry", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/retry", &manifest)
         .expect("dispatch");
     assert_eq!(
         inner_attempts.load(Ordering::SeqCst),
@@ -2764,7 +2897,7 @@ fn adapter_inner_retries_spend_the_shared_outer_cap_and_never_resurrect_a_cancel
         .expect("manifest");
     assert!(broker.cancel_attempt(&doomed.attempt_id));
     let late = broker
-        .dispatch("/world/retry", &doomed)
+        .dispatch(&mut rivect::model::NullLedger, "/world/retry", &doomed)
         .expect_err("a cancelled attempt never re-dispatches");
     assert!(
         matches!(&late, ModelError::AttemptCancelled { attempt_id }
@@ -2772,7 +2905,7 @@ fn adapter_inner_retries_spend_the_shared_outer_cap_and_never_resurrect_a_cancel
         "wrong rejection: {late}"
     );
     let again = broker
-        .dispatch("/world/retry", &doomed)
+        .dispatch(&mut rivect::model::NullLedger, "/world/retry", &doomed)
         .expect_err("the cancellation stays authoritative");
     assert!(
         matches!(&again, ModelError::AttemptCancelled { .. }),
@@ -2809,7 +2942,7 @@ fn cancel_then_late_provider_callback_produces_no_new_dispatch_or_effect() {
         .expect("manifest");
     assert!(broker.cancel_attempt(&manifest.attempt_id));
     let late = broker
-        .dispatch("/world/cancel", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/cancel", &manifest)
         .expect_err("a cancelled attempt never dispatches");
     assert!(
         matches!(&late, ModelError::AttemptCancelled { attempt_id }
@@ -2831,7 +2964,7 @@ fn cancel_then_late_provider_callback_produces_no_new_dispatch_or_effect() {
         )
         .expect("manifest");
     let pending_error = broker
-        .dispatch("/world/cancel", &manual)
+        .dispatch(&mut rivect::model::NullLedger, "/world/cancel", &manual)
         .expect_err("manual records the choice");
     assert!(matches!(
         &pending_error,
@@ -2849,13 +2982,15 @@ fn cancel_then_late_provider_callback_produces_no_new_dispatch_or_effect() {
     let done = broker
         .prepare("relay", &config, "/world/cancel", "goal: done")
         .expect("manifest");
-    broker.dispatch("/world/cancel", &done).expect("dispatch");
+    broker
+        .dispatch(&mut rivect::model::NullLedger, "/world/cancel", &done)
+        .expect("dispatch");
     assert!(
         !broker.cancel_attempt(&done.attempt_id),
         "a spent attempt is not cancelled"
     );
     let replay = broker
-        .dispatch("/world/cancel", &done)
+        .dispatch(&mut rivect::model::NullLedger, "/world/cancel", &done)
         .expect_err("the spent attempt reports spent, not cancelled");
     assert!(
         matches!(&replay, ModelError::AttemptAlreadyAccounted { attempt_id }
@@ -2914,7 +3049,11 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         )
         .expect("manifest");
     let error = broker
-        .dispatch("/world/exhausted", &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/exhausted",
+            &manifest,
+        )
         .expect_err("the exhausted chain pauses instead of dispatching");
     // the rejection vector is exact: every skipped entry in chain order
     // with its typed cause — only `reserve` ever reached a send
@@ -2994,7 +3133,11 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
 
     // an operator retry resumes the same frozen intent
     broker
-        .dispatch("/world/exhausted", &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/exhausted",
+            &manifest,
+        )
         .expect("the paused attempt retries the same manifest");
     assert_eq!(sent.lock().expect("wire log lock").len(), 3);
     assert_eq!(broker.accounted_requests(), 1);
@@ -3035,7 +3178,11 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         )
         .expect("manifest");
     let error = broker
-        .dispatch("/world/transport-exhausted", &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/transport-exhausted",
+            &manifest,
+        )
         .expect_err("the typed transport primary exhausts the same chain");
     let ModelError::FallbackExhausted {
         attempt_id,
@@ -3722,7 +3869,7 @@ fn send_failure_walks_the_admitted_chain_in_order() {
         .expect("manifest");
     assert_eq!(broker.admitted_attempts(), 1, "the prepare admits one");
     let reply = broker
-        .dispatch("/world/walk", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/walk", &manifest)
         .expect("the walk answers through shadowed");
     assert!(!reply.text.is_empty());
 
@@ -3794,7 +3941,7 @@ fn failed_send_leaves_no_phantom_epoch() {
         .prepare("relay", &config, "/world/epoch", "goal: epoch")
         .expect("manifest");
     let error = broker
-        .dispatch("/world/epoch", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/epoch", &manifest)
         .expect_err("the single-entry chain exhausts");
     assert!(
         matches!(&error, ModelError::FallbackExhausted {
@@ -3868,7 +4015,12 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     // refuses the substitute dispatch typed — the flag alone authorizes
     // nothing
     let premature = broker
-        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest.attempt_id,
+            "reserve",
+        )
         .expect_err("an un-paused Manual admission has no substitute path");
     assert!(
         matches!(&premature, ModelError::NoPendingChoice { .. }),
@@ -3876,7 +4028,11 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     );
 
     let error = broker
-        .dispatch("/world/manual-epoch", &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest,
+        )
         .expect_err("manual records the pending choice");
     assert!(matches!(&error, ModelError::ManualFallbackPending { .. }));
     // the publish path consumes the pending choice — the surviving pin
@@ -3889,7 +4045,12 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     // the pick is confined to the served set: the just-failed primary
     // is never on it, even while it still passes the live check
     let off_menu = broker
-        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "local")
+        .dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest.attempt_id,
+            "local",
+        )
         .expect_err("the failed primary was never served");
     assert!(
         matches!(
@@ -3903,7 +4064,12 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     );
 
     let picked = broker
-        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest.attempt_id,
+            "reserve",
+        )
         .expect_err("the substitute's send fails");
     assert!(
         matches!(
@@ -3945,10 +4111,20 @@ fn manual_substitute_send_failure_restores_epoch_and_prunes_admission() {
     // consumed pause clears exactly once, and a later answer is refused
     // typed — the spent primary's id never replays either
     broker
-        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest.attempt_id,
+            "reserve",
+        )
         .expect("the retried pick dispatches the substitute");
     let refused = broker
-        .dispatch_fallback_choice("/world/manual-epoch", &manifest.attempt_id, "reserve")
+        .dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/manual-epoch",
+            &manifest.attempt_id,
+            "reserve",
+        )
         .expect_err("the consumed pause refuses a second substitute");
     assert!(
         matches!(&refused, ModelError::NoAdmission { .. }),
@@ -3979,7 +4155,7 @@ fn manual_fallback_with_no_servable_candidate_exhausts_instead_of_wedging() {
         .prepare("relay", &config, "/world/wedge", "goal: wedge")
         .expect("manifest");
     let error = broker
-        .dispatch("/world/wedge", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/wedge", &manifest)
         .expect_err("a pause with no servable candidate is exhaustion");
     assert!(
         matches!(&error, ModelError::FallbackExhausted {
@@ -4049,7 +4225,7 @@ fn a_failed_prepare_never_rewrites_the_dispatch_recheck_view() {
         "a purpose with no defaults fails typed: {failed:?}"
     );
     let error = broker
-        .dispatch("/world/view", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/view", &manifest)
         .expect_err("manual pauses on the failed send");
     assert!(matches!(&error, ModelError::ManualFallbackPending { .. }));
     let pending = broker
@@ -4103,7 +4279,7 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
         )
         .expect("manifest A");
     let confirmed = broker
-        .dispatch("/world/stream", &first)
+        .dispatch(&mut rivect::model::NullLedger, "/world/stream", &first)
         .expect("the first dispatch confirms its tool effect");
     assert_eq!(
         confirmed.tool_calls.len(),
@@ -4114,7 +4290,7 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
     // the stream's re-send of the spent attempt is the replay surface:
     // it can never re-run the confirmed effect
     let replay = broker
-        .dispatch("/world/stream", &first)
+        .dispatch(&mut rivect::model::NullLedger, "/world/stream", &first)
         .expect_err("a spent attempt never replays");
     assert!(
         matches!(&replay, ModelError::AttemptAlreadyAccounted { attempt_id }
@@ -4141,7 +4317,7 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
         )
         .expect("manifest B");
     let continued = broker
-        .dispatch("/world/stream", &follow)
+        .dispatch(&mut rivect::model::NullLedger, "/world/stream", &follow)
         .expect("the reserve continues the broken stream");
     assert_eq!(
         continued.tool_calls.len(),
@@ -4188,7 +4364,11 @@ fn stream_broken_after_a_confirmed_tool_effect_never_replays_the_effect() {
     // like every spent attempt — no id ever replays its accounting
     let substitute_manifest = sent.lock().expect("wire log lock")[2].clone();
     let again = broker
-        .dispatch("/world/stream", &substitute_manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/stream",
+            &substitute_manifest,
+        )
         .expect_err("the spent substitute never replays either");
     assert!(
         matches!(&again, ModelError::AttemptAlreadyAccounted { attempt_id }
@@ -4216,11 +4396,13 @@ fn accounting_record_reflects_provider_reply_usage_exactly_unknown_never_zero() 
                 text: "one".to_string(),
                 tool_calls: Vec::new(),
                 usage: reported,
+                wire_retries: 0,
             }),
             Respond::Reply(ProviderReply {
                 text: "two".to_string(),
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
+                wire_retries: 0,
             }),
         ],
         0,
@@ -4233,7 +4415,7 @@ fn accounting_record_reflects_provider_reply_usage_exactly_unknown_never_zero() 
         .prepare("main", &config, "/world/usage", "goal: first")
         .expect("first prepares");
     let first_reply = broker
-        .dispatch("/world/usage", &first)
+        .dispatch(&mut rivect::model::NullLedger, "/world/usage", &first)
         .expect("the crafted reply dispatches");
     assert_eq!(
         first_reply.usage, reported,
@@ -4258,7 +4440,7 @@ fn accounting_record_reflects_provider_reply_usage_exactly_unknown_never_zero() 
         .prepare("main", &config, "/world/usage", "goal: second")
         .expect("second prepares");
     let second_reply = broker
-        .dispatch("/world/usage", &second)
+        .dispatch(&mut rivect::model::NullLedger, "/world/usage", &second)
         .expect("the usage-less reply dispatches");
     assert_eq!(
         second_reply.usage,
@@ -4321,7 +4503,7 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
     // candidate passes the credential gate — the dialect gate is the
     // only denial left: no installed adapter serves its class
     let error = broker
-        .dispatch("/world/profiles", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/profiles", &manifest)
         .expect_err("a candidate no adapter serves is skipped");
     assert!(
         matches!(&error, ModelError::FallbackExhausted { rejected, .. }
@@ -4337,7 +4519,7 @@ fn profile_bound_credential_reaches_the_dispatch_recheck() {
     config.profiles.remove("p");
     broker.set_config(&config);
     let error = broker
-        .dispatch("/world/profiles", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/profiles", &manifest)
         .expect_err("the profile-less candidate loses its grant");
     assert!(
         matches!(&error, ModelError::FallbackExhausted { rejected, .. }
@@ -4375,7 +4557,7 @@ fn a_reserved_connection_denies_with_the_unserved_dialect_truth() {
         .prepare("relay", &config, "/world/reserved", "goal: reserved")
         .expect("the declared reserved candidate ranks");
     let error = broker
-        .dispatch("/world/reserved", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/reserved", &manifest)
         .expect_err("the reserved id denies before any send");
     assert!(
         matches!(
@@ -4425,7 +4607,11 @@ fn ollama_cloud_dialect_unserved_display_names_ollama_chat() {
         )
         .expect("the declared reserved candidate ranks");
     let error = broker
-        .dispatch("/world/native-reserved", &manifest)
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/native-reserved",
+            &manifest,
+        )
         .expect_err("the reserved native id denies before any send");
     assert!(
         matches!(

@@ -9552,6 +9552,7 @@ mod plan_selection {
                 text,
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
+                wire_retries: 0,
             }
         }
 
@@ -9626,6 +9627,46 @@ mod plan_selection {
                 } if refused == action => cause,
                 other => panic!("expected a refused {action} reply, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn semantic_dispatch_settles_one_row_without_a_charge() {
+            let (mut world, session, rotate) = plan_world("semantic-settle", &PLAN_CRITERIA);
+            let request = material(&world, &rotate);
+            select(&mut world, &session, &request, &[]);
+            run(
+                &mut world,
+                &session,
+                ActionInput::FrameGoal(request.clone()),
+            )
+            .expect("frame");
+            let config = semantic_config(&fixed(CHALLENGE_DIRECTION, "off"));
+            let (mut broker, _log) = scripted(|manifest, inputs| Ok(faithful(manifest, inputs)));
+            run_with(
+                &mut world,
+                &session,
+                &config,
+                &mut broker,
+                ActionInput::ChallengeDirection(request),
+            )
+            .expect("the semantic leg dispatches");
+
+            let store = world.runtime.store();
+            let totals = store.settlement_totals().expect("totals");
+            assert_eq!(totals.settled_count, 1, "one semantic send settles one row");
+            assert_eq!(
+                totals.charged_units, None,
+                "no scope was open, so nothing was charged"
+            );
+            assert_eq!(totals.dispatched_count, 0, "the row is closed");
+            let row = store.latest_settlement().expect("the settled row");
+            assert_eq!(row.charged_units, None);
+            assert_eq!(row.exactness, rivect::resources::Exactness::Unknown);
+            assert_eq!(
+                row.unknown_reason.as_deref(),
+                Some("provider reported no usage"),
+                "the reason is the provider's silent report, not an interruption"
+            );
         }
 
         #[test]
@@ -10137,6 +10178,7 @@ mod plan_selection {
                             path: Some("secrets.txt".to_string()),
                         }],
                         usage: UsageDelta::Unknown,
+                        wire_retries: 0,
                     },
                     SemanticRefusal::ToolCall,
                 ),
@@ -10282,7 +10324,7 @@ mod plan_selection {
             assert!(broker.pending_choice(&paused.attempt_id).is_none());
             assert!(broker.admission(&paused.attempt_id).is_none());
             assert!(matches!(
-                broker.dispatch(WORLD, &paused),
+                broker.dispatch(&mut rivect::model::NullLedger, WORLD, &paused),
                 Err(ModelError::AttemptCancelled { .. })
             ));
             assert_eq!(
@@ -10318,7 +10360,7 @@ mod plan_selection {
             );
             let spent = calls(&log).remove(1);
             assert!(matches!(
-                broker.dispatch(WORLD, &spent),
+                broker.dispatch(&mut rivect::model::NullLedger, WORLD, &spent),
                 Err(ModelError::AttemptCancelled { .. })
             ));
             assert_eq!(

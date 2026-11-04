@@ -383,6 +383,62 @@ pub const SET_BUDGET_RESERVATION_STATE: &str =
     "UPDATE budget_reservations SET state = ?2, charged = ?3 WHERE reservation_id = ?1";
 pub const BUDGET_RESERVATION_ROW: &str =
     "SELECT state, bound, charged FROM budget_reservations WHERE reservation_id = ?1 LIMIT 1";
+// ----- usage settlements (AC-057) -----
+
+/// The open scopes a dispatch reserves against: the bound is held at every
+/// level that was opened, and a level that was never opened is not a level
+/// the request draws from.
+pub const BUDGET_SCOPE_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM budget_scopes WHERE scope = ?1)";
+/// The `dispatched` row is the replay identity of one physical child
+/// attempt: written in the reserve transaction, it exists before a byte
+/// crosses the wire, so a crash leaves exactly one row to reconcile. The
+/// row names its own positive rowid (floor 1): an omitted rowid reads `-1`
+/// inside the INSERT guard, where it cannot be told apart from a stored
+/// `-1` identity, so the product never relies on the implicit assignment.
+pub const INSERT_SETTLEMENT_DISPATCHED: &str = "INSERT INTO usage_settlements
+                 (rowid, attempt_id, parent_attempt_id, purpose, connection, ranking_basis,
+                  cost_bound, state, exactness, wire_retries)
+                 VALUES ((SELECT MAX(COALESCE(MAX(rowid), 0) + 1, 1) FROM usage_settlements),
+                         ?1, ?2, ?3, ?4, ?5, ?6, 'dispatched', 'unknown', 0)";
+/// Closing a row is conditional on it still being open: a second settle of
+/// the same attempt matches nothing, so the exactly-once guard is the
+/// statement, not a read-then-write.
+pub const SETTLE_USAGE_SETTLEMENT: &str =
+    "UPDATE usage_settlements SET state = 'settled', exactness = ?2, unknown_reason = ?3,
+                 wire_retries = ?4, prompt_tokens = ?5, completion_tokens = ?6,
+                 reasoning_tokens = ?7, cache_read_tokens = ?8, cache_write_tokens = ?9,
+                 total_tokens = ?10, charged_units = ?11
+                 WHERE attempt_id = ?1 AND state = 'dispatched'";
+pub const SETTLEMENT_ROW: &str =
+    "SELECT attempt_id, parent_attempt_id, purpose, connection, ranking_basis, cost_bound,
+                 state, exactness, unknown_reason, wire_retries, prompt_tokens,
+                 completion_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                 total_tokens, charged_units
+                 FROM usage_settlements WHERE attempt_id = ?1";
+pub const DISPATCHED_SETTLEMENTS: &str = "SELECT attempt_id, cost_bound FROM usage_settlements WHERE state = 'dispatched' ORDER BY rowid";
+pub const SETTLEMENTS_FOR_PARENT: &str =
+    "SELECT attempt_id, parent_attempt_id, purpose, connection, ranking_basis, cost_bound,
+                 state, exactness, unknown_reason, wire_retries, prompt_tokens,
+                 completion_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                 total_tokens, charged_units
+                 FROM usage_settlements WHERE parent_attempt_id = ?1 ORDER BY rowid";
+/// The newest settlement row, whichever attempt it belongs to: the one a
+/// dedicated-action proof reads when it does not own the minted attempt id.
+pub const LATEST_SETTLEMENT: &str =
+    "SELECT attempt_id, parent_attempt_id, purpose, connection, ranking_basis, cost_bound,
+                 state, exactness, unknown_reason, wire_retries, prompt_tokens,
+                 completion_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
+                 total_tokens, charged_units
+                 FROM usage_settlements ORDER BY rowid DESC LIMIT 1";
+/// The status projection's one aggregate: the lifetime settled spend, the
+/// cache legs it carried and the sends still open, in a single statement
+/// so a status refresh never walks the settlement rows.
+pub const SETTLEMENT_TOTALS: &str = "SELECT COUNT(*), SUM(total_tokens), SUM(prompt_tokens),
+                 SUM(cache_read_tokens), SUM(charged_units),
+                 (SELECT COUNT(*) FROM usage_settlements WHERE state = 'dispatched'),
+                 (SELECT prompt_tokens FROM usage_settlements WHERE state = 'settled'
+                  ORDER BY rowid DESC LIMIT 1)
+                 FROM usage_settlements WHERE state = 'settled'";
 
 // ----- plan selection, plan obligations, plan revisions, gate holds -----
 
@@ -677,7 +733,7 @@ pub const ADD_BASE_STATE_SET_EPOCH: &str =
 /// runtime is exposed.
 pub const RECOVERY_TABLES_PRESENT: &str = "SELECT COUNT(*) FROM sqlite_schema
              WHERE type = 'table'
-             AND name IN ('config_publications', 'retained', 'attempts')";
+             AND name IN ('config_publications', 'retained', 'attempts', 'usage_settlements')";
 /// The consistent copy an update takes before it touches anything: `VACUUM
 /// INTO` writes one complete database beside the primary from the connection
 /// that holds the writer lock, so the copy is transactionally consistent

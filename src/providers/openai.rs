@@ -1356,6 +1356,7 @@ impl OpenAiProvider {
             text,
             tool_calls,
             usage,
+            wire_retries: 0,
         })
     }
 
@@ -1370,16 +1371,30 @@ impl OpenAiProvider {
         let input = usage.get("input_tokens").and_then(Value::as_u64);
         let output = usage.get("output_tokens").and_then(Value::as_u64);
         let total = usage.get("total_tokens").and_then(Value::as_u64);
+        // The recorded detail objects: a cached prompt share and a reasoning
+        // share already folded into the completion count. Absent stays
+        // unknown and the report stays exact.
+        let cache_read = usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let reasoning = usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64);
         match (input, output, total) {
             // The reported total is charged verbatim — never re-summed
             // — and a usage object that withholds it is a wire
             // violation, not an estimate the peer never charged.
             (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
-                Ok(UsageDelta::Exact {
+                Ok(UsageDelta::from_reported(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                })
+                    reasoning,
+                    cache_read,
+                    None,
+                ))
             }
             _ => Err(violation(
                 &self.connection,

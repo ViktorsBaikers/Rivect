@@ -200,7 +200,7 @@ fn dispatch(
 ) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
-        let outcome = broker.dispatch(&world, &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
         (broker, outcome)
     })
     .join()
@@ -309,7 +309,8 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/google", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/google", &manifest);
             (broker, replay)
         })
         .join()
@@ -799,6 +800,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
     let (class, request, io) = match error {
@@ -965,7 +967,7 @@ fn a_pin_no_adapter_serves_is_denied_before_send_or_accounting() {
     let manifest = broker
         .prepare("main", &config, "/world/google", "goal: unserved pin")
         .expect("the google pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/google", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/google", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1009,7 +1011,7 @@ fn a_reserved_dialect_id_is_never_loopback_served() {
     let manifest = broker
         .prepare("main", &config, "/world/google", "goal: reserved id")
         .expect("the local-kind pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/google", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/google", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1076,7 +1078,7 @@ async fn a_manual_pick_of_a_google_candidate_reaches_the_real_send() {
     // primary send fails and the manual pause offers the served google
     // candidate.
     let (mut broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch("/world/google", &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/google", &manifest);
         (broker, outcome)
     })
     .join()
@@ -1095,7 +1097,12 @@ async fn a_manual_pick_of_a_google_candidate_reaches_the_real_send() {
     );
 
     let (broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch_fallback_choice("/world/google", &attempt_id, "google");
+        let outcome = broker.dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/google",
+            &attempt_id,
+            "google",
+        );
         (broker, outcome)
     })
     .join()
@@ -1681,6 +1688,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         IncompatibleOutput,
         UnsupportedParameter,
         ReasoningProvenance,
+        Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
         match error {
@@ -1712,6 +1720,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
     #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -4675,6 +4684,47 @@ async fn provider_legs_matrix_executes_all_expected_legs() {
 }
 
 // ----- TP-PROVIDER-INSTALLED::google --------------------------------
+
+/// Cached-prefix and thought counters the peer reports ride as their own
+/// legs; the completion bin is not re-summed with the thoughts (AC-057).
+#[tokio::test]
+async fn usage_metadata_cache_and_thought_legs_are_carried() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    mount_generate(
+        &server,
+        completed_stream(
+            "cached",
+            Vec::new(),
+            Some(json!({
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 12,
+                "cachedContentTokenCount": 3,
+                "thoughtsTokenCount": 2,
+            })),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared(&config, "/world/google", "goal: cache legs");
+    let (broker, outcome) = dispatch(broker, "/world/google", manifest.clone());
+    outcome.expect("the cached send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Legs {
+            prompt_tokens: Some(5),
+            completion_tokens: Some(7),
+            reasoning_tokens: Some(2),
+            cache_read_tokens: Some(3),
+            cache_write_tokens: None,
+            total_tokens: Some(12),
+        }
+    );
+}
 
 /// TP-PROVIDER-INSTALLED::google = NOT_RUN: the installed-provider
 /// proof is a live-environment leg this offline slice never runs.

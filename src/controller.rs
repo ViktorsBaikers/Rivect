@@ -13,7 +13,7 @@ use crate::contracts::{
 use crate::executor::{EffectOutcome, EffectRequest, ExecutorError};
 use crate::model::{ModelError, PendingFallback, RequestManifest};
 use crate::policy::PolicyError;
-use crate::providers::ProviderError;
+use crate::providers::{ProviderError, ProviderReply};
 use crate::resources::{Delivery, OutputSettlement};
 use crate::scheduler::{NodeId, SchedulerError, WaitTransition};
 use crate::state::{ConflictCause, InvalidCause, StoreError};
@@ -233,6 +233,10 @@ impl ControllerError {
             Self::Model(ModelError::Provider(
                 ProviderError::UnsupportedParameter { .. } | ProviderError::EndpointRequired { .. },
             )) => ErrorCode::InvalidInput,
+            // A ledger refusal keeps its own class: the budget arm is the
+            // one that never entered a send, every other is the store's.
+            Self::Model(ModelError::BudgetExhausted { .. }) => ErrorCode::BudgetExhausted,
+            Self::Model(ModelError::Ledger(error)) => error.code(),
             Self::Model(_) => ErrorCode::Denied,
             Self::Executor(error) => error.error_code(),
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,
@@ -524,6 +528,7 @@ impl Runtime {
         grant_id: &str,
     ) -> Result<Option<StepOutcome>, ControllerError> {
         if self.owner.store.task_lifecycle(task_id)?.is_terminal() {
+            self.clear_budget_wait(session_id, task_id);
             let snapshot = self.owner.store.snapshot(task_id)?;
             return Ok(Some(StepOutcome::NoAction { snapshot }));
         }
@@ -642,14 +647,34 @@ impl Runtime {
                                 .as_ref()
                                 .is_some_and(|choice| choice.candidates.contains(&option_id.0))
                     })
-                    .map(|paused| (paused.manifest.attempt_id.clone(), option_id.0.clone()))
+                    .map(|paused| {
+                        (
+                            paused.manifest.attempt_id.clone(),
+                            option_id.0.clone(),
+                            paused.manifest.clone(),
+                        )
+                    })
             }
             AnswerSelection::Custom { .. } => None,
         };
-        if let Some((attempt_id, connection)) = chosen {
-            let reply = self
-                .broker
-                .dispatch_fallback_choice(&world, &attempt_id, &connection)?;
+        if let Some((attempt_id, connection, paused_manifest)) = chosen {
+            let scopes = self.budget_scopes(task_id)?;
+            let sent = {
+                let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
+                self.broker
+                    .dispatch_fallback_choice(&mut ledger, &world, &attempt_id, &connection)
+            };
+            self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest))?;
+            let reply = match sent {
+                Ok(reply) => reply,
+                // The substitute never entered a send: the task waits on
+                // the named budget resolution, keeping its pause.
+                Err(ModelError::BudgetExhausted { .. }) => {
+                    let snapshot = self.owner.store.snapshot(task_id)?;
+                    return Ok(Err(StepOutcome::Waiting { snapshot }));
+                }
+                Err(source) => return Err(source.into()),
+            };
             self.provider_calls += 1;
             self.paused_attempts.remove(&task_id.0);
             return self.read_target_from_reply(task_id, reply, Some(attempt_id));
@@ -684,7 +709,18 @@ impl Runtime {
             origin,
         )?;
         self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
-        match self.broker.dispatch(&world, &manifest) {
+        let scopes = self.budget_scopes(task_id)?;
+        let sent = {
+            let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
+            self.broker.dispatch(&mut ledger, &world, &manifest)
+        };
+        // The refusal is known here, so the admission and its frozen inputs
+        // are dropped before the fallible projection refresh can return early.
+        if matches!(sent, Err(ModelError::BudgetExhausted { .. })) {
+            self.broker.cancel_attempt(&manifest.attempt_id);
+        }
+        self.note_send_outcome(session_id, task_id, &sent, Some(&manifest))?;
+        match sent {
             Ok(reply) => {
                 self.provider_calls += 1;
                 // The send landed: any attempt this task was paused on
@@ -692,6 +728,13 @@ impl Runtime {
                 // frozen manifest is refused, not resurrected.
                 self.tombstone_paused(task_id);
                 self.read_target_from_reply(task_id, reply, Some(manifest.attempt_id))
+            }
+            // The frozen bound did not fit an open scope: the attempt
+            // never entered a send, and the task waits on the named
+            // resolution instead of spinning on the same refusal.
+            Err(ModelError::BudgetExhausted { .. }) => {
+                let snapshot = self.owner.store.snapshot(task_id)?;
+                Ok(Err(StepOutcome::Waiting { snapshot }))
             }
             Err(ModelError::ManualFallbackPending { .. }) => {
                 self.pause_on_fallback_choice(session_id, task_id, manifest)
@@ -705,6 +748,33 @@ impl Runtime {
                 Err(source.into())
             }
         }
+    }
+
+    /// Records what one broker send did for the controller's own view
+    /// (AC-059, AC-062): the economy projection is refreshed after the
+    /// ledger's store borrow ends, and a budget refusal becomes the task's
+    /// named waiting reason — cleared as soon as a later send gets through.
+    fn note_send_outcome(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        sent: &Result<ProviderReply, ModelError>,
+        manifest: Option<&RequestManifest>,
+    ) -> Result<(), ControllerError> {
+        // The prepared manifest is offered on every outcome: the projection
+        // reads the durable row family and stays untouched when nothing
+        // landed. On the mixed path an entered primary's row is the landing
+        // even though the fallback leg was refused before it sent.
+        self.refresh_economy(manifest)?;
+        match sent {
+            Err(ModelError::BudgetExhausted { scope }) => self.record_budget_wait(
+                session_id,
+                task_id,
+                format!("budget exhausted at scope {scope}; waiting for its resolution"),
+            ),
+            _ => self.clear_budget_wait(session_id, task_id),
+        }
+        Ok(())
     }
 
     /// Remembers the broker attempt this task is paused on so a later
@@ -802,7 +872,7 @@ impl Runtime {
     fn read_target_from_reply(
         &mut self,
         task_id: &TaskId,
-        reply: crate::providers::ProviderReply,
+        reply: ProviderReply,
         retained_attempt_id: Option<String>,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
         let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
@@ -1145,6 +1215,7 @@ impl Runtime {
             }
         };
         if matches!(outcome, StepOutcome::Completed { .. }) {
+            self.clear_budget_wait(session_id, &context.task);
             self.scheduler.complete(node)?;
         } else {
             self.scheduler.settle(node)?;

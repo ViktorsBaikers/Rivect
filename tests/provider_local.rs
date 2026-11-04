@@ -208,7 +208,7 @@ fn dispatch(
 ) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
-        let outcome = broker.dispatch(&world, &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
         (broker, outcome)
     })
     .join()
@@ -354,7 +354,7 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/local", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/local", &manifest);
             (broker, replay)
         })
         .join()
@@ -898,6 +898,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
     let (class, request, io) = match error {
@@ -1051,7 +1052,7 @@ fn a_pin_no_adapter_serves_is_denied_before_send_or_accounting() {
     let manifest = broker
         .prepare("main", &config, "/world/local", "goal: unserved pin")
         .expect("the pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/local", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/local", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1095,7 +1096,7 @@ fn a_reserved_dialect_id_is_never_loopback_served() {
     let manifest = broker
         .prepare("main", &config, "/world/local", "goal: reserved id")
         .expect("the local-kind pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/local", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/local", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1145,7 +1146,7 @@ async fn a_manual_pick_of_a_candidate_reaches_the_real_send() {
     // primary send fails and the manual pause offers the served
     // candidate.
     let (mut broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch("/world/local", &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/local", &manifest);
         (broker, outcome)
     })
     .join()
@@ -1164,7 +1165,12 @@ async fn a_manual_pick_of_a_candidate_reaches_the_real_send() {
     );
 
     let (broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch_fallback_choice("/world/local", &attempt_id, CONNECTION);
+        let outcome = broker.dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/local",
+            &attempt_id,
+            CONNECTION,
+        );
         (broker, outcome)
     })
     .join()
@@ -1744,6 +1750,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         IncompatibleOutput,
         UnsupportedParameter,
         ReasoningProvenance,
+        Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
         match error {
@@ -1775,6 +1782,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
     #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -4796,7 +4804,11 @@ async fn abliteration_valid_control_yields_one_outcome_and_one_physical_usage() 
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/abliteration", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/abliteration",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -5961,7 +5973,7 @@ async fn aiand_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/aiand", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/aiand", &manifest);
             (broker, replay)
         })
         .join()
@@ -6887,7 +6899,8 @@ async fn aimlapi_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/aimlapi", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/aimlapi", &manifest);
             (broker, replay)
         })
         .join()
@@ -7775,7 +7788,11 @@ async fn alibaba_coding_plan_valid_control_yields_one_outcome_and_one_physical_u
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/alibaba-cp", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/alibaba-cp",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -8921,7 +8938,11 @@ async fn alibaba_token_plan_valid_control_yields_one_outcome_and_one_physical_us
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/alibaba-tp", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/alibaba-tp",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -10261,7 +10282,11 @@ async fn coreweave_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/coreweave", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/coreweave",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -11179,7 +11204,11 @@ async fn deepinfra_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/deepinfra", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/deepinfra",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -12085,7 +12114,8 @@ async fn deepseek_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/deepseek", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/deepseek", &manifest);
             (broker, replay)
         })
         .join()
@@ -13238,7 +13268,11 @@ async fn fireworks_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/fireworks", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/fireworks",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -14401,7 +14435,8 @@ async fn firepass_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/firepass", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/firepass", &manifest);
             (broker, replay)
         })
         .join()
@@ -15191,7 +15226,7 @@ async fn gmi_cloud_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/gmi", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/gmi", &manifest);
             (broker, replay)
         })
         .join()
@@ -15992,7 +16027,7 @@ async fn groq_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/groq", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/groq", &manifest);
             (broker, replay)
         })
         .join()
@@ -17163,7 +17198,11 @@ async fn huggingface_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/huggingface", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/huggingface",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -18624,7 +18663,7 @@ async fn kilo_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/kilo", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/kilo", &manifest);
             (broker, replay)
         })
         .join()
@@ -21020,3 +21059,48 @@ include!("provider_local/band2.rs");
 include!("provider_local/band3.rs");
 include!("provider_local/band4.rs");
 include!("provider_local/band5.rs");
+
+/// `prompt_tokens_details.cached_tokens` and
+/// `completion_tokens_details.reasoning_tokens` ride as their own legs; the
+/// completion bin keeps the folded reasoning (AC-057).
+#[tokio::test]
+async fn chat_completion_detail_legs_are_carried() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&local_config(&server_uri_v1(&server))).expect("valid");
+    mount_chat(
+        &server,
+        completed_stream(
+            "cached",
+            Some(json!({
+                "prompt_tokens": 5,
+                "completion_tokens": 7,
+                "total_tokens": 12,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 },
+            })),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared_with(
+        local_provider(&config),
+        &config,
+        "/world/local",
+        "goal: detail legs",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/local", manifest.clone());
+    outcome.expect("the detailed send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Legs {
+            prompt_tokens: Some(5),
+            completion_tokens: Some(7),
+            reasoning_tokens: Some(2),
+            cache_read_tokens: Some(3),
+            cache_write_tokens: None,
+            total_tokens: Some(12),
+        }
+    );
+}

@@ -29,14 +29,16 @@ use rivect::controller::{
     ControllerError, SchedulerStep, StepOutcome, step_error_observation, step_outcome_observation,
 };
 use rivect::executor::{EffectOutcome, EffectRequest, ExecutorError, ReadWorker, WorkerError};
-use rivect::model::{ModelError, RequestManifest};
+use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::policy::{PermissionMode, PolicyError};
 use rivect::providers::{Provider, ProviderError, ProviderReply, ToolCall};
 use rivect::resources::{FlightRole, ReadFlights, UsageDelta};
 use rivect::scheduler::{
     CompleteTransition, DeliverVerdict, NodeState, Scheduler, SchedulerError, WaitTransition,
 };
-use rivect::state::{BudgetStatus, ConflictCause, InvalidCause, Missing, StoreError, TaskStore};
+use rivect::state::{
+    BudgetStatus, ConflictCause, InvalidCause, Missing, SettlementState, StoreError, TaskStore,
+};
 use rivect::supervisor::{
     ClassThresholds, FailureSignature, Observation, OperationClass, PolicyFault, Reaction,
     StallCause, Supervisor, SupervisorError, SupervisorPolicy, WATCH_LIMIT,
@@ -2127,6 +2129,7 @@ impl Provider for NoReadProvider {
             text: "no permitted action".to_string(),
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
+            wire_retries: 0,
         })
     }
 }
@@ -2156,6 +2159,7 @@ impl Provider for OutsideScopeProvider {
                 path: Some(self.target.clone()),
             }],
             usage: UsageDelta::Unknown,
+            wire_retries: 0,
         })
     }
 }
@@ -3038,8 +3042,7 @@ fn zero_reserved(limit_units: u64) -> BudgetStatus {
 fn unknown_sent_cost_is_retained_not_released_as_zero() {
     let config = rivect::config::Config::parse_validated(&support::config_distinct_pools())
         .expect("config validates");
-    let mut broker =
-        rivect::model::Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
     let manifest = broker
         .prepare(
             "backend_task",
@@ -3050,7 +3053,7 @@ fn unknown_sent_cost_is_retained_not_released_as_zero() {
         .expect("manifest");
     assert!(manifest.cost_bound > 0, "the bound is a finite number");
     let reply = broker
-        .dispatch("/world/budget", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/budget", &manifest)
         .expect("offline dispatch");
     assert!(!reply.text.is_empty(), "the request really was sent");
 
@@ -3830,5 +3833,656 @@ fn cross_process_second_writer_is_refused_before_sql() {
         child_open(&db, &mut root),
         "WRITER_OPEN admitted",
         "the lock is released when the holder drops"
+    );
+}
+
+// ----- durable settlement through the broker boundary (AC-057/059) -----
+
+/// One prepared manifest on a broker with the given provider: the
+/// settlement legs start from this frozen request, exactly as a real
+/// dispatch does.
+fn prepared_manifest(
+    broker: &mut Broker,
+    config: &rivect::config::Config,
+    inputs: &str,
+) -> RequestManifest {
+    broker
+        .prepare("main", config, "/world/settle", inputs)
+        .expect("the fixture request prepares")
+}
+
+fn settle_context() -> rivect::model::SendContext {
+    rivect::model::SendContext {
+        purpose: "main".to_string(),
+        connection: "local".to_string(),
+        parent_attempt_id: None,
+        ranking_basis: None,
+    }
+}
+
+/// A bound large enough to exercise a refusal: one unit per 4096 input
+/// bytes, plus one for the request itself.
+fn wide_inputs() -> String {
+    "x".repeat(9_000)
+}
+
+/// The frozen bound is reserved at EVERY open scope in one transaction: a
+/// level that cannot fit denies the whole reservation, so neither scope
+/// holds units and no settlement row exists.
+#[test]
+fn reserve_spans_every_open_scope_atomically() {
+    let root = tempfile::TempDir::with_prefix("rivect-settle-scopes-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget("wide", 4).expect("wide scope opens");
+    store.open_budget("narrow", 3).expect("narrow scope opens");
+    let config = rivect::config::Config::parse_validated(&support::config_one_provider())
+        .expect("fixture config validates");
+    let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let manifest = prepared_manifest(&mut broker, &config, &wide_inputs());
+    assert_eq!(manifest.cost_bound, 4, "the wide request's bound is 4");
+
+    let denied = store.begin_send(&["wide", "narrow"], &settle_context(), &manifest);
+    assert!(
+        matches!(
+            denied,
+            Err(StoreError::Conflict(ConflictCause::BudgetExhausted { ref scope, .. }))
+                if scope == "narrow"
+        ),
+        "the later level denies the whole reservation: {denied:?}"
+    );
+    assert!(
+        matches!(
+            store.settlement(&manifest.attempt_id),
+            Err(StoreError::NotFound(_))
+        ),
+        "a denied begin writes no settlement row"
+    );
+    assert_eq!(store.budget_status("wide").expect("wide").reserved, 0);
+    assert_eq!(store.budget_status("narrow").expect("narrow").reserved, 0);
+}
+
+/// An entered send whose provider fails retains the bound: the row closes
+/// unknown with the bound charged, never released as zero.
+#[test]
+fn entered_send_failure_retains_the_bound() {
+    let root = tempfile::TempDir::with_prefix("rivect-settle-entered-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget("entered", 10).expect("budget opens");
+    let config = rivect::config::Config::parse_validated(&support::config_one_provider())
+        .expect("fixture config validates");
+    let mut broker = Broker::new(Box::new(FailingProvider));
+    let manifest = prepared_manifest(&mut broker, &config, "goal: entered failure");
+
+    let sent = {
+        let mut ledger = rivect::state::StoreLedger::new(&mut store, vec!["entered".to_string()]);
+        broker.dispatch(&mut ledger, "/world/settle", &manifest)
+    };
+    assert!(sent.is_err(), "the entered send fails: {sent:?}");
+    let record = store
+        .settlement(&manifest.attempt_id)
+        .expect("a row exists");
+    assert_eq!(record.state, SettlementState::Settled);
+    assert_eq!(record.bins.total_tokens, None);
+    assert_eq!(record.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(record.charged_units, Some(manifest.cost_bound));
+    let status = store.budget_status("entered").expect("scope status");
+    assert_eq!(status.spent, manifest.cost_bound, "the bound is retained");
+    assert_eq!(status.reserved, 0);
+}
+
+/// A refusal before the send exits creates neither a reservation nor a
+/// row: the ledger is never touched by a pre-send denial.
+#[test]
+fn pre_send_failure_never_reserves() {
+    let root = tempfile::TempDir::with_prefix("rivect-settle-presend-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget("presend", 10).expect("budget opens");
+    let config = rivect::config::Config::parse_validated(&support::config_one_provider())
+        .expect("fixture config validates");
+    let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let manifest = prepared_manifest(&mut broker, &config, "goal: pre-send denial");
+    // The dispatch re-check reads the broker's current view: a connection
+    // removed after prepare denies before the ledger seam.
+    let stripped = rivect::config::Config::parse_validated(
+        "config_version = 1\n[connections.other]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1\"\n[models.defaults]\nmodel = { mode = \"fixed\", connection = \"other\", model_id = \"m\" }\neffort = { mode = \"fixed\", value = \"high\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("stripped config validates");
+    broker.set_config(&stripped);
+
+    let sent = {
+        let mut ledger = rivect::state::StoreLedger::new(&mut store, vec!["presend".to_string()]);
+        broker.dispatch(&mut ledger, "/world/settle", &manifest)
+    };
+    assert!(sent.is_err(), "the pre-send re-check denies: {sent:?}");
+    assert!(
+        matches!(
+            store.settlement(&manifest.attempt_id),
+            Err(StoreError::NotFound(_))
+        ),
+        "a pre-send denial writes no row"
+    );
+    assert_eq!(store.budget_status("presend").expect("scope").reserved, 0);
+}
+
+/// One failing primary and one answering fallback: each physical child
+/// attempt settles exactly once, and the substitute's row names the
+/// attempt it fell back from.
+#[test]
+fn primary_fallback_and_substitute_each_settle_once() {
+    /// The first send fails and later sends answer: a chain entry that
+    /// passed the re-check but failed its own send is skipped, and the
+    /// next entry answers.
+    struct FirstSendFails {
+        calls: u32,
+    }
+
+    impl Provider for FirstSendFails {
+        fn name(&self) -> &'static str {
+            "first-send-fails"
+        }
+
+        fn serves(&self, _connection: &str, entry: &rivect::config::Connection) -> bool {
+            entry.kind == rivect::config::ConnKind::Local
+        }
+
+        fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(ProviderError::ProviderFailed {
+                    connection: "primary".to_string(),
+                    reason: "fixture primary failure".to_string(),
+                });
+            }
+            Ok(ProviderReply {
+                text: "fallback answer".to_string(),
+                tool_calls: Vec::new(),
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                },
+                wire_retries: 0,
+            })
+        }
+    }
+
+    let root = tempfile::TempDir::with_prefix("rivect-settle-fallback-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget("chain", 10).expect("budget opens");
+    let config = rivect::config::Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"high\" }\n\
+         fallback = { mode = \"auto\", chain = [{ mode = \"fixed\", connection = \"reserve\", model_id = \"fixture-reserve\" }] }\n",
+    )
+    .expect("fixture config validates");
+    let mut broker = Broker::new(Box::new(FirstSendFails { calls: 0 }));
+    let manifest = broker
+        .prepare("main", &config, "/world/settle", "goal: chain")
+        .expect("the fixture request prepares");
+    let primary_attempt = manifest.attempt_id.clone();
+
+    let reply = {
+        let mut ledger = rivect::state::StoreLedger::new(&mut store, vec!["chain".to_string()]);
+        broker
+            .dispatch(&mut ledger, "/world/settle", &manifest)
+            .expect("the fallback answers")
+    };
+    assert_eq!(reply.text, "fallback answer");
+
+    let primary = store.settlement(&primary_attempt).expect("primary row");
+    assert_eq!(primary.state, SettlementState::Settled);
+    assert_eq!(
+        primary.bins.total_tokens, None,
+        "the failed primary's usage is unknown"
+    );
+    assert_eq!(primary.charged_units, Some(manifest.cost_bound));
+
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals.settled_count, 2,
+        "one row per physical child attempt"
+    );
+    assert_eq!(totals.dispatched_count, 0, "no row stays open");
+    assert_eq!(
+        totals.total_tokens,
+        Some(3),
+        "only the answering send's bins count"
+    );
+}
+
+/// The production executor shares one flight registry: two identical
+/// permitted reads admitted through `runtime.executor()` execute once and
+/// both observe the same physical read.
+#[test]
+fn runtime_executor_merges_identical_reads_and_charges_once() {
+    let (mut world, file, grant) = scoped_world("runtime-flights");
+    let session = world.open_session("bootstrap-runtime-flights");
+    let task_a = flight_task(&mut world, &session, "cmd-runtime-flight-a");
+    let task_b = flight_task(&mut world, &session, "cmd-runtime-flight-b");
+    let request = |grant: &str| EffectRequest::Read {
+        grant_id: grant.to_string(),
+        path: file.clone(),
+    };
+    let admitted_a = world
+        .runtime
+        .executor()
+        .admit(&task_a, request(&grant), PermissionMode::Manual)
+        .expect("the leader admits");
+    let admitted_b = world
+        .runtime
+        .executor()
+        .admit(&task_b, request(&grant), PermissionMode::Manual)
+        .expect("the follower admits");
+    let outcome_a = world
+        .runtime
+        .executor()
+        .execute(&admitted_a)
+        .expect("the leader reads");
+    let outcome_b = world
+        .runtime
+        .executor()
+        .execute(&admitted_b)
+        .expect("the follower takes the shared observation");
+    let (
+        EffectOutcome::Read {
+            digest: digest_a, ..
+        },
+        EffectOutcome::Read {
+            digest: digest_b, ..
+        },
+    ) = (outcome_a, outcome_b)
+    else {
+        panic!("both identical reads answer");
+    };
+    assert_eq!(digest_a, digest_b, "both subscribers observe one read");
+    assert_eq!(
+        world.worker_reads(),
+        1,
+        "one physical charge through the runtime registry"
+    );
+}
+
+/// The substitute's settlement names the attempt it fell back from and
+/// carries only its own bins: a parent total is derived from the recorded
+/// lineage, never duplicated into a second total.
+#[test]
+fn substitute_settlement_records_its_parent_and_its_own_bins() {
+    struct FirstFails {
+        calls: u32,
+    }
+
+    impl Provider for FirstFails {
+        fn name(&self) -> &'static str {
+            "first-fails"
+        }
+
+        fn serves(&self, _connection: &str, entry: &rivect::config::Connection) -> bool {
+            entry.kind == rivect::config::ConnKind::Local
+        }
+
+        fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(ProviderError::ProviderFailed {
+                    connection: "local".to_string(),
+                    reason: "fixture failure".to_string(),
+                });
+            }
+            Ok(ProviderReply {
+                text: "reserve answered".to_string(),
+                tool_calls: Vec::new(),
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                },
+                wire_retries: 0,
+            })
+        }
+    }
+
+    let root = tempfile::TempDir::with_prefix("rivect-lineage-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget("lineage", 10).expect("budget opens");
+    let config = rivect::config::Config::parse_validated(
+        "config_version = 1\n\
+         [connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"high\" }\n\
+         fallback = { mode = \"auto\", chain = [{ mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }\n",
+    )
+    .expect("fixture config validates");
+    let mut broker = Broker::new(Box::new(FirstFails { calls: 0 }));
+    let manifest = broker
+        .prepare("main", &config, "/world/lineage", "goal: lineage")
+        .expect("prepares");
+    let primary = manifest.attempt_id.clone();
+    {
+        let mut ledger = rivect::state::StoreLedger::new(&mut store, vec!["lineage".to_string()]);
+        broker
+            .dispatch(&mut ledger, "/world/lineage", &manifest)
+            .expect("the fallback answers");
+    }
+    let children = store
+        .settlements_for_parent(&primary)
+        .expect("lineage read");
+    assert_eq!(children.len(), 1, "one substitute settles under the parent");
+    assert_eq!(
+        children[0].parent_attempt_id.as_deref(),
+        Some(primary.as_str())
+    );
+    assert_eq!(children[0].bins.total_tokens, Some(3));
+    let primary_row = store.settlement(&primary).expect("primary row");
+    assert_eq!(primary_row.bins.total_tokens, None);
+    assert_eq!(
+        store.settlement_totals().expect("totals").total_tokens,
+        Some(3),
+        "the lineage is not counted twice"
+    );
+}
+
+/// Two writers racing for the last unit at one scope: exactly one admits,
+/// one is refused, and one row exists. The store's single writer serializes
+/// the calls, so the race is over the admission statement, not the file.
+#[test]
+fn racing_begins_admit_one_send() {
+    use std::sync::{Arc, Mutex};
+    let root = tempfile::TempDir::with_prefix("rivect-begin-race-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    // Each fixture request carries a bound of two units, so one unit of room
+    // is not enough for either — the scope holds exactly one send's bound.
+    store.open_budget("race", 2).expect("budget opens");
+    let config = rivect::config::Config::parse_validated(&support::config_one_provider())
+        .expect("config validates");
+    let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    let first = broker
+        .prepare("main", &config, "/world/race", "goal: one")
+        .expect("first prepares");
+    let second = broker
+        .prepare("main", &config, "/world/race", "goal: two")
+        .expect("second prepares");
+    let shared = Arc::new(Mutex::new(store));
+    let manifests = [first, second];
+    let outcomes: Vec<Result<(), StoreError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = manifests
+            .iter()
+            .map(|manifest| {
+                let shared = Arc::clone(&shared);
+                scope.spawn(move || {
+                    let mut store = shared.lock().expect("store lock");
+                    store
+                        .begin_send(&["race"], &settle_context(), manifest)
+                        .map(|_ticket| ())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread joins"))
+            .collect()
+    });
+    let admitted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                Err(StoreError::Conflict(ConflictCause::BudgetExhausted { .. }))
+            )
+        })
+        .count();
+    assert_eq!((admitted, refused), (1, 1), "{outcomes:?}");
+    let mut shared = shared;
+    let store = Arc::get_mut(&mut shared)
+        .expect("sole owner")
+        .get_mut()
+        .expect("lock");
+    assert_eq!(
+        store.settlement_totals().expect("totals").dispatched_count,
+        1,
+        "one begun send, one row"
+    );
+    let status = store.budget_status("race").expect("scope");
+    assert_eq!(status.reserved, 2, "only the admitted send's bound is held");
+}
+
+/// A real ledger refusal at the dispatch boundary becomes `Waiting` with a
+/// recorded reason, and the next reservation resolution clears it.
+#[test]
+fn budget_refusal_waits_then_resumes_after_the_resolution() {
+    let (mut world, file, grant) = scoped_world("budget-wait");
+    world.runtime.purpose = "backend_task".to_string();
+    let session = world.open_session("bootstrap-budget-wait");
+    let task = world.create_task(&session, "cmd-budget-wait");
+    answer_task(
+        &mut world,
+        &session,
+        "cmd-budget-answer",
+        &task,
+        &node_answer(&file),
+        1,
+    );
+    let scope = task.0.clone();
+    // Every frozen request carries at least two units (one per 4096 input
+    // bytes plus one), so the scope holds exactly one send's bound.
+    world
+        .runtime
+        .store_writer()
+        .open_budget(&scope, 2)
+        .expect("the task's scope opens");
+    world
+        .runtime
+        .store_writer()
+        .budget_reserve("blocker", &[scope.as_str()], 2)
+        .expect("the last units are held");
+
+    match drive_step(&mut world, &session, &task, &grant, &node_answer(&file)) {
+        Ok(SchedulerStep::Ran { outcome, .. }) => assert!(
+            matches!(*outcome, StepOutcome::Waiting { .. }),
+            "a budget refusal waits: {outcome:?}"
+        ),
+        other => panic!("the step never ran: {other:?}"),
+    }
+    assert_eq!(
+        world.runtime.broker.admitted_attempts(),
+        0,
+        "the refused primary's admission and frozen inputs are dropped"
+    );
+    let reason = world
+        .runtime
+        .budget_waiting_reason(&session, &task)
+        .expect("the waiting reason is recorded")
+        .to_string();
+    assert!(
+        reason.contains(&scope),
+        "the reason names the refused scope: {reason}"
+    );
+    // The status payload is the product surface: the refusal it serves
+    // carries the task and the same reason, not just a test-only accessor.
+    let served = world.dispatch(&support::corpus_status(&session));
+    let waiting = served["result"]["budget_waiting"]
+        .as_array()
+        .expect("the status serves the waiting list");
+    let entry = waiting
+        .iter()
+        .find(|entry| entry["task_id"].as_str() == Some(task.0.as_str()))
+        .expect("the status serves the refused task");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .expect("the entry names its reason")
+            .contains(&scope),
+        "the served reason names the refused scope: {entry}"
+    );
+
+    // The resolution frees the unit: the next step is no longer waiting and
+    // the recorded reason is gone.
+    world
+        .runtime
+        .store_writer()
+        .budget_charge("blocker", Some(0))
+        .expect("the blocker resolves");
+    let resumed = drive_step(&mut world, &session, &task, &grant, &node_answer(&file));
+    assert!(
+        !matches!(
+            resumed,
+            Ok(SchedulerStep::Ran { ref outcome, .. })
+                if matches!(**outcome, StepOutcome::Waiting { .. })
+        ),
+        "the resolved scope no longer waits: {resumed:?}"
+    );
+    assert!(
+        world
+            .runtime
+            .budget_waiting_reason(&session, &task)
+            .is_none(),
+        "the waiting reason clears once a send gets through"
+    );
+    let served = world.dispatch(&support::corpus_status(&session));
+    assert!(
+        served["result"]["budget_waiting"]
+            .as_array()
+            .expect("the status serves the waiting list")
+            .iter()
+            .all(|entry| entry["task_id"].as_str() != Some(task.0.as_str())),
+        "the cleared reason leaves the status surface: {served}"
+    );
+    // The resumed step really settled: one row through the ledger, the
+    // bound charged, and the served economy no longer reports an open send.
+    let manifest = world
+        .last_manifest()
+        .expect("the resumed step reached the provider");
+    let row = world
+        .runtime
+        .store()
+        .settlement(&manifest.attempt_id)
+        .expect("the resumed send settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(row.charged_units, Some(manifest.cost_bound));
+    let economy = &served["result"]["economy"];
+    assert_eq!(economy["pending_sends"], json!(0));
+    assert_eq!(economy["charged_units"], json!(manifest.cost_bound));
+}
+
+/// One budget-refused descendant waits; cancelling the parent drains the
+/// whole subtree and the served waiting list names none of it.
+#[test]
+fn cancelled_parent_clears_the_cancelled_subtrees_budget_waiting() {
+    let (mut world, file, grant) = scoped_world("budget-cancel-subtree");
+    world.runtime.purpose = "backend_task".to_string();
+    let session = world.open_session("bootstrap-budget-cancel-subtree");
+    let parent = world.create_task(&session, "cmd-budget-cancel-parent");
+    let child = create_child_task(&mut world, &session, "cmd-budget-cancel-child", &parent);
+    world
+        .runtime
+        .store_writer()
+        .open_budget(&child.0, 0)
+        .expect("the child's scope cannot fit its bound");
+    let refused = drive_step(&mut world, &session, &child, &grant, &node_answer(&file));
+    assert!(
+        matches!(
+            refused,
+            Ok(SchedulerStep::Ran { ref outcome, .. })
+                if matches!(**outcome, StepOutcome::Waiting { .. })
+        ),
+        "the child waits on its budget: {refused:?}"
+    );
+    let served = world.dispatch(&support::corpus_status(&session));
+    assert!(
+        served["result"]["budget_waiting"]
+            .as_array()
+            .expect("the status serves the waiting list")
+            .iter()
+            .any(|entry| entry["task_id"].as_str() == Some(child.0.as_str())),
+        "the child's refusal is served before the cancel: {served}"
+    );
+
+    cancel_task_via_ingress(&mut world, &session, &parent);
+    let served = world.dispatch(&support::corpus_status(&session));
+    assert!(
+        served["result"]["budget_waiting"]
+            .as_array()
+            .expect("the status serves the waiting list")
+            .iter()
+            .all(|entry| entry["task_id"].as_str() != Some(child.0.as_str())
+                && entry["task_id"].as_str() != Some(parent.0.as_str())),
+        "the cancelled subtree leaves the waiting surface: {served}"
+    );
+}
+
+/// A waiting task newer than one tasks page is still served: the waiting
+/// record is keyed by session, not by the status page slice.
+#[test]
+fn budget_waiting_is_served_beyond_the_tasks_page() {
+    let (mut world, file, grant) = scoped_world("budget-wait-page");
+    world.runtime.purpose = "backend_task".to_string();
+    let session = world.open_session("bootstrap-budget-wait-page");
+    // `corpus_status` requests the 20-row page the status surface serves.
+    const STATUS_PAGE: usize = 20;
+    for index in 0..STATUS_PAGE {
+        world.create_task(&session, &format!("cmd-budget-page-{index}"));
+    }
+    let waiting_task = world.create_task(&session, "cmd-budget-page-waiting");
+    world
+        .runtime
+        .store_writer()
+        .open_budget(&waiting_task.0, 0)
+        .expect("the waiting scope cannot fit its bound");
+    let refused = drive_step(
+        &mut world,
+        &session,
+        &waiting_task,
+        &grant,
+        &node_answer(&file),
+    );
+    assert!(
+        matches!(
+            refused,
+            Ok(SchedulerStep::Ran { ref outcome, .. })
+                if matches!(**outcome, StepOutcome::Waiting { .. })
+        ),
+        "the task waits on its budget: {refused:?}"
+    );
+
+    let served = world.dispatch(&support::corpus_status(&session));
+    let page = served["result"]["tasks"]["items"]
+        .as_array()
+        .expect("the status serves a tasks page");
+    assert_eq!(page.len(), STATUS_PAGE, "the page is full");
+    assert!(
+        !page
+            .iter()
+            .any(|task| task["task_id"].as_str() == Some(waiting_task.0.as_str())),
+        "the waiting task sits outside the page: {served}"
+    );
+    let entry = served["result"]["budget_waiting"]
+        .as_array()
+        .expect("the status serves the waiting list")
+        .iter()
+        .find(|entry| entry["task_id"].as_str() == Some(waiting_task.0.as_str()))
+        .expect("the waiting task is served beyond the page");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .expect("the entry names its reason")
+            .contains(&waiting_task.0),
+        "the served reason names the refused scope: {entry}"
+    );
+
+    // The waiting list is session-scoped: another session serves none of it.
+    let other = world.open_session("bootstrap-budget-wait-other");
+    let other_status = world.dispatch(&support::corpus_status(&other));
+    assert!(
+        other_status["result"]["budget_waiting"]
+            .as_array()
+            .expect("the other session serves a waiting list")
+            .is_empty(),
+        "another session sees none of this session's waits: {other_status}"
     );
 }

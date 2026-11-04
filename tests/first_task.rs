@@ -94,6 +94,7 @@ impl Provider for NoToolProvider {
             text: String::new(),
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
+            wire_retries: 0,
         })
     }
 }
@@ -2874,7 +2875,7 @@ fn request_limits_and_manifest_immutability() {
     let reply = world
         .runtime
         .broker
-        .dispatch(&world_id, &manifest)
+        .dispatch(&mut rivect::model::NullLedger, &world_id, &manifest)
         .expect("dispatch frozen manifest");
     assert!(!reply.text.is_empty());
     let recorded = world
@@ -2886,7 +2887,11 @@ fn request_limits_and_manifest_immutability() {
     );
     // The frozen manifest cannot be replayed from another execution
     // world, even under the changed config (AC-013).
-    let foreign = world.runtime.broker.dispatch("/world/foreign", &manifest);
+    let foreign =
+        world
+            .runtime
+            .broker
+            .dispatch(&mut rivect::model::NullLedger, "/world/foreign", &manifest);
     assert!(
         matches!(
             foreign,

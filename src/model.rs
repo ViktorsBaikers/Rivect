@@ -161,6 +161,16 @@ pub enum ModelError {
         "attempt {attempt_id} was cancelled; a late retry or provider callback never resurrects it"
     )]
     AttemptCancelled { attempt_id: String },
+    /// The frozen bound no longer fits an open budget scope: the attempt
+    /// never entered a send, and the controller records the waiting reason
+    /// instead of retrying in a loop.
+    #[error("dispatch waits for budget at scope {scope}")]
+    BudgetExhausted { scope: String },
+    /// The settlement ledger refused at the send boundary. A refusal before
+    /// the row opens records nothing; a close refusal leaves the opened row
+    /// for the reopen to reconcile.
+    #[error("settlement ledger: {0}")]
+    Ledger(#[from] LedgerError),
     // These two Displays carry the purpose but never the attempt id:
     // a retried step mints a fresh attempt each time, and the
     // supervisor's exact-repeat fingerprint needs equivalent failures
@@ -406,6 +416,145 @@ impl ModelOutcome {
         match self {
             Self::Reply { reply, .. } => reply,
         }
+    }
+}
+
+/// What one `complete_send` attempt ended with: the provider's own failure
+/// (which a fallback chain may answer) or a ledger refusal (which no chain
+/// entry can — the send never started or never settled).
+pub(crate) enum SendFailure {
+    Provider(ProviderError),
+    Ledger(LedgerError),
+}
+
+/// Where one dispatched send begins, as the ledger records it (AC-057):
+/// the purpose and connection the send ran under, the attempt it fell back
+/// from, and the basis the ranking chose it on. `parent_attempt_id` is the
+/// failed primary a substitute inherited from — the lineage a later total is
+/// derived from, never a second total.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendContext {
+    pub purpose: String,
+    pub connection: String,
+    pub parent_attempt_id: Option<String>,
+    /// The choosing basis the ranker froze on the attempt; `None` while no
+    /// recorded basis explains the pick — unknown, never a made-up reason.
+    pub ranking_basis: Option<String>,
+}
+
+/// What one entered send reports back to the ledger: the provider's own
+/// bins and wire retries when it answered, or the failure that ends the
+/// attempt with its usage unknown — the bound stays charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    Settled {
+        usage: UsageDelta,
+        wire_retries: u32,
+    },
+    Failed {
+        wire_retries: u32,
+    },
+}
+
+/// The durable identity one `begin_send` minted: the attempt whose
+/// settlement row is open, and whether a budget reservation stands behind
+/// it. `reserved` is `false` when no scope was open — the row is still
+/// recorded, and there is nothing to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendTicket {
+    pub attempt_id: String,
+    pub cost_bound: u64,
+    pub reserved: bool,
+}
+
+/// A ledger failure at the send boundary. The budget refusal is its own
+/// variant so the controller reports a waiting reason instead of a provider
+/// denial; every other failure is the store's typed error.
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    #[error(transparent)]
+    Store(crate::state::StoreError),
+    #[error("budget exhausted at scope {scope}")]
+    BudgetExhausted { scope: String },
+}
+
+impl LedgerError {
+    /// The wire code this ledger refusal reports (P-001).
+    #[must_use]
+    pub fn code(&self) -> crate::contracts::ErrorCode {
+        match self {
+            Self::Store(error) => error.code(),
+            Self::BudgetExhausted { .. } => crate::contracts::ErrorCode::BudgetExhausted,
+        }
+    }
+}
+
+/// One ledger refusal at the dispatch boundary: a budget denial becomes the
+/// dedicated `BudgetExhausted` error — the one the controller turns into a
+/// waiting step with a named reason — and every other store refusal keeps
+/// its typed class. A store ledger that surfaced the budget conflict inside
+/// its own error keeps the same mapping.
+fn ledger_refusal(error: LedgerError) -> ModelError {
+    match error {
+        LedgerError::BudgetExhausted { scope } => ModelError::BudgetExhausted { scope },
+        LedgerError::Store(crate::state::StoreError::Conflict(
+            crate::state::ConflictCause::BudgetExhausted { scope, .. },
+        )) => ModelError::BudgetExhausted { scope },
+        other => ModelError::Ledger(other),
+    }
+}
+
+/// The one ledger seam at the Broker call boundary (DEC-012): the broker
+/// cannot own the runtime's single `TaskStore`, so the caller lends it a
+/// ledger for the duration of one dispatch. `begin_send` runs after the
+/// broker's pre-send checks and before the provider sees the request;
+/// `finish_send` closes the row it opened. Both are exactly-once.
+pub trait Ledger {
+    /// # Errors
+    /// [`LedgerError::BudgetExhausted`] when the frozen bound no longer fits
+    /// an open scope, or [`LedgerError::Store`] for a storage failure.
+    fn begin_send(
+        &mut self,
+        context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> Result<SendTicket, LedgerError>;
+
+    /// # Errors
+    /// [`LedgerError::Store`] when the settlement cannot be written; the row
+    /// stays open and the reservation stays held.
+    fn finish_send(
+        &mut self,
+        ticket: &SendTicket,
+        outcome: &SendOutcome,
+    ) -> Result<(), LedgerError>;
+}
+
+/// A ledger that records nothing: the seam's no-op for a caller that reads
+/// only the provider reply (adapter and routing proofs) and for the
+/// documentation probes. It reserves no bound, because a caller that binds
+/// no store has no scope to reserve against.
+#[derive(Debug, Default)]
+pub struct NullLedger;
+
+impl Ledger for NullLedger {
+    fn begin_send(
+        &mut self,
+        _context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> Result<SendTicket, LedgerError> {
+        Ok(SendTicket {
+            attempt_id: manifest.attempt_id.clone(),
+            cost_bound: manifest.cost_bound,
+            reserved: false,
+        })
+    }
+
+    fn finish_send(
+        &mut self,
+        _ticket: &SendTicket,
+        _outcome: &SendOutcome,
+    ) -> Result<(), LedgerError> {
+        Ok(())
     }
 }
 
@@ -1025,6 +1174,7 @@ impl Broker {
     /// [`ModelError::Provider`] when the provider rejects the request.
     pub fn dispatch(
         &mut self,
+        ledger: &mut dyn Ledger,
         world: &str,
         manifest: &RequestManifest,
     ) -> Result<ProviderReply, ModelError> {
@@ -1085,9 +1235,12 @@ impl Broker {
                 current: current_version,
             });
         }
-        match self.complete_send(manifest, &admission.connection) {
+        match self.complete_send(ledger, manifest, &admission.connection, None) {
             Ok(reply) => Ok(reply),
-            Err(source) => self.fallback_or_fail(manifest, &admission, source),
+            Err(SendFailure::Ledger(source)) => Err(ledger_refusal(source)),
+            Err(SendFailure::Provider(source)) => {
+                self.fallback_or_fail(ledger, manifest, &admission, source)
+            }
         }
     }
 
@@ -1096,35 +1249,46 @@ impl Broker {
     /// site — the presented-manifest re-check for the primary, the chain
     /// re-check for a fallback candidate. On success the spent admission
     /// and any stale pending choice die with the send.
+    ///
+    /// The ledger seam brackets the send (DEC-012): the pre-send checks
+    /// run first, so a denial never creates a reservation; `begin_send`
+    /// then reserves the frozen bound and opens the settlement row before
+    /// a byte crosses the wire, and `finish_send` closes it — with the
+    /// provider's bins when it answered, with the usage unknown and the
+    /// bound retained when it failed.
     fn complete_send(
         &mut self,
+        ledger: &mut dyn Ledger,
         manifest: &RequestManifest,
         connection: &str,
-    ) -> Result<ProviderReply, ProviderError> {
+        parent_attempt_id: Option<&str>,
+    ) -> Result<ProviderReply, SendFailure> {
         // Fail closed on the provider's own dialect claim (AC-046):
         // the frozen manifest's connection must still be declared, and
         // the injected adapter must actually serve it — eligibility
         // alone never authorizes a send, and the denial lands before
         // the provider sees the request or anything is accounted.
         let Some(entry) = self.view_connections.get(connection) else {
-            return Err(ProviderError::UnknownConnection {
+            return Err(SendFailure::Provider(ProviderError::UnknownConnection {
                 connection: connection.to_string(),
-            });
+            }));
         };
         if !self.provider.serves(connection, entry) {
             // An id `dialect_for` reserves fails differently from one
             // the adapter merely declines: the build carries no adapter
             // that speaks the recorded dialect — say so instead of
             // blaming the injected adapter's own dialect.
-            return Err(match providers::dialect_for(connection) {
-                Some(dialect) => ProviderError::DialectUnserved {
-                    connection: connection.to_string(),
-                    dialect,
+            return Err(SendFailure::Provider(
+                match providers::dialect_for(connection) {
+                    Some(dialect) => ProviderError::DialectUnserved {
+                        connection: connection.to_string(),
+                        dialect,
+                    },
+                    None => ProviderError::DialectMismatch {
+                        connection: connection.to_string(),
+                    },
                 },
-                None => ProviderError::DialectMismatch {
-                    connection: connection.to_string(),
-                },
-            });
+            ));
         }
         // The dispatch decision IS the auto pool's choice: the send
         // narrows the assignment to the one connection this broker
@@ -1145,7 +1309,39 @@ impl Broker {
             }
             _ => manifest,
         };
-        let reply = self.provider.send(manifest)?;
+        let context = SendContext {
+            purpose: manifest.purpose.clone(),
+            connection: connection.to_string(),
+            parent_attempt_id: parent_attempt_id.map(str::to_string),
+            ranking_basis: None,
+        };
+        let ticket = ledger
+            .begin_send(&context, manifest)
+            .map_err(SendFailure::Ledger)?;
+        let reply = match self.provider.send(manifest) {
+            Ok(reply) => reply,
+            Err(source) => {
+                // The send was entered, so its usage is unknown: the
+                // settlement closes unknown, the bound stays charged, and
+                // the adapter's own retry count rides the failure so a
+                // corrected attempt that also failed records every leg it
+                // crossed. The caller still meets the failure's own class.
+                let (wire_retries, source) = source.settle();
+                ledger
+                    .finish_send(&ticket, &SendOutcome::Failed { wire_retries })
+                    .map_err(SendFailure::Ledger)?;
+                return Err(SendFailure::Provider(source));
+            }
+        };
+        ledger
+            .finish_send(
+                &ticket,
+                &SendOutcome::Settled {
+                    usage: reply.usage,
+                    wire_retries: reply.wire_retries,
+                },
+            )
+            .map_err(SendFailure::Ledger)?;
         // The reply carries this send's physical usage report; the
         // outcome lifts it into the attempt's single accounting
         // record — the only place it charges.
@@ -1196,6 +1392,7 @@ impl Broker {
     /// for a retry.
     pub fn dispatch_fallback_choice(
         &mut self,
+        ledger: &mut dyn Ledger,
         world: &str,
         attempt_id: &str,
         connection: &str,
@@ -1264,7 +1461,7 @@ impl Broker {
             },
         };
         let (substitute, displaced) = self.mint_substitute(&admission, model, connection, "manual");
-        match self.complete_send(&substitute, connection) {
+        match self.complete_send(ledger, &substitute, connection, Some(attempt_id)) {
             Ok(reply) => {
                 // The substitute answered the intent: the paused
                 // primary's admission is spent with it, so neither id
@@ -1272,7 +1469,11 @@ impl Broker {
                 self.clear_attempt(attempt_id);
                 Ok(reply)
             }
-            Err(source) => {
+            Err(SendFailure::Ledger(source)) => {
+                self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
+                Err(ledger_refusal(source))
+            }
+            Err(SendFailure::Provider(source)) => {
                 self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
                 Err(ModelError::Provider(source))
             }
@@ -1290,10 +1491,13 @@ impl Broker {
     /// a candidate failing the check never receives the request. An
     /// admitted entry mints one fallback manifest carrying the failed
     /// attempt's frozen task data byte-for-byte under its own attempt
-    /// id, the chain entry's fixed model and the same cost bound — one
-    /// reservation, one accounting, no second-order fallback.
+    /// id, the chain entry's fixed model and the same cost bound — each
+    /// dispatched attempt reserves and settles exactly once, so the failed
+    /// primary and its substitute each carry their own row and charge,
+    /// with no second-order fallback.
     fn fallback_or_fail(
         &mut self,
+        ledger: &mut dyn Ledger,
         manifest: &RequestManifest,
         admission: &AdmissionRecord,
         source: ProviderError,
@@ -1371,7 +1575,12 @@ impl Broker {
                     let (fallback_manifest, displaced) =
                         self.mint_substitute(admission, model, &entry.connection, "fallback");
                     attempted.push(entry.connection.clone());
-                    match self.complete_send(&fallback_manifest, &entry.connection) {
+                    match self.complete_send(
+                        ledger,
+                        &fallback_manifest,
+                        &entry.connection,
+                        Some(&manifest.attempt_id),
+                    ) {
                         Ok(reply) => {
                             // The substitute answered the intent: the
                             // failed primary's admission is spent with
@@ -1379,7 +1588,18 @@ impl Broker {
                             self.admissions.remove(&manifest.attempt_id);
                             return Ok(reply);
                         }
-                        Err(send_error) => {
+                        // A ledger refusal ends the walk: the entry never
+                        // entered a send, so the chain gains nothing by
+                        // trying the next one.
+                        Err(SendFailure::Ledger(source)) => {
+                            self.abandon_substitute(
+                                &fallback_manifest.attempt_id,
+                                &admission.purpose,
+                                displaced,
+                            );
+                            return Err(ledger_refusal(source));
+                        }
+                        Err(SendFailure::Provider(send_error)) => {
                             self.abandon_substitute(
                                 &fallback_manifest.attempt_id,
                                 &admission.purpose,
@@ -1858,7 +2078,7 @@ mod tests {
         // rights content changed while the version stayed frozen: only
         // the direct allows re-evaluation can still block the send
         broker.entitlements.rights = Some(BTreeSet::from(["reserve".to_string()]));
-        match broker.dispatch("/world/drift", &manifest) {
+        match broker.dispatch(&mut NullLedger, "/world/drift", &manifest) {
             Err(ModelError::EligibilityStale {
                 connection,
                 frozen: 0,

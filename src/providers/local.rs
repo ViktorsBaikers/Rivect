@@ -4472,6 +4472,7 @@ impl ChatCompletionsProvider {
             text: state.text,
             tool_calls,
             usage,
+            wire_retries: 0,
         })
     }
 
@@ -4486,16 +4487,30 @@ impl ChatCompletionsProvider {
         let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
         let completion = usage.get("completion_tokens").and_then(Value::as_u64);
         let total = usage.get("total_tokens").and_then(Value::as_u64);
+        // The recorded detail objects: a cached prompt share and a reasoning
+        // share already folded into the completion count. Absent stays
+        // unknown and the report stays exact.
+        let cache_read = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64);
+        let reasoning = usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64);
         match (prompt, completion, total) {
             // The reported total is charged verbatim — never re-summed
             // — and a usage object that withholds a counter is a wire
             // violation, not an estimate the peer never charged.
             (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
-                Ok(UsageDelta::Exact {
+                Ok(UsageDelta::from_reported(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                })
+                    reasoning,
+                    cache_read,
+                    None,
+                ))
             }
             _ => Err(violation(
                 &self.connection,

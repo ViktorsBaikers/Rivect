@@ -31,9 +31,11 @@ use rivect::providers::{
     CatalogModel, Dialect, ProviderError, ProviderReply, SecretRef, StoreKind, TransportCause,
     TransportClass, WireAuth, dialect_for, route_for, routes_for,
 };
-use rivect::resources::UsageDelta;
+use rivect::resources::{Exactness, UsageDelta};
+use rivect::state::{SettlementState, StoreLedger, TaskStore};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -280,7 +282,7 @@ fn dispatch(
 ) -> (Broker, Result<ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
-        let outcome = broker.dispatch(&world, &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
         (broker, outcome)
     })
     .join()
@@ -604,7 +606,11 @@ async fn anthropic_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/anthropic", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/anthropic",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -1414,13 +1420,22 @@ async fn anthropic_signature_400_permanent() {
     second.epoch_id = "epoch-three".to_string();
     let (provider, outcome) = send_on_thread(provider, second);
     let error = outcome.expect_err("the permanent signature error denies");
-    assert!(matches!(
-        error,
-        ProviderError::Transport {
-            cause: TransportCause::Status { .. },
-            ..
+    match error {
+        ProviderError::Retried {
+            wire_retries,
+            source,
+        } => {
+            assert_eq!(wire_retries, 1, "the corrected retry is counted");
+            assert!(matches!(
+                *source,
+                ProviderError::Transport {
+                    cause: TransportCause::Status { .. },
+                    ..
+                }
+            ));
         }
-    ));
+        other => panic!("the permanent signature error keeps its class: {other:?}"),
+    }
     let mut third = prepared_manifest(&config);
     third.epoch_id = "epoch-three".to_string();
     let (provider, outcome) = send_on_thread(provider, third);
@@ -1501,6 +1516,410 @@ async fn anthropic_signature_400_permanent() {
             .expect("messages is an array")
             .iter()
             .all(|message| message["role"] != json!("assistant"))
+    );
+}
+
+#[tokio::test]
+async fn wire_retry_is_recorded_and_not_a_second_child() {
+    // One physical child attempt answers after the adapter's own stripped
+    // retry: the reply carries the retry count, the settlement carries it
+    // beside the answering leg's bins, and no second child is opened.
+    let server = MockServer::start().await;
+    mount_messages_once(&server, thinking_stream("captured")).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains(SIGNATURE))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                "Invalid signature: thinking block bound to a different conversation",
+            ),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_messages(&server, text_stream("retried", 5, 7)).await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+    let root = tempfile::TempDir::with_prefix("rivect-retry-settlement-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (broker, outcome, attempts) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store.open_budget("retry-scope", 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(provider));
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let manifest = broker
+                .prepare("main", &config, "/world/anthropic", "goal: retry")
+                .expect("the pin prepares");
+            attempts.push(manifest.attempt_id.clone());
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-scope".to_string()]);
+            broker
+                .dispatch(&mut ledger, "/world/anthropic", &manifest)
+                .expect("the send settles");
+        }
+        (broker, store, attempts)
+    })
+    .join()
+    .expect("the settlement thread joins");
+    drop(broker);
+    let totals = outcome.settlement_totals().expect("totals");
+    assert_eq!(
+        totals.settled_count, 2,
+        "one row per dispatched child attempt"
+    );
+    assert_eq!(
+        totals.dispatched_count, 0,
+        "the retry never leaves a second open row"
+    );
+    let capture = outcome
+        .settlement(&attempts[0])
+        .expect("the capture row settles");
+    let retried = outcome
+        .settlement(&attempts[1])
+        .expect("the retried row settles");
+    assert_eq!(capture.wire_retries, 0, "the plain send carries no retry");
+    assert_eq!(
+        retried.wire_retries, 1,
+        "the adapter's correction is recorded"
+    );
+    assert_eq!(
+        retried.bins.total_tokens,
+        Some(12),
+        "only the answering leg's usage settles"
+    );
+    assert_eq!(
+        retried.bins.prompt_tokens,
+        Some(5),
+        "the answering leg's reported prompt count settles"
+    );
+    assert_eq!(
+        retried.exactness,
+        Exactness::Exact,
+        "the answering leg settles exact, not an inferred unknown"
+    );
+    assert_eq!(
+        retried.unknown_reason, None,
+        "an answered retry carries no unknown marker"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the sends");
+    assert_eq!(
+        requests.len(),
+        3,
+        "capture, one signature-rejected replay, one stripped retry — never a second child"
+    );
+    drop_blocking(outcome);
+}
+
+#[tokio::test]
+async fn failed_stripped_retry_settles_with_the_retry_count() {
+    // The capture send seeds the lineage; every later replay is rejected as
+    // a permanent signature failure, so the adapter's one stripped retry is
+    // its second crossed leg — and that leg fails too. The entered send must
+    // settle with the count of the retry it made, not zero.
+    let server = MockServer::start().await;
+    mount_messages_once(&server, thinking_stream("captured")).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains(SIGNATURE))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                "Invalid signature: thinking block bound to a different conversation",
+            ),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                "Invalid signature: thinking block bound to a different conversation",
+            ),
+        )
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+    let root = tempfile::TempDir::with_prefix("rivect-retry-failure-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, attempt, cost_bound, failed) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store
+            .open_budget("retry-failure-scope", 10)
+            .expect("budget opens");
+        let mut broker = Broker::new(Box::new(provider));
+        let capture = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry failure")
+            .expect("the capture prepares");
+        {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-failure-scope".to_string()]);
+            broker
+                .dispatch(&mut ledger, "/world/anthropic", &capture)
+                .expect("the capture settles");
+        }
+        let retried = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry failure")
+            .expect("the retried send prepares");
+        let failed = {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-failure-scope".to_string()]);
+            broker.dispatch(&mut ledger, "/world/anthropic", &retried)
+        };
+        (store, retried.attempt_id, retried.cost_bound, failed)
+    })
+    .join()
+    .expect("the settlement thread joins");
+    assert!(
+        matches!(
+            &failed,
+            Err(ModelError::Provider(ProviderError::Transport {
+                cause: TransportCause::Status { .. },
+                ..
+            }))
+        ),
+        "the failure keeps its typed class through the broker: {failed:?}"
+    );
+    let row = store
+        .settlement(&attempt)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 1,
+        "the corrected retry is recorded beside the failure"
+    );
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(
+        row.bins.total_tokens, None,
+        "a failed retry reports no usage, never zero"
+    );
+    assert_eq!(
+        row.charged_units,
+        Some(cost_bound),
+        "the failed send retains the frozen bound captured from its manifest"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the sends");
+    assert_eq!(
+        requests.len(),
+        3,
+        "capture, rejected replay, failed stripped retry"
+    );
+}
+
+/// One scripted Messages peer for the corrected-retry POST failure: the
+/// capture answers the thinking stream, the replay is a permanent
+/// signature refusal, and the corrected retry's POST is dropped before a
+/// response — its transport error is the second crossed leg.
+fn retry_post_failure_peer() -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture peer binds");
+    let address = listener.local_addr().expect("fixture address");
+    let handle = std::thread::spawn(move || {
+        for attempt in 0..3 {
+            let (mut stream, _) = listener.accept().expect("fixture peer accepts");
+            read_fixture_request(&mut stream);
+            let response = match attempt {
+                0 => {
+                    let body = thinking_stream("captured");
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                }
+                1 => {
+                    let body =
+                        "Invalid signature: thinking block bound to a different conversation";
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                }
+                _ => {
+                    drop(stream);
+                    continue;
+                }
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("fixture response");
+        }
+    });
+    (format!("http://{address}/v1"), handle)
+}
+
+/// Consumes one fixture request's head and stated body so the peer only
+/// answers after the client finished writing it.
+fn read_fixture_request(stream: &mut std::net::TcpStream) {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).expect("fixture request read");
+        if read == 0 {
+            return;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                let value = lower.strip_prefix("content-length:")?.trim();
+                value.parse::<usize>().ok()
+            })
+            .unwrap_or(0);
+        if bytes.len() >= head_end + 4 + length {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_retry_post_settles_with_the_retry_count() {
+    // The capture seeds the lineage; the replay is refused as a permanent
+    // signature failure; the corrected retry's POST itself fails at the
+    // transport, so the entered send must still settle the one retry.
+    let (endpoint, peer) = retry_post_failure_peer();
+    let config = Config::parse_validated(&anthropic_config(&endpoint)).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+    let root = tempfile::TempDir::with_prefix("rivect-retry-post-failure-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, attempt, cost_bound, failed) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store
+            .open_budget("retry-post-scope", 10)
+            .expect("budget opens");
+        let mut broker = Broker::new(Box::new(provider));
+        let capture = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry post")
+            .expect("the capture prepares");
+        {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-post-scope".to_string()]);
+            broker
+                .dispatch(&mut ledger, "/world/anthropic", &capture)
+                .expect("the capture settles");
+        }
+        let retried = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry post")
+            .expect("the retried send prepares");
+        let failed = {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-post-scope".to_string()]);
+            broker.dispatch(&mut ledger, "/world/anthropic", &retried)
+        };
+        (store, retried.attempt_id, retried.cost_bound, failed)
+    })
+    .join()
+    .expect("the settlement thread joins");
+    assert!(
+        matches!(
+            &failed,
+            Err(ModelError::Provider(ProviderError::Transport { .. }))
+        ),
+        "the retry POST failure keeps its typed class: {failed:?}"
+    );
+    let row = store
+        .settlement(&attempt)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 1,
+        "the failed corrected POST is the second crossed leg"
+    );
+    assert_eq!(row.exactness, Exactness::Unknown);
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(row.charged_units, Some(cost_bound));
+    peer.join().expect("fixture peer finishes");
+}
+
+#[tokio::test]
+async fn deadline_while_reading_the_refusable_400_settles_uncounted() {
+    // The signature-refused replay's 400 body is delayed past the whole-send
+    // deadline, so the deadline trips while reading that body and the corrected
+    // retry leg is never built or posted. The refused attempt settles with the
+    // typed deadline class and no crossed-leg count.
+    //
+    // The corrected leg's own `check_deadline`/`wire_body` checks are
+    // defensive: from the HTTP seam the first leg's body read already enforces
+    // the shared clock, so only this reachable uncounted path is exercised.
+    let server = MockServer::start().await;
+    mount_messages_once(&server, thinking_stream("captured")).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_delay(Duration::from_millis(1500))
+                .set_body_string(
+                    "Invalid signature: thinking block bound to a different conversation",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let store = Arc::new(MapStore::seeded(STORE_KIND, &[(CREDENTIAL_REF, SECRET)]));
+    let deadline = Duration::from_millis(1000);
+    let provider = provider_with_deadline(&config, store, deadline);
+    let root = tempfile::TempDir::with_prefix("rivect-retry-deadline-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, attempt, cost_bound, failed) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store
+            .open_budget("retry-deadline-scope", 10)
+            .expect("budget opens");
+        let mut broker = Broker::new(Box::new(provider));
+        let capture = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry deadline")
+            .expect("the capture prepares");
+        {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-deadline-scope".to_string()]);
+            broker
+                .dispatch(&mut ledger, "/world/anthropic", &capture)
+                .expect("the capture settles");
+        }
+        let retried = broker
+            .prepare("main", &config, "/world/anthropic", "goal: retry deadline")
+            .expect("the retried send prepares");
+        let failed = {
+            let mut ledger = StoreLedger::new(&mut store, vec!["retry-deadline-scope".to_string()]);
+            broker.dispatch(&mut ledger, "/world/anthropic", &retried)
+        };
+        (store, retried.attempt_id, retried.cost_bound, failed)
+    })
+    .join()
+    .expect("the settlement thread joins");
+    match &failed {
+        Err(ModelError::Provider(ProviderError::Transport {
+            cause: TransportCause::Deadline { budget },
+            ..
+        })) => assert_eq!(*budget, deadline, "the typed deadline is the send budget"),
+        other => panic!("the deadline keeps its typed class: {other:?}"),
+    }
+    let row = store
+        .settlement(&attempt)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 0,
+        "a retry refused by the deadline never crossed the wire"
+    );
+    assert_eq!(row.exactness, Exactness::Unknown);
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(row.charged_units, Some(cost_bound));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the sends");
+    assert_eq!(
+        requests.len(),
+        2,
+        "capture and the refused replay; the corrected retry never posts"
     );
 }
 
@@ -1756,6 +2175,87 @@ fn wire_auth_debug_redacts_resolved_material() {
 }
 
 // ----- TP-PROVIDER-INSTALLED::anthropic -------------------------------
+
+/// The peer's `cache_read_input_tokens`/`cache_creation_input_tokens` ride
+/// as their own legs; the completion bin keeps the cumulative output count
+/// (AC-057).
+#[tokio::test]
+async fn message_start_cache_legs_are_carried() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}{}{}{}{}",
+        sse_block(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": 3,
+                        "cache_creation_input_tokens": 2,
+                    },
+                },
+            }),
+        ),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "cached"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 0}),
+        ),
+        sse_block(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 7},
+            }),
+        ),
+        sse_block("message_stop", &json!({"type": "message_stop"})),
+    );
+    mount_messages(&server, body).await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/anthropic", "goal: cache legs")
+        .expect("the pin prepares");
+    let attempt_id = manifest.attempt_id.clone();
+    let (broker, outcome) = std::thread::spawn(move || {
+        let mut ledger = rivect::model::NullLedger;
+        let outcome = broker.dispatch(&mut ledger, "/world/anthropic", &manifest);
+        (broker, outcome)
+    })
+    .join()
+    .expect("the send thread joins");
+    outcome.expect("the cached send completes");
+    let record = broker
+        .accounting_record(&attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Legs {
+            prompt_tokens: Some(5),
+            completion_tokens: Some(7),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(3),
+            cache_write_tokens: Some(2),
+            total_tokens: Some(12),
+        }
+    );
+}
 
 /// TP-PROVIDER-INSTALLED::anthropic = NOT_RUN: the installed-provider
 /// proof is a live-environment leg this offline slice never runs.

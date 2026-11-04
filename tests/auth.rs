@@ -202,6 +202,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::IncompatibleOutput { .. } => "IncompatibleOutput",
         ProviderError::UnsupportedParameter { .. } => "UnsupportedParameter",
         ProviderError::ReasoningProvenance { .. } => "ReasoningProvenance",
+        ProviderError::Retried { .. } => "Retried",
     }
 }
 

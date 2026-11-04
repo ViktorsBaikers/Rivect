@@ -146,7 +146,7 @@ fn dispatch(
 ) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
-        let outcome = broker.dispatch(&world, &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
         (broker, outcome)
     })
     .join()
@@ -236,7 +236,8 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/openai", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/openai", &manifest);
             (broker, replay)
         })
         .join()
@@ -982,6 +983,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
+        Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
     };
     let (class, request, io) = match error {
@@ -1135,7 +1137,7 @@ fn a_pin_no_adapter_serves_is_denied_before_send_or_accounting() {
     let manifest = broker
         .prepare("main", &config, "/world/openai", "goal: unserved pin")
         .expect("the openai pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/openai", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/openai", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1179,7 +1181,7 @@ fn a_reserved_dialect_id_is_never_loopback_served() {
     let manifest = broker
         .prepare("main", &config, "/world/openai", "goal: reserved id")
         .expect("the local-kind pin passes DEC-011 eligibility");
-    let outcome = broker.dispatch("/world/openai", &manifest);
+    let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/openai", &manifest);
     assert!(
         matches!(
             outcome,
@@ -1235,7 +1237,7 @@ async fn a_manual_pick_of_an_openai_candidate_reaches_the_real_send() {
     // The adapter speaks no `local` dialect: the primary send fails
     // and the manual pause offers the served openai candidate.
     let (mut broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch("/world/openai", &manifest);
+        let outcome = broker.dispatch(&mut rivect::model::NullLedger, "/world/openai", &manifest);
         (broker, outcome)
     })
     .join()
@@ -1254,7 +1256,12 @@ async fn a_manual_pick_of_an_openai_candidate_reaches_the_real_send() {
     );
 
     let (broker, outcome) = std::thread::spawn(move || {
-        let outcome = broker.dispatch_fallback_choice("/world/openai", &attempt_id, "openai");
+        let outcome = broker.dispatch_fallback_choice(
+            &mut rivect::model::NullLedger,
+            "/world/openai",
+            &attempt_id,
+            "openai",
+        );
         (broker, outcome)
     })
     .join()
@@ -1822,6 +1829,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         IncompatibleOutput,
         UnsupportedParameter,
         ReasoningProvenance,
+        Retried,
     }
     fn provider_variant(error: &ProviderError) -> ProviderVariant {
         match error {
@@ -1853,6 +1861,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
+            ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
     }
     #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -4653,7 +4662,7 @@ async fn meta_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/meta", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/meta", &manifest);
             (broker, replay)
         })
         .join()
@@ -5672,7 +5681,8 @@ async fn ollama_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/ollama", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/ollama", &manifest);
             (broker, replay)
         })
         .join()
@@ -6946,7 +6956,11 @@ async fn openrouter_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/openrouter", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/openrouter",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -7932,7 +7946,8 @@ async fn sakana_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/sakana", &manifest);
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/sakana", &manifest);
             (broker, replay)
         })
         .join()
@@ -8738,7 +8753,11 @@ async fn custom_responses_valid_control_yields_one_outcome_and_one_physical_usag
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/custom-responses", &manifest);
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/custom-responses",
+                &manifest,
+            );
             (broker, replay)
         })
         .join()
@@ -9817,4 +9836,44 @@ fn sse_eventsource_stream_defects_10_11_do_not_reproduce() {
     let events = parse_all(&chunks).expect("long line in small chunks");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data.len(), 100 * 1024);
+}
+
+/// Cached prompt and folded reasoning details ride as their own legs
+/// (AC-057), with the completion bin unchanged.
+#[tokio::test]
+async fn response_usage_detail_legs_are_carried() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "cached",
+            Vec::new(),
+            Some(json!({
+                "input_tokens": 5,
+                "output_tokens": 7,
+                "total_tokens": 12,
+                "input_tokens_details": { "cached_tokens": 3 },
+                "output_tokens_details": { "reasoning_tokens": 2 },
+            })),
+        ),
+    )
+    .await;
+    let (broker, manifest) = prepared(&config, "/world/openai", "goal: detail legs");
+    let (broker, outcome) = dispatch(broker, "/world/openai", manifest.clone());
+    outcome.expect("the detailed send completes");
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Legs {
+            prompt_tokens: Some(5),
+            completion_tokens: Some(7),
+            reasoning_tokens: Some(2),
+            cache_read_tokens: Some(3),
+            cache_write_tokens: None,
+            total_tokens: Some(12),
+        }
+    );
 }

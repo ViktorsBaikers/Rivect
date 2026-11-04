@@ -729,7 +729,7 @@ async fn ollama_cloud_usage_from_done_chunk_is_charged_once() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/oc-usage", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/oc-usage", &manifest);
             (broker, replay)
         })
         .join()
@@ -2381,7 +2381,7 @@ async fn qianfan_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/qianfan", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/qianfan", &manifest);
             (broker, replay)
         })
         .join()
@@ -3240,7 +3240,7 @@ async fn qwen_portal_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/qwen-portal", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/qwen-portal", &manifest);
             (broker, replay)
         })
         .join()
@@ -4025,7 +4025,7 @@ async fn siliconflow_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/siliconflow", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/siliconflow", &manifest);
             (broker, replay)
         })
         .join()
@@ -4807,7 +4807,7 @@ async fn siliconflow_cn_valid_control_yields_one_outcome_and_one_physical_usage(
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/siliconflow-cn", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/siliconflow-cn", &manifest);
             (broker, replay)
         })
         .join()
@@ -5758,7 +5758,7 @@ async fn synthetic_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/synthetic", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/synthetic", &manifest);
             (broker, replay)
         })
         .join()
@@ -6754,7 +6754,7 @@ async fn together_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/together", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/together", &manifest);
             (broker, replay)
         })
         .join()

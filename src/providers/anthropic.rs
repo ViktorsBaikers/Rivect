@@ -314,6 +314,9 @@ struct StreamState {
     blocks: BTreeMap<u64, Block>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Cache legs the peer reported on `message_start`; absent stays unknown.
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     stop_reason: Option<String>,
     thinking: Vec<Value>,
     transformations: u64,
@@ -970,13 +973,47 @@ impl MessagesProvider {
                     drop_block: binding.drop_block,
                 };
                 let retry_body = self.request_body(manifest, &fixed, &stripped);
+                // Defensive: the HTTP seam cannot reach these two checks — the
+                // first leg's refusable body read already enforces the shared
+                // clock — so neither failure may ever be counted as a retry.
                 let retry_bytes = wire_body(&self.connection, &retry_body)?;
                 check_deadline(&self.connection, self.deadline, started)?;
-                let retry = self.post(&token, retry_bytes, stripped.drop_block)?;
-                if !retry.status().is_success() {
-                    return Err(transport_status(&self.connection, retry.status()));
+                let retry = match self.post(&token, retry_bytes, stripped.drop_block) {
+                    Ok(retry) => retry,
+                    Err(source) => {
+                        // The corrected leg's POST is the second crossed
+                        // leg even when it fails before a response: the
+                        // count rides the failure beside its class.
+                        return Err(ProviderError::Retried {
+                            wire_retries: 1,
+                            source: Box::new(source),
+                        });
+                    }
+                };
+                let retry_status = retry.status();
+                if !retry_status.is_success() {
+                    // The corrected leg crossed the wire and was refused:
+                    // the settlement keeps the count beside the class.
+                    return Err(ProviderError::Retried {
+                        wire_retries: 1,
+                        source: Box::new(transport_status(&self.connection, retry_status)),
+                    });
                 }
-                return self.read_stream(manifest, &fixed.model_id, retry, started);
+                // The correction is this child's own second leg, not a
+                // second attempt: the reply carries the count and the
+                // first leg's usage stays unknown. A retried leg that
+                // fails while its body streams crossed too.
+                let mut reply = match self.read_stream(manifest, &fixed.model_id, retry, started) {
+                    Ok(reply) => reply,
+                    Err(source) => {
+                        return Err(ProviderError::Retried {
+                            wire_retries: 1,
+                            source: Box::new(source),
+                        });
+                    }
+                };
+                reply.wire_retries = reply.wire_retries.saturating_add(1);
+                return Ok(reply);
             }
         }
         Err(transport_status(&self.connection, status))
@@ -1047,11 +1084,17 @@ impl MessagesProvider {
                         .ok_or_else(|| {
                             violation(&self.connection, "usage token counts overflow the total")
                         })?;
-                UsageDelta::Exact {
+                // A reported cache leg makes the report a leg set: the pair
+                // keeps its folded shape and the cache counters ride as
+                // their own legs. A peer reporting none stays exact.
+                UsageDelta::from_reported(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                }
+                    None,
+                    state.cache_read_tokens,
+                    state.cache_write_tokens,
+                )
             }
             _ => UsageDelta::Unknown,
         };
@@ -1061,6 +1104,7 @@ impl MessagesProvider {
             text: state.text,
             tool_calls: state.tool_calls,
             usage,
+            wire_retries: 0,
         })
     }
 
@@ -1146,6 +1190,10 @@ impl MessagesProvider {
                     "message_start input_tokens is not a token count",
                 )
             })?);
+            state.cache_read_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+            state.cache_write_tokens = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64);
         }
         state.transformations = transformations_in(&self.connection, message)?
             .saturating_add(transformations_in(&self.connection, payload)?);

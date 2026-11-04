@@ -826,6 +826,7 @@ impl GeminiProvider {
             text: state.text,
             tool_calls: state.tool_calls,
             usage,
+            wire_retries: 0,
         })
     }
 
@@ -847,16 +848,24 @@ impl GeminiProvider {
             Some(count) => count.as_u64(),
         };
         let total = usage.get("totalTokenCount").and_then(Value::as_u64);
+        // The recorded cache and thought counters: a cached prefix and a
+        // thinking share already included in the candidate count. Absent
+        // stays unknown and the report stays exact.
+        let cache_read = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
+        let thoughts = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
         match (prompt, completion, total) {
             // The reported total is charged verbatim — never re-summed
             // — and a usage object that withholds it is a wire
             // violation, not an estimate the peer never charged.
             (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
-                Ok(UsageDelta::Exact {
+                Ok(UsageDelta::from_reported(
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
-                })
+                    thoughts,
+                    cache_read,
+                    None,
+                ))
             }
             _ => Err(violation(
                 &self.connection,

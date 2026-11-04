@@ -384,9 +384,100 @@ pub enum UsageDelta {
         completion_tokens: u64,
         total_tokens: u64,
     },
+    /// The provider reported individual legs — a cache read/write pair or
+    /// a reasoning count — beside the prompt/completion pair. Each leg keeps
+    /// the provider's own presence: a reported zero is a fact, an absent leg
+    /// stays unknown, and a reasoning count already folded into the
+    /// completion count is never added to it a second time.
+    Legs {
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    },
+}
+
+/// The settled token bins of one physical send (AC-057): every counter the
+/// provider reported, `None` where it reported nothing. A reported zero is
+/// `Some(0)` and a missing counter is `None`; the two never collapse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageBins {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+/// How trustworthy one settlement's bins are: `exact` and `estimate` come
+/// from a provider report, `unknown` is the retained unknown — the bound is
+/// charged and no bin is invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exactness {
+    Exact,
+    Estimate,
+    Unknown,
+}
+
+impl Exactness {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Estimate => "estimate",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The stored spelling; a value outside the closed set is a corrupted
+    /// settlement row, never a fourth class.
+    #[must_use]
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "exact" => Some(Self::Exact),
+            "estimate" => Some(Self::Estimate),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 impl UsageDelta {
+    /// The one report shape every dialect reduces its counters to: a
+    /// reported detail leg — reasoning, cache read or cache write — makes
+    /// the set `Legs`, otherwise the pair stays `Exact` with the dialect's
+    /// own total. Each leg keeps the provider's own presence.
+    #[must_use]
+    pub fn from_reported(
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        reasoning_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Self {
+        if reasoning_tokens.is_some() || cache_read_tokens.is_some() || cache_write_tokens.is_some()
+        {
+            Self::Legs {
+                prompt_tokens: Some(prompt_tokens),
+                completion_tokens: Some(completion_tokens),
+                reasoning_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                total_tokens: Some(total_tokens),
+            }
+        } else {
+            Self::Exact {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            }
+        }
+    }
+
     /// The confirmed total the charge path may release — `None` while
     /// usage is unknown, so the retained bound never collapses to zero.
     #[must_use]
@@ -394,6 +485,58 @@ impl UsageDelta {
         match self {
             Self::Unknown => None,
             Self::Exact { total_tokens, .. } => Some(*total_tokens),
+            Self::Legs { total_tokens, .. } => *total_tokens,
+        }
+    }
+
+    /// The settlement bins this report carries: `Exact` fills the pair and
+    /// its total, `Legs` keeps each reported leg verbatim.
+    #[must_use]
+    pub fn bins(&self) -> UsageBins {
+        match self {
+            Self::Unknown => UsageBins::default(),
+            Self::Exact {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => UsageBins {
+                prompt_tokens: Some(*prompt_tokens),
+                completion_tokens: Some(*completion_tokens),
+                total_tokens: Some(*total_tokens),
+                ..UsageBins::default()
+            },
+            Self::Legs {
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                total_tokens,
+            } => UsageBins {
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+                reasoning_tokens: *reasoning_tokens,
+                cache_read_tokens: *cache_read_tokens,
+                cache_write_tokens: *cache_write_tokens,
+                total_tokens: *total_tokens,
+            },
+        }
+    }
+
+    /// The exactness the bins carry: a reported total is exact, a report
+    /// with legs but no total is an estimate, and no report is unknown.
+    #[must_use]
+    pub fn exactness(&self) -> Exactness {
+        match self {
+            Self::Unknown => Exactness::Unknown,
+            Self::Exact { .. } => Exactness::Exact,
+            Self::Legs { total_tokens, .. } => {
+                if total_tokens.is_some() {
+                    Exactness::Exact
+                } else {
+                    Exactness::Estimate
+                }
+            }
         }
     }
 }

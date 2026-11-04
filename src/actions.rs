@@ -2548,13 +2548,19 @@ impl Stage<'_> {
                 .broker
                 .prepare_call(self.action, ctx.config, seam.world, inputs, &contract)
             {
-                Ok(manifest) => match seam.broker.dispatch(seam.world, &manifest) {
-                    Ok(reply) => Ok((manifest.attempt_id, reply)),
-                    Err(source) => {
-                        seam.broker.cancel_attempt(&manifest.attempt_id);
-                        Err(source)
+                Ok(manifest) => {
+                    // The semantic legs are not scheduler nodes, so their
+                    // settlement records the send without a tree scope to
+                    // reserve against.
+                    let mut ledger = crate::state::StoreLedger::new(&mut *ctx.store, Vec::new());
+                    match seam.broker.dispatch(&mut ledger, seam.world, &manifest) {
+                        Ok(reply) => Ok((manifest.attempt_id, reply)),
+                        Err(source) => {
+                            seam.broker.cancel_attempt(&manifest.attempt_id);
+                            Err(source)
+                        }
                     }
-                },
+                }
                 Err(source) => Err(source),
             };
         match sent {

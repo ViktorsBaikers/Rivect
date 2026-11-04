@@ -127,6 +127,11 @@ pub struct ProviderReply {
     /// never an estimate and never a zero the retained bound could
     /// release as.
     pub usage: UsageDelta,
+    /// How many adapter-internal corrections this physical child attempt
+    /// sent before the answering one (AC-057). A retry is the same child —
+    /// its first leg's usage is unknown, never zero — so the settlement
+    /// carries the count instead of opening a second attempt.
+    pub wire_retries: u32,
 }
 
 /// A transport failure's programmatic class, independent of diagnostic text.
@@ -426,6 +431,31 @@ pub enum ProviderError {
     /// is a provenance failure, never silently dropped or replayed.
     #[error("connection {connection} returned a reasoning artifact outside the lineage: {reason}")]
     ReasoningProvenance { connection: String, reason: String },
+    /// One failed send after the adapter's own corrected retry: the count
+    /// travels beside the failure so the entered settle records how many
+    /// legs crossed the wire. The broker unwraps the marker at the send
+    /// boundary, so callers meet only the failure's own class.
+    #[error("send failed after {wire_retries} wire retries: {source}")]
+    Retried {
+        wire_retries: u32,
+        #[source]
+        source: Box<ProviderError>,
+    },
+}
+
+impl ProviderError {
+    /// Splits the adapter's retry marker off this failure: the wire-retry
+    /// count and the class the caller sees. A failure without a marker
+    /// crossed no retried leg.
+    pub(crate) fn settle(self) -> (u32, Self) {
+        match self {
+            Self::Retried {
+                wire_retries,
+                source,
+            } => (wire_retries, *source),
+            class => (0, class),
+        }
+    }
 }
 
 /// The native secret-store class a credential reference resolves to
@@ -1641,11 +1671,13 @@ impl Provider for LoopbackProvider {
                     path: Some(path),
                 }],
                 usage: UsageDelta::Unknown,
+                wire_retries: 0,
             }),
             None => Ok(ProviderReply {
                 text: WAITING_FOR_DECISION.to_string(),
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
+                wire_retries: 0,
             }),
         }
     }

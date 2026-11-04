@@ -15,6 +15,64 @@ use crate::policy::{
     ModeDecision, canonical_egress_target, grant_id_is_key_safe, preapproval_scope,
 };
 use crate::providers::LoopbackProvider;
+
+/// The provider the TUI's one runtime dispatches through. Production is the
+/// offline loopback, full stop; the test twin below is the seam the card
+/// driver's child uses to install a slow peer.
+#[cfg(not(test))]
+fn test_provider() -> Box<dyn crate::providers::Provider> {
+    Box::new(LoopbackProvider::new())
+}
+
+/// The env marker arming the card driver's slow peer, in milliseconds.
+#[cfg(test)]
+const SLOW_SEND_ENV: &str = "RIVECT_TUI_SLOW_SEND_MS";
+
+/// Test twin of the provider seam: an armed `RIVECT_TUI_SLOW_SEND_MS` makes
+/// every send wait that long before the loopback answers, so a PTY leg can
+/// observe the loop while a send is in flight. Inert unless the child sets
+/// it — the seam never arms itself.
+#[cfg(test)]
+fn test_provider() -> Box<dyn crate::providers::Provider> {
+    match std::env::var(SLOW_SEND_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        Some(millis) if millis > 0 => Box::new(SlowSendProvider {
+            delay: Duration::from_millis(millis),
+            inner: LoopbackProvider::new(),
+        }),
+        _ => Box::new(LoopbackProvider::new()),
+    }
+}
+
+/// The loopback peer with a fixed pre-answer delay: the test-only stand-in
+/// for a provider that takes its time. It parks the send thread for exactly
+/// the armed interval — no poll loop and no second timer.
+#[cfg(test)]
+struct SlowSendProvider {
+    delay: Duration,
+    inner: LoopbackProvider,
+}
+
+#[cfg(test)]
+impl crate::providers::Provider for SlowSendProvider {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn serves(&self, connection: &str, entry: &crate::config::Connection) -> bool {
+        self.inner.serves(connection, entry)
+    }
+
+    fn send(
+        &mut self,
+        manifest: &crate::model::RequestManifest,
+    ) -> Result<crate::providers::ProviderReply, crate::providers::ProviderError> {
+        std::thread::park_timeout(self.delay);
+        self.inner.send(manifest)
+    }
+}
 use crate::resources::{OutputStatus, OutputStream, sanitize_status_cause};
 use crate::state::StoreWriter;
 use crossterm::cursor::Show;
@@ -833,7 +891,22 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             rows.push(Constraint::Length(1));
             rows.push(Constraint::Min(1));
         }
-        rows.push(Constraint::Length(view.dock.len().clamp(1, 3) as u16));
+        // The dock's task rows keep their three-row window; the fixed economy
+        // row below them is its own slot, so it paints even when three tasks
+        // fill the dock and never clips off the panel. A status projection's
+        // economy row takes two rows: at the 60-column acceptance geometry a
+        // single row cannot carry project, cwd, figures and their sources at
+        // once, so it wraps within these two instead of clipping its tail.
+        // The pre-status placeholder dock is one row and keeps the body
+        // regions the geometry they had before the projection arrived.
+        let task_rows = view.dock.len().saturating_sub(1).clamp(0, 3);
+        let economy_rows = match view.dock.len() {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        };
+        rows.push(Constraint::Length(task_rows as u16));
+        rows.push(Constraint::Length(economy_rows as u16));
         rows.push(Constraint::Length(1));
         let chunks = ratatui::layout::Layout::vertical(rows).split(area);
         frame.render_widget(
@@ -893,15 +966,23 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             Paragraph::new(
                 view.dock
                     .iter()
+                    .take(view.dock.len().saturating_sub(1))
                     .map(|line| sanitize_status_cause(line))
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
             chunks[next],
         );
+        if let Some(economy) = view.dock.last() {
+            frame.render_widget(
+                Paragraph::new(sanitize_status_cause(economy))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                chunks[next + 1],
+            );
+        }
         frame.render_widget(
             Paragraph::new(format!("> {}", sanitize_status_cause(&view.composer))),
-            chunks[next + 1],
+            chunks[next + 2],
         );
         if let Some(panel) = &view.panel {
             // Modal overlay: capped at the 60-column acceptance geometry,
@@ -1368,14 +1449,13 @@ impl TuiDispatch {
         // so this arm fills the same transcript/error channels the
         // sibling arms do for a discarded runtime. The cause stays an
         // object under its context; `failure_report` joins them.
-        let mut runtime =
-            Runtime::open(data_root, Box::new(LoopbackProvider::new())).map_err(|carrier| {
-                let boot_diagnostics = carrier.diagnostics().to_vec();
-                TuiOpenError {
-                    error: io::Error::other(RuntimeOpenFailure(carrier.into_source())),
-                    boot_diagnostics,
-                }
-            })?;
+        let mut runtime = Runtime::open(data_root, test_provider()).map_err(|carrier| {
+            let boot_diagnostics = carrier.diagnostics().to_vec();
+            TuiOpenError {
+                error: io::Error::other(RuntimeOpenFailure(carrier.into_source())),
+                boot_diagnostics,
+            }
+        })?;
         let result = match dispatch_tui_request(
             &mut runtime,
             json!({
@@ -1715,9 +1795,89 @@ pub fn task_dock(status: &Value) -> Vec<String> {
         }
     }
     if lines.is_empty() {
-        return vec![DOCK_EMPTY.to_string()];
+        lines.push(DOCK_EMPTY.to_string());
     }
+    // The economy row is the dock's one fixed slot (AC-062): it paints on
+    // every beat — with or without tasks — so a spend or quota figure
+    // appearing or vanishing never moves the rows below it.
+    lines.push(economy_row(status.get("economy")));
     lines
+}
+
+/// The longest source/model/effort label one economy row carries before it
+/// is elided on a char boundary.
+const ECONOMY_LABEL_MAX: usize = 32;
+
+/// The longest project/cwd head the row carries. The row wraps inside its
+/// two-row slot, but the 60-column acceptance geometry gives it 120 cells
+/// total; a 16-char head keeps both workspace names, the settled unit and
+/// the quota unknown with its source inside that budget.
+const ECONOMY_PATH_MAX: usize = 16;
+
+/// The row painted while the status carries no economy projection.
+const ECONOMY_UNKNOWN_ROW: &str = "economy: unknown";
+
+/// Cuts `label` to at most `max` characters, ending with an ellipsis. The
+/// head stays readable — the part that names the source — so an unknown
+/// marker and its source survive a narrow row.
+fn elide_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let mut kept: String = label.chars().take(max.saturating_sub(1)).collect();
+    kept.push('…');
+    kept
+}
+
+/// One fixed dock row for the economy projection (AC-062): settled tokens,
+/// context occupancy, cost, quota and the request's model/effort facts —
+/// each unknown figure spelled `unknown` beside the source that would
+/// answer it, with project and cwd always visible. Occupancy and lifetime
+/// spend stay labelled apart. The workspace names lead: they are what a
+/// narrow dock must never lose, and the row wraps inside its two-row slot.
+fn economy_row(economy: Option<&Value>) -> String {
+    let Some(economy) = economy else {
+        return ECONOMY_UNKNOWN_ROW.to_string();
+    };
+    let number = |key: &str| {
+        economy
+            .get(key)
+            .and_then(Value::as_u64)
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+    };
+    let text = |key: &str| {
+        economy
+            .get(key)
+            .and_then(Value::as_str)
+            .map_or_else(|| "unknown".to_string(), elide_label_with_max)
+    };
+    let path = |key: &str| {
+        economy.get(key).and_then(Value::as_str).map_or_else(
+            || "unknown".to_string(),
+            |label| elide_label(label, ECONOMY_PATH_MAX),
+        )
+    };
+    format!(
+        "economy: project {} · cwd {} · settled {} tok · quota {} ({}) · model {} via {} [{}] · context {} tok ({}) · cost {} u · cache ({}) · effort {} ({})",
+        path("project"),
+        path("cwd"),
+        number("settled_tokens"),
+        number("quota_remaining"),
+        text("quota_source"),
+        text("model"),
+        text("connection"),
+        text("source"),
+        number("context_tokens"),
+        text("context_source"),
+        number("charged_units"),
+        text("cache_source"),
+        text("effort"),
+        text("effort_source"),
+    )
+}
+
+fn elide_label_with_max(label: &str) -> String {
+    elide_label(label, ECONOMY_LABEL_MAX)
 }
 
 const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
@@ -1893,17 +2053,10 @@ pub fn handle_decision_event(
         }
         return true;
     }
+    if decision_navigation(card, event) {
+        return true;
+    }
     match code {
-        KeyCode::Left
-        | KeyCode::BackTab
-        | KeyCode::Right
-        | KeyCode::Tab
-        | KeyCode::Up
-        | KeyCode::Down => {
-            let backward = matches!(code, KeyCode::Left | KeyCode::BackTab | KeyCode::Up);
-            card.shift_focus(backward);
-        }
-        KeyCode::PageUp | KeyCode::PageDown => card.scroll_body(code == KeyCode::PageDown),
         KeyCode::Enter => apply_decision_choice(view, rt, session_id),
         // Esc returns the question untouched: the card closes, the fork
         // stays pending — never a denial and never an implied answer —
@@ -1924,85 +2077,149 @@ pub fn handle_decision_event(
 /// open; the custom row opens editing on an empty draft and submits the
 /// draft otherwise.
 fn apply_decision_choice(view: &mut LocalView, rt: &mut Runtime, session_id: &SessionId) {
-    let Some(mut card) = view.decision.take() else {
+    let Some(card) = view.decision.clone() else {
         return;
     };
-    if card.focus() == card.custom_row() {
-        if card.custom_draft().trim().is_empty() {
-            card.set_custom_editing(true);
-            view.decision = Some(card);
-            return;
+    match decision_commit(&card) {
+        DecisionCommit::Send(selection) => {
+            view.decision = None;
+            let result = commit_answer(rt, session_id, &card, selection);
+            paint_answer(view, result);
         }
-        let selection = AnswerSelection::Custom {
-            text: card.custom_draft().to_string(),
-        };
-        answer_from_card(view, rt, session_id, &card, selection);
-        return;
-    }
-    let Some(option) = card.question.options.get(card.focus()) else {
-        view.decision = Some(card);
-        return;
-    };
-    match &option.availability {
-        Availability::Disabled { reason } => {
-            view.transcript.push(format!(
-                "decision position unavailable: {}",
-                sanitize_status_cause(reason)
-            ));
-            view.decision = Some(card);
+        DecisionCommit::Refused(line) => view.transcript.push(line),
+        DecisionCommit::EditDraft => {
+            if let Some(card) = view.decision.as_mut() {
+                card.set_custom_editing(true);
+            }
         }
-        Availability::Enabled => {
-            let selection = AnswerSelection::Option {
-                option_id: option.option_id.clone(),
-            };
-            answer_from_card(view, rt, session_id, &card, selection);
-        }
+        DecisionCommit::Open => {}
     }
 }
 
-/// Commits the card's pinned question id/revision through the shared
-/// answer seam, then resumes the task through the same scheduler path
-/// the wire answer takes — a committed answer that never submits its
-/// runnable node leaves the task parked on a drained question. A denial
-/// keeps the attempt journaled, lands on the transcript with the typed
-/// reason, and closes the card — the stored question already moved past
-/// the card's copy.
-fn answer_from_card(
-    view: &mut LocalView,
+/// What the focused card position commits to, decided without a runtime so
+/// the send window — which holds the runtime elsewhere — makes exactly the
+/// choice the synchronous path does.
+#[derive(Debug, Clone, PartialEq)]
+enum DecisionCommit {
+    Send(AnswerSelection),
+    Refused(String),
+    EditDraft,
+    Open,
+}
+
+fn decision_commit(card: &DecisionPanel) -> DecisionCommit {
+    if card.focus() == card.custom_row() {
+        if card.custom_draft().trim().is_empty() {
+            return DecisionCommit::EditDraft;
+        }
+        return DecisionCommit::Send(AnswerSelection::Custom {
+            text: card.custom_draft().to_string(),
+        });
+    }
+    let Some(option) = card.question.options.get(card.focus()) else {
+        return DecisionCommit::Open;
+    };
+    match &option.availability {
+        Availability::Disabled { reason } => DecisionCommit::Refused(format!(
+            "decision position unavailable: {}",
+            sanitize_status_cause(reason)
+        )),
+        Availability::Enabled => DecisionCommit::Send(AnswerSelection::Option {
+            option_id: option.option_id.clone(),
+        }),
+    }
+}
+
+/// What one committed card answer produced. A value, because the send
+/// window runs away from the view that paints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnswerResult {
+    Applied,
+    Settled,
+    ResumeFailed(String),
+    Denied(String),
+}
+
+/// Commits the card's pinned question through the shared answer seam, then
+/// resumes the task through the same scheduler path the wire answer takes —
+/// a committed answer that never submits its runnable node leaves the task
+/// parked on a drained question. This whole span is the blocked window the
+/// send owner moves off the UI loop.
+fn commit_answer(
     rt: &mut Runtime,
     session_id: &SessionId,
     card: &DecisionPanel,
     selection: AnswerSelection,
-) {
+) -> AnswerResult {
+    let task = card.question.task_id.clone();
     match rt.owner.store.answer_question(
         session_id,
-        &card.question.task_id,
+        &task,
         &card.question.question_id,
         card.question.question_revision,
         &selection,
         DECISION_ANSWER_AUTHOR,
     ) {
-        Ok(_) => match rt.resume_answered(session_id, &card.question.task_id, selection) {
-            Ok(ResumeAdmission::Drained) => {
-                view.transcript.push(DECISION_ANSWERED_NOTE.to_string());
-            }
+        Ok(_) => match rt.resume_answered(session_id, &task, selection) {
+            Ok(ResumeAdmission::Drained) => AnswerResult::Applied,
             // The committed answer grew nothing runnable — a cancelled or
             // settled subtree never dispatches again, so the note says
             // "settled", never "resumed".
-            Ok(ResumeAdmission::Tombstoned) => {
-                view.transcript.push(DECISION_SETTLED_NOTE.to_string());
-            }
-            // The answer committed; only the resume failed — the note
-            // names that exactly, never claims "resumed".
-            Err(error) => view.transcript.push(format!(
-                "decision answer recorded; resume failed: {}",
-                sanitize_status_cause(&error.to_string())
-            )),
+            Ok(ResumeAdmission::Tombstoned) => AnswerResult::Settled,
+            // The answer committed; only the resume failed — the note names
+            // that exactly, never claims "resumed".
+            Err(error) => AnswerResult::ResumeFailed(error.to_string()),
         },
-        Err(error) => view.transcript.push(format!(
-            "decision answer denied: {}",
-            sanitize_status_cause(&error.to_string())
+        Err(error) => AnswerResult::Denied(error.to_string()),
+    }
+}
+
+/// Paints one committed answer, on whichever thread holds the view.
+fn paint_answer(view: &mut LocalView, result: AnswerResult) {
+    match result {
+        AnswerResult::Applied => view.transcript.push(DECISION_ANSWERED_NOTE.to_string()),
+        AnswerResult::Settled => view.transcript.push(DECISION_SETTLED_NOTE.to_string()),
+        AnswerResult::ResumeFailed(reason) => view.transcript.push(format!(
+            "decision answer recorded; resume failed: {}",
+            sanitize_status_cause(&reason)
         )),
+        AnswerResult::Denied(reason) => view.transcript.push(format!(
+            "decision answer denied: {}",
+            sanitize_status_cause(&reason)
+        )),
+    }
+}
+
+/// Moves the card's own view state — focus and scroll — and reports whether
+/// the event was navigation. These keys need no runtime, so the send window
+/// keeps them live: echoed input never waits on the provider.
+fn decision_navigation(card: &mut DecisionPanel, event: &TermEvent) -> bool {
+    let TermEvent::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Press,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+    match code {
+        KeyCode::Left
+        | KeyCode::BackTab
+        | KeyCode::Right
+        | KeyCode::Tab
+        | KeyCode::Up
+        | KeyCode::Down => {
+            card.shift_focus(matches!(
+                code,
+                KeyCode::Left | KeyCode::BackTab | KeyCode::Up
+            ));
+            true
+        }
+        KeyCode::PageUp | KeyCode::PageDown => {
+            card.scroll_body(*code == KeyCode::PageDown);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2207,6 +2424,135 @@ fn status_band(view: &LocalView, width: usize) -> String {
         rows.push(sanitize_status_cause(stale).replace('\n', " "));
     }
     rows.join("\n")
+}
+
+/// Painted when a cancel arrives while the send window is open: the cancel
+/// is acknowledged at once and observed when the in-flight send settles.
+pub const TUI_CANCEL_PENDING: &str = "cancel requested; waiting for the in-flight send to settle";
+
+/// Painted while the send window is open: the answer is committed and the
+/// provider is still working, and input stays live.
+pub const TUI_SEND_PENDING: &str = "send in flight; input stays live";
+
+/// The test-only marker that makes the send worker leave before it settles,
+/// so the loop's worker-failure path is exercised without a panic. Production
+/// never sets it.
+#[cfg(test)]
+const SEND_FAILURE_ENV: &str = "RIVECT_TUI_SEND_FAILURE";
+
+/// How many completed send windows may wait for the loop. One is the whole
+/// policy: only one window can be in flight, so a second answer would name a
+/// run the loop never started — the channel blocks that instead of hiding it.
+const SEND_COMPLETION_CAPACITY: usize = 1;
+
+/// The tracked owner of one answer+resume+drain window: the runtime moves
+/// here so the loop keeps reading input while the provider send blocks, and
+/// comes back with the paintable result. One spawn, joined on completion and
+/// on teardown; the channel is bounded, so a second completion can never be
+/// produced.
+///
+/// The handoff changes no dispatch boundary: commit_answer still answers
+/// through the store and resumes through `Runtime::resume_answered`, so the
+/// Broker's ledger begin/finish stay where DEC-012 put them.
+struct SendOwner {
+    rx: std::sync::mpsc::Receiver<(TuiDispatch, AnswerResult)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One look at the send window. The finished payload is boxed: the runtime
+/// is large, and the poll's other two variants are unit-sized.
+enum WindowPoll {
+    Done(Box<(TuiDispatch, AnswerResult)>),
+    Running,
+    Failed,
+}
+
+impl SendOwner {
+    fn start(
+        mut dispatch: TuiDispatch,
+        session_id: SessionId,
+        card: DecisionPanel,
+        selection: AnswerSelection,
+    ) -> io::Result<Self> {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<(TuiDispatch, AnswerResult)>(SEND_COMPLETION_CAPACITY);
+        let handle = std::thread::Builder::new()
+            .name("rivect-tui-send".to_string())
+            .spawn(move || {
+                // A test-only failure seam: an armed marker makes the worker
+                // return before it settles, dropping both its sender and the
+                // runtime — the loop's disconnected path. Production never
+                // sets it.
+                #[cfg(test)]
+                if std::env::var_os(SEND_FAILURE_ENV).is_some() {
+                    return;
+                }
+                let result = dispatch.commit_answer(&session_id, &card, selection);
+                // A closed receiver is teardown after a cancel: the send
+                // already settled through the ledger, so the failed
+                // hand-back only retires the runtime with this thread.
+                if tx.send((dispatch, result)).is_err() {
+                    std::hint::black_box(());
+                }
+            })
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            rx,
+            handle: Some(handle),
+        })
+    }
+
+    /// One non-blocking look at the window: a finished hand-back, a worker
+    /// that died without one (its sender dropped), or still running.
+    fn poll(&mut self) -> WindowPoll {
+        match self.rx.try_recv() {
+            Ok((dispatch, result)) => {
+                self.join();
+                WindowPoll::Done(Box::new((dispatch, result)))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => WindowPoll::Running,
+            // The sender is gone with no value: the worker failed before it
+            // could hand back. The loop joins it and leaves through its
+            // failure path instead of waiting on a completion that can
+            // never come.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.join();
+                WindowPoll::Failed
+            }
+        }
+    }
+
+    /// Waits out the one window at teardown: the runtime it holds must come
+    /// back so its release runs on the loop's thread.
+    fn finish(mut self) -> Option<(TuiDispatch, AnswerResult)> {
+        let done = self.rx.recv().ok();
+        self.join();
+        done
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // A panicked worker took the runtime with it; the cancellation
+            // and settlement are already durable, so the loop only drops
+            // what is left and exits on its own path.
+            if handle.join().is_err() {
+                std::hint::black_box(());
+            }
+        }
+    }
+}
+
+impl TuiDispatch {
+    /// The send window's body: commits the answer, resumes the task and
+    /// drains the one decision step. Runs on the send owner's thread.
+    fn commit_answer(
+        &mut self,
+        session_id: &SessionId,
+        card: &DecisionPanel,
+        selection: AnswerSelection,
+    ) -> AnswerResult {
+        commit_answer(&mut self.runtime, session_id, card, selection)
+    }
 }
 
 /// The loop's input wait: one pass per interval.
@@ -2508,6 +2854,13 @@ where
     // how many reads in a row have failed.
     let mut dock_refreshed: Option<Instant> = None;
     let mut dock_failures = 0;
+    // The one send window: while it is open the runtime lives on the send
+    // owner's thread and the loop paints from the view alone. A cancel
+    // recorded here is honoured the moment the window closes.
+    let mut send_owner: Option<SendOwner> = None;
+    let mut cancel_requested = false;
+    // The status the in-flight label replaced, restored when the window closes.
+    let mut status_before_send: Option<String> = None;
     loop {
         if let Some(dispatch) = tui_dispatch.as_mut() {
             between_passes(dispatch, pending_task.as_ref())?;
@@ -2576,7 +2929,13 @@ where
                 card_opened = true;
             }
         }
-        render(guard.terminal_mut(), &view)?;
+        if let Err(error) = render(guard.terminal_mut(), &view) {
+            // A paint failure leaves through the loop's error path, but the
+            // in-flight window must still be joined and its runtime released
+            // here, on the loop's thread.
+            close_window(&mut send_owner, &mut tui_dispatch);
+            return Err(error);
+        }
         if card_opened {
             // The card's first frame just painted, so anything still
             // queued was produced before the question was visible —
@@ -2596,9 +2955,64 @@ where
                 read()?;
             }
         }
-        if poll(POLL_INTERVAL)? {
-            let event = read()?;
-            if let Some(card) = &view.decision {
+        let polled = match poll(POLL_INTERVAL) {
+            Ok(polled) => polled,
+            Err(error) => {
+                close_window(&mut send_owner, &mut tui_dispatch);
+                return Err(error);
+            }
+        };
+        if polled {
+            let event = match read() {
+                Ok(event) => event,
+                Err(error) => {
+                    close_window(&mut send_owner, &mut tui_dispatch);
+                    return Err(error);
+                }
+            };
+            // Cancellation is highest priority: while a send window is open
+            // the cancel keys are acknowledged at once and the loop keeps
+            // painting until the in-flight send settles.
+            let cancel_key = matches!(
+                &event,
+                TermEvent::Key(KeyEvent {
+                    code: KeyCode::Esc,
+                    kind: KeyEventKind::Press,
+                    ..
+                })
+            ) || matches!(
+                &event,
+                TermEvent::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL)
+            );
+            if send_owner.is_some() && cancel_key {
+                if matches!(
+                    &event,
+                    TermEvent::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        ..
+                    })
+                ) {
+                    exit = 130;
+                }
+                if !cancel_requested {
+                    cancel_requested = true;
+                    // The status line is painted over the card, so the
+                    // acknowledgement is visible at once; the transcript
+                    // it would otherwise sit in is behind the modal.
+                    view.status = TUI_CANCEL_PENDING.to_string();
+                }
+                continue;
+            }
+            if let Some(card_now) = view.decision.clone() {
+                // The card is cloned for this pass: the send window takes
+                // the runtime away, and the view must stay readable while it
+                // is gone.
+                let card = &card_now;
                 // Until the card has been visible DECISION_CONSENT_DELAY,
                 // a commit or dismiss keypress cannot have been aimed at
                 // the question — autorepeat on a held Enter, bytes still
@@ -2616,7 +3030,48 @@ where
                 if unaimed_consent {
                     continue;
                 }
-                // The card owns the keys through the shared production
+                // While the window is open the runtime is elsewhere: only
+                // the card's own view state moves, so echoed input never
+                // waits on the provider.
+                if send_owner.is_some() {
+                    if let Some(card) = view.decision.as_mut() {
+                        decision_navigation(card, &event);
+                    }
+                    continue;
+                }
+                // Enter is the one key that opens the send window — but only
+                // outside the draft, where Enter is a newline, not a commit.
+                if !card.custom_editing()
+                    && matches!(
+                        event,
+                        TermEvent::Key(KeyEvent {
+                            code: KeyCode::Enter,
+                            kind: KeyEventKind::Press,
+                            ..
+                        })
+                    )
+                {
+                    let card = card.clone();
+                    match decision_commit(&card) {
+                        DecisionCommit::Send(selection) => {
+                            let dispatch = tui_dispatch
+                                .take()
+                                .ok_or_else(|| io::Error::other("no open session to send on"))?;
+                            let session_id = SessionId(dispatch.session_id.clone());
+                            send_owner =
+                                Some(SendOwner::start(dispatch, session_id, card, selection)?);
+                            status_before_send = Some(view.status.clone());
+                            view.status = TUI_SEND_PENDING.to_string();
+                            continue;
+                        }
+                        DecisionCommit::Refused(line) => {
+                            view.transcript.push(line);
+                            continue;
+                        }
+                        DecisionCommit::EditDraft | DecisionCommit::Open => {}
+                    }
+                }
+                // Every non-commit key stays on the shared production
                 // handler; the answer records on the same store handle
                 // question.answer reads and resumes through the same
                 // scheduler seam the wire answer takes.
@@ -2702,9 +3157,64 @@ where
                 _ => {}
             }
         }
+        // Completions come after input in this pass: a key already queued is
+        // handled first, and the finished window is drained without blocking.
+        let window = match send_owner.as_mut().map(SendOwner::poll) {
+            Some(WindowPoll::Done(done)) => Some(Ok(*done)),
+            Some(WindowPoll::Failed) => Some(Err(())),
+            Some(WindowPoll::Running) | None => None,
+        };
+        match window {
+            Some(Ok((dispatch, result))) => {
+                send_owner = None;
+                tui_dispatch = Some(dispatch);
+                view.decision = None;
+                paint_answer(&mut view, result);
+                // The in-flight label is a window fact, not a session one:
+                // the surface goes back to the status it carried before.
+                view.status = status_before_send
+                    .take()
+                    .unwrap_or_else(|| STATUS_DISCONNECTED.to_string());
+                if cancel_requested {
+                    // The completion is a state change of its own; paint it
+                    // once before the cancel takes effect so the operator
+                    // sees the settled state, not the stale in-flight line.
+                    render(guard.terminal_mut(), &view)?;
+                    break;
+                }
+            }
+            // The worker failed before it could hand the runtime back: the
+            // loop joins it, says so, and leaves through its own exit path
+            // instead of waiting forever on a completion that cannot come.
+            Some(Err(())) => {
+                send_owner = None;
+                view.status = STATUS_DISCONNECTED.to_string();
+                view.transcript
+                    .push("send window failed; the in-flight attempt was released".to_string());
+                exit = 1;
+                render(guard.terminal_mut(), &view)?;
+                break;
+            }
+            None => {}
+        }
     }
+    // A window still open at teardown (an I/O error path) is waited out so the
+    // runtime comes back and releases on this thread; the ledger already
+    // settled it, so the wait changes no spend.
+    close_window(&mut send_owner, &mut tui_dispatch);
     guard.restore()?;
     Ok(exit)
+}
+
+/// Waits out the one in-flight send window and puts the runtime back on the
+/// loop thread, where its release runs. Used by every exit path so no worker
+/// is left detached and no channel is dropped out from under a live send.
+fn close_window(send_owner: &mut Option<SendOwner>, tui_dispatch: &mut Option<TuiDispatch>) {
+    if let Some(owner) = send_owner.take()
+        && let Some((dispatch, _result)) = owner.finish()
+    {
+        *tui_dispatch = Some(dispatch);
+    }
 }
 
 /// Client-side projection rules (architecture «Транспорт и размеры»): apply
@@ -2752,10 +3262,10 @@ impl Projection {
 mod tests {
     use super::{
         CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_CONSENT_DELAY,
-        DOCK_EMPTY, DecisionPanel, LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch,
-        TuiOpenError, append_composer_char, append_composer_paste, initial_view, note_open_failure,
-        output_status_line, render, surface_boot_diagnostics, task_dock, types_text,
-        types_text_altgr, wrapped_row_count,
+        DOCK_EMPTY, DecisionPanel, ECONOMY_UNKNOWN_ROW, LoopbackProvider, OUTPUT_SCROLL_HINT,
+        OutputStream, TuiDispatch, TuiOpenError, append_composer_char, append_composer_paste,
+        initial_view, note_open_failure, output_status_line, render, surface_boot_diagnostics,
+        task_dock, types_text, types_text_altgr, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, Question, TEXT_MAX_BYTES, TaskId};
     use crossterm::event::KeyModifiers;
@@ -2866,7 +3376,19 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .map(Vec::len);
         assert_eq!(task_count, Some(PAGE_MAX as usize));
-        assert_eq!(task_dock(&status).len(), PAGE_MAX as usize);
+        // The economy row is the dock's one fixed slot, so PAGE_MAX todo
+        // rows render beside it rather than replacing it.
+        assert_eq!(task_dock(&status).len(), PAGE_MAX as usize + 1);
+        let economy = task_dock(&status)
+            .last()
+            .cloned()
+            .expect("the economy slot paints last");
+        assert!(
+            economy.starts_with("economy: project ")
+                && economy.contains("settled unknown tok")
+                && economy.contains("quota unknown"),
+            "an unspent runtime names its workspace and unknowns: {economy}"
+        );
         Ok(())
     }
 
@@ -2881,7 +3403,11 @@ mod tests {
                 }]
             }
         }));
-        assert_eq!(dock, vec!["task task-1: blocked (outcome_unknown)"]);
+        assert_eq!(
+            &dock[..dock.len() - 1],
+            ["task task-1: blocked (outcome_unknown)"]
+        );
+        assert_eq!(dock.last().map(String::as_str), Some(ECONOMY_UNKNOWN_ROW));
     }
 
     #[test]
@@ -2890,13 +3416,13 @@ mod tests {
             "todo": { "items": [] },
             "profile": { "pending": "p2", "active": "p1" }
         }));
-        assert_eq!(dock, vec!["profile: p1 active → p2 pending"]);
+        assert_eq!(&dock[..dock.len() - 1], ["profile: p1 active → p2 pending"]);
 
         let converged = task_dock(&json!({
             "todo": { "items": [] },
             "profile": { "pending": "p1", "active": "p1" }
         }));
-        assert_eq!(converged, vec!["profile: p1"]);
+        assert_eq!(&converged[..converged.len() - 1], ["profile: p1"]);
 
         // a pending profile with no active binding yet still shows —
         // tagged so it never reads as the bound one
@@ -2904,19 +3430,126 @@ mod tests {
             "todo": { "items": [] },
             "profile": { "pending": "p2", "active": null }
         }));
-        assert_eq!(pending_only, vec!["profile: p2 pending"]);
+        assert_eq!(
+            &pending_only[..pending_only.len() - 1],
+            ["profile: p2 pending"]
+        );
 
         let active_only = task_dock(&json!({
             "todo": { "items": [] },
             "profile": { "pending": null, "active": "p1" }
         }));
-        assert_eq!(active_only, vec!["profile: p1"]);
+        assert_eq!(&active_only[..active_only.len() - 1], ["profile: p1"]);
 
         let silent = task_dock(&json!({
             "todo": { "items": [] },
             "profile": { "pending": null, "active": null }
         }));
-        assert_eq!(silent, vec![DOCK_EMPTY]);
+        assert_eq!(&silent[..silent.len() - 1], [DOCK_EMPTY]);
+        for rows in [&dock, &converged, &pending_only, &active_only, &silent] {
+            assert_eq!(rows.last().map(String::as_str), Some(ECONOMY_UNKNOWN_ROW));
+        }
+    }
+
+    #[test]
+    fn economy_row_paints_below_three_todo_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let economy = json!({
+            "project": "/projects/pinned",
+            "cwd": "/projects/pinned/src",
+            "model": "fixture-model",
+            "connection": "local",
+            "source": "fixed pin",
+            "effort": "high",
+            "effort_source": "sent setting; the endpoint reports no effective effort",
+            "context_tokens": 9,
+            "settled_tokens": 12,
+            "charged_units": 2,
+            "quota_remaining": null,
+            "quota_source": "unknown: no quota endpoint reports remaining units",
+            "cache_rate": null,
+            "cache_source": "unknown: settled cache and prompt legs are not both recorded"
+        });
+        let mut view = initial_view();
+        view.dock = task_dock(&json!({
+            "todo": { "items": [
+                { "task_id": "a", "lifecycle": "running" },
+                { "task_id": "b", "lifecycle": "running" },
+                { "task_id": "c", "lifecycle": "running" }
+            ]},
+            "economy": economy
+        }));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))?;
+        render(&mut terminal, &view)?;
+        let buffer = terminal.backend().buffer().clone();
+        let painted: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for needle in [
+            "task a:", "task b:", "task c:", "economy:", "tok", "unknown",
+        ] {
+            assert!(
+                painted.contains(needle),
+                "the three-todo frame paints {needle}: {painted}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn economy_row_is_visible_with_zero_and_three_todos() {
+        let economy = json!({
+            "project": "/projects/a-very-long-project-name-over-the-label-limit",
+            "cwd": "/projects/a-very-long-project-name-over-the-label-limit/src",
+            "model": "fixture-model",
+            "connection": "local",
+            "source": "fixed pin",
+            "effort": "high",
+            "effort_source": "sent setting; the endpoint reports no effective effort",
+            "context_tokens": 128,
+            "settled_tokens": 18,
+            "charged_units": 3,
+            "quota_remaining": null,
+            "quota_source": "unknown: no quota endpoint reports remaining units",
+            "cache_rate": null,
+            "cache_source": "unknown: settled cache and prompt legs are not both recorded"
+        });
+        let empty = task_dock(&json!({ "todo": { "items": [] }, "economy": economy }));
+        let three = task_dock(&json!({
+            "todo": { "items": [
+                { "task_id": "a", "lifecycle": "running" },
+                { "task_id": "b", "lifecycle": "running" },
+                { "task_id": "c", "lifecycle": "running" }
+            ]},
+            "economy": economy
+        }));
+        // One fixed economy slot in both cases: the empty dock keeps its
+        // placeholder row and the economy row sits below the todos.
+        assert_eq!(empty.len(), 2);
+        assert_eq!(three.len(), 4);
+        for dock in [&empty, &three] {
+            let row = dock.last().expect("the economy slot paints last");
+            assert!(
+                row.contains("unknown"),
+                "an unreported quota keeps its marker: {row}"
+            );
+            assert!(row.contains("tok"), "the row names its unit: {row}");
+            assert!(
+                row.contains("no quota endpoint"),
+                "the unknown keeps its source: {row}"
+            );
+            assert!(
+                row.contains("project /projects/"),
+                "project stays visible: {row}"
+            );
+            assert!(row.contains("cwd /projects/"), "cwd stays visible: {row}");
+            assert!(row.contains('…'), "a long label is elided: {row}");
+            assert!(
+                row.contains("settled 18 tok") && row.contains("context 128 tok"),
+                "occupancy and lifetime spend stay separately labelled: {row}"
+            );
+        }
     }
 
     #[test]
@@ -3935,8 +4568,9 @@ mod card_pty {
     };
     use super::{
         COMPACT_TOKEN, CONTEXT_COMPACTED, CONTEXT_MEASURE_INTERVAL, CommandId,
-        DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, DOCK_REFRESH_INTERVAL, NOTHING_TO_COMPACT,
-        TuiDispatch, dispatch_tui_request, drive_tui, failure_report,
+        DECISION_ANSWERED_NOTE, DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, DOCK_REFRESH_INTERVAL,
+        NOTHING_TO_COMPACT, SEND_FAILURE_ENV, SLOW_SEND_ENV, TUI_SEND_PENDING, TuiDispatch,
+        dispatch_tui_request, drive_tui, failure_report,
     };
     use crate::contracts::{AnswerAttemptOutcome, AnswerSelection, Question, SessionId, TaskId};
     use crate::state::TaskStore;
@@ -4337,6 +4971,39 @@ mod card_pty {
                     }),
                 )
                 .map_err(|error| error.to_string())
+            }
+            "prepare" => {
+                // A model send needs a declared connection and a purpose the
+                // document resolves: the child's shipped defaults own none,
+                // so the driver writes the card's own context beside its
+                // read scope and reloads it through the owner's ingress.
+                let config = "\
+config_version = 1\n\
+[connections.local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+[models.defaults]\n\
+model = { mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }\n\
+effort = { mode = \"fixed\", value = \"high\" }\n\
+fallback = { mode = \"off\" }\n\
+[models.purposes.backend_task]\n\
+model = { mode = \"fixed\", connection = \"local\", model_id = \"fixture-model\" }\n\
+effort = { mode = \"fixed\", value = \"high\" }\n\
+fallback = { mode = \"off\" }\n";
+                std::fs::write(&dispatch.runtime.config_path, config)
+                    .map_err(|error| error.to_string())?;
+                dispatch.runtime.reload_config().map_err(
+                    |error| match std::error::Error::source(&error) {
+                        Some(cause) => format!("{error}: {cause}"),
+                        None => error.to_string(),
+                    },
+                )?;
+                let scope = dispatch.runtime.owner().runtime_dir().join("scope");
+                let scoped_file = scope.join("allowed.txt");
+                std::fs::create_dir_all(&scope).map_err(|error| error.to_string())?;
+                std::fs::write(&scoped_file, b"card-driver-scope\n")
+                    .map_err(|error| error.to_string())?;
+                dispatch.runtime.purpose = "backend_task".to_string();
+                dispatch.runtime.set_read_scope(scope, scoped_file);
+                Ok(Value::Null)
             }
             "answer" => {
                 let question = pending(dispatch)?;
@@ -4813,6 +5480,151 @@ mod card_pty {
         let mut opened = open_card_unwaited(rows, cols, env);
         must(wait_consent_window(&mut opened.driver.pty), "pty pump");
         opened
+    }
+
+    #[test]
+    fn pty_send_window_failure_stays_exitable() {
+        // The worker leaves before it settles: the receiver disconnects, and
+        // the loop must join it and exit instead of waiting forever.
+        let failing = [(SEND_FAILURE_ENV, "1")];
+        let opened = open_card(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &failing);
+        let mut driver = opened.driver;
+        press(&mut driver.pty, b"\r");
+        expect_exit(&mut driver, secs(20));
+        let (outcome, store) = driver.exited();
+        assert_eq!(
+            outcome.get("exit").and_then(Value::as_u64),
+            Some(1),
+            "a failed send window leaves with the failure code: {outcome}"
+        );
+        let totals = store.settlement_totals().expect("settlement totals");
+        assert_eq!(totals.settled_count, 0, "the failed window settled nothing");
+        assert_eq!(totals.dispatched_count, 0, "and left no open row");
+        drop(store);
+        must(driver.finish(), "pty teardown");
+    }
+
+    #[test]
+    fn pty_input_echo_and_cancel_stay_responsive_while_a_send_settles() {
+        use crate::ui::DECISION_FOOTER_HINT;
+
+        // The child's provider parks for 5 s before answering, well above the
+        // 250 ms loop beat, so CI cannot drain the send before cancel.
+        let slow = [(SLOW_SEND_ENV, "5000")];
+        let opened = open_card(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &slow);
+        let mut driver = opened.driver;
+
+        // A free-text answer needs the model, so this commit really
+        // dispatches: Up reaches the custom row, Enter opens the draft, the
+        // typed text echoes, Esc finishes editing and Enter commits it.
+        must(driver.command("prepare"), "the card context prepares");
+        press(&mut driver.pty, b"\x1b[A");
+        press(&mut driver.pty, b"\r");
+        press(&mut driver.pty, b"slow lane");
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "slow lane",
+            secs(10),
+        );
+        assert!(
+            squashed(&visible).contains("slow lane"),
+            "the typed draft echoes: {visible}"
+        );
+        press(&mut driver.pty, b"\x1b");
+        let closed = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            DECISION_FOOTER_HINT,
+            secs(10),
+        );
+        assert!(
+            squashed(&closed).contains(DECISION_FOOTER_HINT),
+            "the draft closes before the commit: {closed}"
+        );
+        press(&mut driver.pty, b"\r");
+        // The send window really opens: the child paints its in-flight state
+        // while the provider is still parked.
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            TUI_SEND_PENDING,
+            secs(10),
+        );
+        assert!(
+            squashed(&visible).contains("send in flight"),
+            "the commit opens the send window: {visible}"
+        );
+        // Echo observed while the window is open: a navigation key still
+        // moves the card's own focus and the frame repaints.
+        press(&mut driver.pty, b"\x1b[B");
+        press(&mut driver.pty, b"\x1b[B");
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "focus 2/6",
+            secs(10),
+        );
+        assert!(
+            squashed(&visible).contains("focus 2/6"),
+            "input echoes while the send settles: {visible}"
+        );
+
+        // Cancel is acknowledged at once, while the provider is still
+        // parked — the loop paints the acknowledgement, then waits for the
+        // one in-flight send to settle before it may exit.
+        press(&mut driver.pty, b"\x1b");
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "cancel requested",
+            secs(5),
+        );
+        assert!(
+            squashed(&visible).contains("cancel requested"),
+            "cancel is acknowledged during the window: {visible}"
+        );
+
+        // The completion is one more state change: the settled frame paints
+        // without the in-flight label, and the answer note lands.
+        let settled = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            DECISION_ANSWERED_NOTE,
+            secs(20),
+        );
+        assert!(
+            squashed(&settled).contains("decision answer recorded"),
+            "the settled frame paints the answer note: {settled}"
+        );
+        assert!(
+            !squashed(&settled).contains("send in flight"),
+            "the in-flight label is cleared once the window closes: {settled}"
+        );
+
+        // The window closes, the cancel takes effect, and the ledger settled
+        // the cancelled send exactly once.
+        expect_exit(&mut driver, secs(20));
+        let (outcome, store) = driver.exited();
+        assert_eq!(
+            outcome.get("exit").and_then(Value::as_u64),
+            Some(0),
+            "the cancelled session exits normally: {outcome}"
+        );
+        let totals = store.settlement_totals().expect("settlement totals");
+        assert_eq!(
+            totals.settled_count, 1,
+            "the cancelled send settled exactly once"
+        );
+        assert_eq!(totals.dispatched_count, 0, "no settlement row is left open");
+        drop(store);
+        must(driver.finish(), "pty teardown");
     }
 
     #[test]
@@ -7462,5 +8274,70 @@ mod card_pty {
         press(&mut driver.pty, b"\x1b");
         expect_normal_exit(&mut driver, secs(10));
         teardown(driver);
+    }
+
+    #[test]
+    fn economy_row_budgets_the_narrow_dock() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::ui::{initial_view, render, task_dock};
+
+        // A production-shaped projection: long workspace paths, one numeric
+        // figure and several unknowns with their sources. The narrowest
+        // acceptance geometry is 60x20, where the row has two rows; the wide
+        // frame proves the same fields with room to spare.
+        let economy = json!({
+            "project": "/projects/a-very-long-project-name-over-the-label-limit",
+            "cwd": "/projects/a-very-long-project-name-over-the-label-limit/src",
+            "model": "fixture-model",
+            "connection": "local",
+            "source": "fixed pin",
+            "effort": "high",
+            "effort_source": "sent setting; the endpoint reports no effective effort",
+            "context_tokens": 9,
+            "context_source": "latest settled attempt's reported prompt tokens",
+            "settled_tokens": 12,
+            "charged_units": 2,
+            "quota_remaining": null,
+            "quota_source": "unknown: no quota endpoint reports remaining units",
+            "cache_rate": null,
+            "cache_source": "unknown: settled cache and prompt legs are not both recorded"
+        });
+        let status = json!({
+            "todo": { "items": [
+                { "task_id": "a", "lifecycle": "running" },
+                { "task_id": "b", "lifecycle": "running" },
+                { "task_id": "c", "lifecycle": "running" }
+            ]},
+            "economy": economy
+        });
+        let narrow = ["tok", "unknown", "no quota", "project ", "cwd "];
+        let wide = [
+            "tok",
+            "unknown",
+            "no quota endpoint",
+            "project ",
+            "cwd ",
+            "latest settled attempt",
+            "fixed pin",
+        ];
+        for (cols, rows, needles) in [(60u16, 20u16, &narrow[..]), (180u16, 30u16, &wide[..])] {
+            let mut view = initial_view();
+            view.dock = task_dock(&status);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows))?;
+            render(&mut terminal, &view)?;
+            let buffer = terminal.backend().buffer().clone();
+            let painted: String = buffer
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            for needle in needles {
+                assert!(
+                    painted.contains(needle),
+                    "the {cols}x{rows} economy row paints {needle}: {painted}"
+                );
+            }
+        }
+        Ok(())
     }
 }

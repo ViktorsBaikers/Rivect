@@ -6684,7 +6684,7 @@ fn deterministic_update_and_rollback_make_zero_provider_calls() {
     world
         .runtime
         .broker
-        .dispatch(WORLD, &manifest)
+        .dispatch(&mut rivect::model::NullLedger, WORLD, &manifest)
         .expect("the loopback answers");
     assert_eq!(
         world.provider_calls.load(Ordering::SeqCst),

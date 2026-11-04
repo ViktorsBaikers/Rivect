@@ -3880,7 +3880,7 @@ fn profile_switch_preserves_pinned_model_effort_manual_permissions_and_workflow_
     world
         .runtime
         .broker
-        .dispatch("/world/profile", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/profile", &manifest)
         .expect("dispatch binds the profile");
     let bound = world
         .runtime
@@ -3959,7 +3959,7 @@ fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface(
     world
         .runtime
         .broker
-        .dispatch("/world/status", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/status", &manifest)
         .expect("dispatch");
     let status = world.dispatch(&support::corpus_status(&session));
     assert_eq!(status["result"]["profile"]["active"], json!("p1"));
@@ -4000,7 +4000,7 @@ fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface(
     world
         .runtime
         .broker
-        .dispatch("/world/status", &next)
+        .dispatch(&mut rivect::model::NullLedger, "/world/status", &next)
         .expect("dispatch");
     let status = world.dispatch(&support::corpus_status(&session));
     assert_eq!(status["result"]["profile"]["active"], json!("p2"));
@@ -4062,7 +4062,7 @@ fn profile_change_does_not_replace_draft_or_task_state() {
     world
         .runtime
         .broker
-        .dispatch("/world/draft", &manifest)
+        .dispatch(&mut rivect::model::NullLedger, "/world/draft", &manifest)
         .expect("dispatch");
     assert_eq!(world.last_manifest().as_ref(), Some(&manifest));
 }

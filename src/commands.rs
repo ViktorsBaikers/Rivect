@@ -42,6 +42,13 @@ pub enum Ingress {
     Machine,
 }
 
+/// One recorded budget refusal: the reason a surface paints for a task whose
+/// dispatch never entered a send.
+#[derive(Debug, Clone)]
+pub(crate) struct BudgetWait {
+    reason: String,
+}
+
 /// The runtime's closed binding: the owner and the policy are read through
 /// accessors and never rebound from outside the crate.
 ///
@@ -138,6 +145,18 @@ pub struct Runtime {
     /// answer — cancellation tombstones the attempt through this map,
     /// and the answered candidate dispatches from its frozen manifest.
     pub paused_attempts: BTreeMap<String, PausedAttempt>,
+    /// The one single-flight registry the production executor shares
+    /// (INV-023, AC-060): identical permitted reads merge here, and a
+    /// second registry would charge the same physical read twice.
+    pub(crate) flights: crate::resources::ReadFlights,
+    /// The cached economy projection (AC-062): refreshed after every
+    /// dispatch and at open, so a status read never walks the store.
+    pub(crate) economy: EconomySnapshot,
+    /// Controller-side budget waiting records keyed by `(session, task)`
+    /// (AC-059): an attempt that never entered a send because the frozen
+    /// bound did not fit waits on a named resolution instead of spinning,
+    /// and a status read serves only its own session's records.
+    pub(crate) budget_waiting: BTreeMap<(String, String), BudgetWait>,
     /// The one index seam this runtime shares with every action handler:
     /// the pinned project root and the capped worker that parses it
     /// (AC-036c, DEC-031). One root, one worker program, one helper, one
@@ -585,10 +604,11 @@ impl Runtime {
     /// its one instrumented event.
     pub fn executor(&mut self) -> crate::executor::Executor<'_> {
         let hooks = self.effective.parsed.as_ref().map(|config| &config.hooks);
-        crate::executor::Executor::new(
+        crate::executor::Executor::with_flights(
             &mut self.policy,
             &mut self.owner.store,
             self.read_worker.as_mut(),
+            &mut self.flights,
         )
         .with_hooks(hooks)
     }
@@ -618,6 +638,166 @@ impl Runtime {
             flights,
         )
         .with_hooks(hooks)
+    }
+
+    /// The economy projection the status surface serves (AC-062). Cached:
+    /// [`Runtime::refresh_economy`] is the only writer, so a status read
+    /// never scans the settlement table.
+    #[must_use]
+    pub fn economy(&self) -> &EconomySnapshot {
+        &self.economy
+    }
+
+    /// Rebuilds the cached economy projection: one aggregate read of the
+    /// settled totals plus the facts of the request that just dispatched.
+    /// The controller calls it after `Broker::dispatch` returns, so the
+    /// projection never reads the store the send is still holding.
+    ///
+    /// # Errors
+    /// The storage failure of the aggregate read; the previous snapshot
+    /// stays served.
+    pub fn refresh_economy(&mut self, sent: Option<&RequestManifest>) -> Result<(), StoreError> {
+        let totals = self.owner.store.settlement_totals()?;
+        self.economy.settled_tokens = totals.total_tokens;
+        self.economy.charged_units = totals.charged_units;
+        self.economy.cache_rate = totals.cache_rate();
+        self.economy.pending_sends = totals.dispatched_count;
+        self.economy.agents = u64::try_from(self.scheduler.running_count()).unwrap_or(u64::MAX);
+        // Occupancy is the latest settled attempt's reported prompt tokens —
+        // a real provider figure, named as such — never the request's bytes
+        // relabelled `tok`, and never the lifetime spend beside it.
+        self.economy.context_tokens = totals.latest_prompt_tokens;
+        self.economy.context_source = if totals.latest_prompt_tokens.is_some() {
+            CONTEXT_SOURCE.to_string()
+        } else {
+            "unknown: the latest settled attempt reported no prompt tokens".to_string()
+        };
+        if let Some(manifest) = sent
+            && let Some(landing) = self.landing_settlement(&manifest.attempt_id)?
+        {
+            // The answering settlement row is the only proof a setting
+            // reached a provider. The prepared attempt's own row is the
+            // same send; a substitute row under it means the prepared
+            // selection was never the one that answered — even when the
+            // chain entry reused the same connection.
+            let same_attempt = landing.attempt_id == manifest.attempt_id;
+            let (model, source) = if same_attempt {
+                match &manifest.model {
+                    config::ModelAssign::Fixed(fixed) => {
+                        (Some(fixed.model_id.clone()), Some("fixed pin".to_string()))
+                    }
+                    config::ModelAssign::Auto { .. } => (None, Some("auto pool".to_string())),
+                    config::ModelAssign::Inherit => (None, Some("inherited".to_string())),
+                }
+            } else {
+                let attempted = landing.connection.clone();
+                let source = match landing.state {
+                    crate::state::SettlementState::Dispatched => format!(
+                        "fallback attempt via {attempted} is unresolved; no fallback answered"
+                    ),
+                    crate::state::SettlementState::Settled
+                        if landing.unknown_reason.as_deref() == Some("send failed") =>
+                    {
+                        format!("fallback attempted via {attempted}; no fallback answered")
+                    }
+                    crate::state::SettlementState::Settled => format!(
+                        "fallback answered via {attempted}; the prepared selection was not sent"
+                    ),
+                };
+                (None, Some(source))
+            };
+            self.economy.model = model;
+            self.economy.source = source;
+            self.economy.effort = Some(effort_text(&manifest.effort));
+            self.economy.purpose = Some(manifest.purpose.clone());
+            self.economy.ranking_basis = None;
+            self.economy.connection = Some(landing.connection);
+        }
+        // The project is the pinned root the index seam carries — the tree
+        // the runtime serves — never the data root that happens to hold it.
+        self.economy.project = self.index.root.display().to_string();
+        Ok(())
+    }
+
+    /// The settlement row that answers the current dispatch under
+    /// `attempt_id`: the last substitute settled under it when a fallback
+    /// answered, else its own row when the prepared send entered. `None`
+    /// means the attempt never landed, so no setting may be named.
+    fn landing_settlement(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<crate::state::SettlementRecord>, StoreError> {
+        if let Some(substitute) = self
+            .owner
+            .store
+            .settlements_for_parent(attempt_id)?
+            .into_iter()
+            .last()
+        {
+            return Ok(Some(substitute));
+        }
+        match self.owner.store.settlement(attempt_id) {
+            Ok(row) => Ok(Some(row)),
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The controller-side waiting reason of one task (AC-059): present
+    /// while its last dispatch was refused by budget and nothing has
+    /// resolved the scope since. `None` for a task that is not waiting.
+    #[must_use]
+    pub fn budget_waiting_reason(&self, session: &SessionId, task: &TaskId) -> Option<&str> {
+        self.budget_waiting
+            .get(&(session.0.clone(), task.0.clone()))
+            .map(|wait| wait.reason.as_str())
+    }
+
+    /// The budget levels a dispatch by this task draws from: its scheduler
+    /// node's scope chain, root first. A task the scheduler never submitted
+    /// has no levels — its send still records the settlement and reserves
+    /// nothing. A scheduler refusal is returned, never swallowed: an empty
+    /// chain would silently disable the money gate.
+    pub(crate) fn budget_scopes(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<String>, crate::scheduler::SchedulerError> {
+        let Some(node) = self.scheduler.node_of_task(task) else {
+            return Ok(Vec::new());
+        };
+        self.scheduler
+            .budget_scopes(node)
+            .map(|scopes| scopes.into_iter().map(|id| id.0).collect())
+    }
+
+    /// Records the budget refusal one step ended on: the attempt never
+    /// entered a send, so the task waits on a named resolution instead of
+    /// retrying in a loop.
+    pub(crate) fn record_budget_wait(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        reason: String,
+    ) {
+        self.budget_waiting
+            .insert((session.0.clone(), task.0.clone()), BudgetWait { reason });
+    }
+
+    /// Clears the waiting record once a step leaves the budget refusal.
+    pub(crate) fn clear_budget_wait(&mut self, session: &SessionId, task: &TaskId) {
+        self.budget_waiting
+            .remove(&(session.0.clone(), task.0.clone()));
+    }
+
+    /// Clears the waiting records a cancelled task's tree can no longer
+    /// honour. Descendants whose node already settled at the refusal are not
+    /// in the scheduler's returned node list, so every record of the session
+    /// is dropped: a live sibling re-records its reason on its next refused
+    /// step, while a stale reason for cancelled work would never resolve.
+    pub(crate) fn clear_budget_wait_subtree(&mut self, session: &SessionId, _task: &TaskId) {
+        let session_id = session.0.clone();
+        self.budget_waiting
+            .retain(|(record_session, _), _| record_session != &session_id);
     }
 
     /// The borrowed surfaces an action handler reads, over this runtime's
@@ -831,6 +1011,16 @@ impl Runtime {
         match reconcile_unrecovered_checks(&mut owner.store) {
             Ok(lines) => diagnostics.extend(lines),
             Err(error) => return Err(OpenError::new(error, diagnostics)),
+        }
+        // An interrupted dispatch is closed as unknown and charged at its
+        // bound before any surface serves (HZN-16-11): the attempt is
+        // never blind-resent, and the spend it may have caused is not
+        // released as zero.
+        let reconciled = owner.store.reconcile_sends().map_err(OwnerError::from)?;
+        if reconciled > 0 {
+            diagnostics.push(format!(
+                "settlement recovery: {reconciled} interrupted send(s) closed unknown at the retained bound"
+            ));
         }
         Ok(diagnostics)
     }
@@ -1066,6 +1256,9 @@ impl Runtime {
             boot_diagnostics,
             base_recovery,
             paused_attempts: BTreeMap::new(),
+            flights: crate::resources::ReadFlights::new(),
+            economy: EconomySnapshot::empty(data_root),
+            budget_waiting: BTreeMap::new(),
             index: IndexSeam {
                 root: data_root.to_path_buf(),
                 watch_refusal: None,
@@ -1094,6 +1287,9 @@ impl Runtime {
         // re-pushes it through the same seam.
         runtime.broker.set_config(&runtime.config_for_broker());
         runtime.broker.set_learning_definition(learned);
+        runtime.refresh_economy(None).map_err(|error| {
+            open_failure(OwnerError::from(error), &runtime.boot_diagnostics.clone())
+        })?;
         Ok(runtime)
     }
 
@@ -1220,6 +1416,7 @@ impl Runtime {
             }
             Ok(None) => {
                 self.tombstone_paused(task);
+                self.clear_budget_wait(session_id, task);
                 // The scheduler answered for a dead tree, so the durable
                 // row settles too: the answer commit just wrote
                 // `running`, and a snapshot read off it would report
@@ -1341,6 +1538,16 @@ pub struct StatusResult {
     /// binds under the current config — they diverge only while an
     /// accepted profile edit waits for the next request.
     pub profile: ProfileStatus,
+    /// The cached economy projection (AC-062): the model, connection,
+    /// effort and occupancy of the latest request beside lifetime settled
+    /// spend, each unknown field `None` with the source that would answer
+    /// it. Served from the cache, so a status read never scans the store.
+    pub economy: EconomySnapshot,
+    /// The tasks whose last dispatch was refused by budget and whose scope
+    /// has not resolved since (AC-059): the controller's own waiting record,
+    /// served so a surface can name the resolution the task waits on
+    /// instead of retrying the same refusal blind.
+    pub budget_waiting: Vec<BudgetWaitStatus>,
     pub tasks: Page<crate::contracts::TaskStatus>,
     pub todo: Page<crate::contracts::TodoItem>,
     pub scheduler: Page<crate::contracts::SchedulerItem>,
@@ -1379,6 +1586,28 @@ pub struct StatusResult {
 pub struct ProfileStatus {
     pub pending: Option<String>,
     pub active: Option<String>,
+}
+
+/// One budget refusal the status surface serves (AC-059): the task whose
+/// step waits on a resolution and the reason naming the exhausted scope.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BudgetWaitStatus {
+    pub task_id: String,
+    pub reason: String,
+}
+
+/// The controller's waiting records for this session, in stable task order:
+/// a status read never serves another session's refusal, and a waiting task
+/// outside the current tasks page still appears.
+fn budget_waiting_status(rt: &Runtime, session: &SessionId) -> Vec<BudgetWaitStatus> {
+    rt.budget_waiting
+        .iter()
+        .filter(|((record_session, _), _)| record_session == &session.0)
+        .map(|((_, task_id), wait)| BudgetWaitStatus {
+            task_id: task_id.clone(),
+            reason: wait.reason.clone(),
+        })
+        .collect()
 }
 
 /// One typed instruction conflict as the status surface serves it (AC-076):
@@ -1430,6 +1659,97 @@ fn profile_status(rt: &Runtime) -> ProfileStatus {
     ProfileStatus {
         pending,
         active: bound.profile,
+    }
+}
+
+/// The economy projection the status surface serves (AC-062): what this
+/// runtime is spending, on what, and which figures the endpoint simply does
+/// not report. Every unknown is `None` beside the source that would answer
+/// it — never a zero, never an unlimited reading — and the two token
+/// figures stay distinct: `context_tokens` is the occupancy of the latest
+/// request, `settled_tokens` is lifetime spend.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EconomySnapshot {
+    pub project: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub connection: Option<String>,
+    /// Where the model choice came from; `None` until a dispatch froze one.
+    pub source: Option<String>,
+    /// The effort setting the request actually carried.
+    pub effort: Option<String>,
+    /// Why `effort` is the best available answer: the endpoint reports no
+    /// effective effort, so the sent setting and its source are what a
+    /// surface may name.
+    pub effort_source: String,
+    /// The purpose whose request the effort belongs to.
+    pub purpose: Option<String>,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub context_source: String,
+    pub settled_tokens: Option<u64>,
+    pub charged_units: Option<u64>,
+    pub cache_rate: Option<f64>,
+    pub cache_source: String,
+    pub quota_remaining: Option<u64>,
+    pub quota_source: String,
+    pub reset_at: Option<String>,
+    /// Slots the scheduler currently runs.
+    pub agents: u64,
+    pub ranking_basis: Option<String>,
+    /// Settlements still open: a send in flight or one a killed process
+    /// left for the next open to reconcile.
+    pub pending_sends: u64,
+}
+
+/// The answer a quota-less endpoint earns: an unknown remainder with the
+/// scope that would have reported it, never zero and never unlimited.
+const QUOTA_SOURCE: &str = "unknown: no quota endpoint reports remaining units";
+/// Where the occupancy figure comes from: the latest settled attempt's own
+/// reported prompt tokens.
+const CONTEXT_SOURCE: &str = "latest settled attempt's reported prompt tokens";
+/// The cache rate's source until both cache and prompt legs are settled.
+const CACHE_SOURCE: &str = "unknown: settled cache and prompt legs are not both recorded";
+/// The effort's source: the frozen request is the only recorded setting.
+const EFFORT_SOURCE: &str = "sent setting; the endpoint reports no effective effort";
+
+impl EconomySnapshot {
+    fn empty(project: &Path) -> Self {
+        Self {
+            project: project.display().to_string(),
+            cwd: std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            model: None,
+            connection: None,
+            source: None,
+            effort: None,
+            effort_source: EFFORT_SOURCE.to_string(),
+            purpose: None,
+            context_tokens: None,
+            context_window: None,
+            context_source: CONTEXT_SOURCE.to_string(),
+            settled_tokens: None,
+            charged_units: None,
+            cache_rate: None,
+            cache_source: CACHE_SOURCE.to_string(),
+            quota_remaining: None,
+            quota_source: QUOTA_SOURCE.to_string(),
+            reset_at: None,
+            agents: 0,
+            ranking_basis: None,
+            pending_sends: 0,
+        }
+    }
+}
+
+/// The effort setting one frozen request carried: the closed level names,
+/// so a surface never renders a config spelling of its own.
+fn effort_text(effort: &config::EffortAssign) -> String {
+    match effort {
+        config::EffortAssign::Fixed { value } => value.name().to_string(),
+        config::EffortAssign::Auto => "auto".to_string(),
+        config::EffortAssign::Inherit => "inherit".to_string(),
     }
 }
 
@@ -3031,6 +3351,7 @@ fn handle_method(
                 Ok(update) => update,
                 Err(err) => return base_error(id, &err),
             };
+            let budget_waiting = budget_waiting_status(rt, &session);
             let result = StatusResult {
                 schema_version: SCHEMA_VERSION,
                 session_id: session,
@@ -3038,6 +3359,8 @@ fn handle_method(
                 state: "ready".to_string(),
                 workflow: rt.effective.workflow_entry.clone(),
                 profile: profile_status(rt),
+                economy: rt.economy().clone(),
+                budget_waiting,
                 tasks,
                 todo,
                 scheduler,
@@ -4753,9 +5076,11 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 .cancel_task(&session, &task, expected_intent, reason)
             {
                 Ok(result) => {
+                    rt.clear_budget_wait_subtree(&session, &task);
                     // The tree drains with the store cancellation: the
                     // remaining children of the cancelled task never admit
-                    // or dispatch (AC-012).
+                    // or dispatch (AC-012), and none of them stays on the
+                    // waiting surface.
                     match rt.scheduler.cancel_task_tree(&task) {
                         Ok(_) => {
                             rt.tombstone_paused(&task);

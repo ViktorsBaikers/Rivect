@@ -179,7 +179,7 @@ async fn llama_cpp_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/llama", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/llama", &manifest);
             (broker, replay)
         })
         .join()
@@ -974,7 +974,7 @@ async fn lm_studio_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/studio", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/studio", &manifest);
             (broker, replay)
         })
         .join()
@@ -1995,7 +1995,7 @@ async fn minimax_code_valid_control_yields_one_outcome_and_one_physical_usage() 
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/minimax", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/minimax", &manifest);
             (broker, replay)
         })
         .join()
@@ -2680,7 +2680,7 @@ async fn minimax_code_cn_valid_control_yields_one_outcome_and_one_physical_usage
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/minimax-cn", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/minimax-cn", &manifest);
             (broker, replay)
         })
         .join()
@@ -3403,7 +3403,7 @@ async fn mistral_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/mistral", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/mistral", &manifest);
             (broker, replay)
         })
         .join()
@@ -4350,7 +4350,7 @@ async fn moonshot_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/moonshot", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/moonshot", &manifest);
             (broker, replay)
         })
         .join()
@@ -5288,7 +5288,7 @@ async fn nanogpt_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/nanogpt", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/nanogpt", &manifest);
             (broker, replay)
         })
         .join()
@@ -6124,7 +6124,7 @@ async fn novita_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/novita", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/novita", &manifest);
             (broker, replay)
         })
         .join()
@@ -7087,7 +7087,7 @@ async fn nvidia_valid_control_yields_one_outcome_and_one_physical_usage() {
         let manifest = manifest.clone();
         std::thread::spawn(move || {
             let mut broker = broker;
-            let replay = broker.dispatch("/world/nvidia", &manifest);
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/nvidia", &manifest);
             (broker, replay)
         })
         .join()

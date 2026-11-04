@@ -16,6 +16,8 @@ use crate::index::{
     ProjectGraph, SourceRef, StaleCause,
 };
 use crate::model::InputOrigin;
+use crate::model::{Ledger, LedgerError, RequestManifest, SendContext, SendOutcome, SendTicket};
+use crate::resources::{Exactness, UsageBins, UsageDelta};
 use crate::verification::{AssumptionCheckRecord, RetainedAttempt};
 use rivect_sandbox_helper::{REUSE_TOKEN_MAX, ReuseToken};
 use rusqlite::types::Value as SqlValue;
@@ -50,6 +52,8 @@ pub enum Missing {
     BudgetScope(String),
     #[error("budget reservation {0}")]
     Reservation(String),
+    #[error("usage settlement {0}")]
+    Settlement(String),
     #[error("obligation")]
     Obligation,
     #[error("learning delta {0}")]
@@ -127,6 +131,10 @@ pub enum ConflictCause {
         reserved: u64,
         bound: u64,
     },
+    #[error("usage settlement {attempt_id} is already recorded")]
+    SettlementAlreadyRecorded { attempt_id: String },
+    #[error("usage settlement {attempt_id} is {state}, not dispatched")]
+    SettlementNotDispatched { attempt_id: String, state: String },
     #[error("task has no plan selection")]
     PlanSelectionMissing,
     #[error("plan facts do not match the current selection revision {revision}")]
@@ -180,6 +188,11 @@ pub enum InvalidCause {
     EmptyBudgetScopes,
     #[error("confirmed cost {confirmed} exceeds reservation bound {bound}")]
     ConfirmedExceedsBound { confirmed: u64, bound: u64 },
+    #[error("settlement {attempt_id} claims {exactness} exactness without a confirmed total")]
+    SettlementMissingTotal {
+        attempt_id: String,
+        exactness: &'static str,
+    },
 }
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -1727,7 +1740,10 @@ impl TaskStore {
             .conn()?
             .query_row(sql::RECOVERY_TABLES_PRESENT, [], |row| row.get(0))
             .map_err(storage)?;
-        Ok(present == 3)
+        // Four: the settlement reconciliation reads `usage_settlements`, so a
+        // store predating that additive table takes the post-commit path and
+        // the DDL exists before the first read.
+        Ok(present == 4)
     }
 
     /// The production startup's single commit: see
@@ -6538,6 +6554,21 @@ impl TaskStore {
             .conn_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
+        Self::resolve_reservation_tx(&tx, reservation_id, terminal_state, confirmed, release)?;
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// The resolution body both the standalone charge/release and the
+    /// settlement's own transaction run: a caller that must settle a row
+    /// and resolve its reservation atomically passes the same `tx` to both.
+    fn resolve_reservation_tx(
+        tx: &rusqlite::Transaction<'_>,
+        reservation_id: &str,
+        terminal_state: &'static str,
+        confirmed: Option<i64>,
+        release: bool,
+    ) -> Result<()> {
         let rows = tx
             .prepare(sql::BUDGET_RESERVATION_SCOPES)
             .map_err(storage)?
@@ -6608,7 +6639,6 @@ impl TaskStore {
             params![reservation_id, terminal_state, confirmed],
         )
         .map_err(storage)?;
-        tx.commit().map_err(storage)?;
         Ok(())
     }
 
@@ -6644,6 +6674,369 @@ impl TaskStore {
             // The scope row itself failed to read: the storage error
             // wins over guessing an admission verdict.
             Err(source) => storage(source),
+        }
+    }
+
+    // ----- usage settlements (AC-057) -----
+
+    /// Begins one dispatched child attempt (AC-057, DEC-012): the frozen
+    /// bound is reserved at every open scope and the `dispatched`
+    /// settlement row is inserted in one `IMMEDIATE` transaction, so no
+    /// crash can separate the reservation from the row that names it.
+    /// A scope that was never opened is not a level the request draws
+    /// from, so it is skipped rather than refused.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] with `BudgetExhausted` when an open scope
+    /// cannot fit the bound (nothing is reserved), with
+    /// `SettlementAlreadyRecorded` on a replay, or
+    /// [`StoreError::InvalidInput`] for an unstorable bound.
+    pub fn begin_send(
+        &mut self,
+        scopes: &[&str],
+        context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> Result<SendTicket> {
+        let stored_bound = budget_units_i64(manifest.cost_bound)?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let replayed: bool = tx
+            .query_row(sql::SETTLEMENT_ROW, params![manifest.attempt_id], |_row| {
+                Ok(true)
+            })
+            .optional()
+            .map_err(storage)?
+            .unwrap_or(false);
+        if replayed {
+            return Err(StoreError::Conflict(
+                ConflictCause::SettlementAlreadyRecorded {
+                    attempt_id: manifest.attempt_id.clone(),
+                },
+            ));
+        }
+        let mut open: Vec<&str> = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            let exists: bool = tx
+                .query_row(sql::BUDGET_SCOPE_EXISTS, params![scope], |row| row.get(0))
+                .map_err(storage)?;
+            if exists && !open.contains(scope) {
+                open.push(scope);
+            }
+        }
+        for scope in &open {
+            // The admission invariant rides in the WHERE clause, exactly
+            // as the standalone reserve does: the check and the increment
+            // are one statement.
+            let reserved = tx
+                .execute(sql::RESERVE_BUDGET, params![scope, stored_bound])
+                .map_err(storage)?;
+            if reserved == 0 {
+                return Err(Self::reserve_denied(&tx, scope, manifest.cost_bound));
+            }
+            tx.execute(
+                sql::INSERT_BUDGET_RESERVATION,
+                params![manifest.attempt_id, scope, stored_bound],
+            )
+            .map_err(storage)?;
+        }
+        tx.execute(
+            sql::INSERT_SETTLEMENT_DISPATCHED,
+            params![
+                manifest.attempt_id,
+                context.parent_attempt_id,
+                context.purpose,
+                context.connection,
+                context.ranking_basis,
+                stored_bound,
+            ],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
+        Ok(SendTicket {
+            attempt_id: manifest.attempt_id.clone(),
+            cost_bound: manifest.cost_bound,
+            reserved: !open.is_empty(),
+        })
+    }
+
+    /// Closes one dispatched attempt (AC-057, DEC-012): the row settles
+    /// with the provider's bins, exactness, unknown reason, wire retries
+    /// and the units actually charged, and the reservation resolves —
+    /// all in one transaction, so a crash cannot charge twice or settle
+    /// without charging. The charge is `min(confirmed_total, bound)`;
+    /// unknown usage retains the bound, never released as zero.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] with `SettlementNotDispatched` when the
+    /// row is absent or already settled (a replay), and
+    /// [`StoreError::InvalidInput`] when the outcome claims an exactness
+    /// it carries no total for.
+    pub fn finish_send(&mut self, ticket: &SendTicket, outcome: &SendOutcome) -> Result<()> {
+        let (usage, wire_retries) = match outcome {
+            SendOutcome::Settled {
+                usage,
+                wire_retries,
+            } => (*usage, *wire_retries),
+            SendOutcome::Failed { wire_retries } => (UsageDelta::Unknown, *wire_retries),
+        };
+        let bins = usage.bins();
+        let exactness = usage.exactness();
+        let confirmed = usage.confirmed_total();
+        // An estimate (reported legs without a total) is settleable: its bins
+        // are kept and the retained bound caps the charge. Only an `exact`
+        // row that claims exactness without a total is a caller defect.
+        if exactness == Exactness::Exact && confirmed.is_none() {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::SettlementMissingTotal {
+                    attempt_id: ticket.attempt_id.clone(),
+                    exactness: exactness.as_str(),
+                },
+            ));
+        }
+        let unknown_reason = match (exactness, outcome) {
+            (Exactness::Unknown, SendOutcome::Failed { .. }) => Some("send failed"),
+            (Exactness::Unknown, SendOutcome::Settled { .. }) => Some("provider reported no usage"),
+            (Exactness::Exact | Exactness::Estimate, _) => None,
+        };
+        // The bound caps the charge: a confirmed total above it settles
+        // its exact bins and still charges at most the frozen bound.
+        let charged = ticket
+            .reserved
+            .then(|| confirmed.map_or(ticket.cost_bound, |total| total.min(ticket.cost_bound)));
+        let stored_charged = charged.map(budget_units_i64).transpose()?;
+        let stored_bins = [
+            bins.prompt_tokens.map(budget_units_i64).transpose()?,
+            bins.completion_tokens.map(budget_units_i64).transpose()?,
+            bins.reasoning_tokens.map(budget_units_i64).transpose()?,
+            bins.cache_read_tokens.map(budget_units_i64).transpose()?,
+            bins.cache_write_tokens.map(budget_units_i64).transpose()?,
+            bins.total_tokens.map(budget_units_i64).transpose()?,
+        ];
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let settled = tx
+            .execute(
+                sql::SETTLE_USAGE_SETTLEMENT,
+                params![
+                    ticket.attempt_id,
+                    exactness.as_str(),
+                    unknown_reason,
+                    wire_retries,
+                    stored_bins[0],
+                    stored_bins[1],
+                    stored_bins[2],
+                    stored_bins[3],
+                    stored_bins[4],
+                    stored_bins[5],
+                    stored_charged,
+                ],
+            )
+            .map_err(storage)?;
+        if settled == 0 {
+            return Err(Self::settlement_not_dispatched(&tx, &ticket.attempt_id));
+        }
+        if ticket.reserved {
+            Self::resolve_reservation_tx(
+                &tx,
+                &ticket.attempt_id,
+                "charged",
+                stored_charged,
+                false,
+            )?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(())
+    }
+
+    /// Closes every interrupted `dispatched` row on reopen (HZN-16-11):
+    /// the send may have reached the provider, so its usage is unknown
+    /// and the bound is charged — the attempt is never blind-resent, and
+    /// a later replay reads the settled unknown row.
+    ///
+    /// # Errors
+    /// The storage failure of the reconciliation transaction; the rows
+    /// stay open for the next open.
+    pub fn reconcile_sends(&mut self) -> Result<u64> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let interrupted = tx
+            .prepare(sql::DISPATCHED_SETTLEMENTS)
+            .map_err(storage)?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        let mut reconciled = 0u64;
+        for (attempt_id, bound) in interrupted {
+            // The row's charged figure names what the ledger actually held:
+            // a send begun with no open scope reserved nothing, so its
+            // interrupted row settles unknown with no charge.
+            let reserved = Self::reservation_is_open(&tx, &attempt_id)?;
+            let charged = reserved.then_some(bound);
+            let settled = tx
+                .execute(
+                    sql::SETTLE_USAGE_SETTLEMENT,
+                    params![
+                        attempt_id,
+                        Exactness::Unknown.as_str(),
+                        Some("interrupted"),
+                        0,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        Option::<i64>::None,
+                        charged,
+                    ],
+                )
+                .map_err(storage)?;
+            if settled == 0 {
+                continue;
+            }
+            if reserved {
+                Self::resolve_reservation_tx(&tx, &attempt_id, "charged", Some(bound), false)?;
+            }
+            reconciled += 1;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(reconciled)
+    }
+
+    /// The newest settlement row: what a proof reads when it does not own
+    /// the minted attempt id.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with `Missing::Settlement` when no row exists.
+    pub fn latest_settlement(&self) -> Result<SettlementRecord> {
+        let row = self
+            .conn()?
+            .query_row(sql::LATEST_SETTLEMENT, [], settlement_from_row)
+            .optional()
+            .map_err(storage)?;
+        match row {
+            Some(row) => row.into_record(),
+            None => Err(StoreError::NotFound(Missing::Settlement(
+                "latest".to_string(),
+            ))),
+        }
+    }
+
+    /// The settlements one parent attempt's substitutes recorded: the
+    /// lineage a parent total is derived from, never a second total.
+    ///
+    /// # Errors
+    /// The storage failure of that read.
+    pub fn settlements_for_parent(&self, parent: &str) -> Result<Vec<SettlementRecord>> {
+        self.conn()?
+            .prepare(sql::SETTLEMENTS_FOR_PARENT)
+            .map_err(storage)?
+            .query_map(params![parent], settlement_from_row)
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?
+            .into_iter()
+            .map(StoredSettlement::into_record)
+            .collect()
+    }
+
+    /// Whether one reservation still holds every scope at `reserved`: a
+    /// reservation that is absent or already terminal holds nothing to
+    /// resolve. Read beside the settle inside the same transaction, so the
+    /// decision and the write see one state.
+    fn reservation_is_open(tx: &rusqlite::Transaction<'_>, reservation_id: &str) -> Result<bool> {
+        let mut statement = tx
+            .prepare(sql::BUDGET_RESERVATION_SCOPES)
+            .map_err(storage)?;
+        let rows = statement
+            .query_map(params![reservation_id], |row| row.get::<_, String>(2))
+            .map_err(storage)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage)?;
+        Ok(!rows.is_empty() && rows.iter().all(|state| state == "reserved"))
+    }
+
+    /// One settlement row as the status projection reads it.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with `Missing::Settlement` for an attempt
+    /// this store never began, and typed storage errors for a corrupted
+    /// row.
+    pub fn settlement(&self, attempt_id: &str) -> Result<SettlementRecord> {
+        let row = self
+            .conn()?
+            .query_row(
+                sql::SETTLEMENT_ROW,
+                params![attempt_id],
+                settlement_from_row,
+            )
+            .optional()
+            .map_err(storage)?;
+        row.ok_or_else(|| StoreError::NotFound(Missing::Settlement(attempt_id.to_string())))?
+            .into_record()
+    }
+
+    /// The lifetime settled totals of the status projection (AC-062): one
+    /// aggregate statement, so a status read never walks the settlement
+    /// rows.
+    ///
+    /// # Errors
+    /// The storage failure of that read.
+    pub fn settlement_totals(&self) -> Result<SettlementTotals> {
+        self.conn()?
+            .query_row(sql::SETTLEMENT_TOTALS, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(storage)
+            .and_then(
+                |(count, total, prompt, cache_read, charged, dispatched, latest)| -> Result<
+                    SettlementTotals,
+                > {
+                    Ok(SettlementTotals {
+                        settled_count: unsigned(count)?,
+                        total_tokens: total.map(unsigned).transpose()?,
+                        prompt_tokens: prompt.map(unsigned).transpose()?,
+                        cache_read_tokens: cache_read.map(unsigned).transpose()?,
+                        charged_units: charged.map(unsigned).transpose()?,
+                        dispatched_count: unsigned(dispatched)?,
+                        latest_prompt_tokens: latest.map(unsigned).transpose()?,
+                    })
+                },
+            )
+    }
+
+    /// Why one settle found no open row: an absent row is a missing
+    /// settlement, an already-closed one is the exactly-once refusal.
+    fn settlement_not_dispatched(tx: &rusqlite::Transaction<'_>, attempt_id: &str) -> StoreError {
+        let state = tx
+            .query_row(sql::SETTLEMENT_ROW, params![attempt_id], |row| {
+                row.get::<_, String>(6)
+            })
+            .optional()
+            .map_err(storage);
+        match state {
+            Ok(None) => StoreError::NotFound(Missing::Settlement(attempt_id.to_string())),
+            Ok(Some(state)) => StoreError::Conflict(ConflictCause::SettlementNotDispatched {
+                attempt_id: attempt_id.to_string(),
+                state,
+            }),
+            Err(error) => error,
         }
     }
 }
@@ -7396,6 +7789,29 @@ impl StoreWriter<'_> {
     }
 
     /// # Errors
+    /// See [`TaskStore::begin_send`].
+    pub fn begin_send(
+        &mut self,
+        scopes: &[&str],
+        context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> Result<SendTicket> {
+        self.store.begin_send(scopes, context, manifest)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::finish_send`].
+    pub fn finish_send(&mut self, ticket: &SendTicket, outcome: &SendOutcome) -> Result<()> {
+        self.store.finish_send(ticket, outcome)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::reconcile_sends`].
+    pub fn reconcile_sends(&mut self) -> Result<u64> {
+        self.store.reconcile_sends()
+    }
+
+    /// # Errors
     /// See [`TaskStore::force_compaction`].
     pub fn force_compaction(
         &mut self,
@@ -7605,6 +8021,217 @@ impl BudgetReservationState {
                 format!("unknown budget reservation state {raw:?}"),
             ))),
         }
+    }
+}
+
+/// One settlement row as the status projection and the proofs read it
+/// (AC-057): the physical child attempt, the attempt it fell back from,
+/// the frozen bound, the provider bins and exactness, the wire retries,
+/// and the units actually charged. Every counter keeps the provider's own
+/// presence — a reported zero is `Some(0)`, a missing one is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementRecord {
+    pub attempt_id: String,
+    pub parent_attempt_id: Option<String>,
+    pub purpose: String,
+    pub connection: String,
+    pub ranking_basis: Option<String>,
+    pub cost_bound: u64,
+    pub state: SettlementState,
+    pub exactness: Exactness,
+    pub unknown_reason: Option<String>,
+    pub wire_retries: u32,
+    pub bins: UsageBins,
+    /// The units the bound was charged: `None` while the row is open or
+    /// no scope was open, `Some(bound)` when the usage stayed unknown.
+    pub charged_units: Option<u64>,
+}
+
+/// The one-way settlement lifecycle: a row is opened `dispatched` and
+/// closed `settled`, never reopened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementState {
+    Dispatched,
+    Settled,
+}
+
+impl SettlementState {
+    fn from_db(raw: &str) -> Result<Self> {
+        match raw {
+            "dispatched" => Ok(Self::Dispatched),
+            "settled" => Ok(Self::Settled),
+            _ => Err(corrupt_column("settlement state", raw)),
+        }
+    }
+}
+
+/// The lifetime settled totals one aggregate read answers (AC-062):
+/// occupancy is a request figure, and this is lifetime spend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettlementTotals {
+    pub settled_count: u64,
+    pub total_tokens: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub charged_units: Option<u64>,
+    /// Rows still `dispatched`: a send in flight or one an interrupted
+    /// process left for the next open to reconcile.
+    pub dispatched_count: u64,
+    /// The prompt tokens of the latest settled attempt: the model-visible
+    /// prefix the provider last reported, so the status can call it a real
+    /// token figure instead of deriving one from wire bytes.
+    pub latest_prompt_tokens: Option<u64>,
+}
+
+impl SettlementTotals {
+    /// The cache-read share of the settled prompt tokens: `None` until
+    /// both legs are known, so an unknown rate is never reported as zero.
+    #[must_use]
+    pub fn cache_rate(&self) -> Option<f64> {
+        let read = self.cache_read_tokens?;
+        let prompt = self.prompt_tokens?;
+        if prompt == 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a token count past f64's exact range is not a rate worth more precision than the display"
+        )]
+        Some(read as f64 / prompt as f64)
+    }
+}
+
+/// One settlement row's raw columns, before the closed vocabularies are
+/// resolved — the same read-then-decode shape the store's other strict
+/// columns use.
+struct StoredSettlement {
+    attempt_id: String,
+    parent_attempt_id: Option<String>,
+    purpose: String,
+    connection: String,
+    ranking_basis: Option<String>,
+    cost_bound: i64,
+    state: String,
+    exactness: String,
+    unknown_reason: Option<String>,
+    wire_retries: i64,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    charged_units: Option<i64>,
+}
+
+impl StoredSettlement {
+    fn into_record(self) -> Result<SettlementRecord> {
+        let exactness = Exactness::from_db(&self.exactness)
+            .ok_or_else(|| corrupt_column("settlement exactness", &self.exactness))?;
+        Ok(SettlementRecord {
+            attempt_id: self.attempt_id,
+            parent_attempt_id: self.parent_attempt_id,
+            purpose: self.purpose,
+            connection: self.connection,
+            ranking_basis: self.ranking_basis,
+            cost_bound: unsigned(self.cost_bound)?,
+            state: SettlementState::from_db(&self.state)?,
+            exactness,
+            unknown_reason: self.unknown_reason,
+            wire_retries: u32::try_from(self.wire_retries).map_err(|_negative| {
+                corrupt_column("settlement wire retries", &self.wire_retries.to_string())
+            })?,
+            bins: UsageBins {
+                prompt_tokens: self.prompt_tokens.map(unsigned).transpose()?,
+                completion_tokens: self.completion_tokens.map(unsigned).transpose()?,
+                reasoning_tokens: self.reasoning_tokens.map(unsigned).transpose()?,
+                cache_read_tokens: self.cache_read_tokens.map(unsigned).transpose()?,
+                cache_write_tokens: self.cache_write_tokens.map(unsigned).transpose()?,
+                total_tokens: self.total_tokens.map(unsigned).transpose()?,
+            },
+            charged_units: self.charged_units.map(unsigned).transpose()?,
+        })
+    }
+}
+
+fn settlement_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSettlement> {
+    Ok(StoredSettlement {
+        attempt_id: row.get(0)?,
+        parent_attempt_id: row.get(1)?,
+        purpose: row.get(2)?,
+        connection: row.get(3)?,
+        ranking_basis: row.get(4)?,
+        cost_bound: row.get(5)?,
+        state: row.get(6)?,
+        exactness: row.get(7)?,
+        unknown_reason: row.get(8)?,
+        wire_retries: row.get(9)?,
+        prompt_tokens: row.get(10)?,
+        completion_tokens: row.get(11)?,
+        reasoning_tokens: row.get(12)?,
+        cache_read_tokens: row.get(13)?,
+        cache_write_tokens: row.get(14)?,
+        total_tokens: row.get(15)?,
+        charged_units: row.get(16)?,
+    })
+}
+
+/// The store-backed ledger the Broker dispatch receives (DEC-012): the
+/// disjoint store borrow plus the scope chain the runtime's scheduler
+/// names for the task. `begin_send` reserves at every open scope of that
+/// chain; an empty chain records the settlement without a reservation.
+pub struct StoreLedger<'a> {
+    store: &'a mut TaskStore,
+    scopes: Vec<String>,
+}
+
+impl<'a> StoreLedger<'a> {
+    #[must_use]
+    pub fn new(store: &'a mut TaskStore, scopes: Vec<String>) -> Self {
+        Self { store, scopes }
+    }
+}
+
+impl std::fmt::Debug for StoreLedger<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreLedger")
+            .field("scopes", &self.scopes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One store refusal at the ledger seam: the budget refusals keep their
+/// own variant so dispatch can map them to a waiting outcome, and every
+/// other failure stays the store's typed error.
+fn ledger_error(error: StoreError) -> LedgerError {
+    match error {
+        StoreError::Conflict(ConflictCause::BudgetExhausted { scope, .. }) => {
+            LedgerError::BudgetExhausted { scope }
+        }
+        other => LedgerError::Store(other),
+    }
+}
+
+impl Ledger for StoreLedger<'_> {
+    fn begin_send(
+        &mut self,
+        context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> std::result::Result<SendTicket, LedgerError> {
+        let scopes: Vec<&str> = self.scopes.iter().map(String::as_str).collect();
+        self.store
+            .begin_send(&scopes, context, manifest)
+            .map_err(ledger_error)
+    }
+
+    fn finish_send(
+        &mut self,
+        ticket: &SendTicket,
+        outcome: &SendOutcome,
+    ) -> std::result::Result<(), LedgerError> {
+        self.store
+            .finish_send(ticket, outcome)
+            .map_err(LedgerError::Store)
     }
 }
 
