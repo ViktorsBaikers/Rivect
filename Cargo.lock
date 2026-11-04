@@ -2314,6 +2314,7 @@ dependencies = [
  "crossterm",
  "filedescriptor",
  "focaccia",
+ "getrandom 0.3.4",
  "globset",
  "grep-matcher",
  "grep-regex",

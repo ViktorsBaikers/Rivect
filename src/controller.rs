@@ -226,12 +226,13 @@ impl ControllerError {
             // publishable question — the honest class is a blocked
             // decision dependency, never a denial.
             Self::Model(ModelError::ManualFallbackPending { .. }) => ErrorCode::DependencyBlocked,
-            // A parameter the frozen request cannot honour is the
-            // caller's own input, never a denial of the connection:
-            // sibling caller-input causes carry their own code too.
-            Self::Model(ModelError::Provider(ProviderError::UnsupportedParameter { .. })) => {
-                ErrorCode::InvalidInput
-            }
+            // A parameter the frozen request cannot honour, or a base
+            // the connection declaration must supply, is the caller's
+            // own input, never a denial of the connection: sibling
+            // caller-input causes carry their own code too.
+            Self::Model(ModelError::Provider(
+                ProviderError::UnsupportedParameter { .. } | ProviderError::EndpointRequired { .. },
+            )) => ErrorCode::InvalidInput,
             Self::Model(_) => ErrorCode::Denied,
             Self::Executor(error) => error.error_code(),
             Self::Scheduler(SchedulerError::UnitsExceedCap { .. }) => ErrorCode::BudgetExhausted,

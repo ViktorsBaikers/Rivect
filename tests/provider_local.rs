@@ -890,6 +890,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::DialectUnserved { .. }) => "DialectUnserved",
         Some(ProviderError::UnpinnedModel { .. }) => "UnpinnedModel",
         Some(ProviderError::RegionMismatch { .. }) => "RegionMismatch",
+        Some(ProviderError::EndpointRequired { .. }) => "EndpointRequired",
         Some(ProviderError::Transport { .. }) => "Transport",
         Some(ProviderError::ProviderFailed { .. }) => "ProviderFailed",
         Some(ProviderError::UnknownTerminal { .. }) => "UnknownTerminal",
@@ -1735,6 +1736,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         DialectUnserved,
         UnpinnedModel,
         RegionMismatch,
+        EndpointRequired,
         Transport,
         ProviderFailed,
         UnknownTerminal,
@@ -1765,6 +1767,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::DialectUnserved { .. } => ProviderVariant::DialectUnserved,
             ProviderError::UnpinnedModel { .. } => ProviderVariant::UnpinnedModel,
             ProviderError::RegionMismatch { .. } => ProviderVariant::RegionMismatch,
+            ProviderError::EndpointRequired { .. } => ProviderVariant::EndpointRequired,
             ProviderError::Transport { .. } => ProviderVariant::Transport,
             ProviderError::ProviderFailed { .. } => ProviderVariant::ProviderFailed,
             ProviderError::UnknownTerminal { .. } => ProviderVariant::UnknownTerminal,
@@ -6124,6 +6127,7 @@ async fn aiand_catalog_is_the_authoritative_org_listing_over_the_static_seed() {
             id: "unseeded-org-model".to_string(),
             reasoning: true,
             vision: true,
+            tools: false,
             efforts: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
             effort_default: Some(EffortLevel::Medium),
             context_window: Some(262144),
@@ -7879,6 +7883,7 @@ async fn alibaba_coding_plan_catalog_is_the_recorded_allowlist_without_a_wire_le
         id: id.to_string(),
         reasoning: false,
         vision,
+        tools: false,
         efforts: vec![],
         effort_default: None,
         context_window: None,
@@ -21014,3 +21019,4 @@ include!("provider_local/band2.rs");
 // Band-3 tests keep their root names; the split restores the duplicate scanner's per-file coverage.
 include!("provider_local/band3.rs");
 include!("provider_local/band4.rs");
+include!("provider_local/band5.rs");

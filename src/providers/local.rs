@@ -288,7 +288,17 @@
 //! dial's `low`/`high` wire values ride verbatim; the recorded remap
 //! (`minimal`→`low`, `medium`→`high`, `xhigh`→`max`) has no manifest
 //! carrier, so those pins deny typed rather than sending an unrecorded
-//! wire value.
+//! wire value. The configured-or-recorded
+//! `https://open.bigmodel.cn/api/coding/paas/v4` base of
+//! `zhipu-coding-plan` carries its key-gated authoritative `/models`
+//! listing: listed ids ride the generic metadata surface the listing
+//! states, no seed floor exists, and the recorded `<id>.<secret>`
+//! credential form — material outside that grammar denies typed before
+//! any wire leg — rides the bearer verbatim. The recorded `zai` thinking
+//! surface streams `reasoning_content` as progress, never joined to
+//! `text`; the body constructs no developer role, and the class records
+//! no effort dial, so a pinned `reasoning_effort` denies typed rather
+//! than being dropped.
 //! The adapter authors no async code — [`Provider::send`] is a blocking
 //! single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -320,10 +330,11 @@ use crate::model::RequestManifest;
 use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, TransportCause, bounded_reason, check_deadline, dialect_for,
-    payload_reason, read_catalog_body, read_chunk, resolve_credential,
-    resolve_optional_credential_in, sse, transport, transport_status, violation, wire_body,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES, ToolCall,
+    TransportCause, WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
+    payload_reason, positive_count, read_catalog_body, read_chunk, resolve_credential,
+    resolve_optional_credential_in, routes_for, sse, transport, transport_status, violation,
+    wire_body, wire_effort,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -1183,6 +1194,12 @@ const YOLO_AUTO_SEED_MODEL: &str = "deepseek-flash-v4";
 /// The pinned seed row's recorded context window in tokens.
 const YOLO_AUTO_SEED_CONTEXT_WINDOW: u64 = 131_072;
 
+/// The recorded default API root of a `zhipu-coding-plan` connection
+/// (DEC-007): the coding-plan class's own base path, never the general
+/// API root, with `{base}/chat/completions` as the inference ingress. A
+/// configured `region` denies typed: the contract names none.
+const ZHIPU_CODING_PLAN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+
 /// The recorded per-model K3 effort ladder the pinned `moonshot`
 /// rows state (`reasoning_effort` `low`/`high`): a level a model
 /// does not name is a parameter its wire contract rejects, so a pin
@@ -1347,6 +1364,13 @@ enum CredentialRule {
     /// not in the catalogue: [`CatalogRule::UnauthenticatedListing`] is
     /// `kilo`'s separate discovery tolerance over an absent scope.
     OpenProxy,
+    /// `zhipu-coding-plan`'s recorded credential (DEC-007): the coding
+    /// plan's key is the `<id>.<secret>` form — a dot-separated pair
+    /// whose two halves name the account id and the secret, each
+    /// non-empty — and the trimmed material is the bearer verbatim.
+    /// Material outside that grammar names no enrolled coding-plan key
+    /// and denies as malformed before any wire leg.
+    Zhipu,
 }
 
 /// The recorded per-entry transform a `data[]` listing runs
@@ -1560,6 +1584,17 @@ enum EntryRule {
     /// denies the remapped ones typed rather than sending an unrecorded
     /// wire value.
     YoloAuto,
+    /// The `zhipu-coding-plan` arm: the key-gated authoritative
+    /// `/models` listing is the offer set, each admitted entry mapping
+    /// the generic metadata the listing states (`context_length`,
+    /// `max_completion_tokens`) and nothing else — no seed floor and no
+    /// borrowed capability or price surface. The class records no
+    /// reasoning-effort dial: [`ChatCompletionsProvider::check_parameters`]
+    /// denies every pinned `reasoning_effort` typed rather than dropping
+    /// it from the body, while a streamed `reasoning_content` fragment
+    /// stays progress and never joins `text` (the shared delta
+    /// reducer's rule).
+    Zhipu,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -1586,6 +1621,26 @@ struct SourceContract {
     entries: EntryRule,
 }
 
+/// The recorded GitLab Duo proxy base (DEC-013) and the CC aliases'
+/// `upstreamModelId` table; the routed owner supplies this base as the
+/// codec's configured endpoint.
+const GITLAB_OPENAI_PROXY: &str = "https://cloud.gitlab.com/ai/v1/proxy/openai/v1";
+
+/// The recorded `opencode-zen` Chat Completions base: the routed owner
+/// passes `{base}/v1` as the configured endpoint, and an empty endpoint
+/// resolves this recorded API root.
+const OPENCODE_ZEN_CC_BASE: &str = "https://opencode.ai/zen/v1";
+
+/// The recorded `opencode-go` Chat Completions base: the routed owner
+/// passes `{base}/v1` as the configured endpoint, and an empty endpoint
+/// resolves this recorded API root.
+const OPENCODE_GO_CC_BASE: &str = "https://opencode.ai/zen/go/v1";
+const GITLAB_COMPLETIONS_MODELS: &[(&str, bool)] = &[
+    ("gpt-5.1-2025-11-13", false),
+    ("gpt-5.2-2025-12-11", false),
+    ("gpt-5-mini-2025-08-07", false),
+];
+
 /// The recorded per-connection contract for a Chat Completions id
 /// (DEC-007/DEC-025): `build` denies every id without the recorded
 /// Chat Completions class before this lookup runs, and an id the
@@ -1594,6 +1649,35 @@ struct SourceContract {
 /// predicates as a named arm here, never inherits another's.
 fn contract_for(connection: &str) -> Option<SourceContract> {
     match connection {
+        "gitlab-duo" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(GITLAB_OPENAI_PROXY),
+            catalog: CatalogRule::Allowlist(GITLAB_COMPLETIONS_MODELS),
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
+        // DEC-014/DEC-020: the routed owner passes `{base}/v1` as the
+        // configured endpoint, and this arm is also the gateway's
+        // whole catalogue reader — the listing is the source, and every
+        // id whose route the table records is offered.
+        "opencode-go" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(OPENCODE_GO_CC_BASE),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
+        // DEC-014: the routed owner passes `{base}/v1` as the
+        // configured endpoint, and this arm is also the gateway's
+        // whole catalogue reader — the listing is the source, and every
+        // id whose route the table records is offered.
+        "opencode-zen" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(OPENCODE_ZEN_CC_BASE),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
         "custom-chat-completions" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::Verbatim,
@@ -2309,6 +2393,26 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Bearer,
             entries: EntryRule::YoloAuto,
         }),
+        // `zhipu-coding-plan` (HZN-008 class P — the plan-key cell): the
+        // configured-or-recorded
+        // `https://open.bigmodel.cn/api/coding/paas/v4` base — its own
+        // coding-plan host, never the sibling general API root — whose
+        // key-gated authoritative `/models` listing is the whole
+        // catalogue: listed ids ride the generic metadata surface the
+        // listing states, no seed floor exists, and an empty or failed
+        // answer invents no offer. The recorded key is the
+        // `<id>.<secret>` form carried as the bearer verbatim — material
+        // outside that grammar denies typed before any wire leg — and
+        // the class records no effort dial: a pinned `reasoning_effort`
+        // denies typed rather than being dropped. A configured `region`
+        // denies: the contract names none.
+        "zhipu-coding-plan" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(ZHIPU_CODING_PLAN_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Zhipu,
+            entries: EntryRule::Zhipu,
+        }),
         _ => None,
     }
 }
@@ -2329,7 +2433,8 @@ impl SourceContract {
             | CredentialRule::Firepass
             | CredentialRule::CoreWeave
             | CredentialRule::HuggingFace
-            | CredentialRule::Kilo => false,
+            | CredentialRule::Kilo
+            | CredentialRule::Zhipu => false,
         }
     }
 
@@ -2459,6 +2564,9 @@ pub struct CatalogModel {
     pub reasoning: bool,
     /// The listing's declared image-input capability.
     pub vision: bool,
+    /// The listing's declared tool/function-calling capability; `false`
+    /// where the class records no tool surface.
+    pub tools: bool,
     /// The reasoning-effort levels the listing declared, in wire
     /// order — wire values our effort enum cannot name never land.
     pub efforts: Vec<EffortLevel>,
@@ -2590,13 +2698,12 @@ pub struct ChatCompletionsProvider {
     /// endpoint rule — the API root including its version segment
     /// (`/v1`).
     endpoint: String,
-    /// The scoped credential binding resolved under DEC-013
-    /// precedence — material is read from the store per send so a
-    /// rotation is honoured without rebuilding the adapter — or `None`
-    /// on a recorded credential-optional class whose declaration binds
-    /// nothing: the recorded absent-binding form sends no
-    /// `Authorization` header and never a dummy key.
-    credential: Option<SecretRef>,
+    /// The credential seam: a scoped reference resolved per send — a
+    /// rotation is honoured without rebuilding the adapter — or a
+    /// preflight-resolved token the routed owner supplied. A
+    /// `Store(None)` is the recorded absent-binding form: no
+    /// `Authorization` header, never a dummy key.
+    auth: WireAuth,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
     /// The one budget the whole send — credential resolution, the
@@ -2637,7 +2744,7 @@ impl ChatCompletionsProvider {
         connection: &str,
         store: Arc<dyn CredentialStore>,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, REQUEST_DEADLINE)
+        Self::build(config, connection, store, REQUEST_DEADLINE, None)
     }
 
     /// The same adapter under an explicit whole-request deadline —
@@ -2652,7 +2759,30 @@ impl ChatCompletionsProvider {
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, deadline)
+        Self::build(config, connection, store, deadline, None)
+    }
+
+    /// Builds the adapter for a route-scoped construction. The routed
+    /// owner is the caller: the gate is the id's recorded route table,
+    /// and a preflight-resolved [`WireAuth`] skips the store resolve.
+    ///
+    /// # Errors
+    /// [`Self::new`]'s contract, and
+    /// [`ProviderError::DialectMismatch`] when the id's recorded routes
+    /// do not include Chat Completions.
+    pub fn with_route(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: WireAuth,
+    ) -> Result<Self, ProviderError> {
+        if !routes_for(connection).contains(&Dialect::ChatCompletions) {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
+        Self::assemble(config, connection, store, deadline, Some(auth))
     }
 
     fn build(
@@ -2660,12 +2790,23 @@ impl ChatCompletionsProvider {
         connection: &str,
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
+        auth: Option<WireAuth>,
     ) -> Result<Self, ProviderError> {
         if dialect_for(connection) != Some(Dialect::ChatCompletions) {
             return Err(ProviderError::DialectMismatch {
                 connection: connection.to_string(),
             });
         }
+        Self::assemble(config, connection, store, deadline, auth)
+    }
+
+    fn assemble(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: Option<WireAuth>,
+    ) -> Result<Self, ProviderError> {
         // A Chat-Completions-classed id without its own recorded
         // contract arm is denied the same way — the predicates are
         // recorded per literal id, never inherited silently.
@@ -2708,10 +2849,13 @@ impl ChatCompletionsProvider {
                 cause: None,
             });
         }
-        let credential = if contract.binds_optional_credential() {
-            resolve_optional_credential_in(&config.connections, &config.profiles, connection)?
-        } else {
-            Some(resolve_credential(config, connection)?)
+        let auth = match auth {
+            Some(auth) => auth,
+            None => WireAuth::Store(if contract.binds_optional_credential() {
+                resolve_optional_credential_in(&config.connections, &config.profiles, connection)?
+            } else {
+                Some(resolve_credential(config, connection)?)
+            }),
         };
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
@@ -2726,7 +2870,7 @@ impl ChatCompletionsProvider {
             connection: connection.to_string(),
             endpoint: contract.endpoint(&conn.endpoint),
             contract,
-            credential,
+            auth,
             store,
             client,
             deadline,
@@ -2937,7 +3081,8 @@ impl ChatCompletionsProvider {
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         let request =
-            WireSecret::attach(self.client.get(format!("{}/models", self.endpoint)), secret);
+            WireSecret::attach(self.client.get(format!("{}/models", self.endpoint)), secret)
+                .headers(forwarded_header_map(self.auth.forwarded()));
         let mut response = match request.send() {
             Ok(response) => response,
             Err(err) => return self.floor_or(transport(&self.connection, err)),
@@ -3020,7 +3165,8 @@ impl ChatCompletionsProvider {
                 | EntryRule::SiliconFlow
                 | EntryRule::Synthetic
                 | EntryRule::Vllm
-                | EntryRule::Wafer => Some(CatalogModel {
+                | EntryRule::Wafer
+                | EntryRule::Zhipu => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
                 }),
@@ -3213,6 +3359,7 @@ impl ChatCompletionsProvider {
                 ..CatalogModel::default()
             }),
             EntryRule::GenericMetadata => Some(generic_metadata_entry(id, entry)),
+            EntryRule::Zhipu => Some(generic_metadata_entry(id, entry)),
             EntryRule::Aiand => Some(aiand_entry(id, entry)),
             // `filterModel` runs on the mapped model's id — verbatim
             // `entry.id` here, the mapped id `mapWithBundledReference`
@@ -3323,8 +3470,12 @@ impl ChatCompletionsProvider {
     /// mangled header. Every grammar, scope or base denial lands here,
     /// before any wire leg.
     fn leg_secret(&self, leg: CredentialLeg) -> Result<Option<WireSecret>, ProviderError> {
-        let Some(credential) = &self.credential else {
-            return Ok(None);
+        let credential = match &self.auth {
+            WireAuth::Store(None) => return Ok(None),
+            WireAuth::Store(Some(credential)) => credential,
+            WireAuth::Resolved { token, .. } => {
+                return self.wire_secret(token.clone().into_bytes()).map(Some);
+            }
         };
         match self.store.resolve(credential) {
             Ok(material) => self.wire_secret(material).map(Some),
@@ -3359,6 +3510,7 @@ impl ChatCompletionsProvider {
                 .prefixed_bearer(&text, HUGGINGFACE_TOKEN_PREFIX)
                 .map(WireSecret::bearer),
             CredentialRule::Kilo => self.opaque_bearer(&text).map(WireSecret::bearer),
+            CredentialRule::Zhipu => self.zhipu_bearer(&text).map(WireSecret::bearer),
             // The absent-binding class's declared form is the host's own
             // key — a proxy master/virtual key, or a local server key —
             // carried as the plain bearer the recorded `api-key` login
@@ -3440,6 +3592,26 @@ impl ChatCompletionsProvider {
     fn opaque_bearer(&self, material: &str) -> Result<String, ProviderError> {
         let token = material.trim();
         if token.is_empty() {
+            return Err(ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            });
+        }
+        Ok(token.to_string())
+    }
+
+    /// The bearer a `zhipu-coding-plan` credential resolves (DEC-007):
+    /// the coding plan's key is the `<id>.<secret>` form — a
+    /// dot-separated pair whose two halves name the account id and the
+    /// secret, each non-empty — and the trimmed material is the bearer
+    /// verbatim. Material outside that grammar (a bare key, an empty
+    /// half, whitespace only) names no enrolled coding-plan key and
+    /// denies as malformed before any wire leg.
+    fn zhipu_bearer(&self, material: &str) -> Result<String, ProviderError> {
+        let token = material.trim();
+        let well_formed = token
+            .split_once('.')
+            .is_some_and(|(id, secret)| !id.is_empty() && !secret.is_empty());
+        if !well_formed {
             return Err(ProviderError::CredentialMalformed {
                 connection: self.connection.clone(),
             });
@@ -3592,7 +3764,7 @@ impl ChatCompletionsProvider {
     /// transform — `IdsOnly`, `GenericMetadata`, `Aiand`, `Aimlapi`,
     /// `AlibabaTokenPlan`, `DeepSeek`, `Groq`, `HuggingFace`,
     /// `LiteLlm`, `Moonshot`, `NanoGpt`, `Novita`, `SiliconFlow`,
-    /// `Synthetic`, `Vllm`, `Wafer` and `YoloAuto` —
+    /// `Synthetic`, `Vllm`, `Wafer`, `YoloAuto` and `Zhipu` —
     /// sends the offered id unchanged. Each variant is listed so a
     /// future transform cannot ship verbatim ids silently.
     fn wire_model_id(&self, model_id: &str) -> String {
@@ -3616,7 +3788,8 @@ impl ChatCompletionsProvider {
             | EntryRule::Synthetic
             | EntryRule::Vllm
             | EntryRule::Wafer
-            | EntryRule::YoloAuto => model_id.to_string(),
+            | EntryRule::YoloAuto
+            | EntryRule::Zhipu => model_id.to_string(),
         }
     }
 
@@ -3697,7 +3870,9 @@ impl ChatCompletionsProvider {
     /// constructed by this adapter, so none can be dropped. `vllm`
     /// records no effort ladder either: the listing that could state
     /// the chat-template surface is not visible at the send seam, so
-    /// every pinned level denies typed. `yolo-auto` records its dial
+    /// every pinned level denies typed; `zhipu-coding-plan` records no
+    /// effort dial at all, so its pinned levels deny the same way.
+    /// `yolo-auto` records its dial
     /// provider-wide rather than per model: only the levels the
     /// recorded effort remap leaves unchanged ride verbatim, and a
     /// remapped level — whose wire value the remap would produce —
@@ -3723,7 +3898,9 @@ impl ChatCompletionsProvider {
             // The listing that could state the effort surface is not
             // visible at the send seam, so no level is recorded: every
             // pinned effort denies typed rather than being dropped.
-            EntryRule::Vllm | EntryRule::Wafer => false,
+            // `zhipu-coding-plan` records no effort dial at all, so its
+            // pinned levels deny the same way.
+            EntryRule::Vllm | EntryRule::Wafer | EntryRule::Zhipu => false,
             EntryRule::IdsOnly
             | EntryRule::GenericMetadata
             | EntryRule::Aiand
@@ -4341,33 +4518,6 @@ fn is_falsy(value: &Value) -> bool {
     }
 }
 
-/// The recorded `aiand` effort wire value
-/// (`AIAND_EFFORT_BY_WIRE_VALUE`), restricted to the levels our
-/// effort enum names — the recorded `max` has no landing level and
-/// never maps onto a lower one.
-fn aiand_effort(value: &str) -> Option<EffortLevel> {
-    match value {
-        "minimal" => Some(EffortLevel::Minimal),
-        "low" => Some(EffortLevel::Low),
-        "medium" => Some(EffortLevel::Medium),
-        "high" => Some(EffortLevel::High),
-        "xhigh" => Some(EffortLevel::Xhigh),
-        _ => None,
-    }
-}
-
-/// `toPositiveNumber(_, null)`: a positive whole count or its decimal
-/// string reads; anything else — a stated zero included — is absent.
-fn positive_count(value: Option<&Value>) -> Option<u64> {
-    value
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
-        })
-        .filter(|count| *count > 0)
-}
-
 /// The recorded generic listing transform (DEC-020): the id plus the two
 /// limits a row can state — `context_length` on the window carrier and
 /// `max_completion_tokens` on the maximum-output carrier — each read as a
@@ -4572,7 +4722,7 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
             .map(|list| {
                 list.iter()
                     .filter_map(Value::as_str)
-                    .filter_map(aiand_effort)
+                    .filter_map(wire_effort)
                     .collect()
             })
             .unwrap_or_default()
@@ -4582,12 +4732,13 @@ fn aiand_entry(id: &str, entry: &Value) -> CatalogModel {
     let effort_default = entry
         .get("reasoning_effort_default")
         .and_then(Value::as_str)
-        .and_then(aiand_effort)
+        .and_then(wire_effort)
         .filter(|default| reasoning && efforts.contains(default));
     CatalogModel {
         id: id.to_string(),
         reasoning,
         vision: capability("vision"),
+        tools: false,
         efforts,
         effort_default,
         context_window: positive_count(entry.get("context_window")),
@@ -4755,6 +4906,7 @@ fn litellm_metadata_model(entry: &Value) -> Option<CatalogModel> {
             == Some(true),
         vision: litellm_metadata_value(entry, "supports_vision").and_then(Value::as_bool)
             == Some(true),
+        tools: false,
         efforts: Vec::new(),
         effort_default: None,
         context_window: positive_count(litellm_metadata_value(entry, "max_input_tokens")),
@@ -5180,7 +5332,7 @@ fn synthetic_entry(id: &str, entry: &Value) -> CatalogModel {
         .unwrap_or_default();
     let efforts: Vec<EffortLevel> = wire_efforts
         .iter()
-        .filter_map(|effort| aiand_effort(effort))
+        .filter_map(|effort| wire_effort(effort))
         .collect();
     // A route with at least one representable tier exposes a real
     // reasoning dial; a vocabulary naming only `none`/unrecognized
@@ -5188,8 +5340,9 @@ fn synthetic_entry(id: &str, entry: &Value) -> CatalogModel {
     // stated vocabulary overrides the `supported_features` mark rather
     // than resurrecting a dial the wire states none for. Only a wire
     // stating no vocabulary at all leaves `supported_features` as the
-    // answer. `tools` lands nowhere — no shared field carries a tool
-    // surface, so the feature neither offers one nor implies reasoning.
+    // answer. `tools` stays unmarked from this transform — the shared
+    // record carries the field but this class states no per-model tool
+    // predicate, so the feature neither offers one nor implies reasoning.
     let reasoning = if wire_efforts.is_empty() {
         features.contains(&"reasoning")
     } else {
@@ -5199,6 +5352,7 @@ fn synthetic_entry(id: &str, entry: &Value) -> CatalogModel {
         id: id.to_string(),
         reasoning,
         vision: modalities.contains(&"image"),
+        tools: false,
         efforts,
         effort_default: None,
         context_window: positive_count(entry.get("context_length")),
@@ -5376,7 +5530,7 @@ impl std::fmt::Debug for ChatCompletionsProvider {
         f.debug_struct("ChatCompletionsProvider")
             .field("connection", &self.connection)
             .field("endpoint", &self.endpoint)
-            .field("credential", &self.credential)
+            .field("credential", &self.auth)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -5489,7 +5643,8 @@ impl Provider for ChatCompletionsProvider {
                 .header(reqwest::header::ACCEPT, "text/event-stream")
                 .body(body_bytes),
             secret.as_ref(),
-        );
+        )
+        .headers(forwarded_header_map(self.auth.forwarded()));
         let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;

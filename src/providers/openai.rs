@@ -1,13 +1,17 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
 //! the literal connection ids `openai`, `abliteration`, `meta`,
-//! `ollama`, `openrouter`, `sakana`, `xai` and `xai-oauth` record this
+//! `ollama`, `custom-responses`, `openrouter`, `sakana`, `xai` and
+//! `xai-oauth` record this
 //! dialect. `ollama`
 //! is the local endpoint whose credential is optional (DEC-009) and
 //! whose catalogue carries a bounded native discovery overlay
 //! (DEC-012); `openrouter` rides the recorded paste-key form behind a
 //! catalogue-only keyless listing (DEC-003/DEC-010); `sakana` rides a
 //! key-gated authoritative listing whose in-source Fugu entries are
-//! mapping references, never offers (DEC-004); `xai` and `xai-oauth`
+//! mapping references, never offers (DEC-004); `custom-responses` rides
+//! an operator-configured origin with no default base — its listing is
+//! the model source and an absent binding is the headerless custom-open
+//! form (DEC-015); `xai` and `xai-oauth`
 //! ride the authoritative xAI listing — the latter with the
 //! device-code-produced token resolved at the scoped credential seam,
 //! the former rejecting the listing's recorded negative effort residue.
@@ -36,9 +40,10 @@ use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, ModelPrice, Provider, ProviderError, ProviderReply,
-    STREAM_CHUNK_BYTES, SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for,
-    open_proxy_connection, read_catalog_body, read_chunk, resolve_admitted_credential_in, sse,
-    transport, transport_status, violation, wire_body,
+    STREAM_CHUNK_BYTES, ToolCall, WireAuth, bounded_reason, check_deadline, dialect_for,
+    forwarded_header_map, open_proxy_connection, read_catalog_body, read_chunk,
+    resolve_admitted_credential_in, routes_for, sse, transport, transport_status, violation,
+    wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -80,6 +85,24 @@ const XAI_DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 /// here, and a configured value otherwise wins after this adapter's
 /// trim. The device-code token is the credential, not a host selector.
 const XAI_OAUTH_DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
+
+/// The recorded GitLab Duo OpenAI proxy base (DEC-013); the routed owner
+/// supplies it as the codec's configured endpoint.
+const GITLAB_RESPONSES_PROXY: &str = "https://cloud.gitlab.com/ai/v1/proxy/openai/v1";
+
+/// The recorded `opencode-zen` Responses base: the routed owner passes
+/// `{base}/v1` as the configured endpoint, and an empty endpoint
+/// resolves this recorded API root.
+const OPENCODE_ZEN_RESPONSES_BASE: &str = "https://opencode.ai/zen/v1";
+
+/// The recorded `opencode-go` Responses base: the routed owner passes
+/// `{base}/v1` as the configured endpoint, and an empty endpoint
+/// resolves this recorded API root.
+const OPENCODE_GO_RESPONSES_BASE: &str = "https://opencode.ai/zen/go/v1";
+
+/// The Responses aliases' `upstreamModelId` table (DEC-013): the routed
+/// owner translates the public alias before the wire.
+const GITLAB_RESPONSES_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
 
 /// The recorded `openrouter` paste-key prefix (DEC-003): the bare
 /// `sk-or-…` key the paste form stores at the scoped credential seam.
@@ -190,6 +213,12 @@ struct SourceContract {
     /// returns a replayable artifact; `meta`: the record states no
     /// encrypted reasoning artifact for the id, so none is asked for).
     reasoning_artifact: bool,
+    /// `true` — the origin is operator data and no default base exists
+    /// (`custom-responses`, DEC-015): an empty configured endpoint
+    /// denies [`crate::providers::ProviderError::EndpointRequired`]
+    /// before the wire. `false` — [`endpoint_for`] resolves the arm's
+    /// recorded default or keeps the shipped verbatim value.
+    requires_configured_endpoint: bool,
 }
 
 /// The recorded per-connection contract for a Responses id
@@ -205,24 +234,28 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: false,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
+            requires_configured_endpoint: false,
         }),
         "abliteration" => Some(SourceContract {
             seed: ABLITERATION_MODELS,
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         "meta" => Some(SourceContract {
             seed: META_MUSE_MODELS,
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         "ollama" => Some(SourceContract {
             seed: &[],
             authoritative_models: true,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-010): the keyless `/models` answer offers only what the
@@ -233,6 +266,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: true,
             entry: EntryRule::OpenRouterTools,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-004): the recorded in-source Fugu entries are mapping
@@ -243,6 +277,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: true,
             entry: EntryRule::Sakana,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         // The xAI listing is authoritative and carries no vendored
         // floor; its recorded negative effort residue bounds a pinned
@@ -252,6 +287,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: true,
             entry: EntryRule::Xai,
             reasoning_artifact: false,
+            requires_configured_endpoint: false,
         }),
         // The xAI OAuth listing is authoritative and no vendored
         // selected list is retained, so the listing alone offers — minus
@@ -263,6 +299,51 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             authoritative_models: true,
             entry: EntryRule::XaiOAuth,
             reasoning_artifact: true,
+            requires_configured_endpoint: false,
+        }),
+        // DEC-013: the routed owner translates the alias and passes the
+        // fixed proxy base as the configured endpoint; the listing is
+        // not a source — the alias table is.
+        "gitlab-duo" => Some(SourceContract {
+            seed: GITLAB_RESPONSES_MODELS,
+            authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+            requires_configured_endpoint: false,
+        }),
+        // DEC-014/DEC-020: the routed owner passes `{base}/v1` as the
+        // configured endpoint for the Muse Spark and deepseek-v4-flash
+        // overrides; the gateway listing is the whole catalogue and
+        // states no replay artifact for the id.
+        "opencode-go" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+            requires_configured_endpoint: false,
+        }),
+        // DEC-014: the routed owner passes `{base}/v1` as the
+        // configured endpoint for the Muse Spark overrides; the
+        // gateway listing is the whole catalogue and states no replay
+        // artifact for the id.
+        "opencode-zen" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+            requires_configured_endpoint: false,
+        }),
+        // DEC-015: the origin is operator-configured, so no default base
+        // is invented and an empty endpoint denies before the wire. The
+        // listing is the model source (a pinned manual id sends without
+        // it), an absent binding is the recorded custom-open headerless
+        // form, and the record states no replay artifact for the id.
+        "custom-responses" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+            requires_configured_endpoint: true,
         }),
         _ => None,
     }
@@ -272,8 +353,11 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// trimmed of surrounding whitespace and of every trailing slash —
 /// this adapter's own normalization, not a rule the other adapters
 /// share — and the empty result resolves the recorded base on `ollama`,
-/// `openrouter`, `sakana`, `xai` and `xai-oauth` alone. Every other id
-/// keeps the trimmed value verbatim; no id's base is ever inferred.
+/// `openrouter`, `sakana`, `xai`, `xai-oauth`, `gitlab-duo`,
+/// `opencode-go` and `opencode-zen` alone. Every other id
+/// keeps the trimmed value verbatim; no id's base is ever inferred, and
+/// an arm recording no default (`custom-responses`) denies the empty
+/// result at assembly.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
     if configured.is_empty() {
@@ -283,6 +367,9 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
             "sakana" => SAKANA_DEFAULT_ENDPOINT.to_string(),
             "xai" => XAI_DEFAULT_ENDPOINT.to_string(),
             "xai-oauth" => XAI_OAUTH_DEFAULT_ENDPOINT.to_string(),
+            "gitlab-duo" => GITLAB_RESPONSES_PROXY.to_string(),
+            "opencode-go" => OPENCODE_GO_RESPONSES_BASE.to_string(),
+            "opencode-zen" => OPENCODE_ZEN_RESPONSES_BASE.to_string(),
             _ => configured.to_string(),
         }
     } else {
@@ -336,12 +423,11 @@ pub struct OpenAiProvider {
     /// trailing slash stripped, and the recorded local default on
     /// `ollama` when that leaves nothing.
     endpoint: String,
-    /// The scoped credential binding resolved under DEC-013
-    /// precedence — `None` on the recorded absent-binding form, where
-    /// no header rides the catalogue or send legs (DEC-009). Material
-    /// is read from the store per send so a rotation is honoured
-    /// without rebuilding the adapter.
-    credential: Option<SecretRef>,
+    /// The credential seam: a scoped reference resolved per send — a
+    /// rotation is honoured without rebuilding the adapter — or a
+    /// preflight-resolved token the routed owner supplied. `Store(None)`
+    /// is the recorded absent-binding form: no header rides either leg.
+    auth: WireAuth,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
     /// The one budget the whole send — credential resolution, the
@@ -391,7 +477,9 @@ impl OpenAiProvider {
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the Responses source class; [`ProviderError::UnknownConnection`]
     /// for an undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; [`ProviderError::LocalProfileDeclared`] for a
+    /// configured region; [`ProviderError::EndpointRequired`] when the
+    /// arm records no default base and the configured endpoint is
+    /// empty; [`ProviderError::LocalProfileDeclared`] for a
     /// `local` declaration that binds a `profile`;
     /// [`ProviderError::CredentialUnresolved`] for a `local`
     /// declaration of a reserved id that is not an open proxy — denied
@@ -406,7 +494,7 @@ impl OpenAiProvider {
         connection: &str,
         store: Arc<dyn CredentialStore>,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, REQUEST_DEADLINE)
+        Self::build(config, connection, store, REQUEST_DEADLINE, None)
     }
 
     /// The same adapter under an explicit whole-request deadline —
@@ -421,7 +509,30 @@ impl OpenAiProvider {
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, deadline)
+        Self::build(config, connection, store, deadline, None)
+    }
+
+    /// Builds the adapter for a route-scoped construction. The routed
+    /// owner is the caller: the gate is the id's recorded route table,
+    /// and a preflight-resolved [`WireAuth`] skips the store resolve.
+    ///
+    /// # Errors
+    /// [`Self::new`]'s contract, and
+    /// [`ProviderError::DialectMismatch`] when the id's recorded routes
+    /// do not include Responses.
+    pub fn with_route(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: WireAuth,
+    ) -> Result<Self, ProviderError> {
+        if !routes_for(connection).contains(&Dialect::Responses) {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
+        Self::assemble(config, connection, store, deadline, Some(auth))
     }
 
     fn build(
@@ -429,12 +540,23 @@ impl OpenAiProvider {
         connection: &str,
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
+        auth: Option<WireAuth>,
     ) -> Result<Self, ProviderError> {
         if dialect_for(connection) != Some(Dialect::Responses) {
             return Err(ProviderError::DialectMismatch {
                 connection: connection.to_string(),
             });
         }
+        Self::assemble(config, connection, store, deadline, auth)
+    }
+
+    fn assemble(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: Option<WireAuth>,
+    ) -> Result<Self, ProviderError> {
         // A Responses-classed id without its own recorded contract arm
         // is denied the same way — the predicates are recorded per
         // literal id, never inherited silently.
@@ -474,13 +596,29 @@ impl OpenAiProvider {
                 cause: None,
             });
         }
+        // DEC-015: an arm recording no default base has no host unless
+        // the operator supplied one — deny before the credential seam
+        // or any wire leg.
+        let endpoint = endpoint_for(connection, &conn.endpoint);
+        if contract.requires_configured_endpoint && endpoint.is_empty() {
+            return Err(ProviderError::EndpointRequired {
+                connection: connection.to_string(),
+            });
+        }
         // The admitted absent-binding classes — the open proxy, the
-        // local endpoint and the catalogue-only `openrouter` — resolve
-        // `None` for a declaration that binds nothing; every required
-        // Responses id resolves through the same precedence and keeps
-        // its typed denial when nothing binds (DEC-009/DEC-010).
-        let credential =
-            resolve_admitted_credential_in(&config.connections, &config.profiles, connection)?;
+        // local endpoint, the custom-origin id and the catalogue-only
+        // `openrouter` — resolve `None` for a declaration that binds
+        // nothing; every required Responses id resolves through the
+        // same precedence and keeps its typed denial when nothing binds
+        // (DEC-009/DEC-010/DEC-015).
+        let auth = match auth {
+            Some(auth) => auth,
+            None => WireAuth::Store(resolve_admitted_credential_in(
+                &config.connections,
+                &config.profiles,
+                connection,
+            )?),
+        };
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
         // names itself the send's deadline, while reqwest's timer only
@@ -490,12 +628,11 @@ impl OpenAiProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| transport(connection, err))?;
-        let endpoint = endpoint_for(connection, &conn.endpoint);
         Ok(Self {
             connection: connection.to_string(),
             contract,
             endpoint,
-            credential,
+            auth,
             store,
             client,
             deadline,
@@ -526,9 +663,10 @@ impl OpenAiProvider {
     /// source seeds on top, `ollama` enriches the listing's own
     /// offers from the bounded native discovery overlay (DEC-012), and
     /// `openrouter` offers only the listing's tool-capable entries with
-    /// their recorded surfaces mapped (DEC-010), and `sakana` offers the
+    /// their recorded surfaces mapped (DEC-010), `sakana` offers the
     /// authoritative listing's entries with the recorded Fugu mapping
-    /// (DEC-004), and `xai` offers the authoritative xAI listing as
+    /// (DEC-004), `custom-responses` offers the authoritative listing
+    /// alone (DEC-015), and `xai` offers the authoritative xAI listing as
     /// id-only entries with no vendored selected-list floor while
     /// `xai-oauth` offers the same listing minus its recorded non-chat
     /// image/STT/voice families — each id carrying the shared
@@ -577,6 +715,7 @@ impl OpenAiProvider {
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
+        request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let mut response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
@@ -659,14 +798,16 @@ impl OpenAiProvider {
     /// (DEC-003): material outside `sk-or-…` denies typed here, before
     /// any wire leg.
     fn secret(&self) -> Result<Option<String>, ProviderError> {
-        let Some(credential) = &self.credential else {
-            return Ok(None);
+        let token = match &self.auth {
+            WireAuth::Store(None) => return Ok(None),
+            WireAuth::Store(Some(credential)) => {
+                let material = self.store.resolve(credential)?;
+                String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+                    connection: self.connection.clone(),
+                })?
+            }
+            WireAuth::Resolved { token, .. } => token.clone(),
         };
-        let material = self.store.resolve(credential)?;
-        let token =
-            String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
-                connection: self.connection.clone(),
-            })?;
         if self.connection != "openrouter" {
             return Ok(Some(token));
         }
@@ -1477,7 +1618,7 @@ impl std::fmt::Debug for OpenAiProvider {
         f.debug_struct("OpenAiProvider")
             .field("connection", &self.connection)
             .field("endpoint", &self.endpoint)
-            .field("credential", &self.credential)
+            .field("credential", &self.auth)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -1594,6 +1735,7 @@ impl Provider for OpenAiProvider {
         if let Some(token) = &token {
             request = request.bearer_auth(token);
         }
+        request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;
@@ -1610,11 +1752,13 @@ mod tests {
 
     /// DEC-011's endpoint rule: the configured base is trimmed and
     /// loses every trailing slash, and the empty result resolves the
-    /// recorded base on `ollama`, `openrouter`, `sakana`, `xai` and
-    /// `xai-oauth` alone — a sibling id keeps its own (absent) value
-    /// and never borrows another's host. The `ollama`, `sakana`, `xai`
-    /// and `xai-oauth` defaults are pinned as literals, not only through
-    /// the consts they resolve.
+    /// recorded base on `ollama`, `openrouter`, `sakana`, `xai`,
+    /// `xai-oauth`, `gitlab-duo`, `opencode-go` and `opencode-zen`
+    /// alone — a sibling id keeps its own (absent) value and never
+    /// borrows another's host. The `ollama`, `sakana`, `xai`,
+    /// `xai-oauth`, `gitlab-duo`, `opencode-go` and `opencode-zen`
+    /// defaults are pinned as literals, not only through the consts
+    /// they resolve.
     #[test]
     fn endpoint_rule_trims_before_resolving_the_recorded_defaults() {
         assert_eq!(endpoint_for("ollama", "   "), "http://127.0.0.1:11434/v1");
@@ -1646,6 +1790,18 @@ mod tests {
         assert_eq!(
             endpoint_for("xai-oauth", " https://api.x.ai/v1/// "),
             "https://api.x.ai/v1"
+        );
+        assert_eq!(
+            endpoint_for("gitlab-duo", ""),
+            "https://cloud.gitlab.com/ai/v1/proxy/openai/v1"
+        );
+        assert_eq!(
+            endpoint_for("opencode-go", ""),
+            "https://opencode.ai/zen/go/v1"
+        );
+        assert_eq!(
+            endpoint_for("opencode-zen", ""),
+            "https://opencode.ai/zen/v1"
         );
         assert_eq!(
             endpoint_for("openrouter", " https://openrouter.ai/api/v1/ "),

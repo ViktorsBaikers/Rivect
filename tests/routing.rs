@@ -3150,6 +3150,12 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
             rivect::contracts::ErrorCode::InvalidInput,
         ),
         (
+            ModelError::Provider(ProviderError::EndpointRequired {
+                connection: "cloudflare-ai-gateway".to_string(),
+            }),
+            rivect::contracts::ErrorCode::InvalidInput,
+        ),
+        (
             ModelError::ManualFallbackPending {
                 attempt_id: "attempt".to_string(),
                 purpose: "relay".to_string(),
@@ -6438,5 +6444,189 @@ fn openrouter_unbound_connection_is_not_send_eligible() {
     assert!(
         rivect::providers::offline_usable(&bound.connections, &bound.profiles, "openrouter"),
         "a bound openrouter row is send-eligible"
+    );
+}
+
+/// `custom-responses` joins the recorded custom-open absent-binding form
+/// (DEC-015/DEC-017): the unbound `api_key` row is admitted at ingress and
+/// is offline-eligible, and the widened predicate stays scoped to that
+/// literal id — `openrouter` remains catalogue-only, an unbound required
+/// `api_key` row is still refused at admission, and the bound custom row
+/// keeps its own usability.
+#[test]
+fn custom_responses_eligibility_does_not_widen_other_ids() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.\"custom-responses\"]\nkind = \"api_key\"\nendpoint = \"https://custom.example.invalid/v1\"\n\
+         [connections.\"custom-responses-keyed\"]\nkind = \"api_key\"\nendpoint = \"https://custom.example.invalid/v1\"\ncredential_ref = \"keyring:rivect/custom-responses\"\n\
+         [connections.openrouter]\nkind = \"api_key\"\nendpoint = \"https://openrouter.ai/api/v1\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"custom-responses\", model_id = \"fixture-custom-model\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the custom-open row is admitted at ingress");
+    assert_eq!(
+        rivect::providers::dialect_for("custom-responses"),
+        Some(Dialect::Responses),
+        "the literal id routes to the shared Responses dialect"
+    );
+    assert_eq!(
+        config.connections["custom-responses"].credential_ref, None,
+        "the unbound row binds no credential"
+    );
+
+    let unbound = ModelAssign::Fixed(FixedModel {
+        connection: "custom-responses".to_string(),
+        model_id: "fixture-custom-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&unbound, &config.connections, &config.profiles)
+            .is_ok(),
+        "the recorded custom-open form is usable without a live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "custom-responses",
+    ));
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/custom-responses",
+            "goal: custom open",
+        )
+        .expect("the unbound custom pin prepares");
+    assert!(
+        matches!(&manifest.model, ModelAssign::Fixed(fixed)
+            if fixed.connection == "custom-responses"
+                && fixed.model_id == "fixture-custom-model"),
+        "the prepared manifest pins the custom connection and model: {:?}",
+        manifest.model
+    );
+
+    // the catalogue-only id keeps its narrower answer: admission without
+    // a binding is not a send grant
+    let openrouter = ModelAssign::Fixed(FixedModel {
+        connection: "openrouter".to_string(),
+        model_id: "vendor/tool-model".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(&openrouter, &config.connections, &config.profiles,),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "openrouter keeps its typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(&config.connections, &config.profiles, "openrouter"),
+        "the custom-open form never widens openrouter's send eligibility"
+    );
+
+    // a required sibling id still refuses an unbound declaration at ingress
+    let required = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.deepseek]\nkind = \"api_key\"\nendpoint = \"https://api.deepseek.com\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    );
+    let Err(error) = required else {
+        panic!("a required api_key declaration without a binding is refused at admission")
+    };
+    assert!(
+        matches!(
+            &error.issue,
+            ConfigIssue::CredentialRefRequired {
+                kind: ConnKind::ApiKey
+            }
+        ),
+        "the absent binding stays scoped to the custom-open class: {error}"
+    );
+
+    // the bound custom row is send-eligible like every scoped binding
+    let bound = ModelAssign::Fixed(FixedModel {
+        connection: "custom-responses-keyed".to_string(),
+        model_id: "fixture-custom-model".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&bound, &config.connections, &config.profiles).is_ok(),
+        "the bound custom row stays eligible"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "custom-responses-keyed",
+    ));
+}
+
+// ----- AC-040h Pro/Max profile is not an offline inference grant --------
+
+/// The login's scoped subscription credential is a live grant, not an
+/// offline inference credential: the scoped `SecretRef` resolves at the
+/// credential seam the Messages adapter consumes, while the Broker's
+/// unchanged offline gate refuses the pin with the typed live-grant
+/// denial and the API-key row keeps its own usability.
+#[test]
+fn anthropic_subscription_profile_is_not_offline_inference() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.anthropic]\nkind = \"api_key\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"keyring:rivect/anthropic\"\n\
+         [connections.anthropic-subscription]\nkind = \"subscription\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\nprofile = \"anthropic-pro-max\"\n\
+         [profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"anthropic-subscription\", model_id = \"claude-opus-4-8\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n",
+    )
+    .expect("the isolated pair parses");
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "anthropic-subscription".to_string(),
+        model_id: "claude-opus-4-8".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::Subscription
+            })
+        ),
+        "the subscription profile is the live-grant class"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &config.connections,
+            &config.profiles,
+            "anthropic-subscription",
+        ),
+        "a subscription profile is never offline-usable inference"
+    );
+    assert!(
+        rivect::providers::offline_usable(&config.connections, &config.profiles, "anthropic"),
+        "the api-key row keeps its own usability"
+    );
+
+    // The login's scoped ref resolves at the credential seam — the
+    // Messages adapter reads the stored access token there — while the
+    // Broker's offline gate is not weakened.
+    let reference = rivect::providers::resolve_credential(&config, "anthropic-subscription")
+        .expect("the login's scoped ref resolves for the adapter seam");
+    assert_eq!(reference.profile(), "anthropic-pro-max");
+
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let err = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/pro-max",
+            "goal: subscription inference",
+        )
+        .expect_err("the subscription pin never prepares");
+    assert!(
+        matches!(
+            err,
+            ModelError::Provider(ProviderError::LiveGrantRequired {
+                kind: ConnKind::Subscription
+            })
+        ),
+        "the real admission path refuses it: {err:?}"
     );
 }

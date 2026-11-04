@@ -1,14 +1,16 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
-//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,sakana}):
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,sakana,custom-responses}):
 //! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
 //! wiremock fixtures, no OMP, no user adapter, no real host. `ollama`
 //! is the credential-optional local class whose catalogue carries the
 //! bounded native discovery overlay; `openrouter` is the catalogue-only
-//! keyless class behind the recorded paste-key form. The SSE legs pin
+//! keyless class behind the recorded paste-key form; `custom-responses`
+//! records the operator-configured custom origin with an absent-binding
+//! headerless form. The SSE legs pin
 //! the shared parser's WHATWG §9.2.5–9.2.6 conformance.
-//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana} stays
+//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana,custom-responses} stays
 //! NOT_RUN — the ignored named cases carry that status explicitly.
 
 #![allow(
@@ -972,6 +974,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::DialectUnserved { .. }) => "DialectUnserved",
         Some(ProviderError::UnpinnedModel { .. }) => "UnpinnedModel",
         Some(ProviderError::RegionMismatch { .. }) => "RegionMismatch",
+        Some(ProviderError::EndpointRequired { .. }) => "EndpointRequired",
         Some(ProviderError::Transport { .. }) => "Transport",
         Some(ProviderError::ProviderFailed { .. }) => "ProviderFailed",
         Some(ProviderError::UnknownTerminal { .. }) => "UnknownTerminal",
@@ -1811,6 +1814,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         DialectUnserved,
         UnpinnedModel,
         RegionMismatch,
+        EndpointRequired,
         Transport,
         ProviderFailed,
         UnknownTerminal,
@@ -1841,6 +1845,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::DialectUnserved { .. } => ProviderVariant::DialectUnserved,
             ProviderError::UnpinnedModel { .. } => ProviderVariant::UnpinnedModel,
             ProviderError::RegionMismatch { .. } => ProviderVariant::RegionMismatch,
+            ProviderError::EndpointRequired { .. } => ProviderVariant::EndpointRequired,
             ProviderError::Transport { .. } => ProviderVariant::Transport,
             ProviderError::ProviderFailed { .. } => ProviderVariant::ProviderFailed,
             ProviderError::UnknownTerminal { .. } => ProviderVariant::UnknownTerminal,
@@ -8527,6 +8532,1004 @@ async fn sakana_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::sakana = NOT_RUN"]
 fn provider_installed_sakana() {}
+
+// ----- custom-responses --------------------------------------------------
+//
+// `custom-responses` records the OpenAI Responses transport over an
+// operator-configured origin (DEC-015): no default base exists, an empty
+// endpoint denies before the wire, `/models` is the model source while a
+// pinned manual id still sends when the listing fails, and an absent
+// credential binding rides the recorded custom-open headerless form.
+
+const CUSTOM_RESPONSES_REF: &str = "keyring:rivect-test/custom-responses";
+
+const CUSTOM_RESPONSES_MODEL: &str = "custom-fixture-model";
+
+/// Fixture key material — never a real credential, only ever sent to
+/// localhost.
+const CUSTOM_RESPONSES_SECRET: &str = "fixture-custom-responses-key";
+
+/// One configured `custom-responses` connection pointing at the fixture
+/// peer: the api_key class resolves a scoped `SecretRef`, and the
+/// dialect comes from the literal connection id (DEC-015).
+fn custom_responses_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.\"custom-responses\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{CUSTOM_RESPONSES_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"custom-responses\", model_id = \"{CUSTOM_RESPONSES_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded custom-open form: the same origin and pin with no
+/// `credential_ref` member at all.
+fn custom_responses_unbound_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.\"custom-responses\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"custom-responses\", model_id = \"{CUSTOM_RESPONSES_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The listing is the model source in the auto form: no fixed pin names
+/// the wire model until the catalogue leg answers.
+fn custom_responses_auto_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.\"custom-responses\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{CUSTOM_RESPONSES_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn custom_responses_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CUSTOM_RESPONSES_REF, CUSTOM_RESPONSES_SECRET)],
+    ));
+    let provider = provider_result(
+        config.clone(),
+        "custom-responses".to_string(),
+        store.clone(),
+    )
+    .expect("the shared adapter builds for the custom-responses id");
+    (provider, store)
+}
+
+fn custom_responses_unbound_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::new(STORE_KIND));
+    let provider = provider_result(
+        config.clone(),
+        "custom-responses".to_string(),
+        store.clone(),
+    )
+    .expect("the absent binding builds headerless");
+    (provider, store)
+}
+
+/// The rich catalogue on a plain OS thread: the blocking client cannot
+/// be dropped inside a tokio context.
+fn custom_responses_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    drop_blocking(provider);
+    outcome.expect("the custom-responses catalogue answers")
+}
+
+/// The same adapter under an explicit whole-call deadline, so the budget
+/// is exercised deterministically.
+fn custom_responses_provider_with_deadline(config: &Config, deadline: Duration) -> OpenAiProvider {
+    let config = config.clone();
+    std::thread::spawn(move || {
+        let store = Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(CUSTOM_RESPONSES_REF, CUSTOM_RESPONSES_SECRET)],
+        ));
+        OpenAiProvider::with_deadline(&config, "custom-responses", store, deadline)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the adapter builds under the explicit deadline")
+}
+
+/// Every denial renders Display and Debug with typed context only — the
+/// fixture material and the peer's response body never appear on either.
+fn assert_custom_denial_clean(err: &ProviderError) {
+    for rendered in [format!("{err}"), format!("{err:?}")] {
+        assert!(
+            !rendered.contains(CUSTOM_RESPONSES_SECRET),
+            "the credential material never renders: {rendered}"
+        );
+        assert!(
+            !rendered.contains(BODY_MARKER),
+            "the peer's response body never renders: {rendered}"
+        );
+    }
+}
+
+// ----- TP-PROVIDER-WIRE::custom-responses ---------------------------
+
+/// A configured `custom-responses` connection returns a verified model
+/// outcome through the standard Broker: prepare admits the bound pin, the
+/// shared adapter posts exactly the frozen manifest as a Responses
+/// request — `store: false`, `stream: true`, pinned model, instructions,
+/// tool surface and pinned effort verbatim — the SSE stream validates its
+/// terminal, and the one physical send is charged once with the provider's
+/// reported usage.
+#[tokio::test]
+async fn custom_responses_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified custom outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 17, "output_tokens": 5, "total_tokens": 22})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: prove the custom wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified custom outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CUSTOM_RESPONSES_SECRET}")
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], CUSTOM_RESPONSES_MODEL);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["instructions"], manifest.instructions);
+    assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }])
+    );
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "custom-responses");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 17,
+            completion_tokens: 5,
+            total_tokens: 22,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch("/world/custom-responses", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-AUTH::custom-responses ---------------------------
+
+/// The origin is operator-configured (DEC-015): an empty endpoint is the
+/// typed `EndpointRequired` denial before the credential seam or any wire
+/// leg, while a configured origin builds and posts exactly once. The
+/// empty store pins the ordering: the endpoint gate answers before the
+/// credential seam, so no stored material participates in this denial.
+#[tokio::test]
+async fn custom_responses_requires_a_configured_endpoint() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&custom_responses_config("")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let err = provider_result(config, "custom-responses".to_string(), store)
+        .expect_err("an empty origin is denied");
+    assert!(
+        matches!(&err, ProviderError::EndpointRequired { connection }
+            if connection == "custom-responses"),
+        "the empty origin is the typed denial, never a credential outcome: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "connection custom-responses requires a configured endpoint"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "configured origin",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: configured origin",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    outcome.expect("the configured origin sends once");
+    assert_eq!(server.received_requests().await.expect("recorded").len(), 1);
+    drop_blocking(broker);
+}
+
+/// The absent binding is the recorded custom-open form (DEC-015): the
+/// unbound `api_key` declaration is admitted at ingress, both legs reach
+/// the configured origin, and neither carries an `Authorization` header —
+/// never a fabricated bearer.
+#[tokio::test]
+async fn custom_responses_absent_binding_is_admitted_and_headerless() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": CUSTOM_RESPONSES_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "headerless outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_responses_unbound_config(&server_uri_v1(&server)))
+        .expect("the recorded custom-open form is admitted");
+    assert_eq!(
+        config.connections["custom-responses"].credential_ref, None,
+        "the unbound row binds no credential"
+    );
+
+    let models = custom_responses_catalog(custom_responses_unbound_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![CUSTOM_RESPONSES_MODEL],
+        "the listing serves the keyless custom open form"
+    );
+
+    let (broker, manifest) = prepared_with(
+        custom_responses_unbound_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: headerless custom open",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    outcome.expect("the absent binding sends headerless");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded both legs");
+    assert_eq!(requests.len(), 2, "the listing plus the one send");
+    for request in &requests {
+        assert!(
+            request.headers.get("authorization").is_none(),
+            "the absent binding sends no Authorization header on {}",
+            request.url.path()
+        );
+    }
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-WIRE::custom-responses (request shape) -----------
+
+/// `store: false` and `stream: true` are unconditional, and the tool
+/// surface is exactly the frozen manifest's function tools: the recorded
+/// custom-open peer gets no hosted-tool authority and no replay artifact
+/// include.
+#[tokio::test]
+async fn custom_responses_sends_store_false_and_never_a_hosted_tool() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "shape outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: request shape",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    outcome.expect("the shape control sends");
+
+    let bodies = received_bodies(&server).await;
+    assert_eq!(bodies.len(), 1);
+    let body = &bodies[0];
+    assert_eq!(body["store"], false, "store:false is unconditional");
+    assert_eq!(body["stream"], true, "stream:true is unconditional");
+    assert!(
+        body.get("include").is_none(),
+        "the record states no replay artifact for the id: {body}"
+    );
+    assert_eq!(
+        body["tools"],
+        json!([{ "type": "function", "name": "read_file" }]),
+        "only the frozen manifest's function tools ride the request"
+    );
+    let tools = body["tools"].as_array().expect("the tools array");
+    assert!(
+        tools.iter().all(|tool| tool["type"] == "function"),
+        "no hosted tool kind is ever sent: {body}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::custom-responses ------------------------
+
+/// `/models` is the authoritative listing (DEC-015): every non-empty id
+/// offers once in sorted order with no seeded floor and no chat filter,
+/// the bound bearer rides the one listing leg, and an auto assignment
+/// takes its wire model from that listing.
+#[tokio::test]
+async fn custom_responses_catalog_is_the_authoritative_listing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "custom-beta"},
+                {"id": "custom-alpha"},
+                {"id": "custom-alpha"},
+                {"id": ""},
+                {"owned_by": "nobody"},
+                {"id": 7},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let models = custom_responses_catalog(custom_responses_provider(&config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["custom-alpha", "custom-beta"],
+        "the authoritative listing names the offers, sorted and deduplicated"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the listing is the one catalogue leg");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CUSTOM_RESPONSES_SECRET}")
+    );
+
+    // an empty listing is a real answer with no offers — the id records
+    // no seeded floor
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let models = custom_responses_catalog(custom_responses_provider(&config).0);
+    assert!(
+        models.is_empty(),
+        "an empty listing has no floor to fall back to: {:?}",
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // the auto send resolves its wire model from the same listing
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "custom-zeta"}, {"id": "custom-alpha"}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "listing resolved",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_responses_auto_config(&server_uri_v1(&server)))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: listing is the model source",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    let reply = outcome.expect("the auto send resolves its model");
+    assert_eq!(reply.text, "listing resolved");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        vec!["/v1/models", "/v1/responses"],
+        "the catalogue resolution then the one physical send"
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"], "custom-alpha",
+        "the listing's sorted-first id rode the wire"
+    );
+    drop_blocking(broker);
+}
+
+/// A failed listing denies only where the listing is the model source: a
+/// pinned manual id still sends without consulting it (DEC-015).
+#[tokio::test]
+async fn custom_responses_manual_model_sends_when_the_listing_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "manual model outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+
+    // the listing itself is the typed denial — the failed source
+    let (provider, denied) = {
+        let provider = custom_responses_provider(&config).0;
+        std::thread::spawn(move || {
+            let outcome = provider.catalog_models();
+            (provider, outcome)
+        })
+        .join()
+        .expect("the catalog thread joins")
+    };
+    let ProviderError::Transport { connection, cause } = denied.expect_err("the listing fails")
+    else {
+        panic!("a failed listing is the typed transport denial");
+    };
+    assert_eq!(connection, "custom-responses");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 503 },
+        "the failed listing keeps its status: {cause}"
+    );
+    drop_blocking(provider);
+
+    // the pinned manual id still sends against a peer whose listing
+    // fails, and never opens that listing leg
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "manual model outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: manual model",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    let reply = outcome.expect("the pinned manual id sends");
+    assert_eq!(reply.text, "manual model outcome");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        request_paths(&requests),
+        vec!["/v1/responses"],
+        "a pinned manual model never consults the failed listing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-AUTH::custom-responses ---------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `custom-responses`: a configured region — the recorded contract names
+/// none — the profile-bound ref whose scope disagrees with the binding, an
+/// absent credential and a refused bearer each land a typed denial, and
+/// none renders credential material or the peer's body.
+#[tokio::test]
+async fn custom_responses_wrong_credential_profile_or_region_denies_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied, never ignored
+    let regioned =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server)).replace(
+            "kind = \"api_key\"",
+            "kind = \"api_key\"\nregion = \"eu-1\"",
+        ))
+        .expect("valid");
+    let err = provider_result(
+        regioned,
+        "custom-responses".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    assert!(
+        matches!(&err, ProviderError::RegionMismatch { connection, region }
+            if connection == "custom-responses" && region == "eu-1"),
+        "a configured region is the typed mismatch: {err}"
+    );
+    assert_custom_denial_clean(&err);
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.\"custom-responses\"]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"custom-responses\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "custom-responses".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_custom_denial_clean(&err);
+
+    // a bound ref with no material at its own scope
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "custom-responses".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_custom_denial_clean(&err);
+    drop_blocking(provider);
+
+    // a refused bearer token is a typed transport denial, never success
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CUSTOM_RESPONSES_REF, CUSTOM_RESPONSES_SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "custom-responses".to_string(), store)
+        .expect("the adapter builds");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused token is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused token is transport: {err}")
+    };
+    assert_eq!(connection, "custom-responses");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_custom_denial_clean(&err);
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-RECOVERY::custom-responses -----------------------
+
+/// A partial tool block and an unknown terminal never report success: a
+/// stream ended mid function_call is the wire violation, and a stream
+/// whose completed envelope carries an unclassifiable status is the
+/// unknown terminal.
+#[tokio::test]
+async fn custom_responses_rejects_partial_tool_block_and_unknown_terminal() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": "", "call_id": "call_1"}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.function_call_arguments.delta",
+            &json!({"delta": "{\"path\":", "item_id": "fc_1", "output_index": 0}),
+        ),
+    );
+    mount_responses(&server, body).await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, outcome) = send_on_thread(
+        custom_responses_provider(&config).0,
+        prepared_manifest(&config),
+    );
+    let error = outcome.expect_err("a truncated stream is never success");
+    assert!(
+        matches!(error, ProviderError::StreamViolation { .. }),
+        "a stream ended mid output item is the wire violation: {error}"
+    );
+    drop_blocking(provider);
+
+    // a terminal whose outcome the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"id": "resp_1", "status": "concluded", "output": []}}),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, outcome) = send_on_thread(
+        custom_responses_provider(&config).0,
+        prepared_manifest(&config),
+    );
+    let error = outcome.expect_err("an unclassifiable terminal is never success");
+    assert!(
+        matches!(error, ProviderError::UnknownTerminal { .. }),
+        "an unclassifiable terminal is the unknown terminal: {error}"
+    );
+    drop_blocking(provider);
+}
+
+/// Well-formed output the dialect cannot honour is a typed rejection: a
+/// server-side tool kind the frozen function surface never declared, and a
+/// reasoning artifact the recorded custom-open peer never returns.
+#[tokio::test]
+async fn custom_responses_rejects_incompatible_tools_or_reasoning() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "",
+            vec![json!({
+                "id": "mcp_1", "type": "mcp_call", "name": "server.tool",
+                "arguments": "{}", "server_label": "fixture",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, outcome) = send_on_thread(
+        custom_responses_provider(&config).0,
+        prepared_manifest(&config),
+    );
+    let error = outcome.expect_err("an unhonourable hosted tool is never success");
+    assert!(
+        matches!(error, ProviderError::IncompatibleOutput { .. }),
+        "an unhonourable output item is a typed rejection: {error}"
+    );
+    drop_blocking(provider);
+
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "",
+            vec![json!({
+                "id": "rs_1", "type": "reasoning", "summary": [],
+                "encrypted_content": "opaque-artifact-the-record-never-returns",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, outcome) = send_on_thread(
+        custom_responses_provider(&config).0,
+        prepared_manifest(&config),
+    );
+    let error = outcome.expect_err("an off-contract artifact cannot be accepted");
+    assert!(
+        matches!(error, ProviderError::ReasoningProvenance { .. }),
+        "a reasoning artifact the recorded peer never returns is the provenance denial: {error}"
+    );
+    drop_blocking(provider);
+}
+
+/// A non-success status is the typed transport denial: the status code
+/// alone is the diagnostic, nothing is accounted, and no status opens a
+/// second request.
+#[tokio::test]
+async fn custom_responses_non_success_status_denies() {
+    for status in [400_u16, 429, 500] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("peer failure body"))
+            .mount(&server)
+            .await;
+        let config = Config::parse_validated(&custom_responses_config(&server_uri_v1(&server)))
+            .expect("valid");
+        let (broker, manifest) = prepared_with(
+            custom_responses_provider(&config),
+            &config,
+            "/world/custom-responses",
+            "goal: non-success",
+        );
+        let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+        let Err(ModelError::Provider(ProviderError::Transport { cause, .. })) = outcome else {
+            panic!("status {status} is a typed transport denial: {outcome:?}");
+        };
+        assert_eq!(
+            cause.class(),
+            TransportClass::HttpStatus { code: status },
+            "the status code alone is the diagnostic"
+        );
+        assert_eq!(broker.accounted_requests(), 0);
+        drop_blocking(broker);
+        assert_eq!(
+            server.received_requests().await.expect("recorded").len(),
+            1,
+            "a non-success status is never retried"
+        );
+    }
+}
+
+/// The whole-send deadline denies typed and never opens a second request.
+#[tokio::test]
+async fn custom_responses_short_deadline_denies_without_a_second_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(responses_completed_stream("late", Vec::new(), None))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+    let deadline = Duration::from_millis(400);
+    let provider = custom_responses_provider_with_deadline(&config, deadline);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let error = outcome.expect_err("the expired budget denies");
+    assert!(
+        matches!(
+            error,
+            ProviderError::Transport {
+                cause: TransportCause::Deadline { budget },
+                ..
+            } if budget == deadline
+        ),
+        "the adapter's own deadline is the denial: {error:?}"
+    );
+    drop_blocking(provider);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "an expired budget never opens a second request"
+    );
+}
+
+/// The legs matrix enforces the recorded expected set for
+/// `custom-responses`: CATALOG, AUTH, WIRE and RECOVERY each execute and
+/// report inside this run, and INSTALLED reports NOT_RUN.
+#[tokio::test]
+async fn custom_responses_provider_legs_matrix_executes_all_expected_legs() {
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": CUSTOM_RESPONSES_MODEL}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&custom_responses_config(&server_uri_v1(&server))).expect("valid");
+
+    // CATALOG: the authoritative listing answers its offers.
+    let models = custom_responses_catalog(custom_responses_provider(&config).0);
+    reported.insert(
+        "CATALOG",
+        if models
+            .iter()
+            .map(|model| model.id.as_str())
+            .eq(std::iter::once(CUSTOM_RESPONSES_MODEL))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "custom-responses".to_string(), empty)
+        .expect("the binding resolves; the store is read at send");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        custom_responses_provider(&config),
+        &config,
+        "/world/custom-responses",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-responses", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(
+        config.clone(),
+        "custom-responses".to_string(),
+        empty.clone(),
+    )
+    .expect("the binding resolves; the store is read at send");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(CUSTOM_RESPONSES_REF, CUSTOM_RESPONSES_SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::custom-responses ----------------------
+
+/// TP-PROVIDER-INSTALLED::custom-responses = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline slice
+/// never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::custom-responses = NOT_RUN"]
+fn provider_installed_custom_responses() {}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 

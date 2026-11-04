@@ -18,6 +18,7 @@ use rivect::config::{
     Config, ConfigEdit, ConfigError, ConfigIssue, ConfigValue, ConnKind, EffortAssign,
     FallbackAssign, FixedModel, ModelAssign, Stage,
 };
+use rivect::providers::{ProviderError, offline_usable, resolve_credential};
 
 fn resolve_or_panic(config: &Config, purpose: &str) -> rivect::config::ResolvedPurpose {
     config
@@ -4890,5 +4891,137 @@ fn vllm_credential_ref_grammar_admits_the_absent_binding_and_rejects_unknown_key
     assert!(
         matches!(&error.issue, ConfigIssue::SecretRefExpected { key } if key == "connections.vllm.credential_ref"),
         "wrong rejection: {error}"
+    );
+}
+
+// ----- AC-040h Pro/Max profile pair -------------------------------------
+
+/// The isolated subscription row beside the API-key row it must never
+/// share a scope with.
+fn anthropic_profile_pair() -> String {
+    "config_version = 1\n\
+     [connections.anthropic]\nkind = \"api_key\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"keyring:rivect/anthropic\"\n\
+     [connections.anthropic-subscription]\nkind = \"subscription\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\nprofile = \"anthropic-pro-max\"\n\
+     [profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\n\
+     [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n"
+        .to_string()
+}
+
+/// The Pro/Max entry resolves one distinct scoped subscription profile:
+/// profile precedence, the scope/binding agreement and the class's
+/// required binding are all the shipped config rules, and the two
+/// profiles never share a scope.
+#[test]
+fn anthropic_pro_max_profile_is_isolated_from_the_api_key_profile() {
+    let config = Config::parse_validated(&anthropic_profile_pair()).expect("the pair parses");
+    let api = &config.connections["anthropic"];
+    let pro = &config.connections["anthropic-subscription"];
+    assert_eq!(api.kind, ConnKind::ApiKey);
+    assert_eq!(
+        api.credential_ref.as_deref(),
+        Some("keyring:rivect/anthropic")
+    );
+    assert_eq!(api.profile, None, "the api-key row binds no profile");
+    assert_eq!(pro.kind, ConnKind::Subscription);
+    assert_eq!(pro.profile.as_deref(), Some("anthropic-pro-max"));
+
+    let api_ref = resolve_credential(&config, "anthropic").expect("api key ref");
+    let pro_ref = resolve_credential(&config, "anthropic-subscription").expect("pro max ref");
+    assert_eq!(api_ref.scope(), "rivect/anthropic");
+    assert_eq!(
+        pro_ref.scope(),
+        "rivect/anthropic-pro-max/anthropic-pro-max"
+    );
+    assert_eq!(
+        pro_ref.profile(),
+        "anthropic-pro-max",
+        "the scope's profile leg is the name the login answers"
+    );
+    assert_ne!(
+        api_ref.scope(),
+        pro_ref.scope(),
+        "the two profiles never share a credential scope"
+    );
+
+    // A divergent profile scope is the named mismatch — scope and
+    // binding cannot drift apart.
+    let mismatched = Config::parse_validated(&anthropic_profile_pair().replace(
+        "[profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"",
+        "[profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/other\"",
+    ))
+    .expect("the rows still parse");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "anthropic-subscription"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "a profile whose scope names another profile is CredentialProfileMismatch"
+    );
+
+    // An empty profile row resolves no reference.
+    let empty = Config::parse_validated(&anthropic_profile_pair().replace(
+        "[profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"",
+        "[profiles.anthropic-pro-max]",
+    ))
+    .expect("an empty profile row parses");
+    assert!(
+        matches!(
+            resolve_credential(&empty, "anthropic-subscription"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "a profile with no reference cannot stand in for the binding"
+    );
+
+    // The subscription class requires its binding at ingress.
+    let unbound = Config::parse_validated(&anthropic_profile_pair().replace(
+        "credential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\nprofile = \"anthropic-pro-max\"",
+        "profile = \"anthropic-pro-max\"",
+    ))
+    .expect_err("a subscription row without its binding is refused");
+    assert!(
+        matches!(
+            &unbound.issue,
+            ConfigIssue::CredentialRefRequired { kind } if *kind == ConnKind::Subscription
+        ),
+        "wrong rejection: {unbound}"
+    );
+}
+
+/// The API-key profile's binding and usability are exactly what they were
+/// before the subscription row existed; the subscription row never
+/// borrows it.
+#[test]
+fn anthropic_api_key_profile_stays_usable_when_the_subscription_profile_is_present() {
+    let config = Config::parse_validated(&anthropic_profile_pair()).expect("the pair parses");
+    assert!(
+        offline_usable(&config.connections, &config.profiles, "anthropic"),
+        "the api-key profile stays usable"
+    );
+    assert!(
+        !offline_usable(
+            &config.connections,
+            &config.profiles,
+            "anthropic-subscription",
+        ),
+        "the subscription profile stays grant-gated"
+    );
+    let api_ref = resolve_credential(&config, "anthropic").expect("api key ref");
+    assert_eq!(api_ref.raw(), "keyring:rivect/anthropic");
+    assert_eq!(
+        config.connections["anthropic"].credential_ref.as_deref(),
+        Some(api_ref.raw()),
+        "the api-key binding is the declared one, not the subscription scope"
+    );
+
+    // A dangling profile binding is refused at ingress, so a subscription
+    // row can never silently fall through to the API-key profile.
+    let dangling = Config::parse_validated(&anthropic_profile_pair().replace(
+        "[profiles.anthropic-pro-max]\ncredential_ref = \"keyring:rivect/anthropic-pro-max/anthropic-pro-max\"\n",
+        "",
+    ))
+    .expect_err("a dangling profile binding is refused");
+    assert!(
+        matches!(&dangling.issue, ConfigIssue::UnknownProfileReference { profile } if profile == "anthropic-pro-max"),
+        "wrong rejection: {dangling}"
     );
 }

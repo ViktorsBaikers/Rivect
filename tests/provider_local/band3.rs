@@ -1303,6 +1303,7 @@ fn ollama_cloud_entry(
         id: id.to_string(),
         reasoning,
         vision,
+        tools: false,
         efforts,
         effort_default: None,
         context_window: Some(context_window),

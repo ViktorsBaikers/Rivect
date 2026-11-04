@@ -25,6 +25,10 @@ mod support;
 
 use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
 use rivect::model::{InputOrigin, RequestManifest};
+use rivect::providers::anthropic_login::{
+    LoginError, begin_login, challenge_for, clear_subscription, complete_login, read_subscription,
+    refresh_login,
+};
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::{
     CredentialStore, Dialect, FlightedStore, KeyringBackend, Provider, ProviderError, SecretRef,
@@ -39,6 +43,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::Duration;
 use support::SECRET_CANARY;
+use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// The only namespace the proof may write to (DEC-002): a service prefix
 /// that can never collide with production `rivect` entries or foreign
@@ -188,6 +194,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::DialectUnserved { .. } => "DialectUnserved",
         ProviderError::UnpinnedModel { .. } => "UnpinnedModel",
         ProviderError::RegionMismatch { .. } => "RegionMismatch",
+        ProviderError::EndpointRequired { .. } => "EndpointRequired",
         ProviderError::Transport { .. } => "Transport",
         ProviderError::ProviderFailed { .. } => "ProviderFailed",
         ProviderError::UnknownTerminal { .. } => "UnknownTerminal",
@@ -5025,4 +5032,742 @@ fn together_api_key_binding_resolves_through_scoped_secret_ref() {
         ),
         "profile/scope disagreement is CredentialProfileMismatch"
     );
+}
+
+// ----- AC-040h Pro/Max login profile ------------------------------------
+
+/// The isolated subscription connection/profile pair and the api-key
+/// neighbour the login must never write.
+const PRO_MAX_CONNECTION: &str = "anthropic-subscription";
+const PRO_MAX_PROFILE: &str = "anthropic-pro-max";
+const API_KEY_CONNECTION: &str = "anthropic";
+const API_KEY_REF: &str = "keyring:rivect-test/anthropic";
+const PRO_MAX_REF: &str = "keyring:rivect-test/anthropic-pro-max/anthropic-pro-max";
+/// Fixture material — never a real token, only ever sent to localhost.
+const API_KEY_FIXTURE: &str = "fixture-api-key-not-a-real-credential";
+const ACCESS_FIXTURE: &str = "fixture-subscription-access-not-real";
+const REFRESH_FIXTURE: &str = "fixture-subscription-refresh-not-real";
+const ROTATED_ACCESS_FIXTURE: &str = "fixture-rotated-access-not-real";
+const ROTATED_REFRESH_FIXTURE: &str = "fixture-rotated-refresh-not-real";
+const RECORDED_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// One configured api-key connection beside the isolated Pro/Max pair.
+fn pro_max_config() -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{API_KEY_CONNECTION}]\nkind = \"api_key\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"{API_KEY_REF}\"\n\
+         [connections.{PRO_MAX_CONNECTION}]\nkind = \"subscription\"\nendpoint = \"https://api.anthropic.com/v1\"\ncredential_ref = \"{PRO_MAX_REF}\"\nprofile = \"{PRO_MAX_PROFILE}\"\n\
+         [profiles.{PRO_MAX_PROFILE}]\ncredential_ref = \"{PRO_MAX_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"auto\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"auto\" }}\n"
+    )
+}
+
+/// The api-key profile's material is seeded so "unchanged" is a
+/// discriminated observation, never vacuously true.
+fn login_store() -> support::MapStore {
+    support::MapStore::seeded(StoreKind::Keychain, &[(API_KEY_REF, API_KEY_FIXTURE)])
+}
+
+fn callback_url(state: &str, query: &str) -> String {
+    format!("http://127.0.0.1:54545/callback?{query}&state={state}")
+}
+
+fn token_endpoint(server: &MockServer) -> String {
+    format!("{}/v1/oauth/token", server.uri())
+}
+
+/// reqwest's blocking client panics inside a tokio context, so every
+/// login leg that can reach the wire runs on a plain OS thread.
+fn on_login_thread<T: Send>(op: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| scope.spawn(op).join().expect("login thread joins"))
+}
+
+async fn mount_exchange(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .and(body_partial_json(json!({
+            "grant_type": "authorization_code",
+            "code": "good-code",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": ACCESS_FIXTURE,
+            "refresh_token": REFRESH_FIXTURE,
+            "expires_in": 28_800,
+            "account": {"uuid": "account-fixture", "email_address": "operator@example.invalid"},
+            "organization": {"uuid": "org-fixture", "name": "Fixture Max"},
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_rejected_and_orgless(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .and(body_partial_json(json!({"code": "rejected-code"})))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .and(body_partial_json(json!({"code": "orgless-code"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": ACCESS_FIXTURE,
+            "refresh_token": REFRESH_FIXTURE,
+            "expires_in": 28_800,
+            "account": {"uuid": "account-fixture"},
+            "organization": {"name": "No Uuid"},
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_refresh(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .and(body_partial_json(json!({
+            "grant_type": "refresh_token",
+            "refresh_token": REFRESH_FIXTURE,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": ROTATED_ACCESS_FIXTURE,
+            "refresh_token": ROTATED_REFRESH_FIXTURE,
+            "expires_in": 28_800,
+            // A rebinding peer: the stored org must win.
+            "account": {"uuid": "rebound-account", "email_address": "rebound@example.invalid"},
+            "organization": {"uuid": "rebound-org", "name": "Rebound Org"},
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A revoked or expired grant: the peer refuses the rotated refresh token.
+async fn mount_expired_refresh(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .and(body_partial_json(json!({
+            "grant_type": "refresh_token",
+            "refresh_token": ROTATED_REFRESH_FIXTURE,
+        })))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(server)
+        .await;
+}
+
+/// A token reply one byte past the bounded read: the login leg denies
+/// before parsing, never buffering the peer's payload unbounded.
+async fn mount_oversized_exchange(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(1024 * 1024 + 1)))
+        .mount(server)
+        .await;
+}
+
+/// The `LoginError` variant name — plus the wrapped store verdict — is
+/// the only error detail a leg assertion may branch on.
+fn login_variant(error: &LoginError) -> &'static str {
+    match error {
+        LoginError::Entropy { .. } => "Entropy",
+        LoginError::NotARedirect => "NotARedirect",
+        LoginError::OriginMismatch => "OriginMismatch",
+        LoginError::StateMismatch => "StateMismatch",
+        LoginError::Cancelled => "Cancelled",
+        LoginError::Denied { .. } => "Denied",
+        LoginError::MissingCode => "MissingCode",
+        LoginError::EndpointNotRecorded { .. } => "EndpointNotRecorded",
+        LoginError::TokenRejected { .. } => "TokenRejected",
+        LoginError::MissingField { .. } => "MissingField",
+        LoginError::ResponseTooLarge => "ResponseTooLarge",
+        LoginError::MalformedResponse { .. } => "MalformedResponse",
+        LoginError::NotSubscription { .. } => "NotSubscription",
+        LoginError::StoredCredentialMalformed { .. } => "StoredCredentialMalformed",
+        LoginError::Serialization { .. } => "Serialization",
+        LoginError::Clock { .. } => "Clock",
+        LoginError::Provider(inner) => error_variant(inner),
+    }
+}
+
+fn leg_name(outcome: Result<String, LoginError>) -> String {
+    match outcome {
+        Ok(profile) => format!("ok:{profile}"),
+        Err(error) => login_variant(&error).to_string(),
+    }
+}
+
+/// The login path writes only its declared scope: a store whose write is
+/// interrupted answers `StoreUnavailable` and leaves prior bytes alone.
+struct InterruptedStore {
+    inner: support::MapStore,
+}
+
+impl CredentialStore for InterruptedStore {
+    fn kind(&self) -> StoreKind {
+        self.inner.kind()
+    }
+
+    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+        self.inner.occupied(credential)
+    }
+
+    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
+        self.inner.entry_accounts(service)
+    }
+
+    fn login(&self, _credential: &SecretRef, _secret: &[u8]) -> Result<(), ProviderError> {
+        Err(ProviderError::StoreUnavailable {
+            store: self.inner.kind(),
+            reason: "interrupted credential write".to_string(),
+        })
+    }
+
+    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+        self.inner.resolve(credential)
+    }
+
+    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.inner.refresh(credential, secret)
+    }
+
+    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.inner.revoke(credential)
+    }
+
+    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.inner.logout(credential)
+    }
+}
+
+/// The code+PKCE exchange binds the organization the peer reports and
+/// the refresh rotates the secrets without rebinding it; the API-key
+/// profile stays byte-identical and no token enters `Debug`.
+#[tokio::test]
+async fn anthropic_pro_max_exchange_binds_the_org_and_refreshes_without_rebinding() {
+    let server = MockServer::start().await;
+    mount_exchange(&server).await;
+    mount_refresh(&server).await;
+    let endpoint = token_endpoint(&server);
+    let config = Config::parse_validated(&pro_max_config()).expect("the isolated pair parses");
+    let store = login_store();
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("subscription ref");
+    assert_eq!(reference.profile(), PRO_MAX_PROFILE);
+    let api_reference = resolve_credential(&config, API_KEY_CONNECTION).expect("api key ref");
+
+    let session = begin_login().expect("the platform entropy source answers");
+    assert!(
+        session
+            .authorize_url()
+            .starts_with("https://claude.ai/oauth/authorize?code=true"),
+        "the recorded authorize endpoint and param: {}",
+        session.authorize_url()
+    );
+    assert!(session.authorize_url().contains(RECORDED_CLIENT_ID));
+    assert!(
+        session
+            .authorize_url()
+            .contains("code_challenge_method=S256")
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains(&format!("state={}", session.state()))
+    );
+    assert_eq!(
+        session.code_challenge(),
+        challenge_for(session.code_verifier()),
+        "the published challenge is S256 of the verifier"
+    );
+    assert_eq!(
+        session.code_verifier().len(),
+        43,
+        "the verifier is a recorded-length base64url string"
+    );
+
+    let redirect = callback_url(session.state(), "code=good-code");
+    let profile = on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &redirect,
+            &endpoint,
+            &store,
+        )
+    })
+    .expect("the contract peer completes the login");
+    assert_eq!(
+        profile, PRO_MAX_PROFILE,
+        "the returned profile name is the scope's profile leg"
+    );
+
+    let credential =
+        read_subscription(&store, &reference).expect("the scoped credential reads back");
+    assert_eq!(credential.access_token(), ACCESS_FIXTURE);
+    assert_eq!(credential.organization_id(), "org-fixture");
+    assert_eq!(credential.organization_name(), Some("Fixture Max"));
+    assert!(
+        credential.expires_at() > 1_700_000_000,
+        "the recorded skew still leaves a real expiry"
+    );
+
+    // The exchange body is exactly the recorded code+PKCE form.
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(requests.len(), 1, "one exchange request");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["grant_type"], "authorization_code");
+    assert_eq!(body["code"], "good-code");
+    assert_eq!(body["redirect_uri"], "http://127.0.0.1:54545/callback");
+    assert_eq!(body["client_id"], RECORDED_CLIENT_ID);
+    assert_eq!(body["code_verifier"], session.code_verifier());
+    assert_eq!(body["state"], session.state());
+
+    // Secret material never enters Debug.
+    let rendered = format!("{credential:?} {session:?}");
+    assert!(!rendered.contains(ACCESS_FIXTURE));
+    assert!(!rendered.contains(REFRESH_FIXTURE));
+    assert!(!rendered.contains(session.code_verifier()));
+    assert!(rendered.contains("<redacted>"));
+
+    // Refresh: the peer reports a different org and account, and neither
+    // rebinds the credential captured at login.
+    let profile = on_login_thread(|| refresh_login(&config, PRO_MAX_CONNECTION, &endpoint, &store))
+        .expect("the contract peer refreshes");
+    assert_eq!(profile, PRO_MAX_PROFILE);
+    let refreshed = read_subscription(&store, &reference).expect("refreshed credential");
+    assert_eq!(refreshed.access_token(), ROTATED_ACCESS_FIXTURE);
+    assert_eq!(
+        refreshed.organization_id(),
+        "org-fixture",
+        "refresh never rebinds the org"
+    );
+    assert_eq!(refreshed.organization_name(), Some("Fixture Max"));
+    assert!(!format!("{refreshed:?}").contains(ROTATED_REFRESH_FIXTURE));
+
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(requests.len(), 2, "exchange plus refresh");
+    let refresh_request = &requests[1];
+    assert_eq!(
+        refresh_request
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok()),
+        Some("oauth-2025-04-20"),
+        "the recorded refresh beta"
+    );
+    assert!(
+        refresh_request
+            .headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("anthropic-sdk-typescript/")),
+        "the recorded refresh user agent"
+    );
+    let body: Value = serde_json::from_slice(&refresh_request.body).expect("json body");
+    assert_eq!(body["grant_type"], "refresh_token");
+    assert_eq!(body["refresh_token"], REFRESH_FIXTURE);
+    assert_eq!(body["client_id"], RECORDED_CLIENT_ID);
+
+    // The API-key profile is untouched, byte for byte.
+    assert_ne!(reference.scope(), api_reference.scope());
+    assert_eq!(
+        store.resolve(&api_reference).expect("api key material"),
+        API_KEY_FIXTURE.as_bytes()
+    );
+}
+
+/// Wrong state, wrong origin and an operator cancel all deny before any
+/// wire leg and leave both profiles exactly as they were.
+#[test]
+fn anthropic_wrong_state_or_origin_or_cancel_does_not_activate_a_profile() {
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let store = login_store();
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+    let api_reference = resolve_credential(&config, API_KEY_CONNECTION).expect("api key ref");
+    let session = begin_login().expect("entropy");
+    // A dead loopback port: any leg that reached the wire would deny with
+    // a transport verdict, not the callback verdict asserted here.
+    let endpoint = "http://127.0.0.1:1/v1/oauth/token";
+    let legs = [
+        (
+            "wrong state",
+            callback_url("foreign-state", "code=good-code"),
+            "StateMismatch",
+        ),
+        (
+            "wrong origin",
+            format!(
+                "http://127.0.0.1:9999/callback?code=good-code&state={}",
+                session.state()
+            ),
+            "OriginMismatch",
+        ),
+        (
+            "cancel",
+            callback_url(session.state(), "error=access_denied"),
+            "Cancelled",
+        ),
+    ];
+    for (leg, redirect, expected) in legs {
+        let error = complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &redirect,
+            endpoint,
+            &store,
+        )
+        .expect_err("the leg never activates a profile");
+        assert_eq!(login_variant(&error), expected, "{leg}: {error}");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("good-code"), "{leg} names no code");
+        assert!(
+            !rendered.contains(session.code_verifier()),
+            "{leg} names no verifier"
+        );
+    }
+    assert!(
+        !store.occupied(&reference).expect("the store answers"),
+        "no subscription profile was activated"
+    );
+    assert_eq!(
+        store.resolve(&api_reference).expect("api key material"),
+        API_KEY_FIXTURE.as_bytes(),
+        "the api-key profile is untouched"
+    );
+}
+
+/// An interrupted credential write leaves the previous subscription
+/// material and the API-key profile intact.
+#[tokio::test]
+async fn anthropic_interrupted_profile_write_keeps_the_previous_profile() {
+    let server = MockServer::start().await;
+    mount_exchange(&server).await;
+    let endpoint = token_endpoint(&server);
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+    let api_reference = resolve_credential(&config, API_KEY_CONNECTION).expect("api key ref");
+
+    // One completed login is the profile the interrupted write must keep.
+    let seeded = login_store();
+    let session = begin_login().expect("entropy");
+    on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &callback_url(session.state(), "code=good-code"),
+            &endpoint,
+            &seeded,
+        )
+    })
+    .expect("the first login completes");
+    let prior = seeded.resolve(&reference).expect("prior material");
+
+    let interrupted = InterruptedStore {
+        inner: support::MapStore::seeded(StoreKind::Keychain, &[(API_KEY_REF, API_KEY_FIXTURE)]),
+    };
+    interrupted.inner.enroll(PRO_MAX_REF, &prior);
+    let retry = begin_login().expect("entropy");
+    let error = on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &retry,
+            &callback_url(retry.state(), "code=good-code"),
+            &endpoint,
+            &interrupted,
+        )
+    })
+    .expect_err("the interrupted write denies");
+    assert_eq!(login_variant(&error), "StoreUnavailable", "{error}");
+    assert_eq!(
+        interrupted.inner.resolve(&reference).expect("material"),
+        prior,
+        "the previous subscription profile is byte-identical"
+    );
+    assert_eq!(
+        interrupted.inner.resolve(&api_reference).expect("material"),
+        API_KEY_FIXTURE.as_bytes()
+    );
+}
+
+/// A crafted endpoint that puts the loopback literal in the userinfo
+/// never impersonates the host: the parsed URL is rejected and the raw
+/// userinfo never renders in the diagnostic.
+#[test]
+fn anthropic_token_endpoint_rejects_userinfo_and_foreign_hosts() {
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let store = login_store();
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+    let session = begin_login().expect("entropy");
+    for endpoint in [
+        "http://127.0.0.1:9@evil.example/v1/oauth/token",
+        "https://api.anthropic.com@evil.example/v1/oauth/token",
+        "https://api.anthropic.com/v1/oauth/token?via=evil.example",
+        "http://evil.example/v1/oauth/token",
+        "https://127.0.0.1:9/v1/oauth/token",
+    ] {
+        let error = complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &callback_url(session.state(), "code=good-code"),
+            endpoint,
+            &store,
+        )
+        .expect_err("an unrecorded endpoint denies before the wire");
+        assert_eq!(
+            login_variant(&error),
+            "EndpointNotRecorded",
+            "{endpoint}: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains('@'),
+            "{endpoint}: no raw userinfo renders: {rendered}"
+        );
+        assert!(
+            !rendered.contains("good-code"),
+            "{endpoint}: the code never renders"
+        );
+    }
+    assert!(
+        !store.occupied(&reference).expect("the store answers"),
+        "no rejected endpoint activates the profile"
+    );
+}
+
+/// A token reply past the bounded read denies `ResponseTooLarge` before
+/// any parse and leaves the profile unactivated.
+#[tokio::test]
+async fn anthropic_oversized_token_reply_denies_before_parse() {
+    let server = MockServer::start().await;
+    mount_oversized_exchange(&server).await;
+    let endpoint = token_endpoint(&server);
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let store = login_store();
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+    let session = begin_login().expect("entropy");
+    let error = on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &callback_url(session.state(), "code=good-code"),
+            &endpoint,
+            &store,
+        )
+    })
+    .expect_err("the oversized reply denies");
+    assert_eq!(login_variant(&error), "ResponseTooLarge", "{error}");
+    assert!(
+        !store.occupied(&reference).expect("the store answers"),
+        "an oversized reply never activates the profile"
+    );
+}
+
+/// Enrollment is create-only, so a re-login first clears the scope through
+/// `clear_subscription` (the store's `logout`) and only then enrolls again.
+#[tokio::test]
+async fn anthropic_relogin_after_logout_enrolls_a_second_credential() {
+    let server = MockServer::start().await;
+    mount_exchange(&server).await;
+    let endpoint = token_endpoint(&server);
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let store = login_store();
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+
+    let first = begin_login().expect("entropy");
+    on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &first,
+            &callback_url(first.state(), "code=good-code"),
+            &endpoint,
+            &store,
+        )
+    })
+    .expect("the first login enrolls");
+
+    // The occupied scope is the typed denial, never an overwrite.
+    let second = begin_login().expect("entropy");
+    let error = on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &second,
+            &callback_url(second.state(), "code=good-code"),
+            &endpoint,
+            &store,
+        )
+    })
+    .expect_err("a second login into the occupied scope denies");
+    assert_eq!(login_variant(&error), "CredentialOccupied", "{error}");
+
+    // Revoke → login: the recorded sequence.
+    on_login_thread(|| clear_subscription(&store, &reference)).expect("the scope clears");
+    assert!(
+        !store.occupied(&reference).expect("the store answers"),
+        "the revoke leaves the scope open"
+    );
+    let third = begin_login().expect("entropy");
+    let profile = on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &third,
+            &callback_url(third.state(), "code=good-code"),
+            &endpoint,
+            &store,
+        )
+    })
+    .expect("the second successful login enrolls");
+    assert_eq!(profile, PRO_MAX_PROFILE);
+    let credential = read_subscription(&store, &reference).expect("the re-login material reads");
+    assert_eq!(credential.access_token(), ACCESS_FIXTURE);
+}
+
+/// Every expected login leg executes and answers its own verdict: the
+/// positive exchange and refresh, the callback negatives, the endpoint
+/// guard, the peer refusals, the store interruption and the api-key
+/// binding guard.
+#[tokio::test]
+async fn anthropic_pro_max_profile_legs_matrix_executes_all_expected_legs() {
+    let server = MockServer::start().await;
+    mount_exchange(&server).await;
+    mount_refresh(&server).await;
+    mount_expired_refresh(&server).await;
+    mount_rejected_and_orgless(&server).await;
+    let endpoint = token_endpoint(&server);
+    let config = Config::parse_validated(&pro_max_config()).expect("valid");
+    let mut observed = Vec::new();
+
+    let store = login_store();
+    let session = begin_login().expect("entropy");
+    observed.push(leg_name(on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &session,
+            &callback_url(session.state(), "code=good-code"),
+            &endpoint,
+            &store,
+        )
+    })));
+    observed.push(leg_name(on_login_thread(|| {
+        refresh_login(&config, PRO_MAX_CONNECTION, &endpoint, &store)
+    })));
+
+    // An expired or revoked grant is a typed denial that leaves the
+    // stored profile untouched.
+    let reference = resolve_credential(&config, PRO_MAX_CONNECTION).expect("ref");
+    let before_rejected = store.resolve(&reference).expect("material");
+    observed.push(leg_name(on_login_thread(|| {
+        refresh_login(&config, PRO_MAX_CONNECTION, &endpoint, &store)
+    })));
+    assert_eq!(
+        store.resolve(&reference).expect("material"),
+        before_rejected,
+        "a rejected refresh leaves the stored credential intact"
+    );
+
+    let fresh = begin_login().expect("entropy");
+    let fresh_store = login_store();
+    observed.push(leg_name(complete_login(
+        &config,
+        PRO_MAX_CONNECTION,
+        &fresh,
+        &callback_url("foreign-state", "code=good-code"),
+        &endpoint,
+        &fresh_store,
+    )));
+    observed.push(leg_name(complete_login(
+        &config,
+        PRO_MAX_CONNECTION,
+        &fresh,
+        &format!(
+            "http://127.0.0.1:9999/callback?code=good-code&state={}",
+            fresh.state()
+        ),
+        &endpoint,
+        &fresh_store,
+    )));
+    observed.push(leg_name(complete_login(
+        &config,
+        PRO_MAX_CONNECTION,
+        &fresh,
+        &callback_url(fresh.state(), "error=access_denied"),
+        &endpoint,
+        &fresh_store,
+    )));
+    observed.push(leg_name(complete_login(
+        &config,
+        PRO_MAX_CONNECTION,
+        &fresh,
+        &callback_url(fresh.state(), "code=good-code"),
+        "https://foreign.example.invalid/v1/oauth/token",
+        &fresh_store,
+    )));
+    observed.push(leg_name(on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &fresh,
+            &callback_url(fresh.state(), "code=rejected-code"),
+            &endpoint,
+            &fresh_store,
+        )
+    })));
+    observed.push(leg_name(on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &fresh,
+            &callback_url(fresh.state(), "code=orgless-code"),
+            &endpoint,
+            &fresh_store,
+        )
+    })));
+
+    let interrupted = InterruptedStore {
+        inner: support::MapStore::new(StoreKind::Keychain),
+    };
+    observed.push(leg_name(on_login_thread(|| {
+        complete_login(
+            &config,
+            PRO_MAX_CONNECTION,
+            &fresh,
+            &callback_url(fresh.state(), "code=good-code"),
+            &endpoint,
+            &interrupted,
+        )
+    })));
+
+    observed.push(leg_name(complete_login(
+        &config,
+        API_KEY_CONNECTION,
+        &fresh,
+        &callback_url(fresh.state(), "code=good-code"),
+        &endpoint,
+        &fresh_store,
+    )));
+
+    assert_eq!(
+        observed,
+        [
+            format!("ok:{PRO_MAX_PROFILE}"),
+            format!("ok:{PRO_MAX_PROFILE}"),
+            "TokenRejected".to_string(),
+            "StateMismatch".to_string(),
+            "OriginMismatch".to_string(),
+            "Cancelled".to_string(),
+            "EndpointNotRecorded".to_string(),
+            "TokenRejected".to_string(),
+            "MissingField".to_string(),
+            "StoreUnavailable".to_string(),
+            "NotSubscription".to_string(),
+        ],
+        "every login leg executes and answers its own verdict"
+    );
+    assert_eq!(observed.len(), 11, "the matrix executes every expected leg");
 }

@@ -32,10 +32,10 @@ use crate::config::{Config, Connection, EffortAssign, EffortLevel, FixedModel, M
 use crate::model::RequestManifest;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
-    SecretRef, ToolCall, bounded_reason, check_deadline, dialect_for, payload_reason,
-    read_catalog_body, read_chunk, resolve_credential, sse, transport, transport_status, violation,
-    wire_body,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES, ToolCall,
+    WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map, payload_reason,
+    read_catalog_body, read_chunk, resolve_credential, routes_for, sse, transport,
+    transport_status, violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -126,9 +126,10 @@ pub struct GeminiProvider {
     /// API root including its version segment (`/v1beta`).
     endpoint: String,
     /// The scoped credential binding resolved under DEC-013
-    /// precedence — material is read from the store per send so a
+    /// precedence, or material a routed caller already resolved for
+    /// this send — material is read from the store per send so a
     /// rotation is honoured without rebuilding the adapter.
-    credential: SecretRef,
+    auth: WireAuth,
     store: Arc<dyn CredentialStore>,
     client: reqwest::blocking::Client,
     /// The one budget the whole send — credential resolution, the
@@ -187,6 +188,31 @@ impl GeminiProvider {
         Self::build(config, connection, store, deadline)
     }
 
+    /// Builds the adapter for a route-scoped construction. The routed
+    /// owner is the caller: the gate is the id's recorded route table,
+    /// and a preflight-resolved [`WireAuth`] skips the store resolve —
+    /// its forwarded headers ride this adapter's catalogue and wire
+    /// legs.
+    ///
+    /// # Errors
+    /// [`Self::new`]'s contract, and
+    /// [`ProviderError::DialectMismatch`] when the id's recorded routes
+    /// do not include Gemini.
+    pub fn with_route(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: WireAuth,
+    ) -> Result<Self, ProviderError> {
+        if !routes_for(connection).contains(&Dialect::Gemini) {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
+        Self::assemble(config, connection, store, deadline, Some(auth))
+    }
+
     fn build(
         config: &Config,
         connection: &str,
@@ -198,6 +224,16 @@ impl GeminiProvider {
                 connection: connection.to_string(),
             });
         }
+        Self::assemble(config, connection, store, deadline, None)
+    }
+
+    fn assemble(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        auth: Option<WireAuth>,
+    ) -> Result<Self, ProviderError> {
         let conn =
             config
                 .connections
@@ -211,7 +247,10 @@ impl GeminiProvider {
                 region: region.clone(),
             });
         }
-        let credential = resolve_credential(config, connection)?;
+        let auth = match auth {
+            Some(auth) => auth,
+            None => WireAuth::Store(Some(resolve_credential(config, connection)?)),
+        };
         // The transport backstop sits strictly above the adapter's own
         // deadline: an expiry races out through `check_deadline` and
         // names itself the send's deadline, while reqwest's timer only
@@ -224,7 +263,7 @@ impl GeminiProvider {
         Ok(Self {
             connection: connection.to_string(),
             endpoint: conn.endpoint.trim_end_matches('/').to_string(),
-            credential,
+            auth,
             store,
             client,
             deadline,
@@ -268,6 +307,7 @@ impl GeminiProvider {
             .client
             .get(format!("{}/models", self.endpoint))
             .header("x-goog-api-key", token)
+            .headers(forwarded_header_map(self.auth.forwarded()))
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
@@ -324,10 +364,20 @@ impl GeminiProvider {
     /// cannot be an API-key header: typed denial, never a mangled
     /// header.
     fn secret(&self) -> Result<String, ProviderError> {
-        let material = self.store.resolve(&self.credential)?;
-        String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
-            connection: self.connection.clone(),
-        })
+        match &self.auth {
+            WireAuth::Store(Some(credential)) => {
+                let material = self.store.resolve(credential)?;
+                String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+                    connection: self.connection.clone(),
+                })
+            }
+            WireAuth::Store(None) => Err(ProviderError::CredentialUnresolved {
+                connection: self.connection.clone(),
+                scope: format!("connections.{}.credential_ref", self.connection),
+                cause: None,
+            }),
+            WireAuth::Resolved { token, .. } => Ok(token.clone()),
+        }
     }
 
     /// The frozen manifest as the Gemini wire request: the lineage's
@@ -836,7 +886,7 @@ impl std::fmt::Debug for GeminiProvider {
         f.debug_struct("GeminiProvider")
             .field("connection", &self.connection)
             .field("endpoint", &self.endpoint)
-            .field("credential", &self.credential)
+            .field("auth", &self.auth)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
     }
@@ -949,6 +999,7 @@ impl Provider for GeminiProvider {
             .header("x-goog-api-key", &token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
+            .headers(forwarded_header_map(self.auth.forwarded()))
             .body(body_bytes)
             .send()
             .map_err(|err| transport(&self.connection, err))?;

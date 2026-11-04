@@ -31,8 +31,31 @@
 //! | `xiaomi-token-plan-cn` | Chat Completions | `https://token-plan-cn.xiaomimimo.com/v1` | `api_key` bearer (token-plan literal) | none |
 //! | `xiaomi-token-plan-sgp` | Chat Completions | `https://token-plan-sgp.xiaomimimo.com/v1` | `api_key` bearer (token-plan literal) | none |
 //! | `yolo-auto` | Chat Completions | `https://yolo-auto.com/v1` | `api_key` bearer | none |
+//!
+//! # Recorded routed contract (band 5)
+//!
+//! A routed id owns no single dialect: [`dialect_for`] stays its literal
+//! default, and [`routes_for`]/[`route_for`] name the codec each model
+//! rides. `gitlab-duo` is Chat Completions by default with a closed alias
+//! table (Messages aliases and Responses codex aliases). Both OpenCode
+//! gateways record `openai-completions` as their default resolution:
+//! `opencode-go` sends `claude-*`/`qwen*`/`minimax-m2.5*` on Messages
+//! (except the five CC exacts) and the GPT/Grok/Muse families plus
+//! `deepseek-v4-flash` on Responses; `opencode-zen` sends
+//! `claude-*`/`qwen-*` on Messages, the GPT/Grok/Muse families on
+//! Responses and `gemini-*` on the Gemini dialect. A model outside a
+//! closed alias table denies; every other routed id falls back to its
+//! recorded default.
+//!
+//! `anthropic` also carries the recorded subscription form: a
+//! `kind = "subscription"` declaration stores the login module's
+//! [`anthropic_login::SubscriptionCredential`] JSON at its scoped ref, and
+//! the Messages adapter sends that credential's `access_token` as
+//! `Authorization: Bearer` — never the stored JSON and never `x-api-key`.
+//! The login lifecycle itself ([`anthropic_login`]) is library-level; no
+//! CLI verb is added.
 
-use crate::config::{Config, ConnKind, Connection, ModelAssign, Profile};
+use crate::config::{Config, ConnKind, Connection, EffortLevel, ModelAssign, Profile};
 use crate::model::RequestManifest;
 use crate::resources::UsageDelta;
 use serde_json::Value;
@@ -43,16 +66,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod anthropic;
+pub mod anthropic_login;
 pub mod gemini;
 pub mod local;
 pub mod ollama_cloud;
 pub mod openai;
+pub mod routed;
 pub mod sse;
 
 /// The one catalogue record both dialect owners share (DEC-007):
 /// defined once in the local adapter, re-exported here so the
 /// Responses surface offers the same vocabulary.
 pub use local::{CatalogModel, ModelPrice};
+
+/// A stated positive whole count; absent, zero or unreadable stays `None`.
+pub(crate) fn positive_count(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .filter(|count| *count > 0)
+}
+
+/// The recorded reasoning level on our effort vocabulary: a level the
+/// enum cannot name never lands.
+pub(crate) fn wire_effort(value: &str) -> Option<EffortLevel> {
+    match value {
+        "minimal" => Some(EffortLevel::Minimal),
+        "low" => Some(EffortLevel::Low),
+        "medium" => Some(EffortLevel::Medium),
+        "high" => Some(EffortLevel::High),
+        "xhigh" => Some(EffortLevel::Xhigh),
+        _ => None,
+    }
+}
+
+/// A host the recorded loopback contract admits: the v4 loopback, its v6
+/// literal, or the reserved `localhost` name. Parsed hosts are compared
+/// exactly, never by suffix or by the text before a `@`.
+pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("127.0.0.1" | "::1" | "localhost"))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -322,6 +379,11 @@ pub enum ProviderError {
     /// is never silently ignored.
     #[error("connection {connection} region {region} is outside the dialect's endpoint contract")]
     RegionMismatch { connection: String, region: String },
+    /// DEC-005: the arm's base is operator data (Cloudflare
+    /// account/gateway), so no default host exists — an empty
+    /// configured endpoint names no recorded base to send to.
+    #[error("connection {connection} requires a configured endpoint")]
+    EndpointRequired { connection: String },
     /// The transport failed before a usable reply — connect, TLS,
     /// status or read failure. The source is retained for programmatic inspection.
     #[error("connection {connection} transport failed: {cause}")]
@@ -493,6 +555,55 @@ impl SecretRef {
 impl std::fmt::Display for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.raw)
+    }
+}
+
+/// The credential material a wire request authenticates with: a scoped
+/// reference the adapter resolves per send, or material an exchange
+/// already resolved for one send. The `Resolved` form exists for the
+/// two-leg proxies; no diagnostic may render either half.
+#[derive(Clone)]
+pub enum WireAuth {
+    /// The scoped store reference — the adapter reads material through
+    /// [`CredentialStore`] once per send; `None` is the recorded
+    /// absent-binding form.
+    Store(Option<SecretRef>),
+    /// Material a preflight exchange resolved for this send: the token
+    /// plus the returned headers the proxy leg may forward.
+    Resolved {
+        token: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+/// The header map a store-bound credential forwards: none. A resolved
+/// exchange is the only source of proxy headers, and the exchange itself
+/// admits only the recorded `x-gitlab-*` names.
+static NO_FORWARDED_HEADERS: BTreeMap<String, String> = BTreeMap::new();
+
+impl WireAuth {
+    /// The headers the proxy leg may forward — empty for a store-bound
+    /// credential, never an exchange's token-bearing names.
+    pub(crate) fn forwarded(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Store(_) => &NO_FORWARDED_HEADERS,
+            Self::Resolved { headers, .. } => headers,
+        }
+    }
+}
+
+impl std::fmt::Debug for WireAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(credential) => f.debug_tuple("Store").field(credential).finish(),
+            Self::Resolved { headers, .. } => {
+                let headers = format!("<{} redacted>", headers.len());
+                f.debug_struct("Resolved")
+                    .field("token", &"<redacted>")
+                    .field("headers", &headers)
+                    .finish()
+            }
+        }
     }
 }
 
@@ -1160,7 +1271,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// recorded local Responses plug with the optional credential
 /// (DEC-009), `openrouter` its catalogue-only-keyless Responses
 /// plug behind the recorded paste-key form (DEC-003), `sakana` its
-/// key-gated authoritative Responses plug (DEC-004), and `xai`/
+/// key-gated authoritative Responses plug (DEC-004), `custom-responses`
+/// its operator-configured custom-origin Responses plug (DEC-015), and
+/// `xai`/
 /// `xai-oauth` their authoritative-listing Responses plugs — the latter
 /// carrying the device-code-produced token at the scoped seam; `google`
 /// speaks
@@ -1190,7 +1303,7 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
     Responses,
@@ -1202,6 +1315,10 @@ pub enum Dialect {
     /// compatible host wired under the literal `custom-chat-completions`
     /// id shares (HZN-008 class S).
     ChatCompletions,
+    /// The Anthropic Messages API (`POST {endpoint}/v1/messages`, SSE):
+    /// the recorded dialect of `anthropic`, `minimax`, `umans` and
+    /// `cloudflare-ai-gateway`, never inferred from an auth label.
+    Messages,
     /// The native Ollama Cloud chat API (`POST {endpoint}/api/chat`,
     /// newline-delimited JSON) — the recorded dialect of the literal
     /// `ollama-cloud` id (DEC-001), never SSE and never shared.
@@ -1214,6 +1331,7 @@ impl std::fmt::Display for Dialect {
             Self::Responses => "responses",
             Self::Gemini => "gemini",
             Self::ChatCompletions => "chat-completions",
+            Self::Messages => "messages",
             Self::OllamaChat => "ollama-chat",
         })
     }
@@ -1228,12 +1346,20 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "abliteration" => Some(Dialect::Responses),
         "meta" => Some(Dialect::Responses),
         "ollama" => Some(Dialect::Responses),
+        "custom-responses" => Some(Dialect::Responses),
         "openrouter" => Some(Dialect::Responses),
         "sakana" => Some(Dialect::Responses),
         "xai" => Some(Dialect::Responses),
         "xai-oauth" => Some(Dialect::Responses),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
+        "anthropic" => Some(Dialect::Messages),
+        "minimax" => Some(Dialect::Messages),
+        "umans" => Some(Dialect::Messages),
+        "cloudflare-ai-gateway" => Some(Dialect::Messages),
+        "gitlab-duo" => Some(Dialect::ChatCompletions),
+        "opencode-go" => Some(Dialect::ChatCompletions),
+        "opencode-zen" => Some(Dialect::ChatCompletions),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
         "aiand" => Some(Dialect::ChatCompletions),
         "aimlapi" => Some(Dialect::ChatCompletions),
@@ -1272,6 +1398,179 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "xiaomi-token-plan-cn" => Some(Dialect::ChatCompletions),
         "xiaomi-token-plan-sgp" => Some(Dialect::ChatCompletions),
         "yolo-auto" => Some(Dialect::ChatCompletions),
+        "zhipu-coding-plan" => Some(Dialect::ChatCompletions),
+        _ => None,
+    }
+}
+
+/// The recorded dialects a routed id can serve (DEC-017). Only the ids
+/// with a route table in this build are listed; a single-dialect id
+/// answers an empty slice and keeps [`dialect_for`] as its sole gate, and
+/// a further routed id appends its own table here.
+#[must_use]
+pub fn routes_for(connection: &str) -> &'static [Dialect] {
+    match connection {
+        "gitlab-duo" => GITLAB_DUO_ROUTES,
+        "opencode-go" => OPENCODE_GO_ROUTES,
+        "opencode-zen" => OPENCODE_ZEN_ROUTES,
+        _ => &[],
+    }
+}
+
+/// The recorded dialect a routed id serves for `model` (REQ-038); `None`
+/// for an unrouted id or a model outside a closed recorded set.
+#[must_use]
+pub fn route_for(connection: &str, model: &str) -> Option<Dialect> {
+    routed_wire_model(connection, model).map(|(_, dialect)| dialect)
+}
+
+/// The GitLab alias table (DEC-013): the public alias is deployment
+/// identity, and its `upstreamModelId` is the wire model. The table is
+/// closed — an alias outside it has no recorded route.
+const GITLAB_DUO_MODELS: &[(&str, &str, Dialect)] = &[
+    ("duo-chat-opus-4-6", "claude-opus-4-6", Dialect::Messages),
+    (
+        "duo-chat-sonnet-4-6",
+        "claude-sonnet-4-6",
+        Dialect::Messages,
+    ),
+    (
+        "duo-chat-opus-4-5",
+        "claude-opus-4-5-20251101",
+        Dialect::Messages,
+    ),
+    (
+        "duo-chat-sonnet-4-5",
+        "claude-sonnet-4-5-20250929",
+        Dialect::Messages,
+    ),
+    (
+        "duo-chat-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        Dialect::Messages,
+    ),
+    (
+        "duo-chat-gpt-5-1",
+        "gpt-5.1-2025-11-13",
+        Dialect::ChatCompletions,
+    ),
+    (
+        "duo-chat-gpt-5-2",
+        "gpt-5.2-2025-12-11",
+        Dialect::ChatCompletions,
+    ),
+    (
+        "duo-chat-gpt-5-mini",
+        "gpt-5-mini-2025-08-07",
+        Dialect::ChatCompletions,
+    ),
+    ("duo-chat-gpt-5-codex", "gpt-5-codex", Dialect::Responses),
+    (
+        "duo-chat-gpt-5-2-codex",
+        "gpt-5.2-codex",
+        Dialect::Responses,
+    ),
+];
+
+const GITLAB_DUO_ROUTES: &[Dialect] = &[
+    Dialect::Messages,
+    Dialect::Responses,
+    Dialect::ChatCompletions,
+];
+
+/// The `opencode-go` route table (DEC-014): Chat Completions is the
+/// recorded `defaultResolution`; the GPT/Grok/Muse families and
+/// `deepseek-v4-flash` ride Responses; the MiniMax M2.5, Qwen and
+/// Claude families ride Messages except where the recorded CC exacts
+/// override them.
+const OPENCODE_GO_ROUTES: &[Dialect] = &[
+    Dialect::ChatCompletions,
+    Dialect::Messages,
+    Dialect::Responses,
+];
+
+/// The recorded `opencode-go` route for one model (DEC-014): the
+/// Responses classes first, then the recorded CC exacts, then the
+/// Messages families, and finally the recorded Chat Completions
+/// default.
+fn opencode_go_route(model: &str) -> Dialect {
+    if model.starts_with("gpt-")
+        || model.starts_with("grok-")
+        || model.starts_with("muse-")
+        || model == "deepseek-v4-flash"
+    {
+        Dialect::Responses
+    } else if matches!(
+        model,
+        "minimax-m2.7" | "minimax-m3" | "minimax-m3-free" | "qwen3.5-plus" | "qwen3.6-plus"
+    ) {
+        Dialect::ChatCompletions
+    } else if model.starts_with("claude-")
+        || model.starts_with("qwen")
+        || model.starts_with("minimax-m2.5")
+    {
+        Dialect::Messages
+    } else {
+        Dialect::ChatCompletions
+    }
+}
+
+/// The `opencode-zen` route table (DEC-014/DEC-018): Chat Completions
+/// is the recorded `defaultResolution`, and the overrides route Claude/
+/// `qwen-` to Messages, GPT/Grok/Muse to Responses and Gemini to its
+/// own dialect.
+const OPENCODE_ZEN_ROUTES: &[Dialect] = &[
+    Dialect::ChatCompletions,
+    Dialect::Messages,
+    Dialect::Responses,
+    Dialect::Gemini,
+];
+
+/// The recorded `opencode-zen` route for one model: the family
+/// overrides first, then the recorded Chat Completions default —
+/// an id matching no override rides that default (DEC-018).
+fn opencode_zen_route(model: &str) -> Dialect {
+    if model.starts_with("gpt-") || model.starts_with("grok-") || model.starts_with("muse-") {
+        Dialect::Responses
+    } else if model.starts_with("claude-") || model.starts_with("qwen-") {
+        Dialect::Messages
+    } else if model.starts_with("gemini-") {
+        Dialect::Gemini
+    } else {
+        Dialect::ChatCompletions
+    }
+}
+
+/// The wire model and route of a routed id's model: the GitLab alias
+/// table's `upstreamModelId`, or the `opencode-go`/`opencode-zen`
+/// family route over the verbatim model id. `None` is the closed-set
+/// denial.
+pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String, Dialect)> {
+    match connection {
+        "gitlab-duo" => GITLAB_DUO_MODELS
+            .iter()
+            .find(|(alias, ..)| *alias == model)
+            .map(|(_, upstream, dialect)| ((*upstream).to_string(), *dialect)),
+        "opencode-go" => Some((model.to_string(), opencode_go_route(model))),
+        "opencode-zen" => Some((model.to_string(), opencode_zen_route(model))),
+        _ => None,
+    }
+}
+
+/// The aliases a routed id offers as its catalogue: GitLab's static
+/// alias table, or `None` where the catalogue is the one keyed gateway
+/// listing its route table filters.
+pub(crate) fn routed_catalog(connection: &str) -> Option<Vec<CatalogModel>> {
+    match connection {
+        "gitlab-duo" => Some(
+            GITLAB_DUO_MODELS
+                .iter()
+                .map(|(alias, ..)| CatalogModel {
+                    id: (*alias).to_string(),
+                    ..CatalogModel::default()
+                })
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -1354,9 +1653,11 @@ impl Provider for LoopbackProvider {
 
 /// Whether a literal connection id records the credential-optional
 /// absent-binding form: the open proxy (`litellm`) — a configured proxy
-/// that serves with or without a key — and the local-endpoint class
+/// that serves with or without a key — the local-endpoint class
 /// (`llama.cpp`, `lm-studio`, `ollama`, `vllm`) — a local server whose
-/// recorded auth is optional beside its server-key mode. Both admit a
+/// recorded auth is optional beside its server-key mode — and the
+/// custom-origin class (`custom-responses`) — an operator-configured
+/// origin whose recorded auth is optional (DEC-015). Each admits a
 /// declaration that omits `credential_ref`, an absent binding sends no
 /// `Authorization` header — never a dummy key — and the pin stays
 /// offline-usable. The catalogue-only `openrouter` is the exception
@@ -1369,12 +1670,13 @@ impl Provider for LoopbackProvider {
 /// `llama.cpp`, `lm-studio`, `vllm`) is `CredentialRule::OpenProxy` in
 /// the local adapter's per-id table, the arm that carries the class's
 /// wire form; `ollama`'s contract side is the Responses adapter's
-/// `Option<SecretRef>` arm.
+/// `Option<SecretRef>` arm, and `custom-responses`' is its own
+/// Responses `SourceContract` arm.
 #[must_use]
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
     matches!(
         connection,
-        "litellm" | "llama.cpp" | "lm-studio" | "ollama" | "vllm"
+        "litellm" | "llama.cpp" | "lm-studio" | "ollama" | "vllm" | "custom-responses"
     )
 }
 
@@ -1581,6 +1883,25 @@ pub(crate) fn read_catalog_body(
         body.extend_from_slice(&chunk[..read]);
     }
     Ok(body)
+}
+
+/// The forwarded proxy headers as a request map: a name or value the
+/// HTTP grammar rejects is never constructed — the exchange's untrusted
+/// header object cannot smuggle framing through this seam.
+pub(crate) fn forwarded_header_map(
+    headers: &BTreeMap<String, String>,
+) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
 }
 
 /// The serialized body is what crosses the wire: it carries the
