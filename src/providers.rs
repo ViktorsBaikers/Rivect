@@ -342,10 +342,12 @@ pub enum ProviderError {
     #[error("no credential material at scope {scope}")]
     CredentialAbsent { scope: String },
     /// The resolved credential material cannot serve this dialect —
-    /// non-UTF-8 bytes where the contract needs a bearer token, or a
+    /// non-UTF-8 bytes where the contract needs a bearer token, a
     /// token outside the dialect's recorded credential grammar (a
     /// PAYG `sk-…` key where the contract binds plan `sk-sp-…`
-    /// keys). The material itself never appears in the error.
+    /// keys), or — on the codex ids — stored material that is not the
+    /// login module's credential JSON or whose access token is blank.
+    /// The material itself never appears in the error.
     #[error("credential material for connection {connection} is not usable by this dialect")]
     CredentialMalformed { connection: String },
     /// The credential's enrolled endpoint base does not match the
@@ -1311,7 +1313,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// its operator-configured custom-origin Responses plug (DEC-015), and
 /// `xai`/
 /// `xai-oauth` their authoritative-listing Responses plugs — the latter
-/// carrying the device-code-produced token at the scoped seam; `google`
+/// carrying the device-code-produced token at the scoped seam — and
+/// `openai-codex`/`openai-codex-device` the ChatGPT account-scoped
+/// Responses plug whose device alias shares the one contract; `google`
 /// speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `ollama-cloud` its recorded native `ollama-chat` JSONL dialect
@@ -1336,7 +1340,7 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `https://yolo-auto.com/v1` base — and
 /// `minimax-code`/`minimax-code-cn` the recorded class-P plan-key plugs
 /// on that same dialect (HZN-008) — never inferred from an
-/// auth label or a catalogue answer. `openai-codex`, `google-vertex`,
+/// auth label or a catalogue answer. `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1387,6 +1391,8 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "sakana" => Some(Dialect::Responses),
         "xai" => Some(Dialect::Responses),
         "xai-oauth" => Some(Dialect::Responses),
+        "openai-codex" => Some(Dialect::Responses),
+        "openai-codex-device" => Some(Dialect::Responses),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
         "anthropic" => Some(Dialect::Messages),
@@ -1451,6 +1457,15 @@ pub fn routes_for(connection: &str) -> &'static [Dialect] {
         "opencode-zen" => OPENCODE_ZEN_ROUTES,
         _ => &[],
     }
+}
+
+/// Whether a failed entered send on `from` must not be re-dispatched onto
+/// `to`: both literals resolve to one recorded contract whose arm forbids
+/// a blind same-backend retry (PROH-020). The routing owner consults this
+/// before minting a fallback substitute.
+#[must_use]
+pub(crate) fn blind_retry_refused(from: &str, to: &str) -> bool {
+    openai::refuses_blind_retry(from) && openai::same_recorded_contract(from, to)
 }
 
 /// The recorded dialect a routed id serves for `model` (REQ-038); `None`

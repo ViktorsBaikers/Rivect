@@ -235,6 +235,12 @@ pub enum RejectionCause {
     },
     /// The candidate passed the re-check but its own send failed.
     SendFailed(ProviderError),
+    /// The candidate resolves to the same recorded contract as the failed
+    /// primary or an already-attempted chain entry, and that contract
+    /// forbids re-dispatching a failed send onto a sibling literal: a
+    /// failed send is never retried blindly (PROH-020). The text stays
+    /// accurate for a denial that lands before any byte crossed.
+    BlindRetryRefused,
 }
 
 impl std::fmt::Display for RejectionCause {
@@ -253,6 +259,9 @@ impl std::fmt::Display for RejectionCause {
                 "reserved for dialect {dialect}; no installed adapter serves it in this build"
             ),
             Self::SendFailed(source) => write!(f, "send failed: {source}"),
+            Self::BlindRetryRefused => {
+                f.write_str("same recorded contract; a failed send is never retried blindly")
+            }
         }
     }
 }
@@ -1615,6 +1624,24 @@ impl Broker {
                 let mut rejected = Vec::new();
                 let mut attempted = Vec::new();
                 for entry in chain {
+                    // A failed send to a contract that forbids a blind
+                    // same-backend retry never re-dispatches onto a
+                    // sibling literal of that contract: every failed
+                    // connection in the walk is a refusal source, so an
+                    // alias cannot slip past after its canonical entry
+                    // failed. The contract gate stays ahead of
+                    // eligibility so a sibling literal is refused for
+                    // the right reason.
+                    let blind_refused = std::iter::once(admission.connection.as_str())
+                        .chain(attempted.iter().map(String::as_str))
+                        .any(|failed| providers::blind_retry_refused(failed, &entry.connection));
+                    if blind_refused {
+                        rejected.push(CandidateRejection {
+                            connection: entry.connection.clone(),
+                            cause: RejectionCause::BlindRetryRefused,
+                        });
+                        continue;
+                    }
                     if let Some(cause) =
                         self.candidate_rejection(&admission.purpose, &entry.connection)
                     {

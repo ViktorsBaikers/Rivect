@@ -5985,6 +5985,44 @@ fn openai_codex_connection_is_selectable_through_prepare() {
         .expect("the admission binds a profile");
     assert_eq!(binding.connection, "openai-codex");
     assert_eq!(binding.profile.as_deref(), Some("openai-codex"));
+
+    // The device alias is its own literal id selecting the one canonical
+    // profile: prepare admits it offline and freezes the alias pin, while
+    // the credential binding stays the canonical `openai-codex` profile.
+    let alias = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex-device",
+        "https://chatgpt.com/backend-api/codex",
+    ))
+    .expect("the alias config parses");
+    assert!(
+        rivect::providers::offline_usable(
+            &alias.connections,
+            &alias.profiles,
+            "openai-codex-device"
+        ),
+        "the alias is offline-usable through the canonical profile"
+    );
+    assert_eq!(
+        rivect::providers::dialect_for("openai-codex-device"),
+        Some(Dialect::Responses),
+        "the alias records the Responses dialect"
+    );
+    let mut alias_broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let alias_manifest = alias_broker
+        .prepare("main", &alias, "codex-world", "hello")
+        .expect("prepare selects the alias connection");
+    assert_eq!(
+        alias_manifest.model,
+        ModelAssign::Fixed(rivect::config::FixedModel {
+            connection: "openai-codex-device".to_string(),
+            model_id: "gpt-5.2-codex".to_string(),
+        })
+    );
+    let alias_binding = alias_broker
+        .bound_profile()
+        .expect("the alias admission binds a profile");
+    assert_eq!(alias_binding.connection, "openai-codex-device");
+    assert_eq!(alias_binding.profile.as_deref(), Some("openai-codex"));
 }
 
 /// A second login that answers another workspace or account denies typed

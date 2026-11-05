@@ -1,5 +1,6 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
-//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,sakana,custom-responses}):
+//! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,
+//! sakana,custom-responses,openai-codex,openai-codex-device}):
 //! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
@@ -10,8 +11,9 @@
 //! records the operator-configured custom origin with an absent-binding
 //! headerless form. The SSE legs pin
 //! the shared parser's WHATWG §9.2.5–9.2.6 conformance.
-//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana,custom-responses} stays
-//! NOT_RUN — the ignored named cases carry that status explicitly.
+//! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana,custom-responses,
+//! openai-codex} stays NOT_RUN — the ignored named cases carry that status
+//! explicitly, and `openai-codex::class-002` WebSocket stays NOT_RUN (DEC-017).
 
 #![allow(
     clippy::unwrap_used,
@@ -24,18 +26,20 @@
 )]
 
 use rivect::config::{Config, ConnKind, EffortLevel};
-use rivect::model::{Broker, ModelError, RequestManifest};
+use rivect::model::{Broker, ModelError, RejectionCause, RequestManifest};
 use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
 use rivect::providers::{
-    CatalogModel, Dialect, ModelPrice, Provider, ProviderError, StoreKind, TransportCause,
-    TransportClass,
+    CatalogModel, Dialect, ModelPrice, Provider, ProviderError, ProviderReply, StoreKind,
+    TransportCause, TransportClass,
 };
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -143,7 +147,7 @@ fn dispatch(
     mut broker: Broker,
     world: &str,
     manifest: RequestManifest,
-) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
+) -> (Broker, Result<ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
         let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
@@ -259,7 +263,7 @@ async fn dialect_is_keyed_on_the_literal_connection_id() {
     let server = MockServer::start().await;
     let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
-    let err = provider_result(config.clone(), "openai-codex".to_string(), store)
+    let err = provider_result(config.clone(), "google-vertex".to_string(), store)
         .expect_err("a different literal id is not this dialect");
     assert!(matches!(err, ProviderError::DialectMismatch { .. }));
 
@@ -1146,7 +1150,7 @@ fn a_pin_no_adapter_serves_is_denied_before_send_or_accounting() {
         "a pin the broker's provider cannot serve is a typed denial: {outcome:?}"
     );
     assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
         0,
         "the provider never saw the request"
     );
@@ -1962,7 +1966,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             (Predicate::Connect, error.is_connect()),
         ])
     }
-    fn primary(outcome: Result<rivect::providers::ProviderReply, ProviderError>) -> Primary {
+    fn primary(outcome: Result<ProviderReply, ProviderError>) -> Primary {
         let mut observed = Primary {
             variant: Variant::Other,
             ..Primary::default()
@@ -7629,7 +7633,7 @@ fn openrouter_dialect_is_keyed_on_the_literal_connection_id() {
     let config =
         Config::parse_validated(&openrouter_bound_config("http://127.0.0.1:1/v1")).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
-    let err = provider_result(config.clone(), "openai-codex".to_string(), store)
+    let err = provider_result(config.clone(), "google-vertex".to_string(), store)
         .expect_err("a different literal id is not this dialect");
     assert!(matches!(err, ProviderError::DialectMismatch { .. }));
 
@@ -8381,7 +8385,7 @@ fn sakana_dialect_is_keyed_on_the_literal_connection_id() {
     );
     let config = Config::parse_validated(&sakana_config("http://127.0.0.1:1/v1")).expect("valid");
     let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
-    let err = provider_result(config.clone(), "openai-codex".to_string(), store)
+    let err = provider_result(config.clone(), "google-vertex".to_string(), store)
         .expect_err("a different literal id is not this dialect");
     assert!(matches!(err, ProviderError::DialectMismatch { .. }));
 
@@ -9549,6 +9553,1093 @@ async fn custom_responses_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::custom-responses = NOT_RUN"]
 fn provider_installed_custom_responses() {}
+
+// ----- openai-codex (AC-040i / AC-046f) ------------------------------
+//
+// The canonical `openai-codex` connection and its device alias select the
+// one Responses contract: the scoped credential is the login module's
+// stored JSON, the bearer is its access token, and the account-scoped
+// ChatGPT listing is filtered by the closed recorded route table. The
+// device alias is transport identity, never a second backend.
+
+fn codex_uri(server: &MockServer) -> String {
+    format!("{}/backend-api/codex", server.uri())
+}
+
+fn codex_provider(config: &Config, connection: &str) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let credential = support::codex_stored_credential();
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(support::CODEX_REF, credential.as_str())],
+    ));
+    let provider = provider_result(config.clone(), connection.to_string(), store.clone())
+        .expect("the codex adapter builds for the literal id");
+    (provider, store)
+}
+
+async fn mount_codex_responses(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_codex_models(server: &MockServer, data: Value) {
+    Mock::given(method("GET"))
+        .and(path("/backend-api/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
+        .mount(server)
+        .await;
+}
+
+fn codex_request_header(request: &Request, name: &str) -> String {
+    request
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_else(|| panic!("the request carried no {name} header"))
+        .to_string()
+}
+
+fn codex_bearer() -> String {
+    format!(
+        "Bearer {}",
+        support::codex_access_token(support::CODEX_WORKSPACE, support::CODEX_EMAIL, "plus")
+    )
+}
+
+/// A chain-spanning provider double: codex literals delegate to the real
+/// adapter, while a different contract answers the fixture failure. Every
+/// send records its connection, so a test can prove which entries were
+/// attempted.
+struct ChainProvider {
+    codex: OpenAiProvider,
+    served: Vec<&'static str>,
+    sent: Arc<Mutex<Vec<String>>>,
+}
+
+impl ChainProvider {
+    fn new(config: &Config, served: &[&'static str]) -> (Self, Arc<Mutex<Vec<String>>>) {
+        let (codex, _store) = codex_provider(config, "openai-codex");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                codex,
+                served: served.to_vec(),
+                sent: Arc::clone(&sent),
+            },
+            sent,
+        )
+    }
+}
+
+/// The connection one frozen manifest names; the broker narrows an auto
+/// pool to its chosen member before the provider sees it.
+fn manifest_connection(manifest: &RequestManifest) -> String {
+    match &manifest.model {
+        rivect::config::ModelAssign::Fixed(fixed) => fixed.connection.clone(),
+        rivect::config::ModelAssign::Auto { pool: Some(pool) } => {
+            pool.first().cloned().unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+impl Provider for ChainProvider {
+    fn name(&self) -> &'static str {
+        "chain-fixture"
+    }
+
+    fn serves(&self, connection: &str, _entry: &rivect::config::Connection) -> bool {
+        self.served.contains(&connection)
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        let connection = manifest_connection(manifest);
+        self.sent
+            .lock()
+            .expect("send log lock")
+            .push(connection.clone());
+        if matches!(connection.as_str(), "openai-codex" | "openai-codex-device") {
+            return self.codex.send(manifest);
+        }
+        Err(ProviderError::ProviderFailed {
+            connection,
+            reason: "fixture non-codex failure".to_string(),
+        })
+    }
+}
+
+/// One scripted loopback peer that writes the SSE body in tiny chunks with
+/// a pause between them, so the cuts land inside UTF-8, JSON, SSE lines
+/// and the tool block's arguments. The connection count proves one
+/// physical send.
+fn fragmented_codex_peer() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("the fixture peer binds a loopback port");
+    let address = listener.local_addr().expect("the fixture address");
+    let connections = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&connections);
+    let message = json!({
+        "id": "msg_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": "héllo ✓" }],
+    });
+    let call = json!({
+        "id": "fc_1",
+        "type": "function_call",
+        "status": "completed",
+        "name": "read_file",
+        "arguments": "{\"path\":\"/tmp/fixture\"}",
+    });
+    let terminal_usage = json!({"input_tokens": 5, "output_tokens": 3, "total_tokens": 8});
+    let repeated_usage = json!({"input_tokens": 99, "output_tokens": 99, "total_tokens": 198});
+    let body = format!(
+        "{}{}{}{}{}{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({
+                "item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []},
+                "output_index": 0,
+            }),
+        ),
+        sse_block(
+            "response.output_text.delta",
+            &json!({
+                "delta": "héllo ✓",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+            }),
+        ),
+        sse_block(
+            "response.output_item.done",
+            &json!({"item": message.clone(), "output_index": 0}),
+        ),
+        sse_block(
+            "response.output_item.added",
+            &json!({
+                "item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""},
+                "output_index": 1,
+            }),
+        ),
+        sse_block(
+            "response.output_item.done",
+            &json!({"item": call.clone(), "output_index": 1}),
+        ),
+        sse_block(
+            "response.in_progress",
+            &json!({"response": {"status": "in_progress"}, "usage": repeated_usage.clone()}),
+        ),
+        sse_block(
+            "response.completed",
+            &json!({
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [message, call],
+                    "usage": terminal_usage,
+                },
+            }),
+        ),
+    );
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the fixture peer accepts");
+        count.fetch_add(1, Ordering::SeqCst);
+        support::read_fixture_request(&mut stream);
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).expect("the fixture head");
+        let bytes = body.as_bytes();
+        let sizes = [1usize, 2, 3, 5, 8, 13, 21];
+        let mut offset = 0;
+        let mut step = 0;
+        while offset < bytes.len() {
+            let len = sizes[step % sizes.len()].min(bytes.len() - offset);
+            stream
+                .write_all(&bytes[offset..offset + len])
+                .expect("the fixture fragment");
+            stream.flush().expect("the fixture flushes");
+            offset += len;
+            step += 1;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    (codex_uri_at(address), connections, handle)
+}
+
+fn codex_uri_at(address: std::net::SocketAddr) -> String {
+    format!("http://{address}/backend-api/codex")
+}
+
+/// A valid control yields exactly one outcome and one physical usage: the
+/// scoped credential's access token is the bearer, its workspace scopes
+/// the request, and a replay of the spent attempt sends nothing.
+#[tokio::test]
+async fn openai_codex_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_codex_responses(
+        &server,
+        responses_completed_stream(
+            "codex outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 5, "output_tokens": 3, "total_tokens": 8})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("the codex config parses");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: codex wire")
+        .expect("the codex pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest.clone());
+    let reply = outcome.expect("the codex control answers");
+    assert_eq!(reply.text, "codex outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "openai-codex");
+    assert_eq!(record.usage, reply.usage);
+
+    let requests = server.received_requests().await.expect("the mock recorded");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(received_auth(&requests[0]), codex_bearer());
+    assert_eq!(
+        codex_request_header(&requests[0], "chatgpt-account-id"),
+        support::CODEX_WORKSPACE,
+        "the recorded workspace scopes the request"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], "gpt-5.2-codex");
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "the shared Responses replay contract asks for the artifact"
+    );
+
+    let manifest = manifest.clone();
+    let (broker, replay) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/codex", &manifest);
+        (broker, replay)
+    })
+    .join()
+    .expect("the replay thread joins");
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the replay opened no second physical request"
+    );
+}
+
+/// The account-scoped ChatGPT listing is the discovery leg: it carries the
+/// scoped bearer and workspace, and only the closed recorded route ids
+/// offer — an HTTP 200 naming an unrecorded id grants nothing.
+#[tokio::test]
+async fn openai_codex_catalog_is_the_account_workspace_discovery() {
+    let server = MockServer::start().await;
+    mount_codex_models(
+        &server,
+        json!([
+            {"id": "gpt-5.2-codex"},
+            {"id": "gpt-5-codex"},
+            {"id": "gpt-5.2"},
+            {"id": "o3"},
+            {"id": ""},
+        ]),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("the codex config parses");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let ids = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalogue thread joins")
+        .expect("the account listing answers");
+    assert_eq!(
+        ids,
+        vec!["gpt-5-codex".to_string(), "gpt-5.2-codex".to_string()],
+        "only the recorded route ids offer"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one listing leg");
+    assert_eq!(requests[0].url.path(), "/backend-api/codex/models");
+    assert_eq!(received_auth(&requests[0]), codex_bearer());
+    assert_eq!(
+        codex_request_header(&requests[0], "chatgpt-account-id"),
+        support::CODEX_WORKSPACE
+    );
+
+    // A 200 listing naming only ids outside the recorded route offers
+    // nothing: the answer is discovery input, never entitlement.
+    let server = MockServer::start().await;
+    mount_codex_models(&server, json!([{"id": "gpt-5.2"}, {"id": "o3"}])).await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("the codex config parses");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let ids = std::thread::spawn(move || provider.catalog())
+        .join()
+        .expect("the catalogue thread joins")
+        .expect("the listing answers");
+    assert!(
+        ids.is_empty(),
+        "an HTTP 200 listing outside the recorded route offers nothing"
+    );
+}
+
+/// The device alias selects the same contract: one Responses arm, one
+/// credential profile, and a wire request indistinguishable from the
+/// canonical id's apart from its literal connection.
+#[tokio::test]
+async fn openai_codex_device_alias_selects_the_same_contract() {
+    assert_eq!(
+        rivect::providers::dialect_for("openai-codex-device"),
+        Some(Dialect::Responses),
+        "the alias records the Responses dialect"
+    );
+    let server = MockServer::start().await;
+    mount_codex_responses(
+        &server,
+        responses_completed_stream(
+            "alias outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 1, "total_tokens": 3})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex-device",
+        &codex_uri(&server),
+    ))
+    .expect("the alias config parses");
+    let (provider, _store) = codex_provider(&config, "openai-codex-device");
+    let entry = config
+        .connections
+        .get("openai-codex-device")
+        .expect("the alias is declared");
+    assert!(provider.serves("openai-codex-device", entry));
+    assert!(
+        !provider.serves("openai-codex", entry),
+        "the alias adapter serves its own literal id"
+    );
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: alias wire")
+        .expect("the alias pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest.clone());
+    let reply = outcome.expect("the alias control answers");
+    assert_eq!(reply.text, "alias outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the alias send is accounted");
+    assert_eq!(
+        record.connection, "openai-codex-device",
+        "the accounting names the alias literal"
+    );
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/backend-api/codex/responses");
+    assert_eq!(received_auth(&requests[0]), codex_bearer());
+    assert_eq!(
+        codex_request_header(&requests[0], "chatgpt-account-id"),
+        support::CODEX_WORKSPACE,
+        "the alias carries the same account scope"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], "gpt-5.2-codex");
+}
+
+/// Wrong credential material, profile binding, region or origin each deny
+/// typed before a false success, and the denial never renders the secret.
+#[tokio::test]
+async fn openai_codex_wrong_credential_profile_or_region_denies_without_secrets() {
+    let endpoint = "http://127.0.0.1:1/backend-api/codex";
+
+    // A configured region has no recorded Codex contract.
+    let regional = Config::parse_validated(
+        &support::codex_provider_config("openai-codex", endpoint)
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let denied = provider_result(regional, "openai-codex".to_string(), store)
+        .expect_err("a configured region denies");
+    assert!(
+        matches!(&denied, ProviderError::RegionMismatch { connection, region }
+            if connection == "openai-codex" && region == "eu"),
+        "the typed region denial: {denied:?}"
+    );
+
+    // The profile binding's scope segment is the binding: a divergent
+    // profile denies at build, before any material resolves.
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"codex-neighbor\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{reference}\"\n\
+         [profiles.codex-neighbor]\ncredential_ref = \"{reference}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+        reference = support::CODEX_REF,
+    ))
+    .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let denied = provider_result(mismatched, "openai-codex".to_string(), store)
+        .expect_err("a divergent profile binding denies");
+    assert!(
+        matches!(&denied, ProviderError::CredentialProfileMismatch { connection, profile }
+            if connection == "openai-codex" && profile == "codex-neighbor"),
+        "the typed profile denial: {denied:?}"
+    );
+
+    // An empty origin is the typed endpoint denial before the wire.
+    let empty = Config::parse_validated(&support::codex_provider_config("openai-codex", ""))
+        .expect("valid");
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let denied = provider_result(empty, "openai-codex".to_string(), store)
+        .expect_err("an empty origin denies");
+    assert!(
+        matches!(&denied, ProviderError::EndpointRequired { connection }
+            if connection == "openai-codex"),
+        "the typed endpoint denial: {denied:?}"
+    );
+
+    // Material that is not the stored Codex credential JSON denies at
+    // send, and the material never enters the error.
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let malformed = "fixture-codex-material-not-a-credential";
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(support::CODEX_REF, malformed)],
+    ));
+    let provider = provider_result(config.clone(), "openai-codex".to_string(), store)
+        .expect("the binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("foreign material is never a codex bearer");
+    assert!(
+        matches!(&err, ProviderError::CredentialMalformed { connection }
+            if connection == "openai-codex"),
+        "the typed malformed denial: {err:?}"
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(malformed),
+        "the denial renders no credential material: {rendered}"
+    );
+    drop_blocking(provider);
+
+    // A valid credential shape with a blank access token is the same
+    // malformed denial: no empty bearer reaches the wire.
+    for access_token in ["", "   "] {
+        let credential = support::codex_stored_credential_with_token(access_token);
+        let store = Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(support::CODEX_REF, credential.as_str())],
+        ));
+        let provider = provider_result(config.clone(), "openai-codex".to_string(), store)
+            .expect("the binding resolves; the store is read at send");
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        assert!(
+            matches!(&outcome, Err(ProviderError::CredentialMalformed { connection })
+                if connection == "openai-codex"),
+            "a blank access token is the typed malformed denial: {outcome:?}"
+        );
+        drop_blocking(provider);
+    }
+
+    // An absent scope is the typed absent denial, never an empty bearer.
+    let store = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "openai-codex".to_string(), store)
+        .expect("the binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(&outcome, Err(ProviderError::CredentialAbsent { scope })
+            if scope == "rivect-test/openai-codex"),
+        "the absent scope is typed: {outcome:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "every credential denial landed before any wire leg"
+    );
+}
+
+/// A partial tool block and an unknown terminal deny typed: an unfinished
+/// function_call is never executed and an unclassifiable terminal is never
+/// success.
+#[tokio::test]
+async fn openai_codex_rejects_partial_tool_block_and_unknown_terminal() {
+    let server = MockServer::start().await;
+    mount_codex_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [{
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/tmp/fixture\"}",
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        "an unfinished function_call never becomes a reply: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    let server = MockServer::start().await;
+    mount_codex_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"id": "resp_1", "status": "concluded", "output": []}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(outcome, Err(ProviderError::UnknownTerminal { .. })),
+        "an unclassifiable terminal is never success: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// Chunked delivery inside UTF-8, JSON, SSE and the tool block reassembles
+/// to one outcome; the repeated usage report charges once, and the spent
+/// attempt never opens a second request.
+#[tokio::test]
+async fn openai_codex_stream_fragmentation_and_repeated_usage_never_duplicates() {
+    let (endpoint, connections, peer) = fragmented_codex_peer();
+    let config =
+        Config::parse_validated(&support::codex_provider_config("openai-codex", &endpoint))
+            .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: fragmented")
+        .expect("the codex pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest.clone());
+    let reply = outcome.expect("the fragmented stream reassembles");
+    assert_eq!(reply.text, "héllo ✓");
+    assert_eq!(
+        reply.tool_calls,
+        vec![rivect::providers::ToolCall {
+            tool: "read_file".to_string(),
+            path: Some("/tmp/fixture".to_string()),
+        }]
+    );
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        },
+        "the repeated usage report is charged once"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "one physical send");
+
+    let replay_manifest = manifest.clone();
+    let (broker, replay) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let replay = broker.dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/codex",
+            &replay_manifest,
+        );
+        (broker, replay)
+    })
+    .join()
+    .expect("the replay thread joins");
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the confirmed data is never duplicated: {replay:?}"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the fixture peer joins");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "the replay opened no second connection"
+    );
+}
+
+/// A stream without a classifiable terminal is unknown, never success.
+#[tokio::test]
+async fn openai_codex_stream_without_terminal_denies() {
+    let server = MockServer::start().await;
+    mount_codex_responses(
+        &server,
+        sse_block(
+            "response.created",
+            &json!({"response": {"id": "resp_1", "status": "in_progress"}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(outcome, Err(ProviderError::UnknownTerminal { .. })),
+        "an EOF without a terminal is never success: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// An unknown remote outcome is never retried blindly: the peer's failure
+/// status denies typed, nothing is accounted, and only one request runs.
+#[tokio::test]
+async fn openai_codex_unknown_outcome_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: unknown outcome")
+        .expect("the codex pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest);
+    let Err(ModelError::Provider(ProviderError::Transport { cause, .. })) = outcome else {
+        panic!("the peer's status is the typed transport denial: {outcome:?}");
+    };
+    assert_eq!(cause.class(), TransportClass::HttpStatus { code: 503 });
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "an unknown outcome is never retried blindly"
+    );
+}
+
+/// A pinned model outside the closed recorded route denies typed before
+/// the wire — the account listing never widens what this contract serves.
+#[tokio::test]
+async fn openai_codex_model_outside_the_recorded_route_denies() {
+    for connection in ["openai-codex", "openai-codex-device"] {
+        let server = MockServer::start().await;
+        let config = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.{connection}]\nkind = \"api_key\"\nendpoint = \"{}\"\n\
+             credential_ref = \"{}\"\nprofile = \"openai-codex\"\n\
+             [profiles.openai-codex]\ncredential_ref = \"{}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"{connection}\", model_id = \"gpt-5.2\" }}\n\
+             effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n",
+            codex_uri(&server),
+            support::CODEX_REF,
+            support::CODEX_REF,
+        ))
+        .expect("valid");
+        let (provider, _store) = codex_provider(&config, connection);
+        let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+        let err = outcome.expect_err("a model outside the recorded route denies");
+        assert!(
+            matches!(&err, ProviderError::UnsupportedParameter { connection: denied, parameter, model }
+                if denied == connection && *parameter == "model" && model == "gpt-5.2"),
+            "the closed-route denial is typed for {connection}: {err:?}"
+        );
+        drop_blocking(provider);
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
+            "the denial for {connection} lands before any wire leg"
+        );
+    }
+}
+
+/// A same-contract alias cannot slip past after its canonical entry was
+/// attempted and failed: every failed connection in the walk is a refusal
+/// source, so only the first codex entry crosses the wire.
+#[tokio::test]
+async fn openai_codex_chain_refuses_every_sibling_after_an_attempted_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.primary]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1/primary\"\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.openai-codex-device]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{reference}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"primary\", model_id = \"fixture-primary\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"auto\", chain = [\
+             {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}, \
+             {{ mode = \"fixed\", connection = \"openai-codex-device\", model_id = \"gpt-5.2-codex\" }}] }}\n",
+        endpoint = codex_uri(&server),
+        reference = support::CODEX_REF,
+    ))
+    .expect("valid");
+    let (provider, sent) =
+        ChainProvider::new(&config, &["primary", "openai-codex", "openai-codex-device"]);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: chain refusal")
+        .expect("the chain config prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest);
+    let Err(ModelError::FallbackExhausted {
+        rejected,
+        attempted,
+        ..
+    }) = outcome
+    else {
+        panic!("the chain exhausts: {outcome:?}");
+    };
+    assert_eq!(
+        attempted,
+        vec!["openai-codex".to_string()],
+        "only the first codex entry was attempted"
+    );
+    assert_eq!(rejected.len(), 2, "the attempted entry and the refusal");
+    assert!(
+        matches!(rejected[0].cause, RejectionCause::SendFailed(_)),
+        "the first codex entry's own failure is retained: {:?}",
+        rejected[0].cause
+    );
+    assert_eq!(rejected[1].connection, "openai-codex-device");
+    assert!(
+        matches!(rejected[1].cause, RejectionCause::BlindRetryRefused),
+        "the alias is refused after its canonical entry failed: {:?}",
+        rejected[1].cause
+    );
+    drop_blocking(broker);
+    assert_eq!(
+        *sent.lock().expect("send log lock"),
+        vec!["primary".to_string(), "openai-codex".to_string()],
+        "the alias never reached the provider"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the alias opened no second request"
+    );
+}
+
+/// A different contract after a same-contract refusal is still attempted:
+/// the walk continues past the refusal instead of ending the chain.
+#[tokio::test]
+async fn openai_codex_chain_continues_past_a_same_contract_refusal() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.openai-codex-device]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:1/reserve\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{reference}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"auto\", chain = [\
+             {{ mode = \"fixed\", connection = \"openai-codex-device\", model_id = \"gpt-5.2-codex\" }}, \
+             {{ mode = \"fixed\", connection = \"reserve\", model_id = \"fixture-reserve\" }}] }}\n",
+        endpoint = codex_uri(&server),
+        reference = support::CODEX_REF,
+    ))
+    .expect("valid");
+    let (provider, sent) =
+        ChainProvider::new(&config, &["openai-codex", "openai-codex-device", "reserve"]);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: chain continuation")
+        .expect("the chain config prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest);
+    let Err(ModelError::FallbackExhausted {
+        rejected,
+        attempted,
+        ..
+    }) = outcome
+    else {
+        panic!("the chain exhausts after the reserve fails: {outcome:?}");
+    };
+    assert_eq!(rejected.len(), 2);
+    assert_eq!(rejected[0].connection, "openai-codex-device");
+    assert!(
+        matches!(rejected[0].cause, RejectionCause::BlindRetryRefused),
+        "the alias is refused: {:?}",
+        rejected[0].cause
+    );
+    assert_eq!(rejected[1].connection, "reserve");
+    assert!(
+        matches!(rejected[1].cause, RejectionCause::SendFailed(_)),
+        "the different contract was attempted and failed: {:?}",
+        rejected[1].cause
+    );
+    assert_eq!(
+        attempted,
+        vec!["reserve".to_string()],
+        "the walk continued past the refusal"
+    );
+    drop_blocking(broker);
+    assert_eq!(
+        *sent.lock().expect("send log lock"),
+        vec!["openai-codex".to_string(), "reserve".to_string()],
+        "primary plus the different-contract entry"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "the refusal and reserve opened no codex request"
+    );
+}
+
+/// The account scope is recorded, never invented: a credential without
+/// `account_id` sends both legs successfully and carries no
+/// `chatgpt-account-id` header.
+#[tokio::test]
+async fn openai_codex_account_absent_sends_without_scope_header() {
+    let server = MockServer::start().await;
+    mount_codex_models(&server, json!([{"id": "gpt-5.2-codex"}])).await;
+    mount_codex_responses(
+        &server,
+        responses_completed_stream(
+            "unscoped outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&support::codex_provider_config(
+        "openai-codex",
+        &codex_uri(&server),
+    ))
+    .expect("valid");
+    let credential = support::codex_stored_credential_without_account();
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(support::CODEX_REF, credential.as_str())],
+    ));
+    let provider = provider_result(config.clone(), "openai-codex".to_string(), store)
+        .expect("the adapter builds");
+    let (provider, catalogue) = std::thread::spawn(move || {
+        let catalogue = provider.catalog();
+        (provider, catalogue)
+    })
+    .join()
+    .expect("the catalogue thread joins");
+    assert_eq!(
+        catalogue.expect("the unscoped catalogue answers"),
+        vec!["gpt-5.2-codex".to_string()]
+    );
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: unscoped")
+        .expect("the codex pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest.clone());
+    let reply = outcome.expect("the unscoped send answers");
+    assert_eq!(reply.text, "unscoped outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 2,
+            completion_tokens: 3,
+            total_tokens: 5,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the unscoped send is accounted");
+    assert_eq!(record.connection, "openai-codex");
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 2, "one catalogue and one inference leg");
+    for request in &requests {
+        assert_eq!(received_auth(request), codex_bearer());
+        assert!(
+            request.headers.get("chatgpt-account-id").is_none(),
+            "an absent workspace claim sends no account header on {}",
+            request.url.path()
+        );
+    }
+}
+
+// ----- TP-PROVIDER-INSTALLED::openai-codex --------------------------
+
+/// TP-PROVIDER-INSTALLED::openai-codex = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs, and
+/// `openai-codex::class-002` WebSocket stays NOT_RUN (DEC-017).
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::openai-codex = NOT_RUN; openai-codex::class-002 WebSocket = NOT_RUN (DEC-017)"]
+fn provider_installed_openai_codex() {}
+
+/// An entered unknown outcome is never retried blindly across the one
+/// Codex contract: an auto chain naming the device alias rejects that
+/// entry before any substitute send, and the typed exhaustion names the
+/// contract-level refusal while only the failed primary crossed the wire.
+#[tokio::test]
+async fn openai_codex_unknown_outcome_chain_on_same_contract_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.openai-codex-device]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{reference}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"auto\", chain = [{{ mode = \"fixed\", connection = \"openai-codex-device\", model_id = \"gpt-5.2-codex\" }}] }}\n",
+        endpoint = codex_uri(&server),
+        reference = support::CODEX_REF,
+    ))
+    .expect("valid");
+    let (provider, _store) = codex_provider(&config, "openai-codex");
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/codex", "goal: no blind fallback")
+        .expect("the codex pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/codex", manifest);
+    let Err(ModelError::FallbackExhausted {
+        rejected,
+        attempted,
+        source,
+        ..
+    }) = outcome
+    else {
+        panic!("the exhaustion is the typed outcome: {outcome:?}");
+    };
+    assert!(
+        attempted.is_empty(),
+        "the chain entry never received a substitute send: {attempted:?}"
+    );
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].connection, "openai-codex-device");
+    assert!(
+        matches!(rejected[0].cause, RejectionCause::BlindRetryRefused),
+        "the refusal names the same-contract blind retry: {:?}",
+        rejected[0].cause
+    );
+    assert!(
+        matches!(
+            source.as_ref(),
+            ProviderError::Transport { connection, cause }
+                if connection == "openai-codex"
+                    && cause.class() == TransportClass::HttpStatus { code: 503 }
+        ),
+        "the primary's own unknown outcome is retained: {source:?}"
+    );
+    drop_blocking(broker);
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        1,
+        "only the failed primary crossed the wire"
+    );
+}
 
 // ----- SSE conformance (WHATWG §9.2.5–9.2.6) -------------------------
 

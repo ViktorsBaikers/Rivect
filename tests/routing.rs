@@ -7723,3 +7723,87 @@ fn submit_wide_task(
             .to_string(),
     )
 }
+
+/// The two codex literals own one recorded dialect and never substitute a
+/// sibling id: the adapter refuses a foreign pin before any wire leg, and
+/// a configured region stays the typed denial instead of borrowing another
+/// endpoint.
+#[test]
+fn openai_codex_never_falls_back_across_id_or_region() {
+    for (id, sibling) in [
+        ("openai-codex", "openai-codex-device"),
+        ("openai-codex-device", "openai-codex"),
+    ] {
+        assert_eq!(
+            rivect::providers::dialect_for(id),
+            Some(Dialect::Responses),
+            "{id} records the Responses dialect"
+        );
+        assert!(
+            rivect::providers::routes_for(id).is_empty(),
+            "{id} is single-dialect and records no cross-route table"
+        );
+        let config = Config::parse_validated(&support::codex_provider_config(
+            id,
+            "http://127.0.0.1:1/backend-api/codex",
+        ))
+        .expect("the codex config parses");
+        let entry = config.connections.get(id).expect("declared").clone();
+        let credential = support::codex_stored_credential();
+        let store = Arc::new(support::MapStore::seeded(
+            rivect::providers::StoreKind::Keychain,
+            &[(support::CODEX_REF, credential.as_str())],
+        ));
+        let built = config.clone();
+        let id_owned = id.to_string();
+        let provider = std::thread::spawn(move || {
+            rivect::providers::openai::OpenAiProvider::new(&built, &id_owned, store)
+        })
+        .join()
+        .expect("the provider thread joins")
+        .expect("the codex adapter builds");
+        assert!(provider.serves(id, &entry));
+        assert!(
+            !provider.serves(sibling, &entry),
+            "{id} never serves the sibling literal id"
+        );
+
+        let mut manifest = {
+            let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+            broker
+                .prepare("main", &config, "/world/codex", "goal: no fallback")
+                .expect("the codex pin prepares")
+        };
+        manifest.model = ModelAssign::Fixed(FixedModel {
+            connection: sibling.to_string(),
+            model_id: "gpt-5.2-codex".to_string(),
+        });
+        let (provider, outcome) = support::send_on_thread(provider, manifest);
+        assert!(
+            matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+            "a foreign pin never falls back into this adapter: {outcome:?}"
+        );
+        support::drop_blocking(provider);
+
+        let regional = Config::parse_validated(
+            &support::codex_provider_config(id, "http://127.0.0.1:1/backend-api/codex")
+                .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+        )
+        .expect("the regional config parses");
+        let store = Arc::new(support::MapStore::seeded(
+            rivect::providers::StoreKind::Keychain,
+            &[],
+        ));
+        let denied = std::thread::spawn(move || {
+            rivect::providers::openai::OpenAiProvider::new(&regional, id, store)
+        })
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("a configured region never borrows another endpoint");
+        assert!(
+            matches!(&denied, ProviderError::RegionMismatch { connection, region }
+                if connection == id && region == "eu"),
+            "the typed region denial: {denied:?}"
+        );
+    }
+}

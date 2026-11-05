@@ -1,7 +1,7 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
 //! the literal connection ids `openai`, `abliteration`, `meta`,
-//! `ollama`, `custom-responses`, `openrouter`, `sakana`, `xai` and
-//! `xai-oauth` record this
+//! `ollama`, `custom-responses`, `openrouter`, `sakana`, `xai`,
+//! `xai-oauth`, `openai-codex` and `openai-codex-device` record this
 //! dialect. `ollama`
 //! is the local endpoint whose credential is optional (DEC-009) and
 //! whose catalogue carries a bounded native discovery overlay
@@ -17,8 +17,11 @@
 //! the former rejecting the listing's recorded negative effort residue.
 //! Dialect selection keys
 //! on the literal connection id, never an auth label or a catalogue
-//! answer, and `openai-codex` is a distinct literal id with its own
-//! recorded class. The adapter authors no async code — [`Provider::send`] is
+//! answer, and `openai-codex`/`openai-codex-device` are distinct literal
+//! ids sharing one recorded ChatGPT Responses contract: the login
+//! module's credential JSON is the bearer, its workspace scopes the
+//! account discovery, and the closed route table bounds the wire. The
+//! adapter authors no async code — [`Provider::send`] is
 //! a blocking single-shot seam and Tokio appears only inside reqwest's
 //! blocking client plus the dev-dependency test harness — and
 //! `store: false` is sent verbatim on
@@ -37,6 +40,7 @@ use crate::config::{
     Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
 };
 use crate::model::RequestManifest;
+use crate::providers::openai_login::{CodexCredential, LoginError as CodexLoginError};
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, ModelPrice, Provider, ProviderError, ProviderReply,
@@ -103,6 +107,39 @@ const OPENCODE_GO_RESPONSES_BASE: &str = "https://opencode.ai/zen/go/v1";
 /// The Responses aliases' `upstreamModelId` table (DEC-013): the routed
 /// owner translates the public alias before the wire.
 const GITLAB_RESPONSES_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
+
+/// The closed Codex route table (AC-040i): the account-scoped ChatGPT
+/// listing may name other ids, but only these recorded Responses ids
+/// ride the wire, and a pinned id outside the table denies before any
+/// request. The device alias shares the one table.
+const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
+
+/// The account-scope header the ChatGPT Codex backend binds a request
+/// to (HZN-16-03): the workspace recorded on the scoped credential,
+/// sent only when the credential carries one.
+const CODEX_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+
+/// Whether a literal id records the Codex credential contract: the
+/// canonical connection and its device alias share one backend and one
+/// credential profile.
+fn is_codex_connection(connection: &str) -> bool {
+    matches!(connection, "openai-codex" | "openai-codex-device")
+}
+
+/// Whether one literal id's recorded contract forbids re-dispatching a
+/// failed entered send onto a sibling literal of the same contract
+/// (PROH-020). The routing owner consults this before minting a
+/// fallback substitute; an id with no contract arm answers `false`.
+pub(crate) fn refuses_blind_retry(connection: &str) -> bool {
+    contract_for(connection).is_some_and(|contract| contract.blind_retry == BlindRetry::Refused)
+}
+
+/// Whether two literal ids resolve to the same recorded Codex contract
+/// — the canonical id and its device alias — so a failure on one is a
+/// failure of the one backend, never a fresh substitute target.
+pub(crate) fn same_recorded_contract(left: &str, right: &str) -> bool {
+    is_codex_connection(left) && is_codex_connection(right)
+}
 
 /// The recorded `openrouter` paste-key prefix (DEC-003): the bare
 /// `sk-or-…` key the paste form stores at the scoped credential seam.
@@ -219,6 +256,21 @@ struct SourceContract {
     /// before the wire. `false` — [`endpoint_for`] resolves the arm's
     /// recorded default or keeps the shipped verbatim value.
     requires_configured_endpoint: bool,
+    /// Whether a failed entered send may be re-dispatched onto a sibling
+    /// literal of the same contract: `Refused` on the codex contract —
+    /// an unknown remote outcome is final, never a blind same-backend
+    /// retry (PROH-020) — and `Allowed` elsewhere. The routing owner
+    /// consults this before minting a fallback substitute.
+    blind_retry: BlindRetry,
+}
+
+/// Whether a failed entered send may be re-dispatched onto a sibling
+/// literal of the same recorded contract (PROH-020). The routing owner
+/// reads this through the contract arm before minting a substitute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlindRetry {
+    Allowed,
+    Refused,
 }
 
 /// The recorded per-connection contract for a Responses id
@@ -235,6 +287,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         "abliteration" => Some(SourceContract {
             seed: ABLITERATION_MODELS,
@@ -242,6 +295,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         "meta" => Some(SourceContract {
             seed: META_MUSE_MODELS,
@@ -249,6 +303,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         "ollama" => Some(SourceContract {
             seed: &[],
@@ -256,6 +311,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-010): the keyless `/models` answer offers only what the
@@ -267,6 +323,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::OpenRouterTools,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-004): the recorded in-source Fugu entries are mapping
@@ -278,6 +335,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::Sakana,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // The xAI listing is authoritative and carries no vendored
         // floor; its recorded negative effort residue bounds a pinned
@@ -288,6 +346,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::Xai,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // The xAI OAuth listing is authoritative and no vendored
         // selected list is retained, so the listing alone offers — minus
@@ -300,6 +359,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::XaiOAuth,
             reasoning_artifact: true,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // DEC-013: the routed owner translates the alias and passes the
         // fixed proxy base as the configured endpoint; the listing is
@@ -310,6 +370,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // DEC-014/DEC-020: the routed owner passes `{base}/v1` as the
         // configured endpoint for the Muse Spark and deepseek-v4-flash
@@ -321,6 +382,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
         }),
         // DEC-014: the routed owner passes `{base}/v1` as the
         // configured endpoint for the Muse Spark overrides; the
@@ -332,6 +394,21 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
+        }),
+        // DEC-020/HZN-16-03: the ChatGPT account-scoped listing is the
+        // discovery source, and the closed Codex route table is the
+        // offer set — an HTTP 200 listing never releases an id outside
+        // it. The device alias records the same contract: one backend,
+        // one credential profile. The arm has no recorded default base,
+        // so an empty endpoint denies before the wire.
+        "openai-codex" | "openai-codex-device" => Some(SourceContract {
+            seed: CODEX_MODELS,
+            authoritative_models: false,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: true,
+            requires_configured_endpoint: true,
+            blind_retry: BlindRetry::Refused,
         }),
         // DEC-015: the origin is operator-configured, so no default base
         // is invented and an empty endpoint denies before the wire. The
@@ -344,6 +421,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             entry: EntryRule::IdsOnly,
             reasoning_artifact: false,
             requires_configured_endpoint: true,
+            blind_retry: BlindRetry::Allowed,
         }),
         _ => None,
     }
@@ -406,6 +484,34 @@ enum Terminal {
 struct StreamState {
     open_items: u64,
     terminal: Option<Terminal>,
+}
+
+/// The material one send authenticates with: the bearer token plus the
+/// ChatGPT workspace the credential is bound to. Only the codex ids
+/// record an account scope; every other arm carries `None` and sends no
+/// account header.
+struct WireMaterial {
+    token: String,
+    account: Option<String>,
+}
+
+/// Applies the scoped material to one outgoing request: the bearer and,
+/// where the credential recorded a workspace, the account-scope header.
+/// Both the catalogue and the inference leg use this one seam, so an
+/// absent binding stays headerless on either leg and a recorded account
+/// rides both.
+fn authenticate(
+    request: reqwest::blocking::RequestBuilder,
+    material: Option<&WireMaterial>,
+) -> reqwest::blocking::RequestBuilder {
+    let Some(material) = material else {
+        return request;
+    };
+    let request = request.bearer_auth(&material.token);
+    match &material.account {
+        Some(account) => request.header(CODEX_ACCOUNT_HEADER, account),
+        None => request,
+    }
 }
 
 /// The shared Responses adapter. Constructed per connection from the
@@ -669,7 +775,9 @@ impl OpenAiProvider {
     /// alone (DEC-015), and `xai` offers the authoritative xAI listing as
     /// id-only entries with no vendored selected-list floor while
     /// `xai-oauth` offers the same listing minus its recorded non-chat
-    /// image/STT/voice families — each id carrying the shared
+    /// image/STT/voice families — and `openai-codex`/`openai-codex-device`
+    /// offer the account-scoped ChatGPT listing filtered to the closed
+    /// recorded route table — each id carrying the shared
     /// [`CatalogModel`], returned in deterministic sorted order.
     ///
     /// # Errors
@@ -687,7 +795,7 @@ impl OpenAiProvider {
         // still denies the resolve without touching the seam.
         check_deadline(&self.connection, self.deadline, started)?;
         let token = self.secret()?;
-        let mut models = self.catalog_within(token.as_deref(), started)?;
+        let mut models = self.catalog_within(token.as_ref(), started)?;
         // The overlay is advisory: it enriches the listing's own
         // offers and never extends or replaces them (DEC-012) — and it
         // spends the caller's clock like every other leg, so a peer
@@ -704,17 +812,16 @@ impl OpenAiProvider {
     /// a send passes its own `started` so the lookup spends the same
     /// whole-request budget instead of opening a second, unaccounted
     /// one. An absent token on the recorded optional class sends no
-    /// `Authorization` header.
+    /// `Authorization` header, and the codex account header rides only
+    /// where the scoped credential recorded a workspace.
     fn catalog_within(
         &self,
-        token: Option<&str>,
+        token: Option<&WireMaterial>,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
         let mut request = self.client.get(format!("{}/models", self.endpoint));
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
+        request = authenticate(request, token);
         request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let mut response = request
             .send()
@@ -796,20 +903,30 @@ impl OpenAiProvider {
     /// secret cannot be a bearer token: typed denial, never a mangled
     /// header. `openrouter` admits the recorded paste-key grammar only
     /// (DEC-003): material outside `sk-or-…` denies typed here, before
-    /// any wire leg.
-    fn secret(&self) -> Result<Option<String>, ProviderError> {
-        let token = match &self.auth {
+    /// any wire leg. The codex ids store the login module's credential
+    /// JSON, read back through that module's own parser: the access
+    /// token is the bearer and the recorded workspace is the account
+    /// scope, so foreign material (unparseable JSON, or a blank access
+    /// token) denies `CredentialMalformed` instead of crossing the wire
+    /// as JSON.
+    fn secret(&self) -> Result<Option<WireMaterial>, ProviderError> {
+        if is_codex_connection(&self.connection) {
+            return self.codex_material();
+        }
+        let material = match &self.auth {
             WireAuth::Store(None) => return Ok(None),
-            WireAuth::Store(Some(credential)) => {
-                let material = self.store.resolve(credential)?;
-                String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
-                    connection: self.connection.clone(),
-                })?
-            }
-            WireAuth::Resolved { token, .. } => token.clone(),
+            WireAuth::Store(Some(credential)) => self.store.resolve(credential)?,
+            WireAuth::Resolved { token, .. } => token.clone().into_bytes(),
         };
+        let token =
+            String::from_utf8(material).map_err(|_utf8| ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            })?;
         if self.connection != "openrouter" {
-            return Ok(Some(token));
+            return Ok(Some(WireMaterial {
+                token,
+                account: None,
+            }));
         }
         let token = token.trim();
         if !is_openrouter_paste_key(token) {
@@ -817,7 +934,52 @@ impl OpenAiProvider {
                 connection: self.connection.clone(),
             });
         }
-        Ok(Some(token.to_string()))
+        Ok(Some(WireMaterial {
+            token: token.to_string(),
+            account: None,
+        }))
+    }
+
+    /// The codex credential arm: the login module reads the stored JSON
+    /// (its store denial keeps its typed class), and material that is not
+    /// the recorded credential shape — or whose access token is blank
+    /// after trim — is `CredentialMalformed` before any wire leg. A
+    /// pre-resolved token is refused typed: the routed constructor never
+    /// supplies one for a codex id, and a bare bearer cannot prove it is
+    /// the stored credential the workspace scope is recorded on.
+    fn codex_material(&self) -> Result<Option<WireMaterial>, ProviderError> {
+        let credential: CodexCredential = match &self.auth {
+            WireAuth::Store(None) => return Ok(None),
+            WireAuth::Store(Some(reference)) => {
+                match crate::providers::openai_login::read_credential(
+                    self.store.as_ref(),
+                    reference,
+                ) {
+                    Ok(credential) => credential,
+                    Err(CodexLoginError::Provider(error)) => return Err(error),
+                    Err(_malformed) => {
+                        return Err(ProviderError::CredentialMalformed {
+                            connection: self.connection.clone(),
+                        });
+                    }
+                }
+            }
+            WireAuth::Resolved { .. } => {
+                return Err(ProviderError::CredentialMalformed {
+                    connection: self.connection.clone(),
+                });
+            }
+        };
+        let token = credential.access_token().trim();
+        if token.is_empty() {
+            return Err(ProviderError::CredentialMalformed {
+                connection: self.connection.clone(),
+            });
+        }
+        Ok(Some(WireMaterial {
+            token: token.to_string(),
+            account: credential.account_id().map(str::to_string),
+        }))
     }
 
     /// The recorded xAI negative effort suppression (HZN-008): the
@@ -1708,7 +1870,7 @@ impl Provider for OpenAiProvider {
                 if pool.len() == 1 && pool[0] == self.connection =>
             {
                 let model_id = self
-                    .catalog_within(token.as_deref(), started)?
+                    .catalog_within(token.as_ref(), started)?
                     .into_iter()
                     .next()
                     .map(|model| model.id)
@@ -1731,6 +1893,18 @@ impl Provider for OpenAiProvider {
                 connection: fixed.connection,
             });
         }
+        // The closed Codex route (AC-040i): the account-scoped listing
+        // may name ids this contract does not serve, so a pin outside
+        // the recorded table denies typed before the body exists —
+        // never a silently dropped or forwarded model.
+        if is_codex_connection(&self.connection) && !CODEX_MODELS.contains(&fixed.model_id.as_str())
+        {
+            return Err(ProviderError::UnsupportedParameter {
+                connection: self.connection.clone(),
+                parameter: "model",
+                model: fixed.model_id,
+            });
+        }
         // The recorded xAI residue rejects the effort dial: the denial
         // lands before the body exists, never a silently dropped pin.
         self.check_effort(manifest, &fixed.model_id)?;
@@ -1740,17 +1914,15 @@ impl Provider for OpenAiProvider {
         // catalogue leg that spent the clock fails the send typed
         // here — an expired budget never puts a byte on the wire.
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut request = self
+        let request = self
             .client
             .post(format!("{}/responses", self.endpoint))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes);
         // The absent binding sends no header; a bound one sends the
         // same material the catalogue leg carried (DEC-009).
-        if let Some(token) = &token {
-            request = request.bearer_auth(token);
-        }
-        request = request.headers(forwarded_header_map(self.auth.forwarded()));
+        let request = authenticate(request, token.as_ref());
+        let request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let response = request
             .send()
             .map_err(|err| transport(&self.connection, err))?;

@@ -23,6 +23,7 @@ use rivect::providers::{
 };
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,6 +151,59 @@ pub fn codex_access_token(workspace: &str, email: &str, plan: &str) -> String {
     }))
     .expect("the fixture payload serializes");
     format!("{header}.{}.c2lnbmF0dXJl", base64url(&payload))
+}
+
+/// The stored Codex credential both login entrypoints enroll: the access
+/// token plus the workspace claim the account-scoped discovery binds to.
+pub fn codex_stored_credential() -> String {
+    json!({
+        "access_token": codex_access_token(CODEX_WORKSPACE, CODEX_EMAIL, "plus"),
+        "refresh_token": "fixture-codex-refresh-not-real",
+        "id_token": codex_access_token(CODEX_WORKSPACE, CODEX_EMAIL, "plus"),
+        "expires_at": 4_102_444_800u64,
+        "account_id": CODEX_WORKSPACE,
+        "email": CODEX_EMAIL,
+        "plan_type": "plus",
+    })
+    .to_string()
+}
+
+/// The same stored credential with a chosen access token: an empty or
+/// whitespace token proves the adapter's blank-token guard without
+/// changing the credential shape around it.
+pub fn codex_stored_credential_with_token(access_token: &str) -> String {
+    let mut credential: Value =
+        serde_json::from_str(&codex_stored_credential()).expect("the codex fixture is json");
+    credential["access_token"] = json!(access_token);
+    credential.to_string()
+}
+
+/// The same stored credential with the workspace claim removed: the
+/// account scope is absent, never invented, so neither leg may carry the
+/// account header.
+pub fn codex_stored_credential_without_account() -> String {
+    let mut credential: Value =
+        serde_json::from_str(&codex_stored_credential()).expect("the codex fixture is json");
+    if let Some(object) = credential.as_object_mut() {
+        object.remove("account_id");
+    }
+    credential.to_string()
+}
+
+/// One codex provider config: the literal connection at `endpoint`, the
+/// canonical `openai-codex` profile that supplies its scoped credential,
+/// and the recorded pin. The device alias uses the same profile, so both
+/// ids select one backend.
+pub fn codex_provider_config(connection: &str, endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{connection}]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"{CODEX_REF}\"\nprofile = \"openai-codex\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{CODEX_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"{connection}\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"off\" }}\n"
+    )
 }
 
 fn base64url(bytes: &[u8]) -> String {
@@ -1266,6 +1320,37 @@ pub async fn mount_responses(server: &MockServer, body: String) {
         )
         .mount(server)
         .await;
+}
+
+/// Consumes one fixture request head and its stated body, so a scripted
+/// peer answers only after the client finished writing. The `auth_device`
+/// peer keeps its own `read_request` because it also returns the path and
+/// body it must answer; this shared form only drains the request.
+pub fn read_fixture_request(stream: &mut std::net::TcpStream) {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).expect("the fixture request read");
+        if read == 0 {
+            return;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                let value = lower.strip_prefix("content-length:")?.trim();
+                value.parse::<usize>().ok()
+            })
+            .unwrap_or(0);
+        if bytes.len() >= head_end + 4 + length {
+            return;
+        }
+    }
 }
 
 /// The request bodies the fixture peer received, parsed as JSON.
