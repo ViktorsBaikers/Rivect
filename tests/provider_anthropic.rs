@@ -7204,3 +7204,567 @@ async fn opencode_zen_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::opencode-zen = NOT_RUN"]
 fn provider_installed_opencode_zen() {}
+
+// ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::zenmux ---------------
+
+/// The literal `zenmux` connection id.
+const ZENMUX: &str = "zenmux";
+/// The scoped credential ref the connection binds.
+const ZENMUX_CREDENTIAL_REF: &str = "keyring:rivect-test/zenmux";
+/// An id the authoritative metadata classes as Anthropic.
+const ZENMUX_ANTHROPIC_MODEL: &str = "anthropic/claude-opus-4.8";
+/// An id the metadata keeps on the recorded Chat Completions default.
+const ZENMUX_CC_MODEL: &str = "google/gemini-3-pro-preview";
+/// The recorded Messages mirror of the Chat Completions root.
+const ZENMUX_MESSAGES_PATH: &str = "/api/anthropic/v1/messages";
+/// The Chat Completions path the Messages arm never posts to.
+const ZENMUX_CC_PATH: &str = "/api/v1/chat/completions";
+
+fn zenmux_config(endpoint: &str, model: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.zenmux]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{ZENMUX_CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"zenmux\", model_id = \"{model}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The configured endpoint carries the recorded Chat Completions root;
+/// the Messages arm derives its mirror from the same base.
+fn zenmux_uri(server: &MockServer) -> String {
+    format!("{}/api/v1", server.uri())
+}
+
+fn zenmux_store() -> Arc<MapStore> {
+    Arc::new(MapStore::seeded(
+        STORE_KIND,
+        &[(ZENMUX_CREDENTIAL_REF, SECRET)],
+    ))
+}
+
+/// The Messages arm is built through the route constructor: the literal
+/// default is Chat Completions, so the route table is the gate.
+fn zenmux_provider(config: &Config) -> (MessagesProvider, Arc<MapStore>) {
+    let store = zenmux_store();
+    let reference = SecretRef::parse(ZENMUX_CREDENTIAL_REF).expect("the scoped ref parses");
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        MessagesProvider::with_route(
+            &built,
+            ZENMUX,
+            store.clone(),
+            Duration::from_secs(30),
+            WireAuth::Store(Some(reference)),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the Messages route builds for zenmux");
+    (provider, zenmux_store())
+}
+
+fn zenmux_provider_with_auth(
+    config: &Config,
+    auth: WireAuth,
+) -> Result<MessagesProvider, ProviderError> {
+    let built = config.clone();
+    std::thread::spawn(move || {
+        MessagesProvider::with_route(
+            &built,
+            ZENMUX,
+            Arc::new(MapStore::seeded(STORE_KIND, &[])),
+            Duration::from_secs(30),
+            auth,
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+}
+
+fn zenmux_routed(config: &Config) -> RoutedProvider {
+    let built = config.clone();
+    std::thread::spawn(move || RoutedProvider::new(&built, ZENMUX, zenmux_store()))
+        .join()
+        .expect("the provider thread joins")
+        .expect("the routed owner builds for zenmux")
+}
+
+async fn mount_zenmux_messages(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path(ZENMUX_MESSAGES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// The authoritative metadata's Anthropic class takes the recorded
+/// Messages route: the routed owner resolves the model class, derives the
+/// `/api/anthropic` mirror from the configured Chat Completions root, and
+/// sends one Messages envelope with the plain key — never a Chat
+/// Completions request for the same pin.
+#[tokio::test]
+async fn zenmux_anthropic_class_model_takes_the_messages_route() {
+    assert_eq!(dialect_for(ZENMUX), Some(Dialect::ChatCompletions));
+    assert_eq!(
+        routes_for(ZENMUX),
+        &[Dialect::ChatCompletions, Dialect::Messages]
+    );
+    assert_eq!(
+        route_for(ZENMUX, ZENMUX_ANTHROPIC_MODEL),
+        Some(Dialect::Messages)
+    );
+    assert_eq!(
+        route_for(ZENMUX, ZENMUX_CC_MODEL),
+        Some(Dialect::ChatCompletions)
+    );
+
+    let server = MockServer::start().await;
+    mount_zenmux_messages(&server, text_stream("zenmux messages outcome", 13, 5)).await;
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let provider = zenmux_routed(&config);
+    let (broker, manifest) = prepared_with(
+        (provider, zenmux_store()),
+        &config,
+        "/world/zenmux",
+        "goal: zenmux messages route",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest.clone());
+    let reply = outcome.expect("the Anthropic class rides Messages");
+    assert_eq!(reply.text, "zenmux messages outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            total_tokens: 18,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the Messages send is accounted once");
+    assert_eq!(record.connection, ZENMUX);
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, ZENMUX_MESSAGES_PATH), 1);
+    assert_eq!(
+        count_path(&requests, ZENMUX_CC_PATH),
+        0,
+        "the Anthropic class never falls back to the default route"
+    );
+    let post = requests
+        .iter()
+        .find(|request| request.url.path() == ZENMUX_MESSAGES_PATH)
+        .expect("the Messages request is recorded");
+    let bearer = format!("Bearer {SECRET}");
+    assert_eq!(header(post, "authorization"), Some(bearer.as_str()));
+    assert_eq!(header(post, "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(header(post, "x-api-key"), None);
+    let body = body_of(post);
+    assert_eq!(body["model"], json!(ZENMUX_ANTHROPIC_MODEL));
+    assert_eq!(body["system"], json!(manifest.instructions));
+    assert_eq!(body["max_tokens"], json!(MESSAGES_MAX_TOKENS));
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["messages"],
+        json!([{"role": "user", "content": manifest.inputs}])
+    );
+    assert!(
+        !String::from_utf8_lossy(&post.body).contains(SECRET),
+        "the key rides the header, never the body"
+    );
+
+    // the empty endpoint resolves the recorded Messages mirror; a
+    // configured Messages root folds onto the same fixed pair
+    let unset = Config::parse_validated(&zenmux_config("", ZENMUX_ANTHROPIC_MODEL)).expect("valid");
+    let provider = zenmux_provider_with_auth(&unset, WireAuth::Store(None))
+        .expect("the route constructor builds with the default base");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://zenmux.ai/api/anthropic\""),
+        "an empty endpoint resolves the recorded Messages mirror: {debug}"
+    );
+    drop_blocking(provider);
+
+    let pair = Config::parse_validated(&zenmux_config(
+        &format!("{}/api/anthropic", server.uri()),
+        ZENMUX_ANTHROPIC_MODEL,
+    ))
+    .expect("valid");
+    let provider = zenmux_provider_with_auth(&pair, WireAuth::Store(None))
+        .expect("the Messages root folds onto the fixed pair");
+    assert!(
+        format!("{provider:?}").contains(&format!("endpoint: \"{}/api/anthropic\"", server.uri())),
+        "the configured Messages root is the same base"
+    );
+    drop_blocking(provider);
+}
+
+/// The recorded default class never crosses into Messages: a Chat
+/// Completions-class id — listed or unrecorded — is denied typed before
+/// the wire, while the literal construction gate keeps `new` on the
+/// recorded default.
+#[tokio::test]
+async fn zenmux_unrecorded_class_never_enters_the_messages_route() {
+    for model in [ZENMUX_CC_MODEL, "fixture/unknown-model", "claude-opus-4.8"] {
+        assert_eq!(
+            route_for(ZENMUX, model),
+            Some(Dialect::ChatCompletions),
+            "{model} rides the recorded default"
+        );
+    }
+
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_CC_MODEL))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: default class denial",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = (match outcome {
+        Err(ModelError::Provider(error)) => error,
+        other => panic!("the default class denies typed: {other:?}"),
+    })
+    else {
+        panic!("expected the typed model denial");
+    };
+    assert_eq!(connection, ZENMUX);
+    assert_eq!(parameter, "model");
+    assert_eq!(model, ZENMUX_CC_MODEL);
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+
+    // the literal default is Chat Completions, so `new` cannot build the
+    // Messages arm without the route table gate
+    let denied = std::thread::spawn(move || MessagesProvider::new(&config, ZENMUX, zenmux_store()))
+        .join()
+        .expect("the provider thread joins")
+        .expect_err("a Messages build without a route denies");
+    assert!(matches!(denied, ProviderError::DialectMismatch { .. }));
+}
+
+/// Wrong credential, region or origin never produce a false success for
+/// `zenmux`: a configured region denies at build, an origin outside the
+/// trust boundary is refused at ingress, an absent scope denies before
+/// any wire leg, a refused key lands the typed transport denial, and no
+/// denial renders the material or body.
+#[tokio::test]
+async fn zenmux_wrong_credential_region_or_origin_denies_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region names no recorded contract
+    let regional = Config::parse_validated(
+        &zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL)
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let denied = std::thread::spawn(move || {
+        MessagesProvider::with_route(
+            &regional,
+            ZENMUX,
+            zenmux_store(),
+            Duration::from_secs(1),
+            WireAuth::Store(None),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("a configured region denies");
+    assert!(
+        matches!(&denied, ProviderError::RegionMismatch { connection, region }
+        if connection == ZENMUX && region == "eu")
+    );
+
+    // origins outside the trust boundary are refused at ingress, and the
+    // refusal never echoes the userinfo
+    for origin in [
+        "http://gateway.example.com/api/v1",
+        "https://key:fixture-origin-material@gateway.example.com",
+    ] {
+        let refused = Config::parse_validated(&zenmux_config(origin, ZENMUX_ANTHROPIC_MODEL))
+            .expect_err("the origin is outside the trust boundary");
+        assert!(matches!(&refused.issue, ConfigIssue::EndpointNotAllowed));
+        assert!(
+            !refused.to_string().contains("fixture-origin-material"),
+            "the refusal never echoes the origin's userinfo: {refused}"
+        );
+    }
+
+    // a bound-but-empty scope denies at send without reaching the wire
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let provider = zenmux_provider_with_auth(&config, WireAuth::Store(None))
+        .expect("the route constructor builds");
+    let (provider, denied) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/zenmux"));
+    let error = denied.expect_err("the empty scope denies");
+    assert!(matches!(error, ProviderError::CredentialUnresolved { .. }));
+    for rendered in [format!("{error}"), format!("{error:?}")] {
+        assert!(
+            !rendered.contains(SECRET) && !rendered.contains(NEIGHBOR_SECRET),
+            "diagnostics stay secret-free: {rendered}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before the wire"
+    );
+
+    // a refused key is the typed transport denial carrying only the status
+    Mock::given(method("POST"))
+        .and(path(ZENMUX_MESSAGES_PATH))
+        .respond_with(ResponseTemplate::new(401).set_body_string("fixture-401-body-marker"))
+        .mount(&server)
+        .await;
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/zenmux"));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, ZENMUX);
+    assert!(cause.class() == TransportClass::HttpStatus { code: 401 });
+    assert!(!err.to_string().contains(SECRET));
+    assert!(!err.to_string().contains("fixture-401-body-marker"));
+    drop_blocking(provider);
+}
+
+/// The Messages catalogue is the authoritative `/api/v1/models` metadata
+/// read on the pair's Chat Completions root, filtered to the recorded
+/// class: the unrecorded `/api/anthropic/v1/models` surface is never
+/// contacted, and a default-class row is not offered here.
+#[tokio::test]
+async fn zenmux_catalog_is_the_authoritative_metadata_on_the_messages_arm() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": ZENMUX_ANTHROPIC_MODEL,
+                    "owned_by": "anthropic",
+                    "input_modalities": ["text", "image"],
+                    "capabilities": {"reasoning": true},
+                    "context_length": 200_000,
+                    "max_completion_tokens": 32_000,
+                    "pricings": {
+                        "prompt": [{"value": 5.0, "unit": "perMTokens", "currency": "USD"}],
+                        "completion": [{"value": 25.0, "unit": "perMTokens", "currency": "USD"}],
+                    },
+                },
+                {"id": ZENMUX_CC_MODEL, "owned_by": "google"},
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, catalog) = catalog_models_on_thread(provider);
+    let models = catalog.expect("the authoritative metadata answers");
+    assert_eq!(
+        models,
+        vec![CatalogModel {
+            id: ZENMUX_ANTHROPIC_MODEL.to_string(),
+            reasoning: true,
+            vision: true,
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+            price: rivect::providers::local::ModelPrice::Usd {
+                input_per_1m: 5.0,
+                output_per_1m: 25.0,
+            },
+            ..CatalogModel::default()
+        }],
+        "the class filter keeps the metadata's Anthropic row alone"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(count_path(&requests, "/api/v1/models"), 1);
+    assert_eq!(
+        count_path(&requests, "/api/anthropic/v1/models"),
+        0,
+        "the unrecorded Messages listing is never contacted"
+    );
+}
+
+/// Hostile Messages input never reports success for `zenmux`: a partial
+/// tool block is the typed violation, an unclassifiable stop reason the
+/// unknown terminal, and a repeated usage report one charge — every
+/// rejection accounts nothing.
+#[tokio::test]
+async fn zenmux_rejects_partial_tool_block_unknown_terminal_and_repeated_usage() {
+    // partial tool JSON at the block stop
+    let server = MockServer::start().await;
+    mount_zenmux_messages(
+        &server,
+        format!(
+            "{}{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+            ),
+            sse_block(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/zenmux"));
+    assert!(
+        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        "a partial tool block never becomes a reply: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // a stop reason the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_zenmux_messages(
+        &server,
+        format!(
+            "{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "teleport"}, "usage": {"output_tokens": 1}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/zenmux"));
+    assert!(
+        matches!(outcome, Err(ProviderError::UnknownTerminal { .. })),
+        "an unknown stop reason is an unknown terminal: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // the usage report repeated with the same figures is one charge
+    let server = MockServer::start().await;
+    mount_zenmux_messages(
+        &server,
+        format!(
+            "{}{}{}{}{}",
+            message_start(4),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse_block(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "once"}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&zenmux_uri(&server), ZENMUX_ANTHROPIC_MODEL))
+            .expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: repeated usage",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest.clone());
+    let reply = outcome.expect("the repeated report is one charge");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+}

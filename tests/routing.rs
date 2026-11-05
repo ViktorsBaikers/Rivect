@@ -7877,3 +7877,105 @@ fn vercel_ai_gateway_never_falls_back_across_id_or_region() {
         "the typed region denial: {denied:?}"
     );
 }
+
+/// The `zenmux` route table separates the recorded Chat Completions
+/// default from the metadata's Anthropic class with no third route and
+/// no cross-route fallback: the Messages arm refuses a default-class
+/// model before any wire leg, and the literal default keeps `new` on the
+/// Chat Completions codec.
+#[test]
+fn zenmux_never_falls_back_across_route_or_id() {
+    assert_eq!(
+        rivect::providers::dialect_for("zenmux"),
+        Some(Dialect::ChatCompletions),
+        "the literal default is the recorded Chat Completions dialect"
+    );
+    assert_eq!(
+        rivect::providers::routes_for("zenmux"),
+        &[Dialect::ChatCompletions, Dialect::Messages],
+        "only the recorded two-route table exists"
+    );
+    for (model, expected) in [
+        ("anthropic/claude-opus-4.8", Dialect::Messages),
+        ("anthropic/claude-haiku-4.5", Dialect::Messages),
+        ("google/gemini-3-pro-preview", Dialect::ChatCompletions),
+        ("openai/gpt-6.1-terra", Dialect::ChatCompletions),
+        ("claude-opus-4.8", Dialect::ChatCompletions),
+        ("fixture/unknown-model", Dialect::ChatCompletions),
+    ] {
+        assert_eq!(
+            rivect::providers::route_for("zenmux", model),
+            Some(expected),
+            "{model} takes its recorded route"
+        );
+    }
+
+    let toml = "config_version = 1\n\
+         [connections.zenmux]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/api/v1\"\ncredential_ref = \"keyring:rivect-test/zenmux\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"zenmux\", model_id = \"google/gemini-3-pro-preview\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n";
+    let config = Config::parse_validated(toml).expect("the zenmux config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[("keyring:rivect-test/zenmux", "fixture-zenmux-key-not-real")],
+    ));
+    let reference = rivect::providers::SecretRef::parse("keyring:rivect-test/zenmux")
+        .expect("the scoped ref parses");
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::with_route(
+            &built,
+            "zenmux",
+            store,
+            std::time::Duration::from_secs(1),
+            rivect::providers::WireAuth::Store(Some(reference)),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the Messages route builds");
+
+    let manifest = {
+        let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+        broker
+            .prepare("main", &config, "/world/zenmux", "goal: no fallback")
+            .expect("the pin prepares")
+    };
+    let (provider, outcome) = support::send_on_thread(provider, manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ProviderError::UnsupportedParameter {
+                parameter: "model",
+                ..
+            })
+        ),
+        "a default-class model never enters the Messages route: {outcome:?}"
+    );
+    support::drop_blocking(provider);
+
+    let regional = Config::parse_validated(
+        &toml.replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("the regional config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[],
+    ));
+    let denied = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::with_route(
+            &regional,
+            "zenmux",
+            store,
+            std::time::Duration::from_secs(1),
+            rivect::providers::WireAuth::Store(None),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("a configured region never borrows a route");
+    assert!(
+        matches!(&denied, ProviderError::RegionMismatch { connection, region }
+            if connection == "zenmux" && region == "eu"),
+        "the typed region denial: {denied:?}"
+    );
+}

@@ -21104,3 +21104,977 @@ async fn chat_completion_detail_legs_are_carried() {
         }
     );
 }
+
+// ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::zenmux (CC default) ----
+
+/// The literal `zenmux` connection id.
+const ZENMUX: &str = "zenmux";
+/// The scoped credential ref the connection binds.
+const ZENMUX_REF: &str = "keyring:rivect-test/zenmux";
+/// Fixture material — never a real key, only ever sent to a loopback peer.
+const ZENMUX_KEY: &str = "fixture-zenmux-key-not-real";
+/// A non-Anthropic metadata id: the recorded Chat Completions default.
+const ZENMUX_CC_MODEL: &str = "google/gemini-3-pro-preview";
+/// An id the authoritative metadata classes as Anthropic: Messages route.
+const ZENMUX_ANTHROPIC_MODEL: &str = "anthropic/claude-opus-4.8";
+/// An id the metadata does not record: the Chat Completions default.
+const ZENMUX_UNRECORDED_MODEL: &str = "fixture/unknown-model";
+
+fn server_uri_api_v1(server: &MockServer) -> String {
+    format!("{}/api/v1", server.uri())
+}
+
+fn zenmux_config_at(endpoint: &str, model: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.zenmux]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{ZENMUX_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"zenmux\", model_id = \"{model}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn zenmux_config(endpoint: &str) -> String {
+    zenmux_config_at(endpoint, ZENMUX_CC_MODEL)
+}
+
+/// The CC adapter over a store seeded with the fixture key.
+fn zenmux_provider(config: &Config) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ZENMUX_REF, ZENMUX_KEY)],
+    ));
+    let provider = provider_result(config.clone(), ZENMUX.to_string(), store.clone())
+        .expect("the shared adapter builds for the zenmux id");
+    (provider, store)
+}
+
+async fn zenmux_mount_models(server: &MockServer, rows: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": rows})),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn zenmux_mount_chat(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A completed Messages stream for the routed auto leg's second route.
+fn zenmux_messages_stream(input_tokens: u64, output_tokens: u64) -> String {
+    format!(
+        "{}{}{}{}{}{}",
+        sse_block(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                },
+            }),
+        ),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "routed"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 0}),
+        ),
+        sse_block(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": output_tokens},
+            }),
+        ),
+        sse_block("message_stop", &json!({"type": "message_stop"})),
+    )
+}
+
+/// A configured `zenmux` pin whose metadata class is not Anthropic rides
+/// the recorded Chat Completions default: the configured `…/api/v1` root
+/// is the API base, the keyed pin returns one verified outcome and one
+/// accounted usage, and the wire carries the plain bearer — no listing
+/// leg, no second route and no borrowed host.
+#[tokio::test]
+async fn zenmux_valid_control_on_the_recorded_cc_default() {
+    let server = MockServer::start().await;
+    zenmux_mount_chat(
+        &server,
+        completed_stream(
+            "verified zenmux outcome",
+            Some(json!({"prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: prove the recorded default",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest.clone());
+    let reply = outcome.expect("the recorded default dispatches");
+    assert_eq!(reply.text, "verified zenmux outcome");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no listing leg");
+    assert_eq!(requests[0].url.path(), "/api/v1/chat/completions");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {ZENMUX_KEY}"));
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], ZENMUX_CC_MODEL);
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ])
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(body["stream_options"], json!({"include_usage": true}));
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "auto effort emits no reasoning_effort member"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, ZENMUX);
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 6,
+            total_tokens: 17,
+        }
+    );
+    drop_blocking(broker);
+
+    // the empty endpoint resolves the recorded Chat Completions root, and
+    // the default model class never turns the connection into Messages
+    let unset = Config::parse_validated(&zenmux_config("")).expect("valid");
+    let provider = provider_result(
+        unset,
+        ZENMUX.to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("the shared adapter builds for the zenmux id");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains("endpoint: \"https://zenmux.ai/api/v1\""),
+        "an empty endpoint resolves the recorded Chat Completions root: {debug}"
+    );
+    assert!(
+        !debug.contains("/api/anthropic"),
+        "the CC arm never derives the Messages base: {debug}"
+    );
+    drop_blocking(provider);
+}
+
+/// The authoritative `/api/v1/models` metadata is the whole catalogue:
+/// each listed row lands its stated reasoning, image-input, context,
+/// output-cap and per-1M PAYG surface, a row that states no price keeps
+/// the unknown state, and no seed or sibling row is invented.
+#[tokio::test]
+async fn zenmux_catalog_is_the_authoritative_metadata() {
+    let server = MockServer::start().await;
+    zenmux_mount_models(
+        &server,
+        vec![
+            json!({
+                "id": ZENMUX_CC_MODEL,
+                "object": "model",
+                "display_name": "Google: Gemini 3 Pro",
+                "owned_by": "google",
+                "input_modalities": ["text"],
+                "capabilities": {},
+                "context_length": 1_048_576,
+            }),
+            json!({
+                "id": ZENMUX_ANTHROPIC_MODEL,
+                "object": "model",
+                "display_name": "Anthropic: Claude Opus 4.8",
+                "owned_by": "Anthropic",
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "capabilities": {"reasoning": true},
+                "context_length": 200_000,
+                "max_completion_tokens": 32_000,
+                "pricings": {
+                    "prompt": [{"value": 5.0, "unit": "perMTokens", "currency": "USD"}],
+                    "completion": [{"value": 25.0, "unit": "perMTokens", "currency": "USD"}],
+                },
+            }),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the authoritative metadata answers");
+    assert_eq!(
+        model_ids(&models),
+        vec![ZENMUX_ANTHROPIC_MODEL, ZENMUX_CC_MODEL],
+        "the listing is the whole catalogue, in deterministic order"
+    );
+    assert_eq!(
+        models[0],
+        CatalogModel {
+            id: ZENMUX_ANTHROPIC_MODEL.to_string(),
+            reasoning: true,
+            vision: true,
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+            price: ModelPrice::Usd {
+                input_per_1m: 5.0,
+                output_per_1m: 25.0,
+            },
+            ..CatalogModel::default()
+        },
+        "every stated metadata surface lands on the row"
+    );
+    assert_eq!(
+        models[1],
+        CatalogModel {
+            id: ZENMUX_CC_MODEL.to_string(),
+            context_window: Some(1_048_576),
+            ..CatalogModel::default()
+        },
+        "an absent price or capability stays empty/unknown, never invented"
+    );
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "one listing leg");
+    assert_eq!(requests[0].url.path(), "/api/v1/models");
+    assert_eq!(received_auth(&requests[0]), format!("Bearer {ZENMUX_KEY}"));
+}
+
+/// The metadata's per-1M figures are PAYG rates — the first stated value
+/// of the recorded bucket — and the Builder plan's included quota is a
+/// separate billing fact this surface never states: a row without a
+/// stated price stays unknown, never a zero that would read as included.
+#[tokio::test]
+async fn zenmux_payg_and_builder_are_never_merged() {
+    let server = MockServer::start().await;
+    zenmux_mount_models(
+        &server,
+        vec![
+            json!({
+                "id": "meta/llama-4",
+                "owned_by": "meta",
+                "pricings": {
+                    "prompt": [
+                        {"value": 0.9, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 0.0, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                    "completion": [
+                        {"value": 1.8, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 0.0, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                },
+            }),
+            json!({
+                "id": "inclusionai/ling-2.6",
+                "owned_by": "inclusionai",
+                "pricings": {
+                    "prompt": [{"value": 0.4, "unit": "perMTokens", "currency": "USD"}],
+                },
+            }),
+            json!({
+                "id": "builder/plan-only",
+                "owned_by": "builder",
+            }),
+            json!({
+                "id": "cny/renminbi-model",
+                "owned_by": "cny",
+                "pricings": {
+                    "prompt": [{"value": 7.0, "unit": "perMTokens", "currency": "CNY"}],
+                    "completion": [{"value": 21.0, "unit": "perMTokens", "currency": "CNY"}],
+                },
+            }),
+            json!({
+                "id": "legacy/whole-token-model",
+                "owned_by": "legacy",
+                "pricings": {
+                    "prompt": [{"value": 0.000_001, "unit": "perToken", "currency": "USD"}],
+                    "completion": [{"value": 0.000_002, "unit": "perToken", "currency": "USD"}],
+                },
+            }),
+            json!({
+                "id": "plan/first-zero-model",
+                "owned_by": "plan",
+                "pricings": {
+                    "prompt": [
+                        {"value": 0.0, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 9.0, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                    "completion": [
+                        {"value": 0.0, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 27.0, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                },
+            }),
+        ],
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let (provider, catalog) = catalog_on_thread(provider);
+    let models = catalog.expect("the metadata answers");
+    let price_of = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.price)
+            .expect("the listed row exists")
+    };
+    assert_eq!(
+        price_of("meta/llama-4"),
+        ModelPrice::Usd {
+            input_per_1m: 0.9,
+            output_per_1m: 1.8,
+        },
+        "the first stated PAYG rate wins, never a later plan figure"
+    );
+    assert_eq!(
+        price_of("inclusionai/ling-2.6"),
+        ModelPrice::Unknown,
+        "a partial PAYG figure is no figure"
+    );
+    assert_eq!(
+        price_of("builder/plan-only"),
+        ModelPrice::Unknown,
+        "presence in the catalogue is Builder coverage, never a zero PAYG rate"
+    );
+    assert_eq!(
+        price_of("cny/renminbi-model"),
+        ModelPrice::Unknown,
+        "a non-USD figure is never read as USD"
+    );
+    assert_eq!(
+        price_of("legacy/whole-token-model"),
+        ModelPrice::Unknown,
+        "a non-per-1M unit is never read as a per-1M rate"
+    );
+    assert_eq!(
+        price_of("plan/first-zero-model"),
+        ModelPrice::Usd {
+            input_per_1m: 0.0,
+            output_per_1m: 0.0,
+        },
+        "the first stated PAYG entry decides — a plan-priced zero is not merged with a later rate"
+    );
+    drop_blocking(provider);
+}
+
+/// The route table's class predicate is the recorded metadata identity:
+/// the Anthropic namespace takes Messages, and every other id — a
+/// non-Anthropic provider, a bare family name the metadata never records,
+/// or an id outside the listing — rides the Chat Completions default.
+/// The Messages arm denies the default-class id typed before the wire, so
+/// no cross-route fallback exists.
+#[tokio::test]
+async fn zenmux_unrecorded_class_uses_the_cc_default_not_a_cross_route_fallback() {
+    assert_eq!(
+        rivect::providers::dialect_for(ZENMUX),
+        Some(rivect::providers::Dialect::ChatCompletions),
+        "the literal default is the recorded Chat Completions dialect"
+    );
+    assert_eq!(
+        rivect::providers::routes_for(ZENMUX),
+        &[
+            rivect::providers::Dialect::ChatCompletions,
+            rivect::providers::Dialect::Messages,
+        ],
+        "only the recorded two-route table exists"
+    );
+    for model in [
+        ZENMUX_CC_MODEL,
+        ZENMUX_UNRECORDED_MODEL,
+        "claude-opus-4.8",
+        "openai/gpt-6.1-terra",
+    ] {
+        assert_eq!(
+            rivect::providers::route_for(ZENMUX, model),
+            Some(rivect::providers::Dialect::ChatCompletions),
+            "{model} rides the recorded default, never a cross-route fallback"
+        );
+    }
+    assert_eq!(
+        rivect::providers::route_for(ZENMUX, ZENMUX_ANTHROPIC_MODEL),
+        Some(rivect::providers::Dialect::Messages),
+        "the metadata's Anthropic class owns the Messages route"
+    );
+
+    // the default-class id sends on the recorded CC route, one usage
+    let server = MockServer::start().await;
+    zenmux_mount_chat(&server, completed_stream("default class", None)).await;
+    let config = Config::parse_validated(&zenmux_config_at(
+        &server_uri_api_v1(&server),
+        ZENMUX_UNRECORDED_MODEL,
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: unrecorded class",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    outcome.expect("an unrecorded class rides the recorded default");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/api/v1/chat/completions");
+    drop_blocking(broker);
+}
+
+/// Hostile stream input never reports success for `zenmux`: a tool-call
+/// fragment whose arguments never close is the typed violation, a
+/// terminal the dialect cannot classify is the unknown terminal, and a
+/// repeated usage report is charged once — every rejection accounts
+/// nothing.
+#[tokio::test]
+async fn zenmux_cc_rejects_partial_tool_block_unknown_terminal_and_repeated_usage() {
+    // a complete content delta plus an unterminated tool-call fragment
+    let server = MockServer::start().await;
+    zenmux_mount_chat(
+        &server,
+        format!(
+            "{}{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+            data_block(&finish_chunk("tool_calls")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "an unfinished tool call is a typed violation: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never success
+    let server = MockServer::start().await;
+    zenmux_mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+
+    // the usage report repeated with the same figures is one charge
+    let server = MockServer::start().await;
+    zenmux_mount_chat(
+        &server,
+        format!(
+            "{}{}{}{}{}",
+            data_block(&delta_chunk(
+                json!({"role": "assistant", "content": "once"})
+            )),
+            data_block(&finish_chunk("stop")),
+            data_block(&usage_chunk(
+                json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})
+            )),
+            data_block(&usage_chunk(
+                json!({"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6})
+            )),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: repeated usage",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest.clone());
+    let reply = outcome.expect("the repeated report is one charge");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+}
+
+/// Chunked delivery inside UTF-8, JSON, SSE and the tool block reassembles
+/// to one outcome; the repeated usage report is charged once, and the
+/// spent attempt never opens a second request.
+#[tokio::test]
+async fn zenmux_stream_fragmentation_and_repeated_usage_never_duplicates() {
+    use rivect::providers::ToolCall;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let posts = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&posts);
+    let body = format!(
+        "{}{}{}{}{}{}{}",
+        data_block(&delta_chunk(
+            json!({"role": "assistant", "content": "héllo ✓"})
+        )),
+        data_block(&delta_chunk(json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":"},
+            }],
+        }))),
+        data_block(&delta_chunk(json!({
+            "tool_calls": [{
+                "index": 0,
+                "function": {"arguments": "\"/tmp/fixture\"}"},
+            }],
+        }))),
+        data_block(&finish_chunk("tool_calls")),
+        data_block(&usage_chunk(
+            json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})
+        )),
+        data_block(&usage_chunk(
+            json!({"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8})
+        )),
+        DONE_BLOCK,
+    );
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the fixture peer accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("the fixture read timeout");
+        let mut sink = [0u8; 8192];
+        while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
+        count.fetch_add(1, Ordering::SeqCst);
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).expect("the fixture head");
+        let bytes = body.as_bytes();
+        let sizes = [1usize, 2, 3, 5, 8, 13, 21];
+        let mut offset = 0;
+        let mut step = 0;
+        while offset < bytes.len() {
+            let len = sizes[step % sizes.len()].min(bytes.len() - offset);
+            stream
+                .write_all(&bytes[offset..offset + len])
+                .expect("the fixture fragment");
+            stream.flush().expect("the fixture flushes");
+            offset += len;
+            step += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let endpoint = format!("http://{address}/api/v1");
+    let config = Config::parse_validated(&zenmux_config(&endpoint)).expect("valid");
+    let (provider, _store) = zenmux_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/zenmux", "goal: fragmented")
+        .expect("the pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest.clone());
+    let reply = outcome.expect("the fragmented stream reassembles");
+    assert_eq!(reply.text, "héllo ✓");
+    assert_eq!(
+        reply.tool_calls,
+        vec![ToolCall {
+            tool: "read_file".to_string(),
+            path: Some("/tmp/fixture".to_string()),
+        }]
+    );
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        },
+        "the repeated usage report is charged once"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+
+    let replay_manifest = manifest.clone();
+    let (broker, replay) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let replay = broker.dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/zenmux",
+            &replay_manifest,
+        );
+        (broker, replay)
+    })
+    .join()
+    .expect("the replay thread joins");
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "confirmed data is never duplicated: {replay:?}"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the fixture peer joins");
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "one physical send");
+}
+
+/// The CC arm owns only the recorded default class: an Anthropic-class
+/// pin denies typed before the wire and accounts nothing — no
+/// cross-route fallback exists in this codec.
+#[tokio::test]
+async fn zenmux_cc_route_guard_denies_the_messages_class() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&zenmux_config_at(
+        &server_uri_api_v1(&server),
+        ZENMUX_ANTHROPIC_MODEL,
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: route guard",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = (match outcome {
+        Err(ModelError::Provider(error)) => error,
+        other => panic!("the route guard denies typed: {other:?}"),
+    })
+    else {
+        panic!("the route guard denies UnsupportedParameter");
+    };
+    assert_eq!(connection, ZENMUX);
+    assert_eq!(parameter, "model");
+    assert_eq!(model, ZENMUX_ANTHROPIC_MODEL);
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denial lands before any wire leg"
+    );
+}
+
+/// The metadata states no reasoning-effort ladder, so a pinned level is
+/// the typed parameter denial — never a silently dropped body field —
+/// and the denial lands before the wire.
+#[tokio::test]
+async fn zenmux_pinned_effort_denies_typed() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server)).replace(
+        "effort = { mode = \"auto\" }",
+        "effort = { mode = \"fixed\", value = \"high\" }",
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: effort denial",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = (match outcome {
+        Err(ModelError::Provider(error)) => error,
+        other => panic!("the effort denial is typed: {other:?}"),
+    })
+    else {
+        panic!("the effort denial is UnsupportedParameter");
+    };
+    assert_eq!(connection, ZENMUX);
+    assert_eq!(parameter, "reasoning_effort");
+    assert_eq!(model, ZENMUX_CC_MODEL);
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the effort denial lands before the wire"
+    );
+}
+
+/// The Messages root and the Chat Completions root are one fixed pair:
+/// a connection configured with `…/api/anthropic` still resolves the CC
+/// arm to `…/api/v1`, and its Chat Completions pin posts one request on
+/// the recorded default — never the configured mirror.
+#[tokio::test]
+async fn zenmux_messages_root_folds_onto_the_recorded_cc_base() {
+    let server = MockServer::start().await;
+    zenmux_mount_chat(&server, completed_stream("folded base", None)).await;
+    let messages_root = format!("{}/api/anthropic", server.uri());
+    let config =
+        Config::parse_validated(&zenmux_config(&messages_root)).expect("the pair config parses");
+    let (provider, store) = zenmux_provider(&config);
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains(&format!("endpoint: \"{}/api/v1\"", server.uri())),
+        "the configured Messages root folds onto the recorded CC root: {debug}"
+    );
+    assert!(
+        !debug.contains("/api/anthropic"),
+        "the CC arm never keeps the Messages mirror: {debug}"
+    );
+    let (broker, manifest) = prepared_with(
+        (provider, store),
+        &config,
+        "/world/zenmux",
+        "goal: folded base",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    outcome.expect("the folded base serves the default class");
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/api/v1/chat/completions");
+    drop_blocking(broker);
+}
+
+/// The routed owner composes both legs: a pinned CC model dispatches on
+/// the default route, and an auto pin resolves the authoritative
+/// metadata and follows the resolved model's recorded class — each
+/// physical send is accounted once on its route.
+#[tokio::test]
+async fn zenmux_routed_composition_dispatches_cc_and_auto_pins() {
+    // fixed CC pin through the routed owner
+    let server = MockServer::start().await;
+    zenmux_mount_chat(&server, completed_stream("routed cc", None)).await;
+    let config =
+        Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server))).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ZENMUX_REF, ZENMUX_KEY)],
+    ));
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        rivect::providers::routed::RoutedProvider::new(&built, ZENMUX, store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the routed owner builds for zenmux");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ZENMUX_REF, ZENMUX_KEY)],
+    ));
+    let (broker, manifest) = prepared_with(
+        (provider, store),
+        &config,
+        "/world/zenmux",
+        "goal: routed cc pin",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    outcome.expect("the pinned CC model dispatches on the default route");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/api/v1/chat/completions");
+
+    // auto pin through the routed owner: the listing's sorted-first row
+    // is the Anthropic class, so the route follows the metadata
+    let server = MockServer::start().await;
+    zenmux_mount_models(
+        &server,
+        vec![
+            json!({"id": ZENMUX_ANTHROPIC_MODEL, "owned_by": "anthropic"}),
+            json!({"id": ZENMUX_CC_MODEL, "owned_by": "google"}),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/anthropic/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(zenmux_messages_stream(2, 1)),
+        )
+        .mount(&server)
+        .await;
+    let auto = Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server)).replace(
+        "model = { mode = \"fixed\", connection = \"zenmux\", model_id = \"google/gemini-3-pro-preview\" }",
+        "model = { mode = \"auto\", pool = [\"zenmux\"] }",
+    ))
+    .expect("the auto config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(ZENMUX_REF, ZENMUX_KEY)],
+    ));
+    let built = auto.clone();
+    let provider = std::thread::spawn(move || {
+        rivect::providers::routed::RoutedProvider::new(&built, ZENMUX, store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the routed owner builds for zenmux");
+    let (broker, manifest) = prepared_with(
+        (
+            provider,
+            Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+        ),
+        &auto,
+        "/world/zenmux",
+        "goal: routed auto pin",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    outcome.expect("the resolved class owns the auto leg");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/v1/models")
+            .count(),
+        1,
+        "the auto pick reads the authoritative metadata once"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/anthropic/v1/messages")
+            .count(),
+        1,
+        "the resolved Anthropic class takes the Messages route"
+    );
+}
+
+/// A direct CC auto pin never resolves a row its own route guard would
+/// refuse: the sorted-first Anthropic row is skipped for the first
+/// default-class row, which rides one Chat Completions request.
+#[tokio::test]
+async fn zenmux_cc_auto_pick_skips_the_messages_class() {
+    let server = MockServer::start().await;
+    zenmux_mount_models(
+        &server,
+        vec![
+            json!({"id": ZENMUX_ANTHROPIC_MODEL, "owned_by": "anthropic"}),
+            json!({"id": ZENMUX_CC_MODEL, "owned_by": "google"}),
+        ],
+    )
+    .await;
+    zenmux_mount_chat(&server, completed_stream("auto cc", None)).await;
+    let config = Config::parse_validated(&zenmux_config(&server_uri_api_v1(&server)).replace(
+        "model = { mode = \"fixed\", connection = \"zenmux\", model_id = \"google/gemini-3-pro-preview\" }",
+        "model = { mode = \"auto\", pool = [\"zenmux\"] }",
+    ))
+    .expect("the auto config parses");
+    let (broker, manifest) = prepared_with(
+        zenmux_provider(&config),
+        &config,
+        "/world/zenmux",
+        "goal: cc auto",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/zenmux", manifest);
+    outcome.expect("the default-class row serves the auto leg");
+    assert_eq!(broker.accounted_requests(), 1);
+    drop_blocking(broker);
+    let requests = server.received_requests().await.expect("recorded");
+    let post = requests
+        .iter()
+        .find(|request| request.url.path() == "/api/v1/chat/completions")
+        .expect("one Chat Completions request");
+    let body: Value = serde_json::from_slice(&post.body).expect("json body");
+    assert_eq!(
+        body["model"], ZENMUX_CC_MODEL,
+        "the guard skips the Anthropic class instead of denying the auto leg"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/anthropic/v1/messages")
+            .count(),
+        0,
+        "the CC codec never crosses into the Messages route"
+    );
+}

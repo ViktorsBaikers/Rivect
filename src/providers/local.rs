@@ -298,7 +298,20 @@
 //! surface streams `reasoning_content` as progress, never joined to
 //! `text`; the body constructs no developer role, and the class records
 //! no effort dial, so a pinned `reasoning_effort` denies typed rather
-//! than being dropped.
+//! than being dropped. The configured-or-recorded
+//! `https://zenmux.ai/api/v1` base of `zenmux` is the recorded Chat
+//! Completions root — a configured Messages root
+//! (`…/api/anthropic`) folds onto the same fixed pair — and its
+//! key-gated authoritative `/api/v1/models` metadata is the whole offer
+//! set under the recorded transform: the reasoning mark, image-input
+//! modality, context window, output cap and per-1M PAYG prices the row
+//! states, with a partial price staying [`ModelPrice::Unknown`] so the
+//! Builder plan's separate quota never reads as a zero rate. The plain
+//! key rides the bearer; a configured `region` denies typed; and a
+//! metadata-routed Anthropic-class model denies here before the body —
+//! its Messages route is this id's other leg, never a cross-route
+//! fallback. The metadata states no effort ladder, so a pinned
+//! `reasoning_effort` denies typed rather than being dropped.
 //! The adapter authors no async code — [`Provider::send`] is a blocking
 //! single-shot seam and
 //! Tokio appears only inside reqwest's blocking client plus the
@@ -1240,6 +1253,11 @@ enum EndpointRule {
     /// international, China or a custom origin — is this configured
     /// base itself; neither recorded contract names a `region` field.
     PlanBaseOrDefault(&'static str),
+    /// `zenmux`'s recorded base pair (`normalizeZenMuxOpenAiBaseUrl`):
+    /// an empty base resolves the Chat Completions root, a trailing
+    /// slash is dropped, and a base naming the Messages root folds onto
+    /// the Chat Completions root — never a second, unrelated origin.
+    Zenmux,
 }
 
 /// The recorded catalogue source a literal id binds (HZN-008): the
@@ -1595,6 +1613,16 @@ enum EntryRule {
     /// stays progress and never joins `text` (the shared delta
     /// reducer's rule).
     Zhipu,
+    /// The `zenmux` arm: the authoritative `/api/v1/models` metadata is
+    /// the whole offer set — no seed floor — and each entry maps the
+    /// stated reasoning mark, image-input modality, context window,
+    /// output cap and per-1M PAYG prices. A partial price stays
+    /// [`ModelPrice::Unknown`]; the Builder plan's quota is a separate
+    /// billing fact this surface never states, so presence in the
+    /// catalogue never becomes a zero price. The listing states no
+    /// reasoning-effort ladder, so a pinned level denies typed rather
+    /// than being dropped.
+    Zenmux,
 }
 
 /// The predicates the recorded source class binds to a literal Chat
@@ -2413,6 +2441,22 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Zhipu,
             entries: EntryRule::Zhipu,
         }),
+        // `zenmux` (HZN-008 authoritative-metadata cell): the
+        // configured-or-recorded `https://zenmux.ai/api/v1` Chat
+        // Completions root — the Messages root folds onto the same
+        // fixed pair — whose key-gated `/api/v1/models` metadata is the
+        // whole offer set under the recorded per-entry transform, with
+        // no seed floor and no invented entitlement. The plain key bears
+        // the wire; a configured `region` denies, and the arm's route
+        // guard owns the Anthropic-class split, so this codec never
+        // serves a model the metadata routes on Messages.
+        "zenmux" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::Zenmux,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::Zenmux,
+        }),
         _ => None,
     }
 }
@@ -2525,6 +2569,7 @@ impl SourceContract {
                 }
                 trimmed.trim_end_matches('/').to_string()
             }
+            EndpointRule::Zenmux => super::zenmux_openai_base(configured),
         }
     }
 }
@@ -3218,6 +3263,7 @@ impl ChatCompletionsProvider {
                 | EntryRule::Synthetic
                 | EntryRule::Vllm
                 | EntryRule::Wafer
+                | EntryRule::Zenmux
                 | EntryRule::Zhipu => Some(CatalogModel {
                     id: (*id).to_string(),
                     ..CatalogModel::default()
@@ -3412,6 +3458,7 @@ impl ChatCompletionsProvider {
             }),
             EntryRule::GenericMetadata => Some(generic_metadata_entry(id, entry)),
             EntryRule::Zhipu => Some(generic_metadata_entry(id, entry)),
+            EntryRule::Zenmux => Some(zenmux_entry(id, entry)),
             EntryRule::Aiand => Some(aiand_entry(id, entry)),
             // `filterModel` runs on the mapped model's id — verbatim
             // `entry.id` here, the mapped id `mapWithBundledReference`
@@ -3841,6 +3888,7 @@ impl ChatCompletionsProvider {
             | EntryRule::Vllm
             | EntryRule::Wafer
             | EntryRule::YoloAuto
+            | EntryRule::Zenmux
             | EntryRule::Zhipu => model_id.to_string(),
         }
     }
@@ -3904,6 +3952,31 @@ impl ChatCompletionsProvider {
         body
     }
 
+    /// The recorded route guard of an arm whose dialect is one of two
+    /// routes: `zenmux`'s Anthropic-class model has its own Messages
+    /// route, so this codec denies it typed before the body — never a
+    /// cross-route fallback. Every other arm serves every id it admits.
+    fn check_model(&self, model_id: &str) -> Result<(), ProviderError> {
+        if self.admits_route(model_id) {
+            return Ok(());
+        }
+        Err(ProviderError::UnsupportedParameter {
+            connection: self.connection.clone(),
+            parameter: "model",
+            model: model_id.to_string(),
+        })
+    }
+
+    /// Whether this codec's route owns `model_id`: the `zenmux` arm
+    /// owns every id its metadata leaves on the Chat Completions
+    /// default, while the Anthropic class belongs to the Messages leg.
+    /// The auto pick applies the same guard, so a direct CC auto pin
+    /// never resolves a row this codec would refuse at send.
+    fn admits_route(&self, model_id: &str) -> bool {
+        !(matches!(self.contract.entries, EntryRule::Zenmux)
+            && super::zenmux_is_anthropic(model_id))
+    }
+
     /// The recorded parameter predicate (HZN-008): a pinned
     /// `reasoning_effort` rides the body only where the pin's model
     /// records that level — every other level, and every model with no
@@ -3952,7 +4025,7 @@ impl ChatCompletionsProvider {
             // pinned effort denies typed rather than being dropped.
             // `zhipu-coding-plan` records no effort dial at all, so its
             // pinned levels deny the same way.
-            EntryRule::Vllm | EntryRule::Wafer | EntryRule::Zhipu => false,
+            EntryRule::Vllm | EntryRule::Wafer | EntryRule::Zenmux | EntryRule::Zhipu => false,
             EntryRule::IdsOnly
             | EntryRule::GenericMetadata
             | EntryRule::Aiand
@@ -4598,6 +4671,75 @@ fn generic_metadata_entry(id: &str, entry: &Value) -> CatalogModel {
         max_output_tokens: positive_count(entry.get("max_completion_tokens")),
         ..CatalogModel::default()
     }
+}
+
+/// The recorded `zenmux` metadata transform (`zenmuxModelManagerOptions`):
+/// the authoritative row states the reasoning mark, the input modalities,
+/// the context window, the output cap and per-1M PAYG prices. A price
+/// leg the row does not state keeps [`ModelPrice::Unknown`] — the
+/// Builder plan's included quota is a separate billing fact this
+/// surface never states, so a catalogue row is never coerced to a zero
+/// price. The listing states no effort ladder or tool mark, so neither
+/// is invented.
+pub(crate) fn zenmux_entry(id: &str, entry: &Value) -> CatalogModel {
+    let pricings = entry.get("pricings").filter(|value| value.is_object());
+    CatalogModel {
+        id: id.to_string(),
+        reasoning: entry
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("reasoning"))
+            .and_then(Value::as_bool)
+            == Some(true),
+        vision: entry
+            .get("input_modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities
+                    .iter()
+                    .any(|modality| modality.as_str() == Some("image"))
+            }),
+        context_window: positive_count(entry.get("context_length")),
+        max_output_tokens: positive_count(entry.get("max_completion_tokens")),
+        price: zenmux_price(pricings),
+        ..CatalogModel::default()
+    }
+}
+
+/// The recorded `getZenMuxPricingValue` read: the first stated numeric
+/// `value` in the named bucket. A bucket neither leg states leaves the
+/// price unknown — a partial figure is no figure (INV-005).
+fn zenmux_price(pricings: Option<&Value>) -> ModelPrice {
+    let (Some(input_per_1m), Some(output_per_1m)) = (
+        zenmux_price_value(pricings, "prompt"),
+        zenmux_price_value(pricings, "completion"),
+    ) else {
+        return ModelPrice::Unknown;
+    };
+    ModelPrice::Usd {
+        input_per_1m,
+        output_per_1m,
+    }
+}
+
+/// One pricing bucket's first stated figure under the recorded unit and
+/// currency rule: the first item carrying a numeric `value` decides, and
+/// only its `perMTokens`/`USD` reading lands. Any other unit, currency or
+/// value leaves the price [`ModelPrice::Unknown`] — never a silent USD
+/// default and never a later plan entry merged in.
+fn zenmux_price_value(pricings: Option<&Value>, key: &str) -> Option<f64> {
+    let bucket = pricings?.get(key)?.as_array()?;
+    let number = |value: &Value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+    };
+    let item = bucket
+        .iter()
+        .find(|item| item.get("value").and_then(number).is_some())?;
+    let recorded_unit = item.get("unit").and_then(Value::as_str) == Some("perMTokens");
+    let recorded_currency = item.get("currency").and_then(Value::as_str) == Some("USD");
+    let figure = item.get("value").and_then(number)?;
+    (recorded_unit && recorded_currency && figure.is_finite() && figure >= 0.0).then_some(figure)
 }
 
 /// The recorded `vllm` listing transform: vLLM's own `max_model_len`
@@ -5663,7 +5805,7 @@ impl Provider for ChatCompletionsProvider {
                 let model_id = self
                     .catalog_within(secret.as_ref(), started)?
                     .into_iter()
-                    .next()
+                    .find(|model| self.admits_route(&model.id))
                     .map(|model| model.id)
                     .ok_or_else(|| ProviderError::UnpinnedModel {
                         connection: self.connection.clone(),
@@ -5694,6 +5836,7 @@ impl Provider for ChatCompletionsProvider {
         // A parameter the literal id's recorded contract rejects for
         // this model is a typed denial before the body exists — never
         // a value silently omitted from the request.
+        self.check_model(&fixed.model_id)?;
         self.check_parameters(manifest, &fixed.model_id)?;
         let body = self.request_body(manifest, &wire_model_id);
         let body_bytes = wire_body(&self.connection, &body)?;

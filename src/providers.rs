@@ -47,6 +47,14 @@
 //! closed alias table denies; every other routed id falls back to its
 //! recorded default.
 //!
+//! `zenmux` records the platform's two fixed bases: the authoritative
+//! `/api/v1` metadata listing drives the catalogue, and each model's
+//! recorded class decides the route — an `anthropic/` id (the
+//! metadata's owning provider) takes Messages on `/api/anthropic`,
+//! everything else rides the recorded Chat Completions default. An
+//! unrecorded class or id rides that default too: the class is never
+//! inferred from auth, a family name or the configured default model.
+//!
 //! `anthropic` also carries the recorded subscription form: a
 //! `kind = "subscription"` declaration stores the login module's
 //! [`anthropic_login::SubscriptionCredential`] JSON at its scoped ref, and
@@ -1346,7 +1354,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `https://yolo-auto.com/v1` base — and
 /// `minimax-code`/`minimax-code-cn` the recorded class-P plan-key plugs
 /// on that same dialect (HZN-008) — never inferred from an
-/// auth label or a catalogue answer. `google-vertex`,
+/// auth label or a catalogue answer. `zenmux` records Chat Completions
+/// as its default and a Messages route for its metadata's Anthropic
+/// class. `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1448,6 +1458,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "xiaomi-token-plan-cn" => Some(Dialect::ChatCompletions),
         "xiaomi-token-plan-sgp" => Some(Dialect::ChatCompletions),
         "yolo-auto" => Some(Dialect::ChatCompletions),
+        "zenmux" => Some(Dialect::ChatCompletions),
         "zhipu-coding-plan" => Some(Dialect::ChatCompletions),
         _ => None,
     }
@@ -1463,6 +1474,7 @@ pub fn routes_for(connection: &str) -> &'static [Dialect] {
         "gitlab-duo" => GITLAB_DUO_ROUTES,
         "opencode-go" => OPENCODE_GO_ROUTES,
         "opencode-zen" => OPENCODE_ZEN_ROUTES,
+        "zenmux" => ZENMUX_ROUTES,
         _ => &[],
     }
 }
@@ -1600,10 +1612,84 @@ fn opencode_zen_route(model: &str) -> Dialect {
     }
 }
 
+/// The `zenmux` route table: the recorded Chat Completions default and
+/// the Messages route its authoritative metadata's Anthropic class
+/// takes — never a further dialect, and never a fallback between them.
+const ZENMUX_ROUTES: &[Dialect] = &[Dialect::ChatCompletions, Dialect::Messages];
+
+/// The recorded `zenmux` OpenAI-compatible API root.
+const ZENMUX_OPENAI_BASE: &str = "https://zenmux.ai/api/v1";
+
+/// The recorded `zenmux` Anthropic Messages root.
+const ZENMUX_ANTHROPIC_BASE: &str = "https://zenmux.ai/api/anthropic";
+
+/// The recorded `zenmux` Chat Completions base resolution
+/// (`normalizeZenMuxOpenAiBaseUrl`): an empty configured base resolves
+/// the recorded root, one trailing slash is dropped, and a base naming
+/// the Messages root folds onto the Chat Completions root — the two
+/// bases are one fixed pair, never two unrelated origins.
+pub(crate) fn zenmux_openai_base(configured: &str) -> String {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        return ZENMUX_OPENAI_BASE.to_string();
+    }
+    let normalized = trimmed.strip_suffix('/').unwrap_or(trimmed);
+    match normalized.strip_suffix("/api/anthropic") {
+        Some(origin) => format!("{origin}/api/v1"),
+        None => normalized.to_string(),
+    }
+}
+
+/// The recorded `zenmux` Messages base (`toZenMuxAnthropicBaseUrl`):
+/// derived from the Chat Completions base's origin, replacing its
+/// `/api/v1` suffix with `/api/anthropic` and keeping any custom
+/// origin. The recorded fixed pair is the fallback for a base that is
+/// not a URL.
+pub(crate) fn zenmux_anthropic_base(configured: &str) -> String {
+    let openai = zenmux_openai_base(configured);
+    let Ok(mut url) = reqwest::Url::parse(&openai) else {
+        return ZENMUX_ANTHROPIC_BASE.to_string();
+    };
+    let path = url.path().trim_end_matches('/');
+    let mirror = match path.strip_suffix("/api/v1") {
+        Some(origin) => format!("{origin}/api/anthropic"),
+        None => "/api/anthropic".to_string(),
+    };
+    url.set_path(&mirror);
+    url.to_string()
+}
+
+/// The recorded `zenmux` Anthropic class (HZN-16-01): the authoritative
+/// metadata's owning provider, which its `<provider>/<model>` slug
+/// carries, is the routed class mark. The listing's `owned_by` is the
+/// catalogue authority and the slug is the same owner identity the wire
+/// names, so the two agree by construction; when a record disagreed, the
+/// slug still decides the route because it is the wire identity the
+/// metadata row offers, and the row is never rewritten. Every other id —
+/// including an id outside the metadata — is the recorded Chat
+/// Completions default, so no family name or auth label ever infers the
+/// Messages route.
+pub(crate) fn zenmux_is_anthropic(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case("anthropic"))
+}
+
+/// The recorded `zenmux` route for one model: the metadata's Anthropic
+/// class takes Messages; everything else rides the Chat Completions
+/// default (never a cross-route fallback).
+fn zenmux_route(model: &str) -> Dialect {
+    if zenmux_is_anthropic(model) {
+        Dialect::Messages
+    } else {
+        Dialect::ChatCompletions
+    }
+}
+
 /// The wire model and route of a routed id's model: the GitLab alias
-/// table's `upstreamModelId`, or the `opencode-go`/`opencode-zen`
-/// family route over the verbatim model id. `None` is the closed-set
-/// denial.
+/// table's `upstreamModelId`, or the `opencode-go`/`opencode-zen`/
+/// `zenmux` class route over the verbatim model id. `None` is the
+/// closed-set denial.
 pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String, Dialect)> {
     match connection {
         "gitlab-duo" => GITLAB_DUO_MODELS
@@ -1612,6 +1698,7 @@ pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String
             .map(|(_, upstream, dialect)| ((*upstream).to_string(), *dialect)),
         "opencode-go" => Some((model.to_string(), opencode_go_route(model))),
         "opencode-zen" => Some((model.to_string(), opencode_zen_route(model))),
+        "zenmux" => Some((model.to_string(), zenmux_route(model))),
         _ => None,
     }
 }
@@ -2277,5 +2364,49 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The `zenmux` base pair is the recorded transform itself: the
+    /// configured Chat Completions root, a folded Messages root, and the
+    /// derived mirror — asserted directly so neither half can be removed
+    /// behind the adapter's `Debug` surface.
+    #[test]
+    fn zenmux_bases_resolve_as_the_recorded_pair() {
+        assert_eq!(zenmux_openai_base(""), "https://zenmux.ai/api/v1");
+        assert_eq!(
+            zenmux_openai_base("https://zenmux.ai/api/anthropic/"),
+            "https://zenmux.ai/api/v1"
+        );
+        assert_eq!(
+            zenmux_openai_base("https://gateway.example.test/zenmux/api/v1/"),
+            "https://gateway.example.test/zenmux/api/v1"
+        );
+        assert_eq!(zenmux_anthropic_base(""), "https://zenmux.ai/api/anthropic");
+        assert_eq!(
+            zenmux_anthropic_base("https://zenmux.ai/api/v1"),
+            "https://zenmux.ai/api/anthropic"
+        );
+        assert_eq!(
+            zenmux_anthropic_base("https://zenmux.ai/api/anthropic"),
+            "https://zenmux.ai/api/anthropic"
+        );
+        assert_eq!(
+            zenmux_anthropic_base("https://gateway.example.test/zenmux/api/v1"),
+            "https://gateway.example.test/zenmux/api/anthropic"
+        );
+    }
+
+    /// The routing class is the id's owner prefix, case-insensitive: the
+    /// listing's `owned_by`/metadata is catalogue authority, and the id
+    /// slug is the same owner identity on the wire. A bare family name or
+    /// an id whose slug names no owner rides the Chat Completions default.
+    #[test]
+    fn zenmux_class_is_the_owner_prefix_not_the_family_name() {
+        assert!(zenmux_is_anthropic("anthropic/claude-opus-4.8"));
+        assert!(zenmux_is_anthropic("Anthropic/claude-opus-4.8"));
+        assert!(!zenmux_is_anthropic("claude-opus-4.8"));
+        assert!(!zenmux_is_anthropic("google/gemini-3-pro-preview"));
+        assert!(!zenmux_is_anthropic("fixture/unknown-model"));
+        assert!(!zenmux_is_anthropic("anthropic"));
     }
 }

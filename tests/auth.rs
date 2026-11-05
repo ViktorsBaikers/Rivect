@@ -6473,3 +6473,58 @@ fn config_endpoint_edit_names_config_toml() {
         );
     }
 }
+
+// ----- api-key class: zenmux ------------------------------------------
+
+/// The `zenmux` keyed route (AC-040j): the key resolves through the
+/// scoped `SecretRef`/DEC-013 precedence, and the plan class — PAYG or
+/// Builder — is never inferred from the material: both seeded forms
+/// resolve the connection's own binding and stay offline-usable, while a
+/// divergent profile scope is the typed mismatch.
+#[test]
+fn zenmux_keyed_route_resolves_without_inferring_the_plan_from_the_material() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.zenmux]\nkind = \"api_key\"\nendpoint = \"https://zenmux.ai/api/v1\"\ncredential_ref = \"keyring:rivect-test/zenmux-direct\"\n\
+         [connections.zenmux-profiled]\nkind = \"api_key\"\nendpoint = \"https://zenmux.ai/api/v1\"\ncredential_ref = \"keyring:rivect-test/zenmux-scope\"\nprofile = \"zenmux-team\"\n\
+         [profiles.zenmux-team]\ncredential_ref = \"keyring:rivect-test/zenmux-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    for material in ["sk-fixture-payg-key", "bp-fixture-builder-key"] {
+        let store = support::MapStore::seeded(
+            NATIVE_KIND,
+            &[("keyring:rivect-test/zenmux-direct", material)],
+        );
+        let resolved = resolve_credential(&config, "zenmux")
+            .unwrap_or_else(|e| panic!("the keyed route resolves: {}", error_variant(&e)));
+        assert_eq!(resolved.scope(), "rivect-test/zenmux-direct");
+        assert_eq!(
+            store.resolve(&resolved).expect("the store answers"),
+            material.as_bytes(),
+            "the plan class never changes which scoped material resolves"
+        );
+    }
+
+    let resolved = resolve_credential(&config, "zenmux-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/zenmux-team");
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "zenmux",
+    ));
+
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/zenmux-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "zenmux-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

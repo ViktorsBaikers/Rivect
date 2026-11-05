@@ -28,6 +28,15 @@
 //! `Authorization: Bearer`, and the keyed `/v1/models` listing's
 //! `tool-use` tag is the closed table — a row without the tag is never
 //! offered, and a pin outside the tagged set denies before the body.
+//!
+//! `zenmux` records the Messages mirror of its two fixed bases: the
+//! configured base resolves through the recorded `/api/v1` ↔
+//! `/api/anthropic` transform, the plain key rides `Authorization:
+//! Bearer`, and only a model the authoritative metadata classes as
+//! Anthropic is offered or sent — the catalogue reads the recorded
+//! `/api/v1/models` metadata on the pair's Chat Completions root, never
+//! the unrecorded Messages listing, and every other id stays on the
+//! recorded Chat Completions default, never a cross-route fallback.
 
 use super::anthropic_login::{LoginError, read_subscription};
 use super::sse::{SseEvent, SseParser};
@@ -141,6 +150,12 @@ enum CatalogRule {
     /// (DEC-014): catalogue and send guard share one family set, so a
     /// CC/Responses-family id is neither offered nor sent here.
     KeyedRouteListing,
+    /// The `zenmux` authoritative `/api/v1/models` metadata, read on the
+    /// same fixed pair's Chat Completions root and filtered to the ids
+    /// the recorded class routes on Messages: catalogue and send guard
+    /// share one predicate, so this arm never invents the unrecorded
+    /// `/api/anthropic/v1/models` surface.
+    ZenmuxClassListing,
     /// The `vercel-ai-gateway` keyed `/v1/models` listing filtered by
     /// the recorded `tags` marker: only a `tool-use` row is offered, and
     /// a pin outside the tagged set has no route here — HTTP 200 is not
@@ -179,6 +194,21 @@ enum CredentialRule {
     Bearer,
 }
 
+/// How a configured Messages base resolves before the recorded paths
+/// append (HZN-008).
+#[derive(Clone, Copy)]
+enum BaseRule {
+    /// The configured base wins verbatim after trailing-slash trimming.
+    Configured,
+    /// The configured base loses its trailing `/v1` before the arm's
+    /// own `/v1/...` paths append.
+    StripV1,
+    /// The `zenmux` Messages mirror derived from the recorded Chat
+    /// Completions root (`toZenMuxAnthropicBaseUrl`): the two bases are
+    /// one fixed pair, never unrelated origins.
+    ZenmuxAnthropic,
+}
+
 /// One literal id's recorded Messages predicates (HZN-008/DEC-002): base
 /// rule, catalogue rule and credential form. A further Messages id
 /// appends its own arm; none inherits a sibling's.
@@ -187,9 +217,8 @@ struct MessagesContract {
     /// The recorded default base; a configured endpoint wins verbatim
     /// after trimming.
     default_base: &'static str,
-    /// Whether a configured base carries a trailing `/v1` that the
-    /// recorded arm strips before its own paths are appended.
-    strip_v1: bool,
+    /// How that base resolves before the recorded paths append.
+    base: BaseRule,
     /// The per-id catalogue entry rule.
     catalog: CatalogRule,
     /// The per-id credential form.
@@ -200,7 +229,7 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
     match connection {
         "anthropic" => Some(MessagesContract {
             default_base: ANTHROPIC_DEFAULT_BASE,
-            strip_v1: false,
+            base: BaseRule::Configured,
             catalog: CatalogRule::KeyedListing {
                 excluded_prefixes: ANTHROPIC_EXCLUDED_PREFIXES,
                 excluded_ids: ANTHROPIC_EXCLUDED_IDS,
@@ -209,13 +238,13 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
         }),
         "umans" => Some(MessagesContract {
             default_base: UMANS_DEFAULT_BASE,
-            strip_v1: true,
+            base: BaseRule::StripV1,
             catalog: CatalogRule::ModelsInfo,
             credential: CredentialRule::ApiKey,
         }),
         "minimax" => Some(MessagesContract {
             default_base: MINIMAX_DEFAULT_BASE,
-            strip_v1: false,
+            base: BaseRule::Configured,
             catalog: CatalogRule::Allowlist(MINIMAX_MODELS),
             credential: CredentialRule::ApiKey,
         }),
@@ -224,7 +253,7 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
             // base is invented; the configured endpoint is the complete
             // native proxy base.
             default_base: "",
-            strip_v1: false,
+            base: BaseRule::Configured,
             catalog: CatalogRule::SeedAndPrefix {
                 seed: CLOUDFLARE_SEED,
                 prefix: CLOUDFLARE_MODEL_PREFIX,
@@ -237,7 +266,7 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
         // `tool-use` rows.
         "vercel-ai-gateway" => Some(MessagesContract {
             default_base: VERCEL_DEFAULT_BASE,
-            strip_v1: false,
+            base: BaseRule::Configured,
             catalog: CatalogRule::ToolUseListing,
             credential: CredentialRule::Bearer,
         }),
@@ -247,7 +276,7 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
         // rides `Authorization: Bearer`.
         "gitlab-duo" => Some(MessagesContract {
             default_base: GITLAB_MESSAGES_PROXY,
-            strip_v1: false,
+            base: BaseRule::Configured,
             catalog: CatalogRule::Allowlist(GITLAB_MESSAGES_MODELS),
             credential: CredentialRule::Bearer,
         }),
@@ -258,7 +287,7 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
         // keyed listing is filtered to the Messages route family.
         "opencode-go" => Some(MessagesContract {
             default_base: OPENCODE_GO_BASE,
-            strip_v1: true,
+            base: BaseRule::StripV1,
             catalog: CatalogRule::KeyedRouteListing,
             credential: CredentialRule::Bearer,
         }),
@@ -268,11 +297,25 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
         // Bearer` beside the recorded Anthropic version header.
         "opencode-zen" => Some(MessagesContract {
             default_base: OPENCODE_ZEN_BASE,
-            strip_v1: true,
+            base: BaseRule::StripV1,
             catalog: CatalogRule::KeyedListing {
                 excluded_prefixes: &[],
                 excluded_ids: &[],
             },
+            credential: CredentialRule::Bearer,
+        }),
+        // `zenmux` records the Messages mirror of its Chat Completions
+        // pair: the configured base is resolved through the recorded
+        // `/api/v1` ↔ `/api/anthropic` transform, so both arms share
+        // one origin and one fixed pair. The keyed listing is filtered
+        // to the ids the route table sends on Messages — the same
+        // predicate the send guard applies, from the authoritative
+        // metadata's owning-provider class — and the plain key rides
+        // the bearer.
+        "zenmux" => Some(MessagesContract {
+            default_base: "",
+            base: BaseRule::ZenmuxAnthropic,
+            catalog: CatalogRule::ZenmuxClassListing,
             credential: CredentialRule::Bearer,
         }),
         _ => None,
@@ -619,6 +662,9 @@ impl MessagesProvider {
             CatalogRule::KeyedListing { .. }
             | CatalogRule::KeyedRouteListing
             | CatalogRule::ToolUseListing => Some(models_url(&self.endpoint)),
+            CatalogRule::ZenmuxClassListing => {
+                Some(models_url(&super::zenmux_openai_base(&self.endpoint)))
+            }
             CatalogRule::ModelsInfo => Some(models_info_url(&self.endpoint)),
             CatalogRule::Allowlist(_) | CatalogRule::SeedAndPrefix { .. } => None,
         }
@@ -633,6 +679,7 @@ impl MessagesProvider {
             }
             CatalogRule::KeyedListing { .. }
             | CatalogRule::KeyedRouteListing
+            | CatalogRule::ZenmuxClassListing
             | CatalogRule::ToolUseListing
             | CatalogRule::ModelsInfo => None,
         }
@@ -643,6 +690,7 @@ impl MessagesProvider {
         match self.contract.catalog {
             CatalogRule::KeyedListing { .. }
             | CatalogRule::KeyedRouteListing
+            | CatalogRule::ZenmuxClassListing
             | CatalogRule::ToolUseListing => {
                 let Some(data) = body.get("data").and_then(Value::as_array) else {
                     return Err(violation(
@@ -696,9 +744,12 @@ impl MessagesProvider {
                     return None;
                 }
             }
-            CatalogRule::KeyedRouteListing => {
+            CatalogRule::KeyedRouteListing | CatalogRule::ZenmuxClassListing => {
                 if route_for(&self.connection, id) != Some(Dialect::Messages) {
                     return None;
+                }
+                if matches!(self.contract.catalog, CatalogRule::ZenmuxClassListing) {
+                    return Some(super::local::zenmux_entry(id, entry));
                 }
             }
             CatalogRule::ToolUseListing => {
@@ -879,7 +930,7 @@ impl MessagesProvider {
         let admitted = match self.contract.catalog {
             CatalogRule::Allowlist(ids) => ids.contains(&model),
             CatalogRule::SeedAndPrefix { prefix, .. } => model.starts_with(prefix),
-            CatalogRule::KeyedRouteListing => {
+            CatalogRule::KeyedRouteListing | CatalogRule::ZenmuxClassListing => {
                 route_for(&self.connection, model) == Some(Dialect::Messages)
             }
             CatalogRule::ToolUseListing => {
@@ -991,6 +1042,7 @@ impl MessagesProvider {
             CatalogRule::ToolUseListing => Ok(Some(self.catalog_within(token, started)?)),
             CatalogRule::KeyedListing { .. }
             | CatalogRule::KeyedRouteListing
+            | CatalogRule::ZenmuxClassListing
             | CatalogRule::ModelsInfo
             | CatalogRule::Allowlist(_)
             | CatalogRule::SeedAndPrefix { .. } => Ok(None),
@@ -1622,10 +1674,10 @@ fn endpoint_for(contract: &MessagesContract, configured: &str) -> String {
     } else {
         configured
     };
-    if contract.strip_v1 {
-        base.strip_suffix("/v1").unwrap_or(base).to_string()
-    } else {
-        base.to_string()
+    match contract.base {
+        BaseRule::Configured => base.to_string(),
+        BaseRule::StripV1 => base.strip_suffix("/v1").unwrap_or(base).to_string(),
+        BaseRule::ZenmuxAnthropic => super::zenmux_anthropic_base(base),
     }
 }
 
