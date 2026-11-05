@@ -54,6 +54,11 @@
 //! `Authorization: Bearer` — never the stored JSON and never `x-api-key`.
 //! The login lifecycle itself ([`anthropic_login`]) is library-level; no
 //! CLI verb is added.
+//!
+//! `openai-codex` records the Codex OAuth form (DEC-020): the browser
+//! code+PKCE leg and its device alias both write one canonical
+//! `kind = "api_key"` profile through [`openai_login`], so the Broker's
+//! offline gate admits it; the subscription rule above stays untouched.
 
 use crate::config::{Config, ConnKind, Connection, EffortLevel, ModelAssign, Profile};
 use crate::model::RequestManifest;
@@ -72,6 +77,7 @@ pub mod gemini;
 pub mod local;
 pub mod ollama_cloud;
 pub mod openai;
+pub mod openai_login;
 pub mod routed;
 pub mod sse;
 

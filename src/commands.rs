@@ -19,7 +19,7 @@ use crate::lsp::MAX_INDEX_PARSE_TIME;
 use crate::model::{Broker, PendingFallback, RequestManifest};
 use crate::owner::{Owner, OwnerError};
 use crate::policy::Policy;
-use crate::providers::Provider;
+use crate::providers::{Provider, ProviderError};
 use crate::resources::NotificationQueue;
 use crate::scheduler::{DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP, Scheduler};
 use crate::state::{CacheCohort, CacheRate, ConflictCause, StoreError, TaskStore, denial_class};
@@ -136,6 +136,17 @@ pub struct Runtime {
     /// injects its store; while none is bound a declared reference is
     /// refused instead of resolved from nowhere.
     pub mcp_credentials: Option<Box<dyn crate::providers::CredentialStore>>,
+    /// The credential seam the `auth.login.*` methods write through. A proof
+    /// injects its own store; a complete call that finds none opens the
+    /// platform backend the bound scope's class names.
+    pub login_credentials: Option<Arc<dyn crate::providers::CredentialStore>>,
+    /// Test-only contract-peer endpoints: the in-crate TUI proof needs the
+    /// loopback peer the production surface never selects.
+    #[cfg(test)]
+    pub login_endpoints: Option<crate::providers::openai_login::DeviceEndpoints>,
+    /// The one login `auth.login.begin` minted and `auth.login.complete`
+    /// consumes — the browser PKCE session or the device poll.
+    pending_login: Option<PendingLogin>,
     /// Boot-time publication-recovery verdicts a human must resolve:
     /// collected, sanitized lines with their resolution. Each surface
     /// reports them its own way — headless stderr, TUI transcript — and
@@ -215,6 +226,23 @@ pub struct Runtime {
     /// The task the in-flight run was started for, so a cancellation it
     /// can observe reaches the child through the owner flag.
     index_run_task: Option<TaskId>,
+}
+
+/// One in-flight login between `auth.login.begin` and
+/// `auth.login.complete`: the browser CSRF/PKCE session or the device poll.
+/// The state is the handle `complete` verifies against the pending leg.
+enum PendingLogin {
+    Browser(crate::providers::openai_login::LoginSession),
+    Device(crate::providers::openai_login::DeviceLoginSession),
+}
+
+impl PendingLogin {
+    fn state(&self) -> &str {
+        match self {
+            Self::Browser(session) => session.state(),
+            Self::Device(device) => device.state(),
+        }
+    }
 }
 
 /// The index seam an action handler and the `command.execute`
@@ -1326,6 +1354,10 @@ impl Runtime {
             provider_calls: 0,
             read_worker,
             mcp_credentials: None,
+            login_credentials: None,
+            #[cfg(test)]
+            login_endpoints: None,
+            pending_login: None,
             boot_diagnostics,
             base_recovery,
             paused_attempts: BTreeMap::new(),
@@ -1861,6 +1893,9 @@ const METHODS: &[&str] = &[
     "artifact.read",
     "long_work.start",
     "long_work.stop",
+    "auth.login.begin",
+    "auth.login.complete",
+    "auth.login.cancel",
     "sharing.grant.open",
     "sharing.attach",
     "sharing.grant.revoke",
@@ -1975,6 +2010,12 @@ enum RequestError {
     Selection(#[from] SelectionError),
     #[error("{method} is not available in this build")]
     MethodUnavailable { method: String },
+    #[error("unknown login mode {mode}; known modes: browser, device")]
+    UnknownLoginMode { mode: String },
+    #[error("no login is pending; call auth.login.begin first")]
+    NoPendingLogin,
+    #[error("state does not match the pending login")]
+    LoginStateMismatch,
     #[error("parameter {name} has the wrong type")]
     InvalidParameter { name: &'static str },
     #[error(transparent)]
@@ -1996,6 +2037,8 @@ impl RequestError {
             | Self::ObserverScopeDenied { .. } => ErrorCode::Denied,
             Self::SessionInFlight { .. } => ErrorCode::Conflict,
             Self::SourceDigestMismatch => ErrorCode::Conflict,
+            Self::NoPendingLogin => ErrorCode::Conflict,
+            Self::LoginStateMismatch => ErrorCode::Denied,
             Self::Serialization => ErrorCode::InternalError,
             Self::ProjectIndex(source) => source.code(),
             _ => ErrorCode::InvalidInput,
@@ -3687,6 +3730,9 @@ fn handle_method(
         "task.submit" => submit_task(rt, ingress, params, id),
         "long_work.start" => long_work_start(rt, &params, id),
         "long_work.stop" => long_work_stop(rt, &params, id),
+        "auth.login.begin" => auth_login_begin(rt, ingress, &params, id),
+        "auth.login.complete" => auth_login_complete(rt, ingress, &params, id),
+        "auth.login.cancel" => auth_login_cancel(rt, ingress, &params, id),
         "sharing.grant.open" => sharing_grant_open(rt, ingress, &params, id),
         "sharing.attach" => sharing_attach(rt, &params, id),
         "sharing.grant.revoke" => sharing_grant_revoke(rt, ingress, &params, id),
@@ -5420,11 +5466,26 @@ fn work_budget_result(budget: &crate::state::WorkBudget) -> Value {
     })
 }
 
-/// Grant management accepts the trusted human and the stdio machine ingress:
-/// the headless CLI's request is the same local user driving the same data
-/// root, so it may open or close a grant. The socket observer may not — it is
-/// the untrusted read boundary the grant exists to constrain.
-fn grant_ingress_denied(ingress: Ingress, id: Value, method: &'static str) -> Option<RpcResponse> {
+/// The `auth.login.begin` parameter set: the one connection/mode surface and
+/// the contract-peer endpoints; an unknown key is refused rather than ignored.
+const LOGIN_BEGIN_PARAMS: &[&str] = &[
+    "schema_version",
+    "connection",
+    "mode",
+    "token_endpoint",
+    "usercode_endpoint",
+    "device_token_endpoint",
+];
+const LOGIN_COMPLETE_PARAMS: &[&str] = &["schema_version", "state", "redirect"];
+
+/// Durable ingress policy shared by the login and sharing methods: the
+/// trusted human and the local machine ingress may steer them; the read-only
+/// socket observer may not.
+fn observer_ingress_denied(
+    ingress: Ingress,
+    id: Value,
+    method: &'static str,
+) -> Option<RpcResponse> {
     matches!(ingress, Ingress::Observer).then(|| {
         request_error(
             id,
@@ -5435,6 +5496,345 @@ fn grant_ingress_denied(ingress: Ingress, id: Value, method: &'static str) -> Op
     })
 }
 
+/// One optional string parameter: a non-string value is a typed refusal, and
+/// an absent/null member stays `None`.
+fn optional_string<'a>(
+    params: &'a Value,
+    name: &'static str,
+) -> Result<Option<&'a str>, RequestError> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(RequestError::InvalidParameter { name }),
+    }
+}
+
+/// The first key outside the method's recorded parameter set.
+fn unknown_param(params: &Value, known: &[&str]) -> Option<RequestError> {
+    params
+        .as_object()?
+        .keys()
+        .find(|key| !known.contains(&key.as_str()))
+        .map(|name| RequestError::UnknownParameter { name: name.clone() })
+}
+
+/// `auth.login.begin` (AC-040j): mints the browser code+PKCE leg (the
+/// recorded localhost:1455 callback) or the device alias, and retains the one
+/// pending state `auth.login.complete` consumes. The answer carries the
+/// verification URL, the device user code and the peer's device lifetime;
+/// the browser leg answers null for both device fields.
+fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.begin") {
+        return response;
+    }
+    if let Some(error) = unknown_param(params, LOGIN_BEGIN_PARAMS) {
+        return request_error(id, error);
+    }
+    let connection = match optional_string(params, "connection") {
+        Ok(value) => value.unwrap_or(crate::providers::openai_login::CANONICAL_PROFILE),
+        Err(error) => return request_error(id, error),
+    };
+    let mode = match optional_string(params, "mode") {
+        Ok(value) => value.unwrap_or("browser"),
+        Err(error) => return request_error(id, error),
+    };
+    let recorded = crate::providers::openai_login::DeviceEndpoints::recorded();
+    // Test-only contract-peer override; the production surface always names
+    // the recorded endpoints.
+    #[cfg(test)]
+    let injected = rt.login_endpoints.clone();
+    #[cfg(not(test))]
+    let injected: Option<crate::providers::openai_login::DeviceEndpoints> = None;
+    let endpoints = match (
+        optional_string(params, "usercode_endpoint"),
+        optional_string(params, "device_token_endpoint"),
+        optional_string(params, "token_endpoint"),
+    ) {
+        (Ok(usercode), Ok(token), Ok(exchange)) => {
+            crate::providers::openai_login::DeviceEndpoints {
+                usercode: usercode
+                    .map(str::to_string)
+                    .or_else(|| injected.as_ref().map(|entry| entry.usercode.clone()))
+                    .unwrap_or(recorded.usercode),
+                token: token
+                    .map(str::to_string)
+                    .or_else(|| injected.as_ref().map(|entry| entry.token.clone()))
+                    .unwrap_or(recorded.token),
+                exchange: exchange
+                    .map(str::to_string)
+                    .or_else(|| injected.as_ref().map(|entry| entry.exchange.clone()))
+                    .unwrap_or(recorded.exchange),
+            }
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+            return request_error(id, error);
+        }
+    };
+    let config = rt.config_for_broker();
+    match mode {
+        "browser" => {
+            match crate::providers::openai_login::begin_login(
+                &config,
+                connection,
+                &endpoints.exchange,
+            ) {
+                Ok(session) => {
+                    let result = json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "state": session.state(),
+                        "verification_url": session.authorize_url(),
+                        "user_code": Value::Null,
+                        "expires_in": Value::Null,
+                    });
+                    rt.pending_login = Some(PendingLogin::Browser(session));
+                    RpcResponse::ok(id, result)
+                }
+                Err(error) => login_error(id, &error),
+            }
+        }
+        "device" => {
+            match crate::providers::openai_login::begin_device_login(&config, connection, endpoints)
+            {
+                Ok(device) => {
+                    let result = json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "state": device.state(),
+                        "verification_url": device.verification_url(),
+                        "user_code": device.user_code(),
+                        "expires_in": device.expires_in(),
+                    });
+                    rt.pending_login = Some(PendingLogin::Device(device));
+                    RpcResponse::ok(id, result)
+                }
+                Err(error) => login_error(id, &error),
+            }
+        }
+        other => request_error(
+            id,
+            RequestError::UnknownLoginMode {
+                mode: other.to_string(),
+            },
+        ),
+    }
+}
+
+/// `auth.login.complete` (AC-040j): consumes the pending leg, verifies the
+/// caller's state against it, and answers the canonical profile the
+/// credential was written under. The browser leg performs its one exchange;
+/// the device leg performs exactly one bounded poll and answers a pending
+/// state when the peer has not authorized yet, so the caller's loop is never
+/// parked for the device lifetime. A failure leaves the pending leg in place
+/// so a bad callback or a denied poll is retritable, while the active profile
+/// itself is untouched.
+fn auth_login_complete(
+    rt: &mut Runtime,
+    ingress: Ingress,
+    params: &Value,
+    id: Value,
+) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.complete") {
+        return response;
+    }
+    if let Some(error) = unknown_param(params, LOGIN_COMPLETE_PARAMS) {
+        return request_error(id, error);
+    }
+    let Some(pending) = rt.pending_login.take() else {
+        return request_error(id, RequestError::NoPendingLogin);
+    };
+    let state = match optional_string(params, "state") {
+        Ok(state) => state,
+        Err(error) => {
+            rt.pending_login = Some(pending);
+            return request_error(id, error);
+        }
+    };
+    if state.is_some_and(|state| state != pending.state()) {
+        rt.pending_login = Some(pending);
+        return request_error(id, RequestError::LoginStateMismatch);
+    }
+    let redirect = match optional_string(params, "redirect") {
+        Ok(redirect) => redirect,
+        Err(error) => {
+            rt.pending_login = Some(pending);
+            return request_error(id, error);
+        }
+    };
+    let config = rt.config_for_broker();
+    match pending {
+        PendingLogin::Browser(session) => {
+            let Some(redirect) = redirect else {
+                rt.pending_login = Some(PendingLogin::Browser(session));
+                return request_error(id, RequestError::Required { field: "redirect" });
+            };
+            let store = match login_store(rt, &config, session.connection()) {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::Browser(session));
+                    return login_error(id, &error);
+                }
+            };
+            match crate::providers::openai_login::complete_login(
+                &config,
+                session.connection(),
+                &session,
+                redirect,
+                store.as_ref(),
+            ) {
+                Ok(profile) => RpcResponse::ok(
+                    id,
+                    json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "profile": profile,
+                    }),
+                ),
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::Browser(session));
+                    login_error(id, &error)
+                }
+            }
+        }
+        PendingLogin::Device(mut device) => {
+            let connection = device.connection().to_string();
+            let store = match login_store(rt, &config, &connection) {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::Device(device));
+                    return login_error(id, &error);
+                }
+            };
+            match crate::providers::openai_login::advance_device_login(
+                &config,
+                &connection,
+                &mut device,
+                store.as_ref(),
+            ) {
+                Ok(crate::providers::openai_login::DeviceAdvance::Complete(profile)) => {
+                    RpcResponse::ok(
+                        id,
+                        json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "profile": profile,
+                        }),
+                    )
+                }
+                Ok(advance) => {
+                    let state = if matches!(
+                        advance,
+                        crate::providers::openai_login::DeviceAdvance::SlowDown
+                    ) {
+                        "slow_down"
+                    } else {
+                        "pending"
+                    };
+                    rt.pending_login = Some(PendingLogin::Device(device));
+                    RpcResponse::ok(
+                        id,
+                        json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "state": state,
+                        }),
+                    )
+                }
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::Device(device));
+                    login_error(id, &error)
+                }
+            }
+        }
+    }
+}
+
+/// `auth.login.cancel`: drops the pending leg without writing anything, so a
+/// login the operator abandoned leaves no credential and no residue. The
+/// answer names whether a leg was pending.
+fn auth_login_cancel(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.cancel") {
+        return response;
+    }
+    if let Some(error) = unknown_param(params, &["schema_version"]) {
+        return request_error(id, error);
+    }
+    let cancelled = rt.pending_login.take().is_some();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "state": if cancelled { "cancelled" } else { "none" },
+        }),
+    )
+}
+
+/// The credential seam a login writes through: the injected store, or the
+/// platform backend the bound scope's class and namespace name. The backend
+/// construction is the only open; a headless or locked class answers its
+/// typed store denial and no plaintext fallback exists.
+fn login_store(
+    rt: &mut Runtime,
+    config: &config::Config,
+    connection: &str,
+) -> Result<Arc<dyn crate::providers::CredentialStore>, crate::providers::openai_login::LoginError>
+{
+    let reference = crate::providers::openai_login::canonical_reference(config, connection)?;
+    if let Some(store) = &rt.login_credentials {
+        return Ok(Arc::clone(store));
+    }
+    let store: Arc<dyn crate::providers::CredentialStore> = Arc::new(
+        crate::providers::native_store(reference.store(), reference.service())?,
+    );
+    rt.login_credentials = Some(Arc::clone(&store));
+    Ok(store)
+}
+
+/// One login refusal mapped to the wire class: store conditions are storage
+/// failures, denied/cancelled/expired legs are denials, and a malformed
+/// binding or reply is invalid input.
+fn login_error(id: Value, error: &crate::providers::openai_login::LoginError) -> RpcResponse {
+    use crate::providers::openai_login::LoginError as Login;
+    let code = match error {
+        Login::Provider(inner) => match inner {
+            ProviderError::StoreUnavailable { .. }
+            | ProviderError::StoreAmbiguous { .. }
+            | ProviderError::CredentialOutsideNamespace { .. } => ErrorCode::StorageUnavailable,
+            ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+            ProviderError::Transport { .. }
+            | ProviderError::ProviderFailed { .. }
+            | ProviderError::UnknownTerminal { .. }
+            | ProviderError::StreamViolation { .. }
+            | ProviderError::IncompatibleOutput { .. }
+            | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+            _ => ErrorCode::InvalidInput,
+        },
+        Login::Cancelled
+        | Login::Denied { .. }
+        | Login::TokenRejected { .. }
+        | Login::DeviceDenied
+        | Login::DeviceExpired
+        | Login::WorkspaceMismatch
+        | Login::AccountMismatch
+        | Login::StateMismatch
+        | Login::OriginMismatch => ErrorCode::Denied,
+        Login::Entropy { .. } | Login::Clock { .. } | Login::Serialization { .. } => {
+            ErrorCode::InternalError
+        }
+        Login::StoredCredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+        Login::NotARedirect
+        | Login::MissingCode
+        | Login::EndpointNotRecorded { .. }
+        | Login::MissingField { .. }
+        | Login::MissingIdentity
+        | Login::ResponseTooLarge
+        | Login::MalformedResponse { .. }
+        | Login::NotApiKey { .. }
+        | Login::NotCanonicalProfile { .. }
+        | Login::DeviceExpiryOutOfRange { .. }
+        | Login::TokenExpiryOutOfRange { .. }
+        | Login::DeviceIntervalOutOfRange { .. }
+        | Login::MalformedField { .. }
+        | Login::ConnectionMissing { .. } => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
 /// `sharing.grant.open` (AC-083b): mints the 256-bit token, records only its
 /// digest, starts the grant's private socket and returns the plaintext once.
 fn sharing_grant_open(
@@ -5443,7 +5843,7 @@ fn sharing_grant_open(
     params: &Value,
     id: Value,
 ) -> RpcResponse {
-    if let Some(response) = grant_ingress_denied(ingress, id.clone(), "sharing.grant.open") {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "sharing.grant.open") {
         return response;
     }
     let Some(session) = session_param(params) else {
@@ -5511,7 +5911,7 @@ fn sharing_grant_revoke(
     params: &Value,
     id: Value,
 ) -> RpcResponse {
-    if let Some(response) = grant_ingress_denied(ingress, id.clone(), "sharing.grant.revoke") {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "sharing.grant.revoke") {
         return response;
     }
     let Some(session) = session_param(params) else {

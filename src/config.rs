@@ -67,6 +67,13 @@ const MCP_CREDENTIAL_KEYS: &[&str] = &["reference", "origin", "variable"];
 /// it beside the digest it belongs to.
 pub const SHIPPED_BASE_VERSION: u64 = 2;
 
+/// The shipped base document. A Codex login writes the canonical profile the
+/// operator's `[connections.openai-codex]` row (`kind = "api_key"`, a scoped
+/// `credential_ref`, `profile = "openai-codex"`) and its
+/// `[profiles.openai-codex]` row name; login resolves that existing
+/// declaration and names the missing connection id instead of auto-creating
+/// one. Inlining those rows here would change the base identity and demand a
+/// base-version + pin bump, so they stay documented beside the template.
 pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n# A hook is a user-declared program the executor runs at one\n# instrumented event. It answers allow, deny or stop and may rewrite the\n# request's path; the rewritten request is re-checked by the same\n# admission before any effect, and only the file installs one:\n# [hooks.\"effect.request@project\"]\n# command = \"/usr/local/bin/rivect-hook\"\n# args = []\n# A declared MCP server is operator-owned too: the program, its args, its\n# environment and the origin its egress is admitted against come from this\n# file only, so a request names a server but never supplies one:\n# [mcp.servers.fixture]\n# origin = \"mcp+stdio://fixture\"\n# program = \"/usr/local/bin/rivect-mcp-fixture\"\n# args = []\n# [mcp.servers.fixture.credential]\n# reference = \"keyring:rivect/mcp-fixture\"\n# origin = \"mcp+stdio://fixture\"\n# variable = \"RIVECT_MCP_TOKEN\"\n";
 
 // ----- the versioned base and the update its ledger records -----

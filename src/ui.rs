@@ -832,8 +832,8 @@ pub const TRANSCRIPT_NO_PROJECT: &str =
     "No project or index is selected; ordinary replies are not blocked.";
 pub const HELP_TEXT: &str = concat!(
     "Commands: Enter submits a task; Esc quits; Ctrl-C cancels.\n",
-    "/help shows this list; /new starts an independent conversation;\n",
-    "/clear clears the view; /compact folds the context.",
+    "/help shows this list; /new starts a conversation; /clear clears the view.\n",
+    "/compact folds context; /login: URL, \"device\", \"complete\", \"cancel\".",
 );
 
 /// Status line while external output streams (design-brief §4).
@@ -1262,6 +1262,66 @@ fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Val
         .ok_or_else(|| io::Error::other("tui response omitted result"))
 }
 
+/// Runs one `/login` command against the runtime — the TUI's one login entry,
+/// so the operator command and the proof exercise the same `auth.login.*`
+/// methods. `None` starts the browser leg, `Some("device")` starts the device
+/// alias, `Some("complete")` advances a pending device leg by one bounded
+/// poll, and any other argument is the browser callback URL.
+///
+/// # Errors
+/// The dispatch's transport or refusal error; an omitted result field is a
+/// transport-class error.
+pub fn login_command(runtime: &mut Runtime, argument: Option<&str>) -> io::Result<Vec<String>> {
+    let (method, params) = match argument {
+        None => (
+            "auth.login.begin",
+            json!({ "schema_version": 1, "mode": "browser" }),
+        ),
+        Some("device") => (
+            "auth.login.begin",
+            json!({ "schema_version": 1, "mode": "device" }),
+        ),
+        Some("complete") => ("auth.login.complete", json!({ "schema_version": 1 })),
+        Some("cancel") => ("auth.login.cancel", json!({ "schema_version": 1 })),
+        Some(redirect) => (
+            "auth.login.complete",
+            json!({ "schema_version": 1, "redirect": redirect }),
+        ),
+    };
+    let result = dispatch_tui_request(
+        runtime,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }),
+    )?;
+    if method == "auth.login.cancel" {
+        let line = match result.get("state").and_then(Value::as_str) {
+            Some("cancelled") => "Login cancelled.".to_string(),
+            Some("none") => "No login is pending.".to_string(),
+            _ => return Err(io::Error::other("login cancel answered no state")),
+        };
+        return Ok(vec![line]);
+    }
+    if method == "auth.login.begin" {
+        let url = result
+            .get("verification_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("login begin omitted verification_url"))?;
+        let mut lines = vec![format!("Login pending: {url}")];
+        if let Some(code) = result.get("user_code").and_then(Value::as_str) {
+            lines.push(format!("Enter code: {code}"));
+            lines.push("Run /login complete to check authorization.".to_string());
+        }
+        return Ok(lines);
+    }
+    if let Some(profile) = result.get("profile").and_then(Value::as_str) {
+        return Ok(vec![format!("Login complete: {profile}")]);
+    }
+    let state = result
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("login complete omitted profile and state"))?;
+    Ok(vec![format!("Login pending: {state}")])
+}
+
 /// A failed open still owes the operator the boot verdicts the dropped
 /// runtime collected, followed by its lock release lines: they ride the
 /// error so the caller surfaces them on a channel that is actually
@@ -1426,6 +1486,7 @@ fn is_context_only(error: &(dyn std::error::Error + 'static)) -> bool {
 #[cfg(test)]
 const STATUS_FAULT_REPORT: &str = "runtime.status unavailable";
 
+#[derive(Debug)]
 struct TuiDispatch {
     runtime: Runtime,
     session_id: String,
@@ -2676,9 +2737,11 @@ fn ensure_dispatch<'a>(
 /// serving, while a transport fault still leaves through the loop's error
 /// path. The draft is consumed on every path: the operator asked once.
 ///
-/// Only an exact match is a command: a document that mentions `/clear` on
-/// one line, an argument and a near miss are never one, so none of them can
-/// run, and none of them becomes a paid task either.
+/// Only an exact match is a command, except `/login`, whose one argument is
+/// the recorded callback URL or the `device`/`complete`/`cancel` keyword: a
+/// document that mentions `/clear` on one line, an argument to another
+/// command and a near miss are never one, so none of them can run, and none
+/// of them becomes a paid task either.
 fn run_composer_command(
     input: &str,
     view: &mut LocalView,
@@ -2753,6 +2816,23 @@ fn run_composer_command(
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        _ if input == "/login" || input.starts_with("/login ") => {
+            let argument = input
+                .strip_prefix("/login ")
+                .map(str::trim)
+                .filter(|argument| !argument.is_empty());
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match login_command(&mut dispatch.runtime, argument) {
+                Ok(lines) => {
+                    view.transcript.extend(lines);
+                    Ok(())
+                }
+                // A login refusal never echoes the composer input: the
+                // callback URL carries an authorization code, and a typed
+                // cause is the only detail the transcript may keep.
+                Err(error) => refusal_or_fault(view, "/login", error),
             }
         }
         _ if input.starts_with('/') => {
@@ -3262,14 +3342,22 @@ impl Projection {
 mod tests {
     use super::{
         CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_CONSENT_DELAY,
-        DOCK_EMPTY, DecisionPanel, ECONOMY_UNKNOWN_ROW, LoopbackProvider, OUTPUT_SCROLL_HINT,
-        OutputStream, TuiDispatch, TuiOpenError, append_composer_char, append_composer_paste,
-        initial_view, note_open_failure, output_status_line, render, surface_boot_diagnostics,
-        task_dock, types_text, types_text_altgr, wrapped_row_count,
+        DOCK_EMPTY, DecisionPanel, ECONOMY_UNKNOWN_ROW, LocalView, LoopbackProvider,
+        OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError, append_composer_char,
+        append_composer_paste, dispatch_tui_request, initial_view, note_open_failure,
+        output_status_line, render, run_composer_command, surface_boot_diagnostics, task_dock,
+        types_text, types_text_altgr, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, Question, TEXT_MAX_BYTES, TaskId};
+    use crate::providers::openai_login::DeviceEndpoints;
+    use crate::providers::{CredentialStore, ProviderError, SecretRef, StoreKind};
     use crossterm::event::KeyModifiers;
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// Mirrors `commands.rs::tests::BASE_CONFIG`: a publication needs a
@@ -4165,6 +4253,487 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    /// The in-crate composer proof for `/login`: all four forms run the same
+    /// `auth.login.*` methods the RPC surface serves, the device poll is one
+    /// bounded step, and a refusal never echoes the callback's code.
+    const LOGIN_COMPOSER_CONFIG: &str = "config_version = 1\n\
+        [connections.openai-codex]\n\
+        kind = \"api_key\"\n\
+        endpoint = \"https://chatgpt.com/backend-api/codex\"\n\
+        credential_ref = \"keychain:rivect-test/openai-codex\"\n\
+        profile = \"openai-codex\"\n\
+        [profiles.openai-codex]\n\
+        credential_ref = \"keychain:rivect-test/openai-codex\"\n\
+        [models.defaults]\n\
+        model = { mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }\n\
+        effort = { mode = \"auto\" }\n\
+        fallback = { mode = \"auto\" }\n";
+    const LOGIN_CODEX_REF: &str = "keychain:rivect-test/openai-codex";
+
+    /// A minimal create-only credential store: the composer proof owns its
+    /// material and never touches a platform backend.
+    struct ComposerStore {
+        secrets: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl ComposerStore {
+        fn new() -> Self {
+            Self {
+                secrets: Mutex::new(BTreeMap::new()),
+            }
+        }
+    }
+
+    impl CredentialStore for ComposerStore {
+        fn kind(&self) -> StoreKind {
+            StoreKind::Keychain
+        }
+
+        fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+            Ok(self
+                .secrets
+                .lock()
+                .expect("store lock")
+                .contains_key(credential.scope()))
+        }
+
+        fn entry_accounts(&self, _service: &str) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+            let mut secrets = self.secrets.lock().expect("store lock");
+            if secrets.contains_key(credential.scope()) {
+                return Err(ProviderError::CredentialOccupied {
+                    scope: credential.scope().to_string(),
+                });
+            }
+            secrets.insert(credential.scope().to_string(), secret.to_vec());
+            drop(secrets);
+            Ok(())
+        }
+
+        fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+            self.secrets
+                .lock()
+                .expect("store lock")
+                .get(credential.scope())
+                .cloned()
+                .ok_or_else(|| ProviderError::CredentialAbsent {
+                    scope: credential.scope().to_string(),
+                })
+        }
+
+        fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+            self.login(credential, secret)
+        }
+
+        fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+            self.secrets
+                .lock()
+                .expect("store lock")
+                .remove(credential.scope())
+                .map(|_| ())
+                .ok_or_else(|| ProviderError::CredentialAbsent {
+                    scope: credential.scope().to_string(),
+                })
+        }
+
+        fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+            self.revoke(credential)
+        }
+    }
+
+    /// One loopback contract peer for the usercode, device-token and exchange
+    /// legs; every leg answers immediately so the composer command returns
+    /// without parking the loop for the device lifetime.
+    struct ComposerPeer {
+        base: String,
+    }
+
+    impl ComposerPeer {
+        fn url(&self, path: &str) -> String {
+            format!("{}{path}", self.base)
+        }
+    }
+
+    /// Serves the peer until the test clears its stop flag; the scoped join
+    /// happens at the end of the test closure, so no handle is detached. An
+    /// armed `slow_pending` makes the first device poll take 200 ms and answer
+    /// `authorization_pending`, the slow-peer case the one-step command must
+    /// survive without parking the loop for the device lifetime.
+    fn serve_composer_peer(
+        listener: TcpListener,
+        stop: Arc<AtomicBool>,
+        id_token: String,
+        slow_pending: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+    ) {
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _address)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("peer timeout");
+                    let Some(path) = read_composer_path(&mut stream) else {
+                        continue;
+                    };
+                    let payload = match path.as_str() {
+                        "/deviceauth/usercode" => json!({
+                            "device_auth_id": "device-handle-fixture",
+                            "user_code": "USER-CODE",
+                            "interval": "1",
+                            "expires_in": 10u64,
+                        })
+                        .to_string(),
+                        "/deviceauth/token" => {
+                            let poll = polls.fetch_add(1, Ordering::SeqCst) + 1;
+                            if slow_pending.load(Ordering::SeqCst) && poll == 1 {
+                                std::thread::park_timeout(Duration::from_millis(200));
+                                json!({ "error": "authorization_pending" }).to_string()
+                            } else {
+                                json!({
+                                    "authorization_code": "device-code",
+                                    "code_verifier": "device-verifier-fixture",
+                                })
+                                .to_string()
+                            }
+                        }
+                        "/oauth/token" => json!({
+                            "access_token": "access-fixture",
+                            "refresh_token": "refresh-fixture",
+                            "id_token": id_token,
+                            "expires_in": 28_800u64,
+                        })
+                        .to_string(),
+                        _ => "{}".to_string(),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _written = stream.write_all(response.as_bytes());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::park_timeout(Duration::from_millis(5));
+                }
+                Err(_error) => break,
+            }
+        }
+    }
+
+    fn read_composer_path(stream: &mut TcpStream) -> Option<String> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..position]).to_string();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buffer.len() < position + 4 + length {
+                    let read = stream.read(&mut chunk).ok()?;
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                return head
+                    .lines()
+                    .next()?
+                    .split_whitespace()
+                    .nth(1)
+                    .map(str::to_string);
+            }
+        }
+    }
+
+    fn composer_base64url(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+            let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(char::from(ALPHABET[((triple >> 18) & 0x3f) as usize]));
+            out.push(char::from(ALPHABET[((triple >> 12) & 0x3f) as usize]));
+            if chunk.len() > 1 {
+                out.push(char::from(ALPHABET[((triple >> 6) & 0x3f) as usize]));
+            }
+            if chunk.len() > 2 {
+                out.push(char::from(ALPHABET[(triple & 0x3f) as usize]));
+            }
+        }
+        out
+    }
+
+    fn composer_id_token() -> String {
+        let payload = json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "workspace-fixture" },
+            "https://api.openai.com/profile": { "email": "operator@example.invalid" },
+        });
+        let bytes = serde_json::to_vec(&payload).expect("the identity payload serializes");
+        format!("e30.{}.c2lnbmF0dXJl", composer_base64url(&bytes))
+    }
+
+    /// Clears the peer's stop flag on drop, including an assertion panic, so
+    /// the scoped server thread always joins instead of hanging the suite.
+    struct ComposerStop(Arc<AtomicBool>);
+
+    impl Drop for ComposerStop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn run_login_composer(
+        input: &str,
+        view: &mut LocalView,
+        dispatch: &mut Option<TuiDispatch>,
+        root: &std::path::Path,
+    ) {
+        let mut pending_task = None;
+        run_composer_command(input, view, dispatch, root, &mut pending_task)
+            .expect("the composer command runs");
+    }
+
+    #[test]
+    fn login_composer_routes_all_four_forms_and_redacts_the_code() {
+        let root = tempfile::TempDir::with_prefix("rivect-login-composer-")
+            .expect("create private fixture");
+        std::fs::write(root.path().join("config.toml"), LOGIN_COMPOSER_CONFIG)
+            .expect("config write");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+        listener.set_nonblocking(true).expect("nonblocking peer");
+        let base = format!("http://{}", listener.local_addr().expect("peer address"));
+        let peer = ComposerPeer { base };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let slow_pending = Arc::new(AtomicBool::new(false));
+        let server_slow = Arc::clone(&slow_pending);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let server_polls = Arc::clone(&polls);
+        std::thread::scope(|scope| {
+            let _server = scope.spawn(move || {
+                serve_composer_peer(
+                    listener,
+                    server_stop,
+                    composer_id_token(),
+                    server_slow,
+                    server_polls,
+                )
+            });
+            let _stop = ComposerStop(Arc::clone(&stop));
+            let mut dispatch = TuiDispatch::open(root.path())
+                .map_err(TuiOpenError::into_io_error)
+                .expect("the TUI dispatch opens");
+            let store = Arc::new(ComposerStore::new());
+            dispatch.runtime.login_credentials = Some(store.clone());
+            dispatch.runtime.login_endpoints = Some(DeviceEndpoints {
+                usercode: peer.url("/deviceauth/usercode"),
+                token: peer.url("/deviceauth/token"),
+                exchange: peer.url("/oauth/token"),
+            });
+            let mut dispatch = Some(dispatch);
+            let mut view = initial_view();
+
+            // `/login` begins the browser leg and paints the recorded URL.
+            run_login_composer("/login", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .iter()
+                    .any(|line| line.contains("https://auth.openai.com/oauth/authorize?")),
+                "{:?}",
+                view.transcript
+            );
+
+            // `/login <callback-url>` completes the browser leg; the pending
+            // state is minted through the same begin method the composer calls.
+            let begin = match dispatch.as_mut() {
+                Some(active) => dispatch_tui_request(
+                    &mut active.runtime,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "auth.login.begin",
+                        "params": { "schema_version": 1, "token_endpoint": peer.url("/oauth/token") },
+                    }),
+                )
+                .expect("the browser leg begins"),
+                None => serde_json::Value::Null,
+            };
+            assert!(begin["state"].is_string(), "the dispatch is open");
+            let state = begin["state"].as_str().expect("pending state");
+            run_login_composer(
+                &format!("/login http://localhost:1455/auth/callback?code=good-code&state={state}"),
+                &mut view,
+                &mut dispatch,
+                root.path(),
+            );
+            assert!(
+                view.transcript
+                    .iter()
+                    .any(|line| line == "Login complete: openai-codex"),
+                "{:?}",
+                view.transcript
+            );
+
+            // `/login device` begins the alias and paints the URL, code and
+            // completion hint; `/login complete` performs one bounded poll.
+            // A fresh store keeps the canonical scope create-only for the
+            // device leg after the browser leg already enrolled it.
+            let device_store = Arc::new(ComposerStore::new());
+            if let Some(active) = dispatch.as_mut() {
+                active.runtime.login_credentials = Some(device_store.clone());
+            }
+            run_login_composer("/login device", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .iter()
+                    .any(|line| line == "Enter code: USER-CODE"),
+                "{:?}",
+                view.transcript
+            );
+            assert!(
+                view.transcript
+                    .iter()
+                    .any(|line| line.contains("/login complete")),
+                "{:?}",
+                view.transcript
+            );
+            run_login_composer("/login complete", &mut view, &mut dispatch, root.path());
+            assert_eq!(
+                view.transcript
+                    .iter()
+                    .filter(|line| line.as_str() == "Login complete: openai-codex")
+                    .count(),
+                2,
+                "{:?}",
+                view.transcript
+            );
+
+            // A slow peer: one `/login complete` performs exactly one bounded
+            // poll, paints the pending state and leaves the loop able to take
+            // the next command; the interval then elapses and the following
+            // command completes the login.
+            slow_pending.store(true, Ordering::SeqCst);
+            polls.store(0, Ordering::SeqCst);
+            let slow_store = Arc::new(ComposerStore::new());
+            if let Some(active) = dispatch.as_mut() {
+                active.runtime.login_credentials = Some(slow_store);
+            }
+            run_login_composer("/login device", &mut view, &mut dispatch, root.path());
+            run_login_composer("/login complete", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .last()
+                    .is_some_and(|line| line == "Login pending: pending"),
+                "{:?}",
+                view.transcript
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 1, "one poll, not the loop");
+            // Inside the peer interval the command answers without a wire
+            // request, so the loop keeps serving.
+            run_login_composer("/login complete", &mut view, &mut dispatch, root.path());
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            std::thread::park_timeout(Duration::from_secs(1));
+            run_login_composer("/login complete", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .last()
+                    .is_some_and(|line| line == "Login complete: openai-codex"),
+                "{:?}",
+                view.transcript
+            );
+
+            // A refusal paints its typed cause, never the callback's code.
+            let beginning = match dispatch.as_mut() {
+                Some(active) => dispatch_tui_request(
+                    &mut active.runtime,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "auth.login.begin",
+                        "params": { "schema_version": 1, "token_endpoint": peer.url("/oauth/token") },
+                    }),
+                )
+                .expect("the browser leg begins again"),
+                None => serde_json::Value::Null,
+            };
+            assert!(beginning["state"].is_string());
+            run_login_composer(
+                "/login http://localhost:1455/auth/callback?code=CANARY-CODE-VALUE&state=foreign",
+                &mut view,
+                &mut dispatch,
+                root.path(),
+            );
+            let transcript = view.transcript.join("\n");
+            assert!(transcript.contains("/login refused:"), "{transcript}");
+            assert!(
+                !transcript.contains("CANARY-CODE-VALUE"),
+                "a login refusal never echoes the authorization code: {transcript}"
+            );
+            assert!(
+                !transcript.contains("http://localhost:1455/auth/callback"),
+                "a login refusal never echoes the callback URL: {transcript}"
+            );
+            run_login_composer("/login cancel", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .last()
+                    .is_some_and(|line| line == "Login cancelled."),
+                "{:?}",
+                view.transcript
+            );
+            run_login_composer("/login complete", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .last()
+                    .is_some_and(|line| line.contains("no login is pending")),
+                "a cancelled login has nothing left to complete: {:?}",
+                view.transcript
+            );
+            run_login_composer("/login cancel", &mut view, &mut dispatch, root.path());
+            assert!(
+                view.transcript
+                    .last()
+                    .is_some_and(|line| line == "No login is pending."),
+                "{:?}",
+                view.transcript
+            );
+            run_login_composer("/help", &mut view, &mut dispatch, root.path());
+            let help = view.transcript.join("\n");
+            assert!(
+                help.contains("/login: URL, \"device\", \"complete\", \"cancel\"."),
+                "the help line names the /login complete form: {help}"
+            );
+            assert!(
+                store
+                    .occupied(&SecretRef::parse(LOGIN_CODEX_REF).expect("fixture ref"))
+                    .expect("the store answers")
+            );
+            assert!(
+                device_store
+                    .occupied(&SecretRef::parse(LOGIN_CODEX_REF).expect("fixture ref"))
+                    .expect("the store answers")
+            );
+        });
     }
 }
 

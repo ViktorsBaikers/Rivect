@@ -24,15 +24,19 @@
 mod support;
 
 use rivect::config::{Config, ConfigIssue, ConfigValue, EffortAssign, ModelAssign};
-use rivect::model::{InputOrigin, RequestManifest};
+use rivect::model::{Broker, InputOrigin, RequestManifest};
 use rivect::providers::anthropic_login::{
     LoginError, begin_login, challenge_for, clear_subscription, complete_login, read_subscription,
     refresh_login,
 };
 use rivect::providers::openai::OpenAiProvider;
+use rivect::providers::openai_login::{
+    self, DeviceEndpoints, LoginError as CodexLoginError, challenge_for as codex_challenge_for,
+    read_credential,
+};
 use rivect::providers::{
-    CredentialStore, Dialect, FlightedStore, KeyringBackend, Provider, ProviderError, SecretRef,
-    SecretRefError, StoreKind, native_store, resolve_credential,
+    CredentialStore, Dialect, FlightedStore, KeyringBackend, LoopbackProvider, Provider,
+    ProviderError, SecretRef, SecretRefError, StoreKind, native_store, resolve_credential,
 };
 use serde_json::{Value, json};
 use std::any::Any;
@@ -42,8 +46,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::Duration;
-use support::SECRET_CANARY;
-use wiremock::matchers::{body_partial_json, method, path};
+use support::{CODEX_EMAIL, CODEX_NEIGHBOR_REF, CODEX_REF, CODEX_WORKSPACE, SECRET_CANARY};
+use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// The only namespace the proof may write to (DEC-002): a service prefix
@@ -5771,4 +5775,558 @@ async fn anthropic_pro_max_profile_legs_matrix_executes_all_expected_legs() {
         "every login leg executes and answers its own verdict"
     );
     assert_eq!(observed.len(), 11, "the matrix executes every expected leg");
+}
+
+// ----- Codex login (DEC-020) -------------------------------------------
+
+const CODEX_REFRESH_FIXTURE: &str = "fixture-codex-refresh-not-real";
+
+fn codex_callback(state: &str, code: &str) -> String {
+    format!("http://localhost:1455/auth/callback?code={code}&state={state}")
+}
+
+fn codex_token_endpoint(server: &MockServer) -> String {
+    format!("{}/oauth/token", server.uri())
+}
+
+/// Mounts the recorded form exchange for one authorization code: the reply
+/// carries the access/id token claims for `workspace`/`email`.
+async fn mount_codex_exchange(server: &MockServer, code: &str, workspace: &str, email: &str) {
+    let token = support::codex_access_token(workspace, email, "plus");
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains(format!("code={code}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": token,
+            "refresh_token": CODEX_REFRESH_FIXTURE,
+            "id_token": support::codex_access_token(workspace, email, "plus"),
+            "expires_in": 28_800u64,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The typed variant name is the only detail a leg assertion branches on.
+fn codex_variant(error: &CodexLoginError) -> &'static str {
+    match error {
+        CodexLoginError::Entropy { .. } => "Entropy",
+        CodexLoginError::NotARedirect => "NotARedirect",
+        CodexLoginError::OriginMismatch => "OriginMismatch",
+        CodexLoginError::StateMismatch => "StateMismatch",
+        CodexLoginError::Cancelled => "Cancelled",
+        CodexLoginError::Denied { .. } => "Denied",
+        CodexLoginError::MissingCode => "MissingCode",
+        CodexLoginError::EndpointNotRecorded { .. } => "EndpointNotRecorded",
+        CodexLoginError::TokenRejected { .. } => "TokenRejected",
+        CodexLoginError::MissingField { .. } => "MissingField",
+        CodexLoginError::MissingIdentity => "MissingIdentity",
+        CodexLoginError::ResponseTooLarge => "ResponseTooLarge",
+        CodexLoginError::MalformedResponse { .. } => "MalformedResponse",
+        CodexLoginError::NotApiKey { .. } => "NotApiKey",
+        CodexLoginError::NotCanonicalProfile { .. } => "NotCanonicalProfile",
+        CodexLoginError::WorkspaceMismatch => "WorkspaceMismatch",
+        CodexLoginError::AccountMismatch => "AccountMismatch",
+        CodexLoginError::StoredCredentialMalformed { .. } => "StoredCredentialMalformed",
+        CodexLoginError::Serialization { .. } => "Serialization",
+        CodexLoginError::Clock { .. } => "Clock",
+        CodexLoginError::DeviceDenied => "DeviceDenied",
+        CodexLoginError::DeviceExpired => "DeviceExpired",
+        CodexLoginError::DeviceExpiryOutOfRange { .. } => "DeviceExpiryOutOfRange",
+        CodexLoginError::TokenExpiryOutOfRange { .. } => "TokenExpiryOutOfRange",
+        CodexLoginError::DeviceIntervalOutOfRange { .. } => "DeviceIntervalOutOfRange",
+        CodexLoginError::MalformedField { .. } => "MalformedField",
+        CodexLoginError::ConnectionMissing { .. } => "ConnectionMissing",
+        CodexLoginError::Provider(inner) => error_variant(inner),
+    }
+}
+
+/// The browser code+PKCE leg writes one canonical `openai-codex` profile
+/// under the recorded localhost:1455 callback, with the recorded form body,
+/// the workspace/account claims and no token in `Debug`; the neighbour
+/// profile never moves.
+#[tokio::test]
+async fn codex_browser_code_creates_one_canonical_profile() {
+    let server = MockServer::start().await;
+    mount_codex_exchange(&server, "good-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    let endpoint = codex_token_endpoint(&server);
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let store =
+        support::MapStore::seeded(StoreKind::Keychain, &[(CODEX_NEIGHBOR_REF, SECRET_CANARY)]);
+
+    let session = openai_login::begin_login(&config, "openai-codex", &endpoint)
+        .expect("the platform entropy source answers");
+    assert!(
+        session
+            .authorize_url()
+            .starts_with("https://auth.openai.com/oauth/authorize?"),
+        "the recorded authorize endpoint: {}",
+        session.authorize_url()
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains("app_EMoamEEZ73f0CkXaXp7hrann")
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"),
+        "the recorded localhost:1455 callback: {}",
+        session.authorize_url()
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains("code_challenge_method=S256")
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains(&format!("state={}", session.state()))
+    );
+    assert!(session.authorize_url().contains("originator=omp"));
+    assert_eq!(
+        session.code_challenge(),
+        codex_challenge_for(session.code_verifier()),
+        "the published challenge is S256 of the verifier"
+    );
+    assert_eq!(session.code_verifier().len(), 43);
+
+    let redirect = codex_callback(session.state(), "good-code");
+    let profile = on_login_thread(|| {
+        openai_login::complete_login(&config, "openai-codex", &session, &redirect, &store)
+    })
+    .expect("the contract peer completes the login");
+    assert_eq!(profile, "openai-codex");
+
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+    assert_eq!(reference.profile(), "openai-codex");
+    let credential = read_credential(&store, &reference).expect("the profile reads back");
+    assert_eq!(
+        credential.access_token(),
+        support::codex_access_token(CODEX_WORKSPACE, CODEX_EMAIL, "plus")
+    );
+    assert_eq!(credential.account_id(), Some(CODEX_WORKSPACE));
+    assert_eq!(credential.email(), Some(CODEX_EMAIL));
+    assert_eq!(credential.plan_type(), Some("plus"));
+    assert!(credential.expires_at() > 1_700_000_000);
+
+    // The exchange body is exactly the recorded form.
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(requests.len(), 1, "one exchange request");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-www-form-urlencoded")
+    );
+    let body = String::from_utf8(requests[0].body.clone()).expect("form bytes");
+    assert!(body.contains("grant_type=authorization_code"));
+    assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+    assert!(body.contains("code=good-code"));
+    assert!(body.contains(&format!("code_verifier={}", session.code_verifier())));
+    assert!(body.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+
+    // No token reaches Debug.
+    let rendered = format!("{credential:?} {session:?}");
+    assert!(!rendered.contains(CODEX_REFRESH_FIXTURE));
+    assert!(!rendered.contains(session.code_verifier()));
+    assert!(!rendered.contains(&support::codex_access_token(
+        CODEX_WORKSPACE,
+        CODEX_EMAIL,
+        "plus"
+    )));
+    assert!(rendered.contains("<redacted>"));
+
+    // The neighbour profile is untouched, byte for byte.
+    let neighbor = SecretRef::parse(CODEX_NEIGHBOR_REF).expect("neighbour ref");
+    assert_eq!(
+        store.resolve(&neighbor).expect("neighbour material"),
+        SECRET_CANARY.as_bytes()
+    );
+
+    // DEC-020: a subscription declaration never writes this scope; the
+    // Pro/Max subscription rule stays untouched.
+    let subscription =
+        support::codex_login_config().replacen("kind = \"api_key\"", "kind = \"subscription\"", 1);
+    let subscription_config = Config::parse_validated(&subscription).expect("valid");
+    let error = openai_login::begin_login(
+        &subscription_config,
+        "openai-codex",
+        "http://127.0.0.1:1/oauth/token",
+    )
+    .expect_err("a subscription declaration never opens the Codex login");
+    assert_eq!(codex_variant(&error), "NotApiKey", "{error}");
+}
+
+/// The canonical connection is `kind = "api_key"` with the scoped bearer, so
+/// the shipped offline gate admits it and prepare selects it.
+#[test]
+fn openai_codex_connection_is_selectable_through_prepare() {
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    assert!(
+        rivect::providers::offline_usable(&config.connections, &config.profiles, "openai-codex"),
+        "the canonical api-key connection is offline-usable"
+    );
+    let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+    let manifest = broker
+        .prepare("main", &config, "codex-world", "hello")
+        .expect("prepare selects the canonical connection");
+    assert_eq!(
+        manifest.model,
+        ModelAssign::Fixed(rivect::config::FixedModel {
+            connection: "openai-codex".to_string(),
+            model_id: "gpt-5.2-codex".to_string(),
+        })
+    );
+    let binding = broker
+        .bound_profile()
+        .expect("the admission binds a profile");
+    assert_eq!(binding.connection, "openai-codex");
+    assert_eq!(binding.profile.as_deref(), Some("openai-codex"));
+}
+
+/// A second login that answers another workspace or account denies typed
+/// before the write and never borrows the active token; the stored profile
+/// stays byte-identical.
+#[tokio::test]
+async fn codex_wrong_workspace_or_account_denies_without_token_borrowing() {
+    let server = MockServer::start().await;
+    mount_codex_exchange(&server, "first-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    mount_codex_exchange(&server, "workspace-code", "foreign-workspace", CODEX_EMAIL).await;
+    mount_codex_exchange(
+        &server,
+        "account-code",
+        CODEX_WORKSPACE,
+        "foreign@example.invalid",
+    )
+    .await;
+    let endpoint = codex_token_endpoint(&server);
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let store = support::MapStore::new(StoreKind::Keychain);
+
+    let first = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &first,
+            &codex_callback(first.state(), "first-code"),
+            &store,
+        )
+    })
+    .expect("the active profile is written");
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+    let prior = store.resolve(&reference).expect("prior material");
+
+    for (code, expected) in [
+        ("workspace-code", "WorkspaceMismatch"),
+        ("account-code", "AccountMismatch"),
+    ] {
+        let session =
+            openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+        let error = on_login_thread(|| {
+            openai_login::complete_login(
+                &config,
+                "openai-codex",
+                &session,
+                &codex_callback(session.state(), code),
+                &store,
+            )
+        })
+        .expect_err("another identity never activates a profile");
+        assert_eq!(codex_variant(&error), expected, "{code}: {error}");
+        assert!(
+            !error.to_string().contains("fixture-codex"),
+            "{code}: no token renders"
+        );
+        assert_eq!(
+            store.resolve(&reference).expect("prior material"),
+            prior,
+            "{code}: the active profile is byte-identical"
+        );
+    }
+}
+
+/// An interrupted canonical write keeps the previous profile and the
+/// neighbour material exactly as they were.
+#[tokio::test]
+async fn codex_interrupted_profile_write_keeps_the_active_profile() {
+    let server = MockServer::start().await;
+    mount_codex_exchange(&server, "good-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    let endpoint = codex_token_endpoint(&server);
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+
+    let seeded = support::MapStore::new(StoreKind::Keychain);
+    let first = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &first,
+            &codex_callback(first.state(), "good-code"),
+            &seeded,
+        )
+    })
+    .expect("the first login completes");
+    let prior = seeded.resolve(&reference).expect("prior material");
+
+    let interrupted = InterruptedStore {
+        inner: support::MapStore::seeded(
+            StoreKind::Keychain,
+            &[(CODEX_NEIGHBOR_REF, SECRET_CANARY)],
+        ),
+    };
+    interrupted.inner.enroll(CODEX_REF, &prior);
+    let retry = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    let error = on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &retry,
+            &codex_callback(retry.state(), "good-code"),
+            &interrupted,
+        )
+    })
+    .expect_err("the interrupted write denies");
+    assert_eq!(codex_variant(&error), "StoreUnavailable", "{error}");
+    assert_eq!(
+        interrupted.inner.resolve(&reference).expect("material"),
+        prior,
+        "the previous profile is byte-identical"
+    );
+    let neighbor = SecretRef::parse(CODEX_NEIGHBOR_REF).expect("neighbour ref");
+    assert_eq!(
+        interrupted.inner.resolve(&neighbor).expect("material"),
+        SECRET_CANARY.as_bytes()
+    );
+}
+
+/// The device alias writes the same canonical profile, and neither the device
+/// handle, the PKCE verifier nor a token reaches `Debug` or a diagnostic; the
+/// verification URL and user code are the only device output.
+#[tokio::test]
+async fn codex_device_login_secret_never_reaches_diagnostics() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/deviceauth/usercode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_auth_id": "device-handle-fixture",
+            "user_code": "USER-CODE",
+            "interval": "1",
+            "expires_in": 10u64,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/deviceauth/token"))
+        .and(body_string_contains("device-handle-fixture"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_code": "device-code",
+            "code_verifier": "device-verifier-fixture",
+        })))
+        .mount(&server)
+        .await;
+    mount_codex_exchange(&server, "device-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let endpoints = DeviceEndpoints {
+        usercode: format!("{}/deviceauth/usercode", server.uri()),
+        token: format!("{}/deviceauth/token", server.uri()),
+        exchange: codex_token_endpoint(&server),
+    };
+    let mut device = on_login_thread(|| {
+        openai_login::begin_device_login(&config, "openai-codex-device", endpoints)
+    })
+    .expect("the device alias starts");
+    assert_eq!(
+        device.verification_url(),
+        "https://auth.openai.com/codex/device"
+    );
+    assert_eq!(device.user_code(), "USER-CODE");
+    assert_eq!(device.expires_in(), 10);
+    let device_debug = format!("{device:?}");
+    assert!(device_debug.contains("USER-CODE"));
+    assert!(device_debug.contains("codex/device"));
+    assert!(!device_debug.contains("device-handle-fixture"));
+    assert!(device_debug.contains("<redacted>"));
+
+    let profile = on_login_thread(|| {
+        openai_login::complete_device_login(&config, "openai-codex-device", &mut device, &store)
+    })
+    .expect("the device alias completes the same profile");
+    assert_eq!(profile, "openai-codex");
+
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+    let credential = read_credential(&store, &reference).expect("the profile reads back");
+    let rendered = format!("{credential:?}");
+    assert!(!rendered.contains(CODEX_REFRESH_FIXTURE));
+    assert!(!rendered.contains(&support::codex_access_token(
+        CODEX_WORKSPACE,
+        CODEX_EMAIL,
+        "plus"
+    )));
+    assert!(rendered.contains("<redacted>"));
+
+    // A real denial peer: the typed denial names neither the device handle
+    // nor the verifier the peer echoed.
+    let denied_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/deviceauth/usercode"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_auth_id": "denied-handle-fixture",
+            "user_code": "DENIED-CODE",
+            "interval": "1",
+            "expires_in": 10u64,
+        })))
+        .mount(&denied_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/deviceauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": "access_denied",
+            "error_description": "device-verifier-fixture denied",
+        })))
+        .mount(&denied_server)
+        .await;
+    let mut denied = on_login_thread(|| {
+        openai_login::begin_device_login(
+            &config,
+            "openai-codex-device",
+            DeviceEndpoints {
+                usercode: format!("{}/deviceauth/usercode", denied_server.uri()),
+                token: format!("{}/deviceauth/token", denied_server.uri()),
+                exchange: codex_token_endpoint(&denied_server),
+            },
+        )
+    })
+    .expect("the denial leg starts");
+    let error = on_login_thread(|| {
+        openai_login::complete_device_login(&config, "openai-codex-device", &mut denied, &store)
+    })
+    .expect_err("the denial is terminal");
+    assert_eq!(codex_variant(&error), "DeviceDenied", "{error}");
+    assert!(!error.to_string().contains("device-verifier-fixture"));
+}
+
+/// A create-only scope is the store's `CredentialOccupied`: a matching
+/// identity cannot overwrite the active profile, and the prior bytes stay
+/// exactly as they were.
+#[tokio::test]
+async fn codex_occupied_scope_denies_with_conflict_and_keeps_the_prior_profile() {
+    let server = MockServer::start().await;
+    mount_codex_exchange(&server, "good-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    let endpoint = codex_token_endpoint(&server);
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let store = support::MapStore::new(StoreKind::Keychain);
+
+    let first = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &first,
+            &codex_callback(first.state(), "good-code"),
+            &store,
+        )
+    })
+    .expect("the first login enrolls");
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+    let prior = store.resolve(&reference).expect("prior material");
+
+    let second = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    let error = on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &second,
+            &codex_callback(second.state(), "good-code"),
+            &store,
+        )
+    })
+    .expect_err("the occupied scope is never overwritten");
+    assert_eq!(codex_variant(&error), "CredentialOccupied", "{error}");
+    assert_eq!(
+        store.resolve(&reference).expect("prior material"),
+        prior,
+        "the active profile is byte-identical"
+    );
+}
+
+/// A rejecting exchange is a typed denial whose body never reaches the
+/// diagnostic, and a callback outside the recorded path is an origin
+/// mismatch — neither activates a profile.
+#[tokio::test]
+async fn codex_exchange_denial_and_wrong_callback_path_deny_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string("{\"error\":\"invalid_grant\",\"echo\":\"canary-code-value\"}"),
+        )
+        .mount(&server)
+        .await;
+    let endpoint = codex_token_endpoint(&server);
+    let config = Config::parse_validated(&support::codex_login_config()).expect("valid");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = resolve_credential(&config, "openai-codex").expect("canonical ref");
+
+    let session = openai_login::begin_login(&config, "openai-codex", &endpoint).expect("entropy");
+    let error = on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &session,
+            &codex_callback(session.state(), "canary-code-value"),
+            &store,
+        )
+    })
+    .expect_err("the rejected exchange denies");
+    assert_eq!(codex_variant(&error), "TokenRejected", "{error}");
+    assert!(!error.to_string().contains("canary-code-value"));
+
+    let wrong_path = format!(
+        "http://localhost:1455/wrong?code=canary-code-value&state={}",
+        session.state()
+    );
+    let error =
+        openai_login::complete_login(&config, "openai-codex", &session, &wrong_path, &store)
+            .expect_err("a callback outside the recorded path denies");
+    assert_eq!(codex_variant(&error), "OriginMismatch", "{error}");
+    assert!(!error.to_string().contains("canary-code-value"));
+
+    // A peer claiming a near-unbounded access-token lifetime is a typed
+    // denial, never a never-expiring credential.
+    let unbounded = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": support::codex_access_token(CODEX_WORKSPACE, CODEX_EMAIL, "plus"),
+            "refresh_token": CODEX_REFRESH_FIXTURE,
+            "id_token": support::codex_access_token(CODEX_WORKSPACE, CODEX_EMAIL, "plus"),
+            "expires_in": u64::MAX,
+        })))
+        .mount(&unbounded)
+        .await;
+    let unbounded_endpoint = codex_token_endpoint(&unbounded);
+    let session =
+        openai_login::begin_login(&config, "openai-codex", &unbounded_endpoint).expect("entropy");
+    let error = on_login_thread(|| {
+        openai_login::complete_login(
+            &config,
+            "openai-codex",
+            &session,
+            &codex_callback(session.state(), "good-code"),
+            &store,
+        )
+    })
+    .expect_err("the unbounded token lifetime denies");
+    assert_eq!(codex_variant(&error), "TokenExpiryOutOfRange", "{error}");
+    assert!(
+        !store.occupied(&reference).expect("the store answers"),
+        "neither denial activates a profile"
+    );
 }

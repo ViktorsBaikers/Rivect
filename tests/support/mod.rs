@@ -113,6 +113,65 @@ pub fn config_learned_role() -> String {
 
 pub const SECRET_CANARY: &str = "sk-live-canary-0123456789abcdef";
 
+/// The canonical Codex profile's scoped reference (DEC-020) and the neighbour
+/// profile the isolation legs keep byte-identical.
+pub const CODEX_REF: &str = "keychain:rivect-test/openai-codex";
+pub const CODEX_NEIGHBOR_REF: &str = "keychain:rivect-test/codex-neighbor";
+/// The fixture workspace/account the token claims report.
+pub const CODEX_WORKSPACE: &str = "workspace-fixture";
+pub const CODEX_EMAIL: &str = "operator@example.invalid";
+
+/// One config declaring the canonical `openai-codex` api-key connection and
+/// the profile that names it — both Codex entrypoints resolve here.
+pub fn codex_login_config() -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"https://chatgpt.com/backend-api/codex\"\n\
+         credential_ref = \"{CODEX_REF}\"\nprofile = \"openai-codex\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{CODEX_REF}\"\n\
+         [connections.neighbor]\nkind = \"api_key\"\nendpoint = \"https://api.example.invalid/v1\"\n\
+         credential_ref = \"{CODEX_NEIGHBOR_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"auto\" }}\n"
+    )
+}
+
+/// One unsigned JWT whose payload carries the recorded Codex identity
+/// claims; the fixture keeps the contract's claim namespaces, never a real
+/// token.
+pub fn codex_access_token(workspace: &str, email: &str, plan: &str) -> String {
+    let header = base64url(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = serde_json::to_vec(&json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": workspace,
+            "chatgpt_plan_type": plan,
+        },
+        "https://api.openai.com/profile": { "email": email },
+    }))
+    .expect("the fixture payload serializes");
+    format!("{header}.{}.c2lnbmF0dXJl", base64url(&payload))
+}
+
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(char::from(ALPHABET[((triple >> 18) & 0x3f) as usize]));
+        out.push(char::from(ALPHABET[((triple >> 12) & 0x3f) as usize]));
+        if chunk.len() > 1 {
+            out.push(char::from(ALPHABET[((triple >> 6) & 0x3f) as usize]));
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(ALPHABET[(triple & 0x3f) as usize]));
+        }
+    }
+    out
+}
+
 /// Offline credential-store double (SRC-010 test seam): resolves
 /// exactly the scoped refs it was seeded with and answers the same
 /// typed denial vocabulary the native seam returns — no platform
