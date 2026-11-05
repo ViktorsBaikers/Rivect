@@ -7878,6 +7878,105 @@ fn vercel_ai_gateway_never_falls_back_across_id_or_region() {
     );
 }
 
+/// The operator-configured Messages origin owns no default base and no
+/// route table: the adapter refuses a foreign pin before any wire leg, a
+/// configured region stays the typed denial, and the empty endpoint names
+/// no host at all — a manual id is admitted by the arm, never by a
+/// recorded alias table.
+#[test]
+fn custom_messages_never_falls_back_across_id_or_region() {
+    assert_eq!(
+        rivect::providers::dialect_for("custom-messages"),
+        Some(Dialect::Messages)
+    );
+    assert!(
+        rivect::providers::routes_for("custom-messages").is_empty(),
+        "the id records no cross-route table"
+    );
+    assert_eq!(
+        rivect::providers::route_for("custom-messages", "fixture-messages-model"),
+        None,
+        "a manual id is admitted by the arm, not by a recorded alias table"
+    );
+    let toml = "config_version = 1\n\
+         [connections.custom-messages]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"keyring:rivect-test/custom-messages\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"custom-messages\", model_id = \"fixture-messages-model\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n";
+    let config = Config::parse_validated(toml).expect("the configured origin parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[(
+            "keyring:rivect-test/custom-messages",
+            "fixture-messages-key-not-real",
+        )],
+    ));
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::new(&built, "custom-messages", store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the configured origin builds");
+
+    let mut manifest = {
+        let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+        broker
+            .prepare(
+                "main",
+                &config,
+                "/world/custom-messages",
+                "goal: no fallback",
+            )
+            .expect("the configured pin prepares")
+    };
+    manifest.model = ModelAssign::Fixed(FixedModel {
+        connection: "anthropic".to_string(),
+        model_id: "claude-opus-4-8".to_string(),
+    });
+    let (provider, outcome) = support::send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never falls back into this adapter: {outcome:?}"
+    );
+    support::drop_blocking(provider);
+
+    let regional = Config::parse_validated(
+        &toml.replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("the regional config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[],
+    ));
+    let denied = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::new(&regional, "custom-messages", store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("a configured region never borrows another endpoint");
+    assert!(
+        matches!(&denied, ProviderError::RegionMismatch { connection, region }
+            if connection == "custom-messages" && region == "eu"),
+        "the typed region denial: {denied:?}"
+    );
+
+    let empty = Config::parse_validated(&toml.replace("http://127.0.0.1:1/v1", "")).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[],
+    ));
+    let denied = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::new(&empty, "custom-messages", store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("the arm invents no default origin");
+    assert!(
+        matches!(&denied, ProviderError::EndpointRequired { connection }
+            if connection == "custom-messages"),
+        "the typed endpoint denial: {denied:?}"
+    );
+}
+
 /// The `zenmux` route table separates the recorded Chat Completions
 /// default from the metadata's Anthropic class with no third route and
 /// no cross-route fallback: the Messages arm refuses a default-class

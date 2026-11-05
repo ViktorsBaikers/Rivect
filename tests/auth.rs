@@ -6528,3 +6528,89 @@ fn zenmux_keyed_route_resolves_without_inferring_the_plan_from_the_material() {
         "profile/scope disagreement is CredentialProfileMismatch"
     );
 }
+
+// ----- api-key class: custom-messages ---------------------------------
+
+/// The `custom-messages` configured auth/origin (AC-040j): the keyed route
+/// resolves through the scoped `SecretRef`/DEC-013 precedence, and the
+/// recorded custom-origin form admits a declaration that binds nothing at
+/// ingress — it stays offline-usable while the binding-level resolver still
+/// names the absent binding — with a divergent profile scope the typed
+/// mismatch and an undeclared id ineligible.
+#[test]
+fn custom_messages_configured_auth_resolves_and_admits_the_absent_binding() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.custom-messages]\nkind = \"api_key\"\nendpoint = \"https://messages.example.invalid\"\ncredential_ref = \"keyring:rivect-test/custom-messages-direct\"\n\
+         [connections.custom-messages-profiled]\nkind = \"api_key\"\nendpoint = \"https://messages.example.invalid\"\ncredential_ref = \"keyring:rivect-test/custom-messages-scope\"\nprofile = \"custom-messages-team\"\n\
+         [profiles.custom-messages-team]\ncredential_ref = \"keyring:rivect-test/custom-messages-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "custom-messages")
+        .unwrap_or_else(|e| panic!("the configured ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/custom-messages-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref
+    let resolved = resolve_credential(&config, "custom-messages-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/custom-messages-team");
+
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "custom-messages",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // the recorded custom-origin form: the literal id declared with no
+    // binding is admitted at ingress and stays offline-usable, while the
+    // binding-level resolver still names the absent binding
+    let unbound_toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.custom-messages]\nkind = \"api_key\"\nendpoint = \"https://messages.example.invalid\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let unbound = Config::parse_validated(unbound_toml).expect("the absent binding is admitted");
+    assert!(rivect::providers::offline_usable(
+        &unbound.connections,
+        &unbound.profiles,
+        "custom-messages",
+    ));
+    assert!(
+        matches!(
+            resolve_credential(&unbound, "custom-messages"),
+            Err(ProviderError::CredentialUnresolved { .. })
+        ),
+        "the binding-level resolver names the absent binding"
+    );
+
+    // the widened admission is scoped to the recorded custom-origin class:
+    // another api_key id still states its binding
+    let required_toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.custom-chat-completions]\nkind = \"api_key\"\nendpoint = \"https://messages.example.invalid\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let required = Config::parse_validated(required_toml).expect_err("the id states its binding");
+    assert!(matches!(
+        &required.issue,
+        ConfigIssue::CredentialRefRequired { kind } if *kind == rivect::config::ConnKind::ApiKey
+    ));
+
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/custom-messages-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "custom-messages-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}

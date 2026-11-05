@@ -110,6 +110,17 @@ const VERCEL_MESSAGES_PATH: &str = "/v1/messages";
 /// The keyed catalogue path the marker is read from.
 const VERCEL_MODELS_PATH: &str = "/v1/models";
 
+/// The literal `custom-messages` connection id.
+const CUSTOM_MESSAGES: &str = "custom-messages";
+/// The scoped credential ref the configured origin binds.
+const CUSTOM_MESSAGES_CREDENTIAL_REF: &str = "keyring:rivect-test/custom-messages";
+/// A manual model id the origin serves; no recorded alias table gates it.
+const CUSTOM_MESSAGES_MODEL: &str = "fixture-messages-model";
+/// The origin's inference path under the configured base.
+const CUSTOM_MESSAGES_MESSAGES_PATH: &str = "/v1/messages";
+/// The origin's discovery path under the configured base.
+const CUSTOM_MESSAGES_MODELS_PATH: &str = "/v1/models";
+
 fn anthropic_config(endpoint: &str) -> String {
     format!(
         "config_version = 1\n\
@@ -303,6 +314,42 @@ fn vercel_provider(config: &Config) -> (MessagesProvider, Arc<MapStore>) {
     ));
     let provider = provider_result(config.clone(), VERCEL.to_string(), store.clone())
         .expect("the Messages adapter builds for the literal id");
+    (provider, store)
+}
+
+/// The configured origin is the whole base: inference appends
+/// `/v1/messages` and discovery appends `/v1/models`.
+fn custom_messages_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{CUSTOM_MESSAGES}]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{CUSTOM_MESSAGES_CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"{CUSTOM_MESSAGES}\", model_id = \"{CUSTOM_MESSAGES_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same origin with no credential binding — the recorded custom-origin
+/// form, which sends headerless.
+fn custom_messages_unbound_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{CUSTOM_MESSAGES}]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"{CUSTOM_MESSAGES}\", model_id = \"{CUSTOM_MESSAGES_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn custom_messages_provider(config: &Config) -> (MessagesProvider, Arc<MapStore>) {
+    let store = Arc::new(MapStore::seeded(
+        STORE_KIND,
+        &[(CUSTOM_MESSAGES_CREDENTIAL_REF, SECRET)],
+    ));
+    let provider = provider_result(config.clone(), CUSTOM_MESSAGES.to_string(), store.clone())
+        .expect("the Messages adapter builds for the configured origin");
     (provider, store)
 }
 
@@ -4888,6 +4935,687 @@ async fn vercel_ai_gateway_unknown_outcome_is_not_retried() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::vercel-ai-gateway = NOT_RUN"]
 fn provider_installed_vercel_ai_gateway() {}
+
+// ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::custom-messages ------
+
+/// A configured `custom-messages` origin returns one verified outcome and
+/// exactly one accounted usage through the standard Broker: the configured
+/// base is the whole origin, inference appends `/v1/messages`, the key
+/// rides the dialect's `x-api-key` pair, and no discovery read happens
+/// because the manual pin needs none.
+#[tokio::test]
+async fn custom_messages_valid_control_yields_one_outcome_and_one_physical_usage() {
+    assert_eq!(dialect_for(CUSTOM_MESSAGES), Some(Dialect::Messages));
+    assert!(
+        routes_for(CUSTOM_MESSAGES).is_empty(),
+        "the id is single-dialect and records no route table"
+    );
+    let server = MockServer::start().await;
+    mount_messages(&server, text_stream("custom origin outcome", 17, 6)).await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_messages_provider(&config),
+        &config,
+        "/world/custom-messages",
+        "goal: prove the configured messages origin",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "custom origin outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 17,
+            completion_tokens: 6,
+            total_tokens: 23,
+        }
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    assert_eq!(requests[0].url.path(), CUSTOM_MESSAGES_MESSAGES_PATH);
+    assert_eq!(header(&requests[0], "x-api-key"), Some(SECRET));
+    assert_eq!(
+        header(&requests[0], "anthropic-version"),
+        Some("2023-06-01")
+    );
+    assert_eq!(header(&requests[0], "authorization"), None);
+    assert_eq!(
+        body_of(&requests[0])["model"],
+        json!(CUSTOM_MESSAGES_MODEL),
+        "the manual pin crosses verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(SECRET),
+        "credential material rides the header, never the body"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(record.connection, CUSTOM_MESSAGES);
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+}
+
+/// No default origin exists for this id: an empty configured endpoint —
+/// or one that trims to nothing — denies typed at build, before any
+/// credential resolution or wire leg.
+#[tokio::test]
+async fn custom_messages_requires_a_configured_endpoint() {
+    for endpoint in ["", "   "] {
+        let denied = provider_result(
+            Config::parse_validated(&custom_messages_config(endpoint)).expect("valid"),
+            CUSTOM_MESSAGES.to_string(),
+            Arc::new(MapStore::seeded(
+                STORE_KIND,
+                &[(CUSTOM_MESSAGES_CREDENTIAL_REF, SECRET)],
+            )),
+        )
+        .expect_err("an arm with no recorded base denies the empty endpoint");
+        assert!(
+            matches!(&denied, ProviderError::EndpointRequired { connection }
+                if connection == CUSTOM_MESSAGES),
+            "the denial names the id and invents no default: {denied:?}"
+        );
+        for rendered in [format!("{denied}"), format!("{denied:?}")] {
+            assert!(
+                !rendered.contains(SECRET),
+                "the denial never renders credential material: {rendered}"
+            );
+        }
+    }
+
+    // a wrong origin never reaches the arm: a non-loopback http origin and
+    // a userinfo-bearing origin are refused at config ingress, and the
+    // refusal never echoes the userinfo
+    for origin in [
+        "http://messages.example.com/v1",
+        "https://key:fixture-origin-material@messages.example.com",
+    ] {
+        let refused = Config::parse_validated(&custom_messages_config(origin))
+            .expect_err("the origin is outside the trust boundary");
+        assert!(matches!(&refused.issue, ConfigIssue::EndpointNotAllowed));
+        assert!(
+            !refused.to_string().contains("fixture-origin-material"),
+            "the refusal never echoes the origin's userinfo: {refused}"
+        );
+    }
+}
+
+/// The origin's own listing is the discovery source, and its failure is
+/// typed; the manual pin does not depend on it, so the same adapter still
+/// sends exactly one inference request.
+#[tokio::test]
+async fn custom_messages_manual_model_sends_when_the_listing_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(CUSTOM_MESSAGES_MODELS_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("listing unavailable"))
+        .mount(&server)
+        .await;
+    mount_messages(&server, text_stream("manual model outcome", 4, 2)).await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+
+    let (provider, catalog) = catalog_models_on_thread(provider);
+    let failed = catalog.expect_err("the failed listing denies discovery");
+    let ProviderError::Transport { connection, cause } = &failed else {
+        panic!("the listing failure is transport: {failed}");
+    };
+    assert_eq!(connection, CUSTOM_MESSAGES);
+    assert_eq!(cause.class(), TransportClass::HttpStatus { code: 503 });
+
+    let (provider, outcome) = send_on_thread(
+        provider,
+        prepared_manifest_at(&config, "/world/custom-messages"),
+    );
+    let reply = outcome.expect("the manual model sends without the listing");
+    assert_eq!(reply.text, "manual model outcome");
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded both legs");
+    assert_eq!(
+        count_path(&requests, CUSTOM_MESSAGES_MODELS_PATH),
+        1,
+        "only the discovery leg read the listing"
+    );
+    assert_eq!(
+        count_path(&requests, CUSTOM_MESSAGES_MESSAGES_PATH),
+        1,
+        "the manual send is one physical request"
+    );
+}
+
+/// A discovered listing is the catalogue: the origin's own rows answer in
+/// deterministic order, with no seed or alias table of the id's own.
+#[tokio::test]
+async fn custom_messages_catalog_admits_the_discovered_listing() {
+    let server = MockServer::start().await;
+    mount_models(&server, &["fixture-messages-b", "fixture-messages-a"]).await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+
+    let (provider, catalog) = catalog_on_thread(provider);
+    assert_eq!(
+        catalog.expect("the discovered listing answers"),
+        ["fixture-messages-a", "fixture-messages-b"],
+        "the origin's rows are the whole catalogue"
+    );
+    drop_blocking(provider);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), CUSTOM_MESSAGES_MODELS_PATH);
+    assert_eq!(header(&requests[0], "x-api-key"), Some(SECRET));
+    assert_eq!(
+        header(&requests[0], "anthropic-version"),
+        Some("2023-06-01")
+    );
+}
+
+/// The Messages envelope is the dialect's: `system` is top-level, never a
+/// message role; `max_tokens` is mandatory; the declared client tool
+/// carries `input_schema`; and the user turn is the manifest's input.
+#[tokio::test]
+async fn custom_messages_keeps_top_level_system_and_max_tokens() {
+    let server = MockServer::start().await;
+    mount_messages(&server, text_stream("envelope", 9, 3)).await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+    let manifest = prepared_manifest_at(&config, "/world/custom-messages");
+    let (provider, outcome) = send_on_thread(provider, manifest.clone());
+    outcome.expect("the envelope is accepted");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    let body = body_of(&requests[0]);
+    assert_eq!(
+        body["system"],
+        json!(manifest.instructions),
+        "the system prompt is top-level"
+    );
+    assert_eq!(
+        body["max_tokens"],
+        json!(MESSAGES_MAX_TOKENS),
+        "max_tokens is mandatory"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["messages"],
+        json!([{ "role": "user", "content": manifest.inputs }])
+    );
+    assert!(
+        body["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().all(|message| message["role"] != "system")),
+        "the system prompt is never a message role"
+    );
+    assert_eq!(
+        body["tools"],
+        json!([{
+            "name": "read_file",
+            "description": "",
+            "input_schema": {"type": "object"},
+        }])
+    );
+}
+
+/// A Chat Completions chunk on this wire is another dialect's answer: the
+/// refusal is typed at the first chunk, never an outcome and never an
+/// accounted send.
+#[tokio::test]
+async fn custom_messages_rejects_a_chat_shaped_answer() {
+    let server = MockServer::start().await;
+    let chat = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "wrong dialect"}, "finish_reason": null}],
+        }),
+        json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }),
+    );
+    mount_messages(&server, chat).await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_messages_provider(&config),
+        &config,
+        "/world/custom-messages",
+        "goal: chat shaped answer",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest);
+    let Err(ModelError::Provider(ProviderError::IncompatibleOutput { connection, .. })) = outcome
+    else {
+        panic!("a chat-shaped answer is never a Messages outcome: {outcome:?}");
+    };
+    assert_eq!(connection, CUSTOM_MESSAGES);
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    assert_eq!(
+        count_path(
+            &server.received_requests().await.expect("recorded"),
+            CUSTOM_MESSAGES_MESSAGES_PATH
+        ),
+        1,
+        "the refusal is one request, never a retry"
+    );
+}
+
+/// Hostile Messages input never reports success: a partial tool block is
+/// the typed violation, an unclassifiable stop reason the unknown
+/// terminal, a repeated `message_start` a duplicate-usage violation, and
+/// a repeated usage report one charge.
+#[tokio::test]
+async fn custom_messages_rejects_partial_tool_block_unknown_terminal_and_repeated_usage() {
+    // partial tool JSON at the block stop
+    let server = MockServer::start().await;
+    mount_messages(
+        &server,
+        format!(
+            "{}{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+            ),
+            sse_block(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+    let (provider, outcome) = send_on_thread(
+        provider,
+        prepared_manifest_at(&config, "/world/custom-messages"),
+    );
+    assert!(
+        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        "a partial tool block never becomes a reply: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // a stop reason the dialect cannot classify
+    let server = MockServer::start().await;
+    mount_messages(
+        &server,
+        format!(
+            "{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "teleport"}, "usage": {"output_tokens": 1}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+    let (provider, outcome) = send_on_thread(
+        provider,
+        prepared_manifest_at(&config, "/world/custom-messages"),
+    );
+    assert!(
+        matches!(outcome, Err(ProviderError::UnknownTerminal { .. })),
+        "an unknown stop reason is an unknown terminal: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // a repeated message_start would repeat the input usage: refused
+    let server = MockServer::start().await;
+    mount_messages(
+        &server,
+        format!(
+            "{}{}{}",
+            message_start(3),
+            message_start(3),
+            sse_block("message_stop", &json!({"type": "message_stop"})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+    let (provider, outcome) = send_on_thread(
+        provider,
+        prepared_manifest_at(&config, "/world/custom-messages"),
+    );
+    assert!(
+        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        "a repeated usage-bearing start is refused: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // the usage report repeated with the same figures is one charge
+    let server = MockServer::start().await;
+    mount_messages(
+        &server,
+        format!(
+            "{}{}{}{}{}",
+            message_start(4),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse_block(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "once"}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        custom_messages_provider(&config),
+        &config,
+        "/world/custom-messages",
+        "goal: repeated usage",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest.clone());
+    let reply = outcome.expect("the repeated report is one charge");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+        }
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted once");
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+}
+
+/// One scripted origin peer: the Messages stream is written in tiny
+/// chunks so the cuts land inside UTF-8, JSON, SSE lines and the tool
+/// block's arguments, and the usage report repeats. The counted POSTs
+/// prove one physical send.
+fn fragmented_custom_messages_peer() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("the fixture peer binds a loopback port");
+    let address = listener.local_addr().expect("the fixture address");
+    let posts = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&posts);
+    let body = format!(
+        "{}{}{}{}{}{}{}{}{}",
+        message_start(5),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "héllo ✓"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 0}),
+        ),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"/tmp/fixture\"}"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 1}),
+        ),
+        sse_block(
+            "message_delta",
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+        ),
+        format!(
+            "{}{}",
+            sse_block(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+            ),
+            sse_block("message_stop", &json!({"type": "message_stop"})),
+        ),
+    );
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the fixture peer accepts");
+        read_fixture_request(&mut stream);
+        count.fetch_add(1, Ordering::SeqCst);
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).expect("the fixture head");
+        let bytes = body.as_bytes();
+        let sizes = [1usize, 2, 3, 5, 8, 13, 21];
+        let mut offset = 0;
+        let mut step = 0;
+        while offset < bytes.len() {
+            let len = sizes[step % sizes.len()].min(bytes.len() - offset);
+            stream
+                .write_all(&bytes[offset..offset + len])
+                .expect("the fixture fragment");
+            stream.flush().expect("the fixture flushes");
+            offset += len;
+            step += 1;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    (format!("http://{address}/v1"), posts, handle)
+}
+
+/// Chunked delivery inside UTF-8, JSON, SSE and the tool block reassembles
+/// to one outcome; the repeated usage report is charged once, and the
+/// spent attempt never opens a second request.
+#[tokio::test]
+async fn custom_messages_stream_fragmentation_and_repeated_usage_never_duplicates() {
+    let (endpoint, posts, peer) = fragmented_custom_messages_peer();
+    let config = Config::parse_validated(&custom_messages_config(&endpoint)).expect("valid");
+    let (provider, _store) = custom_messages_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/custom-messages",
+            "goal: fragmented",
+        )
+        .expect("the configured pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest.clone());
+    let reply = outcome.expect("the fragmented stream reassembles");
+    assert_eq!(reply.text, "héllo ✓");
+    assert_eq!(
+        reply.tool_calls,
+        vec![rivect::providers::ToolCall {
+            tool: "read_file".to_string(),
+            path: Some("/tmp/fixture".to_string()),
+        }]
+    );
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        },
+        "the repeated usage report is charged once"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+
+    let replay_manifest = manifest.clone();
+    let (broker, replay) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let replay = broker.dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/custom-messages",
+            &replay_manifest,
+        );
+        (broker, replay)
+    })
+    .join()
+    .expect("the replay thread joins");
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the confirmed data is never duplicated: {replay:?}"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the fixture peer joins");
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "one physical send");
+}
+
+/// A refused credential and a rate limit are typed transport denials: one
+/// request each, nothing accounted, no blind retry, and no peer body text
+/// in diagnostics.
+#[tokio::test]
+async fn custom_messages_auth_failure_and_rate_limit_are_not_retried() {
+    for code in [401u16, 429] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CUSTOM_MESSAGES_MESSAGES_PATH))
+            .respond_with(
+                ResponseTemplate::new(code).set_body_string("fixture-refusal-body-marker"),
+            )
+            .mount(&server)
+            .await;
+        let config =
+            Config::parse_validated(&custom_messages_config(&server.uri())).expect("valid");
+        let (broker, manifest) = prepared_with(
+            custom_messages_provider(&config),
+            &config,
+            "/world/custom-messages",
+            "goal: typed refusal",
+        );
+        let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest);
+        let Err(ModelError::Provider(ProviderError::Transport { connection, cause })) = outcome
+        else {
+            panic!("a {code} is the typed transport denial: {outcome:?}");
+        };
+        assert_eq!(connection, CUSTOM_MESSAGES);
+        assert_eq!(cause.class(), TransportClass::HttpStatus { code });
+        let rendered = format!("{cause}");
+        assert!(!rendered.contains("fixture-refusal-body-marker"));
+        assert!(!rendered.contains(SECRET));
+        assert_eq!(broker.accounted_requests(), 0);
+        drop_blocking(broker);
+        assert_eq!(
+            count_path(
+                &server.received_requests().await.expect("recorded"),
+                CUSTOM_MESSAGES_MESSAGES_PATH
+            ),
+            1,
+            "a {code} is never retried blindly"
+        );
+    }
+}
+
+/// The recorded custom-origin credential is optional: an unbound
+/// declaration builds, stays offline-usable, and sends headerless with
+/// the dialect's mandatory version header still on the request.
+#[tokio::test]
+async fn custom_messages_unbound_origin_sends_headerless() {
+    let server = MockServer::start().await;
+    mount_messages(&server, text_stream("unbound outcome", 3, 1)).await;
+    let config = Config::parse_validated(&custom_messages_unbound_config(&server.uri()))
+        .expect("the absent binding is the recorded form");
+    let store = Arc::new(MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), CUSTOM_MESSAGES.to_string(), store.clone())
+        .expect("the credential-optional arm builds without a binding");
+    let (broker, manifest) = prepared_with(
+        (provider, store),
+        &config,
+        "/world/custom-messages",
+        "goal: unbound origin",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/custom-messages", manifest.clone());
+    let reply = outcome.expect("the unbound origin sends headerless");
+    assert_eq!(reply.text, "unbound outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            total_tokens: 4,
+        }
+    );
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(header(&requests[0], "x-api-key"), None);
+    assert_eq!(header(&requests[0], "authorization"), None);
+    assert_eq!(
+        header(&requests[0], "anthropic-version"),
+        Some("2023-06-01"),
+        "the dialect's mandatory version header still rides an unbound send"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::custom-messages -------------------------
+
+/// TP-PROVIDER-INSTALLED::custom-messages = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::custom-messages = NOT_RUN"]
+fn provider_installed_custom_messages() {}
 
 // ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::gitlab-duo ----------
 

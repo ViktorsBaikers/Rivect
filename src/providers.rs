@@ -69,6 +69,14 @@
 //! `tool-use` tag is the closed table — a row without the tag is never
 //! offered, and a pin outside the tagged set denies before the body.
 //!
+//! `custom-messages` records the operator-configured Messages origin:
+//! no default base exists, so an empty endpoint denies before the
+//! wire. The origin's own `/v1/models` listing is the discovery source
+//! and a manual model id sends without it, because the id records no
+//! closed alias table to fall outside. Its credential is the recorded
+//! custom-origin form — optional, so an unbound declaration sends
+//! headerless rather than inventing a key.
+//!
 //! `openai-codex` records the Codex OAuth form (DEC-020): the browser
 //! code+PKCE leg and its device alias both write one canonical
 //! `kind = "api_key"` profile through [`openai_login`], so the Broker's
@@ -1373,7 +1381,8 @@ pub enum Dialect {
     ChatCompletions,
     /// The Anthropic Messages API (`POST {endpoint}/v1/messages`, SSE):
     /// the recorded dialect of `anthropic`, `minimax`, `umans`,
-    /// `cloudflare-ai-gateway` and `vercel-ai-gateway`, never inferred
+    /// `cloudflare-ai-gateway`, `vercel-ai-gateway` and the
+    /// operator-configured `custom-messages` origin, never inferred
     /// from an auth label.
     Messages,
     /// The native Ollama Cloud chat API (`POST {endpoint}/api/chat`,
@@ -1416,6 +1425,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "minimax" => Some(Dialect::Messages),
         "umans" => Some(Dialect::Messages),
         "cloudflare-ai-gateway" => Some(Dialect::Messages),
+        "custom-messages" => Some(Dialect::Messages),
         "vercel-ai-gateway" => Some(Dialect::Messages),
         "gitlab-duo" => Some(Dialect::ChatCompletions),
         "opencode-go" => Some(Dialect::ChatCompletions),
@@ -1817,15 +1827,16 @@ impl Provider for LoopbackProvider {
 /// that serves with or without a key — the local-endpoint class
 /// (`llama.cpp`, `lm-studio`, `ollama`, `vllm`) — a local server whose
 /// recorded auth is optional beside its server-key mode — and the
-/// custom-origin class (`custom-responses`) — an operator-configured
-/// origin whose recorded auth is optional (DEC-015). Each admits a
-/// declaration that omits `credential_ref`, an absent binding sends no
-/// `Authorization` header — never a dummy key — and the pin stays
-/// offline-usable. The catalogue-only `openrouter` is the exception
-/// this predicate excludes: [`admit_absent_binding`] admits its unbound
-/// declaration at ingress for the keyless `GET /models`, while this
-/// send/eligibility answer stays false. Every other `api_key` id
-/// requires its scoped binding at ingress and at eligibility.
+/// custom-origin class (`custom-responses`, `custom-messages`) — an
+/// operator-configured origin whose recorded auth is optional
+/// (DEC-015). Each admits a declaration that omits `credential_ref`, an
+/// absent binding sends no credential header — never a dummy key — and
+/// the pin stays offline-usable. The catalogue-only `openrouter` is the
+/// exception this predicate excludes: [`admit_absent_binding`] admits
+/// its unbound declaration at ingress for the keyless `GET /models`,
+/// while this send/eligibility answer stays false. Every other
+/// `api_key` id requires its scoped binding at ingress and at
+/// eligibility.
 ///
 /// Its contract-side twin for the CC local-endpoint ids (`litellm`,
 /// `llama.cpp`, `lm-studio`, `vllm`) is `CredentialRule::OpenProxy` in
@@ -1837,7 +1848,13 @@ impl Provider for LoopbackProvider {
 pub(crate) fn open_proxy_connection(connection: &str) -> bool {
     matches!(
         connection,
-        "litellm" | "llama.cpp" | "lm-studio" | "ollama" | "vllm" | "custom-responses"
+        "litellm"
+            | "llama.cpp"
+            | "lm-studio"
+            | "ollama"
+            | "vllm"
+            | "custom-responses"
+            | "custom-messages"
     )
 }
 

@@ -29,6 +29,13 @@
 //! `tool-use` tag is the closed table — a row without the tag is never
 //! offered, and a pin outside the tagged set denies before the body.
 //!
+//! `custom-messages` records the operator-configured Messages origin:
+//! no default base exists, so an empty endpoint denies before the wire.
+//! The origin's own `/v1/models` listing is the discovery source; a
+//! manual model id sends without it because the id records no closed
+//! alias table, and an absent credential binding sends headerless with
+//! the mandatory `anthropic-version` still on the request.
+//!
 //! `zenmux` records the Messages mirror of its two fixed bases: the
 //! configured base resolves through the recorded `/api/v1` ↔
 //! `/api/anthropic` transform, the plain key rides `Authorization:
@@ -269,6 +276,20 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
             base: BaseRule::Configured,
             catalog: CatalogRule::ToolUseListing,
             credential: CredentialRule::Bearer,
+        }),
+        // The origin is operator data, so no default base is invented and
+        // an empty endpoint denies before the wire. The catalogue is the
+        // origin's own listing; the record names no closed alias table, so
+        // a manual id sends even when that listing fails, and the
+        // credential is the recorded custom-origin form — optional.
+        "custom-messages" => Some(MessagesContract {
+            default_base: "",
+            base: BaseRule::Configured,
+            catalog: CatalogRule::KeyedListing {
+                excluded_prefixes: &[],
+                excluded_ids: &[],
+            },
+            credential: CredentialRule::ApiKey,
         }),
         // DEC-013: the proxy base is recorded and the routed owner
         // passes it as the codec's configured endpoint; the wire model
@@ -605,14 +626,8 @@ impl MessagesProvider {
         if let Some(models) = self.static_catalog() {
             return Ok(models);
         }
-        let token = self
-            .token()?
-            .ok_or_else(|| ProviderError::CredentialUnresolved {
-                connection: self.connection.clone(),
-                scope: format!("connections.{}.credential_ref", self.connection),
-                cause: None,
-            })?;
-        self.catalog_within(&token, started)
+        let token = self.required_token()?;
+        self.catalog_within(token.as_deref(), started)
     }
 
     /// How many replayed thinking blocks the peer reported dropping.
@@ -623,7 +638,7 @@ impl MessagesProvider {
 
     fn catalog_within(
         &self,
-        token: &str,
+        token: Option<&str>,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
@@ -808,10 +823,25 @@ impl MessagesProvider {
         }
     }
 
+    /// The token a send or catalogue leg authenticates with: an arm whose
+    /// credential is required denies an absent binding, while the recorded
+    /// credential-optional class sends headerless instead of inventing one.
+    fn required_token(&self) -> Result<Option<String>, ProviderError> {
+        let token = self.token()?;
+        if token.is_none() && !open_proxy_connection(&self.connection) {
+            return Err(ProviderError::CredentialUnresolved {
+                connection: self.connection.clone(),
+                scope: format!("connections.{}.credential_ref", self.connection),
+                cause: None,
+            });
+        }
+        Ok(token)
+    }
+
     fn authenticated(
         &self,
         request: reqwest::blocking::RequestBuilder,
-        token: &str,
+        token: Option<&str>,
     ) -> reqwest::blocking::RequestBuilder {
         let rule = if self.subscription {
             // A subscription token is an OAuth access token: it rides
@@ -819,6 +849,14 @@ impl MessagesProvider {
             CredentialRule::Bearer
         } else {
             self.contract.credential
+        };
+        let Some(token) = token else {
+            // The recorded custom-origin form: an absent binding sends no
+            // credential header, while the dialect's mandatory version
+            // header still rides the request.
+            return request
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .headers(forwarded_header_map(self.auth.forwarded()));
         };
         match rule {
             CredentialRule::ApiKey => request
@@ -992,7 +1030,7 @@ impl MessagesProvider {
     fn auto_model(
         &self,
         manifest: &RequestManifest,
-        token: &str,
+        token: Option<&str>,
         started: Instant,
         offered: Option<&[CatalogModel]>,
     ) -> Result<FixedModel, ProviderError> {
@@ -1035,7 +1073,7 @@ impl MessagesProvider {
     /// listing payload is not the recorded shape.
     fn admitted_listing(
         &self,
-        token: &str,
+        token: Option<&str>,
         started: Instant,
     ) -> Result<Option<Vec<CatalogModel>>, ProviderError> {
         match self.contract.catalog {
@@ -1051,7 +1089,7 @@ impl MessagesProvider {
 
     fn post(
         &self,
-        token: &str,
+        token: Option<&str>,
         body: Vec<u8>,
         drop_block: bool,
     ) -> Result<reqwest::blocking::Response, ProviderError> {
@@ -1089,13 +1127,7 @@ impl MessagesProvider {
     ) -> Result<ProviderReply, ProviderError> {
         let started = Instant::now();
         check_deadline(&self.connection, self.deadline, started)?;
-        let token = self
-            .token()?
-            .ok_or_else(|| ProviderError::CredentialUnresolved {
-                connection: self.connection.clone(),
-                scope: format!("connections.{}.credential_ref", self.connection),
-                cause: None,
-            })?;
+        let token = self.required_token()?;
         // The request-shape denials are local: a pinned effort, an
         // unconstructible tool name, or a pin naming another adapter never
         // reads the marker listing or crosses the wire. An unresolved auto
@@ -1118,17 +1150,17 @@ impl MessagesProvider {
         };
         self.check_effort(manifest, admission_model)?;
         self.check_tools(manifest, admission_model)?;
-        let offered = self.admitted_listing(&token, started)?;
+        let offered = self.admitted_listing(token.as_deref(), started)?;
         let fixed = match pinned {
             Some(fixed) => fixed,
-            None => self.auto_model(manifest, &token, started, offered.as_deref())?,
+            None => self.auto_model(manifest, token.as_deref(), started, offered.as_deref())?,
         };
         self.check_model(&fixed.model_id, offered.as_deref())?;
         let binding = self.binding(manifest, &fixed.model_id);
         let body = self.request_body(manifest, &fixed, &binding);
         let body_bytes = wire_body(&self.connection, &body)?;
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut response = self.post(&token, body_bytes, binding.drop_block)?;
+        let mut response = self.post(token.as_deref(), body_bytes, binding.drop_block)?;
         let status = response.status();
         if status.is_success() {
             return self.read_stream(manifest, &fixed.model_id, response, started);
@@ -1150,7 +1182,7 @@ impl MessagesProvider {
                 // clock — so neither failure may ever be counted as a retry.
                 let retry_bytes = wire_body(&self.connection, &retry_body)?;
                 check_deadline(&self.connection, self.deadline, started)?;
-                let retry = match self.post(&token, retry_bytes, stripped.drop_block) {
+                let retry = match self.post(token.as_deref(), retry_bytes, stripped.drop_block) {
                     Ok(retry) => retry,
                     Err(source) => {
                         // The corrected leg's POST is the second crossed
@@ -1296,6 +1328,20 @@ impl MessagesProvider {
         }
         let payload: Value = serde_json::from_str(&event.data)
             .map_err(|_parse| violation(&self.connection, "event payload is not json"))?;
+        // A Chat Completions chunk on this wire is another dialect's answer,
+        // not an event to skip: it can never reach `message_stop`, so the
+        // refusal lands at the first chunk instead of as an unknown terminal.
+        let chat_shaped = payload.get("choices").is_some()
+            || payload
+                .get("object")
+                .and_then(Value::as_str)
+                .is_some_and(|object| object.starts_with("chat.completion"));
+        if chat_shaped {
+            return Err(ProviderError::IncompatibleOutput {
+                connection: self.connection.clone(),
+                reason: bounded_reason("chat completions chunk on the messages wire"),
+            });
+        }
         let name = if event.event.is_empty() {
             payload
                 .get("type")
