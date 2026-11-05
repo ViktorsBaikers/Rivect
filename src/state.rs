@@ -56,6 +56,8 @@ pub enum Missing {
     Settlement(String),
     #[error("work budget {0}")]
     WorkBudget(String),
+    #[error("sharing grant {0}")]
+    SharingGrant(String),
     #[error("obligation")]
     Obligation,
     #[error("learning delta {0}")]
@@ -141,6 +143,8 @@ pub enum ConflictCause {
     WorkBudgetExists { task_id: String, state: String },
     #[error("work budget for task {task_id} is already stopped")]
     WorkBudgetStopped { task_id: String },
+    #[error("sharing grant {grant_id} is {state}")]
+    SharingGrantClosed { grant_id: String, state: String },
     #[error(
         "work send bound {send_bound} reached for task {task_id} at {settled_sends} settled sends"
     )]
@@ -200,6 +204,8 @@ pub enum InvalidCause {
     BudgetUnitsOutOfRange(u64),
     #[error("work budget {field} {value} exceeds the storable range")]
     WorkBudgetBoundOutOfRange { field: &'static str, value: u64 },
+    #[error("sharing grant expiry {0} exceeds the storable range")]
+    SharingExpiryOutOfRange(u64),
     #[error("budget reservation must name at least one scope")]
     EmptyBudgetScopes,
     #[error("confirmed cost {confirmed} exceeds reservation bound {bound}")]
@@ -6866,6 +6872,193 @@ impl TaskStore {
         .transpose()
     }
 
+    // ----- scoped local sharing (AC-083b) -----
+
+    /// Opens one observer grant: the row records only the token's SHA-256
+    /// digest and its absolute expiry, and it names a task that must belong
+    /// to `session_id`. A mismatched pair records nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidInput`] for an expiry the column cannot store, and
+    /// [`StoreError::NotFound`] with a task cause when the session holds no
+    /// such task.
+    pub fn open_sharing_grant(
+        &mut self,
+        grant_id: &str,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        token_digest: &str,
+        expires_at: u64,
+    ) -> Result<SharingGrant> {
+        let stored_expiry = sharing_expiry_i64(expires_at)?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        let inserted = tx
+            .execute(
+                sql::INSERT_SHARING_GRANT,
+                params![
+                    grant_id,
+                    task_id.0,
+                    token_digest,
+                    stored_expiry,
+                    session_id.0
+                ],
+            )
+            .map_err(storage)?;
+        if inserted == 0 {
+            return Err(StoreError::missing_task(&task_id.0));
+        }
+        let grant = Self::sharing_grant_on(&tx, grant_id)?;
+        tx.commit().map_err(storage)?;
+        grant.ok_or_else(|| StoreError::NotFound(Missing::SharingGrant(grant_id.to_string())))
+    }
+
+    /// Revokes one grant terminally if it belongs to `session_id`. A second
+    /// revoke changes nothing and reports the recorded state, so the wire
+    /// stays idempotent while the row never reopens. A grant owned by another
+    /// session earns the same `NotFound` an absent id does, so the wire never
+    /// reveals another session's grant.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with a sharing-grant cause when the id is
+    /// absent or names another session's task, and the storage failure of the
+    /// write.
+    pub fn revoke_sharing_grant(
+        &mut self,
+        grant_id: &str,
+        session_id: &SessionId,
+    ) -> Result<SharingGrant> {
+        self.transition_sharing_grant(grant_id, Some(session_id), false, |tx| {
+            tx.execute(sql::REVOKE_SHARING_GRANT, params![grant_id])
+        })
+    }
+
+    /// Marks one grant expired once the clock has passed its recorded
+    /// expiry. The guard repeats the deadline check in SQL, so a request that
+    /// raced a clock change writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with a sharing-grant cause for an id this
+    /// store does not hold, [`StoreError::Conflict`] with
+    /// `SharingGrantClosed` when the guarded transition matched no open row,
+    /// and the storage failure of the write.
+    pub fn expire_sharing_grant(
+        &mut self,
+        grant_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<SharingGrant> {
+        let stored_now = sharing_expiry_i64(now_unix_seconds)?;
+        self.transition_sharing_grant(grant_id, None, true, |tx| {
+            tx.execute(sql::EXPIRE_SHARING_GRANT, params![grant_id, stored_now])
+        })
+    }
+
+    /// Marks one grant failed terminally when its listener can no longer
+    /// accept: the row must not read `open` beside a dead surface. An
+    /// already-terminal row is returned unchanged, so the transition is
+    /// idempotent and never reopens a grant.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] with a sharing-grant cause for an id this
+    /// store does not hold, and the storage failure of the write.
+    pub fn fail_sharing_grant(&mut self, grant_id: &str) -> Result<SharingGrant> {
+        self.transition_sharing_grant(grant_id, None, false, |tx| {
+            tx.execute(sql::FAIL_SHARING_GRANT, params![grant_id])
+        })
+    }
+
+    /// Fails every leftover `open` row at runtime open: a grant's listener
+    /// does not survive the process, so the row must not read `open` beside a
+    /// dead surface. Idempotent, and terminal rows are never touched.
+    ///
+    /// # Errors
+    /// The storage failure of the sweep; the open that called it fails.
+    pub fn fail_open_sharing_grants(&mut self) -> Result<()> {
+        self.conn_mut()?
+            .execute(sql::FAIL_OPEN_SHARING_GRANTS, [])
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// The one terminal-transition body: open an `IMMEDIATE` transaction,
+    /// apply the guarded statement, read the row back and — when the caller
+    /// requires the transition — refuse a statement that matched no row. A
+    /// session-scoped transition first proves the grant's task belongs to that
+    /// session, so another session's grant is the same `NotFound` an absent id
+    /// earns.
+    fn transition_sharing_grant(
+        &mut self,
+        grant_id: &str,
+        session_id: Option<&SessionId>,
+        require_transition: bool,
+        apply: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<usize>,
+    ) -> Result<SharingGrant> {
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        if let Some(session_id) = session_id {
+            let owner: Option<String> = tx
+                .query_row(sql::SHARING_GRANT_SESSION, params![grant_id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(storage)?;
+            if owner.as_deref() != Some(session_id.0.as_str()) {
+                return Err(StoreError::NotFound(Missing::SharingGrant(
+                    grant_id.to_string(),
+                )));
+            }
+        }
+        let matched = apply(&tx).map_err(storage)?;
+        let grant = Self::sharing_grant_on(&tx, grant_id)?;
+        let Some(grant) = grant else {
+            return Err(StoreError::NotFound(Missing::SharingGrant(
+                grant_id.to_string(),
+            )));
+        };
+        if require_transition && matched == 0 {
+            // The row was already terminal (or still ahead of the clock):
+            // reporting it as this transition's result would claim a write
+            // that never happened.
+            return Err(StoreError::Conflict(ConflictCause::SharingGrantClosed {
+                grant_id: grant.grant_id.clone(),
+                state: grant.state.as_str().to_string(),
+            }));
+        }
+        tx.commit().map_err(storage)?;
+        Ok(grant)
+    }
+
+    /// The one-row read shared by the open and the terminal transitions, so
+    /// each returns the row it just wrote without a second connection.
+    fn sharing_grant_on(conn: &Connection, grant_id: &str) -> Result<Option<SharingGrant>> {
+        let row = conn
+            .query_row(sql::SHARING_GRANT_ROW, params![grant_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .optional()
+            .map_err(storage)?;
+        row.map(|(grant_id, task_id, token_digest, expires_at, state)| {
+            Ok(SharingGrant {
+                grant_id,
+                task_id,
+                token_digest,
+                expires_at: unsigned(expires_at)?,
+                state: SharingGrantState::from_db(&state)?,
+            })
+        })
+        .transpose()
+    }
+
     // ----- usage settlements (AC-057) -----
 
     /// Begins one dispatched child attempt (AC-057, DEC-012): the frozen
@@ -8094,6 +8287,22 @@ impl StoreWriter<'_> {
     }
 
     /// # Errors
+    /// See [`TaskStore::expire_sharing_grant`].
+    pub fn expire_sharing_grant(
+        &mut self,
+        grant_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<SharingGrant> {
+        self.store.expire_sharing_grant(grant_id, now_unix_seconds)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::fail_sharing_grant`].
+    pub fn fail_sharing_grant(&mut self, grant_id: &str) -> Result<SharingGrant> {
+        self.store.fail_sharing_grant(grant_id)
+    }
+
+    /// # Errors
     /// See [`TaskStore::budget_reserve`].
     pub fn budget_reserve(
         &mut self,
@@ -8398,6 +8607,57 @@ impl WorkBudgetState {
             "open" => Ok(Self::Open),
             "stopped" => Ok(Self::Stopped),
             _ => Err(corrupt_column("work budget state", raw)),
+        }
+    }
+}
+
+/// One observer grant row (AC-083b): the task it exposes, the token's
+/// digest, the absolute expiry and the terminal state. The plaintext token
+/// exists only in the open call's answer, never in this row or its `Debug`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharingGrant {
+    pub grant_id: String,
+    pub task_id: String,
+    /// The SHA-256 hex the attach exchange compares; never the token.
+    pub token_digest: String,
+    /// Seconds since the Unix epoch.
+    pub expires_at: u64,
+    pub state: SharingGrantState,
+}
+
+/// The four grant states: an open grant is live until its expiry; revoked,
+/// expired and failed are terminal — none reopens, and a fresh request is a
+/// new grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharingGrantState {
+    Open,
+    Revoked,
+    Expired,
+    /// The listener could not accept and closed; the row says so instead of
+    /// reading `open` beside a dead surface.
+    Failed,
+}
+
+impl SharingGrantState {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// A column value off the recorded set is a corrupted row: the read
+    /// fails instead of guessing a lifecycle.
+    pub(crate) fn from_db(raw: &str) -> Result<Self> {
+        match raw {
+            "open" => Ok(Self::Open),
+            "revoked" => Ok(Self::Revoked),
+            "expired" => Ok(Self::Expired),
+            "failed" => Ok(Self::Failed),
+            _ => Err(corrupt_column("sharing grant state", raw)),
         }
     }
 }
@@ -8752,6 +9012,13 @@ fn work_bound_i64(field: &'static str, value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_overflow| {
         StoreError::InvalidInput(InvalidCause::WorkBudgetBoundOutOfRange { field, value })
     })
+}
+
+/// A grant expiry is stored as signed seconds like every other timestamp;
+/// a value past the column's range is refused rather than wrapped.
+fn sharing_expiry_i64(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_overflow| StoreError::InvalidInput(InvalidCause::SharingExpiryOutOfRange(value)))
 }
 
 /// Ledger columns are written non-negative; a negative value is corrupt

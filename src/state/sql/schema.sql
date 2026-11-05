@@ -308,3 +308,14 @@ CREATE TABLE IF NOT EXISTS work_budgets (
     state TEXT NOT NULL,
     stop_reason TEXT
 ) STRICT;
+-- Scoped local sharing (AC-083b): one row per observer grant. The token is
+-- never stored — `token_digest` is the SHA-256 hex the exchange compares —
+-- and `state` is terminal once revoked, expired or failed. Additive and
+-- ignored by a build without it: no generation bump.
+CREATE TABLE IF NOT EXISTS sharing_grants (
+    grant_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    token_digest TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL
+) STRICT;

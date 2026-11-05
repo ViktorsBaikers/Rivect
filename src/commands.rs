@@ -34,12 +34,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 
+/// The scoped local sharing boundary (AC-083b): the socket, the token
+/// digest and the observer gate live beside the dispatcher that admits
+/// their methods, so the share module needs no crate-root declaration.
+#[path = "sharing.rs"]
+pub mod sharing;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ingress {
     /// Trusted explicit CLI/TUI input adapter: server-owned human origin.
     TrustedHuman,
     /// Plain SDK/machine JSON: never proves human consent.
     Machine,
+    /// A granted observer over the local share socket: read-only projections
+    /// only, and never a durable effect.
+    Observer,
 }
 
 /// One recorded budget refusal: the reason a surface paints for a task whose
@@ -165,6 +174,11 @@ pub struct Runtime {
     /// the Unix epoch. The default is the system clock; a proof injects a
     /// fixed one so a recorded deadline is deterministic.
     pub work_clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The scoped sharing surface (AC-083b): no listener while no grant is
+    /// open, and every serving turn runs on this runtime's own thread so the
+    /// one store connection stays the only one. The mutex exists only to
+    /// split that borrow from the dispatcher that needs the runtime.
+    pub(crate) sharing: Arc<std::sync::Mutex<sharing::SharingService>>,
     /// The one index seam this runtime shares with every action handler:
     /// the pinned project root and the capped worker that parses it
     /// (AC-036c, DEC-031). One root, one worker program, one helper, one
@@ -1320,6 +1334,7 @@ impl Runtime {
             cache_rate: CacheRate::default(),
             budget_waiting: BTreeMap::new(),
             work_clock: Box::new(system_seconds),
+            sharing: Arc::new(std::sync::Mutex::new(sharing::SharingService::default())),
             index: IndexSeam {
                 root: data_root.to_path_buf(),
                 watch_refusal: None,
@@ -1343,6 +1358,12 @@ impl Runtime {
             index_seal_control: IndexSealControl::default(),
             index_run_task: None,
         };
+        // No share listener survives a process, so a row left `open` by the
+        // previous one must not read `open` beside a dead surface.
+        if let Err(error) = runtime.owner.store.fail_open_sharing_grants() {
+            let diagnostics = runtime.boot_diagnostics.clone();
+            return Err(open_failure(OwnerError::from(error), &diagnostics));
+        }
         // The broker's candidate re-check view tracks the effective
         // config from boot (AC-045b); every admitted config edit
         // re-pushes it through the same seam.
@@ -1840,6 +1861,9 @@ const METHODS: &[&str] = &[
     "artifact.read",
     "long_work.start",
     "long_work.stop",
+    "sharing.grant.open",
+    "sharing.attach",
+    "sharing.grant.revoke",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1941,6 +1965,10 @@ enum RequestError {
         "machine steer without a trusted human ingress is denied; the intent revision is preserved"
     )]
     MachineSteerDenied,
+    #[error("method {method} is not available to an observer")]
+    ObserverDenied { method: String },
+    #[error("observer request names {field} outside its grant")]
+    ObserverScopeDenied { field: &'static str },
     #[error("revision fields are required")]
     MissingRevisionFields,
     #[error(transparent)]
@@ -1963,7 +1991,9 @@ impl RequestError {
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
             Self::MachineAnswerDenied
             | Self::MachineSteerDenied
-            | Self::MachineHookDenied { .. } => ErrorCode::Denied,
+            | Self::MachineHookDenied { .. }
+            | Self::ObserverDenied { .. }
+            | Self::ObserverScopeDenied { .. } => ErrorCode::Denied,
             Self::SessionInFlight { .. } => ErrorCode::Conflict,
             Self::SourceDigestMismatch => ErrorCode::Conflict,
             Self::Serialization => ErrorCode::InternalError,
@@ -1988,6 +2018,8 @@ impl RequestError {
             | Self::MachineAnswerDenied
             | Self::MachineSteerDenied
             | Self::MachineHookDenied { .. }
+            | Self::ObserverDenied { .. }
+            | Self::ObserverScopeDenied { .. }
             | Self::SourceDigestMismatch
             | Self::MethodUnavailable { .. }
             | Self::ProjectIndex(_)
@@ -2010,6 +2042,11 @@ pub fn dispatch_runtime_request(
     connection_id: &str,
     request: &str,
 ) -> String {
+    // Every dispatch turn also advances the opt-in share surface: observer
+    // frames are answered on this thread because the store has one writer.
+    // shortcut: an idle loop serves its next observer frame only after local
+    // input; upgrade when the main/TUI loops gain a dedicated share wake arm.
+    rt.serve_sharing();
     let response = dispatch_inner(rt, ingress, connection_id, request);
     if rt.take_deferral_mark() {
         // `project.init` handed its run to the off-path owner and owes an
@@ -2089,6 +2126,9 @@ pub fn dispatch_step(
     connection_id: &str,
     request: &str,
 ) -> DispatchStep {
+    // A loop turn advances the share surface exactly as the synchronous
+    // entry does, before the local request is routed.
+    rt.serve_sharing();
     let response = dispatch_inner(rt, ingress, connection_id, request);
     // Only the request that started the run is owed an answer. Any other
     // request is answered now, so a second request arriving while a run
@@ -2099,6 +2139,102 @@ pub fn dispatch_step(
     } else {
         DispatchStep::Ready(encode(&response))
     }
+}
+
+/// The only methods a granted observer may call (AC-083b): read-only
+/// projections that neither steer a task nor export a transcript.
+const OBSERVER_METHODS: &[&str] = &[
+    "runtime.status",
+    "task.snapshot",
+    "task.collection",
+    "command.describe",
+];
+
+/// The attach exchange is the one method a connection may call before it
+/// holds an attachment; every other method needs the live attachment first.
+pub(crate) const SHARING_ATTACH_METHOD: &str = "sharing.attach";
+
+/// The observer allowlist as the attach answer serves it.
+pub(crate) fn observer_methods() -> &'static [&'static str] {
+    OBSERVER_METHODS
+}
+
+/// Routes one observer frame through the same dispatcher as every other
+/// ingress, after the allowlist gate: a method outside it is refused before
+/// its body runs, and the frame's session/task ids are bound to the grant —
+/// a mismatched id is refused and a missing one is filled from the grant, so
+/// an attachment can never read another session's or task's projection.
+pub(crate) fn dispatch_observer_request(
+    rt: &mut Runtime,
+    connection_id: &str,
+    session_id: &str,
+    task_id: &str,
+    request: &str,
+) -> String {
+    let mut parsed: Value = match serde_json::from_str(request) {
+        Ok(value) => value,
+        Err(_) => return encode(&request_error(Value::Null, RequestError::InvalidJson)),
+    };
+    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    let method = parsed
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !OBSERVER_METHODS.contains(&method.as_str()) {
+        return encode(&request_error(id, RequestError::ObserverDenied { method }));
+    }
+    let Some(params) = parsed.get_mut("params").and_then(Value::as_object_mut) else {
+        return encode(&request_error(id, RequestError::ParamsNotObject));
+    };
+    for (field, granted, required) in [
+        (
+            "session_id",
+            session_id,
+            matches!(
+                method.as_str(),
+                "runtime.status" | "task.snapshot" | "task.collection"
+            ),
+        ),
+        (
+            "task_id",
+            task_id,
+            matches!(method.as_str(), "task.snapshot" | "task.collection"),
+        ),
+    ] {
+        match params.get(field).and_then(Value::as_str) {
+            Some(requested) if requested != granted => {
+                return encode(&request_error(
+                    id,
+                    RequestError::ObserverScopeDenied { field },
+                ));
+            }
+            Some(_) => {}
+            None if required => {
+                params.insert(field.to_string(), Value::String(granted.to_string()));
+            }
+            None => {}
+        }
+    }
+    let Ok(rewritten) = serde_json::to_string(&parsed) else {
+        return encode(&request_error(id, RequestError::Serialization));
+    };
+    encode(&dispatch_inner(
+        rt,
+        Ingress::Observer,
+        connection_id,
+        &rewritten,
+    ))
+}
+
+/// One sharing-boundary refusal as the wire serves it. The message is the
+/// owner's own and never carries the token.
+pub(crate) fn share_refusal(id: &Value, error: &sharing::SharingError) -> String {
+    encode(&share_response(id.clone(), error))
+}
+
+fn share_response(id: Value, error: &sharing::SharingError) -> RpcResponse {
+    envelope_error(id, error.code(), -32000, &error.to_string())
 }
 
 fn dispatch_inner(
@@ -2138,6 +2274,18 @@ fn dispatch_inner(
     let params = parsed["params"].clone();
     if !METHODS.contains(&method.as_str()) {
         return request_error(id, RequestError::UnknownMethod { method });
+    }
+    // The observer boundary is enforced here, on the one dispatch path: an
+    // observer frame may only carry an allowlisted projection, so no direct
+    // `Ingress::Observer` call reaches a durable method even when a caller
+    // bypasses the share module's own gate.
+    if matches!(ingress, Ingress::Observer) && !OBSERVER_METHODS.contains(&method.as_str()) {
+        return request_error(
+            id,
+            RequestError::ObserverDenied {
+                method: method.clone(),
+            },
+        );
     }
     let schema = params.get("schema_version").and_then(Value::as_u64);
     match schema {
@@ -3225,6 +3373,7 @@ fn decisions_control(rt: &mut Runtime, id: Value, params: &Value, ingress: Ingre
     let principal = match ingress {
         Ingress::TrustedHuman => "local_user",
         Ingress::Machine => "machine",
+        Ingress::Observer => "observer",
     };
     // The receipt check precedes the freshness gate: a retry arrives
     // with the digest it was issued against — already stale once the
@@ -3538,6 +3687,9 @@ fn handle_method(
         "task.submit" => submit_task(rt, ingress, params, id),
         "long_work.start" => long_work_start(rt, &params, id),
         "long_work.stop" => long_work_stop(rt, &params, id),
+        "sharing.grant.open" => sharing_grant_open(rt, ingress, &params, id),
+        "sharing.attach" => sharing_attach(rt, &params, id),
+        "sharing.grant.revoke" => sharing_grant_revoke(rt, ingress, &params, id),
         "task.snapshot" => {
             let Some(_session) = session_param(&params) else {
                 return missing_session(id);
@@ -4816,6 +4968,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
     let principal = match ingress {
         Ingress::TrustedHuman => "local_user",
         Ingress::Machine => "machine",
+        Ingress::Observer => "observer",
     };
     match kind.as_str() {
         "create" => {
@@ -4896,7 +5049,9 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
             if matches!(ingress, Ingress::Machine) {
                 // Fail closed: an SDK answer never proves human consent,
                 // the pending question is preserved untouched — and the
-                // attempt itself is journaled denied.
+                // attempt itself is journaled denied. An observer is refused
+                // earlier by the dispatcher's allowlist gate, which is the
+                // boundary and runs before this handler.
                 if let Err(err) = journal_denied_answer(
                     &mut rt.owner.store,
                     &task,
@@ -5083,7 +5238,8 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 // Fail closed before any row moves: an SDK steer never
                 // proves human intent, so the intent revision, the pending
                 // question and the task revision stay exactly where the
-                // caller found them (AC-009, INV-003).
+                // caller found them (AC-009, INV-003). An observer is
+                // refused earlier by the dispatcher's allowlist gate.
                 return request_error(id, RequestError::MachineSteerDenied);
             }
             let (Some(expected_intent), Some(expected_task)) = (
@@ -5262,6 +5418,119 @@ fn work_budget_result(budget: &crate::state::WorkBudget) -> Value {
         "state": budget.state.as_str(),
         "stop_reason": budget.stop_reason,
     })
+}
+
+/// Grant management accepts the trusted human and the stdio machine ingress:
+/// the headless CLI's request is the same local user driving the same data
+/// root, so it may open or close a grant. The socket observer may not — it is
+/// the untrusted read boundary the grant exists to constrain.
+fn grant_ingress_denied(ingress: Ingress, id: Value, method: &'static str) -> Option<RpcResponse> {
+    matches!(ingress, Ingress::Observer).then(|| {
+        request_error(
+            id,
+            RequestError::ObserverDenied {
+                method: method.to_string(),
+            },
+        )
+    })
+}
+
+/// `sharing.grant.open` (AC-083b): mints the 256-bit token, records only its
+/// digest, starts the grant's private socket and returns the plaintext once.
+fn sharing_grant_open(
+    rt: &mut Runtime,
+    ingress: Ingress,
+    params: &Value,
+    id: Value,
+) -> RpcResponse {
+    if let Some(response) = grant_ingress_denied(ingress, id.clone(), "sharing.grant.open") {
+        return response;
+    }
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let ttl_seconds = match params.get("ttl_seconds") {
+        None => sharing::DEFAULT_GRANT_SECONDS,
+        Some(value) => match value.as_u64() {
+            Some(ttl) if ttl > 0 && ttl <= sharing::MAX_GRANT_SECONDS => ttl,
+            _ => {
+                return request_error(
+                    id,
+                    RequestError::InvalidParameter {
+                        name: "ttl_seconds",
+                    },
+                );
+            }
+        },
+    };
+    match rt.open_sharing_grant(&session, &task, ttl_seconds) {
+        Ok(opened) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "grant_id": opened.grant_id,
+                "token": opened.token,
+                "task_id": opened.task_id,
+                "socket_path": opened.socket_path,
+                "expires_at": opened.expires_at,
+                "state": "open",
+            }),
+        ),
+        Err(error) => share_response(id, &error),
+    }
+}
+
+/// `sharing.attach` (AC-083b): exchanges a grant token for a read-only
+/// attachment. A token no live grant holds is the same denial as a wrong
+/// one, and an expired grant is closed before the refusal.
+fn sharing_attach(rt: &mut Runtime, params: &Value, id: Value) -> RpcResponse {
+    let Some(token) = params.get("token").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "token" });
+    };
+    match rt.attach_sharing(token) {
+        Ok(attachment) => match serde_json::to_value(attachment) {
+            Ok(view) => RpcResponse::ok(id, view),
+            // A success that cannot serialize is never reported as a null
+            // result: it is the same internal failure the envelope names.
+            Err(_error) => request_error(id, RequestError::Serialization),
+        },
+        Err(error) => share_response(id, &error),
+    }
+}
+
+/// `sharing.grant.revoke` (AC-083b): the row moves to `revoked` once and the
+/// listener closes; the next observer request is refused. The session the
+/// request names must own the grant's task, so one session cannot revoke
+/// another's grant.
+fn sharing_grant_revoke(
+    rt: &mut Runtime,
+    ingress: Ingress,
+    params: &Value,
+    id: Value,
+) -> RpcResponse {
+    if let Some(response) = grant_ingress_denied(ingress, id.clone(), "sharing.grant.revoke") {
+        return response;
+    }
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(grant_id) = params.get("grant_id").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "grant_id" });
+    };
+    match rt.revoke_sharing_grant(&session, grant_id) {
+        Ok(revoked) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "grant_id": revoked.grant_id,
+                "state": revoked.state,
+            }),
+        ),
+        Err(error) => share_response(id, &error),
+    }
 }
 
 /// A denied answer attempt that never reaches `answer_question` still

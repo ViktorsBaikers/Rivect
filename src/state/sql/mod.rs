@@ -486,6 +486,36 @@ pub const WORK_BUDGET_ROW: &str =
 pub const STOP_WORK_BUDGET: &str = "UPDATE work_budgets SET state = 'stopped', stop_reason = ?2
              WHERE task_id = ?1 AND state = 'open'";
 
+// ----- scoped local sharing (AC-083b) -----
+
+/// The grant's task must belong to the session that opened it: the insert
+/// selects the task row, so a grant over another session's task records
+/// nothing. `token_digest` is the only at-rest form of the token.
+pub const INSERT_SHARING_GRANT: &str = "INSERT INTO sharing_grants
+             (grant_id, task_id, token_digest, expires_at, state)
+             SELECT ?1, ?2, ?3, ?4, 'open'
+             WHERE EXISTS (SELECT 1 FROM tasks WHERE task_id = ?2 AND session_id = ?5)";
+pub const SHARING_GRANT_ROW: &str = "SELECT grant_id, task_id, token_digest, expires_at, state
+             FROM sharing_grants WHERE grant_id = ?1";
+/// Revoke and expiry are terminal transitions: the guard matches only an open
+/// row, so a second transition writes nothing and never reopens a grant.
+pub const REVOKE_SHARING_GRANT: &str =
+    "UPDATE sharing_grants SET state = 'revoked' WHERE grant_id = ?1 AND state = 'open'";
+pub const EXPIRE_SHARING_GRANT: &str = "UPDATE sharing_grants SET state = 'expired'
+             WHERE grant_id = ?1 AND state = 'open' AND expires_at <= ?2";
+/// A listener that cannot accept is closed and its row records why; the
+/// guard keeps a terminal row exactly as it was.
+pub const FAIL_SHARING_GRANT: &str = "UPDATE sharing_grants SET state = 'failed'
+             WHERE grant_id = ?1 AND state = 'open'";
+/// Runtime open fails every leftover open row: no listener survived the
+/// process, so the row must never read `open` beside a dead surface.
+pub const FAIL_OPEN_SHARING_GRANTS: &str = "UPDATE sharing_grants SET state = 'failed'
+             WHERE state = 'open'";
+/// The session that owns one grant's task: a revoke must name it, so another
+/// session's grant is refused as absent.
+pub const SHARING_GRANT_SESSION: &str = "SELECT t.session_id FROM sharing_grants g
+             JOIN tasks t ON t.task_id = g.task_id WHERE g.grant_id = ?1";
+
 // ----- plan selection, plan obligations, plan revisions, gate holds -----
 
 pub const PLAN_SELECTION: &str =
