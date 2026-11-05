@@ -2935,12 +2935,12 @@ fn cli_edit_walk_answers_every_models_scope_the_file_surface_names() {
     }
 }
 
-/// F1: one uniform rule for keys the edit surface cannot target — a key
-/// that spells a legal schema location with no EditTarget is
-/// `KeyNotEditable`, never "unknown": the file surface accepts every
-/// spelling below.
+/// F1: keys the edit surface cannot target answer their own typed refusal —
+/// `KeyNotEditable` for a legal schema location with no EditTarget, the
+/// document-only sentence for a connection's identity fields — never
+/// "unknown": the file surface accepts every spelling below.
 #[test]
-fn legal_keys_without_edit_targets_answer_not_editable_never_unknown() {
+fn legal_keys_without_edit_targets_answer_typed_refusals_never_unknown() {
     // File twins: each spelling is legal TOML the corpus carries.
     Config::parse_validated(&support::base_config())
         .expect("models, connections and their fields are legal spellings");
@@ -2984,15 +2984,15 @@ fn legal_keys_without_edit_targets_answer_not_editable_never_unknown() {
         ),
         (
             "connections.primary.kind",
-            "schema connections.primary.kind: key connections.primary.kind is not editable",
+            "schema connections.primary.kind: connections.primary.kind is document-only; declare it in the config file (config.toml); not editable through config.set",
         ),
         (
             "connections.primary.endpoint",
-            "schema connections.primary.endpoint: key connections.primary.endpoint is not editable",
+            "schema connections.primary.endpoint: connections.primary.endpoint is document-only; declare it in the config file (config.toml); not editable through config.set",
         ),
         (
             "connections.primary.credential_ref",
-            "schema connections.primary.credential_ref: key connections.primary.credential_ref is not editable",
+            "schema connections.primary.credential_ref: connections.primary.credential_ref is document-only; declare it in the config file (config.toml); not editable through config.set",
         ),
         ("workflow", "schema workflow: key workflow is not editable"),
     ].iter().enumerate() {
@@ -3004,7 +3004,7 @@ fn legal_keys_without_edit_targets_answer_not_editable_never_unknown() {
         }));
         assert_eq!(
             response["error"]["data"]["message"], expected,
-            "legal-but-untargetable must answer not-editable: {response}"
+            "legal-but-untargetable must answer its typed refusal: {response}"
         );
     }
 }

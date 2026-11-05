@@ -6368,3 +6368,108 @@ async fn codex_exchange_denial_and_wrong_callback_path_deny_typed() {
         "neither denial activates a profile"
     );
 }
+
+// ----- api-key class: vercel-ai-gateway ---------------------------------
+
+/// The `vercel-ai-gateway` keyed route (AC-040j): the gateway key
+/// resolves through the scoped `SecretRef`/DEC-013 precedence — the
+/// connection's own ref and a bound profile's ref both resolve, a
+/// divergent profile scope is the mismatch, and an unbound id stays
+/// offline-ineligible. Resolution is binding-level.
+#[test]
+fn vercel_ai_gateway_keyed_route_resolves_through_the_scoped_secret_ref() {
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.vercel-ai-gateway]\nkind = \"api_key\"\nendpoint = \"https://ai-gateway.vercel.sh\"\ncredential_ref = \"keyring:rivect-test/vercel-direct\"\n\
+         [connections.vercel-profiled]\nkind = \"api_key\"\nendpoint = \"https://ai-gateway.vercel.sh\"\ncredential_ref = \"keyring:rivect-test/vercel-scope\"\nprofile = \"vercel-team\"\n\
+         [profiles.vercel-team]\ncredential_ref = \"keyring:rivect-test/vercel-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "vercel-ai-gateway")
+        .unwrap_or_else(|e| panic!("the gateway ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/vercel-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let resolved = resolve_credential(&config, "vercel-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/vercel-team");
+
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "vercel-ai-gateway",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/vercel-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    assert!(
+        matches!(
+            resolve_credential(&mismatched, "vercel-profiled"),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ),
+        "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}
+
+/// A connection's identity — `kind`, `endpoint` and `credential_ref` —
+/// is the document's own: the edit surface answers the document-only
+/// sentence, names `config.toml`, and moves nothing in the retained
+/// document.
+#[test]
+fn config_endpoint_edit_names_config_toml() {
+    let toml = "config_version = 1\n\
+         [connections.vercel-ai-gateway]\nkind = \"api_key\"\nendpoint = \"https://ai-gateway.vercel.sh\"\ncredential_ref = \"keyring:rivect-test/vercel-direct\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let mut config = Config::parse_validated(toml).expect("config parses");
+    let revision = config.revision();
+
+    for (key, value) in [
+        (
+            "connections.vercel-ai-gateway.kind",
+            ConfigValue::Text("local".to_string()),
+        ),
+        (
+            "connections.vercel-ai-gateway.endpoint",
+            ConfigValue::Text("https://proxy.example.invalid".to_string()),
+        ),
+        (
+            "connections.vercel-ai-gateway.credential_ref",
+            ConfigValue::Text("keyring:rivect-test/other".to_string()),
+        ),
+    ] {
+        let refused = config
+            .set(key, value)
+            .expect_err("the connection identity is document-only");
+        assert!(
+            matches!(&refused.issue, ConfigIssue::DocumentOnlyKey { key: denied } if denied == key),
+            "the typed document-only refusal names {key}: {refused}"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.contains("document-only"),
+            "the answer states the document-only rule: {message}"
+        );
+        assert!(
+            message.contains("config.toml"),
+            "the answer names the file that can write it: {message}"
+        );
+        assert_eq!(
+            config.revision(),
+            revision,
+            "a refused identity edit never moves the document"
+        );
+    }
+}

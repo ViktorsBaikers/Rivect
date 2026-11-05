@@ -55,6 +55,12 @@
 //! The login lifecycle itself ([`anthropic_login`]) is library-level; no
 //! CLI verb is added.
 //!
+//! `vercel-ai-gateway` records the gateway's Messages surface on the
+//! `https://ai-gateway.vercel.sh` root: the gateway key rides
+//! `Authorization: Bearer`, and the keyed `/v1/models` listing's
+//! `tool-use` tag is the closed table — a row without the tag is never
+//! offered, and a pin outside the tagged set denies before the body.
+//!
 //! `openai-codex` records the Codex OAuth form (DEC-020): the browser
 //! code+PKCE leg and its device alias both write one canonical
 //! `kind = "api_key"` profile through [`openai_login`], so the Broker's
@@ -1356,8 +1362,9 @@ pub enum Dialect {
     /// id shares (HZN-008 class S).
     ChatCompletions,
     /// The Anthropic Messages API (`POST {endpoint}/v1/messages`, SSE):
-    /// the recorded dialect of `anthropic`, `minimax`, `umans` and
-    /// `cloudflare-ai-gateway`, never inferred from an auth label.
+    /// the recorded dialect of `anthropic`, `minimax`, `umans`,
+    /// `cloudflare-ai-gateway` and `vercel-ai-gateway`, never inferred
+    /// from an auth label.
     Messages,
     /// The native Ollama Cloud chat API (`POST {endpoint}/api/chat`,
     /// newline-delimited JSON) — the recorded dialect of the literal
@@ -1399,6 +1406,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "minimax" => Some(Dialect::Messages),
         "umans" => Some(Dialect::Messages),
         "cloudflare-ai-gateway" => Some(Dialect::Messages),
+        "vercel-ai-gateway" => Some(Dialect::Messages),
         "gitlab-duo" => Some(Dialect::ChatCompletions),
         "opencode-go" => Some(Dialect::ChatCompletions),
         "opencode-zen" => Some(Dialect::ChatCompletions),

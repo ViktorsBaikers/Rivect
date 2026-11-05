@@ -7807,3 +7807,73 @@ fn openai_codex_never_falls_back_across_id_or_region() {
         );
     }
 }
+
+/// The gateway id owns the Messages dialect and never substitutes a
+/// sibling id or a region default: the adapter refuses a foreign pin
+/// before any wire leg, and a configured region stays the typed denial.
+#[test]
+fn vercel_ai_gateway_never_falls_back_across_id_or_region() {
+    assert_eq!(
+        rivect::providers::dialect_for("vercel-ai-gateway"),
+        Some(Dialect::Messages)
+    );
+    assert!(
+        rivect::providers::routes_for("vercel-ai-gateway").is_empty(),
+        "the gateway is single-dialect and records no cross-route table"
+    );
+    let toml = "config_version = 1\n\
+         [connections.vercel-ai-gateway]\nkind = \"api_key\"\nendpoint = \"http://127.0.0.1:1/v1\"\ncredential_ref = \"keyring:rivect-test/vercel-ai-gateway\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"vercel-ai-gateway\", model_id = \"anthropic/claude-opus-5\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"off\" }\n";
+    let config = Config::parse_validated(toml).expect("the gateway config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[(
+            "keyring:rivect-test/vercel-ai-gateway",
+            "fixture-vercel-key-not-real",
+        )],
+    ));
+    let built = config.clone();
+    let provider = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::new(&built, "vercel-ai-gateway", store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the gateway adapter builds");
+
+    let mut manifest = {
+        let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
+        broker
+            .prepare("main", &config, "/world/vercel", "goal: no fallback")
+            .expect("the gateway pin prepares")
+    };
+    manifest.model = ModelAssign::Fixed(FixedModel {
+        connection: "anthropic".to_string(),
+        model_id: "claude-opus-4-8".to_string(),
+    });
+    let (provider, outcome) = support::send_on_thread(provider, manifest);
+    assert!(
+        matches!(outcome, Err(ProviderError::DialectMismatch { .. })),
+        "a foreign pin never falls back into this adapter: {outcome:?}"
+    );
+    support::drop_blocking(provider);
+
+    let regional = Config::parse_validated(
+        &toml.replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("the regional config parses");
+    let store = Arc::new(support::MapStore::seeded(
+        rivect::providers::StoreKind::Keychain,
+        &[],
+    ));
+    let denied = std::thread::spawn(move || {
+        rivect::providers::anthropic::MessagesProvider::new(&regional, "vercel-ai-gateway", store)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect_err("a configured region never borrows another endpoint");
+    assert!(
+        matches!(&denied, ProviderError::RegionMismatch { connection, region }
+            if connection == "vercel-ai-gateway" && region == "eu"),
+        "the typed region denial: {denied:?}"
+    );
+}

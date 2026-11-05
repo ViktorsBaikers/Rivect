@@ -22,6 +22,12 @@
 //! parses it back and sends only its `access_token`, as
 //! `Authorization: Bearer` beside `anthropic-version` — the stored JSON
 //! and its refresh token never reach the wire or an `x-api-key` header.
+//!
+//! `vercel-ai-gateway` records the gateway's Messages surface on
+//! `https://ai-gateway.vercel.sh`: the gateway key rides
+//! `Authorization: Bearer`, and the keyed `/v1/models` listing's
+//! `tool-use` tag is the closed table — a row without the tag is never
+//! offered, and a pin outside the tagged set denies before the body.
 
 use super::anthropic_login::{LoginError, read_subscription};
 use super::sse::{SseEvent, SseParser};
@@ -63,6 +69,14 @@ const UMANS_DEFAULT_BASE: &str = "https://api.code.umans.ai";
 /// The recorded default base of the `minimax` arm; the configured base
 /// wins verbatim and inference appends `/v1/messages`.
 const MINIMAX_DEFAULT_BASE: &str = "https://api.minimax.io/anthropic";
+
+/// The recorded default base of the `vercel-ai-gateway` arm: the
+/// Messages-compatible gateway root, so inference appends `/v1/messages`.
+const VERCEL_DEFAULT_BASE: &str = "https://ai-gateway.vercel.sh";
+
+/// The recorded `/v1/models` capability tag that admits a model to this
+/// arm: a row without it is neither offered nor sent.
+const VERCEL_TOOL_USE_TAG: &str = "tool-use";
 
 /// The recorded static seed of the `cloudflare-ai-gateway` arm: no
 /// gateway listing exists, so this is the whole catalogue.
@@ -127,6 +141,11 @@ enum CatalogRule {
     /// (DEC-014): catalogue and send guard share one family set, so a
     /// CC/Responses-family id is neither offered nor sent here.
     KeyedRouteListing,
+    /// The `vercel-ai-gateway` keyed `/v1/models` listing filtered by
+    /// the recorded `tags` marker: only a `tool-use` row is offered, and
+    /// a pin outside the tagged set has no route here — HTTP 200 is not
+    /// entitlement.
+    ToolUseListing,
     /// The `umans` object-keyed listing: keys are wire model ids, values
     /// carry the stated capability surface. No seed floor — a retired
     /// cached id is never fabricated.
@@ -211,6 +230,16 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
                 prefix: CLOUDFLARE_MODEL_PREFIX,
             },
             credential: CredentialRule::CloudflareGateway,
+        }),
+        // The gateway root is the recorded Messages base, so inference
+        // appends `/v1/messages`; the gateway key rides `Authorization:
+        // Bearer`, and the catalogue is the keyed `/v1/models` listing's
+        // `tool-use` rows.
+        "vercel-ai-gateway" => Some(MessagesContract {
+            default_base: VERCEL_DEFAULT_BASE,
+            strip_v1: false,
+            catalog: CatalogRule::ToolUseListing,
+            credential: CredentialRule::Bearer,
         }),
         // DEC-013: the proxy base is recorded and the routed owner
         // passes it as the codec's configured endpoint; the wire model
@@ -587,9 +616,9 @@ impl MessagesProvider {
     /// offer set is static.
     fn catalog_url(&self) -> Option<String> {
         match self.contract.catalog {
-            CatalogRule::KeyedListing { .. } | CatalogRule::KeyedRouteListing => {
-                Some(models_url(&self.endpoint))
-            }
+            CatalogRule::KeyedListing { .. }
+            | CatalogRule::KeyedRouteListing
+            | CatalogRule::ToolUseListing => Some(models_url(&self.endpoint)),
             CatalogRule::ModelsInfo => Some(models_info_url(&self.endpoint)),
             CatalogRule::Allowlist(_) | CatalogRule::SeedAndPrefix { .. } => None,
         }
@@ -604,6 +633,7 @@ impl MessagesProvider {
             }
             CatalogRule::KeyedListing { .. }
             | CatalogRule::KeyedRouteListing
+            | CatalogRule::ToolUseListing
             | CatalogRule::ModelsInfo => None,
         }
     }
@@ -611,7 +641,9 @@ impl MessagesProvider {
     /// The listing payload under the literal id's recorded shape.
     fn listed_models(&self, body: &Value) -> Result<Vec<CatalogModel>, ProviderError> {
         match self.contract.catalog {
-            CatalogRule::KeyedListing { .. } | CatalogRule::KeyedRouteListing => {
+            CatalogRule::KeyedListing { .. }
+            | CatalogRule::KeyedRouteListing
+            | CatalogRule::ToolUseListing => {
                 let Some(data) = body.get("data").and_then(Value::as_array) else {
                     return Err(violation(
                         &self.connection,
@@ -643,8 +675,9 @@ impl MessagesProvider {
 
     /// One listed entry under the literal id's recorded rule. An entry
     /// without an id offers nothing; the frozen snapshot families are
-    /// excluded rather than remapped, and the gateway's listing keeps
-    /// only the ids its recorded route table sends on Messages.
+    /// excluded rather than remapped, the OpenCode gateway keeps only the
+    /// ids its recorded route table sends on Messages, and the Vercel
+    /// gateway keeps only the rows carrying the recorded `tool-use` tag.
     fn catalog_entry(&self, entry: &Value) -> Option<CatalogModel> {
         let id = entry
             .get("id")
@@ -667,6 +700,23 @@ impl MessagesProvider {
                 if route_for(&self.connection, id) != Some(Dialect::Messages) {
                     return None;
                 }
+            }
+            CatalogRule::ToolUseListing => {
+                let tagged = entry
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tags| {
+                        tags.iter()
+                            .any(|tag| tag.as_str() == Some(VERCEL_TOOL_USE_TAG))
+                    });
+                if !tagged {
+                    return None;
+                }
+                return Some(CatalogModel {
+                    id: id.to_string(),
+                    tools: true,
+                    ..CatalogModel::default()
+                });
             }
             CatalogRule::ModelsInfo
             | CatalogRule::Allowlist(_)
@@ -812,17 +862,28 @@ impl MessagesProvider {
     }
 
     /// An `Allowlist` arm records its whole serve set, a
-    /// `SeedAndPrefix` arm its upstream-provider route family, and the
+    /// `SeedAndPrefix` arm its upstream-provider route family, the
     /// gateway's `KeyedRouteListing` its Messages family from the same
-    /// route table the routed owner dispatches on: an id outside the
-    /// recorded set has no route here, so the denial lands before the
-    /// body, never as a wire request to a sibling id's model.
-    fn check_model(&self, model: &str) -> Result<(), ProviderError> {
+    /// route table the routed owner dispatches on, and the Vercel
+    /// gateway's `ToolUseListing` the rows the keyed `/v1/models` listing
+    /// tags `tool-use`: an id outside the recorded set has no route here,
+    /// so the denial lands before the body, never as a wire request to a
+    /// sibling id's model. The marker set travels in from
+    /// [`Self::admitted_listing`], whose typed read failures surface
+    /// before this check.
+    fn check_model(
+        &self,
+        model: &str,
+        offered: Option<&[CatalogModel]>,
+    ) -> Result<(), ProviderError> {
         let admitted = match self.contract.catalog {
             CatalogRule::Allowlist(ids) => ids.contains(&model),
             CatalogRule::SeedAndPrefix { prefix, .. } => model.starts_with(prefix),
             CatalogRule::KeyedRouteListing => {
                 route_for(&self.connection, model) == Some(Dialect::Messages)
+            }
+            CatalogRule::ToolUseListing => {
+                offered.is_some_and(|models| models.iter().any(|entry| entry.id == model))
             }
             CatalogRule::KeyedListing { .. } | CatalogRule::ModelsInfo => true,
         };
@@ -837,7 +898,9 @@ impl MessagesProvider {
     }
 
     /// A pinned effort has no recorded Messages dial: the denial lands
-    /// before the body exists, never as a silently dropped field.
+    /// before the marker listing is read and before the body exists, never
+    /// as a silently dropped field. `model` names the frozen pin's id, or
+    /// `auto` while an unpinned request has not resolved one yet.
     fn check_effort(&self, manifest: &RequestManifest, model: &str) -> Result<(), ProviderError> {
         if matches!(manifest.effort, EffortAssign::Fixed { .. }) {
             return Err(ProviderError::UnsupportedParameter {
@@ -851,7 +914,7 @@ impl MessagesProvider {
 
     /// The Messages tool name grammar: 1–128 ASCII alphanumerics, `_` or
     /// `-`. A pin outside it has no constructible client tool and denies
-    /// before the wire.
+    /// before the marker listing and the wire.
     fn check_tools(&self, manifest: &RequestManifest, model: &str) -> Result<(), ProviderError> {
         for name in &manifest.tools {
             if !valid_tool_name(name) {
@@ -865,42 +928,73 @@ impl MessagesProvider {
         Ok(())
     }
 
-    fn fixed_model(
+    /// The auto pool's wire model: the one connection this broker routed
+    /// to is the guard, and the first offered model (already sorted by
+    /// [`Self::admitted_listing`]) is the pick. An assignment outside that
+    /// narrow form is [`ProviderError::UnpinnedModel`].
+    ///
+    /// # Errors
+    /// [`ProviderError::UnpinnedModel`] for a manifest whose model is not a
+    /// one-connection auto pool on this adapter; the catalogue read's
+    /// [`ProviderError::Transport`]/[`ProviderError::StreamViolation`]
+    /// denials when no offered set travels in.
+    fn auto_model(
         &self,
         manifest: &RequestManifest,
         token: &str,
         started: Instant,
+        offered: Option<&[CatalogModel]>,
     ) -> Result<FixedModel, ProviderError> {
-        let fixed = match &manifest.model {
-            ModelAssign::Fixed(fixed) => fixed.clone(),
-            ModelAssign::Auto { pool: Some(pool) }
-                if pool.len() == 1 && pool[0] == self.connection =>
-            {
-                let model_id = self
-                    .catalog_within(token, started)?
-                    .into_iter()
-                    .next()
-                    .map(|model| model.id)
-                    .ok_or_else(|| ProviderError::UnpinnedModel {
-                        connection: self.connection.clone(),
-                    })?;
-                FixedModel {
-                    connection: self.connection.clone(),
-                    model_id,
-                }
-            }
-            _ => {
-                return Err(ProviderError::UnpinnedModel {
-                    connection: self.connection.clone(),
-                });
-            }
+        let ModelAssign::Auto { pool: Some(pool) } = &manifest.model else {
+            return Err(ProviderError::UnpinnedModel {
+                connection: self.connection.clone(),
+            });
         };
-        if fixed.connection != self.connection {
-            return Err(ProviderError::DialectMismatch {
-                connection: fixed.connection,
+        if pool.len() != 1 || pool[0] != self.connection {
+            return Err(ProviderError::UnpinnedModel {
+                connection: self.connection.clone(),
             });
         }
-        Ok(fixed)
+        let model_id = match offered {
+            Some(models) => models.first().map(|model| model.id.clone()),
+            None => self
+                .catalog_within(token, started)?
+                .into_iter()
+                .next()
+                .map(|model| model.id),
+        }
+        .ok_or_else(|| ProviderError::UnpinnedModel {
+            connection: self.connection.clone(),
+        })?;
+        Ok(FixedModel {
+            connection: self.connection.clone(),
+            model_id,
+        })
+    }
+
+    /// The marker-filtered offer set a send admits against, read once: the
+    /// `ToolUseListing` arm answers the keyed listing, every other arm
+    /// answers `None` because its admission needs no wire read. Every
+    /// assignment reaches the local request-shape denials before this read;
+    /// an auto pin learns its model id from it.
+    ///
+    /// # Errors
+    /// [`ProviderError::Transport`] for a failed call, non-success status
+    /// or expired budget; [`ProviderError::StreamViolation`] when the
+    /// listing payload is not the recorded shape.
+    fn admitted_listing(
+        &self,
+        token: &str,
+        started: Instant,
+    ) -> Result<Option<Vec<CatalogModel>>, ProviderError> {
+        match self.contract.catalog {
+            CatalogRule::ToolUseListing => Ok(Some(self.catalog_within(token, started)?)),
+            CatalogRule::KeyedListing { .. }
+            | CatalogRule::KeyedRouteListing
+            | CatalogRule::ModelsInfo
+            | CatalogRule::Allowlist(_)
+            | CatalogRule::SeedAndPrefix { .. } => Ok(None),
+        }
     }
 
     fn post(
@@ -930,8 +1024,10 @@ impl MessagesProvider {
     /// the credential seam's typed denials,
     /// [`ProviderError::UnsupportedParameter`] for a pinned effort, a
     /// tool name the dialect cannot construct, or a model outside an
-    /// allowlist arm's recorded offer set, [`ProviderError::Transport`]
-    /// for a failed or non-success leg, [`ProviderError::ProviderFailed`],
+    /// allowlist arm's recorded offer set, the marker listing's
+    /// [`ProviderError::Transport`]/[`ProviderError::StreamViolation`]
+    /// denials for a marker arm, [`ProviderError::Transport`] for a
+    /// failed or non-success send leg, [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
     /// [`ProviderError::StreamViolation`] and
     /// [`ProviderError::IncompatibleOutput`] as the reducer documents.
@@ -948,10 +1044,34 @@ impl MessagesProvider {
                 scope: format!("connections.{}.credential_ref", self.connection),
                 cause: None,
             })?;
-        let fixed = self.fixed_model(manifest, &token, started)?;
-        self.check_model(&fixed.model_id)?;
-        self.check_effort(manifest, &fixed.model_id)?;
-        self.check_tools(manifest, &fixed.model_id)?;
+        // The request-shape denials are local: a pinned effort, an
+        // unconstructible tool name, or a pin naming another adapter never
+        // reads the marker listing or crosses the wire. An unresolved auto
+        // model admits under its assignment spelling, so every assignment
+        // reaches these checks before the listing read.
+        let pinned = match &manifest.model {
+            ModelAssign::Fixed(fixed) => {
+                if fixed.connection != self.connection {
+                    return Err(ProviderError::DialectMismatch {
+                        connection: fixed.connection.clone(),
+                    });
+                }
+                Some(fixed.clone())
+            }
+            _ => None,
+        };
+        let admission_model = match &manifest.model {
+            ModelAssign::Fixed(fixed) => fixed.model_id.as_str(),
+            _ => "auto",
+        };
+        self.check_effort(manifest, admission_model)?;
+        self.check_tools(manifest, admission_model)?;
+        let offered = self.admitted_listing(&token, started)?;
+        let fixed = match pinned {
+            Some(fixed) => fixed,
+            None => self.auto_model(manifest, &token, started, offered.as_deref())?,
+        };
+        self.check_model(&fixed.model_id, offered.as_deref())?;
         let binding = self.binding(manifest, &fixed.model_id);
         let body = self.request_body(manifest, &fixed, &binding);
         let body_bytes = wire_body(&self.connection, &body)?;
@@ -1729,6 +1849,37 @@ mod tests {
         assert_eq!(
             messages_url("https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic"),
             "https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn vercel_resolves_the_recorded_base_and_the_gateway_paths() {
+        let contract = contract_for("vercel-ai-gateway").expect("the gateway arm records");
+        assert_eq!(
+            endpoint_for(&contract, "  "),
+            "https://ai-gateway.vercel.sh",
+            "the empty sentinel resolves the recorded gateway base"
+        );
+        assert_eq!(
+            models_url(&endpoint_for(&contract, "  ")),
+            "https://ai-gateway.vercel.sh/v1/models"
+        );
+        assert_eq!(
+            messages_url(&endpoint_for(&contract, "  ")),
+            "https://ai-gateway.vercel.sh/v1/messages"
+        );
+        assert_eq!(
+            endpoint_for(&contract, " https://gateway.example/v1/ "),
+            "https://gateway.example/v1",
+            "the configured base wins verbatim"
+        );
+        assert_eq!(
+            models_url("https://gateway.example/v1"),
+            "https://gateway.example/v1/models"
+        );
+        assert_eq!(
+            messages_url("https://gateway.example/v1"),
+            "https://gateway.example/v1/messages"
         );
     }
 }

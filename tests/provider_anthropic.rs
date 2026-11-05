@@ -23,7 +23,7 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences and block-wise fixture assembly; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::{Config, EffortLevel, FixedModel, ModelAssign};
+use rivect::config::{Config, ConfigIssue, EffortLevel, FixedModel, ModelAssign};
 use rivect::model::{Broker, ModelError, RequestManifest};
 use rivect::providers::anthropic::{MESSAGES_MAX_TOKENS, MessagesProvider};
 use rivect::providers::routed::RoutedProvider;
@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -96,6 +97,19 @@ const CLOUDFLARE_BASE_PATH: &str = "/v1/account/gateway/anthropic";
 /// The inference path the configured base carries.
 const CLOUDFLARE_MESSAGES_PATH: &str = "/v1/account/gateway/anthropic/v1/messages";
 
+/// The literal `vercel-ai-gateway` connection id.
+const VERCEL: &str = "vercel-ai-gateway";
+/// The scoped credential ref the gateway connection binds.
+const VERCEL_CREDENTIAL_REF: &str = "keyring:rivect-test/vercel-ai-gateway";
+/// A listed row carrying the recorded `tool-use` tag.
+const VERCEL_MODEL: &str = "anthropic/claude-opus-5";
+/// A listed row without the marker; a pin to it never sends.
+const VERCEL_UNMARKED_MODEL: &str = "openai/text-embedding-4";
+/// The gateway path inference posts to under the recorded root.
+const VERCEL_MESSAGES_PATH: &str = "/v1/messages";
+/// The keyed catalogue path the marker is read from.
+const VERCEL_MODELS_PATH: &str = "/v1/models";
+
 fn anthropic_config(endpoint: &str) -> String {
     format!(
         "config_version = 1\n\
@@ -150,6 +164,31 @@ fn cloudflare_config(endpoint: &str) -> String {
 
 fn cloudflare_endpoint(server: &MockServer) -> String {
     format!("{}{CLOUDFLARE_BASE_PATH}", server.uri())
+}
+
+/// The recorded gateway root is the configured base; inference appends
+/// `/v1/messages` and the marker read appends `/v1/models`.
+fn vercel_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{VERCEL}]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{VERCEL_CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"{VERCEL}\", model_id = \"{VERCEL_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The same gateway row under the one-connection auto pool.
+fn vercel_auto_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.{VERCEL}]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{VERCEL_CREDENTIAL_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\", pool = [\"{VERCEL}\"] }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
 }
 
 /// reqwest's blocking client panics inside a tokio context, so every
@@ -257,6 +296,16 @@ fn cloudflare_with_deadline(config: &Config, deadline: Duration) -> MessagesProv
     .expect("the adapter builds")
 }
 
+fn vercel_provider(config: &Config) -> (MessagesProvider, Arc<MapStore>) {
+    let store = Arc::new(MapStore::seeded(
+        STORE_KIND,
+        &[(VERCEL_CREDENTIAL_REF, SECRET)],
+    ));
+    let provider = provider_result(config.clone(), VERCEL.to_string(), store.clone())
+        .expect("the Messages adapter builds for the literal id");
+    (provider, store)
+}
+
 fn prepared_manifest(config: &Config) -> RequestManifest {
     prepared_manifest_at(config, "/world/anthropic")
 }
@@ -350,13 +399,37 @@ async fn mount_cloudflare_messages(server: &MockServer, body: String) {
         .await;
 }
 
-async fn mount_models(server: &MockServer, ids: &[&str]) {
-    let data: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
-    Mock::given(method("GET"))
-        .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": data})))
+async fn mount_vercel_messages(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path(VERCEL_MESSAGES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
         .mount(server)
         .await;
+}
+
+/// One keyed `/v1/models` row: only the `tags` marker matters to this arm.
+fn vercel_row(id: &str, tags: &[&str]) -> Value {
+    json!({"id": id, "object": "model", "type": "language", "tags": tags})
+}
+
+/// The one keyed `/v1/models` mount: every caller supplies its own rows.
+async fn mount_keyed_models(server: &MockServer, rows: &[Value]) {
+    Mock::given(method("GET"))
+        .and(path(VERCEL_MODELS_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": rows})),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_models(server: &MockServer, ids: &[&str]) {
+    let rows: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+    mount_keyed_models(server, &rows).await;
 }
 
 async fn mount_models_info(server: &MockServer, body: Value) {
@@ -2133,6 +2206,7 @@ fn dialect_defaults_carry_the_recorded_messages_and_cc_ids() {
         dialect_for("cloudflare-ai-gateway"),
         Some(Dialect::Messages)
     );
+    assert_eq!(dialect_for("vercel-ai-gateway"), Some(Dialect::Messages));
     assert_eq!(dialect_for("gitlab-duo"), Some(Dialect::ChatCompletions));
     assert_eq!(dialect_for("opencode-go"), Some(Dialect::ChatCompletions));
     assert_eq!(dialect_for("opencode-zen"), Some(Dialect::ChatCompletions));
@@ -4113,6 +4187,707 @@ async fn cloudflare_ai_gateway_provider_legs_matrix_executes_all_expected_legs()
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::cloudflare-ai-gateway = NOT_RUN"]
 fn provider_installed_cloudflare_ai_gateway() {}
+
+// ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::vercel-ai-gateway ---
+
+fn count_path(requests: &[Request], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.url.path() == path)
+        .count()
+}
+
+/// A configured `vercel-ai-gateway` connection returns one verified
+/// outcome and exactly one accounted usage through the standard Broker:
+/// the configured root is the Messages base, inference appends
+/// `/v1/messages`, the gateway key rides `Authorization: Bearer`, and the
+/// marker read is the only other physical request.
+#[tokio::test]
+async fn vercel_ai_gateway_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_keyed_models(
+        &server,
+        &[vercel_row(VERCEL_MODEL, &["file-input", "tool-use"])],
+    )
+    .await;
+    mount_vercel_messages(&server, text_stream("gateway outcome", 13, 5)).await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        vercel_provider(&config),
+        &config,
+        "/world/vercel",
+        "goal: prove the gateway wire",
+    );
+
+    let (broker, outcome) = dispatch(broker, "/world/vercel", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "gateway outcome");
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 13,
+            completion_tokens: 5,
+            total_tokens: 18,
+        }
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(
+        count_path(&requests, VERCEL_MESSAGES_PATH),
+        1,
+        "one physical Messages request"
+    );
+    assert_eq!(
+        count_path(&requests, VERCEL_MODELS_PATH),
+        1,
+        "the marker guard reads the listing once"
+    );
+    let post = requests
+        .iter()
+        .find(|request| request.url.path() == VERCEL_MESSAGES_PATH)
+        .expect("the Messages request is recorded");
+    let bearer = format!("Bearer {SECRET}");
+    assert_eq!(header(post, "authorization"), Some(bearer.as_str()));
+    assert_eq!(header(post, "x-api-key"), None);
+    assert_eq!(header(post, "anthropic-version"), Some("2023-06-01"));
+    let body = body_of(post);
+    assert_eq!(body["model"], json!(VERCEL_MODEL));
+    assert_eq!(body["system"], json!(manifest.instructions));
+    assert_eq!(body["max_tokens"], json!(MESSAGES_MAX_TOKENS));
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["messages"],
+        json!([{"role": "user", "content": manifest.inputs}])
+    );
+    assert!(
+        !String::from_utf8_lossy(&post.body).contains(SECRET),
+        "credential material rides the header, never the body"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, VERCEL);
+    assert_eq!(record.usage, reply.usage);
+    drop_blocking(broker);
+}
+
+/// The catalogue is the keyed `/v1/models` listing's `tool-use` rows: a
+/// row whose `tags` omit the recorded marker, or carry no `tags` at all,
+/// is not offered, and the marker records the tool surface.
+#[tokio::test]
+async fn vercel_ai_gateway_catalog_requires_the_tool_use_marker() {
+    let server = MockServer::start().await;
+    mount_keyed_models(
+        &server,
+        &[
+            vercel_row(VERCEL_UNMARKED_MODEL, &["embedding"]),
+            vercel_row(VERCEL_MODEL, &["file-input", "tool-use"]),
+            json!({"id": "anthropic/claude-sonnet-5.5", "object": "model", "type": "language"}),
+        ],
+    )
+    .await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let (provider, catalog) = catalog_models_on_thread(provider);
+    let models = catalog.expect("the marker-filtered listing answers");
+    let offered: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(offered, [VERCEL_MODEL], "only the tagged row is offered");
+    assert!(models[0].tools, "the marker is the recorded tool surface");
+    drop_blocking(provider);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(count_path(&requests, VERCEL_MODELS_PATH), 1);
+    let listing = requests
+        .iter()
+        .find(|request| request.url.path() == VERCEL_MODELS_PATH)
+        .expect("the listing request is recorded");
+    let bearer = format!("Bearer {SECRET}");
+    assert_eq!(
+        header(listing, "authorization"),
+        Some(bearer.as_str()),
+        "the gateway key authenticates the marker read"
+    );
+    assert_eq!(header(listing, "x-api-key"), None);
+    assert_eq!(header(listing, "anthropic-version"), Some("2023-06-01"));
+}
+
+/// A pin outside the tagged table is a closed-table denial: the marked row
+/// is offered beside it, so the denial discriminates the marker from mere
+/// absence, and no Messages request reaches the peer.
+#[tokio::test]
+async fn vercel_ai_gateway_model_without_the_marker_denies() {
+    let server = MockServer::start().await;
+    mount_keyed_models(
+        &server,
+        &[
+            vercel_row(VERCEL_MODEL, &["tool-use"]),
+            vercel_row(VERCEL_UNMARKED_MODEL, &["embedding"]),
+        ],
+    )
+    .await;
+    mount_vercel_messages(&server, text_stream("never reached", 1, 1)).await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let mut manifest = prepared_manifest_at(&config, "/world/vercel");
+    manifest.model = ModelAssign::Fixed(FixedModel {
+        connection: VERCEL.to_string(),
+        model_id: VERCEL_UNMARKED_MODEL.to_string(),
+    });
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = outcome.expect_err("a model without the marker denies")
+    else {
+        panic!("expected the typed closed-table denial");
+    };
+    assert_eq!(connection, VERCEL);
+    assert_eq!(parameter, "model");
+    assert_eq!(model, VERCEL_UNMARKED_MODEL);
+    drop_blocking(provider);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the marker read");
+    assert_eq!(
+        count_path(&requests, VERCEL_MESSAGES_PATH),
+        0,
+        "the closed-table denial sends no inference request"
+    );
+    assert_eq!(count_path(&requests, VERCEL_MODELS_PATH), 1);
+}
+
+/// An auto pin over the one gateway connection resolves its wire model from
+/// the same marker listing the admission uses: one listing read and one
+/// Messages request, never a second read.
+#[tokio::test]
+async fn vercel_ai_gateway_auto_pin_reads_one_listing_and_one_messages_request() {
+    let server = MockServer::start().await;
+    mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
+    mount_vercel_messages(&server, text_stream("auto outcome", 7, 2)).await;
+    let config = Config::parse_validated(&vercel_auto_config(&server.uri())).expect("valid");
+    let (broker, manifest) = prepared_with(
+        vercel_provider(&config),
+        &config,
+        "/world/vercel",
+        "goal: auto pin",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/vercel", manifest);
+    let reply = outcome.expect("the auto pin resolves the tagged model");
+    assert_eq!(reply.text, "auto outcome");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(
+        count_path(&requests, VERCEL_MODELS_PATH),
+        1,
+        "the one listing read resolves and admits the auto pin"
+    );
+    assert_eq!(
+        count_path(&requests, VERCEL_MESSAGES_PATH),
+        1,
+        "one physical send"
+    );
+    let post = requests
+        .iter()
+        .find(|request| request.url.path() == VERCEL_MESSAGES_PATH)
+        .expect("the Messages request is recorded");
+    assert_eq!(
+        body_of(post)["model"],
+        json!(VERCEL_MODEL),
+        "the first tagged row is the wire model"
+    );
+    drop_blocking(broker);
+}
+
+#[tokio::test]
+async fn vercel_ai_gateway_wrong_credential_profile_region_or_origin_denies_without_secrets() {
+    // a configured region names no recorded contract — typed denial at build
+    let region_config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.{VERCEL}]\nkind = \"api_key\"\nendpoint = \"https://ai-gateway.vercel.sh\"\nregion = \"eu\"\ncredential_ref = \"{VERCEL_CREDENTIAL_REF}\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"{VERCEL}\", model_id = \"{VERCEL_MODEL}\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the region config parses");
+    let region = provider_result(
+        region_config,
+        VERCEL.to_string(),
+        Arc::new(MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a configured region denies");
+    assert!(matches!(
+        &region,
+        ProviderError::RegionMismatch { connection, region }
+            if connection == VERCEL && region == "eu"
+    ));
+
+    // a profile-bound ref whose scope names another profile cannot bind
+    let profile_config = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.{VERCEL}]\nkind = \"api_key\"\nendpoint = \"https://ai-gateway.vercel.sh\"\ncredential_ref = \"{VERCEL_CREDENTIAL_REF}\"\nprofile = \"vercel-work\"\n\
+         [profiles.vercel-work]\ncredential_ref = \"keyring:rivect-test/another-profile\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"{VERCEL}\", model_id = \"{VERCEL_MODEL}\" }}\neffort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    ))
+    .expect("the profile config parses");
+    let profile = provider_result(
+        profile_config,
+        VERCEL.to_string(),
+        Arc::new(MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect_err("a divergent profile scope denies");
+    assert!(matches!(
+        &profile,
+        ProviderError::CredentialProfileMismatch { connection, profile }
+            if connection == VERCEL && profile == "vercel-work"
+    ));
+
+    // a non-loopback http origin and a userinfo-bearing origin both leave
+    // the endpoint trust boundary; neither echoes its value
+    for origin in [
+        "http://gateway.example.com/v1",
+        "https://key:fixture-origin-material@gateway.example.com",
+    ] {
+        let refused = Config::parse_validated(&vercel_config(origin))
+            .expect_err("the origin is outside the trust boundary");
+        assert!(matches!(&refused.issue, ConfigIssue::EndpointNotAllowed));
+        assert!(
+            !refused.to_string().contains("fixture-origin-material"),
+            "the refusal never echoes the origin's userinfo: {refused}"
+        );
+    }
+
+    // an empty bound scope denies at send without reaching the wire and
+    // without leaking the neighbour's material
+    let server = MockServer::start().await;
+    mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
+    mount_vercel_messages(&server, text_stream("never reached", 1, 1)).await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let store = Arc::new(MapStore::seeded(
+        STORE_KIND,
+        &[(NEIGHBOR_REF, NEIGHBOR_SECRET)],
+    ));
+    let provider =
+        provider_result(config.clone(), VERCEL.to_string(), store).expect("binding resolves");
+    let (provider, denied) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/vercel"));
+    let error = denied.expect_err("the empty scope denies");
+    assert!(matches!(error, ProviderError::CredentialAbsent { .. }));
+    for rendered in [format!("{error}"), format!("{error:?}")] {
+        assert!(
+            !rendered.contains(NEIGHBOR_SECRET) && !rendered.contains(SECRET),
+            "diagnostics stay secret-free: {rendered}"
+        );
+    }
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock recorded")
+            .is_empty(),
+        "the denial lands before the marker read and the wire"
+    );
+}
+
+#[tokio::test]
+async fn vercel_ai_gateway_rejects_partial_tool_block_and_unknown_terminal() {
+    // partial tool JSON at the block stop is a typed violation
+    let server = MockServer::start().await;
+    mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
+    mount_vercel_messages(
+        &server,
+        format!(
+            "{}{}{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+            ),
+            sse_block(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse_block(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 2}}),
+            ),
+            sse_block("message_stop", &json!({"type": "message_stop"})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/vercel"));
+    assert!(
+        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        "a partial tool block never becomes a reply: {outcome:?}"
+    );
+    drop_blocking(provider);
+
+    // a terminal the dialect cannot classify is never success
+    let server = MockServer::start().await;
+    mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
+    mount_vercel_messages(
+        &server,
+        format!(
+            "{}{}{}{}",
+            message_start(3),
+            sse_block(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse_block(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            format!(
+                "{}{}",
+                sse_block(
+                    "message_delta",
+                    &json!({"type": "message_delta", "delta": {"stop_reason": "teleport"}, "usage": {"output_tokens": 1}}),
+                ),
+                sse_block("message_stop", &json!({"type": "message_stop"})),
+            ),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/vercel"));
+    assert!(
+        matches!(outcome, Err(ProviderError::UnknownTerminal { .. })),
+        "an unknown stop reason is an unknown terminal: {outcome:?}"
+    );
+    drop_blocking(provider);
+}
+
+/// A pinned effort and an unconstructible tool name are local denials on
+/// every assignment: both land before the marker listing is read, so the
+/// peer sees no request at all and the typed `UnsupportedParameter` names
+/// the parameter. An auto pin has no resolved model yet and admits under
+/// its assignment spelling.
+#[tokio::test]
+async fn vercel_ai_gateway_rejects_incompatible_tools_or_reasoning() {
+    // a pinned effort has no recorded Messages dial
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&vercel_config(&server.uri()).replace(
+        "effort = { mode = \"auto\" }",
+        "effort = { mode = \"fixed\", value = \"high\" }",
+    ))
+    .expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/vercel"));
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = outcome.expect_err("a pinned effort denies")
+    else {
+        panic!("expected the typed unsupported parameter");
+    };
+    assert_eq!(connection, VERCEL);
+    assert_eq!(parameter, "effort");
+    assert_eq!(model, VERCEL_MODEL);
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the reasoning denial lands before the marker read and the wire"
+    );
+
+    // a tool name outside the Messages grammar has no constructible tool
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let mut manifest = prepared_manifest_at(&config, "/world/vercel");
+    manifest.tools = vec!["read file".to_string()];
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let ProviderError::UnsupportedParameter {
+        parameter, model, ..
+    } = outcome.expect_err("a tool name outside the grammar denies")
+    else {
+        panic!("expected the typed tool denial");
+    };
+    assert_eq!(parameter, "tools");
+    assert_eq!(model, VERCEL_MODEL);
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the tool denial lands before the marker read and the wire"
+    );
+
+    // an auto pin has no resolved model yet: the pinned effort still
+    // denies before the listing read, under the assignment spelling
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&vercel_auto_config(&server.uri()).replace(
+        "effort = { mode = \"auto\" }",
+        "effort = { mode = \"fixed\", value = \"high\" }",
+    ))
+    .expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let (provider, outcome) =
+        send_on_thread(provider, prepared_manifest_at(&config, "/world/vercel"));
+    let ProviderError::UnsupportedParameter {
+        connection,
+        parameter,
+        model,
+    } = outcome.expect_err("a pinned effort denies on an auto pin")
+    else {
+        panic!("expected the typed unsupported parameter");
+    };
+    assert_eq!(connection, VERCEL);
+    assert_eq!(parameter, "effort");
+    assert_eq!(model, "auto");
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the auto effort denial lands before the listing read"
+    );
+
+    // the same auto pin with an unconstructible tool name
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&vercel_auto_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let mut manifest = prepared_manifest_at(&config, "/world/vercel");
+    manifest.tools = vec!["read file".to_string()];
+    let (provider, outcome) = send_on_thread(provider, manifest);
+    let ProviderError::UnsupportedParameter {
+        parameter, model, ..
+    } = outcome.expect_err("a tool name outside the grammar denies on an auto pin")
+    else {
+        panic!("expected the typed tool denial");
+    };
+    assert_eq!(parameter, "tools");
+    assert_eq!(model, "auto");
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the auto tool denial lands before the listing read"
+    );
+}
+
+/// One scripted gateway peer: the marker listing answers the guard's GET,
+/// then the Messages stream is written in tiny chunks so the cuts land
+/// inside UTF-8, JSON, SSE lines and the tool block's arguments. The
+/// counted POSTs prove one physical send.
+fn fragmented_vercel_peer() -> (String, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("the fixture peer binds a loopback port");
+    let address = listener.local_addr().expect("the fixture address");
+    let posts = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&posts);
+    let body = format!(
+        "{}{}{}{}{}{}{}{}{}",
+        message_start(5),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "héllo ✓"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 0}),
+        ),
+        sse_block(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+        ),
+        sse_block(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"/tmp/fixture\"}"}}),
+        ),
+        sse_block(
+            "content_block_stop",
+            &json!({"type": "content_block_stop", "index": 1}),
+        ),
+        sse_block(
+            "message_delta",
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+        ),
+        format!(
+            "{}{}",
+            sse_block(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+            ),
+            sse_block("message_stop", &json!({"type": "message_stop"})),
+        ),
+    );
+    let handle = std::thread::spawn(move || {
+        for request in 0..2 {
+            let (mut stream, _) = listener.accept().expect("the fixture peer accepts");
+            read_fixture_request(&mut stream);
+            if request == 0 {
+                let listing = serde_json::to_string(
+                    &json!({"object": "list", "data": [vercel_row(VERCEL_MODEL, &["tool-use"])]}),
+                )
+                .expect("the fixture listing serializes");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    listing.len()
+                );
+                stream.write_all(head.as_bytes()).expect("the fixture head");
+                stream
+                    .write_all(listing.as_bytes())
+                    .expect("the fixture listing");
+                continue;
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            let head =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            stream.write_all(head.as_bytes()).expect("the fixture head");
+            let bytes = body.as_bytes();
+            let sizes = [1usize, 2, 3, 5, 8, 13, 21];
+            let mut offset = 0;
+            let mut step = 0;
+            while offset < bytes.len() {
+                let len = sizes[step % sizes.len()].min(bytes.len() - offset);
+                stream
+                    .write_all(&bytes[offset..offset + len])
+                    .expect("the fixture fragment");
+                stream.flush().expect("the fixture flushes");
+                offset += len;
+                step += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    });
+    (format!("http://{address}/v1"), posts, handle)
+}
+
+/// Chunked delivery inside UTF-8, JSON, SSE and the tool block reassembles
+/// to one outcome; the repeated usage report is charged once, and the
+/// spent attempt never opens a second request.
+#[tokio::test]
+async fn vercel_ai_gateway_stream_fragmentation_and_repeated_usage_never_duplicates() {
+    let (endpoint, posts, peer) = fragmented_vercel_peer();
+    let config = Config::parse_validated(&vercel_config(&endpoint)).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/vercel", "goal: fragmented")
+        .expect("the gateway pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/vercel", manifest.clone());
+    let reply = outcome.expect("the fragmented stream reassembles");
+    assert_eq!(reply.text, "héllo ✓");
+    assert_eq!(
+        reply.tool_calls,
+        vec![rivect::providers::ToolCall {
+            tool: "read_file".to_string(),
+            path: Some("/tmp/fixture".to_string()),
+        }]
+    );
+    assert_eq!(
+        reply.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        },
+        "the repeated usage report is charged once"
+    );
+    assert_eq!(broker.accounted_requests(), 1);
+
+    let replay_manifest = manifest.clone();
+    let (broker, replay) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let replay = broker.dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/vercel",
+            &replay_manifest,
+        );
+        (broker, replay)
+    })
+    .join()
+    .expect("the replay thread joins");
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the confirmed data is never duplicated: {replay:?}"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the fixture peer joins");
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "one physical send");
+}
+
+/// An unknown remote outcome is never retried blindly: the peer's failure
+/// status denies typed, nothing is accounted, and only one Messages
+/// request runs.
+#[tokio::test]
+async fn vercel_ai_gateway_unknown_outcome_is_not_retried() {
+    let server = MockServer::start().await;
+    mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
+    Mock::given(method("POST"))
+        .and(path(VERCEL_MESSAGES_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&vercel_config(&server.uri())).expect("valid");
+    let (provider, _store) = vercel_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/vercel", "goal: unknown outcome")
+        .expect("the gateway pin prepares");
+    let (broker, outcome) = dispatch(broker, "/world/vercel", manifest);
+    let Err(ModelError::Provider(ProviderError::Transport { cause, .. })) = outcome else {
+        panic!("the peer's status is the typed transport denial: {outcome:?}");
+    };
+    assert_eq!(cause.class(), TransportClass::HttpStatus { code: 503 });
+    assert_eq!(broker.accounted_requests(), 0);
+    drop_blocking(broker);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(
+        count_path(&requests, VERCEL_MESSAGES_PATH),
+        1,
+        "an unknown outcome is never retried blindly"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::vercel-ai-gateway -----------------------
+
+/// TP-PROVIDER-INSTALLED::vercel-ai-gateway = NOT_RUN: the
+/// installed-provider proof is a live-environment leg this offline slice
+/// never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::vercel-ai-gateway = NOT_RUN"]
+fn provider_installed_vercel_ai_gateway() {}
 
 // ----- TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY}::gitlab-duo ----------
 

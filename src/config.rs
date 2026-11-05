@@ -1035,11 +1035,12 @@ pub enum ConfigIssue {
     #[error("key {key} is not editable")]
     KeyNotEditable { key: String },
     /// A declaration the document owns and the wire surfaces never write
-    /// (DEC-010): `[hooks]` and `[mcp.servers.<name>]`. The answer names the
-    /// file that can write it instead of refusing with no why and no next
-    /// action.
+    /// (DEC-010): `[hooks]`, `[mcp.servers.<name>]`, and a connection's
+    /// identity fields (`kind`, `endpoint`, `credential_ref`). The answer
+    /// names the file that can write it instead of refusing with no why and
+    /// no next action.
     #[error(
-        "{key} is document-only; declare it in the config file; not editable through config.set"
+        "{key} is document-only; declare it in the config file (config.toml); not editable through config.set"
     )]
     DocumentOnlyKey { key: String },
     #[error("malformed key {key}: empty segment")]
@@ -2581,6 +2582,11 @@ fn unknown_edit_key(key: &str) -> ConfigError {
         },
         "connections" => match rest {
             [] | [_] => not_editable_key(key),
+            // The connection's identity — its kind, its endpoint and the
+            // scoped ref it authenticates with — is what the document
+            // declares, never a wire edit: the answer names the file
+            // instead of refusing with no next action.
+            [_, "kind" | "endpoint" | "credential_ref"] => document_only_key(key),
             [_, field] if CONNECTION_KEYS.contains(field) => not_editable_key(key),
             _ => unknown_scope_key(key, CONNECTION_KEYS),
         },
@@ -2634,6 +2640,8 @@ fn not_editable_key(key: &str) -> ConfigError {
     )
 }
 
+/// The document-only answer for a key no wire surface writes: the
+/// connection's identity fields and the declared hook/MCP sections.
 fn document_only_key(key: &str) -> ConfigError {
     ConfigError::schema(
         key,
