@@ -309,6 +309,11 @@ pub struct PendingFallback {
     pub purpose: String,
     /// The connections passing the current eligibility check, sorted.
     pub candidates: Vec<String>,
+    /// The primary failure's classifier verdict: an unknown outcome (a
+    /// timeout, a 5xx, a retried leg) may already have applied remotely,
+    /// so a substitute send repeats it; `false` means the denial was
+    /// definitive and provably never applied.
+    pub unknown_outcome: bool,
 }
 
 /// The credential profile the latest prepared manifest froze on its
@@ -516,6 +521,69 @@ fn ledger_refusal(error: LedgerError) -> ModelError {
             crate::state::ConflictCause::BudgetExhausted { scope, .. },
         )) => ModelError::BudgetExhausted { scope },
         other => ModelError::Ledger(other),
+    }
+}
+
+/// Whether one entered send ended with an outcome that may still have
+/// applied remotely. An unknown outcome — a timeout, a deadline, a read
+/// failure, a 5xx/redirect, a retried leg, a post-output provider failure,
+/// a stream violation or an unclassifiable terminal — never walks an auto
+/// chain: only a definitive denial proves no second request can duplicate
+/// the effect. A manual fallback still pauses on it, because the human's
+/// choice is explicit. A request-shape refusal that never produced a byte
+/// is definitive: it cannot have applied.
+fn provider_outcome_unknown(error: &ProviderError) -> bool {
+    use crate::providers::{ProviderError as Provider, TransportCause, TransportClass};
+    match error {
+        // The adapter's own corrected retry crossed the wire more than
+        // once, so neither leg's effect can be ruled out.
+        Provider::Retried { .. } => true,
+        Provider::Transport { cause, .. } => match cause.class() {
+            TransportClass::DeadlineExpired
+            | TransportClass::Timeout
+            | TransportClass::ReadFailure => true,
+            TransportClass::HttpStatus { code } => {
+                code >= 500 || (300..400).contains(&code) || code == 408 || code == 425
+            }
+            // Only a request the client never built or never connected is a
+            // definitive refusal: reqwest also reports send and hand-off
+            // failures here, and those may have crossed the wire.
+            TransportClass::RequestFailure => match cause {
+                TransportCause::Request { source } => !(source.is_builder() || source.is_connect()),
+                _ => true,
+            },
+        },
+        // Adapters emit a provider failure verdict only after the response
+        // has started: a terminal incomplete/cancelled event, a non-STOP
+        // finish or a mid-stream error already crossed the wire. A
+        // malformed stream or foreign artifact likewise follows a
+        // partially applied request, so these stay unknown.
+        Provider::ProviderFailed { .. }
+        | Provider::UnknownTerminal { .. }
+        | Provider::StreamViolation { .. }
+        | Provider::IncompatibleOutput { .. }
+        | Provider::ReasoningProvenance { .. } => true,
+        // Every remaining variant is a pre-send binding, catalogue or
+        // request-shape denial: the request provably did not apply.
+        Provider::UnknownConnection { .. }
+        | Provider::LiveGrantRequired { .. }
+        | Provider::StoreUnavailable { .. }
+        | Provider::StoreAmbiguous { .. }
+        | Provider::CredentialUnresolved { .. }
+        | Provider::LocalProfileDeclared { .. }
+        | Provider::CredentialProfileMismatch { .. }
+        | Provider::CredentialOutsideNamespace { .. }
+        | Provider::CredentialOccupied { .. }
+        | Provider::CredentialAbsent { .. }
+        | Provider::CredentialMalformed { .. }
+        | Provider::CredentialBaseMismatch { .. }
+        | Provider::DialectMismatch { .. }
+        | Provider::DialectUnserved { .. }
+        | Provider::UnpinnedModel { .. }
+        | Provider::RegionMismatch { .. }
+        | Provider::EndpointRequired { .. }
+        | Provider::UnsupportedParameter { .. }
+        | Provider::UnsendableRequest { .. } => false,
     }
 }
 
@@ -1228,10 +1296,12 @@ impl Broker {
     /// when the entitlement snapshot changed since ranking,
     /// [`ModelError::ManualFallbackPending`] when the frozen fallback is
     /// `manual` and the send failed — the pending choice rides
-    /// question.current — [`ModelError::FallbackExhausted`] when the
+    /// question.current even when the failure's outcome is unknown —
+    /// [`ModelError::FallbackExhausted`] when the
     /// auto chain ran out with every entry rejected or failed, or a
     /// `manual` fallback found no servable candidate to pause on, and
-    /// [`ModelError::Provider`] when the provider rejects the request.
+    /// [`ModelError::Provider`] when the provider rejects the request or the
+    /// auto chain stops on an entered unknown outcome.
     pub fn dispatch(
         &mut self,
         ledger: &mut dyn Ledger,
@@ -1299,6 +1369,8 @@ impl Broker {
             Ok(reply) => Ok(reply),
             Err(SendFailure::Ledger(source)) => Err(ledger_refusal(source)),
             Err(SendFailure::Provider(source)) => {
+                // The chain arm alone decides whether an unknown outcome may
+                // walk; a manual pause still lets the human answer it.
                 self.fallback_or_fail(ledger, manifest, &admission, source)
             }
         }
@@ -1390,11 +1462,21 @@ impl Broker {
                 // settlement closes unknown, the bound stays charged, and
                 // the adapter's own retry count rides the failure so a
                 // corrected attempt that also failed records every leg it
-                // crossed. The caller still meets the failure's own class.
+                // crossed. The marker returns to the failure so the outcome
+                // gate sees an unknown even when the last leg's class is a
+                // definitive denial.
                 let (wire_retries, source) = source.settle();
                 ledger
                     .finish_send(&ticket, &SendOutcome::Failed { wire_retries })
                     .map_err(SendFailure::Ledger)?;
+                let source = if wire_retries > 0 {
+                    ProviderError::Retried {
+                        wire_retries,
+                        source: Box::new(source),
+                    }
+                } else {
+                    source
+                };
                 return Err(SendFailure::Provider(source));
             }
         };
@@ -1493,6 +1575,17 @@ impl Broker {
                 current: world.to_string(),
             });
         }
+        // The same recorded contract as the failed primary is refused for
+        // the same reason the auto walk refuses it: a definitive denial is
+        // the only failure whose chain may walk, and a sibling literal is
+        // never a second independent attempt.
+        if providers::blind_retry_refused(&admission.connection, connection) {
+            return Err(ModelError::ManualChoiceRejected {
+                attempt_id: attempt_id.to_string(),
+                connection: connection.to_string(),
+                cause: RejectionCause::BlindRetryRefused,
+            });
+        }
         // The pick is confined to the candidates the pause served — the
         // failed primary is never among them — before the current
         // eligibility re-check runs.
@@ -1540,6 +1633,7 @@ impl Broker {
             }
             Err(SendFailure::Provider(source)) => {
                 self.abandon_substitute(&substitute.attempt_id, &admission.purpose, displaced);
+                let (_, source) = source.settle();
                 Err(ModelError::Provider(source))
             }
         }
@@ -1551,7 +1645,10 @@ impl Broker {
     /// choice and reports it without dispatching a substitute — unless
     /// no candidate survives the re-check, where an unanswerable pause
     /// is the honest exhaustion instead — `auto`
-    /// walks the chain — every entry is re-checked against the CURRENT
+    /// walks the chain — an entered unknown outcome of the failed primary
+    /// stops that walk before any entry is consulted, because a substitute
+    /// could duplicate an effect the peer may already have applied, and
+    /// every entry is re-checked against the CURRENT
     /// catalogue, egress, entitlement and purpose-eligibility gates, so
     /// a candidate failing the check never receives the request. An
     /// admitted entry mints one fallback manifest carrying the failed
@@ -1568,24 +1665,47 @@ impl Broker {
         source: ProviderError,
     ) -> Result<ProviderReply, ModelError> {
         match &admission.fallback {
-            FallbackAssign::Off => Err(ModelError::Provider(source)),
+            FallbackAssign::Off => {
+                // No chain can run, so the retry marker has no decision to
+                // route: the caller meets the provider's own class, exactly
+                // as it did before the marker existed.
+                let (_, source) = source.settle();
+                Err(ModelError::Provider(source))
+            }
             FallbackAssign::Manual => {
+                // The pause hands the classifier verdict to the human: an
+                // unknown outcome may already have applied, so the offered
+                // picks are stated as a repeat. Computed before any
+                // `settle` consumes the failure.
+                let unknown_outcome = provider_outcome_unknown(&source);
                 let mut candidates = self.eligible_candidates(&admission.purpose);
                 // The failed primary never re-enters its own choice
-                // list — it already produced this failure.
-                candidates.retain(|name| name != &admission.connection);
+                // list — it already produced this failure — and a
+                // candidate resolving to the same recorded contract is
+                // refused for the same reason the auto walk refuses it.
+                candidates.retain(|name| {
+                    name != &admission.connection
+                        && !providers::blind_retry_refused(&admission.connection, name)
+                });
                 if candidates.is_empty() {
                     // An empty served set can never be answered — the
                     // pick must name a served member, so pausing here
                     // would pin a question nothing satisfies. Report
                     // the exhaustion honestly instead: every evaluated
-                    // non-primary connection's cause, no send attempted,
+                    // non-primary connection's cause, the filtered
+                    // same-contract sibling included, no send attempted,
                     // the primary's own failure as the source.
                     let rejected = self
                         .view_connections
                         .keys()
                         .filter(|name| name.as_str() != admission.connection)
                         .filter_map(|name| {
+                            if providers::blind_retry_refused(&admission.connection, name) {
+                                return Some(CandidateRejection {
+                                    connection: name.clone(),
+                                    cause: RejectionCause::BlindRetryRefused,
+                                });
+                            }
                             self.candidate_rejection(&admission.purpose, name)
                                 .map(|cause| CandidateRejection {
                                     connection: name.clone(),
@@ -1593,6 +1713,7 @@ impl Broker {
                                 })
                         })
                         .collect();
+                    let (_, source) = source.settle();
                     return Err(ModelError::FallbackExhausted {
                         attempt_id: manifest.attempt_id.clone(),
                         purpose: admission.purpose.clone(),
@@ -1605,6 +1726,7 @@ impl Broker {
                     attempt_id: manifest.attempt_id.clone(),
                     purpose: admission.purpose.clone(),
                     candidates,
+                    unknown_outcome,
                 };
                 // The pause pin outlives the pending record's
                 // publish-time drain: it is the broker-side proof a
@@ -1621,6 +1743,17 @@ impl Broker {
                 })
             }
             FallbackAssign::Auto { chain } => {
+                // An entered unknown outcome ends the walk before an entry
+                // is consulted: a substitute could duplicate an effect the
+                // peer may already have applied. Only a definitive denial
+                // may walk, and the retry marker routes that decision; the
+                // caller meets the failure's own class. `manual` still
+                // pauses: the human, not the chain, decides what a second
+                // request would repeat.
+                if provider_outcome_unknown(&source) {
+                    let (_, source) = source.settle();
+                    return Err(ModelError::Provider(source));
+                }
                 let mut rejected = Vec::new();
                 let mut attempted = Vec::new();
                 for entry in chain {
@@ -1688,6 +1821,15 @@ impl Broker {
                                 &admission.purpose,
                                 displaced,
                             );
+                            // An entered unknown outcome ends the walk
+                            // exactly as it ends the primary: a later entry
+                            // could duplicate an effect this one may already
+                            // have applied. The retry marker routes the
+                            // decision; the caller meets the inner class.
+                            if provider_outcome_unknown(&send_error) {
+                                let (_, send_error) = send_error.settle();
+                                return Err(ModelError::Provider(send_error));
+                            }
                             rejected.push(CandidateRejection {
                                 connection: entry.connection.clone(),
                                 cause: RejectionCause::SendFailed(send_error),
@@ -2207,7 +2349,7 @@ fn deciding_criterion(
     if winner.class.1 < runner_up.class.1 {
         return match winner.class.1 {
             0 => format!(
-                "a recorded context fit for {estimate} estimated tokens",
+                "a recorded context fit for {estimate} estimated characters",
                 estimate = facts.context_tokens_estimate
             ),
             // The winner's window is unrecorded; that is the winner's own
@@ -2224,7 +2366,7 @@ fn deciding_criterion(
         && left < right
     {
         return format!(
-            "the cheaper known full cost of {cost:.4} usd over {estimate} estimated tokens",
+            "the cheaper known full cost of {cost:.4} usd over {estimate} estimated characters",
             cost = left,
             estimate = facts.context_tokens_estimate,
         );
@@ -2570,5 +2712,237 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The request-failure class is definitive only when the retained
+    /// source proves the client never handed bytes to the wire: a builder
+    /// or connect error. The rest of the class table stays unknown — a
+    /// send or response-head failure may follow a partially applied
+    /// request.
+    #[test]
+    fn transport_outcome_verdicts_follow_the_retained_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::providers::{ProviderError as Provider, TransportCause};
+        use std::io::ErrorKind;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let client = reqwest::blocking::Client::builder().no_proxy().build()?;
+        let builder = client
+            .get("ftp://127.0.0.1/fixture")
+            .send()
+            .err()
+            .ok_or("the unsupported scheme must fail")?;
+        assert!(builder.is_builder(), "the fixture carries a builder error");
+
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let closed = reserved.local_addr()?;
+        drop(reserved);
+        let connect = client
+            .get(format!("http://{closed}/fixture"))
+            .send()
+            .err()
+            .ok_or("the closed port must fail")?;
+        assert!(connect.is_connect(), "the fixture carries a connect error");
+
+        let request = peer_request_error()?;
+        assert!(
+            request.is_request()
+                && !request.is_connect()
+                && !request.is_timeout()
+                && !request.is_builder(),
+            "the fixture carries a non-connect request failure: {request}"
+        );
+
+        let transport = |cause| Provider::Transport {
+            connection: "local".to_string(),
+            cause,
+        };
+        let cases = [
+            (
+                "deadline",
+                transport(TransportCause::Deadline {
+                    budget: Duration::from_millis(1),
+                }),
+                true,
+            ),
+            (
+                "timeout",
+                transport(TransportCause::Read {
+                    source: Arc::new(std::io::Error::new(ErrorKind::TimedOut, "fixture")),
+                }),
+                true,
+            ),
+            (
+                "read failure",
+                transport(TransportCause::Read {
+                    source: Arc::new(std::io::Error::other("fixture")),
+                }),
+                true,
+            ),
+            (
+                "status 500",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                }),
+                true,
+            ),
+            (
+                "status 503",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                }),
+                true,
+            ),
+            (
+                "status 408",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::REQUEST_TIMEOUT,
+                }),
+                true,
+            ),
+            (
+                "status 425",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::TOO_EARLY,
+                }),
+                true,
+            ),
+            (
+                "redirect",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::MOVED_PERMANENTLY,
+                }),
+                true,
+            ),
+            (
+                "status 400",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                }),
+                false,
+            ),
+            (
+                "status 401",
+                transport(TransportCause::Status {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                }),
+                false,
+            ),
+            (
+                "builder",
+                transport(TransportCause::Request {
+                    source: Arc::new(builder),
+                }),
+                false,
+            ),
+            (
+                "connect",
+                transport(TransportCause::Request {
+                    source: Arc::new(connect),
+                }),
+                false,
+            ),
+            (
+                "request failure",
+                transport(TransportCause::Request {
+                    source: Arc::new(request),
+                }),
+                true,
+            ),
+            (
+                "retried",
+                Provider::Retried {
+                    wire_retries: 1,
+                    source: Box::new(transport(TransportCause::Status {
+                        status: reqwest::StatusCode::BAD_REQUEST,
+                    })),
+                },
+                true,
+            ),
+            (
+                // Adapters emit this after the response has started, so
+                // its effect may already have applied.
+                "provider failed",
+                Provider::ProviderFailed {
+                    connection: "local".to_string(),
+                    reason: "terminal incomplete".to_string(),
+                },
+                true,
+            ),
+            (
+                // A malformed stream follows a partially applied request.
+                "stream violation",
+                Provider::StreamViolation {
+                    connection: "local".to_string(),
+                    reason: "stream ended mid output item".to_string(),
+                },
+                true,
+            ),
+            (
+                // Raised before the post: no byte crossed, so a
+                // substitute cannot repeat an effect.
+                "unsendable request",
+                Provider::UnsendableRequest {
+                    connection: "local".to_string(),
+                    reason: format!(
+                        "request body of {} bytes exceeds the {} byte wire bound",
+                        crate::contracts::MODEL_WIRE_MAX_BYTES + 1,
+                        crate::contracts::MODEL_WIRE_MAX_BYTES
+                    ),
+                },
+                false,
+            ),
+        ];
+        for (name, error, unknown) in cases {
+            assert_eq!(
+                provider_outcome_unknown(&error),
+                unknown,
+                "the {name} verdict"
+            );
+        }
+        Ok(())
+    }
+
+    /// One genuine non-connect request error: a loopback peer answers
+    /// bytes the HTTP client cannot accept as a response head.
+    fn peer_request_error() -> Result<reqwest::Error, Box<dyn std::error::Error>> {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let error = std::thread::scope(|scope| -> std::io::Result<reqwest::Error> {
+            let peer = scope.spawn(move || -> std::io::Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let mut headers = Vec::new();
+                let mut chunk = [0u8; 512];
+                while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk)?;
+                    if count == 0 {
+                        return Err(std::io::Error::other("fixture request truncated"));
+                    }
+                    headers.extend_from_slice(&chunk[..count]);
+                }
+                stream.write_all(b"invalid-http\r\n\r\n")
+            });
+            let error = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .map_err(std::io::Error::other)?
+                .get(format!("http://{address}/fixture"))
+                .send()
+                .err();
+            peer.join().map_err(|panic| {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown payload");
+                std::io::Error::other(format!("fixture peer panicked: {detail}"))
+            })??;
+            error.ok_or_else(|| std::io::Error::other("the malformed response decoded"))
+        })?;
+        Ok(error)
     }
 }

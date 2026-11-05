@@ -832,8 +832,9 @@ pub const TRANSCRIPT_NO_PROJECT: &str =
     "No project or index is selected; ordinary replies are not blocked.";
 pub const HELP_TEXT: &str = concat!(
     "Commands: Enter submits a task; Esc quits; Ctrl-C cancels.\n",
-    "/help shows this list; /new starts a conversation; /clear clears the view.\n",
-    "/compact folds context; /login: URL, \"device\", \"complete\", \"cancel\".",
+    "/help lists; /new starts a conversation; /clear clears.\n",
+    "/compact folds context.\n",
+    "/login: URL, \"device\", \"complete\", \"cancel\".",
 );
 
 /// Status line while external output streams (design-brief §4).
@@ -891,22 +892,33 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             rows.push(Constraint::Length(1));
             rows.push(Constraint::Min(1));
         }
-        // The dock's task rows keep their three-row window; the fixed economy
+        // The dock's task rows keep their three-row window; the economy
         // row below them is its own slot, so it paints even when three tasks
-        // fill the dock and never clips off the panel. A status projection's
-        // economy row takes two rows: at the 60-column acceptance geometry a
-        // single row cannot carry project, cwd, figures and their sources at
-        // once, so it wraps within these two instead of clipping its tail.
-        // The pre-status placeholder dock is one row and keeps the body
-        // regions the geometry they had before the projection arrived.
+        // fill the dock and never clips off the panel. The slot is sized from
+        // the row's own wrapped height — the same wrap the widget performs —
+        // so a production-shaped projection is never clipped into a fixed
+        // two-row budget; the cap bounds how much of the transcript it may
+        // take, and a row still over the cap ends with an explicit cut marker.
         let task_rows = view.dock.len().saturating_sub(1).clamp(0, 3);
-        let economy_rows = match view.dock.len() {
-            0 => 0,
-            1 => 1,
-            _ => 2,
+        // A modal covers the dock anyway, so the economy slot keeps a short
+        // tail there rather than pushing the base rows under the card's
+        // side margins.
+        let economy_cap = if view.decision.is_some() || view.panel.is_some() {
+            3
+        } else {
+            ECONOMY_MAX_ROWS
         };
+        let economy_text = view
+            .dock
+            .last()
+            .map(|row| fit_economy_row(&sanitize_status_cause(row), area.width, economy_cap));
+        let economy_rows = economy_text
+            .as_deref()
+            .map_or(0, |text| wrapped_row_count(text, area.width.max(1)));
         rows.push(Constraint::Length(task_rows as u16));
-        rows.push(Constraint::Length(economy_rows as u16));
+        rows.push(Constraint::Length(
+            u16::try_from(economy_rows).unwrap_or(u16::MAX),
+        ));
         rows.push(Constraint::Length(1));
         let chunks = ratatui::layout::Layout::vertical(rows).split(area);
         frame.render_widget(
@@ -973,10 +985,12 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             ),
             chunks[next],
         );
-        if let Some(economy) = view.dock.last() {
+        if let Some(economy) = economy_text.as_deref() {
+            // The slot's height and the fit check count `trim: false` rows;
+            // painting the same mode keeps the measured wrap and the painted
+            // wrap in agreement.
             frame.render_widget(
-                Paragraph::new(sanitize_status_cause(economy))
-                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                Paragraph::new(economy).wrap(ratatui::widgets::Wrap { trim: false }),
                 chunks[next + 1],
             );
         }
@@ -1858,9 +1872,10 @@ pub fn task_dock(status: &Value) -> Vec<String> {
     if lines.is_empty() {
         lines.push(DOCK_EMPTY.to_string());
     }
-    // The economy row is the dock's one fixed slot (AC-062): it paints on
-    // every beat — with or without tasks — so a spend or quota figure
-    // appearing or vanishing never moves the rows below it.
+    // The economy row is the dock's one dedicated projection row (AC-062):
+    // it paints on every beat — with or without tasks — and its slot is
+    // sized from its own wrapped height, so the task rows above it keep
+    // their window while the row grows for the figures it must show.
     lines.push(economy_row(status.get("economy")));
     lines
 }
@@ -1869,17 +1884,24 @@ pub fn task_dock(status: &Value) -> Vec<String> {
 /// is elided on a char boundary.
 const ECONOMY_LABEL_MAX: usize = 32;
 
-/// The longest project/cwd head the row carries. The row wraps inside its
-/// two-row slot, but the 60-column acceptance geometry gives it 120 cells
-/// total; an 11-char head keeps the workspace's `/projects/` anchor, and
-/// leaves the reset/agents figures and the quota unknown with its source
-/// inside that budget.
-const ECONOMY_PATH_MAX: usize = 11;
+/// The longest project/cwd tail the row carries. The row wraps inside its
+/// own slot, and the tail keeps the part that names the workspace — a head
+/// cut leaves every deep path reading `/home/brook…`, which tells nobody
+/// which project the figures belong to.
+const ECONOMY_PATH_MAX: usize = 24;
 
 /// The widest reset time the row carries before it is elided. A full
-/// timestamp would push the quota source past the 60-column two-row budget,
-/// so the date head is what stays beside `reset`; the ellipsis marks the cut.
+/// timestamp would push the quota source past the narrow budget, so the
+/// date head is what stays beside `reset`; the ellipsis marks the cut.
 const ECONOMY_RESET_MAX: usize = 10;
+
+/// Most rows the economy slot may take. The slot is sized from the rendered
+/// wrap up to this bound; a projection that still overruns it is cut with
+/// an explicit marker, so no field disappears silently.
+const ECONOMY_MAX_ROWS: usize = 6;
+
+/// The explicit tail a capped economy row ends with.
+const ECONOMY_CUT: &str = " …[cut]";
 
 /// The row painted while the status carries no economy projection.
 const ECONOMY_UNKNOWN_ROW: &str = "economy: unknown";
@@ -1892,55 +1914,137 @@ fn elide_label(label: &str, max: usize) -> String {
         return label.to_string();
     }
     let mut kept: String = label.chars().take(max.saturating_sub(1)).collect();
+    kept.truncate(kept.trim_end().len());
     kept.push('…');
     kept
 }
 
-/// One fixed dock row for the economy projection (AC-062): settled tokens,
-/// context occupancy, cost, quota with its reset and the scheduler's
-/// agents, plus the request's model/effort facts — each unknown figure
-/// spelled `unknown` beside the source that would answer it, with project
-/// and cwd always visible. Occupancy and lifetime spend stay labelled
-/// apart. The workspace names lead: they are what a narrow dock must never
-/// lose, and the row wraps inside its two-row slot. Fields are
-/// space-separated because that slot is only 120 cells at the 60-column
-/// acceptance geometry, and a separator between each field would spend the
-/// cells the reset and agents figures need.
+/// Keeps the last `max - 1` characters of a workspace path verbatim after
+/// an ellipsis: a segment-only tail would spend the budget on the leaf and
+/// render every project below the same parent identically, so the parent
+/// that names the workspace survives beside it. A path already inside the
+/// budget stays verbatim.
+fn elide_path(path: &str, max: usize) -> String {
+    let chars = path.chars().count();
+    if chars <= max {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(chars - max.saturating_sub(1)).collect();
+    format!("…{tail}")
+}
+
+/// One economy string field: absent stays `unknown`, a present value that is
+/// not a string is a malformed projection rather than a silent absence.
+fn economy_label(economy: &Value, key: &str, max: usize) -> String {
+    match economy.get(key) {
+        None | Some(Value::Null) => "unknown".to_string(),
+        Some(Value::String(label)) => elide_label(label, max),
+        Some(_) => "malformed".to_string(),
+    }
+}
+
+/// One economy counter: absent stays `unknown`, and a value that is not a
+/// non-negative integer is reported as malformed instead of being folded
+/// into the same `unknown` spelling.
+fn economy_number(economy: &Value, key: &str) -> String {
+    match economy.get(key) {
+        None | Some(Value::Null) => "unknown".to_string(),
+        Some(value) => value
+            .as_u64()
+            .map_or_else(|| "malformed".to_string(), |number| number.to_string()),
+    }
+}
+
+/// The cache figure the snapshot measured, or the honest unknown. A shape
+/// that cannot be read is a malformed counter, never a measured zero.
+fn economy_cache(economy: &Value) -> String {
+    match economy.get("cache_rate") {
+        None | Some(Value::Null) => "unknown".to_string(),
+        Some(Value::Array(pair)) if pair.len() == 2 => match (pair[0].as_u64(), pair[1].as_u64()) {
+            (Some(read), Some(input)) if input > 0 && read <= input => {
+                format!("{read}/{input} tok")
+            }
+            _ => "malformed".to_string(),
+        },
+        Some(_) => "malformed".to_string(),
+    }
+}
+
+/// One dock row for the economy projection (AC-062): the workspace, then
+/// the five figures a narrow dock must keep — settled tokens, charged
+/// units, agents, reset and quota, each with its unit and the source that
+/// answers it — before the longer provenance (context, cache, model,
+/// effort, purpose). The workspace leads because the figures belong to it;
+/// the required figures lead the provenance because the capped slot cuts
+/// its tail, never a figure the operator needs at the acceptance width.
+/// Fields are space-separated because the slot is tight at that width and
+/// a separator per field would spend the cells the sources need.
 fn economy_row(economy: Option<&Value>) -> String {
     let Some(economy) = economy else {
         return ECONOMY_UNKNOWN_ROW.to_string();
     };
-    let number = |key: &str| {
-        economy
-            .get(key)
-            .and_then(Value::as_u64)
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+    let label = |key: &str| economy_label(economy, key, ECONOMY_LABEL_MAX);
+    let cache = economy_cache(economy);
+    let project = match economy.get("project") {
+        Some(Value::String(path)) => elide_path(path, ECONOMY_PATH_MAX),
+        Some(Value::Null) | None => "unknown".to_string(),
+        Some(_) => "malformed".to_string(),
     };
-    let elided = |key: &str, max: usize| {
-        economy
-            .get(key)
-            .and_then(Value::as_str)
-            .map_or_else(|| "unknown".to_string(), |label| elide_label(label, max))
+    let cwd = match economy.get("cwd") {
+        Some(Value::String(path)) => elide_path(path, ECONOMY_PATH_MAX),
+        Some(Value::Null) | None => "unknown".to_string(),
+        Some(_) => "malformed".to_string(),
     };
     format!(
-        "economy: project {} cwd {} settled {} tok agents {} reset {} quota {} ({}) model {} via {} [{}] context {} tok ({}) cost {} u cache ({}) effort {} ({})",
-        elided("project", ECONOMY_PATH_MAX),
-        elided("cwd", ECONOMY_PATH_MAX),
-        number("settled_tokens"),
-        number("agents"),
-        elided("reset_at", ECONOMY_RESET_MAX),
-        number("quota_remaining"),
-        elided("quota_source", ECONOMY_LABEL_MAX),
-        elided("model", ECONOMY_LABEL_MAX),
-        elided("connection", ECONOMY_LABEL_MAX),
-        elided("source", ECONOMY_LABEL_MAX),
-        number("context_tokens"),
-        elided("context_source", ECONOMY_LABEL_MAX),
-        number("charged_units"),
-        elided("cache_source", ECONOMY_LABEL_MAX),
-        elided("effort", ECONOMY_LABEL_MAX),
-        elided("effort_source", ECONOMY_LABEL_MAX),
+        "economy: project {project} cwd {cwd} settled {} tok ({}) charged {} units ({}) agents {} slots ({}) reset {} ({}) quota {} ({}) context {} tok ({}) cache {cache} ({}) model {} ({}) effort {} ({}) purpose {} scope {}",
+        economy_number(economy, "settled_tokens"),
+        label("settled_source"),
+        economy_number(economy, "charged_units"),
+        label("cost_source"),
+        economy_number(economy, "agents"),
+        label("agents_source"),
+        economy_label(economy, "reset_at", ECONOMY_RESET_MAX),
+        label("reset_source"),
+        economy_number(economy, "quota_remaining"),
+        label("quota_source"),
+        economy_number(economy, "context_tokens"),
+        label("context_source"),
+        label("cache_source"),
+        label("model"),
+        label("source"),
+        label("effort"),
+        label("effort_source"),
+        label("purpose"),
+        label("connection"),
     )
+}
+
+/// Fits one rendered economy row into at most `cap` wrapped rows. A row
+/// that overruns is cut on a char boundary and ends with [`ECONOMY_CUT`],
+/// so the operator sees that the projection was shortened instead of
+/// reading a silently clipped tail.
+fn fit_economy_row(text: &str, width: u16, cap: usize) -> String {
+    let width = width.max(1);
+    let marker_rows = wrapped_row_count(ECONOMY_CUT, width);
+    let cap = cap.max(marker_rows);
+    if wrapped_row_count(text, width) <= cap {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut low, mut high) = (0usize, chars.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let mut candidate: String = chars[..middle].iter().collect();
+        candidate.push_str(ECONOMY_CUT);
+        if wrapped_row_count(&candidate, width) <= cap {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let mut fitted: String = chars[..low].iter().collect();
+    fitted.push_str(ECONOMY_CUT);
+    fitted
 }
 
 const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
@@ -2496,6 +2600,11 @@ pub const TUI_CANCEL_PENDING: &str = "cancel requested; waiting for the in-fligh
 /// Painted while the send window is open: the answer is committed and the
 /// provider is still working, and input stays live.
 pub const TUI_SEND_PENDING: &str = "send in flight; input stays live";
+
+/// Painted when the send worker died before handing the runtime back: the
+/// failure rides the status line, not a transcript row the decision card's
+/// overlay hides until the process exits.
+pub const TUI_SEND_WINDOW_FAILED: &str = "send window failed; the in-flight attempt was released";
 
 /// The test-only marker that makes the send worker leave before it settles,
 /// so the loop's worker-failure path is exercised without a panic. Production
@@ -3270,9 +3379,13 @@ where
             // instead of waiting forever on a completion that cannot come.
             Some(Err(())) => {
                 send_owner = None;
-                view.status = STATUS_DISCONNECTED.to_string();
-                view.transcript
-                    .push("send window failed; the in-flight attempt was released".to_string());
+                // The status line is painted above the modal region, so the
+                // failure stays visible even before the card is dropped; the
+                // card itself is cleared so the transcript line below is not
+                // hidden behind its `Clear` overlay for the exiting frame.
+                view.decision = None;
+                view.status = TUI_SEND_WINDOW_FAILED.to_string();
+                view.transcript.push(TUI_SEND_WINDOW_FAILED.to_string());
                 exit = 1;
                 render(guard.terminal_mut(), &view)?;
                 break;
@@ -3344,11 +3457,11 @@ impl Projection {
 mod tests {
     use super::{
         CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_CONSENT_DELAY,
-        DOCK_EMPTY, DecisionPanel, ECONOMY_UNKNOWN_ROW, LocalView, LoopbackProvider,
-        OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError, append_composer_char,
-        append_composer_paste, dispatch_tui_request, initial_view, note_open_failure,
-        output_status_line, render, run_composer_command, surface_boot_diagnostics, task_dock,
-        types_text, types_text_altgr, wrapped_row_count,
+        DOCK_EMPTY, DecisionPanel, ECONOMY_PATH_MAX, ECONOMY_UNKNOWN_ROW, HELP_TEXT, LocalView,
+        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError,
+        append_composer_char, append_composer_paste, dispatch_tui_request, elide_label, elide_path,
+        initial_view, note_open_failure, output_status_line, render, run_composer_command,
+        surface_boot_diagnostics, task_dock, types_text, types_text_altgr, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, Question, TEXT_MAX_BYTES, TaskId};
     use crate::providers::openai_login::DeviceEndpoints;
@@ -3551,11 +3664,19 @@ mod tests {
             "source": "fixed pin",
             "effort": "high",
             "effort_source": "sent setting; the endpoint reports no effective effort",
+            "purpose": "main",
             "context_tokens": 9,
+            "context_source": "latest settled attempt's reported prompt tokens",
             "settled_tokens": 12,
+            "settled_source": "sum of 1 settled attempt's reported totals",
             "charged_units": 2,
+            "cost_source": "the bound is retained unless a reported total is lower",
             "quota_remaining": null,
             "quota_source": "unknown: no quota endpoint reports remaining units",
+            "reset_at": null,
+            "reset_source": "unknown: the quota surface reports no reset",
+            "agents": 3,
+            "agents_source": "scheduler's running slots",
             "cache_rate": null,
             "cache_source": "unknown: settled cache and prompt legs are not both recorded"
         });
@@ -3588,20 +3709,61 @@ mod tests {
     }
 
     #[test]
+    fn elided_label_trims_the_kept_prefix() {
+        let elided = elide_label("alpha beta  gamma", 12);
+        assert_eq!(
+            elided, "alpha beta…",
+            "the ellipsis follows the kept word, never a floating space: {elided}"
+        );
+    }
+
+    #[test]
+    fn deep_path_elision_keeps_the_workspace_parent_verbatim() {
+        let workspace = "/home/brooke/Work/Rivect/src";
+        let elided = elide_path(workspace, ECONOMY_PATH_MAX);
+        assert!(
+            elided.contains("Rivect") && elided.ends_with("/Rivect/src"),
+            "the tail names the workspace and its leaf: {elided}"
+        );
+        assert_eq!(
+            elided.chars().count(),
+            ECONOMY_PATH_MAX,
+            "the elided path spends exactly its budget: {elided}"
+        );
+        // The old segment-only tail rendered both of these as `…/src`; the
+        // verbatim tail keeps the parent that distinguishes them.
+        let alice = elide_path("/home/alice/Work/Rivect/src", ECONOMY_PATH_MAX);
+        let bob = elide_path("/home/bob/Work/Rivect/src", ECONOMY_PATH_MAX);
+        assert_ne!(alice, bob, "distinct workspaces render differently");
+        assert!(
+            elide_path("/home/brooke", ECONOMY_PATH_MAX) == "/home/brooke",
+            "a path inside the budget stays verbatim"
+        );
+    }
+
+    #[test]
     fn economy_row_is_visible_with_zero_and_three_todos() {
         let economy = json!({
-            "project": "/projects/a-very-long-project-name-over-the-label-limit",
-            "cwd": "/projects/a-very-long-project-name-over-the-label-limit/src",
+            "project": "/home/brooke/Work/Rivect-checkout",
+            "cwd": "/home/brooke/Work/Rivect/src",
             "model": "fixture-model",
             "connection": "local",
             "source": "fixed pin",
             "effort": "high",
             "effort_source": "sent setting; the endpoint reports no effective effort",
+            "purpose": "main",
             "context_tokens": 128,
+            "context_source": "latest settled attempt's reported prompt tokens",
             "settled_tokens": 18,
+            "settled_source": "sum of 1 settled attempt's reported totals",
             "charged_units": 3,
+            "cost_source": "the bound is retained unless a reported total is lower",
             "quota_remaining": null,
             "quota_source": "unknown: no quota endpoint reports remaining units",
+            "reset_at": null,
+            "reset_source": "unknown: the quota surface reports no reset",
+            "agents": 2,
+            "agents_source": "scheduler's running slots",
             "cache_rate": null,
             "cache_source": "unknown: settled cache and prompt legs are not both recorded"
         });
@@ -3626,20 +3788,141 @@ mod tests {
             );
             assert!(row.contains("tok"), "the row names its unit: {row}");
             assert!(
-                row.contains("no quota endpoint"),
+                row.contains("unknown: no quota e"),
                 "the unknown keeps its source: {row}"
             );
+            let project = row
+                .split("project ")
+                .nth(1)
+                .and_then(|rest| rest.split(" cwd ").next())
+                .expect("the row names its project");
+            let cwd = row
+                .split(" cwd ")
+                .nth(1)
+                .and_then(|rest| rest.split(" settled ").next())
+                .expect("the row names its cwd");
             assert!(
-                row.contains("project /projects/"),
-                "project stays visible: {row}"
+                project.starts_with('…') && cwd.starts_with('…'),
+                "a deep path keeps its informative tail: {row}"
             );
-            assert!(row.contains("cwd /projects/"), "cwd stays visible: {row}");
+            assert!(
+                project.contains("Rivect") && cwd.contains("Rivect"),
+                "the elided paths keep the workspace name: {row}"
+            );
+            assert_ne!(project, cwd, "the two paths stay distinguishable: {row}");
+            assert!(
+                cwd.ends_with("/Rivect/src"),
+                "the cwd tail keeps its parent and segment: {row}"
+            );
             assert!(row.contains('…'), "a long label is elided: {row}");
             assert!(
                 row.contains("settled 18 tok") && row.contains("context 128 tok"),
                 "occupancy and lifetime spend stay separately labelled: {row}"
             );
         }
+    }
+
+    #[test]
+    fn economy_row_paints_measured_cache_and_malformed_counters() {
+        let measured = json!({
+            "cache_rate": [5, 10],
+            "cache_source": "settled frozen cohort w-1 of 2026-11-05 over fixture-model",
+        });
+        let row = task_dock(&json!({ "todo": { "items": [] }, "economy": measured }))
+            .pop()
+            .expect("the economy slot paints");
+        assert!(
+            row.contains("cache 5/10 tok"),
+            "a measured rate carries both counters and its unit: {row}"
+        );
+        assert!(
+            row.contains("settled frozen coho"),
+            "the measured rate keeps its source: {row}"
+        );
+
+        let malformed = json!({
+            "cache_rate": "not-a-pair",
+            "settled_tokens": "not-a-counter",
+            "quota_remaining": -1,
+        });
+        let row = task_dock(&json!({ "todo": { "items": [] }, "economy": malformed }))
+            .pop()
+            .expect("the economy slot paints");
+        assert!(
+            row.contains("cache malformed") && row.contains("settled malformed tok"),
+            "a malformed counter is named, never folded into unknown: {row}"
+        );
+        assert!(
+            row.contains("quota malformed"),
+            "a negative counter is malformed, never a figure: {row}"
+        );
+    }
+
+    /// The slot height counts `trim: false` rows, where the whitespace a
+    /// break could not fit opens the next row. A `trim: true` paint drops
+    /// that cell and renders the tail one column left of the counted
+    /// layout, so this frame only matches when the measured wrap and the
+    /// painted wrap are the same mode.
+    #[test]
+    fn economy_slot_paints_the_untrimmed_wrap_it_counted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut view = initial_view();
+        // 60 cells of prefix and token fill the first row exactly; the two
+        // separating spaces overflow it, so one stays at the next row's
+        // start under `trim: false`.
+        view.dock = vec![format!("economy: {}  tail", "x".repeat(51))];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))?;
+        render(&mut terminal, &view)?;
+        let buffer = terminal.backend().buffer().clone();
+        let width = usize::from(buffer.area.width);
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect();
+        let tail = rows
+            .iter()
+            .position(|row| row.contains("tail"))
+            .expect("the wrapped tail paints in the economy slot");
+        assert!(
+            rows[tail].starts_with(" tail"),
+            "the counted wrap keeps its leading cell: {:?}",
+            rows[tail]
+        );
+        assert!(
+            rows[tail - 1].ends_with('x'),
+            "the first row fills where the count says it does: {:?}",
+            rows[tail - 1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn help_fits_the_narrow_frame() -> Result<(), Box<dyn std::error::Error>> {
+        // The transcript paragraph does not wrap, so each help row must fit
+        // the 60-column acceptance width itself; `/login cancel` is the row
+        // that used to clip past the frame.
+        let mut view = initial_view();
+        view.transcript = vec![HELP_TEXT.to_string()];
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20))?;
+        render(&mut terminal, &view)?;
+        let buffer = terminal.backend().buffer().clone();
+        let painted: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for needle in ["/login:", "\"device\"", "\"complete\"", "\"cancel\""] {
+            assert!(
+                painted.contains(needle),
+                "the 60x20 help frame keeps {needle}: {painted}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -5140,8 +5423,8 @@ mod card_pty {
     use super::{
         COMPACT_TOKEN, CONTEXT_COMPACTED, CONTEXT_MEASURE_INTERVAL, CommandId,
         DECISION_ANSWERED_NOTE, DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, DOCK_REFRESH_INTERVAL,
-        NOTHING_TO_COMPACT, SEND_FAILURE_ENV, SLOW_SEND_ENV, TUI_SEND_PENDING, TuiDispatch,
-        dispatch_tui_request, drive_tui, failure_report,
+        NOTHING_TO_COMPACT, SEND_FAILURE_ENV, SLOW_SEND_ENV, TUI_SEND_PENDING,
+        TUI_SEND_WINDOW_FAILED, TuiDispatch, dispatch_tui_request, drive_tui, failure_report,
     };
     use crate::contracts::{AnswerAttemptOutcome, AnswerSelection, Question, SessionId, TaskId};
     use crate::state::TaskStore;
@@ -6061,6 +6344,25 @@ fallback = { mode = \"off\" }\n";
         let opened = open_card(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &failing);
         let mut driver = opened.driver;
         press(&mut driver.pty, b"\r");
+        // The cause must land on the status line the card's overlay never
+        // covers, so the operator sees why the window died before the
+        // process leaves the alternate screen.
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "send window failed",
+            secs(20),
+        );
+        // The failure is duplicated into the transcript below the card, so a
+        // plain `contains` cannot say which surface painted it: the status is
+        // the frame's first row, and that row must carry the text alone.
+        let mut rows = visible.lines();
+        assert_eq!(
+            rows.next(),
+            Some(TUI_SEND_WINDOW_FAILED),
+            "the status line, not a transcript row, carries the failure: {visible}"
+        );
         expect_exit(&mut driver, secs(20));
         let (outcome, store) = driver.exited();
         assert_eq!(
@@ -8851,26 +9153,32 @@ fallback = { mode = \"off\" }\n";
     fn economy_row_budgets_the_narrow_dock() -> Result<(), Box<dyn std::error::Error>> {
         use crate::ui::{initial_view, render, task_dock};
 
-        // A production-shaped projection: long workspace paths, one numeric
-        // figure and several unknowns with their sources. The narrowest
-        // acceptance geometry is 60x20, where the row has two rows; the wide
-        // frame proves the same fields with room to spare.
+        // A production-shaped projection: realistic workspace paths, the five
+        // figures the dock must keep, and long provenance. The narrowest
+        // acceptance geometry is 60x20, where the economy slot's cap is six
+        // rows: the required figures and their sources lead, so the cut falls
+        // on the long provenance instead of a figure.
         let economy = json!({
-            "project": "/projects/a-very-long-project-name-over-the-label-limit",
-            "cwd": "/projects/a-very-long-project-name-over-the-label-limit/src",
+            "project": "/home/brooke/Work/Rivect",
+            "cwd": "/home/brooke/Work/Rivect/src",
             "model": "fixture-model",
             "connection": "local",
             "source": "fixed pin",
             "effort": "high",
             "effort_source": "sent setting; the endpoint reports no effective effort",
+            "purpose": "main",
             "context_tokens": 9,
             "context_source": "latest settled attempt's reported prompt tokens",
             "settled_tokens": 12,
+            "settled_source": "partial: 1 of 2 settled attempts reported no total",
             "charged_units": 2,
+            "cost_source": "the bound is retained unless a reported total is lower",
             "quota_remaining": null,
             "quota_source": "unknown: no quota endpoint reports remaining units",
             "reset_at": "2026-11-05",
+            "reset_source": "unknown: the quota surface reports no reset",
             "agents": 3,
+            "agents_source": "scheduler's running slots",
             "cache_rate": null,
             "cache_source": "unknown: settled cache and prompt legs are not both recorded"
         });
@@ -8882,29 +9190,110 @@ fallback = { mode = \"off\" }\n";
             ]},
             "economy": economy
         });
+        // The five required figures, their units and their sources survive
+        // the 60x20 cap; the workspace keeps its name, not just its leaf.
         let narrow = [
-            "tok",
-            "unknown",
-            "no quota",
             "project ",
             "cwd ",
-            "agents 3",
-            "reset 2026-11-05",
+            "Rivect",
+            "settled 12 tok",
+            "charged 2 units",
+            "agents 3 slots",
+            "2026-11-05",
+            "quota unknown",
+            "partial: 1 of 2",
+            "unknown: no quota endpoint repo",
+            "unknown: the quota surface repo",
+            "the bound is retained",
+            "scheduler's running",
+            "tok",
+            "[cut]",
         ];
         let wide = [
-            "tok",
-            "unknown",
-            "no quota endpoint",
             "project ",
             "cwd ",
-            "latest settled attempt",
+            "latest settled attempt's",
             "fixed pin",
-            "agents 3",
-            "reset 2026-11-05",
+            "fixture-model",
+            "effort high",
+            "context 9 tok",
+            "cache unknown",
+            "partial: 1 of 2 settled attempt",
+            "purpose main",
+            "scope local",
         ];
-        for (cols, rows, needles) in [(60u16, 20u16, &narrow[..]), (180u16, 30u16, &wide[..])] {
+        for (cols, rows, needles) in [
+            (60u16, 20u16, &narrow[..]),
+            (120u16, 40u16, &wide[..]),
+            (180u16, 30u16, &wide[..]),
+        ] {
             let mut view = initial_view();
             view.dock = task_dock(&status);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows))?;
+            render(&mut terminal, &view)?;
+            let buffer = terminal.backend().buffer().clone();
+            let painted: String = buffer
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            for needle in needles {
+                assert!(
+                    painted.contains(needle),
+                    "the {cols}x{rows} economy row paints {needle}: {painted}"
+                );
+            }
+        }
+
+        // A measured cache and a malformed counter paint at the narrow
+        // frames: the 80-column frame keeps the measured pair's both
+        // counters, the 60-column frame cuts its tail with the explicit
+        // marker, and the malformed value is named rather than folded into
+        // the unknown spelling.
+        let odd = json!({
+            "project": "/srv/rivect",
+            "cwd": "/srv/rivect/src",
+            "settled_tokens": "not-a-counter",
+            "settled_source": "partial: 1 of 2 settled attempts reported no total",
+            "charged_units": 2,
+            "cost_source": "the bound is retained unless a reported total is lower",
+            "quota_remaining": -1,
+            "quota_source": "unknown: no quota endpoint reports remaining units",
+            "reset_at": "2026-11-05",
+            "reset_source": "unknown: the quota surface reports no reset",
+            "agents": 1,
+            "agents_source": "scheduler's running slots",
+            "cache_rate": [5, 10],
+            "cache_source": "settled frozen cohort w-1 of 2026-11-05 over fixture-model",
+        });
+        let odd_status = json!({ "todo": { "items": [] }, "economy": odd });
+        for (cols, rows, needles) in [
+            (
+                60u16,
+                20u16,
+                &[
+                    "malformed tok",
+                    "quota malformed",
+                    "quota surface repo",
+                    "[cut]",
+                ][..],
+            ),
+            (
+                80u16,
+                24u16,
+                &[
+                    "malformed tok",
+                    "quota malformed",
+                    "of 2 settled attempt",
+                    "cache 5/10",
+                    "the bound is retained",
+                    "scope unknown",
+                ][..],
+            ),
+        ] {
+            let mut view = initial_view();
+            view.dock = task_dock(&odd_status);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(cols, rows))?;
             render(&mut terminal, &view)?;

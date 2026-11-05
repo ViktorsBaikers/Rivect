@@ -205,6 +205,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::StreamViolation { .. } => "StreamViolation",
         ProviderError::IncompatibleOutput { .. } => "IncompatibleOutput",
         ProviderError::UnsupportedParameter { .. } => "UnsupportedParameter",
+        ProviderError::UnsendableRequest { .. } => "UnsendableRequest",
         ProviderError::ReasoningProvenance { .. } => "ReasoningProvenance",
         ProviderError::Retried { .. } => "Retried",
     }

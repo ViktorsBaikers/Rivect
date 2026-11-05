@@ -35,7 +35,7 @@ use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply
 use rivect::resources::{Exactness, UsageDelta};
 use rivect::state::{
     CacheCohort, CacheCohortCounts, CacheRate, ConflictCause, InvalidCause, SettlementState,
-    StoreError, StoreLedger, TaskStore,
+    SettlementTotals, StoreError, StoreLedger, TaskStore,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -348,11 +348,712 @@ fn interrupted_settle_is_reconciled_on_reopen() {
     let status = reopened.budget_status(SCOPE_A).expect("scope status");
     assert_eq!(status.spent, manifest.cost_bound, "the bound is retained");
     assert_eq!(status.reserved, 0, "the reservation resolved once");
+    // The recovered close lands in the incremental totals exactly once: one
+    // settled row without a total, the retained bound as its charge, and no
+    // send left open.
+    let totals = reopened.settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 1,
+            settled_without_total: 1,
+            total_tokens: None,
+            charged_units: Some(manifest.cost_bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: None,
+        },
+        "the reconciled row lands in the incremental totals exactly once"
+    );
     assert_eq!(
         reopened
             .reconcile_sends()
             .expect("a second pass is a no-op"),
         0
+    );
+    assert_eq!(
+        reopened.settlement_totals().expect("totals"),
+        totals,
+        "a second reconciliation pass changes no total"
+    );
+}
+
+/// An upgrade store carries settlement rows but no incremental totals row:
+/// the O(1) presence guard fills it once from the ledger, counts included,
+/// and the monotonic identity resumes after the newest stored row.
+#[test]
+fn missing_totals_row_is_backfilled_once_from_the_settlement_ledger() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-backfill-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let (charged, measured_total) = {
+        let mut store = TaskStore::open(&path).expect("store opens");
+        store.open_budget(SCOPE_A, 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+        let failed = prepared_with(&mut broker, "goal: backfill failed");
+        let measured = prepared_with(&mut broker, "goal: backfill measured");
+        let charged = failed.cost_bound + measured.cost_bound;
+        for (manifest, usage) in [
+            (&failed, UsageDelta::Unknown),
+            (
+                &measured,
+                UsageDelta::Exact {
+                    prompt_tokens: 6,
+                    completion_tokens: 4,
+                    total_tokens: 10,
+                },
+            ),
+        ] {
+            let ticket = store
+                .begin_send(&[SCOPE_A], &context(), manifest)
+                .expect("the send begins");
+            store
+                .finish_send(
+                    &ticket,
+                    &SendOutcome::Settled {
+                        usage,
+                        wire_retries: 0,
+                    },
+                )
+                .expect("the send settles");
+        }
+        (charged, 10u64)
+    };
+    // The upgrade shape: the ledger rows survive, the incremental row does
+    // not — a store written before the additive totals row existed.
+    let conn = rusqlite::Connection::open(&path).expect("raw connection");
+    conn.execute("DELETE FROM usage_totals", [])
+        .expect("totals row removed");
+    drop(conn);
+
+    let reopened = TaskStore::open(&path).expect("store reopens");
+    let totals = reopened.settlement_totals().expect("totals");
+    assert_eq!(totals.settled_count, 2, "both settled rows are counted");
+    assert_eq!(
+        totals.settled_without_total, 1,
+        "only the failed row reported no total"
+    );
+    assert_eq!(totals.total_tokens, Some(measured_total));
+    assert_eq!(totals.charged_units, Some(charged));
+    assert_eq!(totals.dispatched_count, 0);
+    assert_eq!(
+        totals.latest_prompt_tokens,
+        Some(6),
+        "the newest settled row's prompt is the backfilled figure"
+    );
+    drop(reopened);
+    let conn = rusqlite::Connection::open(&path).expect("raw connection");
+    let next_rowid: i64 = conn
+        .query_row(
+            "SELECT next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the backfilled row answers");
+    assert_eq!(
+        next_rowid, 3,
+        "the backfill resumes after the newest stored ledger row"
+    );
+}
+
+/// A store written before the incremental totals row existed — settlement
+/// rows present, `usage_totals` absent, one send interrupted — opens, closes
+/// the send unknown at its bound, and lands the exact totals. The pre-commit
+/// recovery would write a table this store has not created, so the schema
+/// guard must route the open through the post-commit path.
+#[test]
+fn pre_totals_store_with_an_interrupted_send_opens_and_reconciles() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-pre-totals-").expect("fixture root");
+    let runtime_dir = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    let db = runtime_dir.join("rivect.db");
+    let (attempt_id, bound) = {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store.open_budget(SCOPE_A, 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+        let manifest = prepared_with(&mut broker, "goal: pre-totals interrupted");
+        store
+            .begin_send(&[SCOPE_A], &context(), &manifest)
+            .expect("the send begins");
+        (manifest.attempt_id.clone(), manifest.cost_bound)
+    };
+    // The upgrade shape: the settlement ledger survives, the incremental
+    // totals table does not — the store every earlier candidate of this
+    // feature wrote.
+    let conn = rusqlite::Connection::open(&db).expect("raw connection");
+    conn.execute("DROP TABLE usage_totals", [])
+        .expect("totals table removed");
+    drop(conn);
+
+    let mut world = support::open_world_at(root.path(), Some(config_text()));
+    let record = world
+        .runtime
+        .store()
+        .settlement(&attempt_id)
+        .expect("the open closes the row");
+    assert_eq!(record.state, SettlementState::Settled);
+    assert_eq!(record.exactness, Exactness::Unknown);
+    assert_eq!(record.unknown_reason.as_deref(), Some("interrupted"));
+    assert_eq!(record.charged_units, Some(bound));
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .budget_status(SCOPE_A)
+            .expect("scope status")
+            .spent,
+        bound,
+        "the interrupted send keeps its bound charged"
+    );
+    let totals = world.runtime.store().settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 1,
+            settled_without_total: 1,
+            total_tokens: None,
+            charged_units: Some(bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: None,
+        },
+        "the interrupted row lands in the newly created totals exactly once"
+    );
+    assert!(
+        world
+            .runtime
+            .boot_diagnostics
+            .iter()
+            .any(|line| line.contains("settlement recovery")),
+        "the boot line names the recovery: {:?}",
+        world.runtime.boot_diagnostics
+    );
+    {
+        let mut writer = world.runtime.store_writer();
+        assert_eq!(
+            writer.reconcile_sends().expect("a second pass is a no-op"),
+            0
+        );
+    }
+    assert_eq!(
+        world.runtime.store().settlement_totals().expect("totals"),
+        totals,
+        "a second reconciliation pass changes no total"
+    );
+}
+
+/// A foreign build can write settlement rows past the incremental counter
+/// and leave no totals row of its own. The next dispatch allocates above
+/// every stored identity instead of colliding with it, and its settlement
+/// resumes the ledger: a first send after the upgrade succeeds and lands.
+#[test]
+fn a_foreign_settlement_beyond_the_counter_does_not_wedge_the_next_send() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-foreign-row-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let first_total = {
+        let mut store = TaskStore::open(&path).expect("store opens");
+        store.open_budget(SCOPE_A, 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+        let manifest = prepared_with(&mut broker, "goal: before the foreign row");
+        let ticket = store
+            .begin_send(&[SCOPE_A], &context(), &manifest)
+            .expect("the first send begins");
+        store
+            .finish_send(
+                &ticket,
+                &SendOutcome::Settled {
+                    usage: UsageDelta::Exact {
+                        prompt_tokens: 6,
+                        completion_tokens: 4,
+                        total_tokens: 10,
+                    },
+                    wire_retries: 0,
+                },
+            )
+            .expect("the first send settles");
+        10u64
+    };
+    // A foreign build names its own rowid and leaves `next_rowid` behind:
+    // the identity the next allocation would hand out is already taken.
+    let conn = rusqlite::Connection::open(&path).expect("raw connection");
+    conn.execute(
+        "INSERT INTO usage_settlements
+             (rowid, attempt_id, purpose, connection, cost_bound, state, exactness, wire_retries)
+         VALUES (2, 'foreign-attempt', 'main', 'local', 4, 'dispatched', 'unknown', 0)",
+        [],
+    )
+    .expect("the foreign row lands");
+    conn.execute(
+        "UPDATE usage_settlements SET state = 'settled' WHERE attempt_id = 'foreign-attempt'",
+        [],
+    )
+    .expect("the foreign row closes");
+    drop(conn);
+
+    let mut store = TaskStore::open(&path).expect("the upgraded store opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let manifest = prepared_with(&mut broker, "goal: after the foreign row");
+    let ticket = store
+        .begin_send(&[SCOPE_A], &context(), &manifest)
+        .expect("the allocation resumes above the foreign identity");
+    store
+        .finish_send(
+            &ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the send settles");
+    assert_eq!(
+        store
+            .settlement(&manifest.attempt_id)
+            .expect("the new row")
+            .state,
+        SettlementState::Settled
+    );
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals.settled_count, 3,
+        "the foreign row and the resumed send are both counted"
+    );
+    assert_eq!(totals.total_tokens, Some(first_total + 5));
+    assert_eq!(totals.dispatched_count, 0);
+    let conn = rusqlite::Connection::open(&path).expect("raw connection");
+    let (rowid, state): (i64, String) = conn
+        .query_row(
+            "SELECT rowid, state FROM usage_settlements WHERE attempt_id = 'foreign-attempt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the foreign row survives");
+    assert_eq!(
+        (rowid, state.as_str()),
+        (2, "settled"),
+        "the foreign identity is never overwritten"
+    );
+    let next_rowid: i64 = conn
+        .query_row(
+            "SELECT next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the counter answers");
+    assert_eq!(
+        next_rowid, 4,
+        "the allocation resynchronised past the foreign row"
+    );
+}
+
+/// A store reverted to a build without the incremental row writes its
+/// settlement rows past `next_rowid` and never touches the totals. The open
+/// recomputes the record from the ledger before recovery settles the foreign
+/// rows, so every settled row is counted, the open count lands on zero and
+/// the next identity resumes after the newest row.
+#[test]
+fn a_reverted_store_recomputes_the_totals_before_reconciling_foreign_rows() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-reverted-").expect("fixture root");
+    let runtime_dir = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    let db = runtime_dir.join("rivect.db");
+    let (first_bound, first_total) = {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store.open_budget(SCOPE_A, 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+        let manifest = prepared_with(&mut broker, "goal: before the revert");
+        let ticket = store
+            .begin_send(&[SCOPE_A], &context(), &manifest)
+            .expect("the send begins");
+        store
+            .finish_send(
+                &ticket,
+                &SendOutcome::Settled {
+                    usage: UsageDelta::Exact {
+                        prompt_tokens: 6,
+                        completion_tokens: 4,
+                        total_tokens: 10,
+                    },
+                    wire_retries: 0,
+                },
+            )
+            .expect("the send settles");
+        (manifest.cost_bound, 10u64)
+    };
+    // The reverted shape: the pre-totals build writes rows 2 and 3 and
+    // leaves the record at the pre-revert figures, so the ledger is ahead
+    // of it. Row 2 is an interrupted send, row 3 a settled one.
+    let conn = rusqlite::Connection::open(&db).expect("raw connection");
+    conn.execute(
+        "INSERT INTO usage_settlements
+             (rowid, attempt_id, purpose, connection, cost_bound, state, exactness, wire_retries)
+         VALUES (2, 'foreign-interrupted', 'main', 'local', 4, 'dispatched', 'unknown', 0)",
+        [],
+    )
+    .expect("the foreign interrupted row lands");
+    conn.execute(
+        "INSERT INTO usage_settlements
+             (rowid, attempt_id, purpose, connection, cost_bound, state, exactness, wire_retries)
+         VALUES (3, 'foreign-settled', 'main', 'local', 3, 'dispatched', 'unknown', 0)",
+        [],
+    )
+    .expect("the foreign settled row lands");
+    conn.execute(
+        "UPDATE usage_settlements
+             SET state = 'settled', exactness = 'exact', prompt_tokens = 5,
+                 completion_tokens = 2, total_tokens = 7, charged_units = 3
+             WHERE attempt_id = 'foreign-settled'",
+        [],
+    )
+    .expect("the foreign row closes");
+    let record: (i64, i64) = conn
+        .query_row(
+            "SELECT settled_count, next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the stale record answers");
+    assert_eq!(record, (1, 2), "the record predates both foreign rows");
+    drop(conn);
+
+    let world = support::open_world_at(root.path(), Some(config_text()));
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .settlement_totals()
+            .expect("the open repairs the record"),
+        SettlementTotals {
+            settled_count: 3,
+            settled_without_total: 1,
+            total_tokens: Some(first_total + 7),
+            charged_units: Some(first_bound + 3),
+            dispatched_count: 0,
+            latest_prompt_tokens: Some(5),
+        },
+        "the recomputed record counts every settled row and closes the foreign send"
+    );
+    assert!(
+        world
+            .runtime
+            .boot_diagnostics
+            .iter()
+            .any(|line| line.contains("settlement recovery")),
+        "the boot line names the recovery: {:?}",
+        world.runtime.boot_diagnostics
+    );
+    drop(world);
+    let conn = rusqlite::Connection::open(&db).expect("raw connection");
+    let next_rowid: i64 = conn
+        .query_row(
+            "SELECT next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the counter answers");
+    assert_eq!(
+        next_rowid, 4,
+        "the record resumes after the newest foreign row"
+    );
+}
+
+/// A reopen reconciles an older interrupted row after a newer send already
+/// settled: the older row reported no prompt, so it never overwrites the
+/// newer attempt's measured count in the incremental totals.
+#[test]
+fn an_older_reconciled_row_keeps_the_newest_measured_prompt() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-prompt-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let mut store = TaskStore::open(&path).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let interrupted = prepared_with(&mut broker, "goal: older interrupted");
+    let measured = prepared_with(&mut broker, "goal: newer measured");
+    let charged = interrupted.cost_bound + measured.cost_bound;
+    let _older_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &interrupted)
+        .expect("the older send begins");
+    let newer_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &measured)
+        .expect("the newer send begins");
+    store
+        .finish_send(
+            &newer_ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 42,
+                    completion_tokens: 8,
+                    total_tokens: 50,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the newer send settles");
+    assert_eq!(
+        store
+            .settlement_totals()
+            .expect("totals")
+            .latest_prompt_tokens,
+        Some(42),
+        "the newer measured prompt is the latest settled figure"
+    );
+
+    assert_eq!(store.reconcile_sends().expect("reconciliation runs"), 1);
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals.latest_prompt_tokens,
+        Some(42),
+        "the older interrupted row reports no prompt and keeps the newer measurement"
+    );
+    assert_eq!(totals.settled_count, 2);
+    assert_eq!(totals.settled_without_total, 1);
+    assert_eq!(totals.total_tokens, Some(50));
+    assert_eq!(totals.charged_units, Some(charged));
+    assert_eq!(totals.dispatched_count, 0);
+}
+
+/// A pre-totals build reopens this build's store and closes the allocated
+/// row in place: the ledger settles, `next_rowid` still names the next
+/// identity and the incremental record keeps counting the send as open. The
+/// reopen must see the record behind the ledger and recompute it, or the
+/// projection serves an open send and names no settled attempt over a
+/// settled ledger.
+#[test]
+fn a_pre_totals_in_place_settle_is_recomputed_on_reopen() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-in-place-").expect("fixture root");
+    let runtime_dir = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    let db = runtime_dir.join("rivect.db");
+    let (attempt_id, bound) = {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        store.open_budget(SCOPE_A, 10).expect("budget opens");
+        let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+        let manifest = prepared_with(&mut broker, "goal: in-place settle");
+        store
+            .begin_send(&[SCOPE_A], &context(), &manifest)
+            .expect("the send begins");
+        (manifest.attempt_id.clone(), manifest.cost_bound)
+    };
+    // The downgrade shape: the pre-totals build closes the allocated row in
+    // place and never touches `usage_totals`, so the counter still names the
+    // next identity while the record counts the send as open.
+    let conn = rusqlite::Connection::open(&db).expect("raw connection");
+    conn.execute(
+        "UPDATE usage_settlements
+             SET state = 'settled', exactness = 'exact', wire_retries = 0,
+                 prompt_tokens = 6, completion_tokens = 4, total_tokens = 10,
+                 charged_units = ?1
+             WHERE attempt_id = ?2",
+        rusqlite::params![i64::try_from(bound).expect("the bound fits"), attempt_id],
+    )
+    .expect("the downgraded build closes the row in place");
+    let record: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT settled_count, dispatched_count, next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the record answers");
+    assert_eq!(record, (0, 1, 2), "the downgrade left the record behind");
+    drop(conn);
+
+    let mut world = support::open_world_at(root.path(), Some(config_text()));
+    let totals = world.runtime.store().settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 1,
+            settled_without_total: 0,
+            total_tokens: Some(10),
+            charged_units: Some(bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: Some(6),
+        },
+        "the reopen recomputes the record from the settled ledger"
+    );
+    let session = world.open_session("bootstrap-economy-in-place");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["pending_sends"], json!(0), "no send reads open");
+    assert_eq!(economy["settled_tokens"], json!(10));
+    assert!(
+        !economy["context_source"]
+            .as_str()
+            .expect("a context source is named")
+            .contains("unknown"),
+        "the settled row's measurement is served: {economy}"
+    );
+    assert!(
+        world
+            .runtime
+            .boot_diagnostics
+            .iter()
+            .all(|line| !line.contains("settlement recovery")),
+        "the ledger held no open send, so the boot line claims no recovery: {:?}",
+        world.runtime.boot_diagnostics
+    );
+}
+
+/// Two sends settle out of order: the newer row carries the measurement and
+/// the older measured row settles afterwards. The record names the newest
+/// settled attempt by rowid, so the late older row never replaces the newer
+/// attempt's count.
+#[test]
+fn an_older_measured_settle_keeps_the_newest_measured_prompt() {
+    let root =
+        tempfile::TempDir::with_prefix("rivect-economy-prompt-order-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let mut store = TaskStore::open(&path).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let older = prepared_with(&mut broker, "goal: older measured");
+    let newer = prepared_with(&mut broker, "goal: newer measured");
+    let older_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &older)
+        .expect("the older send begins");
+    let newer_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &newer)
+        .expect("the newer send begins");
+    store
+        .finish_send(
+            &newer_ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 50,
+                    completion_tokens: 4,
+                    total_tokens: 54,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the newer send settles");
+    store
+        .finish_send(
+            &older_ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 42,
+                    completion_tokens: 8,
+                    total_tokens: 50,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the older send settles late");
+
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 2,
+            settled_without_total: 0,
+            total_tokens: Some(104),
+            charged_units: Some(older.cost_bound + newer.cost_bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: Some(50),
+        },
+        "the newest settled row keeps its measurement"
+    );
+}
+
+/// Two measured sends settle in row order: the older row settles first with
+/// the larger prompt, the newer row settles second with the smaller one. The
+/// record names the newest settled attempt by rowid, so a value-maximum or
+/// first-write-wins regression would serve the older figure.
+#[test]
+fn a_newer_measured_settle_replaces_the_older_measured_prompt() {
+    let root =
+        tempfile::TempDir::with_prefix("rivect-economy-prompt-newest-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let mut store = TaskStore::open(&path).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let older = prepared_with(&mut broker, "goal: older measured");
+    let newer = prepared_with(&mut broker, "goal: newer measured");
+    let older_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &older)
+        .expect("the older send begins");
+    let newer_ticket = store
+        .begin_send(&[SCOPE_A], &context(), &newer)
+        .expect("the newer send begins");
+    store
+        .finish_send(
+            &older_ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 50,
+                    completion_tokens: 4,
+                    total_tokens: 54,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the older send settles first");
+    store
+        .finish_send(
+            &newer_ticket,
+            &SendOutcome::Settled {
+                usage: UsageDelta::Exact {
+                    prompt_tokens: 42,
+                    completion_tokens: 8,
+                    total_tokens: 50,
+                },
+                wire_retries: 0,
+            },
+        )
+        .expect("the newer send settles second");
+
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 2,
+            settled_without_total: 0,
+            total_tokens: Some(104),
+            charged_units: Some(older.cost_bound + newer.cost_bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: Some(42),
+        },
+        "the newer settled row replaces the older prompt even though it is smaller"
+    );
+}
+
+/// A row this record never counted is reconciled while the open count is
+/// already zero: the decrement clamps at zero instead of driving the served
+/// ledger negative.
+#[test]
+fn reconcile_clamps_a_foreign_open_row_at_zero() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-clamp-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let mut store = TaskStore::open(&path).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let manifest = prepared_with(&mut broker, "goal: zero clamp");
+    store
+        .begin_send(&[SCOPE_A], &context(), &manifest)
+        .expect("the send begins");
+    // The open row was never counted: a foreign write left the record's
+    // open count at zero while the ledger holds one dispatched row.
+    let conn = rusqlite::Connection::open(&path).expect("raw connection");
+    conn.execute(
+        "UPDATE usage_totals SET dispatched_count = 0 WHERE id = 1",
+        [],
+    )
+    .expect("the record's open count is zeroed");
+    drop(conn);
+
+    assert_eq!(store.reconcile_sends().expect("reconciliation runs"), 1);
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 1,
+            settled_without_total: 1,
+            total_tokens: None,
+            charged_units: Some(manifest.cost_bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: None,
+        },
+        "the decrement clamps at zero, never below it"
     );
 }
 
@@ -426,6 +1127,11 @@ fn status_projects_settled_tokens_and_unknown_quota() {
     let economy = &status(&mut world, &session)["economy"];
 
     assert_eq!(economy["settled_tokens"], json!(10));
+    assert_eq!(
+        economy["settled_source"],
+        json!("sum of 1 settled attempt's reported totals"),
+        "one measured row reads singular possessive: {economy}"
+    );
     assert_eq!(economy["charged_units"], json!(manifest.cost_bound));
     // An unreported quota is unknown beside its source — never zero and
     // never unlimited.
@@ -438,6 +1144,215 @@ fn status_projects_settled_tokens_and_unknown_quota() {
         "the quota source names the unknown: {economy}"
     );
     assert_eq!(economy["reset_at"], Value::Null);
+}
+
+/// Two measured settlements serve the plural possessive: the source names
+/// the lifetime sum, never one row's total.
+#[test]
+fn status_settled_source_sums_two_measured_attempts() {
+    let mut world = support::open_world("economy-two-measured", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-two-measured");
+    settle_through_runtime(
+        &mut world,
+        "two-measured-a",
+        UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 4,
+            total_tokens: 10,
+        },
+    );
+    let second = settle_through_runtime(
+        &mut world,
+        "two-measured-b",
+        UsageDelta::Exact {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            total_tokens: 10,
+        },
+    );
+    world
+        .runtime
+        .refresh_economy(Some(&second))
+        .expect("the projection refreshes");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["settled_tokens"], json!(20));
+    assert_eq!(
+        economy["settled_source"],
+        json!("sum of 2 settled attempts' reported totals"),
+        "two measured rows read plural possessive: {economy}"
+    );
+}
+
+/// A fresh store has no settled attempt and no charged unit: every absent
+/// figure names the unknown it is instead of borrowing a later-branch
+/// explanation about a row that does not exist.
+#[test]
+fn a_fresh_store_names_no_settled_attempt_or_charge() {
+    let mut world = support::open_world("economy-fresh", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-fresh");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["settled_tokens"], Value::Null);
+    assert_eq!(
+        economy["settled_source"],
+        json!("unknown: no settled attempt recorded"),
+        "the empty lifetime is unknown, not a sum: {economy}"
+    );
+    assert_eq!(economy["charged_units"], Value::Null);
+    assert_eq!(
+        economy["cost_source"],
+        json!("unknown: no settled charge recorded"),
+        "the empty charge is unknown, not zero: {economy}"
+    );
+    assert_eq!(economy["context_tokens"], Value::Null);
+    assert_eq!(
+        economy["context_source"],
+        json!("unknown: no settled attempt recorded"),
+        "no settled attempt exists to report a prompt: {economy}"
+    );
+}
+
+/// A send that reserved no budget scope settles uncharged: the projection
+/// names the charge unknown, never zero, while the settled row is counted.
+#[test]
+fn an_uncharged_settled_send_keeps_the_unknown_cost_source() {
+    let mut world = support::open_world("economy-unreserved", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-unreserved");
+    let manifest = world
+        .runtime
+        .broker
+        .prepare(
+            "main",
+            &world.runtime.config_for_broker(),
+            WORLD,
+            "goal: status",
+        )
+        .expect("the status request prepares");
+    {
+        let mut writer = world.runtime.store_writer();
+        let ticket = writer
+            .begin_send(&[], &context(), &manifest)
+            .expect("the send begins");
+        assert!(!ticket.reserved, "no scope is open, so nothing is reserved");
+        writer
+            .finish_send(
+                &ticket,
+                &SendOutcome::Settled {
+                    usage: UsageDelta::Unknown,
+                    wire_retries: 0,
+                },
+            )
+            .expect("the send settles");
+    }
+    world
+        .runtime
+        .refresh_economy(Some(&manifest))
+        .expect("the projection refreshes");
+    let totals = world.runtime.store().settlement_totals().expect("totals");
+    assert_eq!(totals.settled_count, 1);
+    assert_eq!(totals.charged_units, None, "nothing was charged");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["charged_units"], Value::Null);
+    assert_eq!(
+        economy["cost_source"],
+        json!("unknown: no settled charge recorded"),
+        "the uncharged send names the unknown charge: {economy}"
+    );
+}
+
+#[test]
+fn settled_totals_stay_partial_when_a_row_reports_no_total() {
+    let mut world = support::open_world("economy-partial", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-partial");
+    let measured = settle_through_runtime(
+        &mut world,
+        "partial-measured",
+        UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 4,
+            total_tokens: 10,
+        },
+    );
+    settle_through_runtime(&mut world, "partial-unknown", UsageDelta::Unknown);
+    world
+        .runtime
+        .refresh_economy(Some(&measured))
+        .expect("the projection refreshes");
+    let totals = world.runtime.store().settlement_totals().expect("totals");
+    assert_eq!(totals.settled_count, 2);
+    assert_eq!(totals.settled_without_total, 1);
+    assert_eq!(totals.total_tokens, Some(10));
+    assert_eq!(
+        totals.latest_prompt_tokens, None,
+        "the newest settled row reported no prompt, so no older measurement survives"
+    );
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["settled_tokens"], json!(10));
+    assert_eq!(economy["settled_without_total"], json!(1));
+    let source = economy["settled_source"]
+        .as_str()
+        .expect("the partial total names its basis");
+    assert!(
+        source.contains("partial") && source.contains("1 of 2"),
+        "a known part is never presented as the whole: {source}"
+    );
+    assert_eq!(
+        economy["context_tokens"],
+        Value::Null,
+        "occupancy is unknown, never the older measured prompt"
+    );
+    let context = economy["context_source"]
+        .as_str()
+        .expect("the occupied context names its basis");
+    assert!(
+        context.contains("unknown")
+            && context.contains("latest settled attempt reported no prompt tokens"),
+        "the unknown newest attempt is named: {context}"
+    );
+}
+
+/// A lifetime whose every settled row reported no total is unknown, not a
+/// partial sum: naming it `partial: N of N` would present nothing measured
+/// as most of a whole.
+#[test]
+fn settled_totals_are_unknown_when_no_row_reports_a_total() {
+    let mut world = support::open_world("economy-unmeasured", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-unmeasured");
+    settle_through_runtime(&mut world, "unmeasured-first", UsageDelta::Unknown);
+    let second = settle_through_runtime(&mut world, "unmeasured-second", UsageDelta::Unknown);
+    world
+        .runtime
+        .refresh_economy(Some(&second))
+        .expect("the projection refreshes");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(
+        economy["settled_tokens"],
+        Value::Null,
+        "no row reported a total, so no lifetime sum exists: {economy}"
+    );
+    assert_eq!(economy["settled_without_total"], json!(2));
+    assert_eq!(
+        economy["settled_source"],
+        json!("unknown: 2 settled attempts reported no total"),
+        "an unmeasured lifetime is unknown, not partial: {economy}"
+    );
+}
+
+#[test]
+fn a_single_unmeasured_settled_attempt_reads_unknown_singular() {
+    let mut world = support::open_world("economy-unmeasured-one", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-unmeasured-one");
+    let manifest = settle_through_runtime(&mut world, "unmeasured-one", UsageDelta::Unknown);
+    world
+        .runtime
+        .refresh_economy(Some(&manifest))
+        .expect("the projection refreshes");
+    let economy = &status(&mut world, &session)["economy"];
+    assert_eq!(economy["settled_without_total"], json!(1));
+    assert_eq!(
+        economy["settled_source"],
+        json!("unknown: 1 settled attempt reported no total"),
+        "one unmeasured row reads singular: {economy}"
+    );
 }
 
 #[test]
@@ -1233,6 +2148,33 @@ fn open_world_reconciles_an_interrupted_send() {
         "the boot line names the recovery: {:?}",
         world.runtime.boot_diagnostics
     );
+    // The runtime's own open reconciliation lands in the incremental totals
+    // once, and a second pass over the settled ledger changes nothing.
+    let totals = world.runtime.store().settlement_totals().expect("totals");
+    assert_eq!(
+        totals,
+        SettlementTotals {
+            settled_count: 1,
+            settled_without_total: 1,
+            total_tokens: None,
+            charged_units: Some(manifest.cost_bound),
+            dispatched_count: 0,
+            latest_prompt_tokens: None,
+        },
+        "the open's recovery lands in the incremental totals exactly once"
+    );
+    {
+        let mut writer = world.runtime.store_writer();
+        assert_eq!(
+            writer.reconcile_sends().expect("a second pass is a no-op"),
+            0
+        );
+    }
+    assert_eq!(
+        world.runtime.store().settlement_totals().expect("totals"),
+        totals,
+        "a second reconciliation pass changes no total"
+    );
 }
 
 /// A store written before the additive settlement table opens and accepts
@@ -1364,6 +2306,73 @@ fn drive_step(
     world.runtime.scheduler_step(session)
 }
 
+#[test]
+fn projection_fault_after_a_delivered_reply_does_not_drop_the_step() {
+    let mut world = support::open_world_with(
+        "economy-projection-fault",
+        Some(config_text()),
+        Box::new(UsageProvider::settled(UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 4,
+            total_tokens: 10,
+        })),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-economy-fault-marker\n").expect("scoped file");
+    world.runtime.purpose = "main".to_string();
+    let grant = world.runtime.set_read_scope(scope, file.clone());
+    let session = world.open_session("bootstrap-economy-fault");
+    let task = world.create_task(&session, "cmd-economy-fault");
+    world
+        .runtime
+        .store_writer()
+        .open_budget(&task.0, 10)
+        .expect("the task's budget scope opens");
+    // A corrupt counter makes the post-send projection refresh fail; the
+    // delivered reply must still reach the step after that fault.
+    let db = world.runtime.owner().runtime_dir().join("rivect.db");
+    let conn = rusqlite::Connection::open(&db).expect("raw connection");
+    conn.execute(
+        "UPDATE usage_totals SET settled_without_total = -1 WHERE id = 1",
+        [],
+    )
+    .expect("the totals row is poisoned");
+    drop(conn);
+    let stepped = drive_step(
+        &mut world,
+        &session,
+        &task,
+        &grant,
+        &format!("read {}", file.display()),
+    );
+    assert!(
+        matches!(stepped, Ok(SchedulerStep::Ran { .. })),
+        "the delivered reply still reaches the step: {stepped:?}"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .latest_settlement()
+            .expect("the send settled")
+            .state,
+        SettlementState::Settled,
+        "the send's own settlement is durable"
+    );
+    assert!(
+        world
+            .runtime
+            .boot_diagnostics
+            .iter()
+            .any(|line| line.contains("economy projection refresh failed")),
+        "the failed refresh is recorded with its cause: {:?}",
+        world.runtime.boot_diagnostics
+    );
+}
+
 /// The controller's own refresh, not a test-written row: a real step
 /// settles through the broker, the status surface serves the refreshed
 /// projection, and a reopen over the same root serves the open-time
@@ -1424,6 +2433,11 @@ fn status_economy_serves_a_real_step_and_the_open_time_projection() {
                 .expect("the settled bound is charged")
         ),
         "the charged bound is the settled units"
+    );
+    assert_eq!(
+        economy["cost_source"],
+        json!("the bound is retained unless a reported total is lower"),
+        "the served charge source leads with the retained bound: {economy}"
     );
     assert_eq!(economy["pending_sends"], json!(0));
     assert_eq!(economy["context_tokens"], json!(6));
@@ -1668,9 +2682,10 @@ impl Provider for FailingProvider {
     }
 
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
-        Err(ProviderError::ProviderFailed {
+        Err(ProviderError::UnsupportedParameter {
             connection: CONNECTION.to_string(),
-            reason: "fixture failure".to_string(),
+            parameter: "fixture-parameter",
+            model: "fixture-model".to_string(),
         })
     }
 }

@@ -120,6 +120,27 @@ const CONCURRENCY_FAMILY: &[&str] = &[
 /// (standards §3.3: no dead code, no speculative placeholders).
 const DEBT_MARKERS: &[&str] = &["TODO", "FIXME", "XXX", "HACK"];
 
+/// Files an agent loads before it reads anything else, and their byte budgets.
+/// Every turn pays for them, so this is a ratchet: lower a budget when a trim
+/// lands; raise it only by deleting something else in the same diff.
+const ALWAYS_ON_BUDGETS: &[(&str, u64)] = &[
+    ("AGENTS.md", 48_000),
+    (".omp/RULES.md", 1_800),
+    ("CLAUDE.md", 2_400),
+];
+
+/// Surfaces any agent reads without asking: the repo rules, the Claude entry
+/// point, the sticky omp rules, the standards doc the gate sends it to, and the
+/// per-domain Devin rules. A deny lint named in no surface is a rule the agent
+/// cannot see, however mechanical the enforcement is.
+const ALWAYS_ON_SURFACES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".omp/RULES.md",
+    "docs/engineering-standards.md",
+];
+const ALWAYS_ON_RULE_DIR: &str = ".devin/rules";
+
 /// The only file-level lint allows the standards sanction today: `main.rs` owns
 /// process output and exit (standards §8). `rel` is relative to `src/`.
 fn permitted_lint_allows(rel: &Path) -> &'static [&'static str] {
@@ -1558,5 +1579,87 @@ fn mcp_evidence_is_never_deleted_or_overwritten() {
     assert!(
         forbidden_lines(fixture, REMOVAL_FAMILY).is_empty(),
         "test fixtures are outside the production scan"
+    );
+}
+
+#[test]
+fn always_on_instructions_keep_their_size_budget() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut over = Vec::new();
+    for (rel, budget) in ALWAYS_ON_BUDGETS {
+        let size = fs::metadata(root.join(rel))
+            .expect("an always-on instruction file is present")
+            .len();
+        if size > *budget {
+            over.push(format!("{rel}: {size} bytes > {budget}"));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "always-on instruction files grow without a trim — every turn pays for them:\n{}",
+        over.join("\n")
+    );
+}
+
+/// `[lints.*]` entries set to `deny`/`forbid`, so a new mechanical rule must
+/// also reach a surface the agent reads (standards §2, §14).
+fn manifest_deny_tokens(manifest: &str) -> Vec<String> {
+    let mut in_lints = false;
+    let mut tokens = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_lints = line.starts_with("[lints.");
+            continue;
+        }
+        if !in_lints {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"');
+        if value == "deny" || value == "forbid" {
+            tokens.push(name.trim().to_owned());
+        }
+    }
+    tokens
+}
+
+#[test]
+fn every_denied_lint_stays_visible_to_agents() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut corpus = String::new();
+    for rel in ALWAYS_ON_SURFACES {
+        corpus.push_str(&fs::read_to_string(root.join(rel)).expect("read an always-on surface"));
+        corpus.push('\n');
+    }
+    for entry in fs::read_dir(root.join(ALWAYS_ON_RULE_DIR)).expect("read the devin rules dir") {
+        let path = entry.expect("read a rule entry").path();
+        if path.extension().is_some_and(|ext| ext == "md") {
+            corpus.push_str(&fs::read_to_string(&path).expect("read a devin rule"));
+            corpus.push('\n');
+        }
+    }
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let denied = manifest_deny_tokens(&manifest);
+    assert!(!denied.is_empty(), "the manifest declares denied lints");
+    let missing: Vec<&String> = denied
+        .iter()
+        .filter(|token| !corpus.contains(token.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "deny tokens named by no always-on surface (the agent cannot see the rule): {missing:?}"
+    );
+    assert_eq!(
+        manifest_deny_tokens("[lints.clippy]\npanic = \"deny\"\ndead_code = \"warn\" # ratchet\n"),
+        ["panic"],
+        "the manifest scan reads deny entries only"
     );
 }

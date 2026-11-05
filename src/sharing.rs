@@ -660,6 +660,10 @@ impl Runtime {
         let grant_id = random_hex(GRANT_ID_BYTES)?;
         let token = random_hex(TOKEN_BYTES)?;
         let digest = token_digest(&token);
+        // The public entry clips the request to the recorded grant window
+        // itself, so a direct caller cannot mint an expiry the row or wire
+        // cannot represent.
+        let ttl_seconds = ttl_seconds.clamp(1, MAX_GRANT_SECONDS);
         let expires_at = (self.work_clock)().saturating_add(ttl_seconds);
         let socket_path = self
             .data_root

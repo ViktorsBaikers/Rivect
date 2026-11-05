@@ -1183,6 +1183,25 @@ fn grant_open_accepts_the_max_ttl_and_refuses_out_of_range() {
 }
 
 #[test]
+fn direct_grant_open_clamps_an_unbounded_ttl() {
+    let mut fixture = Fixture::new("tc");
+    let opened = fixture
+        .world
+        .runtime
+        .open_sharing_grant(&fixture.session, &fixture.task, u64::MAX)
+        .expect("the direct owner entry clamps instead of overflowing");
+    assert_eq!(
+        opened.expires_at,
+        OPEN + rivect::commands::sharing::MAX_GRANT_SECONDS,
+        "an unbounded request lands on the recorded maximum"
+    );
+    assert_eq!(
+        count(&fixture.world.root, "SELECT COUNT(*) FROM sharing_grants"),
+        1
+    );
+}
+
+#[test]
 fn attach_refuses_a_missing_or_unshaped_token() {
     let mut fixture = Fixture::new("ut");
     let opened = fixture.open(None);

@@ -5768,8 +5768,9 @@ impl Provider for ChatCompletionsProvider {
     /// denials, [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
-    /// [`ProviderError::StreamViolation`] — including a serialized
-    /// request body over the wire bound — [`ProviderError::IncompatibleOutput`]
+    /// [`ProviderError::UnsendableRequest`] for a serialized request
+    /// body over the wire bound, [`ProviderError::StreamViolation`] and
+    /// [`ProviderError::IncompatibleOutput`]
     /// as the stream legs document, and
     /// [`ProviderError::UnsupportedParameter`] when the frozen request
     /// pins a parameter the connection's recorded contract rejects for

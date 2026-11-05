@@ -227,6 +227,33 @@ CREATE TABLE IF NOT EXISTS usage_settlements (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_usage_settlements_state
     ON usage_settlements (state);
+-- Substitutes are looked up by their failed parent on every dispatch, so
+-- the lineage column is indexed instead of scanned.
+CREATE INDEX IF NOT EXISTS idx_usage_settlements_parent
+    ON usage_settlements (parent_attempt_id);
+-- The incremental settlement totals (AC-062): one row updated in the same
+-- transaction that settles a send, so a status refresh reads one row
+-- instead of aggregating the whole table. `next_rowid` is the monotonic
+-- identity the dispatch insert names, so that insert never aggregates the
+-- ledger to find its row. Additive and ignored by a build without it: no
+-- generation bump.
+CREATE TABLE IF NOT EXISTS usage_totals (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    settled_count INTEGER NOT NULL,
+    settled_without_total INTEGER NOT NULL,
+    total_tokens INTEGER,
+    charged_count INTEGER NOT NULL,
+    charged_units INTEGER,
+    latest_prompt_tokens INTEGER,
+    dispatched_count INTEGER NOT NULL,
+    next_rowid INTEGER NOT NULL
+) STRICT;
+-- The row itself is filled by the gated upgrade batch (`USAGE_TOTALS_BACKFILL`)
+-- and recomputed by it when the settlement ledger is ahead of `next_rowid`
+-- (a build without this table wrote past the counter): the O(1) presence and
+-- `MAX(rowid)` reads plus one index-range open-send count per gate keep a
+-- current incremental row untouched and an ordinary open from scanning the
+-- whole settlement ledger; production startup runs the gate twice.
 -- SQLite's `CREATE TRIGGER IF NOT EXISTS` keeps an existing body, so a store
 -- first opened by an earlier candidate would keep stale guard text forever.
 -- Every settlement guard is therefore dropped and recreated with the current

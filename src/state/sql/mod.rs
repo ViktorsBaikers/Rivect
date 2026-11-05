@@ -392,14 +392,23 @@ pub const BUDGET_SCOPE_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM budget_scopes
 /// The `dispatched` row is the replay identity of one physical child
 /// attempt: written in the reserve transaction, it exists before a byte
 /// crosses the wire, so a crash leaves exactly one row to reconcile. The
-/// row names its own positive rowid (floor 1): an omitted rowid reads `-1`
-/// inside the INSERT guard, where it cannot be told apart from a stored
-/// `-1` identity, so the product never relies on the implicit assignment.
+/// row names the monotonic identity the totals row hands out, so the insert
+/// is O(1) and still never relies on the implicit `-1` sentinel the insert
+/// guard cannot tell from a stored row.
 pub const INSERT_SETTLEMENT_DISPATCHED: &str = "INSERT INTO usage_settlements
                  (rowid, attempt_id, parent_attempt_id, purpose, connection, ranking_basis,
                   cost_bound, state, exactness, wire_retries)
-                 VALUES ((SELECT MAX(COALESCE(MAX(rowid), 0) + 1, 1) FROM usage_settlements),
-                         ?1, ?2, ?3, ?4, ?5, ?6, 'dispatched', 'unknown', 0)";
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'dispatched', 'unknown', 0)";
+/// Hands out one monotonic settlement rowid and counts the send as open in
+/// the same statement. The allocation stays above every stored identity, so
+/// a row an older or foreign build wrote past the counter is never
+/// overwritten and the next send resumes after it; `MAX(rowid)` on the
+/// primary key is a single-index lookup, so the per-send cost stays O(1).
+pub const NEXT_SETTLEMENT_ROWID: &str = "UPDATE usage_totals SET
+                 next_rowid = MAX(next_rowid,
+                                  (SELECT COALESCE(MAX(rowid), 0) + 1 FROM usage_settlements)) + 1,
+                 dispatched_count = dispatched_count + 1
+                 WHERE id = 1 RETURNING next_rowid - 1";
 /// Closing a row is conditional on it still being open: a second settle of
 /// the same attempt matches nothing, so the exactly-once guard is the
 /// statement, not a read-then-write.
@@ -409,6 +418,70 @@ pub const SETTLE_USAGE_SETTLEMENT: &str =
                  reasoning_tokens = ?7, cache_read_tokens = ?8, cache_write_tokens = ?9,
                  total_tokens = ?10, charged_units = ?11
                  WHERE attempt_id = ?1 AND state = 'dispatched'";
+/// Adds one closed row to the incremental totals in the settle transaction.
+/// `?1` is the reported total, `?2` the charged units and `?3` the prompt
+/// count; each absent value keeps the corresponding unknown honest. The
+/// prompt figure names the newest settled attempt by rowid, never the last
+/// statement to settle, so an older row settling after a newer one — with or
+/// without a measurement — does not replace the newer attempt's count. The
+/// open count is clamped at zero: a row this record never counted — one a
+/// build without the totals row wrote — must not drive the ledger negative.
+pub const SETTLE_USAGE_TOTAL: &str = "UPDATE usage_totals SET
+                 settled_count = settled_count + 1,
+                 settled_without_total = settled_without_total + (?1 IS NULL),
+                 total_tokens = COALESCE(total_tokens, 0) + COALESCE(?1, 0),
+                 charged_count = charged_count + (?2 IS NOT NULL),
+                 charged_units = COALESCE(charged_units, 0) + COALESCE(?2, 0),
+                 latest_prompt_tokens = CASE
+                     WHEN (SELECT rowid FROM usage_settlements WHERE attempt_id = ?4)
+                          = (SELECT MAX(rowid) FROM usage_settlements WHERE state = 'settled')
+                     THEN ?3
+                     ELSE latest_prompt_tokens
+                 END,
+                 dispatched_count = MAX(dispatched_count - 1, 0)
+                 WHERE id = 1";
+/// The presence half of the totals guard: one primary-key existence read.
+/// A store that already carries the row still pays the staleness gate
+/// ([`USAGE_TOTALS_STALE`]), so the guard as a whole issues one index-range
+/// open-send count per run; production startup runs it twice (compatibility
+/// and backfill), so an open pays at most two such counts, each bounded by
+/// the open sends.
+pub const USAGE_TOTALS_PRESENT: &str = "SELECT EXISTS(SELECT 1 FROM usage_totals WHERE id = 1)";
+/// Whether the settlement ledger is ahead of the incremental record: a build
+/// without the totals row writes its own rows past `next_rowid` or settles an
+/// already-allocated row in place, and neither touches the record, so this
+/// relation names a store whose totals are stale. `MAX(rowid)` on the primary
+/// key is a single lookup; the open-send count is one index-range count over
+/// the state index, bounded by the open sends rather than the whole ledger.
+/// This gate runs once in the compatibility check and once in the backfill
+/// probe, so a production open issues at most two such counts.
+pub const USAGE_TOTALS_STALE: &str = "SELECT EXISTS(SELECT 1 FROM usage_totals
+    WHERE id = 1 AND (next_rowid <= (SELECT MAX(rowid) FROM usage_settlements)
+                      OR dispatched_count <> (SELECT COUNT(*) FROM usage_settlements
+                                              WHERE state = 'dispatched')))";
+/// Recomputes the totals row from the settlement rows this store already
+/// carries: an absent row is filled and a stale one is replaced, so a store a
+/// build without the row wrote is represented exactly. The presence and
+/// staleness reads gate it, so an ordinary open never scans the ledger.
+pub const USAGE_TOTALS_BACKFILL: &str = "INSERT INTO usage_totals
+    (id, settled_count, settled_without_total, total_tokens, charged_count,
+     charged_units, latest_prompt_tokens, dispatched_count, next_rowid)
+SELECT 1, COUNT(*), COUNT(*) - COUNT(total_tokens), SUM(total_tokens),
+       COUNT(charged_units), SUM(charged_units),
+       (SELECT prompt_tokens FROM usage_settlements WHERE state = 'settled'
+        ORDER BY rowid DESC LIMIT 1),
+       (SELECT COUNT(*) FROM usage_settlements WHERE state = 'dispatched'),
+       (SELECT MAX(COALESCE(MAX(rowid), 0) + 1, 1) FROM usage_settlements)
+FROM usage_settlements WHERE state = 'settled'
+ON CONFLICT(id) DO UPDATE SET
+    settled_count = excluded.settled_count,
+    settled_without_total = excluded.settled_without_total,
+    total_tokens = excluded.total_tokens,
+    charged_count = excluded.charged_count,
+    charged_units = excluded.charged_units,
+    latest_prompt_tokens = excluded.latest_prompt_tokens,
+    dispatched_count = excluded.dispatched_count,
+    next_rowid = excluded.next_rowid";
 pub const SETTLEMENT_ROW: &str =
     "SELECT attempt_id, parent_attempt_id, purpose, connection, ranking_basis, cost_bound,
                  state, exactness, unknown_reason, wire_retries, prompt_tokens,
@@ -430,14 +503,14 @@ pub const LATEST_SETTLEMENT: &str =
                  completion_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens,
                  total_tokens, charged_units
                  FROM usage_settlements ORDER BY rowid DESC LIMIT 1";
-/// The status projection's one aggregate: the lifetime settled spend and
-/// the sends still open, in a single statement so a status refresh never
+/// The status projection's one row: the incremental settled totals, the
+/// sends still open and the newest prompt count. A status refresh never
 /// walks the settlement rows.
-pub const SETTLEMENT_TOTALS: &str = "SELECT COUNT(*), SUM(total_tokens), SUM(charged_units),
-                 (SELECT COUNT(*) FROM usage_settlements WHERE state = 'dispatched'),
-                 (SELECT prompt_tokens FROM usage_settlements WHERE state = 'settled'
-                  ORDER BY rowid DESC LIMIT 1)
-                 FROM usage_settlements WHERE state = 'settled'";
+pub const SETTLEMENT_TOTALS: &str = "SELECT settled_count, settled_without_total,
+                 CASE WHEN settled_count > settled_without_total THEN total_tokens END,
+                 CASE WHEN charged_count > 0 THEN charged_units END,
+                 dispatched_count, latest_prompt_tokens
+                 FROM usage_totals WHERE id = 1";
 /// The frozen cohort's rows in one statement: the cache rate sums the
 /// provider legs of exactly the attempts the freeze named, so a status
 /// refresh is one read instead of a read per attempt.
@@ -809,7 +882,8 @@ pub const ADD_BASE_STATE_SET_EPOCH: &str =
 /// runtime is exposed.
 pub const RECOVERY_TABLES_PRESENT: &str = "SELECT COUNT(*) FROM sqlite_schema
              WHERE type = 'table'
-             AND name IN ('config_publications', 'retained', 'attempts', 'usage_settlements')";
+             AND name IN ('config_publications', 'retained', 'attempts', 'usage_settlements',
+                          'usage_totals')";
 /// The consistent copy an update takes before it touches anything: `VACUUM
 /// INTO` writes one complete database beside the primary from the connection
 /// that holds the writer lock, so the copy is transactionally consistent

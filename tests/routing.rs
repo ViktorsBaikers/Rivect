@@ -46,7 +46,10 @@ use rivect::model::{
     Broker, CallContract, CandidateRejection, EpochMutationReason, InputOrigin, ModelError,
     RankingFacts, RecordedFacts, RejectionCause, RequestManifest,
 };
-use rivect::providers::{Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply};
+use rivect::providers::{
+    Dialect, LoopbackProvider, Provider, ProviderError, ProviderReply, TransportCause,
+    TransportClass,
+};
 use rivect::resources::UsageDelta;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1468,6 +1471,26 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         "eligible candidates minus the failed primary"
     );
     let served_question: Question = serde_json::from_value(served).expect("served question parses");
+    assert_eq!(
+        served_question.prompt, "the pinned dispatch failed; choose the fallback connection",
+        "a definitive denial keeps the plain pause"
+    );
+    assert_eq!(
+        served_question.recommendation_basis, "candidates passing the current eligibility check",
+        "a definitive denial keeps the plain basis"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained");
+    assert!(
+        paused
+            .choice
+            .as_ref()
+            .is_some_and(|choice| !choice.unknown_outcome),
+        "a definitive denial is not an unknown outcome"
+    );
 
     // a repeated read serves the same pending question — reading never
     // consumes or mutates the pause
@@ -1588,6 +1611,274 @@ fn fallback_manual_surfaces_a_pending_choice_and_dispatches_nothing() {
         "the replay added no send"
     );
     assert_eq!(world.runtime.broker.accounted_requests(), 1);
+}
+
+/// AC-045/DEC-014 through the production path: an unknown primary outcome
+/// still pauses a manual fallback, and the served question says so — the
+/// effect may already have applied, so every offered pick repeats it rather
+/// than substituting a request that never ran.
+#[test]
+fn manual_pause_on_an_unknown_outcome_serves_the_repeat_warning() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::Transport {
+                connection: "local".to_string(),
+                cause: TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                },
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-unknown",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-unknown-boot");
+    let task = world.create_task(&session, "manual-unknown-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "manual-unknown-first",
+        &task,
+        &question,
+        "steps",
+        json!(4301),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4302),
+    ));
+    let served_question: Question =
+        serde_json::from_value(current["result"]["question"].clone()).expect("served question");
+    assert_eq!(
+        served_question.prompt,
+        "the pinned dispatch ended without a definitive answer; its effect may have applied before the failure — a substitute send repeats it",
+        "the unknown pause discloses the repeat: {served_question:?}"
+    );
+    assert_eq!(
+        served_question.recommendation_basis,
+        "unknown-outcome-repeat: a substitute repeats an effect that may have applied",
+        "the repeat class is machine-readable: {served_question:?}"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained");
+    assert!(
+        paused
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.unknown_outcome),
+        "the pause carries the classifier verdict"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "manual never dispatches a substitute while the choice waits"
+    );
+    assert_eq!(
+        world.runtime.broker.accounted_requests(),
+        0,
+        "the paused send spent nothing"
+    );
+}
+
+/// AC-045/DEC-014 through the production path: a pre-send request-shape
+/// refusal raised before the post — here the over-bound replay body —
+/// never produced a byte, so the pause keeps the plain prompt and basis
+/// and the classifier's `unknown_outcome` stays false: a substitute
+/// cannot repeat an effect that never left the client.
+#[test]
+fn manual_pause_on_an_unsendable_request_keeps_the_plain_basis() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::UnsendableRequest {
+                connection: "local".to_string(),
+                reason: format!(
+                    "request body of {} bytes exceeds the {} byte wire bound",
+                    MODEL_WIRE_MAX_BYTES + 1,
+                    MODEL_WIRE_MAX_BYTES
+                ),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-unsendable",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-unsendable-boot");
+    let task = world.create_task(&session, "manual-unsendable-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "manual-unsendable-first",
+        &task,
+        &question,
+        "steps",
+        json!(4401),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4402),
+    ));
+    let served_question: Question =
+        serde_json::from_value(current["result"]["question"].clone()).expect("served question");
+    assert_eq!(
+        served_question.prompt, "the pinned dispatch failed; choose the fallback connection",
+        "a pre-send refusal keeps the plain pause: {served_question:?}"
+    );
+    assert_eq!(
+        served_question.recommendation_basis, "candidates passing the current eligibility check",
+        "a pre-send refusal keeps the plain basis: {served_question:?}"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained");
+    assert!(
+        paused
+            .choice
+            .as_ref()
+            .is_some_and(|choice| !choice.unknown_outcome),
+        "a request that never crossed the wire cannot have applied"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "manual never dispatches a substitute while the choice waits"
+    );
+}
+
+/// AC-045/DEC-014: the adapter's retry marker makes a pause unknown even
+/// when the last leg's class alone is a definitive denial — an earlier leg
+/// crossed the wire, so the offered picks must repeat the request. A
+/// refactor that settles before classifying would read the 400 and pause as
+/// a plain refusal.
+#[test]
+fn manual_pause_on_a_retried_denial_serves_the_repeat_warning() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::Retried {
+                wire_retries: 1,
+                source: Box::new(ProviderError::Transport {
+                    connection: "local".to_string(),
+                    cause: TransportCause::Status {
+                        status: reqwest::StatusCode::BAD_REQUEST,
+                    },
+                }),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-retried",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-retried-boot");
+    let task = world.create_task(&session, "manual-retried-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "manual-retried-first",
+        &task,
+        &question,
+        "steps",
+        json!(4401),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained");
+    assert!(
+        paused
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.unknown_outcome),
+        "a retried denial is an unknown outcome, never a definitive refusal"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4402),
+    ));
+    let served_question: Question =
+        serde_json::from_value(current["result"]["question"].clone()).expect("served question");
+    assert_eq!(
+        served_question.prompt,
+        "the pinned dispatch ended without a definitive answer; its effect may have applied before the failure — a substitute send repeats it",
+        "the retried pause discloses the repeat: {served_question:?}"
+    );
+    assert_eq!(
+        served_question.recommendation_basis,
+        "unknown-outcome-repeat: a substitute repeats an effect that may have applied",
+        "the retried pause carries the stable repeat token: {served_question:?}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "manual never dispatches a substitute while the choice waits"
+    );
 }
 
 /// AC-045/DEC-012: a manual pick whose frozen bound no longer fits the
@@ -3152,7 +3443,7 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
     assert!(request.is_builder());
     let original = ProviderError::Transport {
         connection: "local".to_string(),
-        cause: rivect::providers::TransportCause::Request {
+        cause: TransportCause::Request {
             source: Arc::new(request.without_url()),
         },
     };
@@ -3212,15 +3503,12 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         panic!("the primary transport error stays typed");
     };
     assert_eq!(connection, "local");
-    assert_eq!(
-        cause.class(),
-        rivect::providers::TransportClass::RequestFailure
-    );
+    assert_eq!(cause.class(), TransportClass::RequestFailure);
     let retained = std::error::Error::source(&error)
         .and_then(|source| source.downcast_ref::<Box<ProviderError>>())
         .expect("the broker retains its primary source");
     let cause = std::error::Error::source(retained.as_ref())
-        .and_then(|source| source.downcast_ref::<rivect::providers::TransportCause>())
+        .and_then(|source| source.downcast_ref::<TransportCause>())
         .expect("the primary retains the transport cause");
     let leaf = std::error::Error::source(cause)
         .and_then(|source| source.downcast_ref::<reqwest::Error>())
@@ -3286,7 +3574,7 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
         (
             ModelError::Provider(ProviderError::Transport {
                 connection: "local".to_string(),
-                cause: rivect::providers::TransportCause::Status {
+                cause: TransportCause::Status {
                     status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
                 },
             }),
@@ -3345,7 +3633,6 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
     {
         use rivect::contracts::{AnswerSelection, TaskId};
         use rivect::controller::{ControllerError, step_error_observation};
-        use rivect::providers::TransportCause;
         use rivect::scheduler::Scheduler;
         use rivect::supervisor::{StallCause, Supervisor, SupervisorPolicy};
         use std::io::{Read, Write};
@@ -3917,6 +4204,347 @@ fn send_failure_walks_the_admitted_chain_in_order() {
         broker.admitted_attempts(),
         0,
         "every admission returns to baseline — the failed substitute left none"
+    );
+}
+
+/// AC-045: a middle chain entry's 503 leaves its outcome unknown, so the
+/// walk ends exactly where the primary gate ends — a later entry could
+/// duplicate an effect the failed one may already have applied. The last
+/// chain entry never receives a request.
+#[test]
+fn chain_unknown_outcome_stops_before_the_next_entry() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\", \"shadowed\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }, \
+             { mode = \"fixed\", connection = \"shadowed\", model_id = \"shadowed-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::Transport {
+                connection: "reserve".to_string(),
+                cause: TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                },
+            }),
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/unknown-chain", "goal: chain")
+        .expect("manifest");
+    assert_eq!(
+        broker.admitted_attempts(),
+        1,
+        "the primary is the only live admission before the walk"
+    );
+    let error = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/unknown-chain",
+            &manifest,
+        )
+        .expect_err("the middle entry's 503 is unknown");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::Transport { connection, cause })
+                if connection == "reserve"
+                    && matches!(cause.class(), TransportClass::HttpStatus { code: 503 })
+        ),
+        "the middle entry's typed failure ends the walk: {error}"
+    );
+    assert_eq!(
+        broker.admitted_attempts(),
+        1,
+        "the abandoned substitute leaves no live admission behind"
+    );
+    // The substitute's provisional epoch minted for the middle entry rolls
+    // back with it: a re-prepare of the same prefix replays the epoch
+    // bytewise instead of reporting a phantom model switch.
+    let replay = broker
+        .prepare("relay", &config, "/world/unknown-chain", "goal: chain")
+        .expect("the prefix re-prepares");
+    assert!(
+        replay.mutation_reason.is_none(),
+        "no phantom mutation: {:?}",
+        replay.mutation_reason
+    );
+    assert_eq!(
+        replay.epoch_id, manifest.epoch_id,
+        "the epoch replays bytewise for the unchanged prefix"
+    );
+    let sent = sent.lock().expect("wire log lock");
+    assert_eq!(
+        sent.len(),
+        2,
+        "the primary and the failing middle entry sent; the last entry never did"
+    );
+    assert_eq!(
+        sent[1].model,
+        ModelAssign::Fixed(FixedModel {
+            connection: "reserve".to_string(),
+            model_id: "reserve-model".to_string(),
+        })
+    );
+}
+
+/// AC-045: a provider failure verdict is emitted only after the response
+/// started (a terminal incomplete/cancelled event, a non-STOP finish or a
+/// mid-stream error), so its effect may already have applied. The auto
+/// walk stops before the chain entry is consulted and never sends a
+/// substitute.
+#[test]
+fn post_output_provider_failure_stops_the_walk_before_the_next_entry() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![Respond::Fail(ProviderError::ProviderFailed {
+            connection: "local".to_string(),
+            reason: "response.cancelled".to_string(),
+        })],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/post-output-chain", "goal: chain")
+        .expect("manifest");
+    let error = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/post-output-chain",
+            &manifest,
+        )
+        .expect_err("a post-output failure is an unknown outcome");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::ProviderFailed { connection, reason })
+                if connection == "local" && reason == "response.cancelled"
+        ),
+        "the caller meets the failure's own class: {error}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the primary sent; a substitute would repeat a possibly applied effect"
+    );
+}
+
+/// AC-045: a pre-send request-shape refusal — the over-bound replay
+/// body — is definitive, so the auto walk consults the chain and
+/// dispatches the admitted substitute instead of stopping as an
+/// unknown outcome would. One physical request is accounted, naming the
+/// substitute's connection.
+#[test]
+fn unsendable_request_walks_the_chain_to_a_definitive_substitute() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnsendableRequest {
+                connection: "local".to_string(),
+                reason: format!(
+                    "request body of {} bytes exceeds the {} byte wire bound",
+                    MODEL_WIRE_MAX_BYTES + 1,
+                    MODEL_WIRE_MAX_BYTES
+                ),
+            }),
+            Respond::Delegate,
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/unsendable-chain", "goal: chain")
+        .expect("manifest");
+    let reply = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/unsendable-chain",
+            &manifest,
+        )
+        .expect("a definitive pre-send refusal never stops the walk");
+    assert!(!reply.text.is_empty());
+    let substitute_attempt = {
+        let sent = sent.lock().expect("wire log lock");
+        assert_eq!(
+            sent.len(),
+            2,
+            "the refused primary and the answering substitute sent"
+        );
+        assert_eq!(
+            sent[1].model,
+            ModelAssign::Fixed(FixedModel {
+                connection: "reserve".to_string(),
+                model_id: "reserve-model".to_string(),
+            }),
+            "the walk dispatched the chain entry"
+        );
+        assert_eq!(sent[1].inputs, sent[0].inputs);
+        sent[1].attempt_id.clone()
+    };
+    assert_eq!(broker.accounted_requests(), 1);
+    assert_eq!(
+        broker
+            .accounting_record(&substitute_attempt)
+            .expect("the substitute send is accounted")
+            .connection,
+        "reserve"
+    );
+    assert_eq!(
+        broker.admitted_attempts(),
+        0,
+        "every admission returns to baseline"
+    );
+}
+
+/// AC-045: the same post-output failure class under a manual fallback
+/// still pauses for the human, and the served question carries the
+/// machine-readable repeat token.
+#[test]
+fn manual_pause_on_a_post_output_failure_serves_the_repeat_warning() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider {
+        inner: LoopbackProvider::new(),
+        sent: sent.clone(),
+        script: Arc::new(Mutex::new(
+            vec![Respond::Fail(ProviderError::ProviderFailed {
+                connection: "local".to_string(),
+                reason: "finishReason OTHER".to_string(),
+            })]
+            .into(),
+        )),
+        inner_attempts: Arc::new(AtomicU64::new(0)),
+        inner_retries: 0,
+    };
+    let mut world = support::open_world_with(
+        "manual-post-output",
+        Some(&fallback_config("fallback = { mode = \"manual\" }")),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "rivect-first-task-marker\n").expect("scoped file");
+    world.runtime.purpose = "relay".to_string();
+    world.runtime.set_read_scope(scope, file);
+
+    let session = world.open_session("manual-post-output-boot");
+    let task = world.create_task(&session, "manual-post-output-choice");
+    let question = world.publish(&session, &task);
+    let answered = world.dispatch(&support::corpus_answer_custom(
+        &session,
+        "manual-post-output-first",
+        &task,
+        &question,
+        "steps",
+        json!(4501),
+    ));
+    assert!(
+        answered.get("error").is_none(),
+        "the answer commits and the step pauses: {answered}"
+    );
+    let paused = world
+        .runtime
+        .paused_attempts
+        .get(&task.0)
+        .expect("the paused attempt is retained");
+    assert!(
+        paused
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.unknown_outcome),
+        "a post-output failure is an unknown outcome"
+    );
+    let current = world.dispatch(&support::corpus_question_current(
+        &session,
+        &task,
+        json!(4502),
+    ));
+    let served_question: Question =
+        serde_json::from_value(current["result"]["question"].clone()).expect("served question");
+    assert_eq!(
+        served_question.prompt,
+        "the pinned dispatch ended without a definitive answer; its effect may have applied before the failure — a substitute send repeats it",
+        "the pause discloses the repeat: {served_question:?}"
+    );
+    assert_eq!(
+        served_question.recommendation_basis,
+        "unknown-outcome-repeat: a substitute repeats an effect that may have applied",
+        "the repeat class is machine-readable: {served_question:?}"
+    );
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "manual never dispatches a substitute while the choice waits"
+    );
+}
+
+/// AC-045: an adapter-retried send is one physical child whose first leg
+/// may have applied. A definitive denial on the second leg is still an
+/// unknown outcome, so the walk stops and the last entry never sends.
+#[test]
+fn retried_send_failure_stops_the_walk_before_the_next_entry() {
+    let config = Config::parse_validated(&fallback_config(
+        "eligible = [\"local\", \"reserve\", \"shadowed\"]\n\
+         fallback = { mode = \"auto\", chain = [\
+             { mode = \"fixed\", connection = \"reserve\", model_id = \"reserve-model\" }, \
+             { mode = \"fixed\", connection = \"shadowed\", model_id = \"shadowed-model\" }] }",
+    ))
+    .expect("valid");
+    let (mut broker, sent, _inner) = scripted_broker(
+        vec![
+            Respond::Fail(ProviderError::UnknownConnection {
+                connection: "local".to_string(),
+            }),
+            Respond::Fail(ProviderError::Retried {
+                wire_retries: 1,
+                source: Box::new(ProviderError::Transport {
+                    connection: "reserve".to_string(),
+                    cause: TransportCause::Status {
+                        status: reqwest::StatusCode::BAD_REQUEST,
+                    },
+                }),
+            }),
+        ],
+        0,
+    );
+    let manifest = broker
+        .prepare("relay", &config, "/world/retried-chain", "goal: chain")
+        .expect("manifest");
+    let error = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/retried-chain",
+            &manifest,
+        )
+        .expect_err("a retried leg's effect is unknown");
+    assert!(
+        matches!(
+            &error,
+            ModelError::Provider(ProviderError::Transport { connection, cause })
+                if connection == "reserve"
+                    && matches!(cause.class(), TransportClass::HttpStatus { code: 400 })
+        ),
+        "the caller meets the last leg's own definitive class: {error}"
+    );
+    let sent = sent.lock().expect("wire log lock");
+    assert_eq!(
+        sent.len(),
+        2,
+        "the primary and the retried middle entry sent; the last entry never did"
     );
 }
 
@@ -7459,9 +8087,10 @@ impl Provider for FailFirstProvider {
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         if !self.failed {
             self.failed = true;
-            return Err(ProviderError::ProviderFailed {
+            return Err(ProviderError::UnsupportedParameter {
                 connection: "yolo-auto".to_string(),
-                reason: "fixture failure".to_string(),
+                parameter: "fixture-parameter",
+                model: "fixture-model".to_string(),
             });
         }
         self.inner.send(manifest)
@@ -8076,5 +8705,248 @@ fn zenmux_never_falls_back_across_route_or_id() {
         matches!(&denied, ProviderError::RegionMismatch { connection, region }
             if connection == "zenmux" && region == "eu"),
         "the typed region denial: {denied:?}"
+    );
+}
+
+/// A definitive primary denial is the only failure a manual pause may
+/// follow. The same-recorded-contract sibling is removed from the served
+/// candidates and refused again if a caller names it directly.
+struct DefinitiveFailProvider {
+    inner: LoopbackProvider,
+    failed: bool,
+}
+
+impl Provider for DefinitiveFailProvider {
+    fn name(&self) -> &'static str {
+        "definitive-fail"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        if !self.failed {
+            self.failed = true;
+            return Err(ProviderError::UnsupportedParameter {
+                connection: "openai-codex".to_string(),
+                parameter: "fixture",
+                model: "gpt-5.2-codex".to_string(),
+            });
+        }
+        self.inner.send(manifest)
+    }
+}
+
+fn codex_manual_config(eligible: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"https://chatgpt.com/backend-api/codex\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.openai-codex-device]\nkind = \"api_key\"\nendpoint = \"https://chatgpt.com/backend-api/codex\"\n\
+         credential_ref = \"{reference}\"\nprofile = \"openai-codex\"\n\
+         [connections.reserve]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
+         [profiles.openai-codex]\ncredential_ref = \"{reference}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\nfallback = {{ mode = \"auto\" }}\n\
+         [models.purposes.relay]\n\
+         model = {{ mode = \"fixed\", connection = \"openai-codex\", model_id = \"gpt-5.2-codex\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"manual\" }}\neligible = [{eligible}]\n",
+        reference = support::CODEX_REF,
+    )
+}
+
+#[test]
+fn manual_fallback_filters_the_same_contract_sibling_from_its_choices() {
+    let config = Config::parse_validated(&codex_manual_config(
+        "\"openai-codex\", \"openai-codex-device\"",
+    ))
+    .expect("the manual codex fixture validates");
+    let mut broker = Broker::new(Box::new(DefinitiveFailProvider {
+        inner: LoopbackProvider::new(),
+        failed: false,
+    }));
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/codex-manual",
+            "goal: manual sibling",
+        )
+        .expect("the codex pin prepares");
+    let outcome = broker.dispatch(
+        &mut rivect::model::NullLedger,
+        "/world/codex-manual",
+        &manifest,
+    );
+    let Err(error) = outcome else {
+        panic!("the empty served set exhausts instead of pausing: {outcome:?}");
+    };
+    let ModelError::FallbackExhausted {
+        rejected,
+        attempted,
+        ..
+    } = error
+    else {
+        panic!("no servable candidate is the typed exhaustion: {error:?}");
+    };
+    assert!(
+        attempted.is_empty(),
+        "the filtered sibling never receives a send: {attempted:?}"
+    );
+    let sibling = rejected
+        .iter()
+        .find(|rejection| rejection.connection == "openai-codex-device")
+        .expect("the filtered sibling is reported, not dropped silently");
+    assert!(
+        matches!(sibling.cause, RejectionCause::BlindRetryRefused),
+        "the refusal names the same-contract blind retry: {:?}",
+        sibling.cause
+    );
+    assert!(
+        rejected
+            .iter()
+            .any(|rejection| rejection.connection == "reserve"),
+        "every evaluated non-primary connection keeps its cause: {rejected:?}"
+    );
+    assert!(
+        broker.pending_choice(&manifest.attempt_id).is_none(),
+        "the same-contract sibling is never offered"
+    );
+}
+
+#[test]
+fn manual_pick_of_the_same_contract_sibling_is_refused() {
+    let config = Config::parse_validated(&codex_manual_config(
+        "\"openai-codex\", \"openai-codex-device\", \"reserve\"",
+    ))
+    .expect("the manual codex fixture validates");
+    let mut broker = Broker::new(Box::new(DefinitiveFailProvider {
+        inner: LoopbackProvider::new(),
+        failed: false,
+    }));
+    let manifest = broker
+        .prepare("relay", &config, "/world/codex-pick", "goal: manual pick")
+        .expect("the codex pin prepares");
+    let error = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/codex-pick",
+            &manifest,
+        )
+        .expect_err("the definitive primary denial pauses");
+    assert!(
+        matches!(error, ModelError::ManualFallbackPending { .. }),
+        "a servable different contract still pauses: {error:?}"
+    );
+    let choice = broker
+        .pending_choice(&manifest.attempt_id)
+        .expect("the pause serves its candidates");
+    assert!(
+        !choice
+            .candidates
+            .contains(&"openai-codex-device".to_string()),
+        "the sibling is filtered from the pause: {choice:?}"
+    );
+    let picked = broker.dispatch_fallback_choice(
+        &mut rivect::model::NullLedger,
+        "/world/codex-pick",
+        &manifest.attempt_id,
+        "openai-codex-device",
+    );
+    assert!(
+        matches!(
+            picked,
+            Err(ModelError::ManualChoiceRejected {
+                cause: RejectionCause::BlindRetryRefused,
+                ..
+            })
+        ),
+        "a direct pick is refused by the contract classification: {picked:?}"
+    );
+}
+
+/// Serves every connection and fails the primary once with an entered 503:
+/// the outcome may already have applied remotely, so only the auto walk
+/// stops — a manual fallback still asks the human.
+struct UnknownOutcomeFailProvider {
+    inner: LoopbackProvider,
+    failed: bool,
+}
+
+impl Provider for UnknownOutcomeFailProvider {
+    fn name(&self) -> &'static str {
+        "unknown-outcome-fail"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        if !self.failed {
+            self.failed = true;
+            return Err(ProviderError::Transport {
+                connection: "openai-codex".to_string(),
+                cause: TransportCause::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                },
+            });
+        }
+        self.inner.send(manifest)
+    }
+}
+
+/// AC-045: an entered unknown outcome ends only the auto walk. A manual
+/// fallback still pauses for the human — the pending choice rides
+/// question.current — and the same-contract sibling stays filtered from the
+/// served candidates, so the pause can only be answered by a different
+/// recorded contract.
+#[test]
+fn manual_fallback_still_pauses_on_an_unknown_primary_outcome() {
+    let config = Config::parse_validated(&codex_manual_config(
+        "\"openai-codex\", \"openai-codex-device\", \"reserve\"",
+    ))
+    .expect("the manual codex fixture validates");
+    let mut broker = Broker::new(Box::new(UnknownOutcomeFailProvider {
+        inner: LoopbackProvider::new(),
+        failed: false,
+    }));
+    let manifest = broker
+        .prepare(
+            "relay",
+            &config,
+            "/world/codex-unknown",
+            "goal: manual unknown",
+        )
+        .expect("the codex pin prepares");
+    let error = broker
+        .dispatch(
+            &mut rivect::model::NullLedger,
+            "/world/codex-unknown",
+            &manifest,
+        )
+        .expect_err("an unknown primary still pauses a manual fallback");
+    assert!(
+        matches!(error, ModelError::ManualFallbackPending { .. }),
+        "the manual pause is the typed outcome, never a provider close: {error:?}"
+    );
+    let choice = broker
+        .pending_choice(&manifest.attempt_id)
+        .expect("the pause serves its candidates");
+    assert_eq!(
+        choice.candidates,
+        vec!["reserve".to_string()],
+        "the failed primary and its same-contract sibling are never offered: {choice:?}"
+    );
+    assert!(
+        choice.unknown_outcome,
+        "an entered 503 is an unknown outcome the pause must disclose: {choice:?}"
+    );
+    assert!(
+        broker.admission(&manifest.attempt_id).is_some(),
+        "the paused primary stays admitted for the human's answer"
     );
 }

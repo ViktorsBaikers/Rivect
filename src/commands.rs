@@ -740,16 +740,54 @@ impl Runtime {
         let mut economy = self.economy.clone();
         let totals = self.owner.store.settlement_totals()?;
         economy.settled_tokens = totals.total_tokens;
+        economy.settled_without_total = totals.settled_without_total;
+        economy.settled_source = if totals.settled_count == 0 {
+            SETTLED_UNKNOWN_SOURCE.to_string()
+        } else {
+            let attempt = |count: u64| {
+                if count == 1 { "attempt" } else { "attempts" }
+            };
+            if totals.settled_without_total == totals.settled_count {
+                format!(
+                    "unknown: {} settled {} reported no total",
+                    totals.settled_without_total,
+                    attempt(totals.settled_without_total)
+                )
+            } else if totals.settled_without_total == 0 {
+                let possessive = if totals.settled_count == 1 {
+                    "attempt's"
+                } else {
+                    "attempts'"
+                };
+                format!(
+                    "sum of {} settled {possessive} reported totals",
+                    totals.settled_count
+                )
+            } else {
+                format!(
+                    "partial: {} of {} settled attempts reported no total",
+                    totals.settled_without_total, totals.settled_count
+                )
+            }
+        };
         economy.charged_units = totals.charged_units;
+        economy.cost_source = if totals.charged_units.is_some() {
+            CHARGED_SOURCE.to_string()
+        } else {
+            COST_SOURCE.to_string()
+        };
         economy.cache_rate = cache.numerator_and_denominator();
         economy.cache_source = cache.source();
         economy.pending_sends = totals.dispatched_count;
         economy.agents = u64::try_from(self.scheduler.running_count()).unwrap_or(u64::MAX);
+        economy.agents_source = AGENTS_SOURCE.to_string();
         // Occupancy is the latest settled attempt's reported prompt tokens —
         // a real provider figure, named as such — never the request's bytes
         // relabelled `tok`, and never the lifetime spend beside it.
         economy.context_tokens = totals.latest_prompt_tokens;
-        economy.context_source = if totals.latest_prompt_tokens.is_some() {
+        economy.context_source = if totals.settled_count == 0 {
+            SETTLED_UNKNOWN_SOURCE.to_string()
+        } else if totals.latest_prompt_tokens.is_some() {
             CONTEXT_SOURCE.to_string()
         } else {
             "unknown: the latest settled attempt reported no prompt tokens".to_string()
@@ -1784,9 +1822,16 @@ fn profile_status(rt: &Runtime) -> ProfileStatus {
 /// request, `settled_tokens` is lifetime spend.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EconomySnapshot {
+    /// The workspace the figures belong to.
     pub project: String,
+    /// The directory this runtime was opened from.
     pub cwd: String,
+    /// The prepared attempt's model when that attempt landed; `None` when
+    /// the landing attempt is a fallback substitute (answered, unresolved
+    /// or failed), the assignment named no single model, or no dispatch
+    /// has frozen one since open.
     pub model: Option<String>,
+    /// The connection that request was routed through.
     pub connection: Option<String>,
     /// Where the model choice came from; `None` until a dispatch froze one.
     pub source: Option<String>,
@@ -1798,22 +1843,60 @@ pub struct EconomySnapshot {
     pub effort_source: String,
     /// The purpose whose request the effort belongs to.
     pub purpose: Option<String>,
+    /// The latest settled attempt's reported prompt tokens: context
+    /// occupancy, never lifetime spend.
     pub context_tokens: Option<u64>,
+    /// The endpoint's reported context window. No provider surface reports
+    /// one in this build, so it stays `None` — unknown, never an invented
+    /// limit.
     pub context_window: Option<u64>,
+    /// Where the occupancy came from, or the unknown reason.
     pub context_source: String,
+    /// The reported totals over settled rows, `None` when no settled row
+    /// reported a total.
     pub settled_tokens: Option<u64>,
+    /// Settled rows that reported no total: `settled_tokens` stays partial
+    /// or absent while this is non-zero, never the whole lifetime spend.
+    pub settled_without_total: u64,
+    /// Where the settled figure came from, or how much of it is
+    /// unmeasured: a partial lifetime sum says how many settled rows
+    /// reported no total rather than presenting the known part as whole.
+    pub settled_source: String,
+    /// The budget units settled sends charged (DEC-012). The unit is the
+    /// unit-sized reservation bound, not a provider token: each settled
+    /// send that reserved a budget scope charges `min(reported total,
+    /// bound)`, so a confirmed total above the bound never rolls the
+    /// charge back and an entered send with unknown usage retains the
+    /// bound; a send that reserved no scope charges nothing. `None` while
+    /// no settled row carries a charge — unknown, never zero.
     pub charged_units: Option<u64>,
+    /// Where the charge came from, or the reason no charge is recorded.
+    pub cost_source: String,
     /// The exact cache-read numerator and all-input denominator from the
     /// frozen cohort: `(cache read, prompt + cache read + cache write)`.
-    /// `None` while no cohort is measured, never a rounded ratio.
+    /// `None` while no cohort is measured, never a rounded ratio and never
+    /// a zero for an unmeasured cohort.
     pub cache_rate: Option<(u64, u64)>,
     /// The cohort provenance and counts, or the `NOT_RUN`/unknown reason.
     pub cache_source: String,
+    /// The endpoint-reported remaining budget units. No quota endpoint
+    /// exists in this build, so it stays `None` — unknown, never zero and
+    /// never unlimited — beside the source that would report it.
     pub quota_remaining: Option<u64>,
+    /// Where `quota_remaining` would come from, or the unknown reason.
     pub quota_source: String,
+    /// The provider-reported reset of the quota window; unreported in this
+    /// build, so `None` beside its source.
     pub reset_at: Option<String>,
+    /// Where the reset came from, or the reason none is reported.
+    pub reset_source: String,
     /// Slots the scheduler currently runs.
     pub agents: u64,
+    /// Where the slot count came from.
+    pub agents_source: String,
+    /// The basis the answering settlement row recorded for its ranking
+    /// (DEC-013); a fallback substitute records none. The frozen fact,
+    /// never re-read from the current config.
     pub ranking_basis: Option<String>,
     /// Settlements still open: a send in flight or one a killed process
     /// left for the next open to reconcile.
@@ -1828,6 +1911,18 @@ const QUOTA_SOURCE: &str = "unknown: no quota endpoint reports remaining units";
 const CONTEXT_SOURCE: &str = "latest settled attempt's reported prompt tokens";
 /// The effort's source: the frozen request is the only recorded setting.
 const EFFORT_SOURCE: &str = "sent setting; the endpoint reports no effective effort";
+/// The absent settled total: no settled row has been recorded yet.
+const SETTLED_UNKNOWN_SOURCE: &str = "unknown: no settled attempt recorded";
+/// The absent charge: no settled row carries a charged unit.
+const COST_SOURCE: &str = "unknown: no settled charge recorded";
+/// DEC-012's charge rule: a settlement with no reported total keeps the
+/// frozen bound, and only a lower reported total caps it. Retention leads
+/// because the dock elides the label at 32 characters.
+const CHARGED_SOURCE: &str = "the bound is retained unless a reported total is lower";
+/// The scheduler's own running-slot count.
+const AGENTS_SOURCE: &str = "scheduler's running slots";
+/// No quota surface reports a reset in this build.
+const RESET_SOURCE: &str = "unknown: the quota surface reports no reset";
 
 impl EconomySnapshot {
     fn empty(project: &Path) -> Self {
@@ -1845,15 +1940,20 @@ impl EconomySnapshot {
             purpose: None,
             context_tokens: None,
             context_window: None,
-            context_source: CONTEXT_SOURCE.to_string(),
+            context_source: SETTLED_UNKNOWN_SOURCE.to_string(),
             settled_tokens: None,
+            settled_without_total: 0,
+            settled_source: SETTLED_UNKNOWN_SOURCE.to_string(),
             charged_units: None,
+            cost_source: COST_SOURCE.to_string(),
             cache_rate: cache.numerator_and_denominator(),
             cache_source: cache.source(),
             quota_remaining: None,
             quota_source: QUOTA_SOURCE.to_string(),
             reset_at: None,
+            reset_source: RESET_SOURCE.to_string(),
             agents: 0,
+            agents_source: AGENTS_SOURCE.to_string(),
             ranking_basis: None,
             pending_sends: 0,
         }
@@ -5466,16 +5566,38 @@ fn work_budget_result(budget: &crate::state::WorkBudget) -> Value {
     })
 }
 
-/// The `auth.login.begin` parameter set: the one connection/mode surface and
-/// the contract-peer endpoints; an unknown key is refused rather than ignored.
-const LOGIN_BEGIN_PARAMS: &[&str] = &[
-    "schema_version",
-    "connection",
-    "mode",
+/// The `auth.login.begin` parameter set: the one connection/mode surface.
+/// The contract-peer endpoint keys are a test-only seam; a release caller
+/// gets `UnknownParameter` for them so a local process cannot redirect the
+/// token exchange away from the recorded origin.
+const LOGIN_BEGIN_PARAMS: &[&str] = &["schema_version", "connection", "mode"];
+/// The test-only endpoint override keys, admitted only in a debug/test build.
+const LOGIN_BEGIN_ENDPOINT_PARAMS: &[&str] = &[
     "token_endpoint",
     "usercode_endpoint",
     "device_token_endpoint",
 ];
+/// Whether this build admits the contract-peer endpoint overrides. The
+/// library proofs link the debug profile, so integration tests keep their
+/// loopback peers; a release binary never admits them.
+const LOGIN_ENDPOINT_OVERRIDE: bool = cfg!(test) || cfg!(debug_assertions);
+
+/// The first unknown key of one login-begin request. The endpoint override
+/// keys join the set only when the build admits them, so the release refusal
+/// is a typed `UnknownParameter` rather than a silently ignored field.
+fn unknown_login_begin_param(params: &Value, allow_endpoints: bool) -> Option<RequestError> {
+    if allow_endpoints {
+        return params
+            .as_object()?
+            .keys()
+            .find(|key| {
+                !LOGIN_BEGIN_PARAMS.contains(&key.as_str())
+                    && !LOGIN_BEGIN_ENDPOINT_PARAMS.contains(&key.as_str())
+            })
+            .map(|name| RequestError::UnknownParameter { name: name.clone() });
+    }
+    unknown_param(params, LOGIN_BEGIN_PARAMS)
+}
 const LOGIN_COMPLETE_PARAMS: &[&str] = &["schema_version", "state", "redirect"];
 
 /// Durable ingress policy shared by the login and sharing methods: the
@@ -5527,7 +5649,7 @@ fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
     if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.login.begin") {
         return response;
     }
-    if let Some(error) = unknown_param(params, LOGIN_BEGIN_PARAMS) {
+    if let Some(error) = unknown_login_begin_param(params, LOGIN_ENDPOINT_OVERRIDE) {
         return request_error(id, error);
     }
     let connection = match optional_string(params, "connection") {
@@ -5540,36 +5662,42 @@ fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
     };
     let recorded = crate::providers::openai_login::DeviceEndpoints::recorded();
     // Test-only contract-peer override; the production surface always names
-    // the recorded endpoints.
-    #[cfg(test)]
-    let injected = rt.login_endpoints.clone();
-    #[cfg(not(test))]
-    let injected: Option<crate::providers::openai_login::DeviceEndpoints> = None;
-    let endpoints = match (
-        optional_string(params, "usercode_endpoint"),
-        optional_string(params, "device_token_endpoint"),
-        optional_string(params, "token_endpoint"),
-    ) {
-        (Ok(usercode), Ok(token), Ok(exchange)) => {
-            crate::providers::openai_login::DeviceEndpoints {
-                usercode: usercode
-                    .map(str::to_string)
-                    .or_else(|| injected.as_ref().map(|entry| entry.usercode.clone()))
-                    .unwrap_or(recorded.usercode),
-                token: token
-                    .map(str::to_string)
-                    .or_else(|| injected.as_ref().map(|entry| entry.token.clone()))
-                    .unwrap_or(recorded.token),
-                exchange: exchange
-                    .map(str::to_string)
-                    .or_else(|| injected.as_ref().map(|entry| entry.exchange.clone()))
-                    .unwrap_or(recorded.exchange),
+    // the recorded endpoints, and the release gate above refuses the keys
+    // before this branch could read them.
+    #[cfg(any(test, debug_assertions))]
+    let endpoints = {
+        #[cfg(test)]
+        let injected = rt.login_endpoints.clone();
+        #[cfg(not(test))]
+        let injected: Option<crate::providers::openai_login::DeviceEndpoints> = None;
+        match (
+            optional_string(params, "usercode_endpoint"),
+            optional_string(params, "device_token_endpoint"),
+            optional_string(params, "token_endpoint"),
+        ) {
+            (Ok(usercode), Ok(token), Ok(exchange)) => {
+                crate::providers::openai_login::DeviceEndpoints {
+                    usercode: usercode
+                        .map(str::to_string)
+                        .or_else(|| injected.as_ref().map(|entry| entry.usercode.clone()))
+                        .unwrap_or(recorded.usercode),
+                    token: token
+                        .map(str::to_string)
+                        .or_else(|| injected.as_ref().map(|entry| entry.token.clone()))
+                        .unwrap_or(recorded.token),
+                    exchange: exchange
+                        .map(str::to_string)
+                        .or_else(|| injected.as_ref().map(|entry| entry.exchange.clone()))
+                        .unwrap_or(recorded.exchange),
+                }
+            }
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                return request_error(id, error);
             }
         }
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-            return request_error(id, error);
-        }
     };
+    #[cfg(not(any(test, debug_assertions)))]
+    let endpoints = recorded;
     let config = rt.config_for_broker();
     match mode {
         "browser" => {
@@ -6072,7 +6200,7 @@ use tests::{IndexAnswerObserver, IndexSealControl};
 
 #[cfg(test)]
 mod tests {
-    use super::{publication_error, recovery_diagnostic};
+    use super::{RequestError, publication_error, recovery_diagnostic, unknown_login_begin_param};
 
     use crate::config::{self, ConfigValue};
     use crate::contracts::ErrorCode;
@@ -7807,6 +7935,38 @@ mod tests {
             assert_eq!(take_release_lines(), Vec::<String>::new());
         }
         Ok(())
+    }
+
+    /// The contract-peer endpoint overrides are a debug/test seam: the gate
+    /// the production call site passes is the compiled flag, so a release
+    /// build refuses every override typed while a debug/test build admits
+    /// them. Both branches are asserted directly, because the compiled flag
+    /// is always set in this test binary: an assertion on the constant alone
+    /// would leave the release refusal unproven.
+    #[test]
+    fn release_login_refuses_endpoint_overrides() {
+        for name in [
+            "token_endpoint",
+            "usercode_endpoint",
+            "device_token_endpoint",
+        ] {
+            let params = serde_json::json!({
+                "schema_version": 1,
+                name: "http://127.0.0.1:1/oauth/token",
+            });
+            let refusal = unknown_login_begin_param(&params, false);
+            assert!(
+                matches!(
+                    refusal,
+                    Some(RequestError::UnknownParameter { name: refused }) if refused == name
+                ),
+                "the release gate refuses the {name} override"
+            );
+            assert!(
+                unknown_login_begin_param(&params, true).is_none(),
+                "the compiled test/debug gate admits the {name} override"
+            );
+        }
     }
 }
 

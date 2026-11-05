@@ -392,7 +392,7 @@ impl GeminiProvider {
     ///
     /// The replay set is bound by `MODEL_WIRE_MAX_BYTES`: once a
     /// lineage's committed turns serialize past it, every send under
-    /// that epoch fails `StreamViolation` — turns are never evicted,
+    /// that epoch fails `UnsendableRequest` — turns are never evicted,
     /// dropping them would break the stateless replay.
     fn request_body(&self, manifest: &RequestManifest) -> Result<Value, ProviderError> {
         let key = (
@@ -424,7 +424,7 @@ impl GeminiProvider {
                 // transmitting an invented spelling or silently
                 // clamping to HIGH would send an effort nobody pinned.
                 EffortLevel::Xhigh => {
-                    return Err(ProviderError::StreamViolation {
+                    return Err(ProviderError::UnsendableRequest {
                         connection: self.connection.clone(),
                         reason: format!(
                             "effort {} has no recorded thinking level in this dialect",
@@ -919,14 +919,15 @@ impl Provider for GeminiProvider {
     /// [`ProviderError::UnpinnedModel`] when the manifest carries no
     /// fixed model id and no single-member auto pool naming this
     /// connection, [`ProviderError::DialectMismatch`] when the pin
-    /// names a different connection, the credential seam's typed
-    /// denials, [`ProviderError::Transport`],
+    /// names a different connection, [`ProviderError::UnsendableRequest`]
+    /// for a pre-send request-shape denial — a serialized request body
+    /// over the wire bound, a pinned effort the recorded `ThinkingLevel`
+    /// enum cannot carry, or a resolved model id outside the URL
+    /// path-segment charset — the credential seam's typed denials,
+    /// [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
-    /// [`ProviderError::StreamViolation`] — including a serialized
-    /// request body over the wire bound, a pinned effort the recorded
-    /// `ThinkingLevel` enum cannot carry, or a resolved model id
-    /// outside the URL path-segment charset —
+    /// [`ProviderError::StreamViolation`],
     /// [`ProviderError::IncompatibleOutput`] and
     /// [`ProviderError::ReasoningProvenance`] as the stream legs
     /// document.
@@ -985,7 +986,7 @@ impl Provider for GeminiProvider {
         // `?` or `%` in an id would traverse the `/models/` collection
         // or rewrite the method suffix.
         if !valid_model_id(&fixed.model_id) {
-            return Err(ProviderError::StreamViolation {
+            return Err(ProviderError::UnsendableRequest {
                 connection: self.connection.clone(),
                 reason: bounded_reason(format!(
                     "model id {:?} is not a usable request path segment",

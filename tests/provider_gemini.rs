@@ -799,6 +799,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
+        Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
@@ -1687,6 +1688,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         StreamViolation,
         IncompatibleOutput,
         UnsupportedParameter,
+        UnsendableRequest,
         ReasoningProvenance,
         Retried,
     }
@@ -1719,6 +1721,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
+            ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
@@ -3204,7 +3207,7 @@ async fn incompatible_tools_or_reasoning_is_a_typed_rejection() {
     let (provider, _store) = google_provider(&config);
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     assert!(
-        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
+        matches!(outcome, Err(ProviderError::UnsendableRequest { .. })),
         "an unrepresentable effort is a typed request rejection: {outcome:?}"
     );
     let requests = server.received_requests().await.expect("recorded");
@@ -3543,7 +3546,7 @@ async fn hostile_model_ids_and_catalog_names_never_reach_the_wire() {
         let (provider, _store) = google_provider(&config);
         let manifest = prepared_manifest(&config);
         let (provider, outcome) = send_on_thread(provider, manifest);
-        let Err(ProviderError::StreamViolation { reason, .. }) = &outcome else {
+        let Err(ProviderError::UnsendableRequest { reason, .. }) = &outcome else {
             panic!("model id {hostile:?} is a typed denial before the post: {outcome:?}")
         };
         assert!(
@@ -4524,7 +4527,7 @@ async fn unknown_usage_never_releases_the_admission_bound() {
 
 /// AC-013/DEC-012: the replayed lineage set rides inside the same
 /// wire bound — a serialized request body past the limit is a typed
-/// violation before any byte is sent, never a silent truncation.
+/// refusal before any byte is sent, never a silent truncation.
 #[tokio::test]
 async fn replay_body_is_bounded_by_the_wire_limit() {
     let server = MockServer::start().await;
@@ -4551,8 +4554,8 @@ async fn replay_body_is_bounded_by_the_wire_limit() {
     }
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     assert!(
-        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
-        "an over-bound replay body is a typed violation: {outcome:?}"
+        matches!(outcome, Err(ProviderError::UnsendableRequest { .. })),
+        "an over-bound replay body is a typed refusal: {outcome:?}"
     );
     let requests = server.received_requests().await.expect("recorded");
     assert_eq!(

@@ -1122,7 +1122,7 @@ impl OpenAiProvider {
     ///
     /// The replay set is bound by `MODEL_WIRE_MAX_BYTES`: once a
     /// lineage's committed items serialize past it, every send under
-    /// that epoch fails `StreamViolation` — items are never evicted,
+    /// that epoch fails `UnsendableRequest` — items are never evicted,
     /// dropping them would break the stateless replay. The wedge's
     /// recorded escape is a prefix mutation opening a new epoch with
     /// an empty set (F15).
@@ -1824,8 +1824,8 @@ impl Provider for OpenAiProvider {
     /// effort the xAI residue suppresses, [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
-    /// [`ProviderError::StreamViolation`] — including a serialized
-    /// request body over the wire bound —
+    /// [`ProviderError::UnsendableRequest`] for a serialized request
+    /// body over the wire bound, [`ProviderError::StreamViolation`],
     /// [`ProviderError::IncompatibleOutput`] and
     /// [`ProviderError::ReasoningProvenance`] as the stream legs
     /// document.

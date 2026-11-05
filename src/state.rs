@@ -375,6 +375,29 @@ fn migrate_supervisor_reactions_on(conn: &Connection) -> Result<()> {
         .map_err(storage)
 }
 
+/// Fills the incremental totals row when this store has none and recomputes it
+/// when the settlement ledger is ahead of it: the presence and `MAX(rowid)`
+/// reads are single lookups, and the open-send count is one index-range count
+/// bounded by the open sends, so an ordinary open never scans the whole
+/// settlement ledger and a current row is never rewritten. Production startup
+/// runs this gate once here and once in the pre-commit compatibility check,
+/// so an open pays at most two such counts.
+fn backfill_usage_totals_on(conn: &Connection) -> Result<()> {
+    let present: bool = conn
+        .query_row(sql::USAGE_TOTALS_PRESENT, [], |row| row.get(0))
+        .map_err(storage)?;
+    if present {
+        let stale: bool = conn
+            .query_row(sql::USAGE_TOTALS_STALE, [], |row| row.get(0))
+            .map_err(storage)?;
+        if !stale {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(sql::USAGE_TOTALS_BACKFILL)
+        .map_err(storage)
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         schema_version: 1,
@@ -1662,6 +1685,7 @@ impl TaskStore {
         ] {
             conn.execute_batch(batch).map_err(storage)?;
         }
+        backfill_usage_totals_on(conn)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -1696,6 +1720,7 @@ impl TaskStore {
             proof::generation_fault(site).map_err(storage)?;
             tx.execute_batch(batch).map_err(storage)?;
         }
+        backfill_usage_totals_on(tx)?;
         Self::expand_generation_tx(tx)?;
         Ok(())
     }
@@ -1764,14 +1789,25 @@ impl TaskStore {
     /// # Errors
     /// Returns the store's typed storage error when the schema cannot be read.
     pub(crate) fn startup_schema_compatible(&self) -> Result<bool> {
-        let present: i64 = self
-            .conn()?
+        let conn = self.conn()?;
+        let present: i64 = conn
             .query_row(sql::RECOVERY_TABLES_PRESENT, [], |row| row.get(0))
             .map_err(storage)?;
-        // Four: the settlement reconciliation reads `usage_settlements`, so a
-        // store predating that additive table takes the post-commit path and
-        // the DDL exists before the first read.
-        Ok(present == 4)
+        // Five: the settlement reconciliation writes `usage_settlements` and
+        // the incremental `usage_totals` row, so a store predating either
+        // additive table takes the post-commit path, where the DDL exists and
+        // the totals row is backfilled before the first recovery write.
+        if present != 5 {
+            return Ok(false);
+        }
+        // A store reverted to a build without the incremental row leaves the
+        // ledger ahead of it — rows past the counter or an allocated row
+        // settled in place; the post-commit path recomputes the row before
+        // recovery settles those foreign rows into it.
+        let stale: bool = conn
+            .query_row(sql::USAGE_TOTALS_STALE, [], |row| row.get(0))
+            .map_err(storage)?;
+        Ok(!stale)
     }
 
     /// The production startup's single commit: see
@@ -7151,9 +7187,13 @@ impl TaskStore {
             )
             .map_err(storage)?;
         }
+        let settlement_rowid: i64 = tx
+            .query_row(sql::NEXT_SETTLEMENT_ROWID, [], |row| row.get(0))
+            .map_err(storage)?;
         tx.execute(
             sql::INSERT_SETTLEMENT_DISPATCHED,
             params![
+                settlement_rowid,
                 manifest.attempt_id,
                 context.parent_attempt_id,
                 context.purpose,
@@ -7249,6 +7289,16 @@ impl TaskStore {
         if settled == 0 {
             return Err(Self::settlement_not_dispatched(&tx, &ticket.attempt_id));
         }
+        tx.execute(
+            sql::SETTLE_USAGE_TOTAL,
+            params![
+                stored_bins[5],
+                stored_charged,
+                stored_bins[0],
+                ticket.attempt_id
+            ],
+        )
+        .map_err(storage)?;
         if ticket.reserved {
             Self::resolve_reservation_tx(
                 &tx,
@@ -7312,6 +7362,16 @@ impl TaskStore {
             if settled == 0 {
                 continue;
             }
+            tx.execute(
+                sql::SETTLE_USAGE_TOTAL,
+                params![
+                    Option::<i64>::None,
+                    charged,
+                    Option::<i64>::None,
+                    attempt_id,
+                ],
+            )
+            .map_err(storage)?;
             if reserved {
                 Self::resolve_reservation_tx(&tx, &attempt_id, "charged", Some(bound), false)?;
             }
@@ -7395,8 +7455,8 @@ impl TaskStore {
     }
 
     /// The lifetime settled totals of the status projection (AC-062): one
-    /// aggregate statement, so a status read never walks the settlement
-    /// rows.
+    /// incremental row, so a status read never walks the settlement rows and
+    /// a count of settled rows that reported no total stays visible.
     ///
     /// # Errors
     /// The storage failure of that read.
@@ -7405,17 +7465,19 @@ impl TaskStore {
             .query_row(sql::SETTLEMENT_TOTALS, [], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(1)?,
                     row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(storage)
             .and_then(
-                |(count, total, charged, dispatched, latest)| -> Result<SettlementTotals> {
+                |(count, without_total, total, charged, dispatched, latest)| {
                     Ok(SettlementTotals {
                         settled_count: unsigned(count)?,
+                        settled_without_total: unsigned(without_total)?,
                         total_tokens: total.map(unsigned).transpose()?,
                         charged_units: charged.map(unsigned).transpose()?,
                         dispatched_count: unsigned(dispatched)?,
@@ -8708,6 +8770,9 @@ impl SettlementState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SettlementTotals {
     pub settled_count: u64,
+    /// Settled rows that reported no total. A non-zero count makes
+    /// `total_tokens` partial, never the whole lifetime spend.
+    pub settled_without_total: u64,
     pub total_tokens: Option<u64>,
     pub charged_units: Option<u64>,
     /// Rows still `dispatched`: a send in flight or one an interrupted
@@ -9918,6 +9983,88 @@ mod tests {
         assert_eq!(repaired_count, 1);
         drop(repaired);
 
+        Ok(())
+    }
+
+    /// The startup compatibility probe reads a settled, current incremental
+    /// row without rewriting it; the in-place downgrade shape — a row a
+    /// pre-totals build settled without touching the record — answers stale,
+    /// so the startup takes the post-commit path that recomputes it.
+    #[test]
+    fn startup_compatibility_rejects_a_record_behind_an_in_place_settle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-totals-gate-")?;
+        let path = root.path().join("state.db");
+        {
+            let store = TaskStore::open(&path)?;
+            let conn = store.conn.as_ref().expect("store connection is open");
+            // The product shape after one measured settle: a settled row and
+            // its current incremental totals.
+            conn.execute(
+                "INSERT INTO usage_settlements
+                     (rowid, attempt_id, purpose, connection, cost_bound, state, exactness,
+                      wire_retries)
+                 VALUES (1, 'gate-settled', 'main', 'local', 0, 'dispatched', 'unknown', 0)",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE usage_settlements
+                     SET state = 'settled', exactness = 'exact', prompt_tokens = 6,
+                         completion_tokens = 4, total_tokens = 10, charged_units = 0
+                     WHERE attempt_id = 'gate-settled'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE usage_totals
+                     SET settled_count = 1, total_tokens = 10, charged_count = 1,
+                         charged_units = 0, latest_prompt_tokens = 6, next_rowid = 2
+                     WHERE id = 1",
+                [],
+            )?;
+            assert!(
+                store.startup_schema_compatible()?,
+                "a settled, current record is compatible"
+            );
+        }
+        let reopened = TaskStore::open(&path)?;
+        let conn = reopened.conn.as_ref().expect("store connection is open");
+        assert_eq!(
+            conn.total_changes(),
+            0,
+            "opening a current record rewrites no row"
+        );
+        let record: (i64, i64, i64) = conn.query_row(
+            "SELECT settled_count, dispatched_count, next_rowid FROM usage_totals WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(record, (1, 0, 2), "the current record is left in place");
+
+        // The downgrade shape: a pre-totals build settles the allocated row in
+        // place, so the counter still names the next identity while the record
+        // counts the send open.
+        conn.execute(
+            "INSERT INTO usage_settlements
+                 (rowid, attempt_id, purpose, connection, cost_bound, state, exactness,
+                  wire_retries)
+             VALUES (2, 'gate-in-place', 'main', 'local', 3, 'dispatched', 'unknown', 0)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE usage_totals SET next_rowid = 3, dispatched_count = 1 WHERE id = 1",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE usage_settlements
+                 SET state = 'settled', exactness = 'exact', prompt_tokens = 3,
+                     completion_tokens = 1, total_tokens = 4, charged_units = 3
+                 WHERE attempt_id = 'gate-in-place'",
+            [],
+        )?;
+        assert!(
+            !reopened.startup_schema_compatible()?,
+            "a record behind an in-place settle is stale"
+        );
         Ok(())
     }
 

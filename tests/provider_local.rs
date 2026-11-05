@@ -897,6 +897,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
+        Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
@@ -1749,6 +1750,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         StreamViolation,
         IncompatibleOutput,
         UnsupportedParameter,
+        UnsendableRequest,
         ReasoningProvenance,
         Retried,
     }
@@ -1781,6 +1783,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
+            ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
@@ -2834,8 +2837,8 @@ async fn request_body_over_the_wire_bound_is_denied_before_any_send() {
     manifest.inputs = "x".repeat(rivect::contracts::MODEL_WIRE_MAX_BYTES);
     let (provider, outcome) = send_on_thread(provider, manifest);
     assert!(
-        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
-        "an over-bound body is a typed violation: {outcome:?}"
+        matches!(outcome, Err(ProviderError::UnsendableRequest { .. })),
+        "an over-bound body is a typed refusal: {outcome:?}"
     );
     let requests = server.received_requests().await.expect("recorded");
     assert!(

@@ -456,6 +456,13 @@ pub enum ProviderError {
         parameter: &'static str,
         model: String,
     },
+    /// The frozen request cannot be shaped into a sendable wire request:
+    /// its body does not serialize, its bytes exceed the wire bound, or a
+    /// value the dialect must transmit is unusable. The denial lands
+    /// before any byte crossed, so it is definitive — a substitute cannot
+    /// repeat an effect that never left the client.
+    #[error("connection {connection} request cannot be sent: {reason}")]
+    UnsendableRequest { connection: String, reason: String },
     /// DEC-012: a reasoning artifact outside this manifest's
     /// session/epoch lineage — absent or foreign `encrypted_content`
     /// is a provenance failure, never silently dropped or replayed.
@@ -2085,12 +2092,16 @@ pub(crate) fn forwarded_header_map(
 /// The serialized body is what crosses the wire: it carries the
 /// replayed lineage set, so the same byte bound the manifest's
 /// accounted size promised is enforced on the actual bytes —
-/// oversized, never truncated (AC-013).
+/// oversized, never truncated (AC-013). A body that cannot serialize
+/// or overruns the bound is [`ProviderError::UnsendableRequest`]: the
+/// refusal lands before the post, so it is definitive.
 pub(crate) fn wire_body(connection: &str, body: &Value) -> Result<Vec<u8>, ProviderError> {
-    let body_bytes = serde_json::to_vec(body)
-        .map_err(|_ser| violation(connection, "request body could not serialize"))?;
+    let body_bytes = serde_json::to_vec(body).map_err(|_ser| ProviderError::UnsendableRequest {
+        connection: connection.to_string(),
+        reason: "request body could not serialize".to_string(),
+    })?;
     if body_bytes.len() > crate::contracts::MODEL_WIRE_MAX_BYTES {
-        return Err(ProviderError::StreamViolation {
+        return Err(ProviderError::UnsendableRequest {
             connection: connection.to_string(),
             reason: format!(
                 "request body of {} bytes exceeds the {} byte wire bound",

@@ -822,7 +822,7 @@ impl Runtime {
                 self.broker
                     .dispatch_fallback_choice(&mut ledger, &world, &attempt_id, &connection)
             };
-            self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest))?;
+            self.note_send_outcome(session_id, task_id, &sent, Some(&paused_manifest));
             let reply = match sent {
                 Ok(reply) => reply,
                 // The substitute never entered a send: a worker's own scope
@@ -918,7 +918,7 @@ impl Runtime {
         if refused_attempt {
             self.broker.cancel_attempt(&manifest.attempt_id);
         }
-        self.note_send_outcome(session_id, task_id, &sent, Some(&manifest))?;
+        self.note_send_outcome(session_id, task_id, &sent, Some(&manifest));
         match sent {
             Ok(reply) => {
                 self.provider_calls += 1;
@@ -1007,21 +1007,18 @@ impl Runtime {
     }
 
     /// Records what one broker send did for the controller's own view
-    /// (AC-059, AC-062): the economy projection is refreshed after the
-    /// ledger's store borrow ends, and a budget refusal becomes the task's
-    /// named waiting reason — cleared as soon as a later send gets through.
+    /// (AC-059, AC-062): a budget refusal becomes the task's named waiting
+    /// reason — cleared as soon as a later send gets through — before the
+    /// fallible projection refresh runs. The refresh is best-effort: a
+    /// delivered reply is never dropped on a store fault, and the fault is
+    /// recorded in the boot diagnostics with its cause instead of vanishing.
     fn note_send_outcome(
         &mut self,
         session_id: &SessionId,
         task_id: &TaskId,
         sent: &Result<ProviderReply, ModelError>,
         manifest: Option<&RequestManifest>,
-    ) -> Result<(), ControllerError> {
-        // The prepared manifest is offered on every outcome: the projection
-        // reads the durable row family and stays untouched when nothing
-        // landed. On the mixed path an entered primary's row is the landing
-        // even though the fallback leg was refused before it sent.
-        self.refresh_economy(manifest)?;
+    ) {
         match sent {
             Err(ModelError::BudgetExhausted { scope }) => self.record_budget_wait(
                 session_id,
@@ -1030,7 +1027,14 @@ impl Runtime {
             ),
             _ => self.clear_budget_wait(session_id, task_id),
         }
-        Ok(())
+        // The prepared manifest is offered on every outcome: the projection
+        // reads the durable row family and stays untouched when nothing
+        // landed. On the mixed path an entered primary's row is the landing
+        // even though the fallback leg was refused before it sent.
+        if let Err(error) = self.refresh_economy(manifest) {
+            self.boot_diagnostics
+                .push(format!("economy projection refresh failed: {error}"));
+        }
     }
 
     /// Remembers the broker attempt this task is paused on so a later
@@ -1094,7 +1098,14 @@ impl Runtime {
             question_revision: 1,
             task_id: task_id.clone(),
             intent_revision: snapshot.intent_revision,
-            prompt: "the pinned dispatch failed; choose the fallback connection".to_string(),
+            // The prompt states the verdict the broker recorded: an unknown
+            // primary may already have applied remotely, so every offered
+            // pick is a repeat of that effect, not just a fallback.
+            prompt: if choice.unknown_outcome {
+                "the pinned dispatch ended without a definitive answer; its effect may have applied before the failure — a substitute send repeats it".to_string()
+            } else {
+                "the pinned dispatch failed; choose the fallback connection".to_string()
+            },
             options: choice
                 .candidates
                 .iter()
@@ -1106,7 +1117,12 @@ impl Runtime {
                 })
                 .collect(),
             recommended_option_id: OptionId(recommended.clone()),
-            recommendation_basis: "candidates passing the current eligibility check".to_string(),
+            recommendation_basis: if choice.unknown_outcome {
+                "unknown-outcome-repeat: a substitute repeats an effect that may have applied"
+            } else {
+                "candidates passing the current eligibility check"
+            }
+            .to_string(),
         };
         // One atomic write: the question lands and the task moves to
         // waiting — on a store error nothing is published, the broker's

@@ -3988,9 +3988,10 @@ fn primary_fallback_and_substitute_each_settle_once() {
         fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
             self.calls += 1;
             if self.calls == 1 {
-                return Err(ProviderError::ProviderFailed {
+                return Err(ProviderError::UnsupportedParameter {
                     connection: "primary".to_string(),
-                    reason: "fixture primary failure".to_string(),
+                    parameter: "fixture-parameter",
+                    model: "fixture-model".to_string(),
                 });
             }
             Ok(ProviderReply {
@@ -4127,9 +4128,10 @@ fn substitute_settlement_records_its_parent_and_its_own_bins() {
         fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
             self.calls += 1;
             if self.calls == 1 {
-                return Err(ProviderError::ProviderFailed {
+                return Err(ProviderError::UnsupportedParameter {
                     connection: "local".to_string(),
-                    reason: "fixture failure".to_string(),
+                    parameter: "fixture-parameter",
+                    model: "fixture-model".to_string(),
                 });
             }
             Ok(ProviderReply {

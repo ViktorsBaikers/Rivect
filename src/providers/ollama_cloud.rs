@@ -938,8 +938,8 @@ impl Provider for OllamaCloudProvider {
     /// denials, [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
-    /// [`ProviderError::StreamViolation`] — including a serialized
-    /// request body over the wire bound — and
+    /// [`ProviderError::UnsendableRequest`] for a serialized request
+    /// body over the wire bound, [`ProviderError::StreamViolation`] and
     /// [`ProviderError::IncompatibleOutput`] as the stream legs
     /// document.
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {

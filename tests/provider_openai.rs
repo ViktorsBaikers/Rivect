@@ -986,6 +986,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::StreamViolation { .. }) => "StreamViolation",
         Some(ProviderError::IncompatibleOutput { .. }) => "IncompatibleOutput",
         Some(ProviderError::UnsupportedParameter { .. }) => "UnsupportedParameter",
+        Some(ProviderError::UnsendableRequest { .. }) => "UnsendableRequest",
         Some(ProviderError::ReasoningProvenance { .. }) => "ReasoningProvenance",
         Some(ProviderError::Retried { .. }) => "Retried",
         None => "none",
@@ -1832,6 +1833,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         StreamViolation,
         IncompatibleOutput,
         UnsupportedParameter,
+        UnsendableRequest,
         ReasoningProvenance,
         Retried,
     }
@@ -1864,6 +1866,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::StreamViolation { .. } => ProviderVariant::StreamViolation,
             ProviderError::IncompatibleOutput { .. } => ProviderVariant::IncompatibleOutput,
             ProviderError::UnsupportedParameter { .. } => ProviderVariant::UnsupportedParameter,
+            ProviderError::UnsendableRequest { .. } => ProviderVariant::UnsendableRequest,
             ProviderError::ReasoningProvenance { .. } => ProviderVariant::ReasoningProvenance,
             ProviderError::Retried { .. } => ProviderVariant::Retried,
         }
@@ -4351,7 +4354,7 @@ async fn interleaved_epoch_sends_preserve_the_live_epochs_replay_set() {
 
 /// AC-013/DEC-012: the replayed lineage set rides inside the same
 /// wire bound — a serialized request body past the limit is a typed
-/// violation before any byte is sent, never a silent truncation.
+/// refusal before any byte is sent, never a silent truncation.
 #[tokio::test]
 async fn replay_body_is_bounded_by_the_wire_limit() {
     let server = MockServer::start().await;
@@ -4377,8 +4380,8 @@ async fn replay_body_is_bounded_by_the_wire_limit() {
     }
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     assert!(
-        matches!(outcome, Err(ProviderError::StreamViolation { .. })),
-        "an over-bound replay body is a typed violation: {outcome:?}"
+        matches!(outcome, Err(ProviderError::UnsendableRequest { .. })),
+        "an over-bound replay body is a typed refusal: {outcome:?}"
     );
     let requests = server.received_requests().await.expect("recorded");
     assert_eq!(
@@ -9668,9 +9671,10 @@ impl Provider for ChainProvider {
         if matches!(connection.as_str(), "openai-codex" | "openai-codex-device") {
             return self.codex.send(manifest);
         }
-        Err(ProviderError::ProviderFailed {
+        Err(ProviderError::UnsupportedParameter {
             connection,
-            reason: "fixture non-codex failure".to_string(),
+            parameter: "fixture",
+            model: "fixture-model".to_string(),
         })
     }
 }
@@ -10350,7 +10354,7 @@ async fn openai_codex_chain_refuses_every_sibling_after_an_attempted_failure() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/backend-api/codex/responses"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("peer failure body"))
         .mount(&server)
         .await;
     let config = Config::parse_validated(&format!(
@@ -10423,7 +10427,7 @@ async fn openai_codex_chain_continues_past_a_same_contract_refusal() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/backend-api/codex/responses"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("peer failure body"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("peer failure body"))
         .mount(&server)
         .await;
     let config = Config::parse_validated(&format!(
@@ -10571,10 +10575,10 @@ async fn openai_codex_account_absent_sends_without_scope_header() {
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::openai-codex = NOT_RUN; openai-codex::class-002 WebSocket = NOT_RUN (DEC-017)"]
 fn provider_installed_openai_codex() {}
 
-/// An entered unknown outcome is never retried blindly across the one
-/// Codex contract: an auto chain naming the device alias rejects that
-/// entry before any substitute send, and the typed exhaustion names the
-/// contract-level refusal while only the failed primary crossed the wire.
+/// An entered unknown outcome ends the auto chain before any candidate is
+/// consulted: the primary's own typed failure is the outcome, no substitute
+/// send is attempted — not even onto the other Codex id — and only the
+/// failed primary crossed the wire.
 #[tokio::test]
 async fn openai_codex_unknown_outcome_chain_on_same_contract_is_not_retried() {
     let server = MockServer::start().await;
@@ -10604,34 +10608,16 @@ async fn openai_codex_unknown_outcome_chain_on_same_contract_is_not_retried() {
         .prepare("main", &config, "/world/codex", "goal: no blind fallback")
         .expect("the codex pin prepares");
     let (broker, outcome) = dispatch(broker, "/world/codex", manifest);
-    let Err(ModelError::FallbackExhausted {
-        rejected,
-        attempted,
-        source,
-        ..
-    }) = outcome
-    else {
-        panic!("the exhaustion is the typed outcome: {outcome:?}");
+    // An entered unknown outcome ends the chain before any candidate is
+    // consulted: a 503 may already have applied, so no substitute may run.
+    let Err(ModelError::Provider(ProviderError::Transport { connection, cause })) = outcome else {
+        panic!("the primary's unknown outcome is the typed outcome: {outcome:?}");
     };
-    assert!(
-        attempted.is_empty(),
-        "the chain entry never received a substitute send: {attempted:?}"
-    );
-    assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0].connection, "openai-codex-device");
-    assert!(
-        matches!(rejected[0].cause, RejectionCause::BlindRetryRefused),
-        "the refusal names the same-contract blind retry: {:?}",
-        rejected[0].cause
-    );
-    assert!(
-        matches!(
-            source.as_ref(),
-            ProviderError::Transport { connection, cause }
-                if connection == "openai-codex"
-                    && cause.class() == TransportClass::HttpStatus { code: 503 }
-        ),
-        "the primary's own unknown outcome is retained: {source:?}"
+    assert_eq!(connection, "openai-codex");
+    assert_eq!(
+        cause.class(),
+        TransportClass::HttpStatus { code: 503 },
+        "the primary's own unknown outcome is retained"
     );
     drop_blocking(broker);
     assert_eq!(

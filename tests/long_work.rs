@@ -81,9 +81,10 @@ impl Provider for FailingProvider {
 
     fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(ProviderError::ProviderFailed {
+        Err(ProviderError::UnsupportedParameter {
             connection: "local".to_string(),
-            reason: "fixture failure".to_string(),
+            parameter: "fixture-parameter",
+            model: "fixture-model".to_string(),
         })
     }
 }
