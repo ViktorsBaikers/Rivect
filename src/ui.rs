@@ -1871,9 +1871,15 @@ const ECONOMY_LABEL_MAX: usize = 32;
 
 /// The longest project/cwd head the row carries. The row wraps inside its
 /// two-row slot, but the 60-column acceptance geometry gives it 120 cells
-/// total; a 16-char head keeps both workspace names, the settled unit and
-/// the quota unknown with its source inside that budget.
-const ECONOMY_PATH_MAX: usize = 16;
+/// total; an 11-char head keeps the workspace's `/projects/` anchor, and
+/// leaves the reset/agents figures and the quota unknown with its source
+/// inside that budget.
+const ECONOMY_PATH_MAX: usize = 11;
+
+/// The widest reset time the row carries before it is elided. A full
+/// timestamp would push the quota source past the 60-column two-row budget,
+/// so the date head is what stays beside `reset`; the ellipsis marks the cut.
+const ECONOMY_RESET_MAX: usize = 10;
 
 /// The row painted while the status carries no economy projection.
 const ECONOMY_UNKNOWN_ROW: &str = "economy: unknown";
@@ -1891,11 +1897,15 @@ fn elide_label(label: &str, max: usize) -> String {
 }
 
 /// One fixed dock row for the economy projection (AC-062): settled tokens,
-/// context occupancy, cost, quota and the request's model/effort facts —
-/// each unknown figure spelled `unknown` beside the source that would
-/// answer it, with project and cwd always visible. Occupancy and lifetime
-/// spend stay labelled apart. The workspace names lead: they are what a
-/// narrow dock must never lose, and the row wraps inside its two-row slot.
+/// context occupancy, cost, quota with its reset and the scheduler's
+/// agents, plus the request's model/effort facts — each unknown figure
+/// spelled `unknown` beside the source that would answer it, with project
+/// and cwd always visible. Occupancy and lifetime spend stay labelled
+/// apart. The workspace names lead: they are what a narrow dock must never
+/// lose, and the row wraps inside its two-row slot. Fields are
+/// space-separated because that slot is only 120 cells at the 60-column
+/// acceptance geometry, and a separator between each field would spend the
+/// cells the reset and agents figures need.
 fn economy_row(economy: Option<&Value>) -> String {
     let Some(economy) = economy else {
         return ECONOMY_UNKNOWN_ROW.to_string();
@@ -1906,39 +1916,31 @@ fn economy_row(economy: Option<&Value>) -> String {
             .and_then(Value::as_u64)
             .map_or_else(|| "unknown".to_string(), |value| value.to_string())
     };
-    let text = |key: &str| {
+    let elided = |key: &str, max: usize| {
         economy
             .get(key)
             .and_then(Value::as_str)
-            .map_or_else(|| "unknown".to_string(), elide_label_with_max)
-    };
-    let path = |key: &str| {
-        economy.get(key).and_then(Value::as_str).map_or_else(
-            || "unknown".to_string(),
-            |label| elide_label(label, ECONOMY_PATH_MAX),
-        )
+            .map_or_else(|| "unknown".to_string(), |label| elide_label(label, max))
     };
     format!(
-        "economy: project {} · cwd {} · settled {} tok · quota {} ({}) · model {} via {} [{}] · context {} tok ({}) · cost {} u · cache ({}) · effort {} ({})",
-        path("project"),
-        path("cwd"),
+        "economy: project {} cwd {} settled {} tok agents {} reset {} quota {} ({}) model {} via {} [{}] context {} tok ({}) cost {} u cache ({}) effort {} ({})",
+        elided("project", ECONOMY_PATH_MAX),
+        elided("cwd", ECONOMY_PATH_MAX),
         number("settled_tokens"),
+        number("agents"),
+        elided("reset_at", ECONOMY_RESET_MAX),
         number("quota_remaining"),
-        text("quota_source"),
-        text("model"),
-        text("connection"),
-        text("source"),
+        elided("quota_source", ECONOMY_LABEL_MAX),
+        elided("model", ECONOMY_LABEL_MAX),
+        elided("connection", ECONOMY_LABEL_MAX),
+        elided("source", ECONOMY_LABEL_MAX),
         number("context_tokens"),
-        text("context_source"),
+        elided("context_source", ECONOMY_LABEL_MAX),
         number("charged_units"),
-        text("cache_source"),
-        text("effort"),
-        text("effort_source"),
+        elided("cache_source", ECONOMY_LABEL_MAX),
+        elided("effort", ECONOMY_LABEL_MAX),
+        elided("effort_source", ECONOMY_LABEL_MAX),
     )
-}
-
-fn elide_label_with_max(label: &str) -> String {
-    elide_label(label, ECONOMY_LABEL_MAX)
 }
 
 const COMPOSER_LIMIT_MESSAGE: &str = "Composer input exceeds the goal size limit.";
@@ -8867,6 +8869,8 @@ fallback = { mode = \"off\" }\n";
             "charged_units": 2,
             "quota_remaining": null,
             "quota_source": "unknown: no quota endpoint reports remaining units",
+            "reset_at": "2026-11-05",
+            "agents": 3,
             "cache_rate": null,
             "cache_source": "unknown: settled cache and prompt legs are not both recorded"
         });
@@ -8878,7 +8882,15 @@ fallback = { mode = \"off\" }\n";
             ]},
             "economy": economy
         });
-        let narrow = ["tok", "unknown", "no quota", "project ", "cwd "];
+        let narrow = [
+            "tok",
+            "unknown",
+            "no quota",
+            "project ",
+            "cwd ",
+            "agents 3",
+            "reset 2026-11-05",
+        ];
         let wide = [
             "tok",
             "unknown",
@@ -8887,6 +8899,8 @@ fallback = { mode = \"off\" }\n";
             "cwd ",
             "latest settled attempt",
             "fixed pin",
+            "agents 3",
+            "reset 2026-11-05",
         ];
         for (cols, rows, needles) in [(60u16, 20u16, &narrow[..]), (180u16, 30u16, &wide[..])] {
             let mut view = initial_view();
