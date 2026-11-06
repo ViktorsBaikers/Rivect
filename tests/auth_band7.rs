@@ -1,7 +1,8 @@
-//! Vertex ADC resolution and Antigravity project provisioning proof
-//! (AC-005, AC-006): the recorded source order, the three file-type
-//! exchanges, the metadata leg, the refresh skew, the create-only profile
-//! write, and the bounded Antigravity onboarding LRO — against loopback
+//! Vertex ADC resolution, Antigravity and Gemini CLI Code Assist project
+//! provisioning proof (AC-005, AC-006, AC-007): the recorded source order,
+//! the three file-type exchanges, the metadata leg, the refresh skew, the
+//! create-only profile write, the bounded onboarding LROs, the
+//! personal/Workspace project rule and the VPC-SC answer — against loopback
 //! contract peers only. No test touches the real token, metadata, IAM or
 //! Code Assist hosts.
 
@@ -21,6 +22,9 @@ use rivect::config::{Config, ConnKind};
 use rivect::providers::antigravity_login::{
     self, AntigravityEndpoints, CODE_ASSIST_ORIGIN, CODE_ASSIST_SANDBOX_ORIGIN, Leg,
     LoginError as AntigravityError, ProvisioningBudget,
+};
+use rivect::providers::gemini_cli_login::{
+    self, CodeAssistEndpoints, LoginError as CodeAssistError, OnboardingBudget, ProjectSource,
 };
 use rivect::providers::vertex_login::{
     self, AdcEndpoints, AdcSources, CredentialSource, EndpointClass, LoginError, METADATA_URL,
@@ -1606,6 +1610,696 @@ fn antigravity_read_profile_rejects_foreign_material() {
 
     assert!(
         matches!(error, AntigravityError::StoredCredentialMalformed { .. }),
+        "{error}"
+    );
+}
+
+/// The Gemini CLI Code Assist connection the producer binds.
+const CODE_ASSIST_SCOPE: &str = "keychain:rivect-test/code-assist";
+
+fn code_assist_config(kind: &str) -> Config {
+    Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.code-assist]\n\
+         kind = \"{kind}\"\n\
+         endpoint = \"https://cloudcode-pa.googleapis.com\"\n\
+         credential_ref = \"keychain:rivect-test/code-assist\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n"
+    ))
+    .expect("the code assist config parses")
+}
+
+fn code_assist_endpoints(peer: &Peer) -> CodeAssistEndpoints {
+    CodeAssistEndpoints {
+        code_assist: peer.base.clone(),
+    }
+}
+
+fn code_assist_reference() -> SecretRef {
+    SecretRef::parse(CODE_ASSIST_SCOPE).expect("the fixture reference parses")
+}
+
+fn code_assist_session(
+    peer: &Peer,
+    budget: OnboardingBudget,
+    project: Option<&str>,
+) -> gemini_cli_login::LoginSession {
+    gemini_cli_login::begin_login_with(
+        "fixture-token",
+        &code_assist_endpoints(peer),
+        budget,
+        &ProjectSource {
+            project: project.map(str::to_string),
+        },
+    )
+    .expect("the code assist login begins")
+}
+
+/// The recorded discovery metadata every Code Assist leg carries.
+fn gemini_metadata() -> Value {
+    json!({
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    })
+}
+
+/// A guard: the recorded onboarding bound — 24 polls at 5 s — the
+/// free-tier onboarding sequence, the poll cadence and the canonical
+/// tier/project profile.
+#[test]
+fn code_assist_lro_bounds() {
+    assert_eq!(
+        OnboardingBudget::recorded(),
+        OnboardingBudget {
+            max_attempts: 24,
+            poll_interval: Duration::from_secs(5),
+        }
+    );
+    assert_eq!(OnboardingBudget::default(), OnboardingBudget::recorded());
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&polls);
+    let peer = Peer::start(move |seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200,
+                json!({ "allowedTiers": [{ "id": "free-tier", "isDefault": true }] }).to_string(),
+            );
+        }
+        if seen.line.contains(":onboardUser") {
+            return (
+                200,
+                json!({ "name": "operations/onboard-1", "done": false }).to_string(),
+            );
+        }
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                200,
+                json!({ "name": "operations/onboard-1", "done": false }).to_string(),
+            );
+        }
+        (
+            200,
+            json!({
+                "name": "operations/onboard-1",
+                "done": true,
+                "response": { "cloudaicompanionProject": { "id": "fixture-project" } }
+            })
+            .to_string(),
+        )
+    });
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    assert_eq!(session.budget(), OnboardingBudget::recorded());
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+
+    let profile = gemini_cli_login::complete_login(
+        &code_assist_config("api_key"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect("the onboarding finishes");
+
+    assert_eq!(profile, "code-assist");
+    let requests = peer.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "identity, onboarding and two polls: {}",
+        requests.len()
+    );
+    assert_eq!(requests[0].line, "POST /v1internal:loadCodeAssist HTTP/1.1");
+    assert_eq!(requests[1].line, "POST /v1internal:onboardUser HTTP/1.1");
+    assert_eq!(
+        requests[2].line,
+        "GET /v1internal/operations/onboard-1 HTTP/1.1"
+    );
+    assert_eq!(
+        requests[3].line,
+        "GET /v1internal/operations/onboard-1 HTTP/1.1"
+    );
+    for request in &requests {
+        assert!(
+            request
+                .head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer fixture-token")),
+            "{}",
+            request.head
+        );
+    }
+    let load_body: Value = serde_json::from_str(&requests[0].body).expect("a json body");
+    assert_eq!(load_body, json!({ "metadata": gemini_metadata() }));
+    let onboard_body: Value = serde_json::from_str(&requests[1].body).expect("a json body");
+    assert_eq!(
+        onboard_body,
+        json!({ "tierId": "free-tier", "metadata": gemini_metadata() })
+    );
+
+    let bytes = store.resolve(&reference).expect("the profile is stored");
+    assert_eq!(
+        String::from_utf8(bytes.clone()).expect("utf-8 bytes"),
+        "{\"access_token\":\"fixture-token\",\"project\":\"fixture-project\",\"tier\":\"free-tier\"}"
+    );
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.access_token(), "fixture-token");
+    assert_eq!(stored.project(), "fixture-project");
+    assert_eq!(stored.tier(), "free-tier");
+    let rendered = format!("{stored:?}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(!rendered.contains("fixture-token"), "{rendered}");
+    let session_rendered = format!("{session:?}");
+    assert!(
+        !session_rendered.contains("fixture-token"),
+        "{session_rendered}"
+    );
+}
+
+#[test]
+fn code_assist_a_current_tier_binds_the_project_without_onboarding() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200,
+                json!({
+                    "currentTier": { "id": "standard-tier" },
+                    "cloudaicompanionProject": "fixture-project"
+                })
+                .to_string(),
+            );
+        }
+        (500u16, "{}".to_string())
+    });
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+
+    gemini_cli_login::complete_login(
+        &code_assist_config("api_key"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect("the profile publishes");
+
+    assert_eq!(
+        peer.requests().len(),
+        1,
+        "a current tier never onboards again"
+    );
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "fixture-project");
+    assert_eq!(stored.tier(), "standard-tier");
+}
+
+#[test]
+fn code_assist_a_workspace_tier_requires_an_explicit_project() {
+    let peer = Peer::start(|_seen| {
+        (
+            200u16,
+            json!({ "currentTier": { "id": "standard-tier" } }).to_string(),
+        )
+    });
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &session, &store)
+        .expect_err("a Workspace tier needs an explicit project");
+    assert!(matches!(error, CodeAssistError::ProjectRequired), "{error}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 1);
+
+    let explicit = code_assist_session(&peer, OnboardingBudget::recorded(), Some("env-project"));
+    gemini_cli_login::complete_login(&config, "code-assist", &explicit, &store)
+        .expect("the explicit project binds the profile");
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "env-project");
+    assert_eq!(stored.tier(), "standard-tier");
+    assert_eq!(peer.requests().len(), 2, "no onboarding leg runs");
+}
+
+#[test]
+fn code_assist_a_non_free_default_tier_requires_an_explicit_project() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200,
+                json!({ "allowedTiers": [{ "id": "standard-tier", "isDefault": true }] })
+                    .to_string(),
+            );
+        }
+        (
+            200u16,
+            json!({
+                "done": true,
+                "response": { "cloudaicompanionProject": { "id": "fixture-project" } }
+            })
+            .to_string(),
+        )
+    });
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &session, &store)
+        .expect_err("a non-free tier needs an explicit project");
+    assert!(matches!(error, CodeAssistError::ProjectRequired), "{error}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 1, "no onboarding leg runs");
+
+    let explicit = code_assist_session(&peer, OnboardingBudget::recorded(), Some("env-project"));
+    gemini_cli_login::complete_login(&config, "code-assist", &explicit, &store)
+        .expect("the non-free tier onboards the explicit project");
+    let requests = peer.requests();
+    assert_eq!(requests.len(), 3);
+    let onboard_body: Value = serde_json::from_str(&requests[2].body).expect("a json body");
+    assert_eq!(
+        onboard_body,
+        json!({
+            "tierId": "standard-tier",
+            "cloudaicompanionProject": "env-project",
+            "metadata": {
+                "ideType": "IDE_UNSPECIFIED",
+                "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI",
+                "duetProject": "env-project",
+            }
+        })
+    );
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "fixture-project");
+    assert_eq!(stored.tier(), "standard-tier");
+}
+
+/// A VPC-SC load answer is the standard tier — never a success shim and
+/// never the free tier.
+#[test]
+fn code_assist_vpc_sc_answers_the_standard_tier() {
+    let peer = Peer::start(|_seen| {
+        (
+            403u16,
+            json!({ "error": { "details": [{ "reason": "SECURITY_POLICY_VIOLATED" }] } })
+                .to_string(),
+        )
+    });
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &session, &store)
+        .expect_err("the standard tier still needs an explicit project");
+    assert!(matches!(error, CodeAssistError::ProjectRequired), "{error}");
+    assert_nothing_published(&store, &reference);
+
+    let explicit = code_assist_session(&peer, OnboardingBudget::recorded(), Some("vpc-project"));
+    gemini_cli_login::complete_login(&config, "code-assist", &explicit, &store)
+        .expect("the VPC-SC answer binds the explicit project");
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "vpc-project");
+    assert_eq!(stored.tier(), "standard-tier");
+    assert_eq!(
+        peer.requests().len(),
+        2,
+        "the standard tier never onboards again"
+    );
+}
+
+#[test]
+fn code_assist_a_rejected_identity_publishes_nothing() {
+    let peer = Peer::start(|_seen| {
+        (
+            403u16,
+            json!({
+                "error": {
+                    "message": "hostile-peer-body",
+                    "details": [{ "reason": "OTHER" }]
+                }
+            })
+            .to_string(),
+        )
+    });
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+
+    let error = gemini_cli_login::complete_login(
+        &code_assist_config("api_key"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect_err("a non-VPC refusal is a typed denial");
+
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::Rejected {
+                leg: gemini_cli_login::Leg::Identity,
+                status: 403
+            }
+        ),
+        "{error}"
+    );
+    let rendered = error.to_string();
+    assert!(!rendered.contains("fixture-token"), "{rendered}");
+    assert!(!rendered.contains("hostile-peer-body"), "{rendered}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 1);
+}
+
+#[test]
+fn code_assist_a_rejected_poll_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200u16,
+                json!({ "allowedTiers": [{ "id": "free-tier", "isDefault": true }] }).to_string(),
+            );
+        }
+        if seen.line.contains(":onboardUser") {
+            return (
+                200u16,
+                json!({ "name": "operations/pending", "done": false }).to_string(),
+            );
+        }
+        (500u16, "{}".to_string())
+    });
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+
+    let error = gemini_cli_login::complete_login(
+        &code_assist_config("api_key"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect_err("a non-ok poll denies");
+
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::Rejected {
+                leg: gemini_cli_login::Leg::Operation,
+                status: 500
+            }
+        ),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 3);
+}
+
+#[test]
+fn code_assist_the_poll_cap_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200u16,
+                json!({ "allowedTiers": [{ "id": "free-tier", "isDefault": true }] }).to_string(),
+            );
+        }
+        (
+            200u16,
+            json!({ "name": "operations/never", "done": false }).to_string(),
+        )
+    });
+    let session = code_assist_session(
+        &peer,
+        OnboardingBudget {
+            max_attempts: 3,
+            poll_interval: Duration::from_millis(5),
+        },
+        None,
+    );
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+
+    let error = gemini_cli_login::complete_login(
+        &code_assist_config("api_key"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect_err("the operation never finishes");
+
+    assert!(
+        matches!(error, CodeAssistError::ProvisioningTimedOut),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    let requests = peer.requests();
+    let polls = requests
+        .iter()
+        .filter(|request| request.line.starts_with("GET "))
+        .count();
+    assert_eq!(polls, 3, "the recorded attempt cap ends the wait");
+}
+
+#[test]
+fn code_assist_a_done_operation_without_a_project_falls_back_to_the_explicit_project() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200u16,
+                json!({ "allowedTiers": [{ "id": "free-tier", "isDefault": true }] }).to_string(),
+            );
+        }
+        (
+            200u16,
+            json!({ "done": true, "response": null }).to_string(),
+        )
+    });
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &session, &store)
+        .expect_err("no project and no explicit project denies");
+    assert!(matches!(error, CodeAssistError::ProjectUnbound), "{error}");
+    assert_nothing_published(&store, &reference);
+
+    let explicit = code_assist_session(&peer, OnboardingBudget::recorded(), Some("env-project"));
+    gemini_cli_login::complete_login(&config, "code-assist", &explicit, &store)
+        .expect("the explicit project is the recorded fallback");
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "env-project");
+    assert_eq!(stored.tier(), "free-tier");
+}
+
+#[test]
+fn code_assist_refresh_preserves_project_and_tier() {
+    let peer = Peer::start(|_seen| {
+        (
+            200u16,
+            json!({
+                "currentTier": { "id": "standard-tier" },
+                "cloudaicompanionProject": "fixture-project"
+            })
+            .to_string(),
+        )
+    });
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    gemini_cli_login::complete_login(&config, "code-assist", &session, &store)
+        .expect("the profile publishes");
+
+    let profile = gemini_cli_login::refresh_profile(&store, &reference, "rotated-token")
+        .expect("the refresh replaces the token");
+    assert_eq!(profile, "code-assist");
+    let stored = gemini_cli_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.access_token(), "rotated-token");
+    assert_eq!(stored.project(), "fixture-project");
+    assert_eq!(stored.tier(), "standard-tier");
+
+    let published = store.resolve(&reference).expect("the profile is stored");
+    let blank = gemini_cli_login::refresh_profile(&store, &reference, "  ")
+        .expect_err("a refresh needs a token");
+    assert!(
+        matches!(
+            blank,
+            CodeAssistError::MissingField {
+                field: "access_token"
+            }
+        ),
+        "{blank}"
+    );
+    assert_eq!(
+        store.resolve(&reference).expect("the profile is untouched"),
+        published,
+        "a refused refresh leaves the prior bytes byte-identical"
+    );
+}
+
+#[test]
+fn code_assist_a_cancelled_or_late_login_publishes_nothing() {
+    let peer = Peer::start(|_seen| (200u16, "{}".to_string()));
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = code_assist_reference();
+    let config = code_assist_config("api_key");
+
+    let cancelled = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    cancelled.cancel();
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &cancelled, &store)
+        .expect_err("a cancelled session publishes nothing");
+    assert!(matches!(error, CodeAssistError::Cancelled), "{error}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(
+        peer.requests().len(),
+        0,
+        "no leg runs for a cancelled login"
+    );
+
+    let binding = Peer::start(|_seen| {
+        (
+            200u16,
+            json!({
+                "currentTier": { "id": "free-tier" },
+                "cloudaicompanionProject": "fixture-project"
+            })
+            .to_string(),
+        )
+    });
+    let first = code_assist_session(&binding, OnboardingBudget::recorded(), None);
+    gemini_cli_login::complete_login(&config, "code-assist", &first, &store)
+        .expect("the first profile publishes");
+    let published = store.resolve(&reference).expect("the profile is stored");
+
+    let late = code_assist_session(&binding, OnboardingBudget::recorded(), None);
+    late.cancel();
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &late, &store)
+        .expect_err("a late completion publishes nothing");
+    assert!(matches!(error, CodeAssistError::Cancelled), "{error}");
+    assert_eq!(
+        store.resolve(&reference).expect("the profile is untouched"),
+        published,
+        "a cancelled completion leaves the prior bytes byte-identical"
+    );
+
+    let second = code_assist_session(&binding, OnboardingBudget::recorded(), None);
+    let error = gemini_cli_login::complete_login(&config, "code-assist", &second, &store)
+        .expect_err("enrollment is create-only");
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::Provider(ProviderError::CredentialOccupied { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        store.resolve(&reference).expect("the profile is untouched"),
+        published,
+        "a refused write leaves the prior bytes byte-identical"
+    );
+}
+
+#[test]
+fn code_assist_an_unrecorded_origin_denies_before_a_request() {
+    assert_eq!(
+        gemini_cli_login::CODE_ASSIST_ORIGIN,
+        "https://cloudcode-pa.googleapis.com"
+    );
+    let error = gemini_cli_login::begin_login(
+        "fixture-token",
+        &CodeAssistEndpoints {
+            code_assist: "https://evil.example".to_string(),
+        },
+    )
+    .expect_err("a foreign origin is refused");
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::EndpointNotAdmitted { ref origin }
+                if origin == "https://evil.example"
+        ),
+        "{error}"
+    );
+    let antigravity = gemini_cli_login::begin_login(
+        "fixture-token",
+        &CodeAssistEndpoints {
+            code_assist: "https://daily-cloudcode-pa.googleapis.com".to_string(),
+        },
+    )
+    .expect_err("the antigravity origin is not a Code Assist origin");
+    assert!(
+        matches!(antigravity, CodeAssistError::EndpointNotAdmitted { .. }),
+        "{antigravity}"
+    );
+    gemini_cli_login::begin_login("fixture-token", &CodeAssistEndpoints::recorded())
+        .expect("the recorded origin is admitted");
+}
+
+#[test]
+fn code_assist_a_blank_token_denies() {
+    let error = gemini_cli_login::begin_login("  ", &CodeAssistEndpoints::recorded())
+        .expect_err("the login needs a token");
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::MissingField {
+                field: "access_token"
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn code_assist_a_non_api_key_binding_denies() {
+    let peer = Peer::start(|_seen| (200u16, "{}".to_string()));
+    let session = code_assist_session(&peer, OnboardingBudget::recorded(), None);
+    let store = support::MapStore::new(StoreKind::Keychain);
+
+    let error = gemini_cli_login::complete_login(
+        &code_assist_config("subscription"),
+        "code-assist",
+        &session,
+        &store,
+    )
+    .expect_err("the login path writes only an api key row");
+
+    assert!(
+        matches!(
+            error,
+            CodeAssistError::NotApiKey {
+                kind: ConnKind::Subscription,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(peer.requests().len(), 0);
+}
+
+#[test]
+fn code_assist_read_profile_rejects_foreign_material() {
+    let reference = code_assist_reference();
+    let store = support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[(
+            CODE_ASSIST_SCOPE,
+            r#"{"access_token":"fixture-token","project":"fixture-project","tier":"free-tier","extra":1}"#,
+        )],
+    );
+
+    let error = gemini_cli_login::read_profile(&store, &reference)
+        .expect_err("an unknown field is refused");
+
+    assert!(
+        matches!(error, CodeAssistError::StoredCredentialMalformed { .. }),
         "{error}"
     );
 }

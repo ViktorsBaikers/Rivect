@@ -113,6 +113,7 @@ pub mod cursor_login;
 pub mod devin_login;
 mod eventstream;
 pub mod gemini;
+pub mod gemini_cli_login;
 pub mod gitlab_agent_login;
 pub mod gitlab_workflow;
 pub mod local;
