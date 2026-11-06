@@ -121,6 +121,7 @@ pub mod openai;
 pub mod openai_login;
 pub mod routed;
 pub mod sse;
+pub mod vertex_login;
 
 /// The one catalogue record both dialect owners share (DEC-007):
 /// defined once in the local adapter, re-exported here so the
