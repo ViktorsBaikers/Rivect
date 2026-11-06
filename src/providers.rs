@@ -103,6 +103,7 @@ use std::time::{Duration, Instant};
 
 pub mod anthropic;
 pub mod anthropic_login;
+pub mod antigravity_login;
 #[doc(hidden)]
 pub mod aws;
 pub mod bedrock;

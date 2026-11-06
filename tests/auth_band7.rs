@@ -1,7 +1,9 @@
-//! Vertex ADC resolution proof (AC-005): the recorded source order, the
-//! three file-type exchanges, the metadata leg, the refresh skew and the
-//! create-only profile write — against loopback contract peers only. No
-//! test touches the real token, metadata or IAM hosts.
+//! Vertex ADC resolution and Antigravity project provisioning proof
+//! (AC-005, AC-006): the recorded source order, the three file-type
+//! exchanges, the metadata leg, the refresh skew, the create-only profile
+//! write, and the bounded Antigravity onboarding LRO — against loopback
+//! contract peers only. No test touches the real token, metadata, IAM or
+//! Code Assist hosts.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,7 +17,11 @@
 
 mod support;
 
-use rivect::config::Config;
+use rivect::config::{Config, ConnKind};
+use rivect::providers::antigravity_login::{
+    self, AntigravityEndpoints, CODE_ASSIST_ORIGIN, CODE_ASSIST_SANDBOX_ORIGIN, Leg,
+    LoginError as AntigravityError, ProvisioningBudget,
+};
 use rivect::providers::vertex_login::{
     self, AdcEndpoints, AdcSources, CredentialSource, EndpointClass, LoginError, METADATA_URL,
     TOKEN_URL,
@@ -25,7 +31,7 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -885,4 +891,721 @@ fn distinct_credential_files_do_not_share_a_cached_token() {
     );
     assert_eq!(first.access_token(), "token-first-refresh");
     assert_eq!(second.access_token(), "token-second-refresh");
+}
+
+/// The Antigravity connection the producer binds.
+const ANTIGRAVITY_SCOPE: &str = "keychain:rivect-test/antigravity";
+
+fn antigravity_config(kind: &str) -> Config {
+    Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.antigravity]\n\
+         kind = \"{kind}\"\n\
+         endpoint = \"https://daily-cloudcode-pa.googleapis.com\"\n\
+         credential_ref = \"keychain:rivect-test/antigravity\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n"
+    ))
+    .expect("the antigravity config parses")
+}
+
+fn antigravity_endpoints(peer: &Peer) -> AntigravityEndpoints {
+    AntigravityEndpoints {
+        code_assist: peer.base.clone(),
+    }
+}
+
+fn antigravity_reference() -> SecretRef {
+    SecretRef::parse(ANTIGRAVITY_SCOPE).expect("the fixture reference parses")
+}
+
+fn assert_nothing_published(store: &support::MapStore, reference: &SecretRef) {
+    let error = store
+        .resolve(reference)
+        .expect_err("nothing is published at the scope");
+    assert!(
+        matches!(error, ProviderError::CredentialAbsent { .. }),
+        "{error}"
+    );
+}
+
+/// A guard: the identity, onboarding and poll legs at the recorded bound —
+/// 30 s total, 1 s polls — with the terminal `done`/`response` checks and
+/// the canonical project-bound profile.
+#[test]
+fn antigravity_lro_bounds() {
+    assert_eq!(
+        ProvisioningBudget::recorded(),
+        ProvisioningBudget {
+            deadline: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(1),
+        }
+    );
+    assert_eq!(
+        ProvisioningBudget::default(),
+        ProvisioningBudget::recorded()
+    );
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&polls);
+    let peer = Peer::start(move |seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200,
+                json!({
+                    "availableModels": [
+                        { "name": "claude-sonnet-4-5", "class": "pro" },
+                        { "name": "gemini-2.5-flash", "class": "fast" }
+                    ]
+                })
+                .to_string(),
+            );
+        }
+        if seen.line.contains(":onboardUser") {
+            return (
+                200,
+                json!({ "name": "operations/onboard-1", "done": false }).to_string(),
+            );
+        }
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                200,
+                json!({ "name": "operations/onboard-1", "done": false }).to_string(),
+            );
+        }
+        (
+            200,
+            json!({
+                "name": "operations/onboard-1",
+                "done": true,
+                "error": null,
+                "response": { "cloudaicompanionProject": "fixture-project" }
+            })
+            .to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    assert_eq!(session.budget(), ProvisioningBudget::recorded());
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let profile = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect("the onboarding finishes");
+
+    assert_eq!(profile, "antigravity");
+    let requests = peer.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "identity, onboarding and two polls: {}",
+        requests.len()
+    );
+    assert_eq!(requests[0].line, "POST /v1internal:loadCodeAssist HTTP/1.1");
+    assert_eq!(requests[1].line, "POST /v1internal:onboardUser HTTP/1.1");
+    assert_eq!(
+        requests[2].line,
+        "GET /v1internal/operations/onboard-1 HTTP/1.1"
+    );
+    assert_eq!(
+        requests[3].line,
+        "GET /v1internal/operations/onboard-1 HTTP/1.1"
+    );
+    for request in &requests {
+        assert!(
+            request
+                .head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer fixture-token")),
+            "{}",
+            request.head
+        );
+    }
+    let identity_body: Value = serde_json::from_str(&requests[0].body).expect("a json body");
+    assert_eq!(
+        identity_body,
+        json!({ "metadata": { "pluginType": "ANTIGRAVITY" } })
+    );
+    let onboard_body: Value = serde_json::from_str(&requests[1].body).expect("a json body");
+    assert_eq!(onboard_body, identity_body);
+
+    let bytes = store.resolve(&reference).expect("the profile is stored");
+    assert_eq!(
+        String::from_utf8(bytes.clone()).expect("utf-8 bytes"),
+        "{\"access_token\":\"fixture-token\",\"project\":\"fixture-project\",\
+         \"classes\":{\"claude-sonnet-4-5\":\"pro\",\"gemini-2.5-flash\":\"fast\"}}"
+    );
+    let stored = antigravity_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.access_token(), "fixture-token");
+    assert_eq!(stored.project(), "fixture-project");
+    assert_eq!(
+        stored
+            .classes()
+            .get("claude-sonnet-4-5")
+            .map(String::as_str),
+        Some("pro")
+    );
+    let rendered = format!("{stored:?}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(!rendered.contains("fixture-token"), "{rendered}");
+    let session_rendered = format!("{session:?}");
+    assert!(
+        !session_rendered.contains("fixture-token"),
+        "{session_rendered}"
+    );
+}
+
+#[test]
+fn antigravity_a_current_tier_binds_the_project_without_onboarding() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200,
+                json!({
+                    "currentTier": { "id": "free-tier" },
+                    "cloudaicompanionProject": { "id": "fixture-project" },
+                    "availableModels": [{ "name": "claude-sonnet-4-5", "class": "pro" }]
+                })
+                .to_string(),
+            );
+        }
+        (500u16, "{}".to_string())
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect("the profile publishes");
+
+    assert_eq!(
+        peer.requests().len(),
+        1,
+        "a current tier never onboards again"
+    );
+    let stored = antigravity_login::read_profile(&store, &reference).expect("the profile reads");
+    assert_eq!(stored.project(), "fixture-project");
+}
+
+#[test]
+fn antigravity_a_rejected_identity_publishes_nothing() {
+    let peer = Peer::start(|_seen| (403u16, "hostile-peer-body".to_string()));
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("the identity leg refuses the token");
+
+    assert!(
+        matches!(
+            error,
+            AntigravityError::Rejected {
+                leg: Leg::Identity,
+                status: 403
+            }
+        ),
+        "{error}"
+    );
+    let rendered = error.to_string();
+    assert!(!rendered.contains("fixture-token"), "{rendered}");
+    assert!(!rendered.contains("hostile-peer-body"), "{rendered}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 1, "no onboarding leg runs");
+}
+
+#[test]
+fn antigravity_a_projectless_tier_denies_without_onboarding() {
+    let peer = Peer::start(|_seen| {
+        (
+            200u16,
+            json!({ "currentTier": { "id": "free-tier" } }).to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("a bound project is required");
+
+    assert!(matches!(error, AntigravityError::ProjectUnbound), "{error}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 1);
+}
+
+#[test]
+fn antigravity_a_finished_operation_with_an_error_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({
+                "name": "operations/denied",
+                "done": true,
+                "error": { "code": 9, "message": "hostile-peer-body" }
+            })
+            .to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("a done operation with an error denies");
+
+    assert!(
+        matches!(error, AntigravityError::ProvisioningDenied),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("hostile-peer-body"));
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 2, "no poll runs");
+}
+
+#[test]
+fn antigravity_a_finished_operation_without_a_response_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({ "done": true, "error": null, "response": null }).to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("a null response denies");
+
+    assert!(
+        matches!(error, AntigravityError::ProvisioningResponseMissing),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+}
+
+#[test]
+fn antigravity_a_pending_operation_without_a_name_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (200u16, json!({ "done": false }).to_string())
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("an unnamed operation can never be polled");
+
+    assert!(
+        matches!(error, AntigravityError::OperationNameMissing),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 2);
+}
+
+#[test]
+fn antigravity_an_operation_name_cannot_rewrite_the_poll_path() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({ "name": "../accessTokens/steal", "done": false }).to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("a rewritten operation path is refused");
+
+    assert!(
+        matches!(error, AntigravityError::OperationNameMalformed),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 2, "no poll is sent");
+}
+
+#[test]
+fn antigravity_a_rejected_poll_denies() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        if seen.line.contains(":onboardUser") {
+            return (
+                200u16,
+                json!({ "name": "operations/pending", "done": false }).to_string(),
+            );
+        }
+        (500u16, "{}".to_string())
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("a non-ok poll denies");
+
+    assert!(
+        matches!(
+            error,
+            AntigravityError::Rejected {
+                leg: Leg::Operation,
+                status: 500
+            }
+        ),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    assert_eq!(peer.requests().len(), 3);
+}
+
+/// A guard: the one budget — not a per-request window — ends the wait. The
+/// poll interval equals the deadline, so the wait parks until the budget is
+/// spent and the typed expiry lands before any poll request; scheduler load
+/// can consume part of the budget inside a leg but never turns the denial
+/// into an opaque transport error.
+#[test]
+fn antigravity_the_deadline_stops_the_wait() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({ "name": "operations/never", "done": false }).to_string(),
+        )
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let session = antigravity_login::begin_login_with(
+        "fixture-token",
+        &endpoints,
+        ProvisioningBudget {
+            deadline: Duration::from_secs(2),
+            poll_interval: Duration::from_secs(2),
+        },
+    )
+    .expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("the operation never finishes");
+
+    assert!(
+        matches!(error, AntigravityError::ProvisioningTimedOut),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    let requests = peer.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.line.contains(":onboardUser")),
+        "the onboarding leg was reached: {} requests",
+        requests.len()
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.line.starts_with("GET ")),
+        "the deadline ends the wait before a poll: {} requests",
+        requests.len()
+    );
+}
+
+#[test]
+fn antigravity_a_cancelled_login_publishes_nothing() {
+    let peer = Peer::start(|_seen| (200u16, "unreachable".to_string()));
+    let endpoints = antigravity_endpoints(&peer);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+    let config = antigravity_config("api_key");
+
+    let cancelled =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    cancelled.cancel();
+    let error = antigravity_login::complete_login(&config, "antigravity", &cancelled, &store)
+        .expect_err("a cancelled session publishes nothing");
+    assert!(matches!(error, AntigravityError::Cancelled), "{error}");
+    assert_nothing_published(&store, &reference);
+    assert_eq!(
+        peer.requests().len(),
+        0,
+        "no leg runs for a cancelled login"
+    );
+
+    let slow = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({ "name": "operations/pending", "done": false }).to_string(),
+        )
+    });
+    let slow_endpoints = antigravity_endpoints(&slow);
+    let session = antigravity_login::begin_login_with(
+        "fixture-token",
+        &slow_endpoints,
+        ProvisioningBudget {
+            deadline: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(20),
+        },
+    )
+    .expect("the login begins");
+
+    let outcome = std::thread::scope(|scope| {
+        let login = scope
+            .spawn(|| antigravity_login::complete_login(&config, "antigravity", &session, &store));
+        std::thread::sleep(Duration::from_millis(150));
+        session.cancel();
+        login.join().expect("the login thread joins")
+    });
+
+    let error = outcome.expect_err("the mid-wait cancellation publishes nothing");
+    assert!(matches!(error, AntigravityError::Cancelled), "{error}");
+    assert_nothing_published(&store, &reference);
+}
+
+#[test]
+fn antigravity_a_late_callback_publishes_nothing() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (
+                200u16,
+                json!({
+                    "currentTier": { "id": "free-tier" },
+                    "cloudaicompanionProject": "fixture-project"
+                })
+                .to_string(),
+            );
+        }
+        (500u16, "{}".to_string())
+    });
+    let endpoints = antigravity_endpoints(&peer);
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+    let config = antigravity_config("api_key");
+
+    let first =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    antigravity_login::complete_login(&config, "antigravity", &first, &store)
+        .expect("the first profile publishes");
+    let published = store.resolve(&reference).expect("the profile is stored");
+
+    let late =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    late.cancel();
+    let error = antigravity_login::complete_login(&config, "antigravity", &late, &store)
+        .expect_err("a late completion publishes nothing");
+    assert!(matches!(error, AntigravityError::Cancelled), "{error}");
+    assert_eq!(
+        store.resolve(&reference).expect("the profile is untouched"),
+        published,
+        "a cancelled completion leaves the prior bytes byte-identical"
+    );
+
+    let second =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let error = antigravity_login::complete_login(&config, "antigravity", &second, &store)
+        .expect_err("enrollment is create-only");
+    assert!(
+        matches!(
+            error,
+            AntigravityError::Provider(ProviderError::CredentialOccupied { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        store.resolve(&reference).expect("the profile is untouched"),
+        published,
+        "a refused write leaves the prior bytes byte-identical"
+    );
+}
+
+#[test]
+fn antigravity_an_unrecorded_origin_denies_before_a_request() {
+    assert_eq!(
+        CODE_ASSIST_ORIGIN,
+        "https://daily-cloudcode-pa.googleapis.com"
+    );
+    assert_eq!(
+        CODE_ASSIST_SANDBOX_ORIGIN,
+        "https://daily-cloudcode-pa.sandbox.googleapis.com"
+    );
+    let error = antigravity_login::begin_login(
+        "fixture-token",
+        &AntigravityEndpoints {
+            code_assist: "https://evil.example".to_string(),
+        },
+    )
+    .expect_err("a foreign origin is refused");
+    assert!(
+        matches!(
+            error,
+            AntigravityError::EndpointNotAdmitted { ref origin }
+                if origin == "https://evil.example"
+        ),
+        "{error}"
+    );
+    antigravity_login::begin_login(
+        "fixture-token",
+        &AntigravityEndpoints {
+            code_assist: CODE_ASSIST_SANDBOX_ORIGIN.to_string(),
+        },
+    )
+    .expect("the recorded sandbox fallback is admitted");
+    assert_eq!(
+        AntigravityEndpoints::recorded().code_assist,
+        CODE_ASSIST_ORIGIN
+    );
+}
+
+#[test]
+fn antigravity_a_blank_token_denies() {
+    let error = antigravity_login::begin_login("  ", &AntigravityEndpoints::recorded())
+        .expect_err("the login needs a token");
+    assert!(
+        matches!(
+            error,
+            AntigravityError::MissingField {
+                field: "access_token"
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn antigravity_a_non_api_key_binding_denies() {
+    let peer = Peer::start(|_seen| (200u16, "{}".to_string()));
+    let endpoints = antigravity_endpoints(&peer);
+    let session =
+        antigravity_login::begin_login("fixture-token", &endpoints).expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+
+    let error = antigravity_login::complete_login(
+        &antigravity_config("subscription"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("the login path writes only an api key row");
+
+    assert!(
+        matches!(
+            error,
+            AntigravityError::NotApiKey {
+                kind: ConnKind::Subscription,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(peer.requests().len(), 0);
+}
+
+#[test]
+fn antigravity_read_profile_rejects_foreign_material() {
+    let reference = antigravity_reference();
+    let store = support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[(
+            ANTIGRAVITY_SCOPE,
+            r#"{"access_token":"fixture-token","project":"fixture-project","classes":{},"extra":1}"#,
+        )],
+    );
+
+    let error = antigravity_login::read_profile(&store, &reference)
+        .expect_err("an unknown field is refused");
+
+    assert!(
+        matches!(error, AntigravityError::StoredCredentialMalformed { .. }),
+        "{error}"
+    );
 }
