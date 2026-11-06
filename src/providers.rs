@@ -113,6 +113,7 @@ pub mod devin_login;
 mod eventstream;
 pub mod gemini;
 pub mod gitlab_agent_login;
+pub mod gitlab_workflow;
 pub mod local;
 pub(crate) mod login_common;
 pub mod ollama_cloud;
@@ -1504,9 +1505,9 @@ pub enum Dialect {
     /// the recorded transport, it is not a wire claim.
     DevinAgent,
     /// The GitLab Duo Agent workflow transport — the recorded class of
-    /// the literal `gitlab-duo-agent` id. No installed adapter serves it
-    /// in this build, so a send denies [`ProviderError::DialectUnserved`]:
-    /// the marker names the recorded transport, it is not a wire claim.
+    /// the literal `gitlab-duo-agent` id, served by
+    /// [`gitlab_workflow::GitlabWorkflowProvider`]: the REST setup chain
+    /// plus the WebSocket workflow stream.
     GitlabWorkflow,
 }
 

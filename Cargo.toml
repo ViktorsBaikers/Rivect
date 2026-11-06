@@ -149,6 +149,12 @@ keyring-core = "1.0.0"
 # graph, which deny.toml rejects; `json` is the wire codec. Redirects
 # stay off — egress is exactly the configured endpoint.
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls"] }
+# DEC-006/SRC-015 (SLICE-099 admission): the DWS workflow socket is the one
+# WebSocket client in the product, and this crate's blocking `accept` is the
+# same entry the loopback proof peer uses. `handshake` carries the HTTP
+# upgrade; `native-tls` is the shipped TLS engine (no rustls, no root-store
+# crate). Hand-rolled RFC 6455 framing/masking/close states stay refused.
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "native-tls"] }
 tempfile = "3.27.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

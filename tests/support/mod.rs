@@ -17,7 +17,9 @@
 use rivect::commands::{Ingress, Runtime};
 use rivect::config::Config;
 use rivect::contracts::{AnswerSelection, Event, Question, SessionId, TaskId};
-use rivect::model::{Broker, RequestManifest};
+use rivect::model::{
+    Broker, Ledger, LedgerError, RequestManifest, SendContext, SendOutcome, SendTicket,
+};
 use rivect::providers::{
     CredentialStore, Provider, ProviderError, ProviderReply, SecretRef, StoreKind,
 };
@@ -1106,6 +1108,7 @@ pub fn event_for_test(cursor: u64, aggregate_revision: u64) -> Event {
 // ----- PTY harness (real terminal, real binary) -----
 
 mod pty;
+pub mod ws_peer;
 
 pub use pty::*;
 
@@ -1242,6 +1245,50 @@ pub fn send_on_thread<P: Provider + 'static>(
     })
     .join()
     .expect("the send thread joins")
+}
+
+/// A ledger that counts the settlement rows a dispatch opened and closed.
+/// `NullLedger` records nothing, so a failed send's single row is only
+/// observable through this double.
+#[derive(Debug, Default)]
+pub struct CountingLedger {
+    pub begun: usize,
+    pub finished: usize,
+    pub failed: usize,
+}
+
+impl CountingLedger {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Ledger for CountingLedger {
+    fn begin_send(
+        &mut self,
+        _context: &SendContext,
+        manifest: &RequestManifest,
+    ) -> Result<SendTicket, LedgerError> {
+        self.begun += 1;
+        Ok(SendTicket {
+            attempt_id: manifest.attempt_id.clone(),
+            cost_bound: manifest.cost_bound,
+            reserved: false,
+        })
+    }
+
+    fn finish_send(
+        &mut self,
+        _ticket: &SendTicket,
+        outcome: &SendOutcome,
+    ) -> Result<(), LedgerError> {
+        self.finished += 1;
+        if matches!(outcome, SendOutcome::Failed { .. }) {
+            self.failed += 1;
+        }
+        Ok(())
+    }
 }
 
 /// A prepared manifest plus the broker that admitted it — the real

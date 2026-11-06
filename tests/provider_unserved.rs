@@ -1,8 +1,9 @@
 //! The registered-but-unserved wire classes (AC-004/DEC-007): the
-//! literal `cursor`, `devin` and `gitlab-duo-agent` ids record their
-//! dialect so a control request denies typed through the Broker's send
-//! gate — naming the recorded class and the absent adapter — with zero
-//! requests and no accounting.
+//! literal `cursor` and `devin` ids record their dialect so a control
+//! request denies typed through the Broker's send gate — naming the
+//! recorded class and the absent adapter — with zero requests and no
+//! accounting. `gitlab-duo-agent` is served by its DWS adapter, so its
+//! recorded wire is asserted in `provider_gitlab` instead.
 
 #![allow(
     clippy::expect_used,
@@ -30,12 +31,6 @@ const MODEL: &str = "cursor-agent-model";
 const DEVIN_CREDENTIAL_REF: &str = "keyring:rivect-test/devin";
 const DEVIN_WORLD: &str = "/world/devin";
 const DEVIN_MODEL: &str = "devin-agent-model";
-
-/// The fixture `gitlab-duo-agent` connection's own scoped material, world
-/// and pin.
-const GITLAB_CREDENTIAL_REF: &str = "keyring:rivect-test/gitlab-duo-agent";
-const GITLAB_WORLD: &str = "/world/gitlab-duo-agent";
-const GITLAB_MODEL: &str = "gitlab-workflow-model";
 
 /// One configured `connection`: `api_key` with scoped material
 /// (DEC-011), so the fixed pin is offline-eligible and reaches the send
@@ -141,46 +136,5 @@ fn unserved_denial_names_the_recorded_transport() {
         source.to_string(),
         "connection cursor is reserved for dialect cursor-agent; no installed adapter serves it in this build",
         "the display names the recorded dialect and the absent adapter"
-    );
-}
-
-#[test]
-fn gitlab_duo_agent_send_denies_unserved_with_zero_requests() {
-    let (error, requests, broker) = unserved_denial(
-        "gitlab-duo-agent",
-        GITLAB_CREDENTIAL_REF,
-        GITLAB_WORLD,
-        GITLAB_MODEL,
-    );
-    let ModelError::Provider(source) = &error else {
-        panic!("expected ModelError::Provider: {error}");
-    };
-    assert!(
-        matches!(
-            source,
-            ProviderError::DialectUnserved { connection, dialect }
-                if connection == "gitlab-duo-agent" && *dialect == Dialect::GitlabWorkflow
-        ),
-        "the send gate names the recorded class: {source}"
-    );
-    assert_eq!(
-        source.to_string(),
-        "connection gitlab-duo-agent is reserved for dialect gitlab-workflow; no installed adapter serves it in this build",
-        "the display names the recorded dialect and the absent adapter"
-    );
-    assert_eq!(
-        dialect_for("gitlab-duo-agent"),
-        Some(Dialect::GitlabWorkflow)
-    );
-    assert_eq!(Dialect::GitlabWorkflow.to_string(), "gitlab-workflow");
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        0,
-        "no adapter leg ran: a silent peer or base is never contacted"
-    );
-    assert_eq!(
-        broker.accounted_requests(),
-        0,
-        "a denied send is never accounted"
     );
 }
