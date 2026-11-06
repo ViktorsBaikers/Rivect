@@ -20,8 +20,11 @@
 //! answer, and `openai-codex`/`openai-codex-device` are distinct literal
 //! ids sharing one recorded ChatGPT Responses contract: the login
 //! module's credential JSON is the bearer, its workspace scopes the
-//! account discovery, and the closed route table bounds the wire. The
-//! adapter authors no async code — [`Provider::send`] is
+//! account discovery, and the closed route table bounds the wire.
+//! `bedrock-mantle` rides the same Responses wire at the recorded
+//! regional base, with a replace-on-success listing policy over its
+//! five-id seed and the blocked static-key class named as such.
+//! The adapter authors no async code — [`Provider::send`] is
 //! a blocking single-shot seam and Tokio appears only inside reqwest's
 //! blocking client plus the dev-dependency test harness — and
 //! `store: false` is sent verbatim on
@@ -40,14 +43,15 @@ use crate::config::{
     Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
 };
 use crate::model::RequestManifest;
+use crate::providers::aws;
 use crate::providers::openai_login::{CodexCredential, LoginError as CodexLoginError};
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, ModelPrice, Provider, ProviderError, ProviderReply,
     STREAM_CHUNK_BYTES, ToolCall, WireAuth, bounded_reason, check_deadline, dialect_for,
-    forwarded_header_map, open_proxy_connection, read_catalog_body, read_chunk,
-    resolve_admitted_credential_in, routes_for, sse, transport, transport_status, violation,
-    wire_body,
+    forwarded_header_map, loopback_base, open_proxy_connection, read_catalog_body, read_chunk,
+    resolve_admitted_credential_in, route_for, routes_for, sse, transport, transport_status,
+    violation, wire_body,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -166,6 +170,17 @@ const OLLAMA_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8_192;
 /// discovery is a later leg.
 const RESPONSES_MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "o4-mini", "o3"];
 
+/// The recorded closed seed of `bedrock-mantle` model ids (DEC-012):
+/// the offer set a failed or unparseable listing keeps, replaced by a
+/// successful authoritative listing — which may name no ids at all.
+const MANTLE_MODELS: &[&str] = &[
+    "openai.gpt-5.4",
+    "openai.gpt-5.5",
+    "openai.gpt-5.6-luna",
+    "openai.gpt-5.6-sol",
+    "openai.gpt-5.6-terra",
+];
+
 /// The recorded static seed of `abliteration` model ids (HZN-008,
 /// `ABLITERATION_STATIC_MODELS`): the merge floor the catalogue
 /// unions over the authoritative `/models` listing — a seeded id
@@ -283,6 +298,18 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
     match connection {
         "openai" => Some(SourceContract {
             seed: RESPONSES_MODELS,
+            authoritative_models: false,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: true,
+            requires_configured_endpoint: false,
+            blind_retry: BlindRetry::Allowed,
+        }),
+        // DEC-012: the recorded 5-id seed is kept when a listing fails
+        // or is unparseable, and replaced by an authoritative listing;
+        // the Responses wire and the encrypted reasoning artifact are
+        // shared with `openai`.
+        "bedrock-mantle" => Some(SourceContract {
+            seed: MANTLE_MODELS,
             authoritative_models: false,
             entry: EntryRule::IdsOnly,
             reasoning_artifact: true,
@@ -410,6 +437,19 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             requires_configured_endpoint: true,
             blind_retry: BlindRetry::Refused,
         }),
+        // DEC-004: the routed owner derives the CAPI base from the
+        // stored credential and passes it as the configured endpoint, so
+        // the arm requires one. The closed route table is the send gate,
+        // and the record states the replay artifact the Responses wire
+        // carries.
+        "github-copilot" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: false,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: true,
+            requires_configured_endpoint: true,
+            blind_retry: BlindRetry::Allowed,
+        }),
         // DEC-015: the origin is operator-configured, so no default base
         // is invented and an empty endpoint denies before the wire. The
         // listing is the model source (a pinned manual id sends without
@@ -435,7 +475,9 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
 /// `opencode-go` and `opencode-zen` alone. Every other id
 /// keeps the trimmed value verbatim; no id's base is ever inferred, and
 /// an arm recording no default (`custom-responses`) denies the empty
-/// result at assembly.
+/// result at assembly. `bedrock-mantle` bypasses this rule: its
+/// configured region substitutes the recorded regional template at
+/// assembly.
 fn endpoint_for(connection: &str, configured: &str) -> String {
     let configured = configured.trim().trim_end_matches('/');
     if configured.is_empty() {
@@ -452,6 +494,17 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
         }
     } else {
         configured.to_string()
+    }
+}
+
+/// The mantle base under one resolved region (DEC-012): the admitted
+/// loopback override when present, else the recorded regional template.
+/// Assembly and send share it so a pin's region and the seed id's
+/// region reach the same host rewrite.
+fn mantle_base_for(base_override: Option<&str>, region: &str) -> String {
+    match base_override {
+        Some(base) => base.to_owned(),
+        None => aws::mantle_base(region),
     }
 }
 
@@ -527,8 +580,25 @@ pub struct OpenAiProvider {
     contract: SourceContract,
     /// The configured endpoint base under DEC-011 — trimmed, every
     /// trailing slash stripped, and the recorded local default on
-    /// `ollama` when that leaves nothing.
+    /// `ollama` when that leaves nothing. On `bedrock-mantle` this is
+    /// the regional base the resolved region substituted.
     endpoint: String,
+    /// The configured region the mantle base resolves through; `None`
+    /// for every Responses id whose endpoint contract admits no region.
+    configured_region: Option<String>,
+    /// The admitted loopback override for offline proof, when the caller
+    /// supplied one. Kept beside the assembled endpoint so a send can
+    /// rebuild the base under the pinned model's own region; `None`
+    /// resolves the recorded regional template.
+    mantle_base_override: Option<String>,
+    /// The ambient region mantle resolution reads. Production leaves it
+    /// `None` and follows the process environment; proof pins one so a
+    /// developer's ambient region cannot move the resolved base.
+    mantle_ambient_region: Option<String>,
+    /// The most recent successful mantle listing; `None` before the
+    /// first attempt and after a failed one, when the send gate falls
+    /// back to the recorded seed instead of re-listing.
+    mantle_offer: std::sync::Mutex<Option<Vec<String>>>,
     /// The credential seam: a scoped reference resolved per send — a
     /// rotation is honoured without rebuilding the adapter — or a
     /// preflight-resolved token the routed owner supplied. `Store(None)`
@@ -576,14 +646,16 @@ impl OpenAiProvider {
     /// Builds the adapter for one connection id: the id must record
     /// the Responses dialect (DEC-007), the connection must be
     /// declared, carry no configured region the dialect's endpoint
-    /// contract cannot honour, and resolve a scoped credential under
-    /// DEC-013 precedence.
+    /// contract cannot honour (`bedrock-mantle` admits its region and
+    /// substitutes it into the regional base), and resolve a scoped
+    /// credential under DEC-013 precedence.
     ///
     /// # Errors
     /// [`ProviderError::DialectMismatch`] for a connection id without
     /// the Responses source class; [`ProviderError::UnknownConnection`]
     /// for an undeclared id; [`ProviderError::RegionMismatch`] for a
-    /// configured region; [`ProviderError::EndpointRequired`] when the
+    /// configured region on an id whose endpoint contract admits none;
+    /// [`ProviderError::EndpointRequired`] when the
     /// arm records no default base and the configured endpoint is
     /// empty; [`ProviderError::LocalProfileDeclared`] for a
     /// `local` declaration that binds a `profile`;
@@ -600,7 +672,7 @@ impl OpenAiProvider {
         connection: &str,
         store: Arc<dyn CredentialStore>,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, REQUEST_DEADLINE, None)
+        Self::build(config, connection, store, REQUEST_DEADLINE, None, None)
     }
 
     /// The same adapter under an explicit whole-request deadline —
@@ -615,7 +687,7 @@ impl OpenAiProvider {
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
     ) -> Result<Self, ProviderError> {
-        Self::build(config, connection, store, deadline, None)
+        Self::build(config, connection, store, deadline, None, None)
     }
 
     /// Builds the adapter for a route-scoped construction. The routed
@@ -638,7 +710,44 @@ impl OpenAiProvider {
                 connection: connection.to_string(),
             });
         }
-        Self::assemble(config, connection, store, deadline, Some(auth))
+        Self::assemble(config, connection, store, deadline, Some(auth), None)
+    }
+
+    /// Builds the `bedrock-mantle` adapter with a loopback base override
+    /// for offline proof.
+    ///
+    /// The override is admitted only for a literal loopback host; a
+    /// non-loopback value is refused before any send. No other id may
+    /// take this seam.
+    ///
+    /// # Errors
+    /// [`Self::new`]'s contract, [`ProviderError::DialectMismatch`] when
+    /// `connection` is not `bedrock-mantle`, and
+    /// [`ProviderError::UnsendableRequest`] when the override is not a
+    /// loopback URL.
+    pub fn with_mantle_base_override(
+        config: &Config,
+        connection: &str,
+        store: Arc<dyn CredentialStore>,
+        deadline: Duration,
+        base_override: Option<String>,
+    ) -> Result<Self, ProviderError> {
+        if connection != "bedrock-mantle" {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
+        Self::build(config, connection, store, deadline, None, base_override)
+    }
+
+    /// Fixes the ambient region mantle resolution reads. Production
+    /// follows the process environment; proof pins one region so a
+    /// developer's ambient value cannot move the resolved base.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_mantle_ambient_region(mut self, region: &str) -> Self {
+        self.mantle_ambient_region = Some(region.to_owned());
+        self
     }
 
     fn build(
@@ -647,13 +756,14 @@ impl OpenAiProvider {
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
         auth: Option<WireAuth>,
+        base_override: Option<String>,
     ) -> Result<Self, ProviderError> {
         if dialect_for(connection) != Some(Dialect::Responses) {
             return Err(ProviderError::DialectMismatch {
                 connection: connection.to_string(),
             });
         }
-        Self::assemble(config, connection, store, deadline, auth)
+        Self::assemble(config, connection, store, deadline, auth, base_override)
     }
 
     fn assemble(
@@ -662,6 +772,7 @@ impl OpenAiProvider {
         store: Arc<dyn CredentialStore>,
         deadline: Duration,
         auth: Option<WireAuth>,
+        base_override: Option<String>,
     ) -> Result<Self, ProviderError> {
         // A Responses-classed id without its own recorded contract arm
         // is denied the same way — the predicates are recorded per
@@ -676,7 +787,14 @@ impl OpenAiProvider {
                 .ok_or_else(|| ProviderError::UnknownConnection {
                     connection: connection.to_string(),
                 })?;
-        if let Some(region) = &conn.region {
+        // `bedrock-mantle` is the one Responses id whose recorded base is
+        // region-scoped: its configured `region` is admitted and
+        // substituted at assembly, because the recorded ids carry no geo
+        // prefix to resolve later. Every other id keeps the shipped
+        // blanket denial.
+        if connection != "bedrock-mantle"
+            && let Some(region) = &conn.region
+        {
             return Err(ProviderError::RegionMismatch {
                 connection: connection.to_string(),
                 region: region.clone(),
@@ -704,8 +822,31 @@ impl OpenAiProvider {
         }
         // DEC-015: an arm recording no default base has no host unless
         // the operator supplied one — deny before the credential seam
-        // or any wire leg.
-        let endpoint = endpoint_for(connection, &conn.endpoint);
+        // or any wire leg. `bedrock-mantle` records a regional template
+        // instead: the configured region, else the ambient region, else
+        // us-east-1, substituted at assembly. The admitted Bearer
+        // material carries no region and the only form that does is the
+        // blocked static-key class, so no material rank contributes here
+        // (DEC-017).
+        let base_override = match base_override {
+            Some(raw) => Some(loopback_base(connection, &raw)?),
+            None => None,
+        };
+        let (endpoint, configured_region, mantle_base_override) = if connection == "bedrock-mantle"
+        {
+            let ambient = aws::ambient_region();
+            let region = aws::resolve_region(
+                connection,
+                MANTLE_MODELS[0],
+                conn.region.as_deref(),
+                None,
+                ambient.as_deref(),
+            )?;
+            let endpoint = mantle_base_for(base_override.as_deref(), &region);
+            (endpoint, conn.region.clone(), base_override)
+        } else {
+            (endpoint_for(connection, &conn.endpoint), None, None)
+        };
         if contract.requires_configured_endpoint && endpoint.is_empty() {
             return Err(ProviderError::EndpointRequired {
                 connection: connection.to_string(),
@@ -738,6 +879,10 @@ impl OpenAiProvider {
             connection: connection.to_string(),
             contract,
             endpoint,
+            configured_region,
+            mantle_base_override,
+            mantle_ambient_region: None,
+            mantle_offer: std::sync::Mutex::new(None),
             auth,
             store,
             client,
@@ -745,6 +890,63 @@ impl OpenAiProvider {
             lineages: BTreeMap::new(),
             blob_owner: BTreeMap::new(),
         })
+    }
+
+    /// The base assembly resolved: the admitted loopback override or the
+    /// recorded regional template under the assembled region. A
+    /// `bedrock-mantle` send rebuilds it for the pinned model through
+    /// [`Self::mantle_send_base`], because the pin's geo can name a
+    /// different region than the seed id assembly resolved.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn resolved_base(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The base a mantle send builds for `model`: the admitted loopback
+    /// override, else the regional template of the region resolved for
+    /// that pin — the send's own region gate, run without a wire.
+    ///
+    /// # Errors
+    /// [`ProviderError::RegionMismatch`] when the configured region
+    /// cannot serve the model's geo.
+    #[doc(hidden)]
+    pub fn mantle_send_base(&self, model: &str) -> Result<String, ProviderError> {
+        let region = aws::resolve_region(
+            &self.connection,
+            model,
+            self.configured_region.as_deref(),
+            None,
+            self.ambient_region().as_deref(),
+        )?;
+        Ok(mantle_base_for(
+            self.mantle_base_override.as_deref(),
+            &region,
+        ))
+    }
+
+    /// The ambient region mantle resolution reads: the proof-pinned one,
+    /// else the process environment.
+    fn ambient_region(&self) -> Option<String> {
+        self.mantle_ambient_region
+            .clone()
+            .or_else(aws::ambient_region)
+    }
+
+    /// Whether the literal id's recorded contract asks the peer for the
+    /// encrypted reasoning artifact the replay contract needs.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn declares_reasoning_artifact(&self) -> bool {
+        self.contract.reasoning_artifact
+    }
+
+    /// Whether the literal id's recorded contract requires a configured
+    /// endpoint before assembly.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn requires_configured_endpoint(&self) -> bool {
+        self.contract.requires_configured_endpoint
     }
 
     /// The model catalogue for this connection (HZN-008): the ids of
@@ -768,10 +970,15 @@ impl OpenAiProvider {
     /// treat the listing as authoritative and merge their static
     /// source seeds on top, `ollama` enriches the listing's own
     /// offers from the bounded native discovery overlay (DEC-012), and
-    /// `openrouter` offers only the listing's tool-capable entries with
-    /// their recorded surfaces mapped (DEC-010), `sakana` offers the
-    /// authoritative listing's entries with the recorded Fugu mapping
-    /// (DEC-004), `custom-responses` offers the authoritative listing
+    /// `bedrock-mantle` offers the most recent attempt's regional
+    /// listing — authoritative even when it names no offer — else its
+    /// recorded five-id seed, with a failed attempt reverting to that
+    /// seed for a missing/non-array `data` or an
+    /// HTTP/transport/parse failure, never an error — `openrouter`
+    /// offers only the listing's tool-capable
+    /// entries with their recorded surfaces mapped (DEC-010), `sakana`
+    /// offers the authoritative listing's entries with the recorded Fugu
+    /// mapping (DEC-004), `custom-responses` offers the authoritative listing
     /// alone (DEC-015), and `xai` offers the authoritative xAI listing as
     /// id-only entries with no vendored selected-list floor while
     /// `xai-oauth` offers the same listing minus its recorded non-chat
@@ -784,7 +991,9 @@ impl OpenAiProvider {
     /// The credential seam's typed denials, [`ProviderError::Transport`]
     /// on a failed call or non-success status or an expired whole-call
     /// budget, and [`ProviderError::StreamViolation`] when the payload
-    /// does not carry the `data` array the contract requires.
+    /// does not carry the `data` array the contract requires. A
+    /// `bedrock-mantle` discovery failure is the recorded exception: it
+    /// answers the retained seed instead of an error.
     pub fn catalog_models(&self) -> Result<Vec<CatalogModel>, ProviderError> {
         // A standalone lookup opens its own whole-call budget — the
         // credential resolution and the wire leg share it, the same
@@ -819,6 +1028,14 @@ impl OpenAiProvider {
         token: Option<&WireMaterial>,
         started: Instant,
     ) -> Result<Vec<CatalogModel>, ProviderError> {
+        // Mantle discovery is its own policy (DEC-012): a successful
+        // listing replaces the seed and a failed or unparseable one
+        // keeps it with no error. The branch sits before the shared
+        // deadline denial so a listing that spends the clock is the
+        // recorded fallback, not a catalogue error.
+        if self.connection == "bedrock-mantle" {
+            return Ok(self.mantle_catalog(token, started));
+        }
         check_deadline(&self.connection, self.deadline, started)?;
         let mut request = self.client.get(format!("{}/models", self.endpoint));
         request = authenticate(request, token);
@@ -860,6 +1077,119 @@ impl OpenAiProvider {
             models.sort_by(|a, b| a.id.cmp(&b.id));
         }
         Ok(models)
+    }
+
+    /// The mantle catalogue policy (DEC-012): a successful parseable
+    /// listing is authoritative and replaces the recorded seed; any
+    /// failed, unparseable or truncated listing keeps the seed, with no
+    /// error. The successful ids are retained so the send gate reflects
+    /// the same offer set the catalogue just answered.
+    fn mantle_catalog(&self, token: Option<&WireMaterial>, started: Instant) -> Vec<CatalogModel> {
+        let listing = self.mantle_listing(token, started);
+        let offer = listing
+            .as_ref()
+            .map(|models| models.iter().map(|model| model.id.clone()).collect());
+        match self.mantle_offer.lock() {
+            Ok(mut retained) => *retained = offer,
+            Err(poisoned) => *poisoned.into_inner() = offer,
+        }
+        match listing {
+            Some(models) => models,
+            None => self.mantle_seed(),
+        }
+    }
+
+    /// The recorded 5-id seed, offered when discovery fails.
+    fn mantle_seed(&self) -> Vec<CatalogModel> {
+        MANTLE_MODELS
+            .iter()
+            .map(|id| CatalogModel {
+                id: (*id).to_string(),
+                ..CatalogModel::default()
+            })
+            .collect()
+    }
+
+    /// Whether `model_id` is inside the current mantle offer set: the
+    /// most recent attempt's listing, with a failed attempt reverting to
+    /// the recorded seed. A poisoned lock recovers the retained set —
+    /// the ids are always valid.
+    fn mantle_offered(&self, model_id: &str) -> bool {
+        let retained = match self.mantle_offer.lock() {
+            Ok(offer) => offer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match retained.as_ref() {
+            Some(offer) => offer.iter().any(|id| id == model_id),
+            None => MANTLE_MODELS.contains(&model_id),
+        }
+    }
+
+    /// One mantle listing attempt: `GET {base-without-/openai/v1}/v1/models`
+    /// under the resolved bearer. Every failure — transport, non-success,
+    /// a missing or non-array `data`, or an unreadable/unparseable
+    /// payload — answers `None`, and the caller keeps the seed, because
+    /// the record marks a failed discovery non-fatal. A 200 whose `data`
+    /// is an array is a successful listing even when it names no id:
+    /// zero offers is authoritative, not a failure.
+    fn mantle_listing(
+        &self,
+        token: Option<&WireMaterial>,
+        started: Instant,
+    ) -> Option<Vec<CatalogModel>> {
+        if check_deadline(&self.connection, self.deadline, started).is_err() {
+            return None;
+        }
+        let mut request = self.client.get(self.mantle_discovery_url());
+        request = authenticate(request, token);
+        request = request.headers(forwarded_header_map(self.auth.forwarded()));
+        let Ok(mut response) = request.send() else {
+            return None;
+        };
+        if !response.status().is_success() {
+            return None;
+        }
+        let Ok(body) = read_catalog_body(&self.connection, self.deadline, &mut response, started)
+        else {
+            return None;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+            return None;
+        };
+        let entries = payload.get("data").and_then(Value::as_array)?;
+        let mut models: Vec<CatalogModel> = entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id").and_then(Value::as_str)?;
+                (!id.is_empty()).then(|| CatalogModel {
+                    id: id.to_string(),
+                    ..CatalogModel::default()
+                })
+            })
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        // A 200 whose `data` is an array is a successful authoritative
+        // listing, `[]` included: entries without an id contribute no
+        // offer, and zero offers is a real answer, never the seed.
+        Some(models)
+    }
+
+    /// The recorded discovery rewrite (DEC-012): the model base's
+    /// `/openai/v1` segment becomes `/v1`, then `/models` — at the same
+    /// regional host. A loopback override takes the same rewrite, so the
+    /// wire proof exercises the recorded path.
+    fn mantle_discovery_url(&self) -> String {
+        if let Some(region) = &self.configured_region
+            && self.endpoint == aws::mantle_base(region)
+        {
+            return aws::mantle_discovery_base(region);
+        }
+        let root = self
+            .endpoint
+            .strip_suffix("/openai/v1")
+            .unwrap_or(&self.endpoint);
+        format!("{root}/v1/models")
     }
 
     /// One listed entry under the literal id's recorded entry rule:
@@ -912,6 +1242,9 @@ impl OpenAiProvider {
     fn secret(&self) -> Result<Option<WireMaterial>, ProviderError> {
         if is_codex_connection(&self.connection) {
             return self.codex_material();
+        }
+        if self.connection == "bedrock-mantle" {
+            return self.mantle_material();
         }
         let material = match &self.auth {
             WireAuth::Store(None) => return Ok(None),
@@ -980,6 +1313,41 @@ impl OpenAiProvider {
             token: token.to_string(),
             account: credential.account_id().map(str::to_string),
         }))
+    }
+
+    /// The mantle credential arm: the recorded Bearer forms — a raw
+    /// token or `{bearer_token}` — are the only admitted material. The
+    /// static-key form (and any object naming either static-key member)
+    /// is the recorded SigV4 class this build blocks, denied typed
+    /// before any request; every other shape keeps the shared parser's
+    /// malformed/blocked denial.
+    fn mantle_material(&self) -> Result<Option<WireMaterial>, ProviderError> {
+        let material = match &self.auth {
+            WireAuth::Store(None) => return Ok(None),
+            WireAuth::Store(Some(credential)) => self.store.resolve(credential)?,
+            WireAuth::Resolved { token, .. } => token.clone().into_bytes(),
+        };
+        // A partial static-key object is not a closed Bearer form, but
+        // its class is still SigV4 — classify it before the parser's
+        // generic object denial.
+        if let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(&material)
+            && (object.contains_key("access_key_id") || object.contains_key("secret_access_key"))
+        {
+            return Err(ProviderError::UnsupportedCredentialClass {
+                connection: self.connection.clone(),
+                class: "sigv4",
+            });
+        }
+        match aws::parse_material(&self.connection, &material)? {
+            aws::AwsMaterial::Bearer(token) => Ok(Some(WireMaterial {
+                token,
+                account: None,
+            })),
+            aws::AwsMaterial::StaticKeys { .. } => Err(ProviderError::UnsupportedCredentialClass {
+                connection: self.connection.clone(),
+                class: "sigv4",
+            }),
+        }
     }
 
     /// The recorded xAI negative effort suppression (HZN-008): the
@@ -1821,7 +2189,11 @@ impl Provider for OpenAiProvider {
     /// connection, [`ProviderError::DialectMismatch`] when the pin
     /// names a different connection, the credential seam's typed
     /// denials, [`ProviderError::UnsupportedParameter`] for a pinned
-    /// effort the xAI residue suppresses, [`ProviderError::Transport`],
+    /// effort the xAI residue suppresses or a `bedrock-mantle` pin
+    /// outside the current offer set (the last successful listing, else
+    /// the recorded seed), [`ProviderError::RegionMismatch`] for a
+    /// mantle pin whose geo the configured region cannot serve,
+    /// [`ProviderError::Transport`],
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
     /// [`ProviderError::UnsendableRequest`] for a serialized request
@@ -1893,11 +2265,46 @@ impl Provider for OpenAiProvider {
                 connection: fixed.connection,
             });
         }
+        // `bedrock-mantle` is region-scoped: `mantle_send_base` runs the
+        // shared geo gate and owns the base for this pin, so a geo pin
+        // never posts to the region assembly picked for the non-geo
+        // seed. The offer gate follows: a pin outside the current offer
+        // set — the most recent attempt's listing, else the recorded
+        // seed — denies here, before the body exists.
+        let mantle_base = if self.connection == "bedrock-mantle" {
+            let base = self.mantle_send_base(&fixed.model_id)?;
+            if !self.mantle_offered(&fixed.model_id) {
+                return Err(ProviderError::UnsupportedParameter {
+                    connection: self.connection.clone(),
+                    parameter: "model",
+                    model: fixed.model_id,
+                });
+            }
+            Some(base)
+        } else {
+            None
+        };
+        let url = match &mantle_base {
+            Some(base) => format!("{base}/responses"),
+            None => format!("{}/responses", self.endpoint),
+        };
         // The closed Codex route (AC-040i): the account-scoped listing
         // may name ids this contract does not serve, so a pin outside
         // the recorded table denies typed before the body exists —
         // never a silently dropped or forwarded model.
         if is_codex_connection(&self.connection) && !CODEX_MODELS.contains(&fixed.model_id.as_str())
+        {
+            return Err(ProviderError::UnsupportedParameter {
+                connection: self.connection.clone(),
+                parameter: "model",
+                model: fixed.model_id,
+            });
+        }
+        // The closed `github-copilot` table is this arm's route gate: a
+        // pin whose recorded route is another codec — or no row at all —
+        // never posts a Responses body.
+        if self.connection == "github-copilot"
+            && route_for(&self.connection, &fixed.model_id) != Some(Dialect::Responses)
         {
             return Err(ProviderError::UnsupportedParameter {
                 connection: self.connection.clone(),
@@ -1916,7 +2323,7 @@ impl Provider for OpenAiProvider {
         check_deadline(&self.connection, self.deadline, started)?;
         let request = self
             .client
-            .post(format!("{}/responses", self.endpoint))
+            .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes);
         // The absent binding sends no header; a bound one sends the

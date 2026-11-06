@@ -885,6 +885,7 @@ async fn dribbling_catalog_cannot_park_past_the_deadline() {
         Some(ProviderError::CredentialOccupied { .. }) => "CredentialOccupied",
         Some(ProviderError::CredentialAbsent { .. }) => "CredentialAbsent",
         Some(ProviderError::CredentialMalformed { .. }) => "CredentialMalformed",
+        Some(ProviderError::UnsupportedCredentialClass { .. }) => "UnsupportedCredentialClass",
         Some(ProviderError::CredentialBaseMismatch { .. }) => "CredentialBaseMismatch",
         Some(ProviderError::DialectMismatch { .. }) => "DialectMismatch",
         Some(ProviderError::DialectUnserved { .. }) => "DialectUnserved",
@@ -1738,6 +1739,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
         CredentialOccupied,
         CredentialAbsent,
         CredentialMalformed,
+        UnsupportedCredentialClass,
         CredentialBaseMismatch,
         DialectMismatch,
         DialectUnserved,
@@ -1771,6 +1773,9 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             ProviderError::CredentialOccupied { .. } => ProviderVariant::CredentialOccupied,
             ProviderError::CredentialAbsent { .. } => ProviderVariant::CredentialAbsent,
             ProviderError::CredentialMalformed { .. } => ProviderVariant::CredentialMalformed,
+            ProviderError::UnsupportedCredentialClass { .. } => {
+                ProviderVariant::UnsupportedCredentialClass
+            }
             ProviderError::CredentialBaseMismatch { .. } => ProviderVariant::CredentialBaseMismatch,
             ProviderError::DialectMismatch { .. } => ProviderVariant::DialectMismatch,
             ProviderError::DialectUnserved { .. } => ProviderVariant::DialectUnserved,

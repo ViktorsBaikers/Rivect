@@ -81,6 +81,14 @@
 //! code+PKCE leg and its device alias both write one canonical
 //! `kind = "api_key"` profile through [`openai_login`], so the Broker's
 //! offline gate admits it; the subscription rule above stays untouched.
+//!
+//! `github-copilot` records three routes over the closed 44-id catalogue
+//! table (DEC-004): every `claude-*` row rides Messages, the recorded
+//! `gpt-5*`/`grok-4.5`/`grok-4.6`/`mai-*` rows ride Responses, and every
+//! other row rides the Chat Completions default. A model outside the
+//! table has no route at all; [`copilot`] is the only owner that builds
+//! its codec, because the API base and the CAPI identity come from the
+//! stored credential rather than a fixed proxy.
 
 use crate::config::{Config, ConnKind, Connection, EffortLevel, ModelAssign, Profile};
 use crate::model::RequestManifest;
@@ -95,8 +103,18 @@ use std::time::{Duration, Instant};
 
 pub mod anthropic;
 pub mod anthropic_login;
+#[doc(hidden)]
+pub mod aws;
+pub mod bedrock;
+pub mod copilot;
+pub mod copilot_login;
+pub mod cursor_login;
+pub mod devin_login;
+mod eventstream;
 pub mod gemini;
+pub mod gitlab_agent_login;
 pub mod local;
+pub(crate) mod login_common;
 pub mod ollama_cloud;
 pub mod openai;
 pub mod openai_login;
@@ -132,11 +150,70 @@ pub(crate) fn wire_effort(value: &str) -> Option<EffortLevel> {
     }
 }
 
-/// A host the recorded loopback contract admits: the v4 loopback, its v6
-/// literal, or the reserved `localhost` name. Parsed hosts are compared
-/// exactly, never by suffix or by the text before a `@`.
-pub(crate) fn is_loopback_host(host: Option<&str>) -> bool {
-    matches!(host, Some("127.0.0.1" | "::1" | "localhost"))
+/// A URL whose host is a loopback address: any literal the standard
+/// library calls loopback — `127.0.0.0/8` and `::1` — or the reserved
+/// `localhost` name and its `*.localhost` children. The parsed host is
+/// compared, never the raw input.
+pub(crate) fn is_loopback_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || matches!(
+            host.rsplit_once('.'),
+            Some((prefix, label)) if !prefix.is_empty() && label.eq_ignore_ascii_case("localhost")
+        )
+}
+
+/// Percent-encodes everything outside the RFC 3986 unreserved set; the one
+/// encoder the login forms and the Bedrock path share.
+#[must_use]
+pub(crate) fn percent_encode_component(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[(byte >> 4) as usize]));
+            out.push(char::from(HEX[(byte & 0xf) as usize]));
+        }
+    }
+    out
+}
+
+/// The loopback base override one adapter's wire proof may take: the
+/// value is trimmed of surrounding whitespace and trailing slashes, and
+/// only a loopback host over http(s) without credentials, query
+/// or fragment is admitted. Every other URL — including a production
+/// host and an ambiguous loopback form — is refused before any send.
+pub(crate) fn loopback_base(connection: &str, raw: &str) -> Result<String, ProviderError> {
+    let base = raw.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(base).map_err(|_url| ProviderError::UnsendableRequest {
+        connection: connection.to_string(),
+        reason: "the base override is not a URL".to_string(),
+    })?;
+    if !is_loopback_url(&url)
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ProviderError::UnsendableRequest {
+            connection: connection.to_string(),
+            reason: "the base override is not a loopback endpoint".to_string(),
+        });
+    }
+    Ok(base.to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -372,15 +449,29 @@ pub enum ProviderError {
     /// The material itself never appears in the error.
     #[error("credential material for connection {connection} is not usable by this dialect")]
     CredentialMalformed { connection: String },
+    /// The store material names a credential class this build cannot
+    /// read — web identity, SSO, ECS/EC2 metadata or a credential
+    /// process. `class` is the recorded descriptor name; no path,
+    /// process or environment value reaches the message.
+    #[error("connection {connection} credential class {class} is blocked in this build")]
+    UnsupportedCredentialClass {
+        connection: String,
+        class: &'static str,
+    },
     /// The credential's enrolled endpoint base does not match the
-    /// connection's configured endpoint (HZN-008 class P): a key
-    /// enrolled for one recorded base — international, China or a
-    /// custom origin — can never serve another, and the denial lands
-    /// before any wire leg reaches the wrong host. `enrolled` is the
-    /// credential's recorded endpoint rendered in the canonical egress
-    /// form (`canonical_egress_target`) — userinfo, query and fragment
-    /// inside the stored material never reach diagnostics, and the
-    /// field stays config-class data, never secret material.
+    /// connection's configured endpoint (HZN-008 class P), or — on a
+    /// credential-derived base such as `github-copilot` — is not an
+    /// admitted https origin: a key enrolled for one recorded base —
+    /// international, China or a custom origin — can never serve
+    /// another, and the denial lands before any wire leg reaches the
+    /// wrong host. `enrolled` is the credential's recorded base rendered
+    /// for diagnostics: the canonical egress form
+    /// (`canonical_egress_target`) for a base compared against a
+    /// configured endpoint, and on a credential-derived base only the
+    /// scheme, host and port — or a fixed marker when the value is not a
+    /// URL. Path, query, fragment and userinfo in stored material never
+    /// reach diagnostics, so the field stays config-class data, never
+    /// secret material.
     #[error(
         "credential for connection {connection} is enrolled for a different endpoint base: {enrolled}"
     )]
@@ -1344,8 +1435,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// `xai-oauth` their authoritative-listing Responses plugs — the latter
 /// carrying the device-code-produced token at the scoped seam — and
 /// `openai-codex`/`openai-codex-device` the ChatGPT account-scoped
-/// Responses plug whose device alias shares the one contract; `google`
-/// speaks
+/// Responses plug whose device alias shares the one contract; and
+/// `bedrock-mantle` the recorded regional Responses plug whose
+/// successful listing replaces its five-id seed; `google` speaks
 /// the Gemini `streamGenerateContent` dialect,
 /// `ollama-cloud` its recorded native `ollama-chat` JSONL dialect
 /// (DEC-001), `custom-chat-completions` speaks the OpenAI-compatible
@@ -1371,7 +1463,8 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// on that same dialect (HZN-008) — never inferred from an
 /// auth label or a catalogue answer. `zenmux` records Chat Completions
 /// as its default and a Messages route for its metadata's Anthropic
-/// class. `google-vertex`,
+/// class, and `github-copilot` records Chat Completions as the default
+/// over its closed three-route table. `google-vertex`,
 /// `google-antigravity` and `google-gemini-cli` are distinct literal
 /// ids and stay unrouted until their own dialects land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1396,6 +1489,25 @@ pub enum Dialect {
     /// newline-delimited JSON) — the recorded dialect of the literal
     /// `ollama-cloud` id (DEC-001), never SSE and never shared.
     OllamaChat,
+    /// The Amazon Bedrock Converse event-stream API
+    /// (`POST {base}/model/{id}/converse-stream`) — the recorded
+    /// dialect of the literal `amazon-bedrock` id.
+    Converse,
+    /// The Cursor agent backend — the recorded class of the literal
+    /// `cursor` id. No installed adapter serves it in this build, so a
+    /// send denies [`ProviderError::DialectUnserved`]: the marker names
+    /// the recorded transport, it is not a wire claim.
+    CursorAgent,
+    /// The Devin agent backend — the recorded class of the literal
+    /// `devin` id. No installed adapter serves it in this build, so a
+    /// send denies [`ProviderError::DialectUnserved`]: the marker names
+    /// the recorded transport, it is not a wire claim.
+    DevinAgent,
+    /// The GitLab Duo Agent workflow transport — the recorded class of
+    /// the literal `gitlab-duo-agent` id. No installed adapter serves it
+    /// in this build, so a send denies [`ProviderError::DialectUnserved`]:
+    /// the marker names the recorded transport, it is not a wire claim.
+    GitlabWorkflow,
 }
 
 impl std::fmt::Display for Dialect {
@@ -1406,6 +1518,10 @@ impl std::fmt::Display for Dialect {
             Self::ChatCompletions => "chat-completions",
             Self::Messages => "messages",
             Self::OllamaChat => "ollama-chat",
+            Self::Converse => "converse",
+            Self::CursorAgent => "cursor-agent",
+            Self::DevinAgent => "devin-agent",
+            Self::GitlabWorkflow => "gitlab-workflow",
         })
     }
 }
@@ -1426,6 +1542,11 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "xai-oauth" => Some(Dialect::Responses),
         "openai-codex" => Some(Dialect::Responses),
         "openai-codex-device" => Some(Dialect::Responses),
+        "amazon-bedrock" => Some(Dialect::Converse),
+        "bedrock-mantle" => Some(Dialect::Responses),
+        "cursor" => Some(Dialect::CursorAgent),
+        "devin" => Some(Dialect::DevinAgent),
+        "gitlab-duo-agent" => Some(Dialect::GitlabWorkflow),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
         "anthropic" => Some(Dialect::Messages),
@@ -1435,6 +1556,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "custom-messages" => Some(Dialect::Messages),
         "vercel-ai-gateway" => Some(Dialect::Messages),
         "gitlab-duo" => Some(Dialect::ChatCompletions),
+        "github-copilot" => Some(Dialect::ChatCompletions),
         "opencode-go" => Some(Dialect::ChatCompletions),
         "opencode-zen" => Some(Dialect::ChatCompletions),
         "custom-chat-completions" => Some(Dialect::ChatCompletions),
@@ -1489,6 +1611,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
 pub fn routes_for(connection: &str) -> &'static [Dialect] {
     match connection {
         "gitlab-duo" => GITLAB_DUO_ROUTES,
+        "github-copilot" => COPILOT_ROUTES,
         "opencode-go" => OPENCODE_GO_ROUTES,
         "opencode-zen" => OPENCODE_ZEN_ROUTES,
         "zenmux" => ZENMUX_ROUTES,
@@ -1565,6 +1688,84 @@ const GITLAB_DUO_ROUTES: &[Dialect] = &[
     Dialect::Responses,
     Dialect::ChatCompletions,
 ];
+
+/// The recorded `github-copilot` route table: Messages for the Claude
+/// families, Responses for the recorded GPT/Grok/Mai rows, and the Chat
+/// Completions default for everything else.
+const COPILOT_ROUTES: &[Dialect] = &[
+    Dialect::Messages,
+    Dialect::ChatCompletions,
+    Dialect::Responses,
+];
+
+/// The closed 44-id `github-copilot` catalogue table with each row's
+/// recorded `api` column. A model outside this table has no route, even
+/// when its name matches a recorded family prefix or glob.
+const COPILOT_MODELS: &[(&str, &str)] = &[
+    ("claude-fable-5", "anthropic-messages"),
+    ("claude-haiku-4.5", "anthropic-messages"),
+    ("claude-opus-4.5", "anthropic-messages"),
+    ("claude-opus-4.6", "anthropic-messages"),
+    ("claude-opus-4.7", "anthropic-messages"),
+    ("claude-opus-4.8", "anthropic-messages"),
+    ("claude-opus-5", "anthropic-messages"),
+    ("claude-sonnet-4", "anthropic-messages"),
+    ("claude-sonnet-4.5", "anthropic-messages"),
+    ("claude-sonnet-4.6", "anthropic-messages"),
+    ("claude-sonnet-5", "anthropic-messages"),
+    ("gemini-2.5-pro", "openai-completions"),
+    ("gemini-3-flash-preview", "openai-completions"),
+    ("gemini-3-pro-preview", "openai-completions"),
+    ("gemini-3.1-pro-preview", "openai-completions"),
+    ("gemini-3.5-flash", "openai-completions"),
+    ("gemini-3.6-flash", "openai-completions"),
+    ("gemini-3.7-flash", "openai-completions"),
+    ("gpt-4.1", "openai-completions"),
+    ("gpt-4o", "openai-completions"),
+    ("gpt-5", "openai-responses"),
+    ("gpt-5-mini", "openai-responses"),
+    ("gpt-5.1", "openai-responses"),
+    ("gpt-5.1-codex", "openai-responses"),
+    ("gpt-5.1-codex-max", "openai-responses"),
+    ("gpt-5.1-codex-mini", "openai-responses"),
+    ("gpt-5.2", "openai-responses"),
+    ("gpt-5.2-codex", "openai-responses"),
+    ("gpt-5.3-codex", "openai-responses"),
+    ("gpt-5.4", "openai-responses"),
+    ("gpt-5.4-mini", "openai-responses"),
+    ("gpt-5.4-nano", "openai-responses"),
+    ("gpt-5.5", "openai-responses"),
+    ("gpt-5.6-luna", "openai-responses"),
+    ("gpt-5.6-sol", "openai-responses"),
+    ("gpt-5.6-terra", "openai-responses"),
+    ("grok-4.5", "openai-responses"),
+    ("grok-4.6", "openai-responses"),
+    ("grok-code-fast-1", "openai-completions"),
+    ("kimi-k2.7-code", "openai-completions"),
+    ("kimi-k3", "openai-completions"),
+    ("mai-code-1-flash-picker", "openai-responses"),
+    ("mai-code-1.1-flash", "openai-responses"),
+    ("raptor-mini", "openai-completions"),
+];
+
+/// The recorded `github-copilot` route for one table row: its `api`
+/// column decides the codec, and only the three recorded columns have a
+/// route — an id outside the closed table answers `None`.
+fn copilot_route(model: &str) -> Option<Dialect> {
+    let (_, api) = COPILOT_MODELS.iter().find(|(id, _)| *id == model)?;
+    match *api {
+        "anthropic-messages" => Some(Dialect::Messages),
+        "openai-completions" => Some(Dialect::ChatCompletions),
+        "openai-responses" => Some(Dialect::Responses),
+        _ => None,
+    }
+}
+
+/// The sorted-first id of the closed `github-copilot` route table: the
+/// deterministic auto pick over the connection's recorded catalogue.
+fn copilot_first_model() -> Option<&'static str> {
+    COPILOT_MODELS.iter().map(|(id, _)| *id).min()
+}
 
 /// The `opencode-go` route table (DEC-014): Chat Completions is the
 /// recorded `defaultResolution`; the GPT/Grok/Muse families and
@@ -1704,15 +1905,17 @@ fn zenmux_route(model: &str) -> Dialect {
 }
 
 /// The wire model and route of a routed id's model: the GitLab alias
-/// table's `upstreamModelId`, or the `opencode-go`/`opencode-zen`/
-/// `zenmux` class route over the verbatim model id. `None` is the
-/// closed-set denial.
+/// table's `upstreamModelId`, the `github-copilot` closed 44-id table's
+/// recorded `api` column (a model outside that table has no route), or
+/// the `opencode-go`/`opencode-zen`/`zenmux` class route over the
+/// verbatim model id. `None` is the closed-set denial.
 pub(crate) fn routed_wire_model(connection: &str, model: &str) -> Option<(String, Dialect)> {
     match connection {
         "gitlab-duo" => GITLAB_DUO_MODELS
             .iter()
             .find(|(alias, ..)| *alias == model)
             .map(|(_, upstream, dialect)| ((*upstream).to_string(), *dialect)),
+        "github-copilot" => copilot_route(model).map(|dialect| (model.to_string(), dialect)),
         "opencode-go" => Some((model.to_string(), opencode_go_route(model))),
         "opencode-zen" => Some((model.to_string(), opencode_zen_route(model))),
         "zenmux" => Some((model.to_string(), zenmux_route(model))),
@@ -1927,6 +2130,8 @@ pub(crate) fn resolve_optional_credential_in(
 /// `openrouter` connection lists here and never sends.
 ///
 /// # Errors
+/// [`ProviderError::DialectMismatch`] for `github-copilot`, whose
+/// dedicated owner builds its own credential-derived codec, and
 /// [`resolve_credential_in`]'s typed denials for every binding the
 /// declaration does carry.
 pub(crate) fn resolve_admitted_credential_in(
@@ -1934,6 +2139,14 @@ pub(crate) fn resolve_admitted_credential_in(
     profiles: &BTreeMap<String, Profile>,
     connection: &str,
 ) -> Result<Option<SecretRef>, ProviderError> {
+    if connection == "github-copilot" {
+        // DEC-016: the shared builders stop here; only
+        // [`copilot::CopilotProvider`] may construct this id, because its
+        // base and CAPI identity come from the stored credential.
+        return Err(ProviderError::DialectMismatch {
+            connection: connection.to_string(),
+        });
+    }
     resolve_absent_binding_in(connections, profiles, connection, admit_absent_binding)
 }
 
@@ -2159,11 +2372,26 @@ pub(crate) fn violation(connection: &str, reason: impl Into<String>) -> Provider
 /// diagnostic surface.
 pub(crate) const REASON_MAX_BYTES: usize = 1024;
 
+/// Renders every C0/C1 control character and DEL as its visible
+/// `\u{..}` escape, so peer text can never carry terminal control
+/// sequences into a diagnostic.
+fn escaped_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
+            escaped.push_str(&format!("\\u{{{:x}}}", u32::from(ch)));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 /// Bounds a peer-provided failure reason to [`REASON_MAX_BYTES`] on a
 /// UTF-8 char boundary — the reason stays valid text, never a
 /// mid-sequence cut.
 pub(crate) fn bounded_reason(reason: impl Into<String>) -> String {
-    let reason = reason.into();
+    let reason = escaped_controls(&reason.into());
     if reason.len() <= REASON_MAX_BYTES {
         return reason;
     }
@@ -2175,14 +2403,14 @@ pub(crate) fn bounded_reason(reason: impl Into<String>) -> String {
 }
 
 /// The reason a failed verdict carries — the peer's own `message`,
-/// `status` or `code` field, whichever it populated. Strings render
-/// verbatim and scalar numbers/booleans still read; a nested object or
-/// array is structure, not prose, and is never serialized into the
-/// reason.
+/// `status` or `code` field, whichever it populated. Strings render with
+/// control characters escaped and scalar numbers/booleans still read; a
+/// nested object or array is structure, not prose, and is never
+/// serialized into the reason.
 pub(crate) fn payload_reason(payload: &Value) -> String {
     for field in ["message", "status", "code"] {
         match payload.get(field) {
-            Some(Value::String(text)) => return text.clone(),
+            Some(Value::String(text)) => return escaped_controls(text),
             Some(scalar @ (Value::Number(_) | Value::Bool(_))) => return scalar.to_string(),
             _ => {}
         }
@@ -2194,6 +2422,62 @@ pub(crate) fn payload_reason(payload: &Value) -> String {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    /// The recorded `github-copilot` table is closed: its 44 `api`
+    /// columns are the only routes, and a family-shaped id that is not a
+    /// row (or a prefix the rules name without a row) has no route.
+    #[test]
+    fn copilot_route_table_matches_the_recorded_rows() {
+        assert_eq!(COPILOT_MODELS.len(), 44);
+        for (id, api) in COPILOT_MODELS {
+            let expected = match *api {
+                "anthropic-messages" => Some(Dialect::Messages),
+                "openai-completions" => Some(Dialect::ChatCompletions),
+                "openai-responses" => Some(Dialect::Responses),
+                _ => None,
+            };
+            assert!(expected.is_some(), "unrecorded copilot api column {api}");
+            assert_eq!(copilot_route(id), expected, "{id}");
+        }
+        assert_eq!(
+            route_for("github-copilot", "claude-opus-4.6"),
+            Some(Dialect::Messages)
+        );
+        assert_eq!(
+            route_for("github-copilot", "gpt-4o"),
+            Some(Dialect::ChatCompletions)
+        );
+        assert_eq!(
+            route_for("github-copilot", "gpt-5.2"),
+            Some(Dialect::Responses)
+        );
+        assert_eq!(route_for("github-copilot", "gpt-6"), None);
+        assert_eq!(route_for("github-copilot", "claude-mythos-9"), None);
+        assert_eq!(
+            routed_wire_model("github-copilot", "grok-4.5"),
+            Some(("grok-4.5".to_string(), Dialect::Responses))
+        );
+    }
+
+    /// The recorded 44-row table is pinned by content: the sorted
+    /// `(id, api)` pairs hash to one digest, so a renamed row, a moved
+    /// `api` column or a silently swapped id reds even when the count
+    /// still reads 44.
+    #[test]
+    fn copilot_route_table_is_pinned_by_content() {
+        use sha2::{Digest, Sha256};
+
+        let mut rows: Vec<String> = COPILOT_MODELS
+            .iter()
+            .map(|(id, api)| format!("{id}\t{api}"))
+            .collect();
+        rows.sort();
+        assert_eq!(COPILOT_MODELS.len(), 44);
+        assert_eq!(
+            crate::model::hex(&Sha256::digest(rows.join("\n").as_bytes())),
+            "6975cd5bde657fa75e3d8b860848be2e7cb46d261fa9c790ee24ae37a72e227b"
+        );
+    }
 
     fn request_error() -> Result<reqwest::Error, Box<dyn Error>> {
         let client = reqwest::blocking::Client::builder().no_proxy().build()?;
@@ -2436,5 +2720,28 @@ mod tests {
         assert!(!zenmux_is_anthropic("google/gemini-3-pro-preview"));
         assert!(!zenmux_is_anthropic("fixture/unknown-model"));
         assert!(!zenmux_is_anthropic("anthropic"));
+    }
+
+    /// Peer text reaches a diagnostic only with every control character
+    /// escaped: an ANSI sequence renders as visible text, never bytes a
+    /// terminal would execute.
+    #[test]
+    fn peer_reasons_escape_control_characters() {
+        let escaped = bounded_reason("failure \u{1b}[31mred\u{7f}\u{9b}");
+        assert_eq!(escaped, "failure \\u{1b}[31mred\\u{7f}\\u{9b}");
+        assert!(!escaped.chars().any(char::is_control));
+
+        let payload = serde_json::json!({"message": "\u{1b}[2Jpayload"});
+        assert_eq!(payload_reason(&payload), "\\u{1b}[2Jpayload");
+        let scalar = serde_json::json!({"code": 7});
+        assert_eq!(payload_reason(&scalar), "7");
+        assert_eq!(payload_reason(&serde_json::json!({})), "unclassified");
+    }
+
+    #[test]
+    fn one_encoder_serves_the_login_forms_and_the_model_path() {
+        assert_eq!(percent_encode_component("a:b/c d~"), "a%3Ab%2Fc%20d~");
+        assert_eq!(percent_encode_component("v1:0"), "v1%3A0");
+        assert_eq!(percent_encode_component("unreserved-._~"), "unreserved-._~");
     }
 }

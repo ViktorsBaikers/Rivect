@@ -22,7 +22,7 @@ use super::local::ChatCompletionsProvider;
 use super::openai::OpenAiProvider;
 use super::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply, WireAuth,
-    check_deadline, is_loopback_host, open_proxy_connection, read_catalog_body,
+    check_deadline, is_loopback_url, open_proxy_connection, read_catalog_body,
     resolve_admitted_credential_in, route_for, routed_catalog, routed_wire_model, routes_for,
     transport, transport_status, violation, wire_body,
 };
@@ -580,9 +580,9 @@ impl Provider for RoutedProvider {
     }
 }
 
-/// A loopback proxy origin: a parsed `http`/`https` URL whose host is one
-/// of the recorded loopback literals, with no userinfo, path, query or
-/// fragment. The answer is the canonical origin, never the raw input.
+/// A loopback proxy origin: a parsed `http`/`https` URL whose host is a
+/// loopback address, with no userinfo, path, query or fragment. The
+/// answer is the canonical origin, never the raw input.
 fn loopback_origin(raw: &str) -> Option<String> {
     let url = reqwest::Url::parse(raw.trim()).ok()?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -594,5 +594,5 @@ fn loopback_origin(raw: &str) -> Option<String> {
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    is_loopback_host(url.host_str()).then(|| url.origin().ascii_serialization())
+    is_loopback_url(&url).then(|| url.origin().ascii_serialization())
 }

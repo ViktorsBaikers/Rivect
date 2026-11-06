@@ -346,8 +346,8 @@ use crate::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES, ToolCall,
     TransportCause, WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
     payload_reason, positive_count, read_catalog_body, read_chunk, resolve_credential,
-    resolve_optional_credential_in, routes_for, sse, transport, transport_status, violation,
-    wire_body, wire_effort,
+    resolve_optional_credential_in, route_for, routes_for, sse, transport, transport_status,
+    violation, wire_body, wire_effort,
 };
 use crate::resources::UsageDelta;
 use serde_json::{Value, json};
@@ -1706,6 +1706,18 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,
         }),
+        // DEC-004: the routed owner derives the CAPI base from the
+        // stored credential and passes it as the configured endpoint, so
+        // the configured value is verbatim. The listing is filtered to
+        // the closed route table by the owner, and the send gate admits
+        // only a row whose recorded api column is Chat Completions.
+        "github-copilot" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::Verbatim,
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
         "custom-chat-completions" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::Verbatim,
@@ -2889,6 +2901,14 @@ impl ChatCompletionsProvider {
         deadline: Duration,
         auth: Option<WireAuth>,
     ) -> Result<Self, ProviderError> {
+        if connection == "github-copilot" {
+            // The Copilot owner is the only construction path for this
+            // id: its credential-derived base and CAPI identity are not
+            // available through the plain codec constructor.
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        }
         if dialect_for(connection) != Some(Dialect::ChatCompletions) {
             return Err(ProviderError::DialectMismatch {
                 connection: connection.to_string(),
@@ -3973,6 +3993,9 @@ impl ChatCompletionsProvider {
     /// The auto pick applies the same guard, so a direct CC auto pin
     /// never resolves a row this codec would refuse at send.
     fn admits_route(&self, model_id: &str) -> bool {
+        if self.connection == "github-copilot" {
+            return route_for(&self.connection, model_id) == Some(Dialect::ChatCompletions);
+        }
         !(matches!(self.contract.entries, EntryRule::Zenmux)
             && super::zenmux_is_anthropic(model_id))
     }

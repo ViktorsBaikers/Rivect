@@ -26,15 +26,13 @@
 //! separate live-grant rule. Token material — the PKCE verifier, the device
 //! handle and every token — never enters `Debug`, `Display` or a diagnostic.
 
-use super::{
-    CATALOG_MAX_BYTES, CredentialStore, ProviderError, STREAM_CHUNK_BYTES, SecretRef,
-    bounded_reason, is_loopback_host, read_chunk, resolve_credential, transport,
-};
+use super::login_common::{self, BindingError, Body, CommonError};
+use super::{CredentialStore, ProviderError, SecretRef, bounded_reason};
 use crate::config::{Config, ConnKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// The canonical profile both entrypoints write (DEC-020).
 pub const CANONICAL_PROFILE: &str = "openai-codex";
@@ -64,9 +62,6 @@ pub const DEVICE_USERCODE_ENDPOINT: &str =
 pub const DEVICE_TOKEN_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub const DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
-/// The recorded expiry skew is `skew-ms=0`; the token's own `expires_in`
-/// stands unadjusted.
-const EXPIRY_SKEW: Duration = Duration::ZERO;
 /// One login leg's whole budget, shared by connect, request and read. The
 /// recorded token leg allows 15 seconds.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -99,8 +94,6 @@ fn leg_timeout() -> Duration {
 fn set_test_leg_timeout(timeout: Option<Duration>) {
     TEST_LEG_TIMEOUT.with(|slot| slot.set(timeout));
 }
-/// The PKCE verifier's entropy: 32 bytes render a 43-character verifier.
-const VERIFIER_BYTES: usize = 32;
 /// The recorded polling fallback and the RFC 8628 increment, in seconds.
 const DEVICE_INTERVAL_SECONDS: u64 = 5;
 const DEVICE_SLOW_DOWN_SECONDS: u64 = 5;
@@ -274,8 +267,7 @@ pub enum DeviceAdvance {
 /// base64url without padding (RFC 7636 §4.2).
 #[must_use]
 pub fn challenge_for(code_verifier: &str) -> String {
-    use sha2::Digest as _;
-    base64url(&sha2::Sha256::digest(code_verifier.as_bytes()))
+    login_common::challenge_for(code_verifier)
 }
 
 /// The recorded connection a login entrypoint writes: the device alias
@@ -307,16 +299,16 @@ pub fn begin_login(
             origin: endpoint_origin(token_endpoint),
         });
     }
-    let state = random_urlsafe()?;
-    let code_verifier = random_urlsafe()?;
+    let state = login_common::random_urlsafe()?;
+    let code_verifier = login_common::random_urlsafe()?;
     let code_challenge = challenge_for(&code_verifier);
     let authorize_url = format!(
         "{AUTHORIZE_URL}?response_type=code&client_id={CLIENT_ID}&redirect_uri={}&scope={}\
          &code_challenge={code_challenge}&code_challenge_method=S256&state={state}\
          &id_token_add_organizations=true&codex_cli_simplified_flow=true\
          &originator={ORIGINATOR}",
-        encode_component(REDIRECT_URI),
-        encode_component(SCOPES),
+        login_common::encode_component(REDIRECT_URI),
+        login_common::encode_component(SCOPES),
     );
     Ok(LoginSession {
         connection: reference.profile().to_string(),
@@ -575,20 +567,7 @@ pub fn complete_device_login(
 /// declaration; [`LoginError::NotCanonicalProfile`] for another profile leg.
 pub fn canonical_reference(config: &Config, connection: &str) -> Result<SecretRef, LoginError> {
     let connection = canonical_connection(connection);
-    let entry =
-        config
-            .connections
-            .get(connection)
-            .ok_or_else(|| LoginError::ConnectionMissing {
-                connection: connection.to_string(),
-            })?;
-    if entry.kind != ConnKind::ApiKey {
-        return Err(LoginError::NotApiKey {
-            connection: connection.to_string(),
-            kind: entry.kind,
-        });
-    }
-    let reference = resolve_credential(config, connection)?;
+    let reference = login_common::api_key_reference(config, connection)?;
     if reference.profile() != CANONICAL_PROFILE {
         return Err(LoginError::NotCanonicalProfile {
             connection: connection.to_string(),
@@ -611,7 +590,9 @@ pub fn read_credential(
     reference: &SecretRef,
 ) -> Result<CodexCredential, LoginError> {
     let bytes = store.resolve(reference)?;
-    serde_json::from_slice(&bytes).map_err(|cause| LoginError::StoredCredentialMalformed { cause })
+    serde_json::from_slice(&bytes).map_err(|cause| LoginError::StoredCredentialMalformed {
+        reason: login_common::malformed_reason(&cause),
+    })
 }
 
 /// The scoped Codex credential written at login. Tokens never appear in
@@ -632,8 +613,11 @@ pub struct CodexCredential {
 impl fmt::Debug for CodexCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CodexCredential")
-            .field("access_token", &"<redacted>")
-            .field("refresh_token", &"<redacted>")
+            .field("access_token", &login_common::redacted(&self.access_token))
+            .field(
+                "refresh_token",
+                &login_common::redacted(&self.refresh_token),
+            )
             .field(
                 "id_token",
                 &self.id_token.as_ref().map(|_token| "<redacted>"),
@@ -742,12 +726,10 @@ pub enum LoginError {
     /// The exchange answered another account than the active profile.
     #[error("the token belongs to a different account than the active profile")]
     AccountMismatch,
-    /// The material at the scope is not a Codex credential.
-    #[error("the stored credential is not a codex credential")]
-    StoredCredentialMalformed {
-        #[source]
-        cause: serde_json::Error,
-    },
+    /// The material at the scope is not a Codex credential. serde's own
+    /// diagnostic can quote the stored bytes, so only its class is kept.
+    #[error("the stored credential is not a codex credential: {reason}")]
+    StoredCredentialMalformed { reason: &'static str },
     /// The in-memory credential could not be encoded for the store.
     #[error("the codex credential could not be serialized")]
     Serialization {
@@ -784,6 +766,30 @@ pub enum LoginError {
     /// occupied scope, or a scope outside the backend's namespace.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+}
+
+impl From<CommonError> for LoginError {
+    fn from(error: CommonError) -> Self {
+        match error {
+            CommonError::Entropy { cause } => Self::Entropy { cause },
+            CommonError::ResponseTooLarge => Self::ResponseTooLarge,
+            CommonError::MalformedResponse { cause } => Self::MalformedResponse { cause },
+            CommonError::Clock { cause } => Self::Clock { cause },
+            CommonError::Transport(cause) => Self::Provider(cause),
+        }
+    }
+}
+
+impl From<BindingError> for LoginError {
+    fn from(error: BindingError) -> Self {
+        match error {
+            BindingError::ConnectionMissing { connection } => {
+                Self::ConnectionMissing { connection }
+            }
+            BindingError::NotApiKey { connection, kind } => Self::NotApiKey { connection, kind },
+            BindingError::Provider(cause) => Self::Provider(cause),
+        }
+    }
 }
 
 /// The redirect's recorded members; unknown query keys are ignored, a
@@ -848,33 +854,20 @@ fn exchange(
             origin: endpoint_origin(token_endpoint),
         });
     }
-    let body = fields
-        .iter()
-        .map(|(name, value)| format!("{}={}", encode_component(name), encode_component(value)))
-        .collect::<Vec<String>>()
-        .join("&");
-    let started = Instant::now();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(client_timeout())
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| transport(connection, err))?;
-    let mut response = client
-        .post(token_endpoint)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(body)
-        .send()
-        .map_err(|err| transport(connection, err))?;
+    let (mut response, started) = login_common::post(
+        connection,
+        token_endpoint,
+        client_timeout(),
+        Body::Form(fields),
+        &[],
+    )?;
     if !response.status().is_success() {
         return Err(LoginError::TokenRejected {
             status: response.status().as_u16(),
         });
     }
     let reply = read_login_body(connection, &mut response, started)?;
-    serde_json::from_slice(&reply).map_err(|cause| LoginError::MalformedResponse { cause })
+    Ok(login_common::parse_json(&reply)?)
 }
 
 /// One JSON request that returns its parsed object — the device usercode leg.
@@ -886,7 +879,7 @@ fn post_json(connection: &str, endpoint: &str, body: &Value) -> Result<Value, Lo
         });
     }
     let reply = read_login_body(connection, &mut response, started)?;
-    serde_json::from_slice(&reply).map_err(|cause| LoginError::MalformedResponse { cause })
+    Ok(login_common::parse_json(&reply)?)
 }
 
 /// The unread response of one JSON request and the instant its budget
@@ -897,18 +890,13 @@ fn post_json_response(
     endpoint: &str,
     body: &Value,
 ) -> Result<(reqwest::blocking::Response, Instant), LoginError> {
-    let started = Instant::now();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(client_timeout())
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| transport(connection, err))?;
-    let response = client
-        .post(endpoint)
-        .json(body)
-        .send()
-        .map_err(|err| LoginError::Provider(transport(connection, err)))?;
-    Ok((response, started))
+    Ok(login_common::post(
+        connection,
+        endpoint,
+        client_timeout(),
+        Body::Json(body),
+        &[],
+    )?)
 }
 
 /// The transport's own backstop: in production the recorded 15-second leg
@@ -930,28 +918,13 @@ fn client_timeout() -> Duration {
 /// carry the code, the verifier or the device handle to a foreign host. The
 /// URL is parsed, so userinfo never impersonates the host it precedes.
 fn admitted_endpoint(endpoint: &str, recorded: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(endpoint) else {
-        return false;
-    };
-    if !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    if endpoint == recorded {
-        return true;
-    }
-    url.scheme() == "http" && is_loopback_host(url.host_str())
+    login_common::admitted_endpoint(endpoint, recorded)
 }
 
 /// The canonical scheme/host class a rejected endpoint names — never the raw
 /// URL, which may carry the code or userinfo.
 fn endpoint_origin(endpoint: &str) -> String {
-    match reqwest::Url::parse(endpoint) {
-        Ok(url) => match url.host_str() {
-            Some(host) => format!("{}://{host}", url.scheme()),
-            None => format!("{} url", url.scheme()),
-        },
-        Err(_parse) => "an unparseable url".to_string(),
-    }
+    login_common::endpoint_origin(endpoint)
 }
 
 /// The reply under the login leg's budget and byte bound — a dribbling or
@@ -961,29 +934,17 @@ fn read_login_body(
     response: &mut reqwest::blocking::Response,
     started: Instant,
 ) -> Result<Vec<u8>, LoginError> {
-    let mut body = Vec::new();
-    let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
-    loop {
-        let read = read_chunk(connection, leg_timeout(), response, &mut chunk, started)?;
-        if read == 0 {
-            break;
-        }
-        if body.len() + read > CATALOG_MAX_BYTES {
-            return Err(LoginError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
-    Ok(body)
+    Ok(login_common::read_body(
+        connection,
+        response,
+        leg_timeout(),
+        started,
+    )?)
 }
 
 /// A non-empty string member of the reply's top level.
 fn token_field(reply: &Value, field: &'static str) -> Result<String, LoginError> {
-    reply
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or(LoginError::MissingField { field })
+    login_common::text_field(reply, field).ok_or(LoginError::MissingField { field })
 }
 
 /// The peer-issued poll interval, in seconds; a missing value keeps the
@@ -1066,13 +1027,7 @@ fn expires_at(expires_in: u64) -> Result<u64, LoginError> {
             seconds: expires_in,
         });
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|cause| LoginError::Clock { cause })?
-        .as_secs();
-    Ok(now
-        .saturating_add(expires_in)
-        .saturating_sub(EXPIRY_SKEW.as_secs()))
+    Ok(login_common::expires_at(expires_in, Duration::ZERO)?)
 }
 
 /// The identity slice the Codex claims carry: the ChatGPT workspace, the
@@ -1127,9 +1082,7 @@ fn claim(claims: Option<&Value>, section: &str, name: &str) -> Option<String> {
 /// The JSON payload of a JWT; a malformed token answers `None` rather than a
 /// parse diagnostic that could quote token bytes.
 fn jwt_claims(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64url_decode(payload)?;
-    serde_json::from_slice(&bytes).ok()
+    login_common::jwt_claims(token)
 }
 
 /// Enrolls the exchanged tokens at the canonical scope. An active profile at
@@ -1152,8 +1105,11 @@ fn enroll(
     let expires_at = expires_at(expires_in(reply)?)?;
     match store.resolve(reference) {
         Ok(bytes) => {
-            let active: CodexCredential = serde_json::from_slice(&bytes)
-                .map_err(|cause| LoginError::StoredCredentialMalformed { cause })?;
+            let active: CodexCredential = serde_json::from_slice(&bytes).map_err(|cause| {
+                LoginError::StoredCredentialMalformed {
+                    reason: login_common::malformed_reason(&cause),
+                }
+            })?;
             if active.account_id.is_some()
                 && identity.workspace.is_some()
                 && active.account_id != identity.workspace
@@ -1183,14 +1139,6 @@ fn enroll(
     Ok(reference.profile().to_string())
 }
 
-/// 32 bytes of OS entropy rendered base64url — the verifier and state share
-/// this one draw helper.
-fn random_urlsafe() -> Result<String, LoginError> {
-    let mut bytes = [0u8; VERIFIER_BYTES];
-    getrandom::fill(&mut bytes).map_err(|cause| LoginError::Entropy { cause })?;
-    Ok(base64url(&bytes))
-}
-
 /// One bounded wait that survives a spurious wake without shortening the
 /// interval: no poll loop and no spawned timer runs beside it.
 fn wait_rung(rung: Duration) {
@@ -1203,100 +1151,8 @@ fn wait_rung(rung: Duration) {
     }
 }
 
-/// base64url without padding, hand-rolled so no new codec dependency is
-/// admitted for two call sites.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(char::from(ALPHABET[((triple >> 18) & 0x3f) as usize]));
-        out.push(char::from(ALPHABET[((triple >> 12) & 0x3f) as usize]));
-        if chunk.len() > 1 {
-            out.push(char::from(ALPHABET[((triple >> 6) & 0x3f) as usize]));
-        }
-        if chunk.len() > 2 {
-            out.push(char::from(ALPHABET[(triple & 0x3f) as usize]));
-        }
-    }
-    out
-}
-
-/// Base64url decoding for the token payload; both the URL alphabet and the
-/// standard alphabet a peer may emit are accepted, padding optional.
-fn base64url_decode(raw: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
-    let mut buffer: u32 = 0;
-    let mut bits = 0u32;
-    for byte in raw.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => u32::from(byte - b'A'),
-            b'a'..=b'z' => u32::from(byte - b'a') + 26,
-            b'0'..=b'9' => u32::from(byte - b'0') + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buffer >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
-}
-
-/// Percent-encodes everything outside the RFC 3986 unreserved set — the
-/// authorize URL carries the redirect URI and the scope list.
-fn encode_component(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push('%');
-            out.push(char::from(HEX[(byte >> 4) as usize]));
-            out.push(char::from(HEX[(byte & 0xf) as usize]));
-        }
-    }
-    out
-}
-
 fn percent_decode(raw: &str) -> Result<String, LoginError> {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = bytes.get(index + 1).and_then(|b| hex_value(*b));
-            let low = bytes.get(index + 2).and_then(|b| hex_value(*b));
-            let (Some(high), Some(low)) = (high, low) else {
-                return Err(LoginError::NotARedirect);
-            };
-            out.push(high << 4 | low);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_cause| LoginError::NotARedirect)
-}
-
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    login_common::percent_decode(raw).ok_or(LoginError::NotARedirect)
 }
 
 #[cfg(test)]
@@ -1306,12 +1162,12 @@ mod tests {
     #[test]
     fn base64url_roundtrips_the_payload_bytes() {
         let payload = br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"ws"}}"#;
-        let encoded = base64url(payload);
+        let encoded = login_common::base64url(payload);
         assert_eq!(
-            base64url_decode(&encoded).expect("the recorded alphabet decodes"),
+            login_common::base64url_decode(&encoded).expect("the recorded alphabet decodes"),
             payload
         );
-        assert!(base64url_decode("a%b").is_none());
+        assert!(login_common::base64url_decode("a%b").is_none());
     }
 
     /// RFC 7636 Appendix B: the recorded verifier's S256 challenge.

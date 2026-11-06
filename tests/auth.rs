@@ -193,6 +193,7 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::CredentialOccupied { .. } => "CredentialOccupied",
         ProviderError::CredentialAbsent { .. } => "CredentialAbsent",
         ProviderError::CredentialMalformed { .. } => "CredentialMalformed",
+        ProviderError::UnsupportedCredentialClass { .. } => "UnsupportedCredentialClass",
         ProviderError::CredentialBaseMismatch { .. } => "CredentialBaseMismatch",
         ProviderError::DialectMismatch { .. } => "DialectMismatch",
         ProviderError::DialectUnserved { .. } => "DialectUnserved",

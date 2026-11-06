@@ -301,6 +301,17 @@ fn contract_for(connection: &str) -> Option<MessagesContract> {
             catalog: CatalogRule::Allowlist(GITLAB_MESSAGES_MODELS),
             credential: CredentialRule::Bearer,
         }),
+        // DEC-004: the routed owner derives the CAPI base from the
+        // stored credential and passes it as the configured endpoint, so
+        // this arm records no default host. The closed route table is
+        // also the send gate: only a `claude-*` row has a Messages route
+        // here, and the CAPI identity rides the resolved wire headers.
+        "github-copilot" => Some(MessagesContract {
+            default_base: "",
+            base: BaseRule::Configured,
+            catalog: CatalogRule::KeyedRouteListing,
+            credential: CredentialRule::Bearer,
+        }),
         // DEC-014: the routed owner passes `{base}/v1` as the
         // configured endpoint; the arm strips it and appends its own
         // `/v1/...` paths, so the gateway key rides `Authorization:

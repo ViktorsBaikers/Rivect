@@ -582,6 +582,7 @@ fn provider_outcome_unknown(error: &ProviderError) -> bool {
         | Provider::UnpinnedModel { .. }
         | Provider::RegionMismatch { .. }
         | Provider::EndpointRequired { .. }
+        | Provider::UnsupportedCredentialClass { .. }
         | Provider::UnsupportedParameter { .. }
         | Provider::UnsendableRequest { .. } => false,
     }
