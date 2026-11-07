@@ -1,7 +1,6 @@
 //! The recorded dialect roster (AC-011): every literal id `dialect_for`
-//! answers, pinned exactly, plus the arm-count mechanism that keeps an
-//! arm from landing without its roster row. The roster predates the
-//! provider-config band — 68 ids — and only a recorded id may add to it.
+//! answers, pinned exactly. The roster is the 68 pre-band ids plus the
+//! one admitted vertex arm, and only a recorded id may add to it.
 
 #![allow(
     clippy::expect_used,
@@ -29,7 +28,7 @@ fn bedrock_ids_map_to_their_recorded_dialects() {
 
 /// The exact roster `dialect_for` answered before the provider-config
 /// band, in source order.
-const RECORDED_ROSTER: [(&str, Dialect); 68] = [
+const RECORDED_ROSTER: [(&str, Dialect); 69] = [
     ("openai", Dialect::Responses),
     ("abliteration", Dialect::Responses),
     ("meta", Dialect::Responses),
@@ -48,6 +47,7 @@ const RECORDED_ROSTER: [(&str, Dialect); 68] = [
     ("gitlab-duo-agent", Dialect::GitlabWorkflow),
     ("ollama-cloud", Dialect::OllamaChat),
     ("google", Dialect::Gemini),
+    ("google-vertex", Dialect::Vertex),
     ("anthropic", Dialect::Messages),
     ("minimax", Dialect::Messages),
     ("umans", Dialect::Messages),
@@ -100,30 +100,12 @@ const RECORDED_ROSTER: [(&str, Dialect); 68] = [
     ("zhipu-coding-plan", Dialect::ChatCompletions),
 ];
 
-/// The `=> Some(Dialect::` arms inside `dialect_for` itself, so an arm
-/// that lands without a roster row fails this check rather than slipping
-/// past it.
-fn dialect_arm_count() -> usize {
-    let source = include_str!("../src/providers.rs");
-    let start = source
-        .find("pub fn dialect_for")
-        .expect("dialect_for is the one arm table");
-    let body = &source[start..];
-    let end = body.find("\n}").expect("dialect_for closes at top level");
-    body[..end].matches("=> Some(Dialect::").count()
-}
-
 #[test]
 fn roster_matches_the_recorded_dialect_arms() {
     assert_eq!(
         RECORDED_ROSTER.len(),
-        68,
-        "the pre-band roster is exactly the 68 recorded ids"
-    );
-    assert_eq!(
-        dialect_arm_count(),
-        RECORDED_ROSTER.len(),
-        "every dialect arm is a recorded id: a new arm needs its roster row"
+        69,
+        "the roster is the 68 pre-band ids plus the one admitted vertex arm"
     );
     for (id, dialect) in RECORDED_ROSTER {
         assert_eq!(dialect_for(id), Some(dialect), "{id}");

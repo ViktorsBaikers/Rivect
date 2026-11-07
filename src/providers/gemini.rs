@@ -115,6 +115,23 @@ struct StreamState {
     terminal: Option<Terminal>,
 }
 
+/// The Gemini request and stream codec — the one seam the `google`
+/// adapter and the Vertex publisher projection share. It owns the
+/// manifest-bound replay sets, one per epoch (DEC-012): the assembled
+/// `{role: "model", parts}` turn of every completed send, replayed
+/// verbatim ahead of the next user content — signature-bearing parts
+/// preserved as-is, never merged or moved across parts. Per-epoch keys
+/// mean a commit under a stale epoch can never wipe the live epoch's
+/// set; a retired set is simply never looked up again. The signature
+/// provenance claims ride beside them, keyed by the session and epoch
+/// that minted each artifact.
+pub(crate) struct GeminiCodec {
+    /// The literal connection id every denial names.
+    connection: String,
+    lineages: BTreeMap<LineageKey, Vec<Value>>,
+    signature_owner: BTreeMap<String, SignatureClaim>,
+}
+
 /// The `google` Gemini adapter. Constructed per connection from the
 /// validated config; the broker owns the handle — workers never hold
 /// one.
@@ -140,15 +157,11 @@ pub struct GeminiProvider {
     /// between calls surfaces as this adapter's named deadline, while
     /// a stall inside one call surfaces the backstop's own text.
     deadline: Duration,
-    /// Manifest-bound replay sets, one per epoch (DEC-012): the
-    /// assembled `{role: "model", parts}` turn of every completed
-    /// send, replayed verbatim ahead of the next user content —
-    /// signature-bearing parts preserved as-is, never merged or moved
-    /// across parts. Per-epoch keys mean a commit under a stale epoch
-    /// can never wipe the live epoch's set; a retired set is simply
-    /// never looked up again.
-    lineages: BTreeMap<LineageKey, Vec<Value>>,
-    signature_owner: BTreeMap<String, SignatureClaim>,
+    /// The manifest-bound replay and signature state, and the request
+    /// and stream codec the `google` send and the Vertex publisher
+    /// projection share — one seam, so a replay, tool or usage rule
+    /// cannot drift between the two arms.
+    codec: GeminiCodec,
 }
 
 impl GeminiProvider {
@@ -267,8 +280,7 @@ impl GeminiProvider {
             store,
             client,
             deadline,
-            lineages: BTreeMap::new(),
-            signature_owner: BTreeMap::new(),
+            codec: GeminiCodec::new(connection),
         })
     }
 
@@ -379,6 +391,18 @@ impl GeminiProvider {
             WireAuth::Resolved { token, .. } => Ok(token.clone()),
         }
     }
+}
+
+impl GeminiCodec {
+    /// The codec for one literal connection id: every denial it emits
+    /// names this id, and its replay and signature state starts empty.
+    pub(crate) fn new(connection: &str) -> Self {
+        Self {
+            connection: connection.to_string(),
+            lineages: BTreeMap::new(),
+            signature_owner: BTreeMap::new(),
+        }
+    }
 
     /// The frozen manifest as the Gemini wire request: the lineage's
     /// recorded model turns replayed ahead of the new user content —
@@ -394,7 +418,7 @@ impl GeminiProvider {
     /// lineage's committed turns serialize past it, every send under
     /// that epoch fails `UnsendableRequest` — turns are never evicted,
     /// dropping them would break the stateless replay.
-    fn request_body(&self, manifest: &RequestManifest) -> Result<Value, ProviderError> {
+    pub(crate) fn request_body(&self, manifest: &RequestManifest) -> Result<Value, ProviderError> {
         let key = (
             manifest.world.clone(),
             manifest.purpose.clone(),
@@ -454,10 +478,11 @@ impl GeminiProvider {
     /// stream that ends without a `finishReason`, or with one the
     /// dialect cannot classify, is never success — the recorded
     /// contract throws on the missing finish reason the same way.
-    fn read_stream(
+    pub(crate) fn read_stream(
         &mut self,
         manifest: &RequestManifest,
         mut response: reqwest::blocking::Response,
+        deadline: Duration,
         started: Instant,
     ) -> Result<ProviderReply, ProviderError> {
         let mut parser = SseParser::new();
@@ -466,7 +491,7 @@ impl GeminiProvider {
         loop {
             let read = read_chunk(
                 &self.connection,
-                self.deadline,
+                deadline,
                 &mut response,
                 &mut chunk,
                 started,
@@ -483,7 +508,7 @@ impl GeminiProvider {
         }
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
-        check_deadline(&self.connection, self.deadline, started)?;
+        check_deadline(&self.connection, deadline, started)?;
         for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_chunk(&mut state, manifest, event)?;
         }
@@ -994,7 +1019,7 @@ impl Provider for GeminiProvider {
                 )),
             });
         }
-        let body = self.request_body(manifest)?;
+        let body = self.codec.request_body(manifest)?;
         let body_bytes = wire_body(&self.connection, &body)?;
         // The wire leg is the last budget check: a resolve or
         // catalogue leg that spent the clock fails the send typed
@@ -1016,6 +1041,7 @@ impl Provider for GeminiProvider {
         if !response.status().is_success() {
             return Err(transport_status(&self.connection, response.status()));
         }
-        self.read_stream(manifest, response, started)
+        self.codec
+            .read_stream(manifest, response, self.deadline, started)
     }
 }

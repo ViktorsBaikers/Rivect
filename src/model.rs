@@ -233,6 +233,13 @@ pub enum RejectionCause {
     DialectUnserved {
         dialect: Dialect,
     },
+    /// The connection's recorded source class is externally blocked: no
+    /// installed adapter, key or PAYG substitute can serve it, and the
+    /// denial lands before the dialect claim and the ledger bracket
+    /// (AC-009).
+    ExternalBlocked {
+        class: &'static str,
+    },
     /// The candidate passed the re-check but its own send failed.
     SendFailed(ProviderError),
     /// The candidate resolves to the same recorded contract as the failed
@@ -258,6 +265,7 @@ impl std::fmt::Display for RejectionCause {
                 f,
                 "reserved for dialect {dialect}; no installed adapter serves it in this build"
             ),
+            Self::ExternalBlocked { class } => write!(f, "externally blocked ({class})"),
             Self::SendFailed(source) => write!(f, "send failed: {source}"),
             Self::BlindRetryRefused => {
                 f.write_str("same recorded contract; a failed send is never retried blindly")
@@ -579,6 +587,8 @@ fn provider_outcome_unknown(error: &ProviderError) -> bool {
         | Provider::CredentialBaseMismatch { .. }
         | Provider::DialectMismatch { .. }
         | Provider::DialectUnserved { .. }
+        | Provider::ExternalBlocked { .. }
+        | Provider::ModelClassUnresolved { .. }
         | Provider::UnpinnedModel { .. }
         | Provider::RegionMismatch { .. }
         | Provider::EndpointRequired { .. }
@@ -1301,8 +1311,11 @@ impl Broker {
     /// [`ModelError::FallbackExhausted`] when the
     /// auto chain ran out with every entry rejected or failed, or a
     /// `manual` fallback found no servable candidate to pause on, and
-    /// [`ModelError::Provider`] when the provider rejects the request or the
-    /// auto chain stops on an entered unknown outcome.
+    /// [`ModelError::Provider`] when the provider rejects the request —
+    /// including [`ProviderError::ExternalBlocked`], whose pre-send denial
+    /// names the recorded class before the adapter's dialect claim and
+    /// before the ledger reserves the send — or the auto chain stops on an
+    /// entered unknown outcome.
     pub fn dispatch(
         &mut self,
         ledger: &mut dyn Ledger,
@@ -1396,6 +1409,15 @@ impl Broker {
         connection: &str,
         parent_attempt_id: Option<&str>,
     ) -> Result<ProviderReply, SendFailure> {
+        // AC-009: the recorded external block precedes the adapter's
+        // dialect claim and the ledger bracket, so neither an installed
+        // adapter nor a reservation can change the denial.
+        if let Some(class) = providers::externally_blocked(connection) {
+            return Err(SendFailure::Provider(ProviderError::ExternalBlocked {
+                connection: connection.to_string(),
+                class,
+            }));
+        }
         // Fail closed on the provider's own dialect claim (AC-046):
         // the frozen manifest's connection must still be declared, and
         // the injected adapter must actually serve it — eligibility
@@ -1534,8 +1556,10 @@ impl Broker {
     /// frozen `Manual` flag alone never substitutes for it),
     /// [`ModelError::WorldMismatch`] when the dispatch world is not the
     /// frozen one, [`ModelError::ManualChoiceRejected`] when the picked
-    /// connection was not among the candidates the pause served or fails
-    /// the current eligibility check, and [`ModelError::Provider`] when
+    /// connection was not among the candidates the pause served, is the
+    /// recorded external block ([`RejectionCause::ExternalBlocked`], which
+    /// denies before the offer set and the ledger bracket), or fails the
+    /// current eligibility check, and [`ModelError::Provider`] when
     /// the substitute's send fails — the paused attempt stays admitted
     /// for a retry.
     pub fn dispatch_fallback_choice(
@@ -1574,6 +1598,16 @@ impl Broker {
             return Err(ModelError::WorldMismatch {
                 frozen: manifest.world.clone(),
                 current: world.to_string(),
+            });
+        }
+        // AC-009: a manual pick of an externally blocked connection denies
+        // on the recorded class before the offer set and the ledger
+        // bracket, so no pause state can authorize it.
+        if let Some(class) = providers::externally_blocked(connection) {
+            return Err(ModelError::ManualChoiceRejected {
+                attempt_id: attempt_id.to_string(),
+                connection: connection.to_string(),
+                cause: RejectionCause::ExternalBlocked { class },
             });
         }
         // The same recorded contract as the failed primary is refused for
@@ -1951,7 +1985,20 @@ impl Broker {
     /// `eligible` input — evaluated against the broker's CURRENT config
     /// view. A candidate failing any gate returns its typed cause and
     /// never receives the request.
+    ///
+    /// The recorded external block is the one gate this check has and the
+    /// ranking deliberately lacks: the denial belongs to the send
+    /// (AC-009), so a blocked id may still rank and prepare and is
+    /// refused here as [`RejectionCause::ExternalBlocked`] before
+    /// catalogue presence, the live-grant rule, the dialect claim and
+    /// entitlement.
     fn candidate_rejection(&self, purpose: &str, connection: &str) -> Option<RejectionCause> {
+        // AC-009: the recorded external block precedes every gate an
+        // adapter could influence — the dialect claim included — so no
+        // installed adapter can change the outcome.
+        if let Some(class) = providers::externally_blocked(connection) {
+            return Some(RejectionCause::ExternalBlocked { class });
+        }
         let Some(entry) = self.view_connections.get(connection) else {
             return Some(RejectionCause::UnknownConnection);
         };
@@ -2573,6 +2620,11 @@ fn rank_recorded(
 /// dialect `serves` gate (AC-046 keeps eligibility and dialect
 /// separate): a candidate's refusal cause — undeclared, live-grant
 /// gated or entitlement denied — in the same gate order.
+///
+/// The recorded external block is absent here too, and intentionally: it
+/// is a send-time denial (AC-009), so a blocked id still ranks and
+/// prepares and meets its typed refusal only when the walk or the send
+/// reaches it.
 fn rank_rejection(
     connections: &BTreeMap<String, Connection>,
     profiles: &BTreeMap<String, Profile>,

@@ -163,7 +163,7 @@ mod sys {
         pub fn getrlimit(resource: c_int, rlim: *mut Rlimit) -> c_int;
         pub fn close(fd: c_int) -> c_int;
         pub fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
-        pub fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int;
+        pub fn open(path: *const c_char, oflag: c_int, ...) -> c_int;
         pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
         pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
         pub fn __error() -> *mut c_int;

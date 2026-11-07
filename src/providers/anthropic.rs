@@ -71,10 +71,10 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 pub const MESSAGES_MAX_TOKENS: u64 = 8192;
 
 /// The protocol version every Messages request must carry.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// The recorded beta surface for the preserved-thinking drop policy.
-const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+pub(crate) const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// The recorded default base of the `anthropic` arm.
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -368,9 +368,9 @@ struct ThinkingLineage {
 
 /// One request's replay decision: the captured blocks to replay and
 /// whether the recorded drop policy rides the request.
-struct RequestBinding {
-    replay: Vec<Value>,
-    drop_block: bool,
+pub(crate) struct RequestBinding {
+    pub(crate) replay: Vec<Value>,
+    pub(crate) drop_block: bool,
 }
 
 /// The replay block state of one content block while it streams.
@@ -456,10 +456,9 @@ pub struct MessagesProvider {
     client: reqwest::blocking::Client,
     /// The one budget credential resolution, catalogue and stream share.
     deadline: Duration,
-    /// Assistant thinking sets, one per lineage.
-    lineages: BTreeMap<LineageKey, ThinkingLineage>,
-    /// How many replayed blocks the peer reported it dropped.
-    dropped_reasoning: u64,
+    /// The lineage, replay and stream-reduction codec the Messages send
+    /// and the Vertex resource projection share.
+    codec: MessagesCodec,
 }
 
 impl MessagesProvider {
@@ -605,8 +604,7 @@ impl MessagesProvider {
             store,
             client,
             deadline,
-            lineages: BTreeMap::new(),
-            dropped_reasoning: 0,
+            codec: MessagesCodec::new(connection),
         })
     }
 
@@ -644,7 +642,7 @@ impl MessagesProvider {
     /// How many replayed thinking blocks the peer reported dropping.
     #[must_use]
     pub fn dropped_reasoning(&self) -> u64 {
-        self.dropped_reasoning
+        self.codec.dropped_reasoning
     }
 
     fn catalog_within(
@@ -882,11 +880,37 @@ impl MessagesProvider {
         }
         .headers(forwarded_header_map(self.auth.forwarded()))
     }
+}
+
+/// The Messages request and stream codec — the one seam the Messages
+/// owners and the Vertex resource projection share. It owns the
+/// assistant thinking sets, one per conversation lineage, the replay
+/// decision those sets drive, and the per-stream reduction rules, so a
+/// replay, tool or usage rule cannot drift between arms.
+pub(crate) struct MessagesCodec {
+    /// The literal connection id every denial names.
+    connection: String,
+    /// Assistant thinking sets, one per lineage.
+    lineages: BTreeMap<LineageKey, ThinkingLineage>,
+    /// How many replayed blocks the peer reported it dropped.
+    dropped_reasoning: u64,
+}
+
+impl MessagesCodec {
+    /// The codec for one literal connection id: every denial it emits
+    /// names this id, and its lineage state starts empty.
+    pub(crate) fn new(connection: &str) -> Self {
+        Self {
+            connection: connection.to_string(),
+            lineages: BTreeMap::new(),
+            dropped_reasoning: 0,
+        }
+    }
 
     /// The frozen manifest as the Messages wire request: `system`
     /// top-level, the mandatory `max_tokens`, the declared client tools
     /// with `input_schema`, and any replayed assistant thinking set.
-    fn request_body(
+    pub(crate) fn request_body(
         &self,
         manifest: &RequestManifest,
         fixed: &FixedModel,
@@ -932,7 +956,7 @@ impl MessagesProvider {
     /// The replay decision for this manifest: an unchanged lineage and
     /// model replays its captured blocks; a mutation or model switch
     /// drops the set and requests the recorded drop policy.
-    fn binding(&mut self, manifest: &RequestManifest, model: &str) -> RequestBinding {
+    pub(crate) fn binding(&mut self, manifest: &RequestManifest, model: &str) -> RequestBinding {
         let key = lineage_key(manifest);
         if manifest.mutation_reason.is_some() {
             self.lineages.remove(&key);
@@ -960,7 +984,9 @@ impl MessagesProvider {
             drop_block: false,
         }
     }
+}
 
+impl MessagesProvider {
     /// An `Allowlist` arm records its whole serve set, a
     /// `SeedAndPrefix` arm its upstream-provider route family, the
     /// gateway's `KeyedRouteListing` its Messages family from the same
@@ -1167,14 +1193,20 @@ impl MessagesProvider {
             None => self.auto_model(manifest, token.as_deref(), started, offered.as_deref())?,
         };
         self.check_model(&fixed.model_id, offered.as_deref())?;
-        let binding = self.binding(manifest, &fixed.model_id);
-        let body = self.request_body(manifest, &fixed, &binding);
+        let binding = self.codec.binding(manifest, &fixed.model_id);
+        let body = self.codec.request_body(manifest, &fixed, &binding);
         let body_bytes = wire_body(&self.connection, &body)?;
         check_deadline(&self.connection, self.deadline, started)?;
         let mut response = self.post(token.as_deref(), body_bytes, binding.drop_block)?;
         let status = response.status();
         if status.is_success() {
-            return self.read_stream(manifest, &fixed.model_id, response, started);
+            return self.codec.read_stream(
+                manifest,
+                &fixed.model_id,
+                response,
+                self.deadline,
+                started,
+            );
         }
         if status == reqwest::StatusCode::BAD_REQUEST && !binding.replay.is_empty() {
             let failed =
@@ -1182,12 +1214,12 @@ impl MessagesProvider {
             if names_invalid_signature(&failed) {
                 // The body is permanently invalid; never replay its blocks
                 // on a later send even when the stripped retry also fails.
-                self.lineages.remove(&lineage_key(manifest));
+                self.codec.lineages.remove(&lineage_key(manifest));
                 let stripped = RequestBinding {
                     replay: Vec::new(),
                     drop_block: binding.drop_block,
                 };
-                let retry_body = self.request_body(manifest, &fixed, &stripped);
+                let retry_body = self.codec.request_body(manifest, &fixed, &stripped);
                 // Defensive: the HTTP seam cannot reach these two checks — the
                 // first leg's refusable body read already enforces the shared
                 // clock — so neither failure may ever be counted as a retry.
@@ -1218,7 +1250,13 @@ impl MessagesProvider {
                 // second attempt: the reply carries the count and the
                 // first leg's usage stays unknown. A retried leg that
                 // fails while its body streams crossed too.
-                let mut reply = match self.read_stream(manifest, &fixed.model_id, retry, started) {
+                let mut reply = match self.codec.read_stream(
+                    manifest,
+                    &fixed.model_id,
+                    retry,
+                    self.deadline,
+                    started,
+                ) {
                     Ok(reply) => reply,
                     Err(source) => {
                         return Err(ProviderError::Retried {
@@ -1233,14 +1271,17 @@ impl MessagesProvider {
         }
         Err(transport_status(&self.connection, status))
     }
+}
 
+impl MessagesCodec {
     /// Reads the SSE body through the shared bounded parser and reduces
     /// it to the one terminal the dialect can classify.
-    fn read_stream(
+    pub(crate) fn read_stream(
         &mut self,
         manifest: &RequestManifest,
         model: &str,
         mut response: reqwest::blocking::Response,
+        deadline: Duration,
         started: Instant,
     ) -> Result<ProviderReply, ProviderError> {
         let mut parser = SseParser::new();
@@ -1249,7 +1290,7 @@ impl MessagesProvider {
         loop {
             let read = read_chunk(
                 &self.connection,
-                self.deadline,
+                deadline,
                 &mut response,
                 &mut chunk,
                 started,
@@ -1264,7 +1305,7 @@ impl MessagesProvider {
                 self.on_event(manifest, &mut state, event)?;
             }
         }
-        check_deadline(&self.connection, self.deadline, started)?;
+        check_deadline(&self.connection, deadline, started)?;
         for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
             self.on_event(manifest, &mut state, event)?;
         }

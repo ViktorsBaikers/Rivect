@@ -3668,13 +3668,13 @@ impl ChatCompletionsProvider {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|key| !key.is_empty())
-            .ok_or_else(&malformed)?;
+            .ok_or_else(malformed)?;
         let project = parsed
             .get(OPENAI_PROJECT_HEADER)
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|scope| !scope.is_empty())
-            .ok_or_else(&malformed)?;
+            .ok_or_else(malformed)?;
         Ok(WireSecret {
             bearer: bearer.to_string(),
             project: Some(project.to_string()),
@@ -3763,14 +3763,14 @@ impl ChatCompletionsProvider {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|token| token.starts_with(PLAN_KEY_PREFIX))
-            .ok_or_else(&malformed)?;
+            .ok_or_else(malformed)?;
         // The recorded ingress normalization applied to the enrolled
         // base — the same rule the configured endpoint resolved under
         // at build, so the comparison is over the normalized bases.
         let enrolled = parsed
             .get("enterpriseUrl")
             .and_then(Value::as_str)
-            .ok_or_else(&malformed)?
+            .ok_or_else(malformed)?
             .trim()
             .trim_end_matches('/');
         if enrolled.is_empty() {
@@ -3824,7 +3824,7 @@ impl ChatCompletionsProvider {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|token| is_token_plan_key(token))
-                .ok_or_else(&malformed)?;
+                .ok_or_else(malformed)?;
             // The recorded optional members: non-string shapes are
             // material the parse never produces — denied; the cookie
             // is then dropped unread, the baseUrl binds the region.

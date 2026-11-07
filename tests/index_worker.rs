@@ -31,6 +31,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -859,12 +860,16 @@ fn uncapped_worker(request: &Query) -> (Result<QueryResult, ContextError>, Strin
             (observed.dev(), observed.ino())
         );
         assert_eq!(executable_hash(&mut executable), hash);
-        let mut custody = format!(
+        let custody = format!(
             "fixed uncapped worker: target={target:?} identity={:?} sha256={hash} pid={pid} held_stdin=true early_envelope=false status={status:?} stdout={out:?} stderr={err:?}",
             (identity.dev(), identity.ino())
         );
         #[cfg(target_os = "linux")]
-        custody.push_str(&format!(" native_before={before:?} native_after={after:?}"));
+        let custody = {
+            let mut custody = custody;
+            custody.push_str(&format!(" native_before={before:?} native_after={after:?}"));
+            custody
+        };
         (out, custody)
     }));
     let (bytes, custody) = match captured {
@@ -987,8 +992,9 @@ fn hostile_typescript_in_worker_ends_as_typed_bounded_failure() {
 fn worker_memory_cap_stops_hostile_parse_before_the_deadline() {
     let tree = hostile_tree("iw-cap");
     let request = search_query(QueryKind::Ast, &tree.path, "x < y");
+    let real = helper();
     let start = Instant::now();
-    let cause = cause_of(isolated(&request, &worker(), &helper(), None));
+    let cause = cause_of(isolated(&request, &worker(), &real, None));
     let elapsed = start.elapsed();
     println!("EVID-474 memory cap: {elapsed:?} -> {cause:?}");
     // macOS: the relative RLIMIT misses GLR's small blocks, so the
@@ -1302,8 +1308,10 @@ fn ast_query_past_the_deadline_ends_as_deadline_exceeded_never_a_partial_answer(
     let tree = slow_tree("iw-ast-deadline");
     let request = search_query(QueryKind::Ast, &tree.path, SLOW_PATTERN);
     let deadline = Duration::from_secs(1);
+    let program = worker();
+    let real = helper();
     let start = Instant::now();
-    let outcome = isolated(&request, &worker(), &helper(), start.checked_add(deadline));
+    let outcome = isolated(&request, &program, &real, start.checked_add(deadline));
     let elapsed = start.elapsed();
     println!("EVID-474 ast past deadline: {elapsed:?} -> {outcome:?}");
     assert_eq!(cause_of(outcome), IsolatedCause::DeadlineExceeded);

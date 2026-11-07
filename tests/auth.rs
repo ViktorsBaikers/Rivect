@@ -197,6 +197,8 @@ fn error_variant(err: &ProviderError) -> &'static str {
         ProviderError::CredentialBaseMismatch { .. } => "CredentialBaseMismatch",
         ProviderError::DialectMismatch { .. } => "DialectMismatch",
         ProviderError::DialectUnserved { .. } => "DialectUnserved",
+        ProviderError::ExternalBlocked { .. } => "ExternalBlocked",
+        ProviderError::ModelClassUnresolved { .. } => "ModelClassUnresolved",
         ProviderError::UnpinnedModel { .. } => "UnpinnedModel",
         ProviderError::RegionMismatch { .. } => "RegionMismatch",
         ProviderError::EndpointRequired { .. } => "EndpointRequired",

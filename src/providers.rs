@@ -124,6 +124,7 @@ pub mod openai;
 pub mod openai_login;
 pub mod routed;
 pub mod sse;
+pub mod vertex;
 pub mod vertex_login;
 pub mod zai_login;
 
@@ -501,6 +502,24 @@ pub enum ProviderError {
         connection: String,
         dialect: Dialect,
     },
+    /// The connection's recorded source class is externally blocked
+    /// (AC-009): the denial lands before any adapter's dialect claim and
+    /// before the ledger reserves the send, so no installed adapter, key
+    /// or PAYG substitute can change it. `class` names the recorded
+    /// block, never a second literal, and the variant carries no
+    /// credential material.
+    #[error("connection {connection} is externally blocked ({class})")]
+    ExternalBlocked {
+        connection: String,
+        class: &'static str,
+    },
+    /// The pinned model has no native class in a dual-class adapter: its
+    /// recorded catalogue `api` owner is neither of the classes this
+    /// adapter serves, so the request can never be projected onto a wire
+    /// resource. The class is never inferred from the model-name family
+    /// or the credential form, and the denial lands before any request.
+    #[error("connection {connection} resolves no native model class for {model}")]
+    ModelClassUnresolved { connection: String, model: String },
     /// The manifest carries no pinned model id for the wire request —
     /// an auto assignment resolves its model at catalogue time, which
     /// this adapter does not hold.
@@ -1470,9 +1489,10 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// auth label or a catalogue answer. `zenmux` records Chat Completions
 /// as its default and a Messages route for its metadata's Anthropic
 /// class, and `github-copilot` records Chat Completions as the default
-/// over its closed three-route table. `google-vertex`,
-/// `google-antigravity` and `google-gemini-cli` are distinct literal
-/// ids and stay unrouted until their own dialects land.
+/// over its closed three-route table. `google-vertex` records its own
+/// dual-class dialect; `google-antigravity` and `google-gemini-cli` are
+/// distinct literal ids that stay unrouted until their own dialects
+/// land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
@@ -1514,6 +1534,14 @@ pub enum Dialect {
     /// [`gitlab_workflow::GitlabWorkflowProvider`]: the REST setup chain
     /// plus the WebSocket workflow stream.
     GitlabWorkflow,
+    /// The Vertex AI dual-class dialect — the recorded class of the
+    /// literal `google-vertex` id, served by [`vertex::VertexProvider`]:
+    /// a model whose catalogue `api` owner is `google-vertex` rides the
+    /// publisher `streamGenerateContent` projection, and one owned by
+    /// `anthropic-messages` rides the regional `streamRawPredict`
+    /// resource. The class is resolved from the recorded catalogue row,
+    /// never from the model-name family.
+    Vertex,
 }
 
 impl std::fmt::Display for Dialect {
@@ -1528,7 +1556,21 @@ impl std::fmt::Display for Dialect {
             Self::CursorAgent => "cursor-agent",
             Self::DevinAgent => "devin-agent",
             Self::GitlabWorkflow => "gitlab-workflow",
+            Self::Vertex => "vertex",
         })
+    }
+}
+
+/// The recorded external block class for `connection`, if any (AC-009):
+/// `muse-code` denies on its recorded premise before any adapter's
+/// dialect claim and before the ledger reserves the send, so no installed
+/// adapter can change the outcome. [`muse_login::EXTERNAL_CLASS`] is the
+/// class's single source, and the id declares no [`dialect_for`] arm.
+#[must_use]
+pub fn externally_blocked(connection: &str) -> Option<&'static str> {
+    match connection {
+        "muse-code" => Some(muse_login::EXTERNAL_CLASS),
+        _ => None,
     }
 }
 
@@ -1555,6 +1597,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "gitlab-duo-agent" => Some(Dialect::GitlabWorkflow),
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
+        "google-vertex" => Some(Dialect::Vertex),
         "anthropic" => Some(Dialect::Messages),
         "minimax" => Some(Dialect::Messages),
         "umans" => Some(Dialect::Messages),

@@ -7,7 +7,9 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd as _;
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -2503,6 +2505,7 @@ fn identity_read_proceeds(already_armed: bool, elapsed: bool) -> bool {
     already_armed || !elapsed
 }
 
+#[cfg(target_os = "linux")]
 fn self_status_identity(
     boundary: &'static str,
     field: u8,
@@ -2694,6 +2697,7 @@ impl OwnedParentError {
         secondary.as_deref()
     }
 
+    #[cfg(target_os = "linux")]
     fn set_secondary(&mut self, error: Self) {
         let Self::Observation(OwnedParentObservation { secondary, .. }) = self;
         if secondary.is_none() {
@@ -3339,7 +3343,7 @@ struct DarwinVolumeAnswer {
 #[cfg(target_os = "macos")]
 const DARWIN_VOLUME_ANSWER_LEN: usize = 76;
 #[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::size_of::<DarwinVolumeAnswer>() == DARWIN_VOLUME_ANSWER_LEN);
+const _: () = assert!(size_of::<DarwinVolumeAnswer>() == DARWIN_VOLUME_ANSWER_LEN);
 
 #[cfg(target_os = "macos")]
 const ATTR_BIT_MAP_COUNT: u16 = 5;

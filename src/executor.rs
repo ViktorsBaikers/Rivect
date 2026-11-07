@@ -44,8 +44,10 @@ pub use macos::{
 /// copying its borrowed path does not transfer cleanup or launch authority.
 #[derive(Debug)]
 pub struct OwnedArtifact {
+    #[cfg(target_os = "linux")]
     directory: tempfile::TempDir,
     path: PathBuf,
+    #[cfg(target_os = "linux")]
     identity: FileIdentity,
     deadline: Instant,
 }
@@ -55,6 +57,14 @@ impl OwnedArtifact {
         Self::create_with_context(prefix, name, Instant::now() + CONFINED_DEADLINE, None)
     }
 
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            unused_variables,
+            unreachable_code,
+            reason = "non-Linux refuses artifact preparation before any allocation"
+        )
+    )]
     fn create_with_context(
         prefix: &str,
         name: &str,
@@ -84,8 +94,10 @@ impl OwnedArtifact {
         })?;
         let path = directory.path().join(name);
         Ok(Self {
+            #[cfg(target_os = "linux")]
             directory,
             path,
+            #[cfg(target_os = "linux")]
             identity: FileIdentity::from_metadata(&metadata),
             deadline,
         })
@@ -127,7 +139,9 @@ pub struct OwnedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub disposition: OwnedDisposition,
+    #[cfg(target_os = "linux")]
     stdout_capture: BoundedCapture,
+    #[cfg(target_os = "linux")]
     stderr_capture: BoundedCapture,
 }
 
@@ -369,6 +383,7 @@ pub struct PreparedLaunch {
     artifacts: Vec<OwnedArtifact>,
     filters: Vec<usize>,
     deadline: Instant,
+    #[cfg(target_os = "linux")]
     profile: rivect_sandbox_helper::OwnedProfile,
     capability: Option<CapabilityHold>,
 }
@@ -435,6 +450,7 @@ impl PreparedLaunch {
             artifacts: Vec::new(),
             filters: Vec::new(),
             deadline: Instant::now() + duration,
+            #[cfg(target_os = "linux")]
             profile,
             capability: None,
         }
@@ -633,7 +649,9 @@ impl PreparedLaunch {
                     stdout: observed.stdout,
                     stderr: observed.stderr,
                     disposition: OwnedDisposition::Unproven,
+                    #[cfg(target_os = "linux")]
                     stdout_capture,
+                    #[cfg(target_os = "linux")]
                     stderr_capture,
                 }))
             }
@@ -1144,6 +1162,7 @@ fn owned_release_result(
     Ok(primary)
 }
 
+#[cfg(target_os = "linux")]
 fn owned_terminal_status(
     terminal: Option<rivect_sandbox_helper::OwnedRecord>,
 ) -> Option<ExitStatus> {
@@ -1160,6 +1179,7 @@ enum OwnedObserve<S> {
     Stopped(S),
 }
 
+#[cfg(target_os = "linux")]
 fn owned_drain<T: Read>(
     pipe: &mut Option<T>,
     retained: &mut Vec<u8>,
@@ -1223,6 +1243,7 @@ fn owned_observed_stop(error: &WorkerError) -> Option<rivect_sandbox_helper::Own
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parent_spawn_error(source: std::io::Error) -> WorkerError {
     if source
         .get_ref()
@@ -1242,6 +1263,7 @@ fn parent_spawn_error(source: std::io::Error) -> WorkerError {
 }
 
 impl OwnedArtifact {
+    #[cfg(target_os = "linux")]
     fn close_verified(self) -> Result<(), WorkerError> {
         let locator = self.directory.path().to_path_buf();
         match std::fs::symlink_metadata(&locator) {
@@ -2360,6 +2382,13 @@ fn index_worker_command(helper: PathBuf, program: &Path) -> PreparedLaunch {
 /// variant keeps the failure typed by the seam it came from: a launch
 /// refusal the worker's own [`WorkerError`], a failed observation the
 /// [`std::io::Error`] that read produced.
+#[cfg_attr(
+    target_os = "macos",
+    expect(
+        variant_size_differences,
+        reason = "the typed worker error is carried inline on this refusal path; boxing it would add an allocation to a failure the caller records once"
+    )
+)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexRunError {
     /// The helper is not a file, or `Command::spawn` refused it.
@@ -2394,6 +2423,13 @@ pub(crate) enum IndexRunError {
 /// when `bounds.stop` asks, when its footprint crosses the memory budget
 /// (macOS) or when the deadline passes. The caller classifies what the
 /// worker answered; nothing here falls back in-process.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        unused_variables,
+        reason = "cancel and stop_kind own the Linux owned-launch protocol; macOS observes through spawn_legacy"
+    )
+)]
 pub(crate) fn run_index_worker<S>(
     helper: &Path,
     program: &Path,
@@ -2440,7 +2476,7 @@ pub(crate) fn run_index_worker<S>(
                 None => footprint_stop(leader).map(Err),
             },
         };
-        return match observe_bounded(&mut child, stdin, request, stdout, stderr, bounds) {
+        match observe_bounded(&mut child, stdin, request, stdout, stderr, bounds) {
             Ok(ObserveOutcome::Exited(output)) => Ok(ObserveOutcome::Exited(output)),
             Ok(ObserveOutcome::Stopped(Ok(reason))) => Ok(ObserveOutcome::Stopped(reason)),
             Ok(ObserveOutcome::Stopped(Err(error))) => Err(error),
@@ -2452,7 +2488,7 @@ pub(crate) fn run_index_worker<S>(
                 source,
                 worker_payload: false,
             }),
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     match command.run_owned(request, Some(cancel), bounds, stop_kind) {
@@ -2710,6 +2746,13 @@ pub(crate) enum ObserveOutcome<S> {
 /// and a wall deadline that kills the child: [`CONFINED_DEADLINE`],
 /// stdout retained up to [`READ_MAX_CAP`], no early stop. A signal death
 /// is [`WorkerError::ConfinedRunKilled`].
+#[cfg_attr(
+    all(target_os = "macos", not(test)),
+    expect(
+        dead_code,
+        reason = "the legacy macOS launch path observes through observe_bounded; this wrapper exists for the test twins that call it"
+    )
+)]
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn observe_confined_child(
     child: &mut Child,
@@ -8467,6 +8510,7 @@ fn run_check_phase(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let predicate = || cancel.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(target_os = "linux")]
     let bounds = ObserveBounds {
         deadline,
         stdout_cap: 0,
@@ -8500,7 +8544,7 @@ fn run_check_phase(
             })?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        return observe_check_phase(&mut child, stdout, stderr, cancel, deadline).map_err(map);
+        observe_check_phase(&mut child, stdout, stderr, cancel, deadline).map_err(map)
     }
     #[cfg(target_os = "linux")]
     match command.run_owned(&[], Some(&predicate), bounds, &|stop| match stop {
@@ -10631,7 +10675,12 @@ mod tests {
     /// An owning scratch root: the `TempDir` removes it when the test
     /// drops it, after every store and child declared below it.
     fn scratch_tree(tag: &str) -> tempfile::TempDir {
-        tempfile::TempDir::with_prefix(format!("rivect-check-unit-{tag}-"))
+        // Darwin's sockaddr_un and the canonical-cargo guard both need a short,
+        // already-canonical fixture root.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|error| unreachable!("the temporary root canonicalizes: {error}"));
+        tempfile::TempDir::with_prefix_in(format!("rc-{tag}-"), base)
             .unwrap_or_else(|error| unreachable!("the scratch root is created: {error}"))
     }
 

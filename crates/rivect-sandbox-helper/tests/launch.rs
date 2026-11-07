@@ -21,7 +21,9 @@ use std::os::fd::AsFd as _;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::os::unix::process::CommandExt as _;
 use std::os::unix::thread::{JoinHandleExt as _, RawPthread};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 

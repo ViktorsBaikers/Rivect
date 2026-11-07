@@ -1809,7 +1809,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = adc_file(directory.path(), &authorized_user_fixture());
         let sources = file_sources(&path, &peer.base);
-        let budget = ResolutionBudget::at(Instant::now() + Duration::from_millis(500));
+        let paused = Instant::now();
+        let budget =
+            ResolutionBudget::with_clock(paused + Duration::from_millis(500), move || paused);
 
         let error =
             resolve_within("vertex", &sources, &budget).expect_err("the leg's own budget ends it");
@@ -1977,7 +1979,9 @@ mod tests {
             unreachable!("a loopback peer is required");
         };
         let sources = metadata_sources(&peer.base);
-        let budget = ResolutionBudget::at(Instant::now() + Duration::from_millis(300));
+        let paused = Instant::now();
+        let budget =
+            ResolutionBudget::with_clock(paused + Duration::from_millis(300), move || paused);
 
         let result = resolve_within("vertex", &sources, &budget);
 
