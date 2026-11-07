@@ -14,9 +14,13 @@
 //! A current tier returns its bound project; a personal account without one
 //! falls back to [`ProjectSource`], and a Workspace/Standard tier requires
 //! that explicit project. A `SECURITY_POLICY_VIOLATED` (VPC-SC) load answer
-//! is the standard tier, never a success shim. The source operation schema
-//! carries no `error` field, so a finished operation without a project is a
-//! project-bound denial rather than a retry.
+//! denies typed with or without an explicit project — no tier is inferred.
+//! A tier entry may carry no id: a default entry without one selects the
+//! free tier, an absent default selects the legacy tier, and a bound current
+//! tier without an id stores the empty tier string, which documents only
+//! that upstream id's absence and is never an entitlement. The source
+//! operation schema carries no `error` field, so a finished operation without
+//! a project is a project-bound denial rather than a retry.
 //!
 //! Enrollment is create-only through [`CredentialStore::login`]: an occupied
 //! scope or a refused store operation denies and leaves the prior bytes
@@ -57,7 +61,6 @@ const PLATFORM: &str = "PLATFORM_UNSPECIFIED";
 /// The recorded tier ids the project rule reads.
 const FREE_TIER: &str = "free-tier";
 const LEGACY_TIER: &str = "legacy-tier";
-const STANDARD_TIER: &str = "standard-tier";
 
 /// The per-fetch bound of the post-callback provisioning calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -228,6 +231,7 @@ pub fn begin_login_with(
 /// [`LoginError::ConnectionMissing`]/[`LoginError::NotApiKey`] for the
 /// config binding; [`LoginError::Cancelled`] for a cancelled session;
 /// [`LoginError::Rejected`] for a refusing leg;
+/// [`LoginError::VpcScDenied`] for the recorded VPC-SC load answer;
 /// [`LoginError::ProjectRequired`] when the tier needs an explicit project;
 /// [`LoginError::ProjectUnbound`]/[`LoginError::ProvisioningTimedOut`] for
 /// the operation's terminal checks; the reply, serialization and store
@@ -301,6 +305,8 @@ pub fn read_profile(
 /// The canonical scoped Code Assist profile: the bearer, the bound project
 /// and the discovered tier. The token is redacted in `Debug`; the project and
 /// tier are scope identifiers and render verbatim, and unknown fields deny.
+/// An empty tier means the upstream current tier carried no id: it confers
+/// no tier entitlement.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodeAssistProfile {
@@ -332,7 +338,9 @@ impl CodeAssistProfile {
         &self.project
     }
 
-    /// The discovered tier the adapter applies its project rule to.
+    /// The discovered tier the adapter applies its project rule to. An empty
+    /// string means the upstream current tier carried no id; it confers no
+    /// tier entitlement and selects no tier rule.
     #[must_use]
     pub fn tier(&self) -> &str {
         &self.tier
@@ -414,6 +422,10 @@ pub enum LoginError {
         /// The peer's status code.
         status: u16,
     },
+    /// The load leg answered the recorded VPC-SC `SECURITY_POLICY_VIOLATED`
+    /// refusal; no tier is inferred from it.
+    #[error("the code assist identity leg answers a security policy violation")]
+    VpcScDenied,
     /// The tier needs an explicit project and the environment names none.
     #[error(
         "the code assist account requires an explicit project: set \
@@ -498,10 +510,11 @@ struct LoadCodeAssistPayload {
     allowed_tiers: Vec<Tier>,
 }
 
-/// One tier the account holds or may onboard.
+/// One tier the account holds or may onboard. The id is optional in the
+/// discovery DTO: an entry may be identified only by its `isDefault` flag.
 #[derive(Deserialize)]
 struct Tier {
-    id: String,
+    id: Option<String>,
     #[serde(rename = "isDefault", default)]
     is_default: bool,
 }
@@ -525,17 +538,11 @@ fn discover(connection: &str, session: &LoginSession) -> Result<Discovered, Logi
         &load_body(project),
         &headers,
     )?;
-    let data = if is_success(status) {
+    // The binding type is load-bearing: field access does not drive inference.
+    let data: LoadCodeAssistPayload = if is_success(status) {
         serde_json::from_value(payload).map_err(|cause| LoginError::MalformedResponse { cause })?
     } else if is_vpc_sc(&payload) {
-        LoadCodeAssistPayload {
-            project: None,
-            current_tier: Some(Tier {
-                id: STANDARD_TIER.to_string(),
-                is_default: false,
-            }),
-            allowed_tiers: Vec::new(),
-        }
+        return Err(LoginError::VpcScDenied);
     } else {
         return Err(LoginError::Rejected {
             leg: Leg::Identity,
@@ -549,12 +556,14 @@ fn discover(connection: &str, session: &LoginSession) -> Result<Discovered, Logi
             .ok_or(LoginError::ProjectRequired)?;
         return Ok(Discovered {
             project: bound.to_string(),
-            tier: tier.id,
+            tier: non_blank(tier.id.as_deref())
+                .unwrap_or_default()
+                .to_string(),
         });
     }
 
-    let tier = default_tier(&data.allowed_tiers).to_string();
-    if tier != FREE_TIER && project.is_none() {
+    let tier = default_tier(&data.allowed_tiers);
+    if tier.as_str() != FREE_TIER && project.is_none() {
         return Err(LoginError::ProjectRequired);
     }
     if session.is_cancelled() {
@@ -749,13 +758,15 @@ fn is_vpc_sc(payload: &Value) -> bool {
         })
 }
 
-/// The default tier the source derives from the allowed tiers: the entry
-/// flagged `isDefault`, else the legacy tier.
-fn default_tier(allowed: &[Tier]) -> &str {
-    allowed
-        .iter()
-        .find(|tier| tier.is_default)
-        .map_or(LEGACY_TIER, |tier| tier.id.as_str())
+/// The default tier the source derives from the allowed tiers: the id of the
+/// entry flagged `isDefault` — the free tier when that entry carries none —
+/// else the legacy tier.
+fn default_tier(allowed: &[Tier]) -> String {
+    // A present-but-blank id counts as absent: only a non-blank id names a tier.
+    allowed.iter().find(|tier| tier.is_default).map_or_else(
+        || LEGACY_TIER.to_string(),
+        |tier| non_blank(tier.id.as_deref()).map_or_else(|| FREE_TIER.to_string(), str::to_string),
+    )
 }
 
 /// The project an operation response binds: the recorded object's `id`.
@@ -873,21 +884,46 @@ mod tests {
     #[test]
     fn the_default_tier_falls_back_to_the_legacy_tier() {
         let free = Tier {
-            id: FREE_TIER.to_string(),
+            id: Some(FREE_TIER.to_string()),
             is_default: true,
         };
         let standard = Tier {
-            id: STANDARD_TIER.to_string(),
+            id: Some("standard-tier".to_string()),
             is_default: false,
         };
         assert_eq!(default_tier(&[standard, free]), FREE_TIER);
         assert_eq!(default_tier(&[]), LEGACY_TIER);
         assert_eq!(
             default_tier(&[Tier {
-                id: STANDARD_TIER.to_string(),
+                id: Some("standard-tier".to_string()),
                 is_default: false,
             }]),
             LEGACY_TIER
+        );
+    }
+
+    #[test]
+    fn a_default_tier_without_an_id_selects_the_free_tier() {
+        assert_eq!(
+            default_tier(&[Tier {
+                id: None,
+                is_default: true,
+            }]),
+            FREE_TIER
+        );
+        assert_eq!(
+            default_tier(&[Tier {
+                id: Some("  ".to_string()),
+                is_default: true,
+            }]),
+            FREE_TIER
+        );
+        assert_eq!(
+            default_tier(&[Tier {
+                id: Some("custom-tier".to_string()),
+                is_default: true,
+            }]),
+            "custom-tier"
         );
     }
 

@@ -10,14 +10,17 @@
 //!
 //! The file's `type` selects the exchange: `service_account` signs an
 //! RS256 assertion whose `aud` is the token endpoint and whose lifetime is
-//! 3600 s; `authorized_user` posts its refresh token; and
+//! 3600 s, through the platform's own safe signing API (OpenSSL off Apple,
+//! Security.framework on macOS) — never project-owned RSA arithmetic;
+//! `authorized_user` posts its refresh token; and
 //! `impersonated_service_account` resolves its own source credential first
 //! and then targets `projects/-/serviceAccounts/{target}` on the recorded
 //! IAM host — never the host the file's own URL names.
 //!
 //! Tokens are cached per source and endpoint and refreshed 60 s before
-//! expiry; one resolution runs at a time under a 30 s leg bound, so
-//! concurrent callers share the result. Secret material — tokens, the
+//! expiry. One resolution runs at a time under a single absolute 30 s
+//! budget that starts before the wait, so a parked caller and every leg
+//! share the same remaining time. Secret material — tokens, the
 //! private key, client secrets and refresh tokens — never enters `Debug`,
 //! `Display` or a diagnostic, and the resolved profile is written only
 //! through the create-only [`CredentialStore::login`] seam.
@@ -63,7 +66,9 @@ const ASSERTION_LIFETIME: u64 = 3600;
 /// before its own expiry (`google-auth.ts:65-67`).
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
 
-/// The shared resolution bound every exchange leg runs under
+/// The one absolute resolution budget: it starts before the single-flight
+/// wait and covers source selection/read, the signing and exchange chain,
+/// response parsing and the publication decision
 /// (`google-auth.ts:277`).
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -76,6 +81,7 @@ const METADATA_FLAVOR: &str = "Metadata-Flavor";
 /// The three endpoints the ADC legs reach. [`AdcEndpoints::recorded`] is
 /// the production form; an offline caller passes its own loopback contract
 /// peers.
+#[derive(Clone)]
 pub struct AdcEndpoints {
     /// The OAuth token exchange.
     pub token: String,
@@ -103,6 +109,7 @@ impl AdcEndpoints {
 /// [`AdcSources::from_environment`] is the operator form; a caller that
 /// owns the environment (an offline probe) passes the same fields
 /// explicitly.
+#[derive(Clone)]
 pub struct AdcSources {
     /// The file `GOOGLE_APPLICATION_CREDENTIALS` names; a named file that
     /// is missing denies instead of falling through.
@@ -346,6 +353,10 @@ pub enum LoginError {
     /// Every recorded source was exhausted.
     #[error("no application default credentials are available")]
     CredentialsMissing,
+    /// The shared resolution budget was exhausted, so no further leg may
+    /// start and no result may be published.
+    #[error("the credential resolution ran out of its shared budget")]
+    ResolutionTimedOut,
     /// The system clock is before the Unix epoch, so no expiry applies.
     #[error("system clock is before the unix epoch")]
     Clock {
@@ -384,6 +395,69 @@ static RESOLUTION: Mutex<()> = Mutex::new(());
 /// The token cache the skew governs.
 static TOKENS: Mutex<BTreeMap<CacheKey, CachedToken>> = Mutex::new(BTreeMap::new());
 
+/// One absolute resolution budget. It starts before the single-flight
+/// wait, so a parked caller and every downstream leg consume the same
+/// remaining time; an exhausted budget denies instead of starting a leg
+/// with a zero bound or publishing a late result.
+struct ResolutionBudget {
+    deadline: Instant,
+    /// The reading the budget consumes. Tests inject it so a spent leg and
+    /// a parked caller are proved without wall-clock sleeps; production
+    /// reads the system clock.
+    #[cfg(test)]
+    now: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl ResolutionBudget {
+    #[cfg(not(test))]
+    fn start() -> Self {
+        Self {
+            deadline: Instant::now() + RESOLVE_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn start() -> Self {
+        Self::at(Instant::now() + RESOLVE_TIMEOUT)
+    }
+
+    /// A budget that ends at `deadline`, read from `now`.
+    #[cfg(test)]
+    fn with_clock(deadline: Instant, now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self {
+            deadline,
+            now: std::sync::Arc::new(now),
+        }
+    }
+
+    /// A budget that ends at `deadline` under the system clock.
+    #[cfg(test)]
+    fn at(deadline: Instant) -> Self {
+        Self::with_clock(deadline, Instant::now)
+    }
+
+    #[cfg(not(test))]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    fn now(&self) -> Instant {
+        (self.now)()
+    }
+
+    /// The time left for the next leg or publication decision.
+    ///
+    /// # Errors
+    /// [`LoginError::ResolutionTimedOut`] once the budget is exhausted.
+    fn remaining(&self) -> Result<Duration, LoginError> {
+        self.deadline
+            .checked_duration_since(self.now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(LoginError::ResolutionTimedOut)
+    }
+}
+
 /// Resolves the ADC credential for one Vertex connection: the recorded
 /// source order, the file-type exchange, the 60 s refresh skew and the one
 /// shared resolution.
@@ -397,8 +471,20 @@ static TOKENS: Mutex<BTreeMap<CacheKey, CachedToken>> = Mutex::new(BTreeMap::new
 /// [`LoginError::MissingLocation`] before any read when the binding is
 /// incomplete; [`LoginError::GacFileMissing`] when the named file is
 /// absent; the file-shape denials; [`LoginError::CredentialsMissing`] when
-/// no source answers; and the typed exchange denials.
+/// no source answers; [`LoginError::ResolutionTimedOut`] when the one 30 s
+/// budget ends before a leg or the cache publication; and the typed
+/// exchange denials.
 pub fn resolve(connection: &str, sources: &AdcSources) -> Result<VertexCredential, LoginError> {
+    resolve_within(connection, sources, &ResolutionBudget::start())
+}
+
+/// One resolution under the caller's budget; the wait, the source read,
+/// every leg and the cache publication each consume what is left.
+fn resolve_within(
+    connection: &str,
+    sources: &AdcSources,
+    budget: &ResolutionBudget,
+) -> Result<VertexCredential, LoginError> {
     if sources.raw_env_token {
         return Err(LoginError::RawTokenRefused);
     }
@@ -409,18 +495,24 @@ pub fn resolve(connection: &str, sources: &AdcSources) -> Result<VertexCredentia
         return Err(LoginError::MissingLocation);
     };
     let _flight = RESOLUTION.lock().unwrap_or_else(PoisonError::into_inner);
+    budget.remaining()?;
+    // shortcut: a credential-file read is not interruptible, so the budget
+    // is re-checked right after it and no leg starts on spent time; upgrade
+    // if a blocking (non-regular) source path is ever admitted.
     let loaded = load(sources)?;
+    budget.remaining()?;
     let source = loaded.source();
     let key = cache_key(source, loaded.file(), sources);
     if let Some(cached) = cached_token(&key)? {
         return Ok(credential(source, project, location, cached));
     }
     let token = match &loaded {
-        Loaded::File(_, _, file) => token_for(connection, sources, file)?,
+        Loaded::File(_, _, file) => token_for(connection, sources, file, budget)?,
         Loaded::Metadata => {
-            metadata_token(connection, sources)?.ok_or(LoginError::CredentialsMissing)?
+            metadata_token(connection, sources, budget)?.ok_or(LoginError::CredentialsMissing)?
         }
     };
+    budget.remaining()?;
     remember(key, &token);
     Ok(credential(source, project, location, token))
 }
@@ -431,17 +523,84 @@ pub fn resolve(connection: &str, sources: &AdcSources) -> Result<VertexCredentia
 ///
 /// # Errors
 /// [`LoginError::Provider`] for an unknown connection or an unresolvable
-/// binding, the [`resolve`] denials, and the store's typed denial
-/// (including [`ProviderError::CredentialOccupied`] on an enrolled scope).
+/// binding, the [`resolve`] denials (including
+/// [`LoginError::ResolutionTimedOut`], which the publication step can also
+/// return), and the store's typed denial (including
+/// [`ProviderError::CredentialOccupied`] on an enrolled scope).
 pub fn login(
     config: &Config,
     connection: &str,
     sources: &AdcSources,
     store: &dyn CredentialStore,
 ) -> Result<String, LoginError> {
+    login_within(
+        config,
+        connection,
+        sources,
+        store,
+        &ResolutionBudget::start(),
+    )
+}
+
+/// [`login`] under the caller's budget; the exchange and the publication
+/// decision each consume what is left.
+fn login_within(
+    config: &Config,
+    connection: &str,
+    sources: &AdcSources,
+    store: &dyn CredentialStore,
+    budget: &ResolutionBudget,
+) -> Result<String, LoginError> {
     let reference = resolve_credential(config, connection)?;
-    let credential = resolve(connection, sources)?;
+    let credential = resolve_within(connection, sources, budget)?;
+    budget.remaining()?;
     store.login(&reference, &serialize(&credential)?)?;
+    Ok(reference.profile().to_string())
+}
+
+/// Explicitly refreshes the stored Vertex credential: it re-runs the
+/// recorded source chain for a fresh token while the stored project and
+/// location stay untouched, so `source`, `access_token` and `expires_at`
+/// are rewritten to describe the artifact actually obtained. A failed or
+/// exhausted exchange writes nothing; the store's own scoped `refresh` is
+/// the only write path.
+///
+/// # Errors
+/// [`LoginError::Provider`] when the scope is empty or the store fails,
+/// [`LoginError::StoredCredentialMalformed`] when the material is not a
+/// vertex credential, and the [`resolve`] denials (including
+/// [`LoginError::ResolutionTimedOut`], which the publication step can also
+/// return).
+pub fn refresh(
+    store: &dyn CredentialStore,
+    reference: &SecretRef,
+    sources: &AdcSources,
+) -> Result<String, LoginError> {
+    refresh_within(store, reference, sources, &ResolutionBudget::start())
+}
+
+/// [`refresh`] under the caller's budget; the exchange and the
+/// publication decision each consume what is left.
+fn refresh_within(
+    store: &dyn CredentialStore,
+    reference: &SecretRef,
+    sources: &AdcSources,
+    budget: &ResolutionBudget,
+) -> Result<String, LoginError> {
+    let stored = read(store, reference)?;
+    let mut bound = sources.clone();
+    bound.project = Some(stored.project.clone());
+    bound.location = Some(stored.location.clone());
+    let fresh = resolve_within(reference.profile(), &bound, budget)?;
+    let updated = VertexCredential {
+        source: fresh.source,
+        project: stored.project,
+        location: stored.location,
+        access_token: fresh.access_token,
+        expires_at: fresh.expires_at,
+    };
+    budget.remaining()?;
+    store.refresh(reference, &serialize(&updated)?)?;
     Ok(reference.profile().to_string())
 }
 
@@ -619,15 +778,20 @@ fn token_for(
     connection: &str,
     sources: &AdcSources,
     file: &AdcFile,
+    budget: &ResolutionBudget,
 ) -> Result<TokenReply, LoginError> {
     match file {
-        AdcFile::ServiceAccount(account) => service_account_exchange(connection, sources, account),
-        AdcFile::AuthorizedUser(user) => authorized_user_exchange(connection, sources, user),
+        AdcFile::ServiceAccount(account) => {
+            service_account_exchange(connection, sources, account, budget)
+        }
+        AdcFile::AuthorizedUser(user) => {
+            authorized_user_exchange(connection, sources, user, budget)
+        }
         AdcFile::Impersonated {
             url,
             delegates,
             source,
-        } => impersonation_exchange(connection, sources, url, delegates, source),
+        } => impersonation_exchange(connection, sources, url, delegates, source, budget),
     }
 }
 
@@ -636,6 +800,7 @@ fn service_account_exchange(
     connection: &str,
     sources: &AdcSources,
     account: &ServiceAccountFile,
+    budget: &ResolutionBudget,
 ) -> Result<TokenReply, LoginError> {
     if account.client_email.is_empty() {
         return Err(LoginError::MissingField {
@@ -648,6 +813,7 @@ fn service_account_exchange(
         });
     }
     admit(&sources.endpoints.token, TOKEN_URL, EndpointClass::Token)?;
+    let timeout = budget.remaining()?;
     let assertion = jwt_assertion(account, &sources.endpoints.token)?;
     let fields = [
         ("grant_type", JWT_BEARER_GRANT),
@@ -657,6 +823,7 @@ fn service_account_exchange(
         connection,
         &sources.endpoints.token,
         EndpointClass::Token,
+        timeout,
         Body::Form(&fields),
         &[],
     )?;
@@ -668,8 +835,10 @@ fn authorized_user_exchange(
     connection: &str,
     sources: &AdcSources,
     user: &AuthorizedUserFile,
+    budget: &ResolutionBudget,
 ) -> Result<TokenReply, LoginError> {
     admit(&sources.endpoints.token, TOKEN_URL, EndpointClass::Token)?;
+    let timeout = budget.remaining()?;
     let fields = [
         ("client_id", user.client_id.as_str()),
         ("client_secret", user.client_secret.as_str()),
@@ -680,6 +849,7 @@ fn authorized_user_exchange(
         connection,
         &sources.endpoints.token,
         EndpointClass::Token,
+        timeout,
         Body::Form(&fields),
         &[],
     )?;
@@ -687,13 +857,15 @@ fn authorized_user_exchange(
 }
 
 /// Resolves the source credential, then exchanges it at the recorded IAM
-/// host for the target service account's access token.
+/// host for the target service account's access token. The source leg
+/// consumes the shared budget, so the IAM leg runs only on what is left.
 fn impersonation_exchange(
     connection: &str,
     sources: &AdcSources,
     url: &str,
     delegates: &[String],
     source: &AdcFile,
+    budget: &ResolutionBudget,
 ) -> Result<TokenReply, LoginError> {
     admit(
         &sources.endpoints.iam,
@@ -701,7 +873,8 @@ fn impersonation_exchange(
         EndpointClass::Impersonation,
     )?;
     let target = impersonated_target(url)?;
-    let source_token = token_for(connection, sources, source)?;
+    let source_token = token_for(connection, sources, source, budget)?;
+    let timeout = budget.remaining()?;
     let base = sources.endpoints.iam.trim_end_matches('/');
     let endpoint = format!("{base}/projects/-/serviceAccounts/{target}:generateAccessToken");
     let payload = serde_json::json!({
@@ -714,6 +887,7 @@ fn impersonation_exchange(
         connection,
         &endpoint,
         EndpointClass::Impersonation,
+        timeout,
         Body::Json(&payload),
         &[("authorization", authorization.as_str())],
     )?;
@@ -762,19 +936,22 @@ fn impersonated_target(url: &str) -> Result<String, LoginError> {
     Ok(target.to_string())
 }
 
-/// The metadata leg under its 2 s bound. An unreachable or non-success
-/// endpoint is the recorded no-source fallback, not an error.
+/// The metadata leg under `min(2 s, remaining)`. An unreachable or
+/// non-success endpoint is the recorded no-source fallback; an already
+/// exhausted shared budget denies typed before the leg starts.
 fn metadata_token(
     connection: &str,
     sources: &AdcSources,
+    budget: &ResolutionBudget,
 ) -> Result<Option<TokenReply>, LoginError> {
     admit(
         &sources.endpoints.metadata,
         METADATA_URL,
         EndpointClass::Metadata,
     )?;
+    let timeout = budget.remaining()?.min(METADATA_TIMEOUT);
     let started = Instant::now();
-    let Ok(client) = login_common::client(connection, METADATA_TIMEOUT) else {
+    let Ok(client) = login_common::client(connection, timeout) else {
         return Ok(None);
     };
     let Ok(mut response) = client
@@ -787,7 +964,7 @@ fn metadata_token(
     if !response.status().is_success() {
         return Ok(None);
     }
-    let body = match read_catalog_body(connection, METADATA_TIMEOUT, &mut response, started) {
+    let body = match read_catalog_body(connection, timeout, &mut response, started) {
         Ok(body) => body,
         // A partial read of an unreachable endpoint is the same no-source
         // fallback as an unanswered connection.
@@ -801,23 +978,24 @@ fn metadata_token(
     Ok(Some(token_reply(&reply)?))
 }
 
-/// One bounded POST parsed as the recorded reply object.
+/// One POST under the remaining budget, parsed as the recorded reply
+/// object.
 fn post_reply(
     connection: &str,
     endpoint: &str,
     class: EndpointClass,
+    timeout: Duration,
     body: Body<'_>,
     headers: &[(&str, &str)],
 ) -> Result<Value, LoginError> {
-    let (mut response, started) =
-        login_common::post(connection, endpoint, RESOLVE_TIMEOUT, body, headers)?;
+    let (mut response, started) = login_common::post(connection, endpoint, timeout, body, headers)?;
     if !response.status().is_success() {
         return Err(LoginError::ExchangeRejected {
             class,
             status: response.status().as_u16(),
         });
     }
-    let body = read_catalog_body(connection, RESOLVE_TIMEOUT, &mut response, started)?;
+    let body = read_catalog_body(connection, timeout, &mut response, started)?;
     serde_json::from_slice(&body).map_err(|cause| LoginError::MalformedResponse {
         reason: login_common::malformed_reason(&cause),
     })
@@ -863,7 +1041,7 @@ fn jwt_assertion(account: &ServiceAccountFile, audience: &str) -> Result<String,
         "iat": now,
     });
     let unsigned = format!("{}.{}", encode_json(&header)?, encode_json(&claims)?);
-    let signature = rsa::sign_sha256(&account.private_key, unsigned.as_bytes())?;
+    let signature = sign_sha256(&account.private_key, unsigned.as_bytes())?;
     Ok(format!(
         "{unsigned}.{}",
         login_common::base64url(&signature)
@@ -1005,327 +1183,100 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     Some(era * 146_097 + day_of_era - 719_468)
 }
 
+/// The DER bytes of the service account's unencrypted PKCS#8 key: PEM
+/// armor stripped, or the bare base64 body an ADC file may carry.
+#[cfg(not(target_os = "macos"))]
+fn key_der(pem: &str) -> Result<Vec<u8>, LoginError> {
+    let mut body = String::with_capacity(pem.len());
+    for line in pem.lines() {
+        let line = line.trim();
+        if line.starts_with("-----") {
+            continue;
+        }
+        body.push_str(line);
+    }
+    if body.is_empty() {
+        return Err(LoginError::PrivateKeyUnusable);
+    }
+    login_common::base64url_decode(&body).ok_or(LoginError::PrivateKeyUnusable)
+}
+
 /// The RS256 signer the service-account exchange needs: a PKCS#8 RSA key
-/// in, an RSASSA-PKCS1-v1_5/SHA-256 signature out.
+/// in, an RSASSA-PKCS1-v1_5/SHA-256 signature out. A direct service-account
+/// file and the service-account source of an impersonation chain use this
+/// one signer, and no project-owned RSA arithmetic exists anywhere.
 ///
-/// `sha2` is the shipped hash and no admitted crate exposes raw RSA
-/// signing, so the modulus arithmetic is the project's own: `u64` limbs
-/// over the Montgomery form, only as wide as one key.
-mod rsa {
-    use super::LoginError;
-    use sha2::Digest as _;
-    use std::cmp::Ordering;
+/// Off Apple the admitted safe API is OpenSSL: PKCS#8 import plus a
+/// SHA-256, PKCS#1 v1.5 `Signer`.
+#[cfg(not(target_os = "macos"))]
+fn sign_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>, LoginError> {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Padding;
+    use openssl::sign::Signer;
 
-    /// The DigestInfo prefix for SHA-256 (RFC 8017 §9.2).
-    const SHA256_DIGEST_INFO: [u8; 19] = [
-        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-        0x05, 0x00, 0x04, 0x20,
-    ];
+    let Ok(key) = PKey::private_key_from_pkcs8(&key_der(pem)?) else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    let Ok(mut signer) = Signer::new(MessageDigest::sha256(), &key) else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    // A non-RSA key and any other padding class are refused here, before a
+    // signature exists.
+    let Ok(()) = signer.set_rsa_padding(Padding::PKCS1) else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    let Ok(()) = signer.update(message) else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    let Ok(signature) = signer.sign_to_vec() else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    Ok(signature)
+}
 
-    /// One parsed key: the modulus width in bytes and both operands.
-    struct RsaKey {
-        size: usize,
-        modulus: Vec<u64>,
-        private_exponent: Vec<u64>,
+/// On macOS the admitted safe API is Security.framework: an import of the
+/// armored bytes that names no keychain destination, then
+/// `RSASignatureMessagePKCS1v15SHA256`. The null keychain is a source
+/// fact; non-persistence is HZN-106 proof, not inferred here.
+#[cfg(target_os = "macos")]
+fn sign_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>, LoginError> {
+    use security_framework::key::Algorithm;
+    use security_framework::os::macos::import_export::{ImportOptions, SecItems};
+
+    let mut items = SecItems::default();
+    let Ok(()) = ImportOptions::new()
+        .filename("key.pem")
+        .items(&mut items)
+        .import(&armored(pem))
+    else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    let Some(key) = items.keys.first() else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    let Ok(signature) = key.create_signature(Algorithm::RSASignatureMessagePKCS1v15SHA256, message)
+    else {
+        return Err(LoginError::PrivateKeyUnusable);
+    };
+    Ok(signature)
+}
+
+/// The bytes `SecItemImport` reads: a bare base64 body is wrapped in the
+/// same armor, so both existing key forms import.
+#[cfg(target_os = "macos")]
+fn armored(pem: &str) -> Vec<u8> {
+    if pem.contains("-----BEGIN") {
+        return pem.as_bytes().to_vec();
     }
-
-    /// Signs `message` with the PEM-wrapped PKCS#8 private key.
-    pub(super) fn sign_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>, LoginError> {
-        let key = private_key(pem)?;
-        let digest = sha2::Sha256::digest(message);
-        let em = encode_sha256(&digest, key.size)?;
-        let signature = mod_pow(&limbs(&em), &key.private_exponent, &key.modulus);
-        Ok(to_bytes(&signature, key.size))
-    }
-
-    /// The PKCS#1 v1.5 encoding: `00 01 FF.. 00 || DigestInfo || digest`.
-    fn encode_sha256(digest: &[u8], size: usize) -> Result<Vec<u8>, LoginError> {
-        let tail = SHA256_DIGEST_INFO.len() + digest.len();
-        let padding = size
-            .checked_sub(3 + tail)
-            .filter(|padding| *padding >= 8)
-            .ok_or(LoginError::PrivateKeyUnusable)?;
-        let mut em = Vec::with_capacity(size);
-        em.extend_from_slice(&[0x00, 0x01]);
-        em.extend(std::iter::repeat_n(0xff, padding));
-        em.push(0x00);
-        em.extend_from_slice(&SHA256_DIGEST_INFO);
-        em.extend_from_slice(digest);
-        Ok(em)
-    }
-
-    /// The modulus and private exponent of a PEM-wrapped PKCS#8 RSA key.
-    fn private_key(pem: &str) -> Result<RsaKey, LoginError> {
-        let body = pem_body(pem)?;
-        let der =
-            super::login_common::base64url_decode(&body).ok_or(LoginError::PrivateKeyUnusable)?;
-        let inner = pkcs8_private_key(&der).ok_or(LoginError::PrivateKeyUnusable)?;
-        let (modulus, exponent) = rsap_private_key(inner).ok_or(LoginError::PrivateKeyUnusable)?;
-        Ok(RsaKey {
-            size: modulus.len(),
-            modulus: limbs(modulus),
-            private_exponent: limbs(exponent),
-        })
-    }
-
-    /// The armor-free PEM body; a body with no content is refused.
-    fn pem_body(pem: &str) -> Result<String, LoginError> {
-        let mut body = String::with_capacity(pem.len());
-        for line in pem.lines() {
-            let line = line.trim();
-            if line.starts_with("-----") {
-                continue;
-            }
-            body.push_str(line);
-        }
-        if body.is_empty() {
-            return Err(LoginError::PrivateKeyUnusable);
-        }
-        Ok(body)
-    }
-
-    /// The PKCS#8 `PrivateKeyInfo`'s inner `RSAPrivateKey` OCTET STRING.
-    fn pkcs8_private_key(der: &[u8]) -> Option<&[u8]> {
-        let (tag, outer, _) = tlv(der)?;
-        if tag != 0x30 {
-            return None;
-        }
-        let (tag, _version, rest) = tlv(outer)?;
-        if tag != 0x02 {
-            return None;
-        }
-        let (tag, _algorithm, rest) = tlv(rest)?;
-        if tag != 0x30 {
-            return None;
-        }
-        let (tag, inner, _) = tlv(rest)?;
-        if tag != 0x04 {
-            return None;
-        }
-        Some(inner)
-    }
-
-    /// The `RSAPrivateKey`'s modulus and private exponent; every member is
-    /// a positive DER INTEGER, so a truncated or negative one is refused.
-    fn rsap_private_key(der: &[u8]) -> Option<(&[u8], &[u8])> {
-        let (tag, body, _) = tlv(der)?;
-        if tag != 0x30 {
-            return None;
-        }
-        let (tag, _version, rest) = tlv(body)?;
-        if tag != 0x02 {
-            return None;
-        }
-        let (tag, modulus, rest) = tlv(rest)?;
-        if tag != 0x02 {
-            return None;
-        }
-        let (tag, _public_exponent, rest) = tlv(rest)?;
-        if tag != 0x02 {
-            return None;
-        }
-        let (tag, private_exponent, _) = tlv(rest)?;
-        if tag != 0x02 {
-            return None;
-        }
-        Some((
-            positive_integer(modulus)?,
-            positive_integer(private_exponent)?,
-        ))
-    }
-
-    /// `tag, value, rest` of one DER element; definite lengths only.
-    fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-        let (&tag, rest) = input.split_first()?;
-        let (&first, rest) = rest.split_first()?;
-        let (length, rest) = if first & 0x80 == 0 {
-            (usize::from(first), rest)
-        } else {
-            let count = usize::from(first & 0x7f);
-            if count == 0 || count > 4 {
-                return None;
-            }
-            let (bytes, rest) = rest.split_at_checked(count)?;
-            let mut length = 0usize;
-            for &byte in bytes {
-                length = (length << 8) | usize::from(byte);
-            }
-            (length, rest)
-        };
-        let (value, rest) = rest.split_at_checked(length)?;
-        Some((tag, value, rest))
-    }
-
-    /// A positive INTEGER without its sign padding; a negative or zero
-    /// INTEGER is refused.
-    fn positive_integer(integer: &[u8]) -> Option<&[u8]> {
-        let (&first, _) = integer.split_first()?;
-        if first & 0x80 != 0 {
-            return None;
-        }
-        let start = integer.iter().position(|byte| *byte != 0)?;
-        Some(&integer[start..])
-    }
-
-    /// Big-endian bytes as little-endian `u64` limbs.
-    fn limbs(bytes: &[u8]) -> Vec<u64> {
-        let mut limbs = Vec::with_capacity(bytes.len().div_ceil(8));
-        for chunk in bytes.rchunks(8) {
-            let mut limb = 0u64;
-            for &byte in chunk {
-                limb = (limb << 8) | u64::from(byte);
-            }
-            limbs.push(limb);
-        }
-        limbs
-    }
-
-    /// A limb vector as fixed-width big-endian bytes.
-    fn to_bytes(limbs: &[u64], width: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; width];
-        for (index, limb) in limbs.iter().enumerate() {
-            for byte in 0..8 {
-                let position = index * 8 + byte;
-                if position < width {
-                    bytes[width - 1 - position] = ((limb >> (byte * 8)) & 0xff) as u8;
-                }
-            }
-        }
-        bytes
-    }
-
-    /// `base^exponent mod modulus` over `u64` limbs. Both operands are
-    /// already reduced and the modulus is odd, so the Montgomery form
-    /// applies.
-    pub(super) fn mod_pow(base: &[u64], exponent: &[u64], modulus: &[u64]) -> Vec<u64> {
-        let width = modulus.len();
-        let inverse = mont_inverse(modulus[0]);
-        let r_squared = r_squared(modulus);
-        let mut one = vec![0u64; width];
-        one[0] = 1;
-        let base = mont_mul(base, &r_squared, modulus, inverse);
-        let mut accumulator = mont_mul(&one, &r_squared, modulus, inverse);
-        for limb in exponent.iter().rev() {
-            for bit in (0..64).rev() {
-                accumulator = mont_mul(&accumulator, &accumulator, modulus, inverse);
-                if (limb >> bit) & 1 == 1 {
-                    accumulator = mont_mul(&accumulator, &base, modulus, inverse);
-                }
-            }
-        }
-        mont_mul(&accumulator, &one, modulus, inverse)
-    }
-
-    /// `-n0^{-1} mod 2^64`, the Montgomery reduction factor.
-    fn mont_inverse(n0: u64) -> u64 {
-        let mut inverse = 1u64;
-        for _ in 0..6 {
-            inverse = inverse.wrapping_mul(2u64.wrapping_sub(n0.wrapping_mul(inverse)));
-        }
-        inverse.wrapping_neg()
-    }
-
-    /// `a * b * R^{-1} mod n` for inputs below `n`.
-    fn mont_mul(a: &[u64], b: &[u64], n: &[u64], inverse: u64) -> Vec<u64> {
-        let width = n.len();
-        let mut wide = vec![0u64; 2 * width + 2];
-        for i in 0..width {
-            let mut carry = 0u128;
-            for j in 0..width {
-                let sum = u128::from(a[i]) * u128::from(b[j]) + u128::from(wide[i + j]) + carry;
-                wide[i + j] = sum as u64;
-                carry = sum >> 64;
-            }
-            add_at(&mut wide, i + width, carry);
-        }
-        for i in 0..width {
-            let factor = wide[i].wrapping_mul(inverse);
-            let mut carry = 0u128;
-            for j in 0..width {
-                let sum = u128::from(factor) * u128::from(n[j]) + u128::from(wide[i + j]) + carry;
-                wide[i + j] = sum as u64;
-                carry = sum >> 64;
-            }
-            add_at(&mut wide, i + width, carry);
-        }
-        let mut result = wide[width..=(2 * width)].to_vec();
-        if result[width] != 0 || compare(&result[..width], n) != Ordering::Less {
-            subtract(&mut result, n);
-        }
-        result.truncate(width);
-        result
-    }
-
-    /// Adds a 128-bit value at `index`, carrying upward. The wide buffer
-    /// always has room for the final carry.
-    fn add_at(wide: &mut [u64], index: usize, value: u128) {
-        let mut carry = value;
-        let mut i = index;
-        while carry != 0 {
-            let Some(slot) = wide.get_mut(i) else {
-                return;
-            };
-            let sum = u128::from(*slot) + (carry & u128::from(u64::MAX));
-            *slot = sum as u64;
-            carry = (carry >> 64) + (sum >> 64);
-            i += 1;
-        }
-    }
-
-    /// `result -= n` with the borrow absorbed by the wider `result`.
-    fn subtract(result: &mut [u64], n: &[u64]) {
-        let mut borrow = 0u64;
-        for (index, slot) in result.iter_mut().enumerate() {
-            let word = n.get(index).copied().unwrap_or(0);
-            let (difference, first) = slot.overflowing_sub(word);
-            let (difference, second) = difference.overflowing_sub(borrow);
-            *slot = difference;
-            borrow = u64::from(first | second);
-        }
-    }
-
-    /// Big-endian limb comparison of two equally wide vectors.
-    fn compare(left: &[u64], right: &[u64]) -> Ordering {
-        for (a, b) in left.iter().rev().zip(right.iter().rev()) {
-            match a.cmp(b) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-        }
-        Ordering::Equal
-    }
-
-    /// `R^2 mod n`, built by two rounds of modular doubling over `R`.
-    fn r_squared(n: &[u64]) -> Vec<u64> {
-        let mut value = vec![0u64; n.len()];
-        value[0] = 1;
-        for _ in 0..(2 * 64 * n.len()) {
-            value = double_mod(&value, n);
-        }
-        value
-    }
-
-    /// `2 * value mod n`.
-    fn double_mod(value: &[u64], n: &[u64]) -> Vec<u64> {
-        let width = n.len();
-        let mut wide = vec![0u64; width + 1];
-        let mut carry = 0u64;
-        for i in 0..width {
-            wide[i] = (value[i] << 1) | carry;
-            carry = value[i] >> 63;
-        }
-        wide[width] = carry;
-        if wide[width] != 0 || compare(&wide[..width], n) != Ordering::Less {
-            subtract(&mut wide, n);
-        }
-        wide.truncate(width);
-        wide
-    }
+    let label = "PRIVATE KEY";
+    format!("-----BEGIN {label}-----\n{pem}\n-----END {label}-----\n").into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::StoreKind;
 
     /// A 2048-bit PKCS#8 RSA fixture (test-only, openssl generated).
     const FIXTURE_KEY: &str = concat!(
@@ -1340,27 +1291,20 @@ mod tests {
     }
 
     #[test]
-    fn tiny_modulus_pow_matches_the_textbook_vector() {
-        // The textbook key: n = 3233, e = 17, d = 2753; 2790^2753 = 65.
-        assert_eq!(rsa::mod_pow(&[65], &[17], &[3233]), vec![2790]);
-        assert_eq!(rsa::mod_pow(&[2790], &[2753], &[3233]), vec![65]);
-    }
-
-    #[test]
     fn signature_matches_the_openssl_vector() {
         // openssl dgst -sha256 -sign over the same message and fixture key.
         let expected = login_common::base64url_decode(
             "oqVUUavrPqZeGMMeYgFEFljC7azyn5T4QH2VlTT+4qfo46Ie+kLunbF7Dp8FT16+bX1BIJlAN8iImm0zlnhmJc/LhVMhqSB9hTh5CA8en/kefIgAsK0UHmLMApeszmmNSYjkMdjBkXAsl6pi+S8+KLJHEmO/5KL3gfOGe8smfkMPtRIzbONQIp9d6/Nyz0D5fKbt+llRiS15pRuRqIV4gC6RmaJXoA6sWBTOkLP59l7OOoC5MX+EaTzeFBi6lBvoN6TUeUZ9cKxPl9pD7pJms53HMTYTMUOthGRw/Ri0/RBURyuyMjNtrf7NT75bSp2eL4h+IUIe+N/BU+DxobffNw==",
-        );
-        let signature = rsa::sign_sha256(
-            &fixture_pem(),
-            b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJmaXh0dXJlIn0",
         )
-        .ok();
+        .expect("the vector decodes");
+        let message = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJmaXh0dXJlIn0";
+        let signature = sign_sha256(&fixture_pem(), message).expect("the fixture key signs");
         assert_eq!(
             signature, expected,
             "the signature matches the openssl vector"
         );
+        let other = sign_sha256(&fixture_pem(), b"another message").expect("the same key signs");
+        assert_ne!(other, expected, "the vector discriminates the message");
     }
 
     #[test]
@@ -1368,9 +1312,60 @@ mod tests {
         let label = "PRIVATE KEY";
         let empty = format!("-----BEGIN {label}-----\n-----END {label}-----\n");
         assert!(matches!(
-            rsa::sign_sha256(&empty, b"x"),
+            sign_sha256(&empty, b"x"),
             Err(LoginError::PrivateKeyUnusable)
         ));
+    }
+
+    /// A PKCS#8 EC key (test-only, openssl generated): the signer must
+    /// refuse anything that is not RSA.
+    const EC_FIXTURE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgzCzurki+F2E2cxXc8yR0sUGz+h0sDYxcx/1TWMPcgWChRANCAATpAoQbpTOYNiKLyYnEinso7DFjkEjbahxFFAscXKXY6Q3opa9Lei2WP+E8bg1D2wEdAeC52qDnG8bKOsnhDcGE";
+
+    #[test]
+    fn a_non_rsa_key_is_refused_without_leaking_it() {
+        match sign_sha256(EC_FIXTURE_KEY, b"x") {
+            Ok(_signature) => unreachable!("an ec key must not produce an rs256 signature"),
+            Err(error) => {
+                assert!(matches!(error, LoginError::PrivateKeyUnusable), "{error}");
+                assert!(!error.to_string().contains(EC_FIXTURE_KEY), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_der_is_refused_without_leaking_it() {
+        // Decodes as base64 but is not a whole PKCS#8 structure.
+        let truncated = &FIXTURE_KEY[..48];
+        match sign_sha256(truncated, b"x") {
+            Ok(_signature) => unreachable!("a truncated der must not sign"),
+            Err(error) => {
+                assert!(matches!(error, LoginError::PrivateKeyUnusable), "{error}");
+                assert!(!error.to_string().contains(truncated), "{error}");
+            }
+        }
+    }
+
+    /// The fixture key re-encrypted as a PKCS#8 `EncryptedPrivateKeyInfo`
+    /// (test-only; `openssl pkcs8 -topk8 -inform DER -v2 aes-256-cbc`). The
+    /// signer is given no passphrase, so the import must deny instead of
+    /// prompting or guessing.
+    const ENCRYPTED_FIXTURE_KEY: &str = concat!(
+        "MIIFNTBfBgkqhkiG9w0BBQ0wUjAxBgkqhkiG9w0BBQwwJAQQ6qSB8x71XhDHloqve6D9UwICCAAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEELbj/ngB9XJV0H/e3SMsDrgEggTQcc9IudIOfZfa/MUOb0iT9Iw0sHX3cYySxYPvfTGn5+ZR8xcoPSGQNn3b3qMbYXj0D+RMizd8aPi9yz6WYLbJCT12Oe+92Dp4Lczemi6ed/tBLOwNyOdCskRqmAhwqWHNoaI0NiuGQNBAwWXeGTUx6xZ7uWZKJVQtVajGIXvYo73AnOLVS0zSvVc3UZV4M43FyTAfv5goKA6bsL0M/mIm7X20Z7jFD+kdX9Z8YpY7Emz553HNmdnuptdow1UVPiezk1XSg14i0N8/xUj/lhp8oI76IFFrsdOgEaEIyDo90nN774r1LeNYGVwVSINPg2Nkfazd8fefKfuCfWt7l351VTlFkKgRElK5FCe6D0Fld42SUwxEgfNESm9jCHdOoSr2Q4/ra2ROLFV6tZalr5Yg1BYNXzggyBccmLOYB4jWHt8T6m5L51OOwWzt18aAVsXP+9S33uqUjJd0h7xg9+BKZ5Ml7dWYR3ez24j9Ra1yod8ih1OS3Kk+TY+Gw6d2yJtJaqttIk62kXMl3iZsHRl7sUYXqzPjsjR7LVtuD/XAaMpJfglfypRmwTYJyYUB6wuXYWeD5QxZSgDUfK7HfzZtpQ1gEKbhZKjYYu+tvFaIk+647p+4ZSWd7usBlH9dW/L9BaTEM/rLJBRhDTvueFT84ynVdlk3n9u0cZOKIHELxZ3E14so8zMPoazvugfiRMHxhIDzgMGvgN0XIpStJpK9SFdniyOxaVWJUBudONodkd+uKAvsyfhLEV9s5MGmNomre1xbaC9WdE2XF2XEA0pbsNumxoB4yLRDvQG8emp5/EZ67zWVAqnfTavzGPkr4DSjgSJ8mUh/lod45/lsR4etzyZZ3pP8SzoOy1wJbpbyaqlp9KfQ1QwbsWr7TVo6XiBubxJhdivSNS2fQvsbCv2jgMkb+ixakzgnXjUA+/2uBh/8XleOBnHgJ0Q4KrJmGI+opLmZDegr/OZCPp5e9cSLQaGRlyueSolPU3/Q5D0nMTgMGxRmDUbSLmyjiA9EPMfoGmwFrViq1FjDrNS3qvMwR/Vc0f5l75hB547pwcqjoIQAkVtEy4w8nHmYz5BoszcmfzB1mZJr3DfFye9GsPLP5xV3M0eZhk3BXHeC+RmEFjqyG2n+jdETSBZDyrWO7Bwo9s8QsYKEE1fiKqK4WcaE5kcpy/UyGCVoNKMX3grpPwE5LH6uz/bYrNNDxc0uUla8QivsEgvF34vR94phLjNtEGE6jfQuY8LXT7F0XeOd5zTyvLQW154Ld2wO3H358/7MMkgCpOx+sCfShsl+HIlwE4ayoeVAaVYB2+9o1Blg9z3tSrOgVgFrGjRmPPlKA+3u/bcy3EpFwrEEhnCdTXVTU4nwLH448LQT7lHmBLUhmiWns3CZG0T2f6W6yV6QwGD2p08+f9heCEWl6X8MOcxDLSkOwnV75V+5CgsrSWLTMc/noKEHsu2FW+raSLp7jzMxjilX3jkj6Q62FF6zNQAaUqRWX5QmbApvc9rIkwlJAUUZ2MrCKylf/2UL7YhzUmYzYhu7lJff/3QHRNIr61jCbCSMFujL26xpKQA5Oli8rhr06HhGEYccQb1YVSWwL+JcxlK3J+Vidpu9WE5jWiUxV9nPDuuX0wJ4dtLHSISI+gg=",
+        "\n",
+    );
+
+    #[test]
+    fn an_encrypted_key_without_a_passphrase_is_refused() {
+        match sign_sha256(ENCRYPTED_FIXTURE_KEY, b"x") {
+            Ok(_signature) => unreachable!("an encrypted key must not sign without a passphrase"),
+            Err(error) => {
+                assert!(matches!(error, LoginError::PrivateKeyUnusable), "{error}");
+                assert!(
+                    !error.to_string().contains(ENCRYPTED_FIXTURE_KEY),
+                    "{error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1397,5 +1392,626 @@ mod tests {
             Some("value")
         );
         assert_eq!(ambient_from(&["third"], lookup), None);
+    }
+
+    /// The sources a budget test needs: a named file that does not exist,
+    /// so a read would surface as [`LoginError::GacFileMissing`] instead of
+    /// the budget denial under test.
+    fn absent_file_sources() -> AdcSources {
+        AdcSources {
+            gac_file: Some(PathBuf::from("absent-key.json")),
+            user_adc_file: None,
+            project: Some("fixture-project".to_string()),
+            location: Some("us-central1".to_string()),
+            raw_env_token: false,
+            endpoints: AdcEndpoints::recorded(),
+        }
+    }
+
+    fn adc_file(directory: &Path, value: &Value) -> PathBuf {
+        let path = directory.join("gac.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(value).expect("the fixture serializes"),
+        )
+        .expect("the fixture writes");
+        path
+    }
+
+    fn authorized_user_fixture() -> Value {
+        serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "fixture-client-id",
+            "client_secret": "fixture-client-secret",
+            "refresh_token": "fixture-refresh",
+        })
+    }
+
+    fn service_account_fixture() -> Value {
+        serde_json::json!({
+            "type": "service_account",
+            "client_email": "fixture@example.iam.gserviceaccount.com",
+            "private_key": fixture_pem(),
+            "private_key_id": "fixture-key-id",
+        })
+    }
+
+    fn token_payload() -> String {
+        serde_json::json!({"access_token": "token-fixture-refresh", "expires_in": 3600}).to_string()
+    }
+
+    /// The sources one file-backed resolution needs, pointed at `base`.
+    fn file_sources(path: &Path, base: &str) -> AdcSources {
+        AdcSources {
+            gac_file: Some(path.to_path_buf()),
+            user_adc_file: None,
+            project: Some("fixture-project".to_string()),
+            location: Some("us-central1".to_string()),
+            raw_env_token: false,
+            endpoints: AdcEndpoints {
+                token: format!("{base}/token"),
+                metadata: format!("{base}/metadata"),
+                iam: format!("{base}/iam"),
+            },
+        }
+    }
+
+    /// The sources that fall through to the metadata leg of `base`.
+    fn metadata_sources(base: &str) -> AdcSources {
+        AdcSources {
+            gac_file: None,
+            user_adc_file: None,
+            project: Some("fixture-project".to_string()),
+            location: Some("us-central1".to_string()),
+            raw_env_token: false,
+            endpoints: AdcEndpoints {
+                token: format!("{base}/token"),
+                metadata: format!("{base}/metadata"),
+                iam: format!("{base}/iam"),
+            },
+        }
+    }
+
+    fn vertex_config() -> Config {
+        Config::parse_validated(
+            "config_version = 1\n\
+             [connections.vertex]\n\
+             kind = \"api_key\"\n\
+             endpoint = \"https://us-central1-aiplatform.googleapis.com\"\n\
+             credential_ref = \"keychain:rivect-test/vertex\"\n\
+             [models.defaults]\n\
+             model = { mode = \"auto\" }\n\
+             effort = { mode = \"auto\" }\n\
+             fallback = { mode = \"auto\" }\n",
+        )
+        .expect("the vertex config parses")
+    }
+
+    /// A budget whose clock advances by `step` on every reading, so a
+    /// named guard can be spent without wall-clock sleeps: the readings
+    /// below `deadline` pass and the one at `deadline` denies.
+    fn step_budget(base: Instant, step: Duration, deadline: Duration) -> ResolutionBudget {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        ResolutionBudget::with_clock(base + deadline, move || {
+            base + step * calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    /// One loopback peer that records each request line and answers it; the
+    /// accept loop stops when [`TestPeer::finish`] or its drop runs.
+    struct TestPeer {
+        base: String,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestPeer {
+        fn start(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> Option<Self> {
+            use std::io::Write as _;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            listener.set_nonblocking(true).ok()?;
+            let base = format!("http://{}", listener.local_addr().ok()?);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .spawn(move || {
+                    while !flag.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _address)) => {
+                                let Some(line) = read_request_line(&mut stream) else {
+                                    continue;
+                                };
+                                recorded
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .push(line.clone());
+                                let payload = answer(&line);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                    payload.len()
+                                );
+                                drop(stream.write_all(response.as_bytes()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::park_timeout(Duration::from_millis(1));
+                            }
+                            Err(_error) => break,
+                        }
+                    }
+                })
+                .ok()?;
+            Some(Self {
+                base,
+                seen,
+                stop,
+                handle: Some(handle),
+            })
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Stops the accept loop and joins its thread, so every request the
+        /// test made is recorded before it reads the list.
+        fn finish(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    impl Drop for TestPeer {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+
+    /// A peer whose answer waits out `delay`: a leg bounded by less than
+    /// that ends only by its own budget.
+    fn slow_answer_peer(delay: Duration) -> Option<TestPeer> {
+        TestPeer::start(move |_line| {
+            wait_for(delay);
+            token_payload()
+        })
+    }
+
+    /// Waits out the whole duration; `park_timeout` may wake spuriously.
+    fn wait_for(delay: Duration) {
+        let deadline = Instant::now() + delay;
+        while let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        {
+            std::thread::park_timeout(left);
+        }
+    }
+
+    /// Reads one request's head and body and answers its request line, so
+    /// the client's write never blocks.
+    fn read_request_line(stream: &mut std::net::TcpStream) -> Option<String> {
+        use std::io::Read as _;
+
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = head_end + 4;
+        while buffer.len() < body_start + length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        head.lines().next().map(str::to_string)
+    }
+
+    const STORE_SCOPE: &str = "rivect-test/vertex";
+    const STORED_VERTEX: &str = "{\"source\":\"gac_file\",\"project\":\"fixture-project\",\"location\":\"us-central1\",\"access_token\":\"stale-token\",\"expires_at\":1}";
+
+    /// A create-only in-memory store: the publication proofs read their
+    /// prior bytes back.
+    struct TestStore {
+        entries: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl TestStore {
+        fn empty() -> Self {
+            Self {
+                entries: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn with(scope: &str, secret: &[u8]) -> Self {
+            let store = Self::empty();
+            store
+                .entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(scope.to_string(), secret.to_vec());
+            store
+        }
+
+        fn bytes(&self, scope: &str) -> Option<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(scope)
+                .cloned()
+        }
+    }
+
+    impl CredentialStore for TestStore {
+        fn kind(&self) -> StoreKind {
+            StoreKind::Keychain
+        }
+
+        fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(credential.scope()))
+        }
+
+        fn entry_accounts(&self, _service: &str) -> Result<Vec<String>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if entries.contains_key(credential.scope()) {
+                return Err(ProviderError::CredentialOccupied {
+                    scope: credential.scope().to_string(),
+                });
+            }
+            entries.insert(credential.scope().to_string(), secret.to_vec());
+            drop(entries);
+            Ok(())
+        }
+
+        fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+            self.bytes(credential.scope())
+                .ok_or_else(|| ProviderError::CredentialAbsent {
+                    scope: credential.scope().to_string(),
+                })
+        }
+
+        fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(credential.scope().to_string(), secret.to_vec());
+            Ok(())
+        }
+
+        fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(credential.scope())
+                .map(|_| ())
+                .ok_or_else(|| ProviderError::CredentialAbsent {
+                    scope: credential.scope().to_string(),
+                })
+        }
+
+        fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+            self.revoke(credential)
+        }
+    }
+
+    #[test]
+    fn an_exhausted_budget_denies_before_any_source_read() {
+        let budget = ResolutionBudget::at(Instant::now());
+
+        let result = resolve_within("vertex", &absent_file_sources(), &budget);
+
+        assert!(matches!(result, Err(LoginError::ResolutionTimedOut)));
+    }
+
+    #[test]
+    fn a_budget_spent_while_the_source_is_read_denies() {
+        let Some(peer) = TestPeer::start(|_line| token_payload()) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = adc_file(directory.path(), &authorized_user_fixture());
+        let sources = file_sources(&path, &peer.base);
+        // A cached token makes the re-check after the read the only guard
+        // between the wait and a successful resolution.
+        let warm = ResolutionBudget::at(Instant::now() + Duration::from_secs(30));
+        resolve_within("vertex", &sources, &warm).expect("the token is cached");
+        let base = Instant::now();
+        let budget = step_budget(base, Duration::from_secs(20), Duration::from_secs(15));
+
+        let error =
+            resolve_within("vertex", &sources, &budget).expect_err("the read spends the budget");
+
+        assert!(matches!(error, LoginError::ResolutionTimedOut), "{error}");
+        assert_eq!(
+            peer.requests().len(),
+            1,
+            "the cached token needs no exchange"
+        );
+    }
+
+    #[test]
+    fn a_parked_caller_consumes_its_own_budget() {
+        let base = Instant::now();
+        let waited = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = std::sync::Arc::clone(&waited);
+        let budget = ResolutionBudget::with_clock(base + Duration::from_millis(150), move || {
+            base + Duration::from_millis(observed.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let sources = absent_file_sources();
+        let (announced, hearing) = std::sync::mpsc::sync_channel(1);
+        let guard = RESOLUTION.lock().unwrap_or_else(PoisonError::into_inner);
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                announced.send(()).expect("the announce lands");
+                resolve_within("vertex", &sources, &budget)
+            })
+            .expect("the parked caller starts");
+
+        // The announce arrives while this thread holds the slot, so the
+        // caller is waiting when the clock moves past its whole budget.
+        hearing
+            .recv()
+            .expect("the caller announces before it waits");
+        waited.store(250, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+
+        match handle.join() {
+            Ok(result) => assert!(matches!(result, Err(LoginError::ResolutionTimedOut))),
+            Err(_panic) => unreachable!("the parked caller thread panicked"),
+        }
+    }
+
+    #[test]
+    fn the_token_leg_is_bounded_by_the_injected_budget() {
+        let Some(mut peer) = slow_answer_peer(Duration::from_secs(2)) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = adc_file(directory.path(), &authorized_user_fixture());
+        let sources = file_sources(&path, &peer.base);
+        let budget = ResolutionBudget::at(Instant::now() + Duration::from_millis(500));
+
+        let error =
+            resolve_within("vertex", &sources, &budget).expect_err("the leg's own budget ends it");
+
+        peer.finish();
+        assert!(
+            matches!(error, LoginError::Provider(ProviderError::Transport { .. })),
+            "{error}"
+        );
+        assert_eq!(
+            peer.requests(),
+            vec!["POST /token HTTP/1.1".to_string()],
+            "the leg's one bounded exchange"
+        );
+    }
+
+    #[test]
+    fn a_source_leg_that_spends_the_budget_stops_the_iam_leg() {
+        let elapsed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let spent = std::sync::Arc::clone(&elapsed);
+        let Some(peer) = TestPeer::start(move |_line| {
+            spent.store(120_000, std::sync::atomic::Ordering::SeqCst);
+            token_payload()
+        }) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let file = serde_json::json!({
+            "type": "impersonated_service_account",
+            "service_account_impersonation_url": format!(
+                "{}/v1/projects/-/serviceAccounts/target@example.iam.gserviceaccount.com:generateAccessToken",
+                peer.base
+            ),
+            "source_credentials": service_account_fixture(),
+        });
+        let path = adc_file(directory.path(), &file);
+        let sources = file_sources(&path, &peer.base);
+        let base = Instant::now();
+        let observed = std::sync::Arc::clone(&elapsed);
+        let budget = ResolutionBudget::with_clock(base + Duration::from_secs(30), move || {
+            base + Duration::from_millis(observed.load(std::sync::atomic::Ordering::SeqCst))
+        });
+
+        let error = resolve_within("vertex", &sources, &budget)
+            .expect_err("the source leg spends the budget");
+
+        assert!(matches!(error, LoginError::ResolutionTimedOut), "{error}");
+        let requests = peer.requests();
+        assert_eq!(requests.len(), 1, "only the source exchange ran");
+        assert!(
+            !requests
+                .iter()
+                .any(|line| line.contains(":generateAccessToken")),
+            "the iam leg never started: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn a_budget_spent_at_the_exchange_is_neither_cached_nor_written() {
+        let elapsed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let spent = std::sync::Arc::clone(&elapsed);
+        let Some(peer) = TestPeer::start(move |_line| {
+            spent.store(120_000, std::sync::atomic::Ordering::SeqCst);
+            token_payload()
+        }) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = adc_file(directory.path(), &authorized_user_fixture());
+        let sources = file_sources(&path, &peer.base);
+        let base = Instant::now();
+        let observed = std::sync::Arc::clone(&elapsed);
+        let budget = ResolutionBudget::with_clock(base + Duration::from_secs(30), move || {
+            base + Duration::from_millis(observed.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let store = TestStore::empty();
+        let config = vertex_config();
+
+        let error = login_within(&config, "vertex", &sources, &store, &budget)
+            .expect_err("the exchange spends the budget before publication");
+
+        assert!(matches!(error, LoginError::ResolutionTimedOut), "{error}");
+        assert!(store.bytes(STORE_SCOPE).is_none(), "nothing is published");
+        let live = ResolutionBudget::at(Instant::now() + Duration::from_secs(30));
+        resolve_within("vertex", &sources, &live).expect("the live budget resolves");
+        assert_eq!(
+            peer.requests().len(),
+            2,
+            "the spent exchange left no cached token"
+        );
+    }
+
+    #[test]
+    fn a_budget_spent_before_login_writes_nothing() {
+        let Some(peer) = TestPeer::start(|_line| token_payload()) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = adc_file(directory.path(), &authorized_user_fixture());
+        let sources = file_sources(&path, &peer.base);
+        let warm = ResolutionBudget::at(Instant::now() + Duration::from_secs(30));
+        resolve_within("vertex", &sources, &warm).expect("the token is cached");
+        let store = TestStore::with(STORE_SCOPE, STORED_VERTEX.as_bytes());
+        // Two readings fit before the cached token returns; the publication
+        // reading is past the deadline.
+        let budget = step_budget(
+            Instant::now(),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+
+        let error = login_within(&vertex_config(), "vertex", &sources, &store, &budget)
+            .expect_err("the publication budget is spent");
+
+        assert!(matches!(error, LoginError::ResolutionTimedOut), "{error}");
+        assert_eq!(
+            store.bytes(STORE_SCOPE),
+            Some(STORED_VERTEX.as_bytes().to_vec()),
+            "the prior bytes are untouched"
+        );
+        assert_eq!(
+            peer.requests().len(),
+            1,
+            "the cached token serves the resolve"
+        );
+    }
+
+    #[test]
+    fn a_budget_spent_before_refresh_writes_nothing() {
+        let Some(peer) = TestPeer::start(|_line| token_payload()) else {
+            unreachable!("a loopback peer is required");
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = adc_file(directory.path(), &authorized_user_fixture());
+        let sources = file_sources(&path, &peer.base);
+        let warm = ResolutionBudget::at(Instant::now() + Duration::from_secs(30));
+        resolve_within("vertex", &sources, &warm).expect("the token is cached");
+        let store = TestStore::with(STORE_SCOPE, STORED_VERTEX.as_bytes());
+        let reference = SecretRef::parse("keychain:rivect-test/vertex").expect("the reference");
+        let budget = step_budget(
+            Instant::now(),
+            Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+
+        let error = refresh_within(&store, &reference, &sources, &budget)
+            .expect_err("the publication budget is spent");
+
+        assert!(matches!(error, LoginError::ResolutionTimedOut), "{error}");
+        assert_eq!(
+            store.bytes(STORE_SCOPE),
+            Some(STORED_VERTEX.as_bytes().to_vec()),
+            "the prior bytes are untouched"
+        );
+        assert_eq!(
+            peer.requests().len(),
+            1,
+            "the cached token serves the resolve"
+        );
+    }
+
+    #[test]
+    fn the_metadata_leg_is_bounded_by_the_remaining_budget() {
+        let Some(mut peer) = slow_answer_peer(Duration::from_millis(1_500)) else {
+            unreachable!("a loopback peer is required");
+        };
+        let sources = metadata_sources(&peer.base);
+        let budget = ResolutionBudget::at(Instant::now() + Duration::from_millis(300));
+
+        let result = resolve_within("vertex", &sources, &budget);
+
+        peer.finish();
+        assert!(
+            matches!(result, Err(LoginError::CredentialsMissing)),
+            "the metadata leg ran past the remaining budget"
+        );
+        assert_eq!(
+            peer.requests(),
+            vec!["GET /metadata HTTP/1.1".to_string()],
+            "the leg's one bounded metadata request"
+        );
+    }
+
+    #[test]
+    fn the_metadata_leg_stops_at_its_recorded_bound() {
+        assert_eq!(
+            METADATA_TIMEOUT,
+            Duration::from_secs(2),
+            "the recorded metadata bound"
+        );
+        let Some(mut peer) = slow_answer_peer(Duration::from_secs(3)) else {
+            unreachable!("a loopback peer is required");
+        };
+        let sources = metadata_sources(&peer.base);
+        let budget = ResolutionBudget::at(Instant::now() + Duration::from_secs(10));
+
+        let result = resolve_within("vertex", &sources, &budget);
+
+        peer.finish();
+        assert!(
+            matches!(result, Err(LoginError::CredentialsMissing)),
+            "the metadata leg ran past its 2 s bound"
+        );
     }
 }

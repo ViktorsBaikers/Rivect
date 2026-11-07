@@ -118,12 +118,14 @@ pub mod gitlab_agent_login;
 pub mod gitlab_workflow;
 pub mod local;
 pub(crate) mod login_common;
+pub mod muse_login;
 pub mod ollama_cloud;
 pub mod openai;
 pub mod openai_login;
 pub mod routed;
 pub mod sse;
 pub mod vertex_login;
+pub mod zai_login;
 
 /// The one catalogue record both dialect owners share (DEC-007):
 /// defined once in the local adapter, re-exported here so the

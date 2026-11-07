@@ -161,6 +161,18 @@ tempfile = "3.27.0"
 # `keychain` feature = the legacy-file keychain store (SRC-010 records the
 # feature name); the crate ships no default features.
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+# HZN-106/DEC-014: the vetted RS256 signer is the platform's own safe
+# import/sign API — an import that names no keychain destination plus
+# RSASignatureMessagePKCS1v15SHA256, never project-owned RSA arithmetic.
+# The null keychain is a source fact; non-persistence is HZN-106 proof.
+security-framework = "3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# HZN-106/DEC-014: the same vetted signer off Apple — OpenSSL's PKCS#8
+# import plus its SHA-256/PKCS#1 v1.5 Signer. No vendored/bindgen/aws-lc
+# engine and no global install; the resolved crate is already the graph's
+# native-tls provider.
+openssl = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Exactly one rt/crypto feature is required; SRC-010 pins rt-tokio-crypto-rust.
