@@ -2534,6 +2534,20 @@ fn note_open_failure(view: &mut LocalView, failure: &TuiOpenError) {
 /// Esc. 64 events covers a realistic paste-tail burst by a wide margin.
 const PRE_PAINT_DRAIN_CAP: usize = 64;
 
+/// Test observation seam for the drain above: when this holds a path, the
+/// loop writes [`PAINT_BARRIER_TOKEN`] there after a card opening's drain,
+/// so a PTY leg can order its next key after both the first-paint stamp and
+/// that drain. Unset, nothing is written and no other behaviour changes.
+#[cfg(test)]
+const PAINT_BARRIER_ENV: &str = "RIVECT_TEST_PAINT_BARRIER";
+
+/// The order token the seam stamps: written only after the opening frame
+/// rendered and its pre-paint queue was drained. It is an ordering marker
+/// for the leg's next key, not proof that every earlier queued byte is
+/// gone — the drain itself is bounded.
+#[cfg(test)]
+const PAINT_BARRIER_TOKEN: &str = "post-render,post-drain";
+
 /// The continuation the near-full warning names — the same token the
 /// composer parses, so the printed command and the accepted input cannot
 /// diverge (DEC-014).
@@ -3144,6 +3158,23 @@ where
                     break;
                 }
                 read()?;
+            }
+            // Test observation seam: the first frame is stamped and its
+            // pre-paint queue is drained, so the order token this file
+            // carries places a PTY leg's next key after both steps — an
+            // ordering marker, not proof that nothing was queued earlier.
+            // Unset, nothing is written.
+            #[cfg(test)]
+            if let Some(path) = std::env::var_os(PAINT_BARRIER_ENV) {
+                // Staged then renamed: the parent polls this path and must
+                // never observe it between create and write.
+                let staged = Path::new(&path).with_extension("staged");
+                if let Err(error) = std::fs::write(&staged, PAINT_BARRIER_TOKEN)
+                    .and_then(|()| std::fs::rename(&staged, &path))
+                {
+                    close_window(&mut send_owner, &mut tui_dispatch);
+                    return Err(error);
+                }
             }
         }
         let polled = match poll(POLL_INTERVAL) {
@@ -5171,7 +5202,7 @@ mod pty_session {
     fn stored_read_fault_rejects_stale_success_and_surfaces_at_finish() {
         // Stale success: `ready` is already in the stream.
         let (session, path, faults) = ready(SLEEPER);
-        faults.fail_next_read.store(true, Ordering::SeqCst);
+        faults.fail_next_read(INJECTED_READ);
         let stale = wait_for_screen_text(&session, 24, 80, "ready", Duration::from_secs(1));
         let finished = session.finish();
         let gone = !path.exists();
@@ -5187,7 +5218,7 @@ mod pty_session {
 
         // Fault taken only at finish: step (2) precedes step (3).
         let (mut session, path, faults) = ready(READER);
-        faults.fail_next_read.store(true, Ordering::SeqCst);
+        faults.fail_next_read(INJECTED_READ);
         must(session.send(b"\n"), "pty send");
         let exit = session.wait_exit(Duration::from_secs(10));
         let finished = session.finish();
@@ -5201,21 +5232,75 @@ mod pty_session {
 
         // `pump_for` returns the fault it took, never `Ok` at its deadline.
         let (mut session, path, faults) = ready(SLEEPER);
-        faults.fail_next_read.store(true, Ordering::SeqCst);
+        faults.fail_next_read(INJECTED_READ);
         let pumped = session.pump_for(Duration::from_secs(1));
-        let armed = faults.fail_next_read.load(Ordering::SeqCst);
+        let armed = faults.armed_read_faults();
         let finished = session.finish();
         let gone = !path.exists();
         assert!(
             matches!(&pumped, Err(PtyIoError::Read { source }) if source.to_string() == INJECTED_READ),
             "{pumped:?}"
         );
-        assert!(!armed, "that pump's read took the armed fault");
+        assert_eq!(armed, 0, "that pump's read took the armed fault");
         assert!(
             finished.is_ok(),
             "the returned fault is not reported again: {finished:?}"
         );
         assert!(gone);
+    }
+
+    #[test]
+    fn a_later_distinct_read_fault_neither_replaces_the_first_nor_stops_draining() {
+        const FIRST: &str = "first injected pty read fault";
+        const SECOND: &str = "second injected pty read fault";
+        // The child writes its second marker only after the first fault is
+        // stored, so that marker is the byte a pass after the fault reads.
+        const LATE: &str = "printf ready; read line; printf late; exit 0";
+
+        let (mut session, path, faults) = ready(LATE);
+        // A pre-send pass proves the reader is still armed: it calls the
+        // reader and takes its arming. It cannot prove anything about the
+        // bytes, because "late" does not exist until the child sees the
+        // line — the post-send pump is the one that can carry them.
+        faults.fail_next_read(FIRST);
+        session.pump_pass(b"late");
+        assert_eq!(
+            faults.armed_read_faults(),
+            0,
+            "the pass's read took its armed fault"
+        );
+        faults.fail_next_read(SECOND);
+        session.pump_pass(b"late");
+        assert_eq!(
+            faults.armed_read_faults(),
+            0,
+            "the second pass's read took its armed fault too"
+        );
+        must(session.send(b"\n"), "pty send");
+        let exit = session.wait_exit(Duration::from_secs(10));
+        assert!(matches!(exit, Ok(Some(0))), "{exit:?}");
+
+        // The post-send pump is authoritative: the bytes the child produced
+        // after the stored fault reach the stream. Which pump read them is
+        // not established here; what a stored fault must not do is stop
+        // later pumping from yielding them.
+        assert!(
+            session.pump_pass(b"late"),
+            "the stream carries the child's post-fault bytes"
+        );
+
+        let collected = session.collected();
+        let finished = session.finish();
+        let gone = !path.exists();
+        assert!(
+            matches!(&collected, Err(PtyIoError::Read { source }) if source.to_string() == FIRST),
+            "the first stored fault is the one reported: {collected:?}"
+        );
+        assert!(
+            finished.is_ok(),
+            "the taken fault is not reported again: {finished:?}"
+        );
+        assert!(gone, "the root is removed after the reap");
     }
 
     #[test]
@@ -5425,8 +5510,9 @@ mod card_pty {
     use super::{
         COMPACT_TOKEN, CONTEXT_COMPACTED, CONTEXT_MEASURE_INTERVAL, CommandId,
         DECISION_ANSWERED_NOTE, DECISION_CONSENT_DELAY, DECISION_MOVED_NOTE, DOCK_REFRESH_INTERVAL,
-        NOTHING_TO_COMPACT, SEND_FAILURE_ENV, SLOW_SEND_ENV, TUI_SEND_PENDING,
-        TUI_SEND_WINDOW_FAILED, TuiDispatch, dispatch_tui_request, drive_tui, failure_report,
+        NOTHING_TO_COMPACT, PAINT_BARRIER_ENV, PAINT_BARRIER_TOKEN, SEND_FAILURE_ENV,
+        SLOW_SEND_ENV, TUI_SEND_PENDING, TUI_SEND_WINDOW_FAILED, TuiDispatch, dispatch_tui_request,
+        drive_tui, failure_report,
     };
     use crate::contracts::{AnswerAttemptOutcome, AnswerSelection, Question, SessionId, TaskId};
     use crate::state::TaskStore;
@@ -5436,11 +5522,14 @@ mod card_pty {
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     const CARD_DRIVER_MARKER: &str = "RIVECT_CARD_DRIVER_ROOT";
+    /// The child's post-drain barrier file in its control directory: the
+    /// fixture arms [`PAINT_BARRIER_ENV`] with this path, and a leg waits
+    /// for it before sending any consent key.
+    const PAINT_BARRIER_FILE: &str = "paint-barrier";
     const DECISION_PTY_ROWS: usize = 20;
     const DECISION_PTY_COLS: usize = 60;
     /// The dock legs' viewport: wide enough for one
@@ -6105,6 +6194,7 @@ fallback = { mode = \"off\" }\n";
             std::fs::create_dir_all(&ctl)?;
             let mut command = pty_command(std::env::current_exe()?);
             command.env(CARD_DRIVER_MARKER, root.path());
+            command.env(PAINT_BARRIER_ENV, ctl.join(PAINT_BARRIER_FILE));
             for (name, value) in env {
                 command.env(name, value);
             }
@@ -6232,6 +6322,27 @@ fallback = { mode = \"off\" }\n";
         must(pty.pump_for(duration), "pty pump");
     }
 
+    /// Waits for the post-drain barrier of one card opening, checks the
+    /// order token [`PAINT_BARRIER_TOKEN`] it carries, and consumes it: the
+    /// child rewrites the same file on every opening, so removing it after
+    /// the check is what makes the next wait observe a later opening
+    /// instead of the one already consumed.
+    fn await_paint_barrier(driver: &mut CardDriver, timeout: Duration) -> bool {
+        let path = driver.ctl.join(PAINT_BARRIER_FILE);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.exists() {
+                let token = must(std::fs::read_to_string(&path), "barrier read");
+                must(std::fs::remove_file(&path), "barrier consume");
+                return token == PAINT_BARRIER_TOKEN;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            pause(&mut driver.pty, Duration::from_millis(25));
+        }
+    }
+
     /// Honest wait for the card's consent floor: the footer needle proves
     /// the frame painted — which is when `DECISION_CONSENT_DELAY` starts —
     /// but nothing on screen marks the window's end, so callers that send
@@ -6330,10 +6441,44 @@ fallback = { mode = \"off\" }\n";
         }
     }
 
-    /// `open_card_unwaited` plus the consent-floor wait every leg that
-    /// sends consent keys needs.
+    /// `open_card_unwaited` plus the consent boundary every leg that sends
+    /// consent keys needs. The opening frame's bytes can be readable before
+    /// `note_first_paint` stamped it, and the pre-paint drain can still
+    /// swallow a key sent now, so the child's post-drain barrier is awaited
+    /// first: past it the stamp has run and the drain is behind us. A Right
+    /// move then proves navigation is live and repaints, and the Left
+    /// restore keeps every caller's initial focus and its repaint is what
+    /// the consent wait starts from.
     fn open_card(rows: u16, cols: u16, env: &[(&str, &str)]) -> Opened {
         let mut opened = open_card_unwaited(rows, cols, env);
+        assert!(
+            await_paint_barrier(&mut opened.driver, secs(10)),
+            "the opening card reports its post-drain barrier"
+        );
+        press(&mut opened.driver.pty, b"\x1b[C");
+        let moved = screen(
+            &opened.driver.pty,
+            rows as usize,
+            cols as usize,
+            "focus 2/6",
+            secs(10),
+        );
+        assert!(
+            moved.contains("focus 2/6"),
+            "navigation repaints after the paint stamp: {moved}"
+        );
+        press(&mut opened.driver.pty, b"\x1b[D");
+        let restored = screen(
+            &opened.driver.pty,
+            rows as usize,
+            cols as usize,
+            "focus 1/6",
+            secs(10),
+        );
+        assert!(
+            restored.contains("focus 1/6"),
+            "the left restore keeps the opening focus: {restored}"
+        );
         must(wait_consent_window(&mut opened.driver.pty), "pty pump");
         opened
     }
@@ -6555,6 +6700,13 @@ fallback = { mode = \"off\" }\n";
         assert!(
             visible.contains("hidden") && visible.contains("PgUp/PgDn"),
             "the pinned footer reports hidden rows and the scroll hint: {visible}"
+        );
+        // The consent floor starts at first paint and the opening drain can
+        // still be swallowing keys: the child's post-drain barrier is the
+        // point both are behind us.
+        assert!(
+            await_paint_barrier(&mut driver, secs(10)),
+            "the opening card reports its post-drain barrier"
         );
         // The commit Enter below is consent: the card must have been
         // visible past the floor before it can be aimed.
@@ -6866,6 +7018,13 @@ fallback = { mode = \"off\" }\n";
         );
         assert!(visible.contains("focus 1/6"), "{visible}");
 
+        // The consent floor starts at first paint and the opening drain can
+        // still be swallowing keys: the child's post-drain barrier is the
+        // point both are behind us.
+        assert!(
+            await_paint_barrier(&mut driver, secs(10)),
+            "the opening card reports its post-drain barrier"
+        );
         // Esc is consent too — it must be sent after the floor or the card
         // refuses it. First Esc closes the card; the second quits the TUI.
         pause(&mut driver.pty, DECISION_CONSENT_DELAY);
@@ -6904,11 +7063,52 @@ fallback = { mode = \"off\" }\n";
         needle: &str,
         timeout: Duration,
     ) -> Result<String, PtyIoError> {
+        wait_for_frame(pty, rows, cols, timeout, |flat| flat.contains(needle))
+    }
+
+    /// `wait_for_squashed` on a whole-frame predicate: the card's body and
+    /// pinned footer can land in separate paints, so a caller that needs
+    /// several facts at once must wait for the frame that carries all of
+    /// them. Returns the last frame seen when the deadline expires.
+    fn wait_for_frame(
+        pty: &mut PtySession,
+        rows: usize,
+        cols: usize,
+        timeout: Duration,
+        done: impl Fn(&str) -> bool,
+    ) -> Result<String, PtyIoError> {
         let deadline = Instant::now() + timeout;
         let mut flat = String::new();
         while Instant::now() < deadline {
             flat = squashed(&reconstruct_screen(&pty.collected()?, rows, cols));
-            if flat.contains(needle) {
+            if done(&flat) {
+                return Ok(flat);
+            }
+            pty.pump_for(Duration::from_millis(25))?;
+        }
+        Ok(flat)
+    }
+
+    /// `wait_for_squashed` on the reopened card as a whole: the replacement
+    /// id, the focus footer, and the dismissed id's absence are separate
+    /// paints, so the first UUID sighting is not the finished frame. Returns
+    /// the last frame seen when the deadline expires.
+    fn wait_for_reopened_card(
+        pty: &mut PtySession,
+        rows: usize,
+        cols: usize,
+        replacement_id: &str,
+        dismissed_id: &str,
+        timeout: Duration,
+    ) -> Result<String, PtyIoError> {
+        let deadline = Instant::now() + timeout;
+        let mut flat = String::new();
+        while Instant::now() < deadline {
+            flat = squashed(&reconstruct_screen(&pty.collected()?, rows, cols));
+            if flat.contains(replacement_id)
+                && flat.contains("focus 1/6")
+                && !flat.contains(dismissed_id)
+            {
                 return Ok(flat);
             }
             pty.pump_for(Duration::from_millis(25))?;
@@ -7216,9 +7416,15 @@ fallback = { mode = \"off\" }\n";
 
         must(driver.pty.resize(40, 120), "pty resize");
         // Only a frame painted in the taller geometry can carry the custom
-        // row, so seeing it at 40x120 is the repaint itself.
+        // row, and the resize repaint lands body and footer in separate
+        // paints: wait for the frame that carries all three, not the first
+        // custom-row sighting.
         let flat = must(
-            wait_for_squashed(&mut driver.pty, 40, 120, "6. custom answer", secs(10)),
+            wait_for_frame(&mut driver.pty, 40, 120, secs(10), |flat| {
+                flat.contains("6. custom answer")
+                    && flat.contains("1. Brief answer")
+                    && flat.contains("focus 1/6")
+            }),
             "pty screen",
         );
         assert!(
@@ -7703,10 +7909,10 @@ fallback = { mode = \"off\" }\n";
         press(&mut faulted.pty, b"transport probe\r");
         drop(screen(&faulted.pty, 24, 80, "Submitted task:", secs(10)));
         must(faulted.command("hold"), "the child holds its pass");
-        faults.fail_next_read.store(true, Ordering::SeqCst);
+        faults.fail_next_read("injected pty read fault");
         let held = faulted.command("report");
         let ack_absent = !faulted.ctl.join(format!("{}.ack", faulted.next)).exists();
-        let armed = faults.fail_next_read.load(Ordering::SeqCst);
+        let armed = faults.armed_read_faults();
         let finished = faulted.finish();
         let parked = faults
             .parked_child
@@ -7728,7 +7934,7 @@ fallback = { mode = \"off\" }\n";
             ack_absent,
             "the held command had no ack when command returned"
         );
-        assert!(!armed, "the ack wait's pump took the armed fault");
+        assert_eq!(armed, 0, "the ack wait's pump took the armed fault");
         assert!(
             finished.is_ok(),
             "the taken fault is not reported again: {finished:?}"
@@ -7924,6 +8130,13 @@ fallback = { mode = \"off\" }\n";
             "the pre-paint arrow never moved focus: {settled}"
         );
 
+        // The consent floor starts at first paint and the opening drain can
+        // still be swallowing keys: the child's post-drain barrier is the
+        // point both are behind us.
+        assert!(
+            await_paint_barrier(&mut driver, secs(10)),
+            "the opening card reports its post-drain barrier"
+        );
         // Esc leaves the card; the next Esc quits. Esc is consent — it
         // waits out the floor like the aimed Enter would.
         pause(&mut driver.pty, DECISION_CONSENT_DELAY);
@@ -8113,18 +8326,41 @@ fallback = { mode = \"off\" }\n";
         // resurrect its card — the dismissal is the operator's choice, not
         // a transient close.
         press(&mut driver.pty, b"\x1b");
-        let visible = screen(&driver.pty, 24, 80, "decision left unanswered", secs(10));
+        // The marker paints before the card is cleared: the settled frame is
+        // the one where the marker is up and the card is gone.
+        let visible = must(
+            wait_for_frame(&mut driver.pty, 24, 80, secs(10), |flat| {
+                flat.contains("decision left unanswered")
+                    && !flat.contains("focus 1/6")
+                    && !flat.contains(dismissed.question_id.0.as_str())
+            }),
+            "pty screen",
+        );
         assert!(
             visible.contains("decision left unanswered"),
             "Esc returns without answering: {visible}"
         );
         // Three poll intervals with the same question still pending: a poll
         // that ignored the dismissal would repaint the card inside one.
-        let settled = screen(&driver.pty, 24, 80, "focus 1/6", Duration::from_millis(750));
-        assert!(
-            !settled.contains("focus 1/6") && !settled.contains(dismissed.question_id.0.as_str()),
-            "the dismissed question's card never resurrected: {settled}"
-        );
+        // Sample fresh frames across the window — one read at its start
+        // cannot see a card the next poll paints.
+        let deadline = Instant::now() + Duration::from_millis(750);
+        loop {
+            let settled = squashed(&reconstruct_screen(
+                &must(driver.pty.collected(), "pty read"),
+                24,
+                80,
+            ));
+            assert!(
+                !settled.contains("focus 1/6")
+                    && !settled.contains(dismissed.question_id.0.as_str()),
+                "the dismissed question's card never resurrected: {settled}"
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            pause(&mut driver.pty, Duration::from_millis(25));
+        }
 
         // A different pending fork is a different question: the store
         // resolves the dismissed fork (the task runs again), then a fresh
@@ -8136,12 +8372,16 @@ fallback = { mode = \"off\" }\n";
             "the answer settles the dismissed fork",
         );
         let replacement = driver.publish(dismissed.intent_revision);
-        let reopened = screen(
-            &driver.pty,
-            24,
-            80,
-            replacement.question_id.0.as_str(),
-            secs(10),
+        let reopened = must(
+            wait_for_reopened_card(
+                &mut driver.pty,
+                24,
+                80,
+                replacement.question_id.0.as_str(),
+                dismissed.question_id.0.as_str(),
+                secs(10),
+            ),
+            "pty screen",
         );
         let flat = squashed(&reopened);
         assert!(
@@ -8151,8 +8391,14 @@ fallback = { mode = \"off\" }\n";
             "a different pending question reopens the card fresh: {reopened}"
         );
 
-        // The reopened card carries its own consent floor; Esc after it
-        // leaves the card, and the next Esc quits the TUI.
+        // The reopened card carries its own consent floor, and its own
+        // opening drain: `open_card` consumed the first opening's barrier,
+        // so this wait observes only the reopen's. Esc after it leaves the
+        // card, and the next Esc quits the TUI.
+        assert!(
+            await_paint_barrier(&mut driver, secs(10)),
+            "the reopened card reports its post-drain barrier"
+        );
         pause(&mut driver.pty, DECISION_CONSENT_DELAY);
         press(&mut driver.pty, b"\x1b");
         drop(screen(&driver.pty, 24, 80, "unanswered", secs(10)));

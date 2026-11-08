@@ -58,9 +58,11 @@ const PLUGIN_TYPE: &str = "GEMINI";
 const IDE_TYPE: &str = "IDE_UNSPECIFIED";
 const PLATFORM: &str = "PLATFORM_UNSPECIFIED";
 
-/// The recorded tier ids the project rule reads.
-const FREE_TIER: &str = "free-tier";
-const LEGACY_TIER: &str = "legacy-tier";
+/// The recorded tier ids the project rule reads; the consumer applies the
+/// same rule to the stored profile, so it imports these instead of
+/// redeclaring the literals.
+pub(crate) const FREE_TIER: &str = "free-tier";
+pub(crate) const LEGACY_TIER: &str = "legacy-tier";
 
 /// The per-fetch bound of the post-callback provisioning calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

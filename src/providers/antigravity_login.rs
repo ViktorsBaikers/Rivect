@@ -58,8 +58,8 @@ const IDE_TYPE: &str = "ANTIGRAVITY";
 const FREE_TIER: &str = "free-tier";
 
 /// One pinned catalog row for the discovered models map: the source
-/// `identity.class` and the explicit alternate ids the same entry declares
-/// (`requestModelId` and aliases).
+/// `identity.class` plus the alternate ids the entry explicitly declares.
+/// `requestModelId` is a request-time override, not a stored catalog field.
 struct PinnedModel {
     class: &'static str,
     alternate_ids: &'static [&'static str],

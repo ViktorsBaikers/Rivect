@@ -4516,6 +4516,37 @@ async fn interleaved_epoch_sends_preserve_the_live_epochs_replay_set() {
     drop_blocking(broker);
 }
 
+/// The reader bounds the whole stream, not only one event: a peer emitting
+/// well-formed frames at the largest size the line and event caps admit
+/// trips the whole-stream byte cap with the typed violation and assembles
+/// no reply.
+#[tokio::test]
+async fn a_stream_over_the_total_byte_bound_is_a_typed_violation() {
+    let server = MockServer::start().await;
+    let text = "x".repeat(250_000);
+    let frame = data_block(&json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": text}]},
+            "index": 0,
+        }],
+    }));
+    // 40 frames of ~250 KB each stay inside the 256 KiB line and 4 MiB
+    // event bounds; together they cross the 8 MiB whole-stream bound.
+    mount_generate(&server, frame.repeat(40)).await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let (broker, manifest) = prepared(&config, "/world/google", "goal: oversized stream");
+    let (broker, outcome) = dispatch(broker, "/world/google", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ),
+        "the over-bound stream is a typed violation, never a reply: {outcome:?}"
+    );
+    drop_blocking(broker);
+}
+
 /// A reply that reports no usage keeps the sent cost unknown: the
 /// accounting record carries `Unknown`, the explain retains the bound
 /// — never a released zero.

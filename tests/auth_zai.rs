@@ -739,6 +739,11 @@ fn zai_stale_and_foreign_callbacks_deny_before_a_request() {
         "{error}"
     );
     assert!(peer.requests().is_empty());
+    assert_eq!(
+        stored(&store, ZAI_SCOPE),
+        PRIOR_PROFILE.as_bytes(),
+        "a foreign callback leaves the prior profile byte-identical"
+    );
 }
 
 /// The pinned upstream's manual `code#state` form exchanges the pasted code

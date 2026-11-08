@@ -10,6 +10,7 @@ use portable_pty::{
     Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize,
 };
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -164,6 +165,13 @@ fn report(error: &PtyTeardownError) {
     }
 }
 
+/// A Darwin probe measured concurrent `openpty` calls failing with errno -6;
+/// locking only the creation call cleared it. This serializes this fixture's
+/// own creation calls only — not the OS race globally — so revisit if Darwin
+/// or portable-pty fixes it.
+#[cfg(target_os = "macos")]
+static OPENPTY: Mutex<()> = Mutex::new(());
+
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: FileDescriptor,
@@ -217,14 +225,18 @@ impl PtySession {
                 source: io::Error::other(source),
             }
         };
-        let pair = NativePtySystem::default()
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|source| setup("open")(source.into()))?;
+        let pair = {
+            #[cfg(target_os = "macos")]
+            let _creation = locked(&OPENPTY);
+            NativePtySystem::default()
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|source| setup("open")(source.into()))?
+        };
         let reader = pair
             .master
             .try_clone_reader()
@@ -340,6 +352,15 @@ impl PtySession {
             }
             nap(deadline);
         }
+    }
+
+    /// One pump pass without taking a stored fault, then whether `needle`
+    /// is in the stream: bytes produced after a stored fault still land
+    /// here, so a test can see that later passes kept reading.
+    pub fn pump_pass(&mut self, needle: &[u8]) -> bool {
+        let output = self.output.get_mut();
+        pump(output);
+        find_subsequence(&output.stream, needle).is_some()
     }
 
     /// Writes every byte or fails.
@@ -554,10 +575,24 @@ pub fn squashed(screen: &str) -> String {
 #[derive(Debug, Default)]
 pub struct PtyFaults {
     pub fail_try_wait: AtomicBool,
-    pub fail_next_read: AtomicBool,
+    /// Read faults in arming order; the reader reports the front and leaves
+    /// the rest queued, so each arming can carry its own message.
+    read_faults: Mutex<VecDeque<&'static str>>,
     pub kills: AtomicUsize,
     pub root_at_first_reap: Mutex<Option<bool>>,
     pub parked_child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+}
+
+impl PtyFaults {
+    /// Arms one injected read fault: the next read reports `message`.
+    pub fn fail_next_read(&self, message: &'static str) {
+        locked(&self.read_faults).push_back(message);
+    }
+
+    /// Read faults still waiting for a read.
+    pub fn armed_read_faults(&self) -> usize {
+        locked(&self.read_faults).len()
+    }
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -660,8 +695,9 @@ struct FaultReader {
 
 impl Read for FaultReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.faults.fail_next_read.swap(false, Ordering::SeqCst) {
-            return Err(io::Error::other("injected pty read fault"));
+        let message = locked(&self.faults.read_faults).pop_front();
+        if let Some(message) = message {
+            return Err(io::Error::other(message));
         }
         self.inner.read(buf)
     }

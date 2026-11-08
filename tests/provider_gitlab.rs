@@ -19,11 +19,15 @@ use rivect::model::{Broker, ModelError, NullLedger, RequestManifest};
 use rivect::providers::gitlab_workflow::{
     GITLAB_DUO_WORKFLOW_DEADLINE, GITLAB_DUO_WORKFLOW_IDLE, GitlabWorkflowProvider, WorkflowBudget,
 };
-use rivect::providers::{CredentialStore, ProviderError, StoreKind, ToolCall, TransportClass};
+use rivect::providers::{
+    CredentialStore, ProviderError, StoreKind, ToolCall, TransportCause, TransportClass,
+};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod support;
 
@@ -124,6 +128,27 @@ fn dispatch(
     )
 }
 
+/// The recorded send against a loopback base the peer fixture cannot
+/// script: the slow-body legs' endpoint and seeded profile.
+fn prepared_against_loopback(base: &str) -> (Broker, RequestManifest) {
+    let config = config_for(base);
+    let store = Arc::new(MapStore::seeded(
+        StoreKind::Keychain,
+        &[(REF, &stored_profile(base, Some(PROJECT_ID)))],
+    ));
+    let credential_store: Arc<dyn CredentialStore> = store.clone();
+    let provider = GitlabWorkflowProvider::with_limits(
+        &config,
+        CONNECTION,
+        credential_store,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        WorkflowBudget::recorded(),
+    )
+    .expect("the loopback base is admitted");
+    prepared_with((provider, store), &config, WORLD, GOAL)
+}
+
 /// One checkpoint snapshot carrying the given `ui_chat_log` entries.
 fn snapshot(entries: Value) -> String {
     json!({ "channel_values": { "ui_chat_log": entries } }).to_string()
@@ -154,6 +179,15 @@ fn step_limit_frame() -> String {
         "message": "The workflow reached its maximum step limit and could not complete.",
     })
     .to_string()
+}
+
+/// The server's de-identified catch-all `FAILED` — the generic restart
+/// signal, distinct from the step-limit cap and the stall signal.
+const GENERIC_MESSAGE: &str =
+    "Error processing your request in the Duo Agent Platform. Please try again.";
+
+fn generic_failure_frame() -> String {
+    json!({ "status": "FAILED", "message": GENERIC_MESSAGE }).to_string()
 }
 
 fn action_frame(request_id: Option<&str>) -> String {
@@ -196,6 +230,7 @@ fn dispatch_returns_one_validated_outcome_and_one_accounting_record() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
@@ -385,6 +420,7 @@ fn non_default_base_is_admitted_under_the_credential_base_rule() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
@@ -442,6 +478,7 @@ fn silent_handshake_is_a_typed_timeout_with_one_settlement_row() {
     let fixture = peer_fixture(PeerScript {
         sockets: Vec::new(),
         silent: true,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) = dispatch(
         &fixture,
@@ -490,6 +527,7 @@ fn idle_death_reconnects_once_on_the_same_workflow_id() {
             },
         ],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) = dispatch(
         &fixture,
@@ -518,6 +556,71 @@ fn idle_death_reconnects_once_on_the_same_workflow_id() {
 }
 
 #[test]
+fn a_second_idle_death_is_the_typed_stop_without_a_third_attempt() {
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![SocketScript::default()],
+        silent: false,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) = dispatch(
+        &fixture,
+        Duration::from_millis(400),
+        WorkflowBudget::recorded(),
+    );
+    let mut ledger = CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("the second consecutive idle death is the typed stop");
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    let ProviderError::Transport { connection, cause } = source else {
+        panic!("expected the transport class: {source}");
+    };
+    assert_eq!(connection, CONNECTION);
+    assert_eq!(
+        cause.class(),
+        TransportClass::Timeout,
+        "the second idle death surfaces as the timeout class"
+    );
+    let TransportCause::Read { source: read_error } = cause else {
+        panic!("the idle death retains its read cause: {cause}");
+    };
+    assert_eq!(read_error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(
+        fixture.peer.sockets(),
+        2,
+        "the first attempt plus the one reconnect, never a third attempt"
+    );
+    assert_eq!(
+        fixture.peer.creates(),
+        1,
+        "the reconnect resumes the created workflow instead of creating another"
+    );
+    let start = fixture.peer.start_frames();
+    assert_eq!(start.len(), 2);
+    assert_eq!(start[0]["startRequest"]["workflowID"], "4242");
+    assert_eq!(start[1]["startRequest"]["workflowID"], "4242");
+    assert_eq!(
+        fixture.peer.requests().len(),
+        5,
+        "3 setup legs + 2 socket upgrades; an idle stop stops no workflow"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(
+        ledger.finished, 1,
+        "the typed stop closes the row it opened"
+    );
+    assert_eq!(ledger.failed, 1, "the row settles as failed");
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+}
+
+#[test]
 fn step_limit_restarts_are_bounded_by_the_outer_budget() {
     let fixture = peer_fixture(PeerScript {
         sockets: vec![SocketScript {
@@ -525,6 +628,7 @@ fn step_limit_restarts_are_bounded_by_the_outer_budget() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
@@ -570,6 +674,7 @@ fn stall_restarts_are_bounded_by_the_stall_cap() {
             close: false,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) = dispatch(
         &fixture,
@@ -604,6 +709,523 @@ fn stall_restarts_are_bounded_by_the_stall_cap() {
 }
 
 #[test]
+fn stall_restarts_allow_two_fresh_workflows_then_stop_typed() {
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![SocketScript {
+            frames: vec![boundary_frame(), boundary_frame()],
+            close: false,
+        }],
+        silent: false,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) =
+        dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
+    let mut ledger = CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("two stall restarts are allowed, the third stall stops");
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert!(
+        matches!(
+            source,
+            ProviderError::ProviderFailed { connection, reason }
+                if connection == CONNECTION
+                    && reason == "the workflow's visible history stopped advancing"
+        ),
+        "the spent stall cap surfaces the recorded reason: {source}"
+    );
+    assert_eq!(
+        fixture.peer.sockets(),
+        3,
+        "the first attempt plus the two recorded stall restarts"
+    );
+    assert_eq!(
+        fixture.peer.creates(),
+        3,
+        "each stall restart asks for a fresh workflow"
+    );
+    let stops = fixture
+        .peer
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "PATCH")
+        .count();
+    assert_eq!(stops, 2, "each abandoned workflow is stopped once");
+    assert_eq!(
+        fixture.peer.requests().len(),
+        10,
+        "3 setup legs + 3 socket upgrades + 2 stops + 2 restart creates"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(
+        ledger.finished, 1,
+        "the typed stop closes the row it opened"
+    );
+    assert_eq!(ledger.failed, 1, "the row settles as failed");
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+}
+
+#[test]
+fn a_generic_failure_restarts_one_fresh_workflow_then_stops_typed() {
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![SocketScript {
+            frames: vec![generic_failure_frame()],
+            close: true,
+        }],
+        silent: false,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) =
+        dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
+    let mut ledger = CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("one generic restart, then the typed stop");
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert!(
+        matches!(
+            source,
+            ProviderError::ProviderFailed { connection, reason }
+                if connection == CONNECTION && reason == GENERIC_MESSAGE
+        ),
+        "the spent generic retry surfaces the peer's reason: {source}"
+    );
+    assert_eq!(
+        fixture.peer.sockets(),
+        2,
+        "the first attempt plus exactly one generic restart"
+    );
+    assert_eq!(
+        fixture.peer.creates(),
+        2,
+        "the generic restart asks for one fresh workflow"
+    );
+    let stops = fixture
+        .peer
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "PATCH")
+        .count();
+    assert_eq!(stops, 1, "the abandoned workflow is stopped once");
+    let start = fixture.peer.start_frames();
+    assert_eq!(start.len(), 2);
+    assert_eq!(start[0]["startRequest"]["workflowID"], "4242");
+    assert_eq!(
+        start[1]["startRequest"]["workflowID"], "4243",
+        "the generic restart opens a fresh workflow, not a same-id reconnect"
+    );
+    assert_eq!(
+        fixture.peer.requests().len(),
+        7,
+        "3 setup legs + 2 socket upgrades + 1 stop + 1 restart create"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(
+        ledger.finished, 1,
+        "the typed stop closes the row it opened"
+    );
+    assert_eq!(ledger.failed, 1, "the row settles as failed");
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+}
+
+/// A restart whose `stop` the server refuses still settles exactly once:
+/// the refused stop is deliberately not propagated, so the send's own
+/// reply and its single settlement row are unaffected.
+#[test]
+fn a_refused_restart_stop_still_settles_once() {
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![
+            SocketScript {
+                frames: vec![boundary_frame(), boundary_frame()],
+                close: false,
+            },
+            SocketScript {
+                frames: vec![answer_frame("FINISHED", "recovered after a refused stop")],
+                close: true,
+            },
+        ],
+        silent: false,
+        refuse_stop: true,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) =
+        dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
+    let mut ledger = CountingLedger::new();
+    let reply = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect("the refused stop is not the send's verdict");
+    assert_eq!(reply.text, "recovered after a refused stop");
+    assert_eq!(reply.wire_retries, 1, "the restart is the one retry");
+    let requests = fixture.peer.requests();
+    let stops: Vec<&PeerRequest> = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .collect();
+    assert_eq!(stops.len(), 1, "the abandoned workflow is stopped once");
+    assert_eq!(
+        body(stops[0]),
+        json!({ "status_event": "stop" }),
+        "the refused stop is the recorded envelope, not skipped"
+    );
+    assert_eq!(fixture.peer.sockets(), 2);
+    assert_eq!(
+        fixture.peer.creates(),
+        2,
+        "the restart asks for a fresh workflow"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1, "the successful send closes that row");
+    assert_eq!(ledger.failed, 0, "the refused stop is not a failure");
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the answering send opens exactly one accounting record"
+    );
+    drop_blocking(broker);
+}
+
+/// A refused numeric project-id lookup leaves the socket namespace-only
+/// instead of failing the send: the recorded best-effort lookup degrades
+/// to namespace routing.
+#[test]
+fn a_refused_project_lookup_leaves_the_socket_namespace_only() {
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![SocketScript {
+            frames: vec![answer_frame("FINISHED", "namespace route")],
+            close: true,
+        }],
+        silent: false,
+        fail_project_lookup: true,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) =
+        dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
+    let reply = broker
+        .dispatch(&mut NullLedger, WORLD, &manifest)
+        .expect("a refused lookup never fails the send");
+    assert_eq!(reply.text, "namespace route");
+    let requests = fixture.peer.requests();
+    let lookup = requests
+        .iter()
+        .find(|request| request.method == "GET")
+        .expect("the lookup leg runs first");
+    assert!(
+        lookup.path().starts_with("/api/v4/projects/"),
+        "the lookup is the recorded numeric-id leg: {}",
+        lookup.target
+    );
+    let socket = upgrade(&requests);
+    assert!(
+        !socket.target.contains("project_id="),
+        "the refused lookup routes by namespace only: {}",
+        socket.target
+    );
+    assert!(
+        socket.target.contains("namespace_id="),
+        "the namespace still addresses the socket: {}",
+        socket.target
+    );
+    assert!(
+        !socket.headers.contains_key("x-gitlab-project-id"),
+        "no numeric project id rides the refused route"
+    );
+    let start = fixture.peer.start_frames();
+    assert_eq!(start.len(), 1);
+    let metadata: Value = serde_json::from_str(
+        start[0]["startRequest"]["workflowMetadata"]
+            .as_str()
+            .expect("the start envelope carries the metadata object"),
+    )
+    .expect("the metadata is json");
+    assert!(
+        metadata.get("projectId").is_none(),
+        "the refused route names no project id: {metadata}"
+    );
+    assert!(
+        metadata.get("namespaceId").is_some(),
+        "the namespace still identifies the workflow: {metadata}"
+    );
+}
+
+#[test]
+fn outer_attempt_exhaustion_stops_typed_without_spending_the_class_caps() {
+    // The recorded outer cap (12) exceeds the most sockets the recorded
+    // class caps can reach — first attempt + 4 step-limit + 2 stall +
+    // 1 generic + 1 idle reconnect = 9 — so under recorded limits a class
+    // cap always stops first. This leg composes a legal budget whose outer
+    // cap is the only stop: three step-limit sockets stay well inside the
+    // step allowance, and the outer bound settles the send after the third
+    // restart creates the fourth workflow. That fourth workflow is never
+    // socketed or stopped; the orphan is intentional under this composed
+    // budget only — `new` cannot reach the composition, and `with_limits`
+    // is the documented public offline seam. It asserts the observed three
+    // restarts, never a fabricated default of twelve requests.
+    let fixture = peer_fixture(PeerScript {
+        sockets: vec![SocketScript {
+            frames: vec![step_limit_frame()],
+            close: true,
+        }],
+        silent: false,
+        ..PeerScript::default()
+    });
+    let (mut broker, manifest) = dispatch(
+        &fixture,
+        Duration::from_secs(5),
+        WorkflowBudget {
+            outer_attempts: 3,
+            step_limit: 4,
+            stall: 2,
+            generic: 1,
+        },
+    );
+    let mut ledger = CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("the outer attempt cap stops the send typed");
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert!(
+        matches!(
+            source,
+            ProviderError::UnknownTerminal { connection } if connection == CONNECTION
+        ),
+        "an exhausted outer budget is the typed unknown, never a reply: {source}"
+    );
+    assert_eq!(
+        fixture.peer.sockets(),
+        3,
+        "the outer cap opens exactly three sockets"
+    );
+    assert_eq!(
+        fixture.peer.creates(),
+        4,
+        "the first workflow plus one fresh workflow per restart"
+    );
+    let stops = fixture
+        .peer
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "PATCH")
+        .count();
+    assert_eq!(stops, 3, "each abandoned workflow is stopped once");
+    let start = fixture.peer.start_frames();
+    assert_eq!(start.len(), 3);
+    let ids: Vec<&str> = start
+        .iter()
+        .map(|frame| {
+            frame["startRequest"]["workflowID"]
+                .as_str()
+                .expect("the start envelope carries the workflow id")
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["4242", "4243", "4244"],
+        "each outer attempt restarts on a fresh workflow"
+    );
+    assert_eq!(
+        fixture.peer.requests().len(),
+        12,
+        "3 setup legs + 3 socket upgrades + 3 stops + 3 restart creates"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(
+        ledger.finished, 1,
+        "the typed unknown closes the row it opened"
+    );
+    assert_eq!(ledger.failed, 1, "the row settles as failed");
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+}
+
+/// The delayed head both slow-body legs share: twelve seconds of the one
+/// 30 s REST bound.
+const LEG_HEAD_DELAY: Duration = Duration::from_secs(12);
+
+/// The reply head both slow-body legs send; their bodies differ.
+const SLOW_REPLY_HEAD: &[u8] =
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 65536\r\nconnection: close\r\n\r\n";
+
+/// Reads one request's head off the loopback socket; `false` when the
+/// peer closes or fails before the terminator.
+fn read_head(stream: &mut TcpStream) -> bool {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while head
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .is_none()
+    {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+    }
+    true
+}
+
+/// A loopback peer that accepts the direct-access request, holds the
+/// response head for [`LEG_HEAD_DELAY`], then dribbles its body one byte
+/// at a time.
+fn dribbling_direct_access() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the peer accepts");
+        if !read_head(&mut stream) {
+            return;
+        }
+        // The head spends most of the one 30 s bound before the body starts.
+        std::thread::sleep(LEG_HEAD_DELAY);
+        if stream.write_all(SLOW_REPLY_HEAD).is_err() {
+            return;
+        }
+        loop {
+            if stream.write_all(b"{").is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// A loopback peer that accepts the direct-access request, holds the
+/// response head for [`LEG_HEAD_DELAY`], sends it, and then writes no body
+/// byte: only a bound that spans the request can cut the read.
+fn stalled_direct_access() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the peer accepts");
+        if !read_head(&mut stream) {
+            return;
+        }
+        std::thread::sleep(LEG_HEAD_DELAY);
+        if stream.write_all(SLOW_REPLY_HEAD).is_err() {
+            return;
+        }
+        // A dropped peer would read as a short body, not as a stalled read.
+        let mut sink = [0_u8; 1];
+        loop {
+            match stream.read(&mut sink) {
+                Ok(0) | Err(_) => return,
+                Ok(_more) => continue,
+            }
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// Characterization of a dribbling REST body: the delayed head and the
+/// byte-at-a-time body end at the 30 s bound, not later. The leg clock
+/// alone ends a body that keeps producing bytes, so this leg cannot
+/// discriminate the request total; the stalled-read leg below does.
+#[test]
+fn a_dribbling_rest_body_stays_inside_the_leg_bound() {
+    let (base, peer) = dribbling_direct_access();
+    let (mut broker, manifest) = prepared_against_loopback(&base);
+    let mut ledger = CountingLedger::new();
+    let started = Instant::now();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("the dribbling body is cut by the leg bound");
+    let elapsed = started.elapsed();
+    let ModelError::Provider(ProviderError::Transport { cause, .. }) = &error else {
+        panic!("expected a typed transport failure: {error}");
+    };
+    assert!(
+        matches!(
+            cause.class(),
+            TransportClass::Timeout | TransportClass::DeadlineExpired
+        ),
+        "the leg bound is the timeout class: {cause}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(30),
+        "the delayed head and dribbling body reach the leg bound: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(38),
+        "the delayed head and dribbling body end at the leg bound: {elapsed:?}"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1);
+    assert_eq!(ledger.failed, 1);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the dribbling peer joins");
+}
+
+/// The discriminating slow-body leg: the head arrives after
+/// [`LEG_HEAD_DELAY`] and the body never starts. The request total cuts
+/// the fetch at 30 s from the request's start; a per-read window would
+/// start after the head and return at ~42 s, so the 35 s bound reds if
+/// the request total is removed.
+#[test]
+fn a_stalled_read_ends_at_the_request_total() {
+    let (base, peer) = stalled_direct_access();
+    let (mut broker, manifest) = prepared_against_loopback(&base);
+    let mut ledger = CountingLedger::new();
+    let started = Instant::now();
+    let error = broker
+        .dispatch(&mut ledger, WORLD, &manifest)
+        .expect_err("the stalled body is cut by the request total");
+    let elapsed = started.elapsed();
+    let ModelError::Provider(ProviderError::Transport { cause, .. }) = &error else {
+        panic!("expected a typed transport failure: {error}");
+    };
+    assert!(
+        matches!(
+            cause.class(),
+            TransportClass::Timeout | TransportClass::DeadlineExpired
+        ),
+        "the request total is the timeout class: {cause}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(30),
+        "the stalled body waits out the request total: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(35),
+        "the request total spans the head, never a read window restarted after it: {elapsed:?}"
+    );
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1);
+    assert_eq!(ledger.failed, 1);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    drop_blocking(broker);
+    peer.join().expect("the stalled peer joins");
+}
+
+#[test]
 fn a_partial_action_or_unknown_terminal_is_never_success() {
     // An action the seam cannot hand on: no request id means no tool call.
     let fixture = peer_fixture(PeerScript {
@@ -612,6 +1234,7 @@ fn a_partial_action_or_unknown_terminal_is_never_success() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
@@ -639,6 +1262,7 @@ fn a_partial_action_or_unknown_terminal_is_never_success() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());
@@ -666,6 +1290,7 @@ fn an_action_hands_back_the_recorded_tool_call() {
             close: true,
         }],
         silent: false,
+        ..PeerScript::default()
     });
     let (mut broker, manifest) =
         dispatch(&fixture, Duration::from_secs(5), WorkflowBudget::recorded());

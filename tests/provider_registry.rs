@@ -104,11 +104,6 @@ const RECORDED_ROSTER: [(&str, Dialect); 71] = [
 
 #[test]
 fn roster_matches_the_recorded_dialect_arms() {
-    assert_eq!(
-        RECORDED_ROSTER.len(),
-        71,
-        "the roster is the 68 pre-band ids plus the vertex and two CloudCode arms"
-    );
     let mut ids: Vec<&str> = RECORDED_ROSTER.iter().map(|(id, _)| *id).collect();
     let recorded = ids.len();
     ids.sort_unstable();

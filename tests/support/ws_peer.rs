@@ -63,6 +63,11 @@ pub struct PeerScript {
     pub sockets: Vec<SocketScript>,
     /// Accept the TCP connection and never answer the upgrade.
     pub silent: bool,
+    /// Answer a workflow `stop` (`PATCH …/workflows/{id}`) with 500.
+    pub refuse_stop: bool,
+    /// Answer the numeric project-id lookup (`GET /api/v4/projects/…`)
+    /// with 404.
+    pub fail_project_lookup: bool,
 }
 
 #[derive(Default)]
@@ -187,7 +192,7 @@ fn serve(stream: TcpStream, script: &PeerScript, shared: &Shared) {
         }
         return;
     }
-    serve_rest(stream, shared);
+    serve_rest(stream, script, shared);
 }
 
 /// Holds an accepted connection that never answers the upgrade — the
@@ -203,19 +208,24 @@ fn hold_unanswered(mut stream: TcpStream) {
     }
 }
 
-fn serve_rest(mut stream: TcpStream, shared: &Shared) {
+fn serve_rest(mut stream: TcpStream, script: &PeerScript, shared: &Shared) {
     let Some(request) = read_request(&mut stream) else {
         return;
     };
-    let payload = route(&request, shared);
+    let (status, payload) = route(&request, script, shared);
     shared
         .requests
         .lock()
         .expect("peer request log")
         .push(request);
     let body = payload.to_string();
+    let reason = if (200..300).contains(&status) {
+        "OK"
+    } else {
+        "Error"
+    };
     let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     if stream.write_all(head.as_bytes()).is_err() {
@@ -228,20 +238,33 @@ fn serve_rest(mut stream: TcpStream, shared: &Shared) {
     drop(flushed);
 }
 
-fn route(request: &PeerRequest, shared: &Shared) -> Value {
+fn route(request: &PeerRequest, script: &PeerScript, shared: &Shared) -> (u16, Value) {
     match (request.method.as_str(), request.path()) {
         ("POST", "/api/v4/ai/duo_workflows/direct_access") => {
-            json!({ "gitlab_rails": { "token": WORKFLOW_TOKEN } })
+            (200, json!({ "gitlab_rails": { "token": WORKFLOW_TOKEN } }))
         }
         ("POST", "/api/v4/ai/duo_workflows/workflows") => {
             let id = FIRST_WORKFLOW_ID + shared.creates.fetch_add(1, Ordering::SeqCst);
-            json!({ "id": id.to_string() })
+            (200, json!({ "id": id.to_string() }))
+        }
+        ("PATCH", path)
+            if path.starts_with("/api/v4/ai/duo_workflows/workflows/") && script.refuse_stop =>
+        {
+            (
+                500,
+                json!({ "message": "the workflow could not be stopped" }),
+            )
         }
         ("PATCH", path) if path.starts_with("/api/v4/ai/duo_workflows/workflows/") => {
-            json!({ "status": "STOPPED" })
+            (200, json!({ "status": "STOPPED" }))
         }
-        ("GET", path) if path.starts_with("/api/v4/projects/") => json!({ "id": PROJECT_ID }),
-        _ => json!({}),
+        ("GET", path) if path.starts_with("/api/v4/projects/") && script.fail_project_lookup => {
+            (404, json!({ "message": "404 project not found" }))
+        }
+        ("GET", path) if path.starts_with("/api/v4/projects/") => {
+            (200, json!({ "id": PROJECT_ID }))
+        }
+        _ => (200, json!({})),
     }
 }
 

@@ -28,6 +28,14 @@ const MAX_LINE_BYTES: usize = 256 * 1024;
 /// The byte cap on one event's accumulated `data` buffer.
 const MAX_DATA_BYTES: usize = 4 * 1024 * 1024;
 
+/// The byte cap on one whole stream. Each event is already bounded, but a
+/// peer that keeps emitting frames can grow the reader's reply state
+/// without limit; twice the per-event cap admits a terminal frame beside
+/// one maximum-size event and no recorded reply approaches it. The
+/// CloudCode/Gemini and Messages streaming readers count every body byte
+/// against this bound and fail closed, keeping no partial reply.
+pub(crate) const MAX_STREAM_BYTES: usize = 2 * MAX_DATA_BYTES;
+
 /// The UTF-8 BOM — removed once, only as the stream's leading bytes.
 const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 

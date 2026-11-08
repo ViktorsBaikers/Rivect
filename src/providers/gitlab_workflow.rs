@@ -9,7 +9,10 @@
 //! token for the workflow token at `…/duo_workflows/direct_access`,
 //! creates the workflow at `…/duo_workflows/workflows`, and opens the
 //! socket at `…/duo_workflows/ws?project_id=…&namespace_id=…` with the
-//! source headers. Every REST fetch is bounded at 30 s, the socket by
+//! source headers. Every REST fetch is bounded at 30 s by the request
+//! timeout — the total for connect, send and the body — plus the leg
+//! clock checked before each read; the clock alone would let an
+//! in-flight read overrun. The socket is bounded by
 //! [`GITLAB_DUO_WORKFLOW_IDLE`], and the whole send by the recorded
 //! [`GITLAB_DUO_WORKFLOW_DEADLINE`].
 //!
@@ -194,14 +197,35 @@ struct CheckpointState {
 }
 
 impl CheckpointState {
-    /// Absorbs one checkpoint snapshot's agent text. A snapshot without a
-    /// readable `ui_chat_log` carries no text and is not a violation.
-    fn absorb(&mut self, checkpoint: &str) {
-        self.last_checkpoint_len = Some(checkpoint.len());
-        let Ok(parsed) = serde_json::from_str::<Value>(checkpoint) else {
-            self.ends_at_boundary = false;
-            return;
-        };
+    /// Absorbs one checkpoint snapshot's agent text. The recorded wire form
+    /// is a serialized snapshot string, parsed once; an already-parsed
+    /// object is borrowed directly instead of being serialized back. A
+    /// snapshot without a readable `ui_chat_log` carries no text and is not
+    /// a violation.
+    fn absorb(&mut self, checkpoint: &Value) {
+        match checkpoint {
+            Value::String(text) => {
+                self.last_checkpoint_len = Some(text.len());
+                match serde_json::from_str::<Value>(text) {
+                    Ok(parsed) => self.absorb_snapshot(&parsed),
+                    Err(_parse) => self.ends_at_boundary = false,
+                }
+            }
+            Value::Object(_) => {
+                self.absorb_snapshot(checkpoint);
+                // The serialized length is the comparable reading only when
+                // the snapshot ends on a tool/request boundary, where the
+                // stall signal consumes it; a non-boundary frame never pays
+                // the serialization.
+                self.last_checkpoint_len =
+                    self.ends_at_boundary.then(|| checkpoint.to_string().len());
+            }
+            _ => self.ends_at_boundary = false,
+        }
+    }
+
+    /// Absorbs one parsed snapshot's `ui_chat_log` entries.
+    fn absorb_snapshot(&mut self, parsed: &Value) {
         let Some(entries) = parsed
             .get("channel_values")
             .and_then(|values| values.get("ui_chat_log"))
@@ -244,8 +268,17 @@ impl CheckpointState {
 
     /// Appends one agent message's delta: a replay of an already-seen key
     /// grows the text only by its newly emitted suffix, and a replayed
-    /// snapshot position is dropped entirely.
+    /// snapshot position is dropped entirely. An unchanged entry returns
+    /// before the signature string and the content copy, so replaying a full
+    /// snapshot costs a comparison per entry, not a re-copy.
     fn push(&mut self, key: &str, content: &str) {
+        if self
+            .content
+            .get(key)
+            .is_some_and(|previous| previous.as_str() == content)
+        {
+            return;
+        }
         let signature = format!("{}\u{0}{content}", self.turn);
         let duplicate = !self.content.contains_key(key) && self.signatures.contains(&signature);
         if !duplicate {
@@ -305,6 +338,18 @@ impl GitlabWorkflowProvider {
 
     /// The same adapter under explicit bounds — the offline proof's seam
     /// for a short idle window and a small restart budget.
+    ///
+    /// The recorded composition is 12 outer sockets × (two 30 s REST legs
+    /// plus the 90 s idle window) plus 3 × 30 s setup and a 30 s margin,
+    /// which is the shipped deadline. The class caps (4 step-limit, 2
+    /// stall, 1 generic) can spend at most 8 sockets after the first one,
+    /// so the recorded outer cap is unreachable under [`Self::new`];
+    /// [`Self::new`] always uses [`WorkflowBudget::recorded`], and only
+    /// this seam composes a smaller bound for proof. Under such a
+    /// composed bound a restart may create the next workflow as the last
+    /// socket is spent: that workflow is never socketed and never stopped
+    /// — the recorded orphan of the composed budget, not a second
+    /// settlement.
     ///
     /// # Errors
     /// [`Self::new`]'s contract.
@@ -387,8 +432,13 @@ impl GitlabWorkflowProvider {
         check_deadline(&self.connection, self.deadline, started)
     }
 
-    /// One REST fetch under the recorded 30 s bound and the send's own
-    /// remaining budget.
+    /// One REST fetch under the recorded 30 s bound: the request timeout
+    /// is the total span from connect until the body is finished, and the
+    /// leg clock starts before `send` and is checked before every read, so
+    /// the phases cannot each spend a fresh 30 s. The clock alone would
+    /// let an in-flight read overrun the bound; the request timeout is
+    /// what cuts it. The client's per-read timeout stays the default for
+    /// every other request this adapter makes.
     fn fetch(
         &self,
         request: reqwest::blocking::RequestBuilder,
@@ -397,6 +447,7 @@ impl GitlabWorkflowProvider {
         self.leg(started)?;
         let leg = Instant::now();
         let mut response = request
+            .timeout(REST_TIMEOUT)
             .send()
             .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
@@ -518,17 +569,19 @@ impl GitlabWorkflowProvider {
         Ok(id)
     }
 
-    /// Stops a workflow a restart abandoned, answering whether the server
-    /// confirmed it. A refusal changes nothing the caller sees — the
-    /// restart already decided the outcome — so it is never propagated.
-    fn stop(&self, credential: &WorkspaceCredential, workflow_id: &str, started: Instant) -> bool {
+    /// Stops a workflow a restart abandoned. Best-effort by contract: a
+    /// refusal never changes the caller's verdict — the restart already
+    /// decided it — so both outcomes end this seam without propagating,
+    /// and the restart arm's explicit counter is the record of the
+    /// abandoned workflow.
+    fn stop(&self, credential: &WorkspaceCredential, workflow_id: &str, started: Instant) {
         let path = format!(
             "{}{}",
             WORKFLOWS_PATH,
             percent_encode_component(workflow_id)
         );
         let Ok(bytes) = wire_body(&self.connection, &json!({ "status_event": "stop" })) else {
-            return false;
+            return;
         };
         let request = self
             .client
@@ -536,7 +589,11 @@ impl GitlabWorkflowProvider {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .bearer_auth(credential.access_token())
             .body(bytes);
-        self.fetch(request, started).is_ok()
+        // Declared fallback: the refusal has no reader, because the
+        // restart has already decided the caller's outcome.
+        let Ok(_reply) = self.fetch(request, started) else {
+            return;
+        };
     }
 
     /// The `startRequest` envelope one socket sends on open.
@@ -690,6 +747,9 @@ impl GitlabWorkflowProvider {
         state: &mut CheckpointState,
         started: Instant,
     ) -> Result<SocketEnd, ProviderError> {
+        // Connect and handshake are part of this leg: the probe runs before
+        // the socket exists, not only before its first frame.
+        self.leg(started)?;
         let mut socket = self.open_socket(target, headers)?;
         socket
             .send(Message::Text(start.to_string().into()))
@@ -870,7 +930,7 @@ impl GitlabWorkflowProvider {
         state: &mut CheckpointState,
     ) -> Result<Frame, ProviderError> {
         if let Some(checkpoint) = checkpoint_of(event) {
-            state.absorb(&checkpoint);
+            state.absorb(checkpoint);
         }
         if let Some(status) = status_of(event) {
             if status == "FINISHED" || status == "INPUT_REQUIRED" {
@@ -1007,7 +1067,9 @@ impl Provider for GitlabWorkflowProvider {
                         });
                     }
                     step_restarts += 1;
-                    let _stopped = self.stop(&credential, &workflow_id, started);
+                    // Best-effort stop: the restart counter above is this
+                    // arm's accounting; a refused stop is not propagated.
+                    self.stop(&credential, &workflow_id, started);
                     workflow_id =
                         self.create_workflow(&credential, rest_project.as_deref(), started)?;
                 }
@@ -1019,7 +1081,9 @@ impl Provider for GitlabWorkflowProvider {
                         });
                     }
                     stall_restarts += 1;
-                    let _stopped = self.stop(&credential, &workflow_id, started);
+                    // Best-effort stop: the restart counter above is this
+                    // arm's accounting; a refused stop is not propagated.
+                    self.stop(&credential, &workflow_id, started);
                     workflow_id =
                         self.create_workflow(&credential, rest_project.as_deref(), started)?;
                 }
@@ -1031,7 +1095,9 @@ impl Provider for GitlabWorkflowProvider {
                         });
                     }
                     generic_restarts += 1;
-                    let _stopped = self.stop(&credential, &workflow_id, started);
+                    // Best-effort stop: the restart counter above is this
+                    // arm's accounting; a refused stop is not propagated.
+                    self.stop(&credential, &workflow_id, started);
                     workflow_id =
                         self.create_workflow(&credential, rest_project.as_deref(), started)?;
                 }
@@ -1158,16 +1224,17 @@ fn status_of(event: &Value) -> Option<&str> {
         })
 }
 
-/// The checkpoint the frame carries, in its serialized string form.
-fn checkpoint_of(event: &Value) -> Option<String> {
+/// The checkpoint the frame carries, borrowed from the parsed frame: the
+/// recorded wire form is a serialized string, an already-parsed object is
+/// passed through, and any other shape carries no checkpoint.
+fn checkpoint_of(event: &Value) -> Option<&Value> {
     let checkpoint = event
         .get("action")
         .and_then(|action| action.get("newCheckpoint"))
         .or_else(|| event.get("newCheckpoint"))
         .or_else(|| event.get("checkpoint"))?;
     match checkpoint {
-        Value::String(text) => Some(text.clone()),
-        Value::Object(_) => Some(checkpoint.to_string()),
+        Value::String(_) | Value::Object(_) => Some(checkpoint),
         _ => None,
     }
 }
@@ -1279,4 +1346,38 @@ fn mcp_arguments(value: Value) -> Value {
 /// Whether one I/O failure is a timeout — the idle window expiring.
 fn is_timeout(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckpointState;
+    use serde_json::json;
+
+    /// An unchanged snapshot replay leaves the stored reply state alone:
+    /// the per-turn signature table does not grow, so a later distinct
+    /// message with the same text at the same turn is not suppressed as a
+    /// duplicate.
+    #[test]
+    fn an_unchanged_snapshot_replay_does_not_touch_the_stored_state() {
+        let snapshot = json!({
+            "channel_values": {
+                "ui_chat_log": [
+                    { "message_type": "request", "content": "goal" },
+                    { "message_type": "agent", "message_id": "m1", "content": "answer" },
+                ],
+            },
+        });
+        let mut state = CheckpointState::default();
+        state.absorb(&snapshot);
+        let signatures = state.signatures.clone();
+        let content = state.content.clone();
+        let text = state.text.clone();
+        state.absorb(&snapshot);
+        assert_eq!(
+            state.signatures, signatures,
+            "the replay stores no new signature"
+        );
+        assert_eq!(state.content, content, "the replay rewrites no stored text");
+        assert_eq!(state.text, text, "the replay appends nothing");
+    }
 }

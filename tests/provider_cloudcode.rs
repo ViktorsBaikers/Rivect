@@ -52,22 +52,23 @@ use rivect::providers::gemini_cli_login::{
 };
 use rivect::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, StoreKind,
-    TransportClass, dialect_for,
+    TransportCause, TransportClass, dialect_for,
 };
-use rivect::resources::UsageDelta;
+use rivect::resources::{Exactness, UsageDelta};
+use rivect::state::{SettlementState, StoreLedger, TaskStore};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
 
-use support::{CountingLedger, MapStore, prepared_with, received_bodies};
+use support::{CountingLedger, MapStore, SlowStore, prepared_with, received_bodies};
 
 /// The literal connection id this adapter serves.
 const ANTIGRAVITY: &str = "google-antigravity";
@@ -1266,6 +1267,804 @@ async fn a_non_transient_or_after_content_failure_never_falls_back() {
     support::drop_blocking(broker);
 }
 
+/// A loopback peer that reads one request's line and aborts the
+/// connection without answering: the client handed the request off, and
+/// the peer sent no response bytes. The read line proves the hand-off.
+fn abort_after_the_request_line() -> (String, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("the daily peer accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the peer read timeout");
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().expect("the peer reads"))
+            .read_line(&mut line)
+            .expect("the request line crosses before the abort");
+        // The abortive close reaches the client as a mid-request death:
+        // the request bytes are gone, the response never starts.
+        stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("the peer aborts");
+        line
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// The narrowed failover: a daily POST that was handed off and then
+/// aborted may have reached the daily origin, so it never re-POSTs the
+/// body to the sandbox. The entered send settles unknown with no crossed
+/// retry.
+#[tokio::test]
+async fn a_request_aborted_after_hand_off_never_falls_back() {
+    let (daily, peer) = abort_after_the_request_line();
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0),
+    )
+    .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = antigravity_provider(&config, &pinned_profile());
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root = tempfile::TempDir::with_prefix("rivect-cloudcode-abort-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::RequestFailure,
+                "an aborted send is a request failure, not a timeout"
+            );
+            let TransportCause::Request { source } = &cause else {
+                panic!("the abort keeps its request cause: {cause:?}");
+            };
+            assert!(
+                !source.is_connect() && !source.is_builder(),
+                "the handed-off failure is no safe pre-stream class"
+            );
+        }
+        other => panic!("the abort is one typed transport failure: {other:?}"),
+    }
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "the sandbox origin is never attempted when the daily leg may have applied"
+    );
+    let line = peer.join().expect("the daily peer joins");
+    assert!(
+        line.starts_with("POST /v1internal:streamGenerateContent"),
+        "the daily POST crossed before the abort: {line:?}"
+    );
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 0,
+        "a non-failover failure crossed exactly one leg"
+    );
+    assert_eq!(row.exactness, Exactness::Unknown);
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(
+        row.bins.total_tokens, None,
+        "a failed send reports no usage, never zero"
+    );
+}
+
+/// A loopback peer that accepts one request and never answers it: the
+/// attempt is handed off and then times out. The thread ends when the
+/// client closes the timed-out connection.
+fn never_answer() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the daily peer accepts");
+        let mut sink = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut sink) {
+            if read == 0 {
+                return;
+            }
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// A loopback peer that answers headers and one content frame, then
+/// stalls its body until the client's timeout closes the connection.
+fn stall_after_one_event() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the daily peer accepts");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .is_none()
+        {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let frame = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {}\n\n",
+            json!({"response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "partial"}]},
+                    "index": 0,
+                }],
+            }}),
+        );
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        let mut sink = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut sink) {
+            if read == 0 {
+                return;
+            }
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// A loopback peer that answers headers and one content frame at once,
+/// then one terminal frame after `terminal_after`: a stream that would
+/// complete inside a whole deadline but past one attempt's share.
+fn slow_completing_stream(terminal_after: Duration) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the daily peer accepts");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .is_none()
+        {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let opened = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {}\n\n",
+            json!({"response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "slow"}]},
+                    "index": 0,
+                }],
+            }}),
+        );
+        if stream.write_all(opened.as_bytes()).is_err() {
+            return;
+        }
+        std::thread::sleep(terminal_after);
+        let terminal = format!(
+            "data: {}\n\n",
+            json!({"response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": []},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 2,
+                },
+            }}),
+        );
+        // The client may already have timed out; the thread ends either way.
+        let _written = stream.write_all(terminal.as_bytes());
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// A loopback peer that keeps one valid stream breathing: a content frame
+/// at once, then one every `drip`, and the terminal at `terminal_after`.
+/// Every gap stays under one attempt's share, so a per-read window never
+/// fires and only a total attempt timeout can cut the stream.
+fn live_drip_stream(
+    drip: Duration,
+    terminal_after: Duration,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback peer");
+    let address = listener.local_addr().expect("the peer address");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the daily peer accepts");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .is_none()
+        {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let frame = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {}\n\n",
+            json!({"response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "live"}]},
+                    "index": 0,
+                }],
+            }}),
+        );
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        let mut written = Duration::ZERO;
+        while written + drip <= terminal_after {
+            std::thread::sleep(drip);
+            written += drip;
+            if stream.write_all(frame.as_bytes()).is_err() {
+                return;
+            }
+        }
+        if terminal_after > written {
+            std::thread::sleep(terminal_after - written);
+        }
+        let terminal = format!(
+            "data: {}\n\n",
+            json!({"response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": []},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 1,
+                    "totalTokenCount": 2,
+                },
+            }}),
+        );
+        // The client may already have timed out; the thread ends either way.
+        let _written = stream.write_all(terminal.as_bytes());
+    });
+    (format!("http://{address}"), handle)
+}
+
+/// The recorded failover inside one deadline: a daily origin that accepts
+/// the request and never answers spends exactly its share of the budget,
+/// then the one retry answers and the whole send stays inside the
+/// deadline. The single-attempt share is the price of that reachability.
+#[tokio::test]
+async fn a_stalled_origin_times_out_once_and_fails_over_inside_the_deadline() {
+    let deadline = Duration::from_secs(4);
+    let (daily, peer) = never_answer();
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("sandbox answer", "resp-s", 6, 4, 1, 1),
+    )
+    .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = provider_with_deadline(&config, &pinned_profile(), deadline);
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let started = Instant::now();
+    let (broker, ledger, outcome) = dispatch(broker, CountingLedger::new(), manifest);
+    let elapsed = started.elapsed();
+    let reply = outcome.expect("the sandbox attempt answers the stalled daily origin");
+    assert_eq!(reply.text, "sandbox answer");
+    assert_eq!(reply.wire_retries, 1, "one retry, never a second");
+    assert!(
+        elapsed >= deadline / 2,
+        "the stalled attempt spent its whole share: {elapsed:?}"
+    );
+    assert!(
+        elapsed < deadline,
+        "the timed-out attempt and its retry stay inside one deadline: {elapsed:?}"
+    );
+    assert_eq!(ledger.begun, 1, "one entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1);
+    assert_eq!(ledger.failed, 0);
+    assert_eq!(
+        broker.accounted_requests(),
+        1,
+        "the answering retry yields exactly one accounting row"
+    );
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        1,
+        "the sandbox origin is the single retry"
+    );
+    peer.join().expect("the daily peer joins");
+    support::drop_blocking(broker);
+}
+
+/// A stream that stalls after its first frame is a read-stage failure, not
+/// a transient hand-off: it never fails over, and the half-budget attempt
+/// bound cuts it there instead of letting it consume the whole deadline.
+#[tokio::test]
+async fn a_read_stage_timeout_never_fails_over() {
+    let deadline = Duration::from_secs(4);
+    let (daily, peer) = stall_after_one_event();
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0),
+    )
+    .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = provider_with_deadline(&config, &pinned_profile(), deadline);
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root =
+        tempfile::TempDir::with_prefix("rivect-cloudcode-read-stall-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let started = Instant::now();
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::Timeout,
+                "the stalled body keeps the timeout class"
+            );
+            assert!(
+                matches!(cause, TransportCause::Read { .. }),
+                "the failure is a body read, not a hand-off: {cause:?}"
+            );
+        }
+        other => panic!("the stalled stream is one typed transport failure: {other:?}"),
+    }
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "a read-stage failure never re-POSTs the body"
+    );
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 0,
+        "the stream crossed one leg and no retry followed"
+    );
+    assert!(
+        elapsed >= deadline / 2 && elapsed < deadline,
+        "the half-share attempt bound cuts the stall: {elapsed:?}"
+    );
+    peer.join().expect("the daily peer joins");
+}
+
+/// The split's cost, pinned: a reply that would finish inside the whole
+/// deadline but past one attempt's share is cut at the request timeout, and
+/// no retry follows because a read-stage failure never fails over. The
+/// former whole-deadline client admitted this stream.
+#[tokio::test]
+async fn a_stream_past_the_attempt_share_is_cut_inside_the_deadline() {
+    let deadline = Duration::from_secs(4);
+    let (daily, peer) = slow_completing_stream(Duration::from_millis(3000));
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0),
+    )
+    .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = provider_with_deadline(&config, &pinned_profile(), deadline);
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root = tempfile::TempDir::with_prefix("rivect-cloudcode-share-cut-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let started = Instant::now();
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::Timeout,
+                "the share cut is the timeout class"
+            );
+            assert!(
+                matches!(cause, TransportCause::Read { .. }),
+                "the cut lands mid-stream: {cause:?}"
+            );
+        }
+        other => panic!("the share cut is one typed transport failure: {other:?}"),
+    }
+    assert!(
+        elapsed >= deadline / 2 && elapsed < deadline,
+        "the attempt is cut at its share, inside the deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "a read-stage failure never re-POSTs the body"
+    );
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(
+        row.wire_retries, 0,
+        "the stream crossed one leg and no retry followed"
+    );
+    peer.join().expect("the slow peer joins");
+}
+
+/// A valid stream that keeps breathing past one attempt's share: frames
+/// arrive well under the share, so a per-read window never fires, and the
+/// terminal lands past the share but inside the deadline. Only the
+/// request-level total cuts the send, with no retry after the read started.
+#[tokio::test]
+async fn a_live_drip_past_the_attempt_share_is_cut_by_the_total_timeout() {
+    let deadline = Duration::from_secs(4);
+    let (daily, peer) = live_drip_stream(Duration::from_millis(400), Duration::from_millis(2600));
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0),
+    )
+    .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = provider_with_deadline(&config, &pinned_profile(), deadline);
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root = tempfile::TempDir::with_prefix("rivect-cloudcode-live-drip-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let started = Instant::now();
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::Timeout,
+                "the total attempt bound is the timeout class"
+            );
+            assert!(
+                matches!(cause, TransportCause::Read { .. }),
+                "the cut lands mid-stream: {cause:?}"
+            );
+        }
+        other => panic!("the live drip is one typed transport failure: {other:?}"),
+    }
+    assert!(
+        elapsed >= deadline / 2 && elapsed < deadline,
+        "each read stayed inside the share; the total cuts the send: {elapsed:?}"
+    );
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "a read-stage failure never re-POSTs the body"
+    );
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(
+        row.wire_retries, 0,
+        "the stream crossed one leg and no retry followed"
+    );
+    peer.join().expect("the live peer joins");
+}
+
+/// A retry that provably never left the client — a refused connect — is
+/// not a crossed leg: the first failure stays the reported one, with its
+/// class, and the settlement records no retry.
+#[tokio::test]
+async fn a_retry_that_never_crossed_the_wire_keeps_the_first_failure() {
+    let deadline = Duration::from_secs(4);
+    let (daily, peer) = never_answer();
+    // A loopback port bound then released: the retry's connect is refused
+    // before a byte of it exists.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let closed = format!(
+        "http://{}",
+        listener.local_addr().expect("the loopback address")
+    );
+    drop(listener);
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let (provider, store) = provider_with_deadline(&config, &pinned_profile(), deadline);
+    let provider = provider
+        .with_fallback(&closed)
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root =
+        tempfile::TempDir::with_prefix("rivect-cloudcode-refused-retry-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let started = Instant::now();
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::Timeout,
+                "the first attempt's class is the one reported"
+            );
+        }
+        other => panic!("the refused retry keeps the first failure: {other:?}"),
+    }
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 0,
+        "a retry that never left the client is not a crossed leg"
+    );
+    assert!(
+        elapsed < deadline,
+        "the timed-out attempt and the refused retry stay inside one deadline: {elapsed:?}"
+    );
+    peer.join().expect("the daily peer joins");
+}
+
+/// A client-level construction failure never reaches a socket on either
+/// leg: the stored bearer carries a newline, so both POSTs fail in
+/// reqwest's builder. The first failure stays the reported one with its
+/// class, and the settlement records no crossed leg.
+#[tokio::test]
+async fn a_builder_failure_on_both_legs_keeps_the_first_error() {
+    let daily = MockServer::start().await;
+    mount_stream(&daily, cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0)).await;
+    let sandbox = MockServer::start().await;
+    mount_stream(
+        &sandbox,
+        cloudcode_stream("never sent", "resp-x", 1, 1, 0, 0),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&antigravity_config(&daily.uri(), GEMINI_MODEL)).expect("valid");
+    // The escaped newline parses into the stored token; a newline is not a
+    // header value, so reqwest rejects the request while building it.
+    let profile = profile_json(&[(GEMINI_MODEL, "gemini")]).replace(TOKEN, "fixture\\nbad");
+    let (provider, store) = provider_with_deadline(&config, &profile, Duration::from_secs(4));
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root = tempfile::TempDir::with_prefix("rivect-cloudcode-builder-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            let TransportCause::Request { source } = &cause else {
+                panic!("the builder failure keeps its request cause: {cause:?}");
+            };
+            assert!(
+                source.is_builder(),
+                "the failure provably never left the client: {source}"
+            );
+            assert_eq!(
+                cause.class(),
+                TransportClass::RequestFailure,
+                "a builder failure is the request class"
+            );
+        }
+        other => panic!("the builder failure is one typed transport error: {other:?}"),
+    }
+    assert_eq!(
+        daily.received_requests().await.expect("recorded").len(),
+        0,
+        "the first POST never reached a socket"
+    );
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "the retry never reached a socket"
+    );
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the entered failure settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(
+        row.wire_retries, 0,
+        "a retry that never left the client is not a crossed leg"
+    );
+}
+
+/// The remaining-budget clamp, not a fixed share: a credential resolve
+/// that spends two of the three seconds leaves the first attempt one
+/// second, so the send ends at the deadline instead of deadline + share.
+/// The fallback is never reached.
+#[tokio::test]
+async fn a_slow_credential_resolve_cannot_push_the_send_past_the_deadline() {
+    let deadline = Duration::from_secs(3);
+    let (daily, peer) = never_answer();
+    let sandbox = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(STREAM_PATH))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(600)))
+        .mount(&sandbox)
+        .await;
+    let config = Config::parse_validated(&antigravity_config(&daily, GEMINI_MODEL)).expect("valid");
+    let profile = pinned_profile();
+    let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
+        inner: MapStore::seeded(STORE_KIND, &[(CREDENTIAL_REF, profile.as_str())]),
+        delay: Duration::from_secs(2),
+    });
+    let handle = Arc::clone(&store);
+    let config_for_provider = config.clone();
+    let provider = std::thread::spawn(move || {
+        CloudCodeProvider::with_deadline(&config_for_provider, ANTIGRAVITY, handle, deadline)
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the adapter builds for the literal id");
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, WORLD, INPUTS)
+        .expect("the pin prepares");
+    let started = Instant::now();
+    let (broker, ledger, outcome) = dispatch(broker, CountingLedger::new(), manifest);
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => assert_eq!(
+            cause.class(),
+            TransportClass::DeadlineExpired,
+            "the retry is refused once the resolve has spent the deadline"
+        ),
+        other => panic!("both origins never answer; the budget is the verdict: {other:?}"),
+    }
+    assert!(
+        elapsed < deadline + Duration::from_millis(250),
+        "the resolve spends the same budget; no attempt adds a share: {elapsed:?}"
+    );
+    assert_eq!(ledger.begun, 1, "one entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1);
+    assert_eq!(ledger.failed, 1);
+    assert_eq!(broker.accounted_requests(), 0);
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        0,
+        "the retry never reaches the sandbox after the deadline"
+    );
+    peer.join().expect("the daily peer joins");
+    support::drop_blocking(broker);
+}
+
+/// A retried leg that answers 200 and then fails while its body streams is
+/// still the second crossed leg: the failure keeps the `Retried` marker
+/// and the settlement records the count.
+#[tokio::test]
+async fn a_retried_stream_failure_keeps_the_crossed_leg_count() {
+    let daily = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(STREAM_PATH))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&daily)
+        .await;
+    let sandbox = MockServer::start().await;
+    let content_only = format!(
+        "data: {}\n\n",
+        json!({"response": {
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "observed"}]},
+                "index": 0,
+            }],
+        }}),
+    );
+    mount_stream(&sandbox, content_only).await;
+    let config =
+        Config::parse_validated(&antigravity_config(&daily.uri(), GEMINI_MODEL)).expect("valid");
+    let (provider, store) = antigravity_provider(&config, &pinned_profile());
+    let provider = provider
+        .with_fallback(&sandbox.uri())
+        .expect("the proof fallback admits");
+    let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
+    let attempt_id = manifest.attempt_id.clone();
+    let root = tempfile::TempDir::with_prefix("rivect-cloudcode-retried-").expect("fixture root");
+    let db = root.path().join("state.db");
+    let (store, outcome) = std::thread::spawn(move || {
+        let mut store = TaskStore::open(&db).expect("store opens");
+        let mut ledger = StoreLedger::new(&mut store, Vec::new());
+        let mut broker = broker;
+        let outcome = broker.dispatch(&mut ledger, WORLD, &manifest);
+        (store, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+    match outcome {
+        // The broker unwraps the adapter's retry marker at the send
+        // boundary, so the caller meets the stream verdict while the
+        // crossed-leg count stays on the settlement row below.
+        Err(ModelError::Provider(ProviderError::UnknownTerminal { connection })) => {
+            assert_eq!(connection, ANTIGRAVITY);
+        }
+        other => panic!("a failed retried stream keeps its class: {other:?}"),
+    }
+    let row = store
+        .settlement(&attempt_id)
+        .expect("the failed retried stream settles");
+    assert_eq!(row.state, SettlementState::Settled);
+    assert_eq!(row.wire_retries, 1, "both physical legs crossed the wire");
+    assert_eq!(row.exactness, Exactness::Unknown);
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(
+        row.bins.total_tokens, None,
+        "a failed retried stream reports no usage, never zero"
+    );
+    assert_eq!(daily.received_requests().await.expect("recorded").len(), 1);
+    assert_eq!(
+        sandbox.received_requests().await.expect("recorded").len(),
+        1
+    );
+}
+
 /// A wrong origin and an unusable profile both deny typed before any
 /// request: zero physical requests, one failed settlement row and no
 /// accounting row.
@@ -2198,6 +2997,76 @@ async fn gemini_cli_envelope_is_recorded() {
         );
     }
 
+    support::drop_blocking(broker);
+}
+
+/// The Gemini CLI request timeout is the budget left at the post, not the
+/// whole deadline: a credential resolve that spends most of a short budget
+/// leaves the never-answering attempt only the remainder, so the send ends
+/// inside the deadline. A fixed full-deadline request timeout would end
+/// past it by the resolve delay.
+#[tokio::test]
+async fn a_slow_resolve_cannot_push_the_gemini_cli_send_past_the_deadline() {
+    let deadline = Duration::from_millis(1600);
+    let (origin, peer) = never_answer();
+    let config =
+        Config::parse_validated(&gemini_cli_config(&origin, GEMINI_CLI_MODEL)).expect("valid");
+    let profile = gemini_cli_profile(GEMINI_CLI_PROJECT, "");
+    let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
+        inner: MapStore::seeded(STORE_KIND, &[(GEMINI_CLI_REF, profile.as_str())]),
+        delay: Duration::from_millis(1000),
+    });
+    let provider = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            GeminiCliProvider::with_deadline(&config, GEMINI_CLI, store, deadline)
+        })
+        .join()
+        .expect("the provider thread joins")
+        .expect("the adapter builds for the literal id")
+    };
+    let (broker, manifest) = prepared_with(
+        (
+            provider,
+            Arc::new(MapStore::seeded(
+                STORE_KIND,
+                &[(GEMINI_CLI_REF, profile.as_str())],
+            )),
+        ),
+        &config,
+        WORLD,
+        GEMINI_CLI_INPUTS,
+    );
+    let started = Instant::now();
+    let (broker, ledger, outcome) = dispatch(broker, CountingLedger::new(), manifest);
+    let elapsed = started.elapsed();
+    match outcome {
+        Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
+            assert_eq!(
+                cause.class(),
+                TransportClass::Timeout,
+                "the remaining-budget timeout is the timeout class"
+            );
+        }
+        other => panic!("the never-answering origin is one typed transport failure: {other:?}"),
+    }
+    assert!(
+        elapsed >= deadline,
+        "the post waits out the remaining budget: {elapsed:?}"
+    );
+    assert!(
+        elapsed < deadline + Duration::from_millis(300),
+        "the resolve spends the same budget; the post adds only its remainder: {elapsed:?}"
+    );
+    assert_eq!(ledger.begun, 1, "one entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1);
+    assert_eq!(ledger.failed, 1);
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a send with no reply opens no accounting record"
+    );
+    peer.join().expect("the unanswered peer joins");
     support::drop_blocking(broker);
 }
 

@@ -1639,6 +1639,70 @@ async fn anthropic_signature_400_permanent() {
     );
 }
 
+/// The Messages reader bounds the whole stream, not only one event: a peer
+/// emitting well-formed deltas at the largest size the line and event caps
+/// admit trips the whole-stream byte cap with the typed violation and
+/// assembles no reply. The stream carries its full close, so without the
+/// cap it would succeed; the reason names the whole-stream bound itself.
+#[tokio::test]
+async fn a_stream_over_the_total_byte_bound_is_a_typed_violation() {
+    let server = MockServer::start().await;
+    let text = "x".repeat(250_000);
+    let delta = sse_block(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        }),
+    );
+    let started = sse_block(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }),
+    );
+    let stopped = sse_block(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": 0}),
+    );
+    let message_delta = sse_block(
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1},
+        }),
+    );
+    let message_stop = sse_block("message_stop", &json!({"type": "message_stop"}));
+    // 40 deltas of ~250 KB each stay inside the 256 KiB line and 4 MiB
+    // event bounds; together they cross the 8 MiB whole-stream bound, and
+    // the complete close proves the cap — not a missing terminal — denies.
+    mount_messages(
+        &server,
+        format!(
+            "{}{started}{}{stopped}{message_delta}{message_stop}",
+            message_start(1),
+            delta.repeat(40),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    match outcome {
+        Err(ProviderError::StreamViolation { reason, .. }) => assert_eq!(
+            reason, "stream exceeds the byte bound",
+            "the whole-stream bound, not a line or event cap, is the reason"
+        ),
+        other => panic!("the over-bound stream is a typed violation, never a reply: {other:?}"),
+    }
+    drop_blocking(provider);
+}
+
 #[tokio::test]
 async fn wire_retry_is_recorded_and_not_a_second_child() {
     // One physical child attempt answers after the adapter's own stripped

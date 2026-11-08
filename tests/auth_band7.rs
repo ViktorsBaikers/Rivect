@@ -207,6 +207,67 @@ fn fixture_pem() -> String {
     format!("-----BEGIN {label}-----\n{FIXTURE_KEY}-----END {label}-----\n")
 }
 
+/// The same PKCS#8 bytes as the bare base64 body some credential files
+/// hold: no armor lines and no trailing newline.
+fn fixture_bare_key() -> String {
+    FIXTURE_KEY.trim_end().to_string()
+}
+
+/// The RS256 signature the fixture key produces over `message`. PKCS#1
+/// v1.5 is deterministic, so re-signing the emitted `header.payload`
+/// verifies that exact preimage and nothing a truncated or substituted
+/// one would sign; an OpenSSL failure names the stage instead of panicking.
+#[cfg(not(target_os = "macos"))]
+fn fixture_signature(message: &str) -> Result<Vec<u8>, &'static str> {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Padding;
+    use openssl::sign::Signer;
+
+    let der = openssl::base64::decode_block(FIXTURE_KEY.trim()).map_err(|_error| "import")?;
+    let key = PKey::private_key_from_pkcs8(&der).map_err(|_error| "import")?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &key).map_err(|_error| "verify")?;
+    signer
+        .set_rsa_padding(Padding::PKCS1)
+        .map_err(|_error| "verify")?;
+    signer
+        .update(message.as_bytes())
+        .map_err(|_error| "verify")?;
+    signer.sign_to_vec().map_err(|_error| "verify")
+}
+
+/// Whether `signature` is the fixture key's RS256 signature over `message`.
+/// Apple has no OpenSSL signer here, so the Mac leg imports the same key
+/// through Security.framework and verifies with the public half it derives;
+/// an API failure names the stage instead of reading as a bad signature.
+fn verify_emitted_signature(message: &str, signature: &[u8]) -> Result<bool, &'static str> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(signature == fixture_signature(message)?.as_slice())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::key::Algorithm;
+        use security_framework::os::macos::import_export::{ImportOptions, SecItems};
+
+        let mut items = SecItems::default();
+        ImportOptions::new()
+            .filename("key.pem")
+            .items(&mut items)
+            .import(fixture_pem().as_bytes())
+            .map_err(|_error| "import")?;
+        let key = items.keys.first().ok_or("no-key")?;
+        let public = key.public_key().ok_or("public-key")?;
+        public
+            .verify_signature(
+                Algorithm::RSASignatureMessagePKCS1v15SHA256,
+                message.as_bytes(),
+                signature,
+            )
+            .map_err(|_error| "verify")
+    }
+}
+
 fn service_account() -> Value {
     json!({
         "type": "service_account",
@@ -547,7 +608,87 @@ fn a_service_account_file_signs_the_recorded_assertion() {
     let issued = claims.get("iat").and_then(Value::as_u64).expect("iat");
     let expires = claims.get("exp").and_then(Value::as_u64).expect("exp");
     assert_eq!(expires - issued, 3600);
-    assert_eq!(signature.len(), 342, "a 2048-bit RS256 signature");
+    let emitted = base64url_decode(signature).expect("the signature decodes");
+    assert_eq!(emitted.len(), 256, "a 2048-bit RS256 signature");
+    assert_eq!(
+        verify_emitted_signature(&format!("{header}.{payload}"), &emitted),
+        Ok(true),
+        "the emitted signature verifies against the emitted header.payload"
+    );
+    let mut flipped = emitted;
+    flipped[0] ^= 0x01;
+    let verified = verify_emitted_signature(&format!("{header}.{payload}"), &flipped);
+    assert!(
+        matches!(verified, Ok(false) | Err("verify")),
+        "a flipped signature byte is not accepted, got {verified:?}"
+    );
+}
+
+#[test]
+fn a_bare_key_service_account_file_signs_the_recorded_assertion() {
+    let mut harness = Harness::new(token_answer(3600));
+    let mut account = service_account();
+    account["private_key"] = Value::String(fixture_bare_key());
+    harness.sources.gac_file = Some(harness.file("gac.json", &account));
+
+    let credential =
+        vertex_login::resolve("vertex", &harness.sources).expect("the bare key is accepted");
+
+    assert_eq!(credential.access_token(), "token-assertion");
+    let requests = harness.peer.requests();
+    assert_eq!(requests.len(), 1, "exactly one token exchange");
+    assert_eq!(requests[0].line, "POST /token HTTP/1.1");
+    let body = &requests[0].body;
+    assert_eq!(
+        form_value(body, "grant_type").as_deref(),
+        Some("urn:ietf:params:oauth:grant-type:jwt-bearer")
+    );
+    let assertion = form_value(body, "assertion").expect("the form carries the assertion");
+    let mut segments = assertion.split('.');
+    let header = segments.next().expect("the jwt header");
+    let payload = segments.next().expect("the jwt payload");
+    let signature = segments.next().expect("the jwt signature");
+    assert!(segments.next().is_none());
+    let header_json: Value =
+        serde_json::from_slice(&base64url_decode(header).expect("the header decodes"))
+            .expect("the header is json");
+    assert_eq!(
+        header_json.get("alg").and_then(Value::as_str),
+        Some("RS256")
+    );
+    assert_eq!(header_json.get("typ").and_then(Value::as_str), Some("JWT"));
+    let claims: Value =
+        serde_json::from_slice(&base64url_decode(payload).expect("the payload decodes"))
+            .expect("the payload is json");
+    assert_eq!(
+        claims.get("iss").and_then(Value::as_str),
+        Some("fixture@example.iam.gserviceaccount.com")
+    );
+    assert_eq!(
+        claims.get("aud").and_then(Value::as_str),
+        Some(harness.sources.endpoints.token.as_str())
+    );
+    assert_eq!(
+        claims.get("scope").and_then(Value::as_str),
+        Some("https://www.googleapis.com/auth/cloud-platform")
+    );
+    let issued = claims.get("iat").and_then(Value::as_u64).expect("iat");
+    let expires = claims.get("exp").and_then(Value::as_u64).expect("exp");
+    assert_eq!(expires - issued, 3600);
+    let emitted = base64url_decode(signature).expect("the signature decodes");
+    assert_eq!(emitted.len(), 256, "a 2048-bit RS256 signature");
+    assert_eq!(
+        verify_emitted_signature(&format!("{header}.{payload}"), &emitted),
+        Ok(true),
+        "the emitted signature verifies against the emitted header.payload"
+    );
+    let mut flipped = emitted;
+    flipped[0] ^= 0x01;
+    let verified = verify_emitted_signature(&format!("{header}.{payload}"), &flipped);
+    assert!(
+        matches!(verified, Ok(false) | Err("verify")),
+        "a flipped signature byte is not accepted, got {verified:?}"
+    );
 }
 
 #[test]
@@ -660,7 +801,8 @@ fn a_service_account_source_completes_the_impersonation_chain() {
     let assertion =
         form_value(&requests[0].body, "assertion").expect("the form carries the assertion");
     let mut segments = assertion.split('.');
-    let payload = segments.nth(1).expect("the jwt payload");
+    let header = segments.next().expect("the jwt header");
+    let payload = segments.next().expect("the jwt payload");
     let signature = segments.next().expect("the jwt signature");
     assert!(segments.next().is_none());
     let claims: Value =
@@ -677,7 +819,20 @@ fn a_service_account_source_completes_the_impersonation_chain() {
     let issued = claims.get("iat").and_then(Value::as_u64).expect("iat");
     let expires = claims.get("exp").and_then(Value::as_u64).expect("exp");
     assert_eq!(expires - issued, 3600);
-    assert_eq!(signature.len(), 342, "a 2048-bit RS256 signature");
+    let emitted = base64url_decode(signature).expect("the signature decodes");
+    assert_eq!(emitted.len(), 256, "a 2048-bit RS256 signature");
+    assert_eq!(
+        verify_emitted_signature(&format!("{header}.{payload}"), &emitted),
+        Ok(true),
+        "the emitted signature verifies against the emitted header.payload"
+    );
+    let mut flipped = emitted;
+    flipped[0] ^= 0x01;
+    let verified = verify_emitted_signature(&format!("{header}.{payload}"), &flipped);
+    assert!(
+        matches!(verified, Ok(false) | Err("verify")),
+        "a flipped signature byte is not accepted, got {verified:?}"
+    );
     assert_eq!(
         requests[1].line,
         "POST /iam/projects/-/serviceAccounts/target@example.iam.gserviceaccount.com:generateAccessToken HTTP/1.1"
@@ -695,6 +850,81 @@ fn a_service_account_source_completes_the_impersonation_chain() {
         harness.peer.requests().len(),
         2,
         "the impersonated token is cached"
+    );
+}
+
+#[test]
+fn a_bare_key_service_account_source_completes_the_impersonation_chain() {
+    let mut harness = Harness::new(impersonation_answer);
+    let impersonation_url = format!(
+        "{}/v1/projects/-/serviceAccounts/target@example.iam.gserviceaccount.com:generateAccessToken",
+        harness.peer.base
+    );
+    let mut source = service_account();
+    source["private_key"] = Value::String(fixture_bare_key());
+    let file = json!({
+        "type": "impersonated_service_account",
+        "service_account_impersonation_url": impersonation_url,
+        "source_credentials": source,
+    });
+    harness.sources.gac_file = Some(harness.file("gac.json", &file));
+
+    let credential = vertex_login::resolve("vertex", &harness.sources).expect("the chain resolves");
+
+    assert_eq!(credential.access_token(), "token-impersonated");
+    let requests = harness.peer.requests();
+    assert_eq!(requests.len(), 2, "source assertion, then the IAM exchange");
+    assert_eq!(requests[0].line, "POST /token HTTP/1.1");
+    let assertion =
+        form_value(&requests[0].body, "assertion").expect("the form carries the assertion");
+    let mut segments = assertion.split('.');
+    let header = segments.next().expect("the jwt header");
+    let payload = segments.next().expect("the jwt payload");
+    let signature = segments.next().expect("the jwt signature");
+    assert!(segments.next().is_none());
+    let claims: Value =
+        serde_json::from_slice(&base64url_decode(payload).expect("the payload decodes"))
+            .expect("the payload is json");
+    assert_eq!(
+        claims.get("iss").and_then(Value::as_str),
+        Some("fixture@example.iam.gserviceaccount.com")
+    );
+    assert_eq!(
+        claims.get("aud").and_then(Value::as_str),
+        Some(harness.sources.endpoints.token.as_str())
+    );
+    assert_eq!(
+        claims.get("scope").and_then(Value::as_str),
+        Some("https://www.googleapis.com/auth/cloud-platform")
+    );
+    let issued = claims.get("iat").and_then(Value::as_u64).expect("iat");
+    let expires = claims.get("exp").and_then(Value::as_u64).expect("exp");
+    assert_eq!(expires - issued, 3600);
+    let emitted = base64url_decode(signature).expect("the signature decodes");
+    assert_eq!(emitted.len(), 256, "a 2048-bit RS256 signature");
+    assert_eq!(
+        verify_emitted_signature(&format!("{header}.{payload}"), &emitted),
+        Ok(true),
+        "the emitted signature verifies against the emitted header.payload"
+    );
+    let mut flipped = emitted;
+    flipped[0] ^= 0x01;
+    let verified = verify_emitted_signature(&format!("{header}.{payload}"), &flipped);
+    assert!(
+        matches!(verified, Ok(false) | Err("verify")),
+        "a flipped signature byte is not accepted, got {verified:?}"
+    );
+    assert_eq!(
+        requests[1].line,
+        "POST /iam/projects/-/serviceAccounts/target@example.iam.gserviceaccount.com:generateAccessToken HTTP/1.1"
+    );
+    assert!(
+        requests[1]
+            .head
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer token-assertion")),
+        "{}",
+        requests[1].head
     );
 }
 
@@ -805,20 +1035,28 @@ fn vertex_profile_publishes_the_canonical_credential_bytes() {
     let store = support::MapStore::new(StoreKind::Keychain);
     let reference = SecretRef::parse(VERTEX_SCOPE).expect("the fixture reference parses");
 
+    let before = now_seconds();
     let profile = vertex_login::login(&config, "vertex", &harness.sources, &store)
         .expect("the profile is published");
+    let after = now_seconds();
 
     assert_eq!(profile, "vertex");
     let bytes = store.resolve(&reference).expect("the profile is stored");
     let credential =
         vertex_login::read(&store, &reference).expect("the profile reads back through its struct");
-    let expected = format!(
-        "{{\"source\":\"gac_file\",\"project\":\"fixture-project\",\"location\":\"us-central1\",\"access_token\":\"token-fixture-refresh\",\"expires_at\":{}}}",
-        credential.expires_at()
-    );
-    assert_eq!(
-        String::from_utf8(bytes.clone()).expect("utf-8 bytes"),
-        expected
+    // The canonical bytes are literal apart from the one field the reply
+    // times: its value is bracketed by the test's own clock readings, so
+    // the expectation never copies the read-back credential it checks.
+    let text = String::from_utf8(bytes.clone()).expect("utf-8 bytes");
+    let prefix = "{\"source\":\"gac_file\",\"project\":\"fixture-project\",\"location\":\"us-central1\",\"access_token\":\"token-fixture-refresh\",\"expires_at\":";
+    let expiry = text
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix('}'))
+        .expect("the stored bytes keep the canonical member order");
+    let expiry: u64 = expiry.parse().expect("the expiry is a number");
+    assert!(
+        (before + 3540..=after + 3540).contains(&expiry),
+        "the stored expiry is the reply's 3600 s under the 60 s skew, got {expiry}"
     );
     assert_eq!(credential.source(), CredentialSource::GacFile);
     assert_eq!(credential.project(), "fixture-project");
@@ -1879,6 +2117,73 @@ fn antigravity_the_deadline_stops_the_wait() {
             .all(|request| !request.line.starts_with("GET ")),
         "the deadline ends the wait before a poll: {} requests",
         requests.len()
+    );
+}
+
+/// A guard: the operation wait is driven by the supplied poll interval, not
+/// a hardcoded one. The deadline allows only a bounded number of full
+/// interval waits, so an ignored interval either starves the polls or breaks
+/// the bound, and the typed expiry still lands when the budget is spent.
+#[test]
+fn antigravity_polls_wait_the_budget_interval() {
+    let peer = Peer::start(|seen| {
+        if seen.line.contains(":loadCodeAssist") {
+            return (200u16, "{}".to_string());
+        }
+        (
+            200u16,
+            json!({ "name": "operations/never", "done": false }).to_string(),
+        )
+    });
+    let interval = Duration::from_millis(20);
+    let deadline = Duration::from_millis(400);
+    let endpoints = antigravity_endpoints(&peer);
+    let session = antigravity_login::begin_login_with(
+        "fixture-token",
+        &endpoints,
+        ProvisioningBudget {
+            deadline,
+            poll_interval: interval,
+        },
+    )
+    .expect("the login begins");
+    let store = support::MapStore::new(StoreKind::Keychain);
+    let reference = antigravity_reference();
+
+    let started = Instant::now();
+    let error = antigravity_login::complete_login(
+        &antigravity_config("api_key"),
+        "antigravity",
+        &session,
+        &store,
+    )
+    .expect_err("the operation never finishes");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, AntigravityError::ProvisioningTimedOut),
+        "{error}"
+    );
+    assert_nothing_published(&store, &reference);
+    let polls = peer
+        .requests()
+        .iter()
+        .filter(|request| request.line.starts_with("GET "))
+        .count();
+    let cap = usize::try_from(deadline.as_millis() / interval.as_millis())
+        .expect("the fixture bound fits");
+    assert!(
+        polls >= 2,
+        "the supplied interval drives the wait: {polls} polls"
+    );
+    assert!(
+        polls <= cap,
+        "every poll spends its interval first, so {deadline:?} allows at \
+         most {cap}: {polls} polls"
+    );
+    assert!(
+        elapsed >= interval * u32::try_from(polls).expect("a small poll count"),
+        "each of {polls} polls waits the budget interval: {elapsed:?}"
     );
 }
 

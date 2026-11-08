@@ -44,7 +44,10 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
 
-use support::{MapStore, drop_blocking, prepared_with, received_bodies, send_on_thread, sse_block};
+use support::{
+    CountingLedger, MapStore, drop_blocking, prepared_with, received_bodies, send_on_thread,
+    sse_block,
+};
 
 /// The literal connection id this adapter serves.
 const VERTEX: &str = "google-vertex";
@@ -149,6 +152,36 @@ fn dispatch(
     })
     .join()
     .expect("the dispatch thread joins")
+}
+
+/// The same frozen dispatch with a counting ledger: a denial's settlement
+/// row and accounting record are observable.
+fn dispatch_counted(
+    mut broker: Broker,
+    world: &str,
+    manifest: RequestManifest,
+) -> (Broker, CountingLedger, Result<ProviderReply, ModelError>) {
+    let world = world.to_string();
+    std::thread::spawn(move || {
+        let mut ledger = CountingLedger::new();
+        let outcome = broker.dispatch(&mut ledger, &world, &manifest);
+        (broker, ledger, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins")
+}
+
+/// A pre-send denial opens and closes one settlement row, fails it, and
+/// writes no accounting record.
+fn assert_denied_settles_without_accounting(broker: &Broker, ledger: &CountingLedger) {
+    assert_eq!(ledger.begun, 1, "the entered send opens one settlement row");
+    assert_eq!(ledger.finished, 1, "the denial closes the row it opened");
+    assert_eq!(ledger.failed, 1, "the row settles as failed");
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denial opens no accounting record"
+    );
 }
 
 /// One SSE response on the recorded resource path.
@@ -628,7 +661,7 @@ async fn unknown_or_third_class_model_denies_before_the_post() {
             "/world/vertex",
             INPUTS,
         );
-        let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+        let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
         match outcome {
             Err(ModelError::Provider(ProviderError::ModelClassUnresolved {
                 connection,
@@ -639,6 +672,7 @@ async fn unknown_or_third_class_model_denies_before_the_post() {
             }
             other => panic!("{model} must deny its class before the post: {other:?}"),
         }
+        assert_denied_settles_without_accounting(&broker, &ledger);
     }
     assert!(
         server
@@ -664,7 +698,7 @@ async fn api_key_form_cannot_serve_the_messages_class() {
         "/world/vertex",
         INPUTS,
     );
-    let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+    let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
     assert!(
         matches!(
             outcome,
@@ -674,6 +708,7 @@ async fn api_key_form_cannot_serve_the_messages_class() {
         ),
         "the API-key form has no project/location resource: {outcome:?}"
     );
+    assert_denied_settles_without_accounting(&broker, &ledger);
     assert!(
         server
             .received_requests()
@@ -706,7 +741,7 @@ async fn auto_assignment_denies_typed_before_the_post() {
         "/world/vertex",
         INPUTS,
     );
-    let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+    let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
     assert!(
         matches!(
             outcome,
@@ -714,6 +749,7 @@ async fn auto_assignment_denies_typed_before_the_post() {
         ),
         "an auto assignment has no pinned class: {outcome:?}"
     );
+    assert_denied_settles_without_accounting(&broker, &ledger);
     assert!(
         server
             .received_requests()
@@ -738,7 +774,7 @@ async fn malformed_api_key_denies_before_the_post() {
             "/world/vertex",
             INPUTS,
         );
-        let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+        let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
         assert!(
             matches!(
                 outcome,
@@ -748,6 +784,7 @@ async fn malformed_api_key_denies_before_the_post() {
             ),
             "{material:?} is not usable reference material: {outcome:?}"
         );
+        assert_denied_settles_without_accounting(&broker, &ledger);
     }
     assert!(
         server
@@ -807,7 +844,7 @@ async fn dot_or_empty_project_denies_before_the_post() {
                 "/world/vertex",
                 INPUTS,
             );
-            let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+            let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
             assert!(
                 matches!(
                     outcome,
@@ -817,6 +854,7 @@ async fn dot_or_empty_project_denies_before_the_post() {
                 ),
                 "{model} with project {project:?} denies its path segment: {outcome:?}"
             );
+            assert_denied_settles_without_accounting(&broker, &ledger);
         }
     }
     assert!(
@@ -843,7 +881,7 @@ async fn bad_location_or_configured_region_denies_typed() {
         "/world/vertex",
         INPUTS,
     );
-    let (_broker, outcome) = dispatch(broker, "/world/vertex", manifest);
+    let (broker, ledger, outcome) = dispatch_counted(broker, "/world/vertex", manifest);
     assert!(
         matches!(
             outcome,
@@ -851,6 +889,7 @@ async fn bad_location_or_configured_region_denies_typed() {
         ),
         "a location outside the host-label charset denies: {outcome:?}"
     );
+    assert_denied_settles_without_accounting(&broker, &ledger);
     assert!(
         server
             .received_requests()

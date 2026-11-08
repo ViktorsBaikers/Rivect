@@ -46,7 +46,7 @@
 //! recorded Chat Completions default, never a cross-route fallback.
 
 use super::anthropic_login::{LoginError, read_subscription};
-use super::sse::{SseEvent, SseParser};
+use super::sse::{MAX_STREAM_BYTES, SseEvent, SseParser};
 use super::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply, ToolCall,
     WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
@@ -1287,6 +1287,7 @@ impl MessagesCodec {
         let mut parser = SseParser::new();
         let mut state = StreamState::default();
         let mut chunk = vec![0u8; super::STREAM_CHUNK_BYTES];
+        let mut total = 0usize;
         loop {
             let read = read_chunk(
                 &self.connection,
@@ -1297,6 +1298,12 @@ impl MessagesCodec {
             )?;
             if read == 0 {
                 break;
+            }
+            // The whole stream is bounded, not only one event: a peer that
+            // keeps emitting frames never grows this reply past the cap.
+            total = total.saturating_add(read);
+            if total > MAX_STREAM_BYTES {
+                return Err(violation(&self.connection, "stream exceeds the byte bound"));
             }
             for event in parser
                 .feed(&chunk[..read])

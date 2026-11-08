@@ -18,6 +18,23 @@
 //! extracted Messages codec, so replay, tool and usage rules cannot
 //! drift from their Messages and Gemini owners.
 //!
+//! The accepted pins are the closed catalogue's native rows only. The
+//! publisher class admits `gemini-2.5-flash`, `gemini-2.5-pro`,
+//! `gemini-3-flash-preview`, `gemini-3-pro-preview` and
+//! `gemini-3.1-pro-preview`; the regional `streamRawPredict` class admits
+//! `claude-haiku-4-5`, `claude-opus-4-5`, `claude-opus-4-8` and
+//! `claude-sonnet-4-5`. The catalogue's third row carries the upstream
+//! `openai-completions` owner (`meta/llama-3.3-70b-instruct-maas`) and
+//! has no native class here. `class_for` admits exactly the
+//! `google-vertex` and `anthropic-messages` owners `VERTEX_MODELS`
+//! records and refuses every other row; the shared catalogue variant's
+//! class names are its own local pin record, and this adapter never
+//! re-projects a Vertex `api` owner onto them.
+//!
+//! The raw API-key form is one token in the recorded grammar: non-empty
+//! and inside `[A-Za-z0-9_-]`. The ADC artifact is JSON, so it can never
+//! satisfy that grammar and be mistaken for a key.
+//!
 //! Secret material crosses only from [`CredentialStore`] into the
 //! request header per send — never into config, manifests, diagnostics
 //! or this type's `Debug` (INV-001/INV-006).
@@ -100,7 +117,8 @@ enum Material {
 }
 
 /// The `google-vertex` adapter. Constructed per connection; the Broker
-/// owns the handle.
+/// owns the handle. Its accepted pin set, raw API-key grammar and the
+/// shared-catalogue projection are the module contract above.
 pub struct VertexProvider {
     /// The literal connection id this adapter serves.
     connection: String,

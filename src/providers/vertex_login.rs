@@ -1308,6 +1308,24 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_key_body_signs_the_same_vector() {
+        // openssl dgst -sha256 -sign over the same message and fixture key.
+        let expected = login_common::base64url_decode(
+            "oqVUUavrPqZeGMMeYgFEFljC7azyn5T4QH2VlTT+4qfo46Ie+kLunbF7Dp8FT16+bX1BIJlAN8iImm0zlnhmJc/LhVMhqSB9hTh5CA8en/kefIgAsK0UHmLMApeszmmNSYjkMdjBkXAsl6pi+S8+KLJHEmO/5KL3gfOGe8smfkMPtRIzbONQIp9d6/Nyz0D5fKbt+llRiS15pRuRqIV4gC6RmaJXoA6sWBTOkLP59l7OOoC5MX+EaTzeFBi6lBvoN6TUeUZ9cKxPl9pD7pJms53HMTYTMUOthGRw/Ri0/RBURyuyMjNtrf7NT75bSp2eL4h+IUIe+N/BU+DxobffNw==",
+        )
+        .expect("the vector decodes");
+        let message = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJmaXh0dXJlIn0";
+        let armored = sign_sha256(&fixture_pem(), message).expect("the armor signs");
+        let bare = FIXTURE_KEY.trim_end();
+        let signature = sign_sha256(bare, message).expect("the bare key body signs");
+        assert_eq!(signature, armored, "the bare body and the armor sign alike");
+        assert_eq!(
+            signature, expected,
+            "the bare body matches the openssl vector"
+        );
+    }
+
+    #[test]
     fn a_pem_without_key_material_is_refused() {
         let label = "PRIVATE KEY";
         let empty = format!("-----BEGIN {label}-----\n-----END {label}-----\n");

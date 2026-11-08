@@ -8,6 +8,15 @@ requests carry, and the catalogue rule its offer set obeys. An empty configured
 | id | dialect | recorded base | credential | catalogue |
 | --- | --- | --- | --- | --- |
 | `vercel-ai-gateway` | Messages | `https://ai-gateway.vercel.sh` | `api_key` bearer | keyed `/v1/models`, `tool-use` marker |
+| `google-antigravity` | `cloudcode` | `https://daily-cloudcode-pa.googleapis.com`; failover `https://daily-cloudcode-pa.sandbox.googleapis.com` | scoped Antigravity profile bearer | none offered; the profile's pinned model-to-class table |
+| `google-gemini-cli` | `cloudcode` | `https://cloudcode-pa.googleapis.com` | scoped Code Assist profile bearer | none offered; the offer set is empty |
+| `google-vertex` | `vertex` | `https://aiplatform.googleapis.com`; regional `https://{location}-aiplatform.googleapis.com` | raw API key `x-goog-api-key`, or the ADC artifact bearer | none offered; the closed native catalogue rows |
+| `gitlab-duo-agent` | `gitlab-workflow` | `https://gitlab.com` | scoped workspace profile bearer | none offered; the pinned workflow model |
+
+The Gemini CLI credential is a scoped Code Assist profile binding the
+project and the tier. Its tier rule classifies the recorded free, legacy and
+standard ids and refuses an unrecorded one before the post; the adapter
+offers no catalogue rows of its own.
 
 ## vercel-ai-gateway
 

@@ -51,13 +51,14 @@ use super::antigravity_login::{
 };
 use super::gemini::{GeminiCodec, StreamOutcome};
 use super::gemini_cli_login::{
-    self as gemini_cli, CODE_ASSIST_ORIGIN as GEMINI_CLI_ORIGIN, CodeAssistProfile,
+    self as gemini_cli, CODE_ASSIST_ORIGIN as GEMINI_CLI_ORIGIN, CodeAssistProfile, FREE_TIER,
+    LEGACY_TIER,
 };
 use super::login_common;
 use super::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, TransportClass, WireAuth,
-    check_deadline, dialect_for, forwarded_header_map, resolve_credential, transport,
-    transport_status, wire_body,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, TransportCause,
+    TransportClass, WireAuth, check_deadline, dialect_for, forwarded_header_map,
+    resolve_credential, transport, transport_status, wire_body,
 };
 use crate::config::{Config, Connection, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
@@ -68,6 +69,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The whole-request budget every CloudCode send shares.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
+
+/// One physical attempt's share of the budget: half, as a *cap*. The real
+/// bound is the budget still remaining when the POST starts, which the
+/// share caps but cannot exceed — a slow credential resolve spends from
+/// the same deadline, so no attempt may assume a full share is left. The
+/// recorded failover retries once inside the same deadline, so a retry
+/// starts with whatever the first attempt left, never a fresh share. A
+/// single successful attempt is bounded the same way: a reply that would
+/// stream past the smaller bound is cut there, which is the price of
+/// fitting the recorded retry inside one deadline. The client's
+/// `timeout(deadline)` stays the outer backstop.
+const ATTEMPT_SHARE: u32 = 2;
 
 /// The recorded request path and query the CloudCode stream rides.
 const STREAM_PATH: &str = "v1internal:streamGenerateContent?alt=sse";
@@ -94,12 +107,10 @@ const GEMINI_CLI_VERSION: &str = "0.46.0";
 const GEMINI_CLI_METADATA: &str =
     "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
 
-/// The recorded tier ids the project rule classifies: the free/default
-/// class, the default fallback and the Workspace/Standard class. The
-/// empty string is the absent upstream current-tier id, which selects no
-/// tier rule.
-const FREE_TIER: &str = "free-tier";
-const LEGACY_TIER: &str = "legacy-tier";
+/// The documented absent upstream tier id: an empty tier selects no
+/// rule. The free/default and legacy ids come from the producer that
+/// writes them, and the Workspace/Standard id is the consumer's own
+/// classification of a stored profile.
 const STANDARD_TIER: &str = "standard-tier";
 
 /// The three recorded Antigravity model classes the profile's pinned map
@@ -166,14 +177,22 @@ pub struct CloudCodeProvider {
 }
 
 impl CloudCodeProvider {
-    /// Builds the adapter for one connection id: the id must record the
-    /// CloudCode dialect, the connection must be declared, carry no
-    /// configured region — the recorded class has none — and resolve a
-    /// scoped credential under DEC-013 precedence.
+    /// Builds the Antigravity adapter for its one literal id
+    /// `google-antigravity`: any other id — the sibling CloudCode
+    /// projection included — is a dialect mismatch. The connection must
+    /// be declared, carry no configured region — the recorded class has
+    /// none — and resolve a scoped credential under DEC-013 precedence.
+    /// The configured endpoint admits exactly the recorded daily and
+    /// sandbox origins, the empty default (the daily origin), and an
+    /// admitted loopback http contract peer; every other origin denies
+    /// before a request. A send shares one whole-request budget: a single
+    /// request attempt is capped at half the deadline, and the recorded
+    /// failover retry is bounded by the budget still remaining when it
+    /// starts — never a second full share.
     ///
     /// # Errors
-    /// [`ProviderError::DialectMismatch`] for a connection id without the
-    /// CloudCode source class; [`ProviderError::UnknownConnection`] for an
+    /// [`ProviderError::DialectMismatch`] for any id but the literal
+    /// `google-antigravity`; [`ProviderError::UnknownConnection`] for an
     /// undeclared id; [`ProviderError::RegionMismatch`] for a configured
     /// region; [`resolve_credential`]'s typed denials for a missing,
     /// malformed or mismatched binding; [`ProviderError::Transport`] when
@@ -186,9 +205,11 @@ impl CloudCodeProvider {
         Self::build(config, connection, store, REQUEST_DEADLINE)
     }
 
-    /// The same adapter under an explicit whole-request deadline — the
-    /// bound is adapter policy; proof legs pin a short one so the budget
-    /// is exercised deterministically.
+    /// The same literal id and admitted endpoint set as [`Self::new`],
+    /// under an explicit whole-request deadline — the bound is adapter
+    /// policy; proof legs pin a short one so the budget is exercised
+    /// deterministically. The same half-deadline attempt cap and
+    /// remaining-budget retry bound apply.
     ///
     /// # Errors
     /// [`Self::new`]'s contract.
@@ -204,8 +225,9 @@ impl CloudCodeProvider {
     /// The same adapter with an explicit failover target — the proof seam
     /// for the recorded daily-to-sandbox rule; production construction
     /// derives the target from the configured origin. The target is
-    /// admitted under the same recorded endpoint set as configuration, so a
-    /// foreign origin can never enter.
+    /// admitted under the same recorded endpoint set [`Self::new`] admits
+    /// — the daily and sandbox origins, the empty default and a loopback
+    /// http contract peer — so a foreign origin can never enter.
     ///
     /// # Errors
     /// [`ProviderError::CredentialBaseMismatch`] for a target outside the
@@ -241,7 +263,7 @@ impl CloudCodeProvider {
         }
         let auth = WireAuth::Store(Some(resolve_credential(config, connection)?));
         let client = reqwest::blocking::Client::builder()
-            .timeout(deadline.saturating_mul(2))
+            .timeout(deadline)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| transport(connection, err))?;
@@ -336,8 +358,14 @@ impl CloudCodeProvider {
         class: ModelClass,
     ) -> Result<Value, ProviderError> {
         let mut request = self.codec.request_body(manifest)?;
-        if let Some(instruction) = request.get_mut("systemInstruction") {
-            instruction["role"] = json!("user");
+        // A system instruction that is not an object keeps its shape: the
+        // recorded envelope adds the role only where the field exists and
+        // is addressable, never overwriting a non-object value.
+        if let Some(instruction) = request
+            .get_mut("systemInstruction")
+            .and_then(Value::as_object_mut)
+        {
+            instruction.insert("role".to_string(), json!("user"));
         }
         let session_id = self.session_id(&manifest.inputs);
         self.step = self.step.saturating_add(1);
@@ -443,9 +471,22 @@ impl CloudCodeProvider {
         let StreamOutcome {
             mut reply,
             response_id,
-        } = self
+        } = match self
             .codec
-            .read_cloudcode_stream(manifest, response, self.deadline, started)?;
+            .read_cloudcode_stream(manifest, response, self.deadline, started)
+        {
+            Ok(outcome) => outcome,
+            // The retried leg crossed the wire, so its stream failure is
+            // that second leg's too: the count rides the failure beside
+            // its class, as the settlement records it.
+            Err(source) if retried => {
+                return Err(ProviderError::Retried {
+                    wire_retries: 1,
+                    source: Box::new(source),
+                });
+            }
+            Err(source) => return Err(source),
+        };
         if retried {
             reply.wire_retries = reply.wire_retries.saturating_add(1);
         }
@@ -458,6 +499,18 @@ impl CloudCodeProvider {
 
     /// The one physical POST: the body crosses as the bytes the bound
     /// checked, and the shared budget is re-read immediately before it.
+    /// The request timeout bounds this attempt — connect, send and its
+    /// stream — by the smaller of [`ATTEMPT_SHARE`]'s cap and the budget
+    /// still remaining at the post, so a slow credential resolve cannot
+    /// push the attempt past the whole-request deadline. The recorded
+    /// failover needs two whole requests inside one deadline: a timed-out
+    /// first leg hands the retry nothing it could reuse, so the retry must
+    /// start its own connect and stream, and only a reserved share keeps
+    /// both inside the budget. The deliberate cost is that a *single*
+    /// successful attempt is bounded the same way: a reply whose stream
+    /// would run past its share is cut at the request timeout even though
+    /// the whole deadline could have admitted it. The client's own
+    /// `timeout(deadline)` stays the outer backstop.
     fn post(
         &self,
         origin: &str,
@@ -466,8 +519,13 @@ impl CloudCodeProvider {
         started: Instant,
     ) -> Result<reqwest::blocking::Response, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
+        let remaining = self
+            .deadline
+            .saturating_sub(started.elapsed())
+            .min(self.deadline / ATTEMPT_SHARE);
         self.client
             .post(format!("{origin}/{STREAM_PATH}"))
+            .timeout(remaining)
             .bearer_auth(token)
             // The recorded source derives its Antigravity `User-Agent` from
             // a live update manifest; no recorded version exists in this
@@ -482,10 +540,13 @@ impl CloudCodeProvider {
             .map_err(|err| transport(&self.connection, err))
     }
 
-    /// One retry against the recorded failover target. No target, a spent
-    /// budget or a non-transient first failure returns the first error
-    /// unchanged; a retry that also fails is one typed failure carrying
-    /// the crossed-leg count.
+    /// One retry against the recorded failover target. No target or a
+    /// non-transient first failure returns the first error unchanged. A
+    /// spent budget returns the fresh expiry rather than a retry. A retry
+    /// that provably never left the client — a connect or builder
+    /// failure — returns the first error and is not counted as a crossed
+    /// leg; one that crossed the wire and failed is a single typed
+    /// failure carrying that one-leg count.
     fn retry_once(
         &self,
         body: &Value,
@@ -511,6 +572,12 @@ impl CloudCodeProvider {
                 if cause.class() == TransportClass::DeadlineExpired
         ) {
             return Err(retry);
+        }
+        // A connect or builder failure provably never left the client:
+        // the first failure remains the reported one and no leg is
+        // counted.
+        if never_left_the_client(&retry) {
+            return Err(first_error);
         }
         Err(ProviderError::Retried {
             wire_retries: 1,
@@ -578,18 +645,37 @@ fn transient_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
-/// Whether a first-attempt failure is the recorded transient transport
-/// class. A read failure belongs to an already-started stream, and an
-/// expired budget is the whole-request verdict — neither fails over.
-fn transient_transport(error: &ProviderError) -> bool {
+/// Whether a transport failure provably never left the client: a connect
+/// or builder failure. A timeout can happen after hand-off, so it is not
+/// this class.
+fn never_left_the_client(error: &ProviderError) -> bool {
     matches!(
         error,
-        ProviderError::Transport { cause, .. }
-            if matches!(
-                cause.class(),
-                TransportClass::Timeout | TransportClass::RequestFailure
-            )
+        ProviderError::Transport {
+            cause: TransportCause::Request { source },
+            ..
+        } if source.is_connect() || source.is_builder()
     )
+}
+
+/// Whether a first-attempt failure is the recorded transient transport
+/// class: a request timeout, or a connect/build failure whose request
+/// provably never left the client. A read failure belongs to an
+/// already-started stream, an expired budget is the whole-request
+/// verdict, and reqwest's other request failures include send and
+/// hand-off errors that may already have crossed the wire — none fails
+/// over.
+fn transient_transport(error: &ProviderError) -> bool {
+    let ProviderError::Transport { cause, .. } = error else {
+        return false;
+    };
+    match cause {
+        TransportCause::Request { source } => {
+            source.is_timeout() || source.is_connect() || source.is_builder()
+        }
+        TransportCause::Read { .. } | TransportCause::Deadline { .. } => false,
+        TransportCause::Status { .. } => false,
+    }
 }
 
 /// The recorded signed-decimal session id: the first eight bytes of the
@@ -747,6 +833,10 @@ impl GeminiCliProvider {
     /// the CloudCode dialect and be `google-gemini-cli`, the connection must
     /// be declared, carry no configured region — the recorded class has
     /// none — and resolve a scoped credential under DEC-013 precedence.
+    /// The configured endpoint admits exactly the recorded `cloudcode-pa`
+    /// origin, the empty default (that same origin), and an admitted
+    /// loopback http contract peer; every other origin denies before a
+    /// request.
     ///
     /// # Errors
     /// [`ProviderError::DialectMismatch`] for any other connection id;
@@ -804,7 +894,7 @@ impl GeminiCliProvider {
         }
         let auth = WireAuth::Store(Some(resolve_credential(config, connection)?));
         let client = reqwest::blocking::Client::builder()
-            .timeout(deadline.saturating_mul(2))
+            .timeout(deadline)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| transport(connection, err))?;
@@ -930,7 +1020,11 @@ impl GeminiCliProvider {
 
     /// The one physical POST: the recorded bearer, JSON and SSE headers
     /// plus the Gemini CLI user agent and plugin metadata; the body crosses
-    /// as the bytes the bound checked.
+    /// as the bytes the bound checked. This projection sends one attempt
+    /// with no retry to share the budget, so its request timeout is the
+    /// budget still remaining at the post — never more than the whole
+    /// deadline — and stalling anywhere inside the attempt, including a
+    /// slow credential resolve before it, cannot outlive the deadline.
     fn post(
         &self,
         origin: &str,
@@ -940,8 +1034,10 @@ impl GeminiCliProvider {
         started: Instant,
     ) -> Result<reqwest::blocking::Response, ProviderError> {
         check_deadline(&self.connection, self.deadline, started)?;
+        let remaining = self.deadline.saturating_sub(started.elapsed());
         self.client
             .post(format!("{origin}/{STREAM_PATH}"))
+            .timeout(remaining)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
