@@ -3681,6 +3681,8 @@ fn exhausted_fallback_chain_pauses_honestly_with_intent_effects_and_budget_prese
                         Err(error) => return Err(error),
                     }
                 };
+                // Darwin inherits the listener's nonblocking flag on accept.
+                stream.set_nonblocking(false)?;
                 let mut headers = Vec::new();
                 while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                     stream.set_read_timeout(Some(remaining()?))?;

@@ -63,6 +63,20 @@ const GEMINI_MODELS: &[&str] = &[
     "gemini-3.7-flash",
 ];
 
+/// The Antigravity members a Gemini CLI frame never carries: the
+/// envelope's `requestId`/`userAgent`/`requestType` plus the
+/// request-only `sessionId`/`labels`. These are exactly the members the
+/// guard below checks — not the whole envelope — so a frame naming one
+/// is the other projection's shape and the Gemini CLI reader refuses it
+/// instead of guessing.
+const ANTIGRAVITY_ENVELOPE: &[&str] = &[
+    "requestId",
+    "userAgent",
+    "requestType",
+    "sessionId",
+    "labels",
+];
+
 /// The recorded key-type predicate for the `google` source class
 /// (HZN-008 docs): the API keys this dialect authenticates with are
 /// the project-billed "standard" keys — distinct from the
@@ -113,6 +127,37 @@ struct StreamState {
     signatures: Vec<String>,
     usage: Option<Value>,
     terminal: Option<Terminal>,
+    /// The CloudCode frame's `response.responseId`, retained so the next
+    /// request can name it as `last_execution_id`.
+    response_id: Option<String>,
+}
+
+/// The frame shape one SSE data event carries. A bare `google`/Vertex
+/// frame is the `GenerateContentResponse` itself; a CloudCode frame
+/// wraps it under `response`, states an in-band error at the top level,
+/// and a frame without a response is a no-op. The Gemini CLI projection
+/// shares that unwrap and additionally rejects the Antigravity request
+/// envelope, so the two projections never read each other's frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkShape {
+    Bare,
+    CloudCode,
+    GeminiCli,
+}
+
+impl ChunkShape {
+    /// Whether this shape wraps the response and carries the CloudCode
+    /// accounting legs.
+    fn cloudcode(self) -> bool {
+        matches!(self, Self::CloudCode | Self::GeminiCli)
+    }
+}
+
+/// One completed stream: the reply plus the CloudCode response id the
+/// caller carries into its next request's `last_execution_id` label.
+pub(crate) struct StreamOutcome {
+    pub(crate) reply: ProviderReply,
+    pub(crate) response_id: Option<String>,
 }
 
 /// The Gemini request and stream codec — the one seam the `google`
@@ -481,10 +526,52 @@ impl GeminiCodec {
     pub(crate) fn read_stream(
         &mut self,
         manifest: &RequestManifest,
-        mut response: reqwest::blocking::Response,
+        response: reqwest::blocking::Response,
         deadline: Duration,
         started: Instant,
     ) -> Result<ProviderReply, ProviderError> {
+        self.read_shaped(manifest, response, deadline, started, ChunkShape::Bare)
+            .map(|outcome| outcome.reply)
+    }
+
+    /// Reads a CloudCode stream through the same ingest and finalize
+    /// seam as [`Self::read_stream`]: the frames wrap the response under
+    /// `response`, a frame without one is skipped, and the completed
+    /// stream's `responseId` rides the outcome for the caller's next
+    /// `last_execution_id` label.
+    pub(crate) fn read_cloudcode_stream(
+        &mut self,
+        manifest: &RequestManifest,
+        response: reqwest::blocking::Response,
+        deadline: Duration,
+        started: Instant,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.read_shaped(manifest, response, deadline, started, ChunkShape::CloudCode)
+    }
+
+    /// Reads a `google-gemini-cli` stream through the same ingest and
+    /// finalize seam as [`Self::read_cloudcode_stream`]: the frame wraps
+    /// the response under `response`, and a frame carrying the Antigravity
+    /// request envelope or a request-only field is a violation for this
+    /// projection. The id keeps no response-id state.
+    pub(crate) fn read_gemini_cli_stream(
+        &mut self,
+        manifest: &RequestManifest,
+        response: reqwest::blocking::Response,
+        deadline: Duration,
+        started: Instant,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.read_shaped(manifest, response, deadline, started, ChunkShape::GeminiCli)
+    }
+
+    fn read_shaped(
+        &mut self,
+        manifest: &RequestManifest,
+        mut response: reqwest::blocking::Response,
+        deadline: Duration,
+        started: Instant,
+        shape: ChunkShape,
+    ) -> Result<StreamOutcome, ProviderError> {
         let mut parser = SseParser::new();
         let mut state = StreamState::default();
         let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
@@ -503,17 +590,21 @@ impl GeminiCodec {
                 .feed(&chunk[..read])
                 .map_err(|err| sse(&self.connection, err))?
             {
-                self.on_chunk(&mut state, manifest, event)?;
+                self.ingest(&mut state, manifest, event, shape)?;
             }
         }
         // Finalization shares the budget — the stream's total cost is
         // bounded even when its last byte lands just inside it.
         check_deadline(&self.connection, deadline, started)?;
         for event in parser.finish().map_err(|err| sse(&self.connection, err))? {
-            self.on_chunk(&mut state, manifest, event)?;
+            self.ingest(&mut state, manifest, event, shape)?;
         }
+        let response_id = state.response_id.clone();
         match state.terminal {
-            Some(Terminal::Completed) => self.complete(manifest, state),
+            Some(Terminal::Completed) => Ok(StreamOutcome {
+                reply: self.complete(manifest, state, shape)?,
+                response_id,
+            }),
             Some(Terminal::Failed { reason }) => Err(ProviderError::ProviderFailed {
                 connection: self.connection.clone(),
                 reason: bounded_reason(reason),
@@ -524,18 +615,17 @@ impl GeminiCodec {
         }
     }
 
-    /// Classifies one dispatched SSE event as a `GenerateContentResponse`
-    /// chunk. `error` and `promptFeedback.blockReason` are peer verdicts;
-    /// `candidates[0]` carries the streamed parts and the mandatory
-    /// `finishReason` — `STOP`/`MAX_TOKENS` complete, every other
-    /// recorded reason is the peer's own failure verdict, and a reason
-    /// the dialect never recorded is unclassifiable, never success. A
-    /// second terminal of any kind is a malformed stream.
-    fn on_chunk(
+    /// Parses one dispatched SSE event once and hands the frame's inner
+    /// value to the response reducer. A CloudCode frame states its
+    /// in-band error at the top level, wraps the response under
+    /// `response` (skipping a frame without one), and names the response
+    /// id the next request echoes.
+    fn ingest(
         &self,
         state: &mut StreamState,
         manifest: &RequestManifest,
         event: SseEvent,
+        shape: ChunkShape,
     ) -> Result<(), ProviderError> {
         let chunk: Value = serde_json::from_str(&event.data)
             .map_err(|_parse| violation(&self.connection, "stream chunk is not json"))?;
@@ -550,6 +640,45 @@ impl GeminiCodec {
                 },
             );
         }
+        let response = match shape {
+            ChunkShape::Bare => &chunk,
+            ChunkShape::CloudCode | ChunkShape::GeminiCli => {
+                if shape == ChunkShape::GeminiCli
+                    && ANTIGRAVITY_ENVELOPE
+                        .iter()
+                        .any(|member| chunk.get(*member).is_some())
+                {
+                    return Err(violation(
+                        &self.connection,
+                        "cloudcode frame carries the antigravity envelope",
+                    ));
+                }
+                let Some(response) = chunk.get("response") else {
+                    return Ok(());
+                };
+                if let Some(id) = response.get("responseId").and_then(Value::as_str) {
+                    state.response_id = Some(id.to_string());
+                }
+                response
+            }
+        };
+        self.ingest_response(state, manifest, response, shape)
+    }
+
+    /// Reduces one unwrapped `GenerateContentResponse` chunk.
+    /// `promptFeedback.blockReason` is a peer verdict; `candidates[0]`
+    /// carries the streamed parts and the mandatory `finishReason` —
+    /// `STOP`/`MAX_TOKENS` complete, every other recorded reason is the
+    /// peer's own failure verdict, and a reason the dialect never
+    /// recorded is unclassifiable, never success. A second terminal of
+    /// any kind is a malformed stream.
+    fn ingest_response(
+        &self,
+        state: &mut StreamState,
+        manifest: &RequestManifest,
+        chunk: &Value,
+        shape: ChunkShape,
+    ) -> Result<(), ProviderError> {
         if let Some(feedback) = chunk.get("promptFeedback") {
             if !feedback.is_object() {
                 return Err(violation(
@@ -564,12 +693,24 @@ impl GeminiCodec {
                         "promptFeedback blockReason is not a string",
                     ));
                 };
-                return self.set_terminal(
-                    state,
-                    Terminal::Failed {
-                        reason: format!("request blocked by google: {reason}"),
-                    },
-                );
+                // The recorded CloudCode rule blocks only a response
+                // with no candidate at all; the bare Gemini control
+                // keeps failing on the verdict alone.
+                let blocked = match shape {
+                    ChunkShape::Bare => true,
+                    ChunkShape::CloudCode | ChunkShape::GeminiCli => !chunk
+                        .get("candidates")
+                        .and_then(Value::as_array)
+                        .is_some_and(|candidates| !candidates.is_empty()),
+                };
+                if blocked {
+                    return self.set_terminal(
+                        state,
+                        Terminal::Failed {
+                            reason: format!("request blocked by google: {reason}"),
+                        },
+                    );
+                }
             }
         }
         if let Some(candidates) = chunk.get("candidates") {
@@ -803,6 +944,7 @@ impl GeminiCodec {
         &mut self,
         manifest: &RequestManifest,
         state: StreamState,
+        shape: ChunkShape,
     ) -> Result<ProviderReply, ProviderError> {
         // Provenance (DEC-012): a claim keys on the epoch that minted
         // the signature, so a signature a retired epoch produced is
@@ -828,7 +970,7 @@ impl GeminiCodec {
                 None => {}
             }
         }
-        let usage = self.usage_of(&state)?;
+        let usage = self.usage_of(&state, shape)?;
         // Commit: the validated assembled turn joins this epoch's own
         // replay set — never the session's last-committed one — and its
         // signatures join the lineage's provenance set. Artifact claims
@@ -858,11 +1000,20 @@ impl GeminiCodec {
     /// The physical usage the terminal reported: absent `usageMetadata`
     /// stays [`UsageDelta::Unknown`] — never an estimate, never a zero
     /// the accounting could release; a present-but-unreadable shape is
-    /// a wire violation.
-    fn usage_of(&self, state: &StreamState) -> Result<UsageDelta, ProviderError> {
+    /// a wire violation. The CloudCode frame reports the fresh input
+    /// (prompt minus the cached prefix) and the completion with its
+    /// thinking share folded in, so that shape maps those legs.
+    fn usage_of(
+        &self,
+        state: &StreamState,
+        shape: ChunkShape,
+    ) -> Result<UsageDelta, ProviderError> {
         let Some(usage) = &state.usage else {
             return Ok(UsageDelta::Unknown);
         };
+        if shape.cloudcode() {
+            return self.cloudcode_usage(usage);
+        }
         let prompt = usage.get("promptTokenCount").and_then(Value::as_u64);
         // proto3 JSON omits zero-valued fields, so an absent
         // `candidatesTokenCount` is the reported zero — not a withheld
@@ -897,6 +1048,45 @@ impl GeminiCodec {
                 "usageMetadata is not a readable token shape",
             )),
         }
+    }
+
+    /// The recorded CloudCode accounting: input is the prompt count minus
+    /// the cached prefix, output is the candidate count plus the thinking
+    /// share, the cache legs are read/write as reported, and the total is
+    /// charged verbatim. An absent counter is the reported zero (proto3
+    /// elides zero fields and the source reads `|| 0`); a present
+    /// non-counter is a wire violation.
+    fn cloudcode_usage(&self, usage: &Value) -> Result<UsageDelta, ProviderError> {
+        if !usage.is_object() {
+            return Err(violation(
+                &self.connection,
+                "usageMetadata is not an object",
+            ));
+        }
+        let prompt = recorded_count(&self.connection, usage, "promptTokenCount")?;
+        let cached = recorded_count(&self.connection, usage, "cachedContentTokenCount")?;
+        let candidates = recorded_count(&self.connection, usage, "candidatesTokenCount")?;
+        let thoughts = recorded_count(&self.connection, usage, "thoughtsTokenCount")?;
+        let total = recorded_count(&self.connection, usage, "totalTokenCount")?;
+        Ok(UsageDelta::from_reported(
+            prompt.saturating_sub(cached),
+            candidates.saturating_add(thoughts),
+            total,
+            (thoughts > 0).then_some(thoughts),
+            Some(cached),
+            Some(0),
+        ))
+    }
+}
+
+/// One recorded CloudCode usage counter: absent is the reported zero, a
+/// present value that does not read is a wire violation.
+fn recorded_count(connection: &str, usage: &Value, field: &str) -> Result<u64, ProviderError> {
+    match usage.get(field) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| violation(connection, format!("usageMetadata {field} is not a count"))),
     }
 }
 
@@ -1043,5 +1233,75 @@ impl Provider for GeminiProvider {
         }
         self.codec
             .read_stream(manifest, response, self.deadline, started)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkShape, GeminiCodec, StreamState, Terminal};
+    use crate::config::{EffortAssign, EffortLevel, FixedModel, ModelAssign};
+    use crate::model::{InputOrigin, RequestManifest};
+    use serde_json::json;
+
+    /// The reducer reads the manifest only to validate tool calls; this
+    /// chunk carries text alone, so the frozen shape stays minimal.
+    fn manifest() -> RequestManifest {
+        RequestManifest {
+            attempt_id: "attempt-1".to_string(),
+            purpose: "main".to_string(),
+            world: "/world".to_string(),
+            model: ModelAssign::Fixed(FixedModel {
+                connection: "google".to_string(),
+                model_id: "gemini-3.1-pro-preview".to_string(),
+            }),
+            effort: EffortAssign::Fixed {
+                value: EffortLevel::Medium,
+            },
+            instructions: "rules".to_string(),
+            tools: Vec::new(),
+            output_reserve: 0,
+            inputs: "goal".to_string(),
+            inputs_digest: "digest".to_string(),
+            epoch_id: "epoch-1".to_string(),
+            mutation_reason: None,
+            epoch_cost: None,
+            input_origin: InputOrigin::Human,
+            cost_bound: 0,
+        }
+    }
+
+    /// The bare `google` arm fails on `promptFeedback.blockReason`
+    /// alone: the verdict closes the chunk, so a candidate finishing
+    /// `STOP` beside it is never read and the turn can never complete.
+    /// The CloudCode empty-candidates rule never reaches this arm — under
+    /// that rule the same chunk would complete with the candidate's
+    /// answer.
+    #[test]
+    fn a_bare_block_reason_closes_the_chunk_before_its_candidate() {
+        let codec = GeminiCodec::new("google");
+        let mut state = StreamState::default();
+        let chunk = json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "still answered"}]},
+                "finishReason": "STOP",
+                "index": 0,
+            }],
+        });
+        codec
+            .ingest_response(&mut state, &manifest(), &chunk, ChunkShape::Bare)
+            .expect("the verdict reduces instead of refusing the chunk");
+        assert!(
+            matches!(
+                &state.terminal,
+                Some(Terminal::Failed { reason })
+                    if reason == "request blocked by google: SAFETY"
+            ),
+            "the blockReason is the bare arm's one terminal"
+        );
+        assert!(
+            state.parts.is_empty() && state.text.is_empty(),
+            "the candidate beside the verdict is never folded"
+        );
     }
 }

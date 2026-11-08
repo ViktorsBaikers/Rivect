@@ -1,6 +1,7 @@
 //! The recorded dialect roster (AC-011): every literal id `dialect_for`
 //! answers, pinned exactly. The roster is the 68 pre-band ids plus the
-//! one admitted vertex arm, and only a recorded id may add to it.
+//! admitted vertex and two CloudCode arms, and only a recorded id may add
+//! to it.
 
 #![allow(
     clippy::expect_used,
@@ -26,9 +27,8 @@ fn bedrock_ids_map_to_their_recorded_dialects() {
     }
 }
 
-/// The exact roster `dialect_for` answered before the provider-config
-/// band, in source order.
-const RECORDED_ROSTER: [(&str, Dialect); 69] = [
+/// The exact current roster `dialect_for` answers, in source order.
+const RECORDED_ROSTER: [(&str, Dialect); 71] = [
     ("openai", Dialect::Responses),
     ("abliteration", Dialect::Responses),
     ("meta", Dialect::Responses),
@@ -48,6 +48,8 @@ const RECORDED_ROSTER: [(&str, Dialect); 69] = [
     ("ollama-cloud", Dialect::OllamaChat),
     ("google", Dialect::Gemini),
     ("google-vertex", Dialect::Vertex),
+    ("google-antigravity", Dialect::CloudCode),
+    ("google-gemini-cli", Dialect::CloudCode),
     ("anthropic", Dialect::Messages),
     ("minimax", Dialect::Messages),
     ("umans", Dialect::Messages),
@@ -104,8 +106,17 @@ const RECORDED_ROSTER: [(&str, Dialect); 69] = [
 fn roster_matches_the_recorded_dialect_arms() {
     assert_eq!(
         RECORDED_ROSTER.len(),
-        69,
-        "the roster is the 68 pre-band ids plus the one admitted vertex arm"
+        71,
+        "the roster is the 68 pre-band ids plus the vertex and two CloudCode arms"
+    );
+    let mut ids: Vec<&str> = RECORDED_ROSTER.iter().map(|(id, _)| *id).collect();
+    let recorded = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        recorded,
+        "a duplicated roster row cannot mask a missing one"
     );
     for (id, dialect) in RECORDED_ROSTER {
         assert_eq!(dialect_for(id), Some(dialect), "{id}");
@@ -115,4 +126,10 @@ fn roster_matches_the_recorded_dialect_arms() {
         None,
         "an id outside the roster has no recorded dialect"
     );
+    assert_eq!(
+        dialect_for("google-gemini-cli"),
+        Some(Dialect::CloudCode),
+        "the second CloudCode id reuses the one recorded variant"
+    );
+    assert_eq!(Dialect::CloudCode.to_string(), "cloudcode");
 }

@@ -74,6 +74,8 @@ impl TestPeer {
             while !flag.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _address)) => {
+                        // Darwin inherits the listener's nonblocking flag on accept.
+                        stream.set_nonblocking(false).expect("peer blocking mode");
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .expect("peer read timeout");

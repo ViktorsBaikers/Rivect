@@ -1524,6 +1524,10 @@ mod tests {
                     while !flag.load(Ordering::SeqCst) {
                         match listener.accept() {
                             Ok((mut stream, _address)) => {
+                                // Darwin inherits the listener's nonblocking flag on accept.
+                                stream
+                                    .set_nonblocking(false)
+                                    .expect("blocking loopback stream");
                                 let Some(line) = read_request_line(&mut stream) else {
                                     continue;
                                 };

@@ -107,6 +107,7 @@ pub mod antigravity_login;
 #[doc(hidden)]
 pub mod aws;
 pub mod bedrock;
+pub mod cloudcode;
 pub mod copilot;
 pub mod copilot_login;
 pub mod cursor_login;
@@ -1490,9 +1491,9 @@ const WAITING_FOR_DECISION: &str = "no permitted action; waiting for a decision"
 /// as its default and a Messages route for its metadata's Anthropic
 /// class, and `github-copilot` records Chat Completions as the default
 /// over its closed three-route table. `google-vertex` records its own
-/// dual-class dialect; `google-antigravity` and `google-gemini-cli` are
-/// distinct literal ids that stay unrouted until their own dialects
-/// land.
+/// dual-class dialect, and `google-antigravity` and `google-gemini-cli`
+/// the CloudCode `v1internal` dialect — one variant, two literal ids
+/// with their own recorded projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Dialect {
     /// The OpenAI Responses API (`POST {endpoint}/responses`, SSE).
@@ -1542,6 +1543,14 @@ pub enum Dialect {
     /// resource. The class is resolved from the recorded catalogue row,
     /// never from the model-name family.
     Vertex,
+    /// The CloudCode `v1internal` dialect — the recorded class of the
+    /// literal `google-antigravity` and `google-gemini-cli` ids.
+    /// [`cloudcode::CloudCodeProvider`] serves the Antigravity envelope
+    /// over the recorded daily or sandbox origin, and
+    /// [`cloudcode::GeminiCliProvider`] the Gemini CLI projection over
+    /// the recorded `cloudcode-pa` origin; both nest the Gemini request
+    /// builder's body under `request`, each with its own top level.
+    CloudCode,
 }
 
 impl std::fmt::Display for Dialect {
@@ -1557,6 +1566,7 @@ impl std::fmt::Display for Dialect {
             Self::DevinAgent => "devin-agent",
             Self::GitlabWorkflow => "gitlab-workflow",
             Self::Vertex => "vertex",
+            Self::CloudCode => "cloudcode",
         })
     }
 }
@@ -1598,6 +1608,8 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "ollama-cloud" => Some(Dialect::OllamaChat),
         "google" => Some(Dialect::Gemini),
         "google-vertex" => Some(Dialect::Vertex),
+        "google-antigravity" => Some(Dialect::CloudCode),
+        "google-gemini-cli" => Some(Dialect::CloudCode),
         "anthropic" => Some(Dialect::Messages),
         "minimax" => Some(Dialect::Messages),
         "umans" => Some(Dialect::Messages),

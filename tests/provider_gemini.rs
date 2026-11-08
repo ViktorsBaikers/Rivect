@@ -1251,6 +1251,8 @@ fn transport_timeout_keeps_the_original_source() {
                     Err(error) => return Err(error),
                 }
             };
+            // Darwin inherits the listener's nonblocking flag on accept.
+            stream.set_nonblocking(false)?;
             let mut request = Vec::new();
             let mut request_len = None;
             loop {

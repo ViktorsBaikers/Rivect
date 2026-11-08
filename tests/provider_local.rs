@@ -1306,6 +1306,8 @@ fn transport_timeout_keeps_the_original_source() {
                     Err(error) => return Err(error),
                 }
             };
+            // Darwin inherits the listener's nonblocking flag on accept.
+            stream.set_nonblocking(false)?;
             let mut request = Vec::new();
             let mut request_len = None;
             loop {
@@ -5166,6 +5168,8 @@ async fn abliteration_stream_gaps_inside_the_deadline_still_complete() {
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // Darwin inherits the listener's nonblocking flag on accept.
+                    stream.set_nonblocking(false).expect("peer blocking mode");
                     // drain the request before answering: closing a
                     // socket that still holds unread request bytes
                     // RSTs the connection and can race the reply out

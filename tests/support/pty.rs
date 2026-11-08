@@ -115,10 +115,10 @@ enum ReapState {
     Unknown,
 }
 
-/// One pass of the only reader: at most [`PUMP_READS`] reads, ended early
-/// by end of stream, `WouldBlock` or a stored fault.
+/// One pass: at most [`PUMP_READS`] reads; ends early on end of stream, `WouldBlock`, or a non-transient read error
+/// (`Interrupted` is retried in-pass); a stored fault is kept, not replaced, and later `pump` passes still read.
 fn pump(output: &mut PtyOutput) {
-    if output.eof || output.fault.is_some() {
+    if output.eof {
         return;
     }
     let mut chunk = [0u8; PUMP_CHUNK];
@@ -133,7 +133,12 @@ fn pump(output: &mut PtyOutput) {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => return,
                 _ => {
-                    output.fault = Some(error);
+                    // The first fault is the one the caller reports; later
+                    // non-transient errors never replace it, and each one ends
+                    // only this pass so later bounded passes may still drain.
+                    if output.fault.is_none() {
+                        output.fault = Some(error);
+                    }
                     return;
                 }
             },
