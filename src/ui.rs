@@ -847,7 +847,8 @@ pub const TRANSCRIPT_NO_PROJECT: &str =
     "No project or index is selected; ordinary replies are not blocked.";
 pub const HELP_TEXT: &str = concat!(
     "Commands: Enter submits a task; Esc quits; Ctrl-C cancels.\n",
-    "/help lists; /new starts a conversation; /clear clears.\n",
+    "/help lists; /new (alias /clear) starts a conversation.\n",
+    "/settings (alias /config) shows the served settings.\n",
     "/compact folds context.\n",
     "/login: URL, \"device\", \"complete\", \"cancel\".",
 );
@@ -1624,24 +1625,43 @@ impl TuiDispatch {
         Ok((status.to_owned(), task_id.to_owned()))
     }
 
-    /// `view.clear`: the runtime answers that the kind is served; the
-    /// rows it drops are the composer's own projection, so they are
-    /// cleared by the caller and nothing durable is addressed.
-    fn clear_view(&mut self) -> io::Result<()> {
-        dispatch_tui_request(
+    /// `settings.open`: the settings surface's opening projection. The lines
+    /// it paints are the served entries, so the transcript shows what the
+    /// dispatcher actually answered instead of a rendered guess.
+    fn open_settings(&mut self) -> io::Result<Vec<String>> {
+        let result = dispatch_tui_request(
             &mut self.runtime,
             json!({
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 6,
                 "method": "command.execute",
                 "params": {
                     "schema_version": 1,
                     "session_id": self.session_id,
-                    "command": { "kind": "view.clear" },
+                    "command": { "kind": "settings.open" },
                 }
             }),
         )?;
-        Ok(())
+        let entries = result
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or_else(|| io::Error::other("tui settings.open omitted entries"))?;
+        let mut lines = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let key = entry.get("key").and_then(Value::as_str).unwrap_or_default();
+            let value = entry
+                .get("effective")
+                .and_then(|effective| effective.get("value"))
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let source = entry
+                .get("source")
+                .and_then(|source| source.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("{key} = {value} ({source})"));
+        }
+        Ok(lines)
     }
 
     /// `session.new`: a fresh conversation on this connection. The
@@ -2794,10 +2814,6 @@ where
 /// operator gets the way back to the vocabulary, not a model call.
 const COMPOSER_USAGE: &str = "Unknown command. /help lists the available commands.";
 
-/// Painted when `/clear` drops the rows: what was read is gone from the
-/// view, and what was stored behind it is not.
-const VIEW_CLEARED_NOTE: &str = "View cleared; the stored conversation is unchanged.";
-
 /// Painted when a `context.compact` is accepted: what the fold replaced and
 /// what it left, so the operator sees the context actually shrank.
 const CONTEXT_COMPACTED: &str = "Context compacted";
@@ -2895,7 +2911,10 @@ fn run_composer_command(
             view.transcript.push(HELP_TEXT.to_string());
             Ok(())
         }
-        "/new" => {
+        // `/clear` is `/new`'s alias: both resolve to `session.new` in the
+        // dispatcher, so the composer cannot clear a view the catalog would
+        // describe differently.
+        "/new" | "/clear" => {
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
             match dispatch.new_session() {
                 Ok(previous) => {
@@ -2921,12 +2940,13 @@ fn run_composer_command(
                 Err(error) => refusal_or_fault(view, input, error),
             }
         }
-        "/clear" => {
+        // `/config` is `/settings`'s alias: both dispatch `settings.open`.
+        "/settings" | "/config" => {
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
-            match dispatch.clear_view() {
-                Ok(()) => {
-                    reset_view_rows(view);
-                    view.transcript.push(VIEW_CLEARED_NOTE.to_string());
+            match dispatch.open_settings() {
+                Ok(lines) => {
+                    view.transcript.push("Settings:".to_string());
+                    view.transcript.extend(lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -8960,16 +8980,21 @@ fallback = { mode = \"off\" }\n";
         frame.matches("Commands:").count()
     }
 
-    /// Fills the transcript past the panel and proves it: the band of help
-    /// text stops growing while more rows are still being added, so the
-    /// rows — and anything chained after them — are painted off screen.
+    /// Fills the transcript past the panel and proves it: the painted band of
+    /// help text is smaller than the number of entries added and stops growing
+    /// when more are added, so the rows — and anything chained after them — are
+    /// painted off screen. The help entry's own height is the product's to
+    /// change, so the check never pins it: the mutation it still kills is a
+    /// panel that keeps painting every added row (or one that paints none).
     fn overflowing_transcript(driver: &mut CardDriver) {
-        press(&mut driver.pty, &b"/help\r".repeat(7));
+        const ENTRIES: usize = 13;
+        press(&mut driver.pty, &b"/help\r".repeat(ENTRIES));
         pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 4);
         let band = help_rows(&settled_frame(driver));
+        assert!(band >= 1, "the help text is painted at all: {band}");
         assert!(
-            band >= 4,
-            "the transcript fills the panel before the fill: {band} row groups"
+            band < ENTRIES,
+            "the transcript has outgrown the panel: {band} of {ENTRIES} entries are on screen"
         );
         press(&mut driver.pty, &b"/help\r".repeat(6));
         pause(&mut driver.pty, DOCK_REFRESH_INTERVAL * 4);

@@ -5,10 +5,10 @@
 use crate::config::{self, EffectiveConfig};
 use crate::context::{ContextError, IsolatedCause};
 use crate::contracts::{
-    AnswerSelection, CommandId, CommandResult, EffectClass, ErrorCode, Lifecycle, LocalCommand,
-    LocalCommandResult, OptionId, PAGE_DEFAULT, PAGE_MAX, Page, ProjectInitResult, QuestionId,
-    QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId, TaskId,
-    WireError,
+    AnswerSelection, AttachmentId, CommandId, CommandResult, EffectClass, ErrorCode, Lifecycle,
+    LocalCommand, LocalCommandResult, OptionId, PAGE_DEFAULT, PAGE_MAX, Page, ProjectInitResult,
+    QuestionId, QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId,
+    TaskId, WireError,
 };
 use crate::index::{
     CarryPolicy, Completeness, GenerationState, IndexWatcher, PartialReason, ProjectGraph,
@@ -1568,8 +1568,17 @@ impl Runtime {
     /// Grants the single scoped read used by the first-task loop and records
     /// the scope root/file pair the loop is confined to.
     pub fn set_read_scope(&mut self, root: PathBuf, file: PathBuf) -> String {
-        self.scope_root = root.clone();
         self.scoped_file = file;
+        self.bind_read_scope(root)
+    }
+
+    /// Binds the declared read scope one shipped entry serves: the one root a
+    /// `read_file` may address, with the grant every read admission names. The
+    /// first-task loop's single-file pair is separate
+    /// ([`Runtime::set_read_scope`]), so an entry that only reads files never
+    /// invents one.
+    pub fn bind_read_scope(&mut self, root: PathBuf) -> String {
+        self.scope_root = root.clone();
         let grant = self.policy.grant_read(root);
         self.scoped_grant = grant.clone();
         grant
@@ -2173,6 +2182,14 @@ const METHODS: &[&str] = &[
     "sharing.grant.revoke",
 ];
 
+/// Every JSON-RPC method this build serves, as the dispatcher's own table.
+/// The catalog names a method carrier against this list, so a row cannot
+/// advertise a method the dispatcher would refuse as unknown.
+#[must_use]
+pub fn served_methods() -> &'static [&'static str] {
+    METHODS
+}
+
 #[derive(Debug, thiserror::Error)]
 enum RequestError {
     #[error("request exceeds the 1 MiB cap")]
@@ -2246,8 +2263,19 @@ enum RequestError {
     UnknownLocalCommand { command: String },
     #[error("task {task_id} is running")]
     SessionInFlight { task_id: String },
-    #[error("{command} is known but not available in this build")]
-    KnownCommandUnavailable { command: String },
+    /// A catalog row this build cannot serve answers with its own exact
+    /// reason, so the caller reads what is missing instead of a blanket
+    /// "not available".
+    #[error("{command} is unavailable: {reason}")]
+    CommandUnavailable { command: String, reason: String },
+    #[error("session.fork needs a session with at least one task goal")]
+    ForkWithoutGoals,
+    #[error("session.fork copies at most {max} goals; this session has more")]
+    ForkTooLarge { max: u32 },
+    #[error("unknown workflow.control op {op}; known ops: status, on, off")]
+    UnknownWorkflowOp { op: String },
+    #[error("unknown harness.control op {op}; known ops: status")]
+    UnknownHarnessOp { op: String },
     #[error("artifact.read is known but not available in this build")]
     ArtifactReadUnavailable,
     #[error("unknown command kind {kind}")]
@@ -2299,7 +2327,8 @@ impl RequestError {
         match self {
             Self::UnknownMethod { .. } => ErrorCode::UnknownMethod,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
-            Self::KnownCommandUnavailable { .. }
+            Self::CommandUnavailable { .. }
+            | Self::ForkTooLarge { .. }
             | Self::ArtifactReadUnavailable
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
             Self::MachineAnswerDenied
@@ -2327,7 +2356,8 @@ impl RequestError {
             | Self::MissingMethod => -32600,
             Self::UnknownMethod { .. } => -32601,
             Self::UnsupportedVersion { .. }
-            | Self::KnownCommandUnavailable { .. }
+            | Self::CommandUnavailable { .. }
+            | Self::ForkTooLarge { .. }
             | Self::SessionInFlight { .. }
             | Self::ArtifactReadUnavailable
             | Self::MachineAnswerDenied
@@ -2428,6 +2458,39 @@ pub enum LoopEvent {
 pub enum DispatchStep {
     Ready(String),
     Deferred,
+}
+
+/// The exit status one machine answer implies while its answer is still owed
+/// to the off-path owner. It is its own class: a client that closes stdin
+/// while a run is unfinished must not read that as either success or failure.
+/// The loop's [`crate::commands::DispatchStep`] arm is `Deferred`, and the
+/// landed answer's class is [`response_status`]'s.
+pub const EXIT_PENDING: u8 = 4;
+
+/// The exit status one ready answer implies: a result frame is success, and an
+/// error frame is the class of the typed code it carries. A frame this build
+/// cannot read — malformed JSON, or an error without the typed `data.code` —
+/// is internal, never success: an unreadable refusal must not read as a clean
+/// run.
+#[must_use]
+pub fn response_status(response: &str) -> u8 {
+    let Ok(frame) = serde_json::from_str::<Value>(response) else {
+        return ErrorCode::InternalError.exit_code();
+    };
+    let Some(error) = frame.get("error") else {
+        return 0;
+    };
+    let Some(code) = error
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+    else {
+        return ErrorCode::InternalError.exit_code();
+    };
+    match serde_json::from_value::<ErrorCode>(Value::String(code.to_string())) {
+        Ok(code) => code.exit_code(),
+        Err(_) => ErrorCode::InternalError.exit_code(),
+    }
 }
 
 /// One step of a dispatch loop: route the request, and say whether its
@@ -3308,16 +3371,26 @@ fn base_recovery_diagnostic(abandoned: &config::BaseDocument, installed: u64) ->
     )
 }
 
-/// Shared tail of the config.set/unset arms: capture the retained view,
-/// apply one typed edit, answer a rejection with the typed ConfigError,
-/// and admit an accepted edit through the singleflight journal.
+/// Shared tail of the config.set/unset arms: the documented freshness
+/// precondition, capture the retained view, apply one typed edit, answer a
+/// rejection with the typed ConfigError, and admit an accepted edit through
+/// the singleflight journal. A caller that names
+/// `expected_source_digest` writes against the sources it read; a digest that
+/// no longer matches is refused `conflict` before any edit is applied, so a
+/// write that never landed is never observed as one.
 fn commit_config_edit(
     rt: &mut Runtime,
     id: Value,
     command: &str,
     key: &str,
+    expected_source_digest: Option<&str>,
     apply: impl FnOnce(&mut config::Config) -> Result<config::ConfigEdit, config::ConfigError>,
 ) -> RpcResponse {
+    if let Some(expected) = expected_source_digest
+        && expected != rt.effective.sources_digest
+    {
+        return request_error(id, RequestError::SourceDigestMismatch);
+    }
     let before = retained_view(rt);
     let edit = match retained_edit(rt, apply) {
         Ok(edit) => edit,
@@ -3482,6 +3555,969 @@ impl crate::mcp::FirstByteGate for EgressReconsult<'_> {
         }
         Ok(())
     }
+}
+
+/// The config entry one key serves, in the shape every read surface publishes.
+/// The three base-supplied keys serve the entry their layer recorded, so a base
+/// value is never reported as the user's; a carrier key reads from the retained
+/// document, where an absent field serves null rather than disappearing.
+fn config_entry(rt: &Runtime, key: &str) -> config::ConfigEntry {
+    if key == config::WORKFLOW_KEY {
+        return rt.effective.workflow_entry.clone();
+    }
+    if key == config::DECISIONS_MODE_KEY {
+        return rt.effective.decisions_entry.clone();
+    }
+    if key == config::CONTEXT_AUTO_COMPACT_KEY {
+        return rt.effective.context_entry.clone();
+    }
+    let view = rt.effective.retained();
+    let revision = rt
+        .effective
+        .parsed
+        .as_ref()
+        .map_or_else(config::shipped_revision, config::Config::revision);
+    let source_kind = if rt.effective.parsed.is_some() {
+        "user"
+    } else {
+        "shipped"
+    };
+    config::ConfigEntry {
+        key: key.to_string(),
+        effective: config::ConfigViewValue::Visible {
+            value: view.read_value(key).unwrap_or(Value::Null),
+        },
+        source: config::ConfigSource {
+            kind: source_kind.to_string(),
+            revision,
+            target: None,
+        },
+    }
+}
+
+/// The refusal one unreadable key answers with: a section the document owns
+/// names its own status, while an unknown spelling names the carriers it could
+/// have meant.
+fn readable_key(id: &Value, key: &str) -> Option<RpcResponse> {
+    if config::is_readable_key(key) {
+        return None;
+    }
+    if config::is_document_only_key(key) {
+        return Some(request_error(
+            id.clone(),
+            RequestError::DocumentOnlyKey {
+                key: key.to_string(),
+            },
+        ));
+    }
+    Some(request_error(
+        id.clone(),
+        RequestError::InvalidKey {
+            key: key.to_string(),
+        },
+    ))
+}
+
+/// One required string parameter.
+fn required_str<'a>(params: &'a Value, field: &'static str) -> Result<&'a str, RequestError> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(RequestError::Required { field })
+}
+
+/// `settings.open`: the settings surface's opening projection — the three
+/// base-supplied entries every settings view edits, and the declared carriers a
+/// deeper read addresses.
+fn settings_open(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let entries = [
+        config::WORKFLOW_KEY,
+        config::DECISIONS_MODE_KEY,
+        config::CONTEXT_AUTO_COMPACT_KEY,
+    ]
+    .into_iter()
+    .map(|key| config_entry(rt, key))
+    .collect::<Vec<_>>();
+    let carriers = config::carrier_samples()
+        .map(|(pattern, sample)| json!({ "pattern": pattern, "sample": sample }))
+        .collect::<Vec<_>>();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "settings.open",
+            "source_digest": rt.effective.sources_digest,
+            "entries": entries,
+            "carriers": carriers,
+        }),
+    )
+}
+
+/// `config.list`: every declared carrier's sample key with its effective value.
+fn config_list(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let entries = config::carrier_samples()
+        .map(|(_, sample)| config_entry(rt, sample))
+        .collect::<Vec<_>>();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.list",
+            "source_digest": rt.effective.sources_digest,
+            "entries": entries,
+        }),
+    )
+}
+
+/// `config.search`: the declared carriers whose pattern or sample contains the
+/// query, case-insensitively. The query is matched in memory against the
+/// declared table, never spliced into a statement.
+fn config_search(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let query = match required_str(params, "query") {
+        Ok(query) if !query.is_empty() => query.to_lowercase(),
+        Ok(_) => {
+            return request_error(
+                id,
+                RequestError::Required {
+                    field: "command.query",
+                },
+            );
+        }
+        Err(err) => return request_error(id, err),
+    };
+    let entries = config::carrier_samples()
+        .filter(|(pattern, sample)| {
+            pattern.to_lowercase().contains(&query) || sample.to_lowercase().contains(&query)
+        })
+        .map(|(_, sample)| config_entry(rt, sample))
+        .collect::<Vec<_>>();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.search",
+            "query": query,
+            "source_digest": rt.effective.sources_digest,
+            "entries": entries,
+        }),
+    )
+}
+
+/// `config.get`: one declared key's entry and the digest it was read against.
+fn config_get(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let key = match required_str(params, "key") {
+        Ok(key) => key,
+        Err(err) => return request_error(id, err),
+    };
+    if let Some(refusal) = readable_key(&id, key) {
+        return refusal;
+    }
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.get",
+            "source_digest": rt.effective.sources_digest,
+            "entry": config_entry(rt, key),
+        }),
+    )
+}
+
+/// `config.explain`: one key's entry, its effective value as the file would
+/// state it, and the sources digest the answer belongs to.
+fn config_explain(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let key = match required_str(params, "key") {
+        Ok(key) => key,
+        Err(err) => return request_error(id, err),
+    };
+    if let Some(refusal) = readable_key(&id, key) {
+        return refusal;
+    }
+    let entry = config_entry(rt, key);
+    let effective = match &entry.effective {
+        config::ConfigViewValue::Visible { value } => value.to_string(),
+        config::ConfigViewValue::Redacted => "redacted".to_string(),
+    };
+    let result = config::ConfigExplainResult {
+        key: key.to_string(),
+        entry,
+        effective,
+        source_digest: rt.effective.sources_digest.clone(),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.explain",
+            "result": result,
+        }),
+    )
+}
+
+/// `config.validate`: reads the operator's document through the owner's one
+/// bounded ingress and validates it with the schema every write uses. The
+/// answer reports what it actually checked — an absent document is valid and
+/// says so — and a rejected document is the schema's own typed refusal.
+fn config_validate(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let document = match crate::owner::read_user_config(&rt.config_path, CONFIG_MAX_BYTES) {
+        Ok(document) => document,
+        Err(err) => return config_read_error(id, &err),
+    };
+    let Some(text) = document else {
+        return RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "config.validate",
+                "present": false,
+                "valid": true,
+                "source_digest": rt.effective.sources_digest,
+            }),
+        );
+    };
+    let parsed = match config::Config::parse_validated(&text) {
+        Ok(parsed) => parsed,
+        Err(err) => return config_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.validate",
+            "present": true,
+            "valid": true,
+            "source_digest": rt.effective.sources_digest,
+            "connections": parsed.connections.len(),
+            "profiles": parsed.profiles.len(),
+            "purposes": parsed.models.purposes.len(),
+        }),
+    )
+}
+
+/// `config.export`: the effective config a support bundle carries — every
+/// declared carrier's sample with its effective value, the sources digest and
+/// the base it composed over. A credential reference is a reference, never
+/// secret material, so nothing here redacts a value the file already states.
+fn config_export(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let entries = config::carrier_samples()
+        .map(|(_, sample)| config_entry(rt, sample))
+        .collect::<Vec<_>>();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "config.export",
+            "source_digest": rt.effective.sources_digest,
+            "base_version": rt.effective.base_version(),
+            "entries": entries,
+        }),
+    )
+}
+
+/// The class one config ingress failure answers with. A document this owner
+/// cannot read is a caller-visible input failure; an election another process
+/// already holds is a conflict; the store carries its own class.
+fn config_read_error(id: Value, error: &OwnerError) -> RpcResponse {
+    let code = match error {
+        OwnerError::AlreadyOwned => ErrorCode::Conflict,
+        OwnerError::Config { .. }
+        | OwnerError::ConfigTooLarge { .. }
+        | OwnerError::ConfigRead { .. } => ErrorCode::InvalidInput,
+        OwnerError::Store(store) => return store_error(id, store),
+        OwnerError::Io(_) | OwnerError::SupervisorPolicy(_) => ErrorCode::InternalError,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
+/// `session.list`: one page of the sessions this data root recorded.
+fn session_list(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let (cursor, limit) = match status_page(params) {
+        Ok(page) => page,
+        Err(err) => return request_error(id, err),
+    };
+    match rt.owner.store.sessions_page(limit, cursor) {
+        Ok(page) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "session.list",
+                "sessions": page,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// `session.search`: the sessions whose recorded goals contain the query.
+fn session_search(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let query = match required_str(params, "query") {
+        Ok(query) if !query.is_empty() => query,
+        Ok(_) => {
+            return request_error(
+                id,
+                RequestError::Required {
+                    field: "command.query",
+                },
+            );
+        }
+        Err(err) => return request_error(id, err),
+    };
+    let (cursor, limit) = match status_page(params) {
+        Ok(page) => page,
+        Err(err) => return request_error(id, err),
+    };
+    match rt.owner.store.sessions_search_page(query, limit, cursor) {
+        Ok(page) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "session.search",
+                "query": query,
+                "sessions": page,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// `session.fork`: a new session carrying the parent's goals as fresh tasks.
+/// The parent is left exactly as it is, and no progress is copied — a copied
+/// evidence row would claim work the fork never did. The fork's bootstrap is
+/// derived from `command_id`, so a retry returns the same session and the
+/// per-task receipts keep it from creating the goals twice. A session larger
+/// than the fork's page is refused typed before any task is created; the
+/// caller re-runs a narrower fork rather than silently losing goals.
+fn session_fork(
+    rt: &mut Runtime,
+    id: Value,
+    params: &Value,
+    connection_id: &str,
+    ingress: Ingress,
+) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(command_id) = params
+        .get("command_id")
+        .and_then(Value::as_str)
+        .filter(|command| !command.is_empty())
+    else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "command_id",
+            },
+        );
+    };
+    let goals = match rt
+        .owner
+        .store
+        .session_goals(&session, PAGE_MAX.saturating_add(1))
+    {
+        Ok(goals) => goals,
+        Err(err) => return store_error(id, &err),
+    };
+    if goals.is_empty() {
+        return request_error(id, RequestError::ForkWithoutGoals);
+    }
+    if goals.len() > PAGE_MAX as usize {
+        return request_error(id, RequestError::ForkTooLarge { max: PAGE_MAX });
+    }
+    // No switch guard here: a fork leaves the parent's surface exactly as it
+    // is, so a running parent task keeps running and stays addressable.
+    let bootstrap = format!("fork:{command_id}");
+    let (forked, attachment, _, _) =
+        match rt.owner.store.open_session(&bootstrap, connection_id, None) {
+            Ok(opened) => opened,
+            Err(err) => return store_error(id, &err),
+        };
+    let principal = principal(ingress);
+    let mut tasks = Vec::with_capacity(goals.len());
+    for (index, goal_bytes) in goals.iter().enumerate() {
+        let Ok(goal) = std::str::from_utf8(goal_bytes) else {
+            return envelope_error(
+                id,
+                ErrorCode::InternalError,
+                -32000,
+                "a stored goal is not valid UTF-8",
+            );
+        };
+        let task_command = format!("{command_id}:{index}");
+        match rt
+            .owner
+            .store
+            .create_task(&forked, &task_command, principal, goal, (&[], &[]))
+        {
+            Ok(result) => tasks.push(result.task_id.0),
+            Err(err) => return store_error(id, &err),
+        }
+    }
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "session.fork",
+            "session_id": forked.0,
+            "parent_session_id": session.0,
+            "attachment_id": attachment.0,
+            "tasks": tasks,
+        }),
+    )
+}
+
+/// `session.export`: one bounded page of a session's recorded events.
+fn session_export(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let after = match after_cursor(params) {
+        Ok(after) => after,
+        Err(err) => return request_error(id, err),
+    };
+    let limit = match page_limit(params) {
+        Ok(limit) => limit,
+        Err(err) => return request_error(id, err),
+    };
+    match rt.owner.store.events_after(&session, None, after, limit) {
+        Ok(events) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "session.export",
+                "session_id": session.0,
+                "after_cursor": after,
+                "items": events,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// `session.recap`: the durable shape of one session — a bounded task page with
+/// its lifecycle counts and the lifetime spend the settlement ledger recorded.
+/// The page honours `page.cursor` like every other bounded page, so a caller
+/// following `next_cursor` continues instead of re-reading page one.
+fn session_recap(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let limit = match page_limit(params) {
+        Ok(limit) => limit,
+        Err(err) => return request_error(id, err),
+    };
+    let cursor = match status_cursor(params) {
+        Ok(cursor) => cursor,
+        Err(err) => return request_error(id, err),
+    };
+    let tasks = match rt.owner.store.task_status_page(&session, limit, cursor) {
+        Ok(tasks) => tasks,
+        Err(err) => return store_error(id, &err),
+    };
+    // The counts are the session's whole population, counted by the engine:
+    // the task page is bounded, so counting its items would silently report
+    // the page as the session.
+    let counts = match rt.owner.store.lifecycle_counts(&session) {
+        Ok(counts) => counts,
+        Err(err) => return store_error(id, &err),
+    };
+    let totals = match rt.owner.store.settlement_totals() {
+        Ok(totals) => totals,
+        Err(err) => return store_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "session.recap",
+            "session_id": session.0,
+            "tasks": tasks.items.len(),
+            "counts": {
+                "running": counts[0],
+                "waiting": counts[1],
+                "paused": counts[2],
+                "blocked": counts[3],
+                "completed": counts[4],
+                "cancelled": counts[5],
+            },
+            "next_cursor": tasks.next_cursor,
+            "settled": render_settlement_totals(&totals),
+        }),
+    )
+}
+
+fn render_settlement_totals(totals: &crate::state::SettlementTotals) -> Value {
+    json!({
+        "settled_count": totals.settled_count,
+        "settled_without_total": totals.settled_without_total,
+        "total_tokens": totals.total_tokens,
+        "charged_units": totals.charged_units,
+        "dispatched_count": totals.dispatched_count,
+        "latest_prompt_tokens": totals.latest_prompt_tokens,
+    })
+}
+
+/// `usage.view`: the lifetime settled totals and the latest settlement, if one
+/// was ever recorded.
+fn usage_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let totals = match rt.owner.store.settlement_totals() {
+        Ok(totals) => totals,
+        Err(err) => return store_error(id, &err),
+    };
+    let latest = match rt.owner.store.latest_settlement() {
+        Ok(record) => Some(record),
+        Err(StoreError::NotFound(_)) => None,
+        Err(err) => return store_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "usage.view",
+            "totals": render_settlement_totals(&totals),
+            "latest": latest.as_ref().map(render_settlement_record),
+        }),
+    )
+}
+
+fn render_settlement_record(record: &crate::state::SettlementRecord) -> Value {
+    let state = match record.state {
+        crate::state::SettlementState::Dispatched => "dispatched",
+        crate::state::SettlementState::Settled => "settled",
+    };
+    json!({
+        "attempt_id": record.attempt_id,
+        "parent_attempt_id": record.parent_attempt_id,
+        "purpose": record.purpose,
+        "connection": record.connection,
+        "state": state,
+        "exactness": record.exactness.as_str(),
+        "cost_bound": record.cost_bound,
+        "wire_retries": record.wire_retries,
+        "charged_units": record.charged_units,
+        "bins": {
+            "prompt_tokens": record.bins.prompt_tokens,
+            "completion_tokens": record.bins.completion_tokens,
+            "reasoning_tokens": record.bins.reasoning_tokens,
+            "cache_read_tokens": record.bins.cache_read_tokens,
+            "cache_write_tokens": record.bins.cache_write_tokens,
+            "total_tokens": record.bins.total_tokens,
+        },
+    })
+}
+
+/// `permissions.view`: the admission mode each served boundary runs under, the
+/// scoped grant that admits this runtime's reads, and the decision mode. There
+/// is no single executor mode to report: `read_file` admits under the interim
+/// manual carrier while `mcp.call` admits under `auto`, so the answer names
+/// both instead of presenting one boundary's mode as the runtime's.
+fn permissions_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let grant = rt.policy.grant(&rt.scoped_grant);
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "permissions.view",
+            "boundaries": [
+                {
+                    "boundary": "read_file",
+                    "mode": crate::tools::READ_FILE_MODE.id(),
+                },
+                {
+                    "boundary": "mcp.call",
+                    "mode": MCP_CALL_MODE.id(),
+                },
+            ],
+            "decisions": rt.effective.decisions_mode().as_str(),
+            "grant": grant.map(|grant| json!({
+                "grant_id": grant.grant_id,
+                "scope_root": grant.scope_root.to_str(),
+                "classes": grant.classes,
+                "revoked": grant.revoked,
+            })),
+        }),
+    )
+}
+
+fn model_text(assign: &config::ModelAssign) -> String {
+    match assign {
+        config::ModelAssign::Inherit => "inherit".to_string(),
+        config::ModelAssign::Auto { pool } => match pool {
+            None => "auto".to_string(),
+            Some(pool) => format!("auto:{}", pool.join(",")),
+        },
+        config::ModelAssign::Fixed(fixed) => {
+            format!("{}:{}", fixed.connection, fixed.model_id)
+        }
+    }
+}
+
+/// One resolved purpose row: the assignment and the layer that supplied it.
+fn resolved_purposes(rt: &Runtime) -> Result<Vec<(String, String, String)>, config::ConfigError> {
+    let composed = rt.effective.composed();
+    let mut rows = Vec::with_capacity(composed.models.purposes.len());
+    for name in composed.models.purposes.keys() {
+        let resolved = composed.resolve_purpose(name)?;
+        rows.push((
+            name.clone(),
+            model_text(&resolved.model),
+            resolved.model_source,
+        ));
+    }
+    Ok(rows)
+}
+
+/// `model.view`: the composed default assignment and the model every configured
+/// purpose resolves to.
+fn model_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let composed = rt.effective.composed();
+    let default = composed
+        .models
+        .defaults
+        .as_ref()
+        .map(|d| model_text(&d.model));
+    let rows = match resolved_purposes(rt) {
+        Ok(rows) => rows,
+        Err(err) => return config_error(id, &err),
+    };
+    let purposes = rows
+        .into_iter()
+        .map(|(purpose, model, source)| json!({"purpose": purpose, "model": model, "source": source}))
+        .collect::<Vec<_>>();
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "model.view",
+            "default": default,
+            "purposes": purposes,
+        }),
+    )
+}
+
+/// `effort.view`: the composed default effort and the effort every configured
+/// purpose resolves to.
+fn effort_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let composed = rt.effective.composed();
+    let default = composed
+        .models
+        .defaults
+        .as_ref()
+        .map(|d| effort_text(&d.effort));
+    let mut purposes = Vec::with_capacity(composed.models.purposes.len());
+    for name in composed.models.purposes.keys() {
+        let resolved = match composed.resolve_purpose(name) {
+            Ok(resolved) => resolved,
+            Err(err) => return config_error(id, &err),
+        };
+        purposes.push(json!({
+            "purpose": name,
+            "effort": effort_text(&resolved.effort),
+            "source": resolved.effort_source,
+        }));
+    }
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "effort.view",
+            "default": default,
+            "purposes": purposes,
+        }),
+    )
+}
+
+/// `context.view`: what the assembled context is made of, by component size.
+fn context_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let assembled = match rt.owner.store.assembled_context(&task) {
+        Ok(assembled) => assembled,
+        Err(err) => return store_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "context.view",
+            "task_id": task.0,
+            "bytes": {
+                "total": assembled.text.len(),
+                "intent": assembled.intent.len(),
+                "decision": assembled.decision.len(),
+                "evidence": assembled.evidence.len(),
+                "remainder": assembled.remainder.len(),
+                "spend": assembled.spend.len(),
+                "history": assembled.history.len(),
+            },
+        }),
+    )
+}
+
+/// `checkpoint.preview`: the continuation checkpoint one fold would replace, and
+/// the assembled size it would shrink. Reading it folds nothing.
+fn checkpoint_preview(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let checkpoint = match rt.owner.store.continuation_checkpoint(&task) {
+        Ok(checkpoint) => checkpoint,
+        Err(err) => return store_error(id, &err),
+    };
+    let assembled = match rt.owner.store.assembled_context(&task) {
+        Ok(assembled) => assembled,
+        Err(err) => return store_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "checkpoint.preview",
+            "task_id": task.0,
+            "assembled_bytes": assembled.text.len(),
+            "checkpoint": checkpoint,
+        }),
+    )
+}
+
+/// `checkpoint.apply`: one forced fold, reported with the bytes it actually
+/// moved. A history the fold would not shorten is the owner's typed refusal.
+fn checkpoint_apply(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    match rt.store_writer().force_compaction(&session, &task) {
+        Ok(report) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "checkpoint.apply",
+                "task_id": task.0,
+                "checkpoint_id": report.checkpoint_id,
+                "before_bytes": report.before_bytes,
+                "after_bytes": report.after_bytes,
+                "folded_records": report.folded_records,
+            }),
+        ),
+        Err(err) => store_error(id, &err),
+    }
+}
+
+/// `workflow.control`: the workflow gate. `status` is a pure read; a switch
+/// rides the same journaled publication `config.set` rides, gated by the
+/// `expected_source_digest` precondition so a toggle that never landed is never
+/// observed.
+fn workflow_control(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(op) = params.get("op").and_then(Value::as_str) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "command.op",
+            },
+        );
+    };
+    if op == "status" {
+        return RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "workflow.control",
+                "op": "status",
+                "source_digest": rt.effective.sources_digest,
+                "entry": rt.effective.workflow_entry,
+            }),
+        );
+    }
+    let enabled = match op {
+        "on" => true,
+        "off" => false,
+        _ => {
+            return request_error(id, RequestError::UnknownWorkflowOp { op: op.to_string() });
+        }
+    };
+    let Some(expected) = params.get("expected_source_digest").and_then(Value::as_str) else {
+        return request_error(
+            id,
+            RequestError::Required {
+                field: "expected_source_digest",
+            },
+        );
+    };
+    if expected != rt.effective.sources_digest {
+        return request_error(id, RequestError::SourceDigestMismatch);
+    }
+    commit_config_edit(
+        rt,
+        id,
+        "workflow.control",
+        config::WORKFLOW_KEY,
+        None,
+        |config| config.set(config::WORKFLOW_KEY, config::ConfigValue::Bool(enabled)),
+    )
+}
+
+/// `harness.control`: the background machinery this runtime owns — the
+/// scheduler's slot occupancy and the newest project index generation. A read
+/// only: no op this build serves starts or stops a worker, so an unknown op is
+/// refused instead of reported as a change.
+fn harness_control(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let op = params.get("op").and_then(Value::as_str).unwrap_or("status");
+    if op != "status" {
+        return request_error(id, RequestError::UnknownHarnessOp { op: op.to_string() });
+    }
+    let index = match rt.owner.store.latest_index_state() {
+        Ok(state) => {
+            state.map(|(generation, state)| json!({"generation": generation, "state": state}))
+        }
+        Err(err) => return store_error(id, &err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "harness.control",
+            "op": "status",
+            "scheduler": {
+                "running": rt.scheduler.running_count(),
+                "held_units": rt.scheduler.held_units(),
+            },
+            "index": index,
+            "workflow": rt.effective.workflow_entry,
+        }),
+    )
+}
+
+/// `read_file`: the catalog's `read` alias resolving to the admitted tool. The
+/// preview is bounded, so a large file answers with what it kept and says what
+/// it left.
+fn read_file_command(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(task) = task_param(params) else {
+        return request_error(id, RequestError::Required { field: "task_id" });
+    };
+    let path = match required_str(params, "path") {
+        Ok(path) => path,
+        Err(err) => return request_error(id, err),
+    };
+    let grant = rt.scoped_grant.clone();
+    match crate::tools::invoke_read(rt, &task, &grant, PathBuf::from(path)) {
+        Ok(outcome) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "kind": "read_file",
+                "outcome": render_effect_outcome(&outcome),
+            }),
+        ),
+        // The executor's own mapping is the one boundary: an unproven
+        // outcome is `outcome_unknown`, an unavailable sandbox is
+        // `capability_unavailable`, and a policy refusal is `denied` — the
+        // caller reads the real class instead of every failure reading as a
+        // denial.
+        Err(err) => {
+            let class = err.error_code();
+            let rpc = match class {
+                ErrorCode::InvalidInput => -32602,
+                _ => -32000,
+            };
+            envelope_error(id, class, rpc, &err.to_string())
+        }
+    }
+}
+
+fn render_effect_outcome(outcome: &crate::executor::EffectOutcome) -> Value {
+    match outcome {
+        crate::executor::EffectOutcome::Read { bytes, digest } => {
+            let (text, truncated) = file_preview(bytes);
+            json!({
+                "class": "read",
+                "bytes": bytes.len(),
+                "digest": digest,
+                "text": text,
+                "truncated": truncated,
+            })
+        }
+        crate::executor::EffectOutcome::Executed { detail } => {
+            json!({"class": "executed", "detail": detail})
+        }
+        crate::executor::EffectOutcome::Denied { reason } => {
+            json!({"class": "denied", "reason": reason})
+        }
+    }
+}
+
+/// The preview one admitted read may carry. A file larger than the bound is
+/// reported with the bytes it kept and `truncated: true`; a file that is not
+/// UTF-8 answers no text rather than a lossy rendering of binary bytes.
+fn file_preview(bytes: &[u8]) -> (Option<String>, bool) {
+    const PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return (None, false);
+    };
+    if text.len() <= PREVIEW_MAX_BYTES {
+        return (Some(text.to_string()), false);
+    }
+    let mut end = PREVIEW_MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Some(text[..end].to_string()), true)
 }
 
 /// `mcp.call`: one admitted `tools/call` against a declared server.
@@ -3770,11 +4806,7 @@ fn decisions_control(rt: &mut Runtime, id: Value, params: &Value, ingress: Ingre
             },
         );
     };
-    let principal = match ingress {
-        Ingress::TrustedHuman => "local_user",
-        Ingress::Machine => "machine",
-        Ingress::Observer => "observer",
-    };
+    let principal = principal(ingress);
     // The receipt check precedes the freshness gate: a retry arrives
     // with the digest it was issued against — already stale once the
     // edit landed — and must be answered from the receipt, not refused.
@@ -3866,6 +4898,18 @@ fn decisions_control(rt: &mut Runtime, id: Value, params: &Value, ingress: Ingre
     }
 }
 
+/// The recorded origin of one ingress: a trusted human adapter is the local
+/// user, a plain machine frame is the machine, and a granted observer is the
+/// observer. Every carrier that records an origin reads this one mapping, so a
+/// fork cannot record a machine request as human-authored.
+fn principal(ingress: Ingress) -> &'static str {
+    match ingress {
+        Ingress::TrustedHuman => "local_user",
+        Ingress::Machine => "machine",
+        Ingress::Observer => "observer",
+    }
+}
+
 fn handle_method(
     rt: &mut Runtime,
     ingress: Ingress,
@@ -3919,17 +4963,38 @@ fn handle_method(
             let Some(session) = session_param(&params) else {
                 return missing_session(id);
             };
-            RpcResponse::ok(
-                id,
-                json!({
-                    "schema_version": SCHEMA_VERSION,
-                    "session_id": session.0,
-                    "owner_generation": 1u64,
-                    "state": "closed",
-                    "attachment_id": params.get("bootstrap_id").and_then(Value::as_str).unwrap_or_default(),
-                    "session_revision": 1u64,
-                }),
-            )
+            let Some(attachment) = params.get("attachment_id").and_then(Value::as_str) else {
+                return request_error(
+                    id,
+                    RequestError::Required {
+                        field: "attachment_id",
+                    },
+                );
+            };
+            // The ack is the row's own state: the attachment moves
+            // `attached` to `closed` durably, a repeat answers that it was
+            // already closed, and an attachment this session never recorded
+            // is not found. The session itself stays attachable — a close
+            // ends one surface, not the conversation.
+            match rt
+                .owner
+                .store
+                .close_attachment(&session, &AttachmentId(attachment.to_string()))
+            {
+                Ok(closed) => RpcResponse::ok(
+                    id,
+                    json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "session_id": session.0,
+                        "owner_generation": rt.owner.generation,
+                        "state": "closed",
+                        "attachment_id": closed.attachment_id.0,
+                        "session_revision": closed.session_revision,
+                        "already_closed": closed.already_closed,
+                    }),
+                ),
+                Err(err) => store_error(id, &err),
+            }
         }
         "runtime.status" => {
             let Some(session) = session_param(&params) else {
@@ -4014,69 +5079,17 @@ fn handle_method(
                         },
                     );
                 }
-                if !config::is_readable_key(key) {
-                    // A section the document owns answers its own status:
-                    // "unknown key" frames a spelling the schema does not
-                    // know, and neither declared section is that.
-                    if config::is_document_only_key(key) {
-                        return request_error(
-                            id,
-                            RequestError::DocumentOnlyKey {
-                                key: key.to_string(),
-                            },
-                        );
-                    }
-                    return request_error(
-                        id,
-                        RequestError::InvalidKey {
-                            key: key.to_string(),
-                        },
-                    );
+                // One refusal shape for every read surface: a section the
+                // document owns names its own status, and an unknown spelling
+                // names the carriers it could have meant.
+                if let Some(refusal) = readable_key(&id, key) {
+                    return refusal;
                 }
                 validated.push(key);
             }
-            // One entry per requested key, in request order. The keys a base
-            // may supply — the workflow flag, the decision mode and the context
-            // guard — serve the entry their layer recorded, so a base value is
-            // never reported as the user's; the additive profile keys read from
-            // the retained document, where an absent field serves null rather
-            // than disappearing (AC-054).
-            let view = rt.effective.retained();
-            let revision = rt
-                .effective
-                .parsed
-                .as_ref()
-                .map_or_else(config::shipped_revision, config::Config::revision);
-            let source_kind = if rt.effective.parsed.is_some() {
-                "user"
-            } else {
-                "shipped"
-            };
             let mut entries = Vec::with_capacity(validated.len());
             for key in validated {
-                if key == config::WORKFLOW_KEY {
-                    entries.push(rt.effective.workflow_entry.clone());
-                    continue;
-                }
-                if key == config::DECISIONS_MODE_KEY {
-                    entries.push(rt.effective.decisions_entry.clone());
-                    continue;
-                }
-                if key == config::CONTEXT_AUTO_COMPACT_KEY {
-                    entries.push(rt.effective.context_entry.clone());
-                    continue;
-                }
-                entries.push(config::ConfigEntry {
-                    key: key.to_string(),
-                    effective: config::ConfigViewValue::Visible {
-                        value: view.read_value(key).unwrap_or(Value::Null),
-                    },
-                    source: config::ConfigSource {
-                        kind: source_kind.to_string(),
-                        revision: revision.clone(),
-                        target: None,
-                    },
-                });
+                entries.push(config_entry(rt, key));
             }
             let result = ConfigReadResult {
                 schema_version: SCHEMA_VERSION,
@@ -4242,7 +5255,8 @@ fn handle_method(
                     let Some(value) = params.get("value") else {
                         return request_error(id, RequestError::Required { field: "value" });
                     };
-                    commit_config_edit(rt, id, "config.set", key, |config| {
+                    let expected = params.get("expected_source_digest").and_then(Value::as_str);
+                    commit_config_edit(rt, id, "config.set", key, expected, |config| {
                         config.set_wire(key, value)
                     })
                 }
@@ -4253,18 +5267,47 @@ fn handle_method(
                     let Some(key) = params.get("key").and_then(Value::as_str) else {
                         return request_error(id, RequestError::Required { field: "key" });
                     };
-                    commit_config_edit(rt, id, "config.unset", key, |config| config.reset(key))
+                    let expected = params.get("expected_source_digest").and_then(Value::as_str);
+                    commit_config_edit(rt, id, "config.unset", key, expected, |config| {
+                        config.reset(key)
+                    })
                 }
                 crate::tools::LocalKind::DecisionsControl => {
                     decisions_control(rt, id, &params, ingress)
                 }
+                crate::tools::LocalKind::SettingsOpen => settings_open(rt, id, &params),
+                crate::tools::LocalKind::ConfigList => config_list(rt, id, &params),
+                crate::tools::LocalKind::ConfigSearch => config_search(rt, id, &params),
+                crate::tools::LocalKind::ConfigGet => config_get(rt, id, &params),
+                crate::tools::LocalKind::ConfigExplain => config_explain(rt, id, &params),
+                crate::tools::LocalKind::ConfigValidate => config_validate(rt, id, &params),
+                crate::tools::LocalKind::ConfigExport => config_export(rt, id, &params),
+                crate::tools::LocalKind::SessionList => session_list(rt, id, &params),
+                crate::tools::LocalKind::SessionSearch => session_search(rt, id, &params),
+                crate::tools::LocalKind::SessionFork => {
+                    session_fork(rt, id, &params, connection_id, ingress)
+                }
+                crate::tools::LocalKind::SessionExport => session_export(rt, id, &params),
+                crate::tools::LocalKind::SessionRecap => session_recap(rt, id, &params),
+                crate::tools::LocalKind::UsageView => usage_view(rt, id, &params),
+                crate::tools::LocalKind::PermissionsView => permissions_view(rt, id, &params),
+                crate::tools::LocalKind::ModelView => model_view(rt, id, &params),
+                crate::tools::LocalKind::EffortView => effort_view(rt, id, &params),
+                crate::tools::LocalKind::ContextView => context_view(rt, id, &params),
+                crate::tools::LocalKind::CheckpointPreview => checkpoint_preview(rt, id, &params),
+                crate::tools::LocalKind::CheckpointApply => checkpoint_apply(rt, id, &params),
+                crate::tools::LocalKind::WorkflowControl => workflow_control(rt, id, &params),
+                crate::tools::LocalKind::HarnessControl => harness_control(rt, id, &params),
+                crate::tools::LocalKind::ReadFile => read_file_command(rt, id, &params),
                 crate::tools::LocalKind::ProjectInit => project_init(rt, id, &params),
                 crate::tools::LocalKind::SessionNew => session_new(rt, id, &params, connection_id),
                 crate::tools::LocalKind::ContextCompact => context_compact(rt, id, &params),
                 crate::tools::LocalKind::McpCall => mcp_call(rt, id, &params),
-                // The rows belong to the TUI's own projection, so the
-                // handler answers the kind it served and no durable
-                // effect: the composer clears them on the same answer.
+                // `view.clear` is a catalog/API row with no durable effect of
+                // its own: the answer names the session it served. The
+                // composer no longer sends it — `/clear` is `/new`'s alias and
+                // switches sessions — so this arm exists for the wire caller
+                // that still names the row.
                 crate::tools::LocalKind::ViewClear => {
                     let Some(session) = session_param(&params) else {
                         return missing_session(id);
@@ -4284,12 +5327,23 @@ fn handle_method(
                         command: kind.to_string(),
                     },
                 ),
-                crate::tools::LocalKind::PlannedUnimplemented => request_error(
-                    id,
-                    RequestError::KnownCommandUnavailable {
-                        command: kind.to_string(),
-                    },
-                ),
+                crate::tools::LocalKind::PlannedUnimplemented => {
+                    let Some(reason) = crate::tools::local_refusal(kind) else {
+                        return request_error(
+                            id,
+                            RequestError::UnknownLocalCommand {
+                                command: kind.to_string(),
+                            },
+                        );
+                    };
+                    request_error(
+                        id,
+                        RequestError::CommandUnavailable {
+                            command: kind.to_string(),
+                            reason,
+                        },
+                    )
+                }
             }
         }
         "artifact.read" => request_error(id, RequestError::ArtifactReadUnavailable),
@@ -5369,11 +6423,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
     if !crate::contracts::TASK_COMMAND_KINDS.contains(&kind.as_str()) {
         return request_error(id, RequestError::UnknownCommandKind { kind });
     }
-    let principal = match ingress {
-        Ingress::TrustedHuman => "local_user",
-        Ingress::Machine => "machine",
-        Ingress::Observer => "observer",
-    };
+    let principal = principal(ingress);
     match kind.as_str() {
         "create" => {
             if params.get("task_id").is_some() {
@@ -7692,6 +8742,7 @@ mod tests {
             serde_json::json!(1),
             "config.set",
             "workflow.enabled",
+            None,
             |config| config.set_wire("workflow.enabled", &serde_json::json!(true)),
         );
         assert!(
@@ -7747,6 +8798,7 @@ mod tests {
             serde_json::json!(2),
             "config.set",
             "workflow.enabled",
+            None,
             |config| config.set_wire("workflow.enabled", &serde_json::json!(false)),
         );
         assert!(
@@ -7859,6 +8911,7 @@ mod tests {
             serde_json::json!(1),
             "config.set",
             "workflow.enabled",
+            None,
             |config| config.set_wire("workflow.enabled", &serde_json::json!(true)),
         );
         match failed.error.as_ref() {
@@ -7907,6 +8960,7 @@ mod tests {
             serde_json::json!(2),
             "config.set",
             "workflow.enabled",
+            None,
             |config| config.set_wire("workflow.enabled", &serde_json::json!(true)),
         );
         assert!(

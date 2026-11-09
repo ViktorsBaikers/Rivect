@@ -60,6 +60,8 @@ pub enum Missing {
     SharingGrant(String),
     #[error("obligation")]
     Obligation,
+    #[error("attachment {0}")]
+    Attachment(String),
     #[error("learning delta {0}")]
     Delta(String),
 }
@@ -4399,6 +4401,213 @@ impl TaskStore {
         Ok(page)
     }
 
+    /// One page of the sessions this data root recorded, newest first. The
+    /// generation is the newest recorded session row, so a cursor from another
+    /// population conflicts instead of continuing into it.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] for a cursor of another generation,
+    /// [`StoreError::InvalidInput`] for an offset past the SQLite range, and
+    /// the storage failure of the read.
+    pub fn sessions_page(
+        &self,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<Page<SessionRow>> {
+        self.session_page(
+            limit,
+            cursor,
+            sql::SESSIONS_GENERATION,
+            |conn, sql_limit, offset| {
+                let mut stmt = conn.prepare(sql::SESSIONS_PAGE).map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![sql_limit, offset], session_row)
+                    .map_err(storage)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(storage)?;
+                Ok(rows)
+            },
+        )
+    }
+
+    /// One page of the sessions whose recorded goal bytes contain `query`,
+    /// ASCII case-insensitively, newest first. The same generation contract as
+    /// [`TaskStore::sessions_page`] holds.
+    ///
+    /// # Errors
+    /// The same refusals as [`TaskStore::sessions_page`].
+    pub fn sessions_search_page(
+        &self,
+        query: &str,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+    ) -> Result<Page<SessionRow>> {
+        self.session_page(
+            limit,
+            cursor,
+            sql::SESSIONS_SEARCH_GENERATION,
+            |conn, sql_limit, offset| {
+                let mut stmt = conn.prepare(sql::SESSIONS_SEARCH_PAGE).map_err(storage)?;
+                let rows = stmt
+                    .query_map(params![query, sql_limit, offset], session_row)
+                    .map_err(storage)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(storage)?;
+                Ok(rows)
+            },
+        )
+    }
+
+    /// The one generation/cursor/limit contract both session pages share: the
+    /// generation is read before the rows, a cursor of another generation is
+    /// refused before any row is read, and the extra row read proves whether a
+    /// next page exists. `generation_sql` is the surface's own population: the
+    /// listing moves with session inserts, and the search moves with task
+    /// inserts too, because a task changes what the query matches.
+    fn session_page(
+        &self,
+        limit: u32,
+        cursor: Option<(u64, u64)>,
+        generation_sql: &str,
+        read: impl FnOnce(&Connection, i64, i64) -> Result<Vec<SessionRow>>,
+    ) -> Result<Page<SessionRow>> {
+        let conn = self.conn()?;
+        let generation: u64 = conn
+            .query_row(generation_sql, [], |row| {
+                row.get::<_, i64>(0).map(|value| value as u64)
+            })
+            .map_err(storage)?;
+        let offset = cursor.map_or(0, |(_, offset)| offset);
+        if let Some((expected, _)) = cursor
+            && expected != generation
+        {
+            return Err(StoreError::Conflict(ConflictCause::CursorGeneration {
+                expected,
+                current: generation,
+            }));
+        }
+        let next_offset = Self::next_page_offset(offset, limit)?;
+        let sql_offset = Self::sql_offset(offset)?;
+        let rows = read(conn, i64::from(limit) + 1, sql_offset)?;
+        let mut page = Page::new(rows, generation);
+        if page.items.len() > limit as usize {
+            page.items.truncate(limit as usize);
+            page.next_cursor = Some(format!("gen:{generation}:offset:{next_offset}"));
+        }
+        Ok(page)
+    }
+
+    /// The goals a fork copies out of one session, in creation order, bounded
+    /// by `limit` so a session larger than the fork's page is refused before
+    /// any task is created. The bytes are the stored goal, not a re-rendered
+    /// form, so a fork starts from exactly what the parent recorded.
+    ///
+    /// # Errors
+    /// The storage failure of the read.
+    pub fn session_goals(&self, session_id: &SessionId, limit: u32) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn()?
+            .prepare(sql::GOALS_FOR_SESSION)
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![session_id.0, i64::from(limit)], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        Ok(rows)
+    }
+
+    /// The lifecycle population of one session, counted by the engine: a
+    /// session larger than any page still reports its real counts.
+    ///
+    /// # Errors
+    /// The storage failure of the read, or an unknown lifecycle spelling a
+    /// store this build wrote cannot produce.
+    pub fn lifecycle_counts(&self, session_id: &SessionId) -> Result<[u64; 6]> {
+        let mut stmt = self
+            .conn()?
+            .prepare(sql::LIFECYCLE_COUNTS_FOR_SESSION)
+            .map_err(storage)?;
+        let rows = stmt
+            .query_map(params![session_id.0], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        let mut counts = [0_u64; 6];
+        for (lifecycle, count) in rows {
+            let slot = match lifecycle.as_str() {
+                "running" => 0,
+                "waiting" => 1,
+                "paused" => 2,
+                "blocked" => 3,
+                "completed" => 4,
+                "cancelled" => 5,
+                other => {
+                    return Err(StoreError::Storage(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown stored lifecycle {other}"),
+                    ))));
+                }
+            };
+            counts[slot] = u64::try_from(count).map_err(|_negative| {
+                StoreError::Storage(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "negative lifecycle count",
+                )))
+            })?;
+        }
+        Ok(counts)
+    }
+
+    /// Closes one attachment durably: the row moves `attached` to `closed` in
+    /// one statement, so a surface's "closed" ack is the row's own state
+    /// rather than a synthesised verdict. A repeat is idempotent and says so;
+    /// an attachment this session never recorded is not found.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for an attachment outside the session, and the
+    /// storage failure of the write or the state read.
+    pub fn close_attachment(
+        &mut self,
+        session_id: &SessionId,
+        attachment_id: &AttachmentId,
+    ) -> Result<ClosedAttachment> {
+        let conn = self.conn_write()?;
+        let changed = conn
+            .execute(
+                sql::CLOSE_ATTACHMENT,
+                params![attachment_id.0, session_id.0],
+            )
+            .map_err(storage)?;
+        let state: Option<String> = conn
+            .query_row(
+                sql::ATTACHMENT_STATE,
+                params![attachment_id.0, session_id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if state.is_none() {
+            return Err(StoreError::NotFound(Missing::Attachment(
+                attachment_id.0.clone(),
+            )));
+        }
+        let revision: u64 = conn
+            .query_row(sql::SESSION_REVISION, params![session_id.0], |row| {
+                row.get::<_, i64>(0).map(|value| value as u64)
+            })
+            .map_err(storage)?;
+        Ok(ClosedAttachment {
+            attachment_id: attachment_id.clone(),
+            session_revision: revision,
+            already_closed: changed == 0,
+        })
+    }
+
     fn todo_items(
         &self,
         session_id: &SessionId,
@@ -7615,6 +7824,118 @@ impl TaskStore {
             }),
             Err(error) => error,
         }
+    }
+}
+
+/// One session row the listing and search surfaces serve.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionRow {
+    pub session_id: SessionId,
+    pub revision: u64,
+    pub created_at: String,
+}
+
+/// One session row from its statement's three columns: both session pages
+/// select the same shape, so the mapping lives once.
+fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        session_id: SessionId(row.get(0)?),
+        revision: row.get::<_, i64>(1)? as u64,
+        created_at: row.get(2)?,
+    })
+}
+
+/// The durable answer one `session.close` serves: the attachment row that was
+/// moved, the session revision it belongs to, and whether this call was the
+/// one that moved it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClosedAttachment {
+    pub attachment_id: AttachmentId,
+    pub session_revision: u64,
+    pub already_closed: bool,
+}
+
+/// What a read-only look at a data root's database can say without opening
+/// it. Deciding the store's health from files alone is the point: a doctor
+/// that opened a connection would take a descriptor on the file the running
+/// owner holds, so the sessionless surface reads bytes instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoreInspection {
+    /// Whether the database file exists at all.
+    pub present: bool,
+    pub bytes: u64,
+    /// Whether the file begins with the SQLite header magic. A present file
+    /// that fails this check is not a database this build can serve.
+    pub header_ok: bool,
+    /// Which write-ahead-log sidecars exist beside the database.
+    pub sidecars: Sidecars,
+}
+
+/// The sidecars an inspection found beside the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sidecars {
+    None,
+    Wal,
+    SharedMemory,
+}
+
+/// Reads the database file's own bytes and names, without opening a
+/// connection, creating a file or taking a lock.
+///
+/// # Errors
+/// The failure of the metadata read or of opening the existing file
+/// read-only; an absent file is `present: false`, not an error.
+pub fn inspect_read_only(db: &Path) -> std::io::Result<StoreInspection> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let metadata = match std::fs::metadata(db) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StoreInspection {
+                present: false,
+                bytes: 0,
+                header_ok: false,
+                sidecars: sidecars_beside(db),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    // The same checked open the config ingress uses (DEC-056): a path another
+    // process swapped for a FIFO must not block the one command whose contract
+    // is to answer. The non-blocking open returns immediately, and the opened
+    // descriptor's own metadata must name a regular file.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            rivect_sandbox_helper::ANCHOR_O_NOFOLLOW | rivect_sandbox_helper::OPEN_NONBLOCK,
+        )
+        .open(db)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the store path is not a regular file",
+        ));
+    }
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header)?;
+    Ok(StoreInspection {
+        present: true,
+        bytes: metadata.len(),
+        header_ok: read == header.len() && &header == b"SQLite format 3\0",
+        sidecars: sidecars_beside(db),
+    })
+}
+
+/// The sidecars present beside one database file.
+fn sidecars_beside(db: &Path) -> Sidecars {
+    match (
+        sidecar_path(db, "wal").exists(),
+        sidecar_path(db, "shm").exists(),
+    ) {
+        (true, true) => Sidecars::SharedMemory,
+        (true, false) => Sidecars::Wal,
+        (false, _) => Sidecars::None,
     }
 }
 

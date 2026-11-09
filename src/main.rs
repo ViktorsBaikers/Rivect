@@ -1,6 +1,8 @@
-//! `rivect` executable: minimal fullscreen TUI on a real terminal,
-//! JSON-RPC headless loop otherwise (machine stdout carries only LF-delimited
-//! JSON, diagnostics go to stderr, no ANSI).
+//! `rivect` executable: the grammar in [`cli`] decides what one command line
+//! asks for; a fullscreen TUI answers on a real terminal, the JSON-RPC
+//! headless loop otherwise (machine stdout carries only LF-delimited JSON,
+//! diagnostics go to stderr, no ANSI), and `rivect doctor` answers through
+//! [`doctor`] before any runtime open.
 
 // CLI boundary: this crate root owns process exit and stderr diagnostics; the
 // workspace denies these lints everywhere else (docs/engineering-standards.md §8).
@@ -11,22 +13,17 @@
     reason = "CLI boundary owns stderr output and process exit (standards §8)"
 )]
 
+mod cli;
+mod doctor;
+
 use crossterm::tty::IsTty;
 use rivect::commands::{DispatchStep, Ingress, LoopEvent, OpenError, Runtime};
 use std::io::{self, BufRead, ErrorKind, Read, StdinLock, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, sync_channel};
 
-const USAGE: &str = "rivect [--tui fullscreen] [--no-mouse] [--headless] [--data-root PATH]";
-
 #[derive(Debug, thiserror::Error)]
 enum CliError {
-    #[error("unsupported render mode in this build: {mode}")]
-    UnsupportedRenderMode { mode: String },
-    #[error("missing value for --data-root")]
-    MissingDataRoot,
-    #[error("unknown flag {flag}")]
-    UnknownFlag { flag: String },
     #[error("runtime open failed")]
     Owner(#[source] rivect::owner::OwnerError),
     #[error("tui failed")]
@@ -58,51 +55,50 @@ fn main() {
         std::process::exit(0);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut headless = false;
-    let mut data_root = default_data_root();
-
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--tui" => {
-                let mode = iter.next().unwrap_or_default();
-                if mode != "fullscreen" {
-                    eprintln!("{}", CliError::UnsupportedRenderMode { mode });
-                    std::process::exit(2);
+    let invocation = match cli::parse(&args, default_data_root()) {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            eprintln!("{error}\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    match invocation {
+        cli::Invocation::Help => println!("{}", cli::help(&rivect::tools::describe())),
+        cli::Invocation::Version => println!("{}", cli::version()),
+        cli::Invocation::Completions { shell } => {
+            print!(
+                "{}",
+                rivect::tools::completions(&rivect::tools::describe(), shell)
+            );
+        }
+        cli::Invocation::Doctor { project, data_root } => {
+            // The CLI is not the owner: a live election is another process's.
+            let report = doctor::inspect(&data_root, project.as_deref(), false);
+            println!("{}", report.to_json());
+            std::process::exit(if report.ready() { 0 } else { 3 });
+        }
+        cli::Invocation::Command { kind, data_root } => {
+            let code = run_command(&data_root, &kind);
+            std::process::exit(code);
+        }
+        cli::Invocation::Run {
+            headless,
+            data_root,
+        } => {
+            let is_tty = io::stdout().is_tty() && io::stdin().is_tty();
+            if !headless && is_tty {
+                match rivect::ui::run_tui(&data_root) {
+                    Ok(code) => std::process::exit(code),
+                    Err(source) => {
+                        report_cli_error(&CliError::Tui(source));
+                        std::process::exit(1);
+                    }
                 }
             }
-            "--no-mouse" => {}
-            "--headless" => headless = true,
-            "--data-root" => {
-                let Some(root) = iter.next() else {
-                    eprintln!("{}\n{USAGE}", CliError::MissingDataRoot);
-                    std::process::exit(2);
-                };
-                data_root = PathBuf::from(root);
-            }
-            flag => {
-                eprintln!(
-                    "{}\n{USAGE}",
-                    CliError::UnknownFlag {
-                        flag: flag.to_string(),
-                    }
-                );
-                std::process::exit(2);
-            }
+            let code = run_headless(&data_root);
+            std::process::exit(code);
         }
     }
-    let is_tty = io::stdout().is_tty() && io::stdin().is_tty();
-    if !headless && is_tty {
-        match rivect::ui::run_tui(&data_root) {
-            Ok(code) => std::process::exit(code),
-            Err(source) => {
-                report_cli_error(&CliError::Tui(source));
-                std::process::exit(1);
-            }
-        }
-    }
-    let code = run_headless(&data_root);
-    std::process::exit(code);
 }
 
 /// Boot diagnostics write to stderr through the locked handle, the same
@@ -200,13 +196,103 @@ fn open_headless(data_root: &Path) -> Result<Runtime, OpenError> {
     Runtime::open_configured(data_root, rivect::providers::configured_provider)
 }
 
+/// One catalog word run once through the dispatcher: attach a fresh session on
+/// this connection, dispatch the word's kind, and answer its class. A row that
+/// needs parameters answers its own typed refusal — never the grammar's usage
+/// error — so every word the completion scripts offer is a dispatcher-level
+/// request.
+fn run_command(data_root: &Path, kind: &str) -> i32 {
+    let mut runtime = match open_headless(data_root) {
+        Ok(runtime) => runtime,
+        Err(carrier) => {
+            report_cli_error(&CliError::Owner(carrier.into_source()));
+            return 1;
+        }
+    };
+    for diagnostic in &runtime.boot_diagnostics {
+        report_boot_diagnostic(diagnostic);
+    }
+    let bootstrap = rivect::contracts::AttachmentId::generate().0;
+    let attach = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.attach",
+        "params": { "schema_version": 1, "bootstrap_id": bootstrap },
+    })
+    .to_string();
+    let attach_answer = rivect::commands::dispatch_runtime_request(
+        &mut runtime,
+        Ingress::Machine,
+        "cli-1",
+        &attach,
+    );
+    let session = serde_json::from_str::<serde_json::Value>(&attach_answer)
+        .ok()
+        .and_then(|frame| {
+            frame
+                .pointer("/result/session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let answer = match session {
+        Some(session) => {
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": session,
+                    "command": { "kind": kind },
+                },
+            })
+            .to_string();
+            rivect::commands::dispatch_runtime_request(
+                &mut runtime,
+                Ingress::Machine,
+                "cli-1",
+                &frame,
+            )
+        }
+        None => attach_answer,
+    };
+    let code = match write_stdout(&answer) {
+        Ok(()) => i32::from(rivect::commands::response_status(&answer)),
+        Err(source) => {
+            report_cli_error(&CliError::Stdout(source));
+            1
+        }
+    };
+    release_runtime(runtime);
+    code
+}
+
 fn run_headless(data_root: &Path) -> i32 {
+    let (events, inbox) = sync_channel::<LoopEvent>(LOOP_CHANNEL_CAPACITY);
+    let runtime_events = events.clone();
+    // Doctor is answered before any runtime open: the request diagnoses the
+    // data root, so opening it first would create the lock and the store the
+    // answer is supposed to describe. Only a frame this module does not serve
+    // reaches the open, and it keeps its place in the loop.
+    // The reader is a tracked spawn: its handle is joined before this
+    // function returns.
+    let reader = std::thread::spawn(move || read_stdin(events, io::stdin().lock()));
+    let mut exit = ExitClass::default();
+    // The pre-open pass serves only frames that arrive. End of input with no
+    // doctor frame is not an answer: the runtime still opens and reports its
+    // own boot diagnostics, exactly as it did before this pass existed.
+    let first = match answer_doctor_frames(&inbox, data_root, &mut exit) {
+        Ok(event) => event,
+        // A run that answered its doctor frames needs no runtime, and a reader
+        // blocked in `read_until` on a live stdin owns no runtime state:
+        // joining it here would hang the exit instead of reporting the answer.
+        // The process exit ends it.
+        Err(status) => return status,
+    };
     let mut runtime = match open_headless(data_root) {
         Ok(runtime) => runtime,
         // The failed open already emitted the collected verdicts to
         // stderr and carries them for surfaces that need their own
         // channel — headless stderr is that channel, so only the source
-        // failure joins the error line.
+        // failure joins the error line. The reader is not joined: a live
+        // stdin keeps it in `read_until`, and the failure must exit 1
+        // instead of hanging on a client that holds its pipe open.
         Err(carrier) => {
             report_cli_error(&CliError::Owner(carrier.into_source()));
             return 1;
@@ -217,110 +303,283 @@ fn run_headless(data_root: &Path) -> i32 {
     // files reach the assembled request. A working directory that cannot be
     // read hands no root and discovers nothing — never a failed boot.
     runtime.set_instructions_root(std::env::current_dir().ok());
+    // The same directory is the declared read scope a shipped `read_file`
+    // addresses: the entry binds it here, so a real binary's read is admitted
+    // under a real grant instead of `UnknownGrant`.
+    if let Ok(scope) = std::env::current_dir() {
+        runtime.bind_read_scope(scope);
+    }
     // Boot recovery verdicts a human must resolve report on stderr —
     // machine stdout stays pure JSON.
     for diagnostic in &runtime.boot_diagnostics {
         report_boot_diagnostic(diagnostic);
     }
-    let (events, inbox) = sync_channel::<LoopEvent>(LOOP_CHANNEL_CAPACITY);
     // The index owner and the watch backend ping this same channel, so a
     // run answering or a batch arriving is noticed by a loop blocked on
     // input rather than by a poll.
-    if !runtime.set_loop_wake(events.clone()) {
+    if !runtime.set_loop_wake(runtime_events) {
         report_cli_error(&CliError::Stdin(io::Error::other(
             "the runtime already holds a loop wake",
         )));
         release_runtime(runtime);
         return 1;
     }
-    // The reader is a tracked spawn: its handle is joined before this
-    // function returns.
-    let reader = std::thread::spawn(move || read_stdin(events, io::stdin().lock()));
-    let mut code = 0;
+    let mut pending = Some(first);
+    let mut input_ended = false;
     loop {
         // Whatever the owner finished or the watch reported is answered
         // before the next request is routed, so a request id never has
         // two answers and the freshest state is served first.
-        let owed = runtime.pump_index();
-        if let Some(response) = owed {
-            // An answer the owner owed is written before the loop waits
-            // for anything else: the loop must not sit on a completed
-            // run waiting for input that may never come.
-            match write_stdout(&response) {
-                Ok(()) => {}
-                Err(source) => {
-                    report_cli_error(&CliError::Stdout(source));
-                    code = 1;
-                    break;
-                }
-            }
-        }
-        // Every sender gone means the reader has returned and the runtime
-        // is being dropped, which unwinds this loop — but the loop is
-        // still waiting to be *told* to stop, because the reader
-        // returning is not the same as end of input.
-        let Ok(event) = inbox.recv() else {
+        if let Err(source) = serve_owed(&mut runtime, &mut exit) {
+            report_cli_error(&CliError::Stdout(source));
+            exit.note(1);
             break;
+        }
+        // The frame the doctor pass held is served before the loop waits
+        // again: it arrived first, so it is answered first. Every sender
+        // gone afterwards means the reader has returned and the runtime is
+        // being dropped, which unwinds this loop — but the loop is still
+        // waiting to be *told* to stop, because the reader returning is not
+        // the same as end of input.
+        let event = match pending.take() {
+            Some(event) => event,
+            None => match inbox.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
         };
-        match event {
-            LoopEvent::InputClosed => {
-                // End of input is not an abort. A request the loop has
-                // already accepted is finished and its answer written,
-                // because a client that closed stdin is owed exactly that
-                // and has no other way to learn the outcome. Nothing new
-                // is started here: a watch repair has no surface left to
-                // serve it, and beginning one would hold the exit open for
-                // a build nobody is waiting for.
-                while let Some(response) = runtime.pump_index_owed() {
-                    if let Err(source) = write_stdout(&response) {
-                        report_cli_error(&CliError::Stdout(source));
-                        code = 1;
-                        break;
-                    }
-                }
-                break;
-            }
-            LoopEvent::InputFailed(kind) => {
-                report_cli_error(&CliError::Stdin(io::Error::from(kind)));
-                code = 1;
-                break;
-            }
-            LoopEvent::FrameTooLarge => {
-                report_cli_error(&CliError::RequestTooLarge {
-                    limit: rivect::contracts::REQUEST_MAX_BYTES,
-                });
-                code = 1;
-                break;
-            }
-            // The owner or the watch reported: nothing is owed yet, so
-            // the loop turns and pumps at the top of the next pass.
-            LoopEvent::Index => continue,
-            LoopEvent::Frame(request) => {
-                let step = rivect::commands::dispatch_step(
-                    &mut runtime,
-                    Ingress::Machine,
-                    "stdio-1",
-                    &request,
-                );
-                if let DispatchStep::Ready(response) = step
-                    && let Err(source) = write_stdout(&response)
-                {
-                    report_cli_error(&CliError::Stdout(source));
-                    code = 1;
-                    break;
-                }
-                // `DispatchStep::Deferred` writes nothing for this id:
-                // the answer is owed to the off-path owner and the loop
-                // writes it when the owner lands it.
-            }
+        // An input that ended is the only stop that proves the reader
+        // returned; a write failure stops the loop with the reader possibly
+        // still blocked on a live stdin.
+        input_ended = matches!(
+            &event,
+            LoopEvent::InputClosed | LoopEvent::InputFailed(_) | LoopEvent::FrameTooLarge
+        );
+        if let Step::Stop = handle_event(event, &mut runtime, data_root, &mut exit) {
+            break;
         }
     }
-    // The reader is joined before the runtime drops, so stdin is not
-    // read by a thread that outlives the loop; the runtime's own drop
-    // then joins the index owner, and its release failures are reported.
+    // The reader is joined before the runtime drops only when it reported the
+    // end of input: a reader still blocked in `read_until` owns no runtime
+    // state, and the process exit ends it.
     release_runtime(runtime);
-    let _reader = reader.join();
-    code
+    if input_ended {
+        let _joined = reader.join();
+    }
+    i32::from(exit.status())
+}
+
+/// The one owner of a headless run's exit class: the most severe outcome the
+/// loop served, under the published precedence, plus the answers the off-path
+/// owner still owes.
+#[derive(Debug, Default)]
+struct ExitClass {
+    status: u8,
+    pending: u32,
+}
+
+impl ExitClass {
+    /// Folds one class into the run. The published order is
+    /// cancelled(130) > internal(1) > pending(4) > error(3) > usage(2) > 0, so
+    /// a later success never erases an earlier failure.
+    fn note(&mut self, status: u8) {
+        if class_rank(status) > class_rank(self.status) {
+            self.status = status;
+        }
+    }
+
+    /// Records one answer the off-path owner still owes.
+    fn defer(&mut self) {
+        self.pending = self.pending.saturating_add(1);
+    }
+
+    /// Lands one owed answer: its own class replaces the pending state, so a
+    /// deferred success exits 0 and a deferred error exits its own class
+    /// instead of `pending`.
+    fn landed(&mut self, response: &str) {
+        self.pending = self.pending.saturating_sub(1);
+        self.note(rivect::commands::response_status(response));
+    }
+
+    /// The class this run exits with: a still-owed answer is `pending` only
+    /// while nothing more severe was served.
+    fn status(&self) -> u8 {
+        if self.pending > 0 && class_rank(rivect::commands::EXIT_PENDING) > class_rank(self.status)
+        {
+            rivect::commands::EXIT_PENDING
+        } else {
+            self.status
+        }
+    }
+}
+
+/// The published precedence of the exit classes.
+fn class_rank(status: u8) -> u8 {
+    match status {
+        130 => 6,
+        1 => 5,
+        4 => 4,
+        3 => 3,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// Writes one answer the off-path owner landed, if any, and folds its class
+/// into the run. The write failure is the loop's stop.
+fn serve_owed(runtime: &mut Runtime, exit: &mut ExitClass) -> io::Result<()> {
+    if let Some(response) = runtime.pump_index() {
+        write_stdout(&response)?;
+        exit.landed(&response);
+    }
+    Ok(())
+}
+
+/// What one loop event did: keep serving, or end the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Continue,
+    Stop,
+}
+
+/// One event the loop turns on. The response a request produced decides the
+/// exit status: a result is success, an error frame is that error's own class,
+/// and an answer still owed to the off-path owner is `pending`. Every branch
+/// folds its class through [`ExitClass`], the run's one owner, so a later
+/// success never erases an earlier failure and a doctor verdict is not dropped
+/// when another frame follows it.
+fn handle_event(
+    event: LoopEvent,
+    runtime: &mut Runtime,
+    data_root: &Path,
+    exit: &mut ExitClass,
+) -> Step {
+    match event {
+        // End of input is not an abort. A request the loop has already
+        // accepted is finished and its answer written, because a client that
+        // closed stdin is owed exactly that and has no other way to learn the
+        // outcome. Nothing new is started here: a watch repair has no surface
+        // left to serve it, and beginning one would hold the exit open for a
+        // build nobody is waiting for.
+        LoopEvent::InputClosed => {
+            while let Some(response) = runtime.pump_index_owed() {
+                if let Err(source) = write_stdout(&response) {
+                    report_cli_error(&CliError::Stdout(source));
+                    exit.note(1);
+                    break;
+                }
+                exit.landed(&response);
+            }
+            Step::Stop
+        }
+        LoopEvent::InputFailed(kind) => {
+            report_cli_error(&CliError::Stdin(io::Error::from(kind)));
+            exit.note(1);
+            Step::Stop
+        }
+        LoopEvent::FrameTooLarge => {
+            report_cli_error(&CliError::RequestTooLarge {
+                limit: rivect::contracts::REQUEST_MAX_BYTES,
+            });
+            exit.note(1);
+            Step::Stop
+        }
+        // The owner or the watch reported: nothing is owed yet, so the loop
+        // turns and pumps at the top of the next pass.
+        LoopEvent::Index => Step::Continue,
+        LoopEvent::Frame(request) => {
+            // Doctor answers the same way whenever it arrives, so a frame
+            // that reaches an already-open runtime still gets the sessionless
+            // report instead of the dispatcher's unavailable refusal. Its
+            // verdict is the run's own class: a later frame must not drop it.
+            if let doctor::DoctorFrame::Doctor { id, project } = doctor::classify_frame(&request) {
+                // The loop answers inside the owner process, so this
+                // process's own exclusive lock is not another writer.
+                let report = doctor::inspect(data_root, project.as_deref(), true);
+                return match write_stdout(&doctor::answer_frame(id, &report)) {
+                    Ok(()) => {
+                        exit.note(if report.ready() { 0 } else { 3 });
+                        Step::Continue
+                    }
+                    Err(source) => {
+                        report_cli_error(&CliError::Stdout(source));
+                        exit.note(1);
+                        Step::Stop
+                    }
+                };
+            }
+            let step =
+                rivect::commands::dispatch_step(runtime, Ingress::Machine, "stdio-1", &request);
+            if let DispatchStep::Ready(response) = &step
+                && let Err(source) = write_stdout(response)
+            {
+                report_cli_error(&CliError::Stdout(source));
+                exit.note(1);
+                return Step::Stop;
+            }
+            match &step {
+                // `DispatchStep::Deferred` writes nothing for this id: the
+                // answer is owed to the off-path owner and the loop writes it
+                // when the owner lands it — `pending` is that state's class
+                // until the answer's own class replaces it.
+                DispatchStep::Deferred => exit.defer(),
+                DispatchStep::Ready(response) => {
+                    exit.note(rivect::commands::response_status(response));
+                }
+            }
+            Step::Continue
+        }
+    }
+}
+
+/// Serves the leading doctor frames of one headless run and returns the first
+/// event the runtime has to handle. End of input after a doctor answer is that
+/// answer's own class: the run needed no runtime, so it opens none. End of
+/// input with no doctor frame is not an answer — the runtime still opens and
+/// reports its own boot diagnostics.
+fn answer_doctor_frames(
+    inbox: &std::sync::mpsc::Receiver<LoopEvent>,
+    data_root: &Path,
+    exit: &mut ExitClass,
+) -> Result<LoopEvent, i32> {
+    let mut answered = false;
+    loop {
+        let event = match inbox.recv() {
+            Ok(event) => event,
+            Err(_receiver_gone) => {
+                // The reader vanished without reporting end of input: that is
+                // the loop's end too, and an answer already served is the
+                // whole run.
+                if answered {
+                    return Err(i32::from(exit.status()));
+                }
+                return Ok(LoopEvent::InputClosed);
+            }
+        };
+        match event {
+            LoopEvent::Frame(request) => match doctor::classify_frame(&request) {
+                doctor::DoctorFrame::Doctor { id, project } => {
+                    // Pre-open: no election is held yet, so a live lock is
+                    // another process's.
+                    let report = doctor::inspect(data_root, project.as_deref(), false);
+                    if let Err(source) = write_stdout(&doctor::answer_frame(id, &report)) {
+                        report_cli_error(&CliError::Stdout(source));
+                        return Err(1);
+                    }
+                    exit.note(if report.ready() { 0 } else { 3 });
+                    answered = true;
+                }
+                doctor::DoctorFrame::Other => return Ok(LoopEvent::Frame(request)),
+            },
+            LoopEvent::InputClosed => {
+                if answered {
+                    return Err(i32::from(exit.status()));
+                }
+                return Ok(LoopEvent::InputClosed);
+            }
+            other => return Ok(other),
+        }
+    }
 }
 
 /// One response to machine stdout, flushed. The failure is the loop's
@@ -447,5 +706,199 @@ mod tests {
         );
         assert_eq!(runtime.broker.accounted_requests(), 0);
         Ok(())
+    }
+
+    /// One headless runtime over a private root, with the session every local
+    /// command needs attached through the real dispatcher.
+    fn loop_runtime(
+        tag: &str,
+    ) -> Result<(tempfile::TempDir, Runtime, String), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix(tag)?;
+        let mut runtime = open_headless(root.path())?;
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session.attach",
+            "params": { "schema_version": 1, "bootstrap_id": format!("{tag}-session") }
+        })
+        .to_string();
+        let answer = rivect::commands::dispatch_runtime_request(
+            &mut runtime,
+            Ingress::Machine,
+            "loop-test",
+            &frame,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&answer)?;
+        let session = parsed
+            .pointer("/result/session_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::other(format!("attach failed: {answer}")))?
+            .to_string();
+        Ok((root, runtime, session))
+    }
+
+    /// One `command.execute` frame under a named kind.
+    fn command_frame(session: &str, kind: &str, id: u64) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "command.execute",
+            "params": {
+                "schema_version": 1,
+                "session_id": session,
+                "command": { "kind": kind },
+            }
+        })
+        .to_string()
+    }
+
+    /// The loop's classes are the run's own, folded through the one owner:
+    /// a usage refusal, a typed error and a later success keep the most
+    /// severe class instead of letting the last frame win.
+    #[test]
+    fn exit_classes_are_sticky_through_handle_event() -> Result<(), Box<dyn std::error::Error>> {
+        let (root, mut runtime, session) = loop_runtime("rivect-loop-classes-")?;
+        let mut exit = ExitClass::default();
+        // usage (2): a required parameter is missing.
+        let usage = command_frame(&session, "config.get", 1);
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(usage),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(exit.status(), 2, "the usage refusal is the run's class");
+        // error (3): a served row this build cannot serve.
+        let error = command_frame(&session, "docs.status", 2);
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(error),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(
+            exit.status(),
+            3,
+            "a more severe class replaces the usage one"
+        );
+        // success (0): a later result never erases the earlier error.
+        let success = command_frame(&session, "view.clear", 3);
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(success),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(exit.status(), 3, "a later success never erases a failure");
+        release_runtime(runtime);
+        Ok(())
+    }
+
+    /// A doctor verdict is the run's class too: it survives a later frame, and
+    /// a later frame's success does not clear it. The root is degraded after
+    /// the open — a document the schema rejects — so the in-loop verdict is a
+    /// real 3 rather than a healthy 0.
+    #[test]
+    fn a_doctor_verdict_survives_a_later_frame() -> Result<(), Box<dyn std::error::Error>> {
+        let (root, mut runtime, session) = loop_runtime("rivect-loop-doctor-")?;
+        std::fs::write(
+            root.path().join("config.toml"),
+            "config_version = \"not-a-number\"\n",
+        )?;
+        let mut exit = ExitClass::default();
+        let doctor = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "command.execute",
+            "params": { "schema_version": 1, "command": { "kind": "doctor" } }
+        })
+        .to_string();
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(doctor),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(exit.status(), 3, "the degraded root is not ready");
+        let success = command_frame(&session, "view.clear", 2);
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(success),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(
+            exit.status(),
+            3,
+            "the doctor verdict is not dropped by the next frame"
+        );
+        release_runtime(runtime);
+        Ok(())
+    }
+
+    /// A deferred request is `pending` while its answer is owed, and the
+    /// answer's own class replaces that state when it lands. The run cannot
+    /// start its worker, so the landed answer is a typed error.
+    #[test]
+    fn a_deferred_answer_lands_with_its_own_class() -> Result<(), Box<dyn std::error::Error>> {
+        let (root, mut runtime, session) = loop_runtime("rivect-loop-deferred-")?;
+        runtime.index.worker.program = PathBuf::from("/nonexistent/rivect-index-worker");
+        runtime.index.worker.helper = PathBuf::from("/nonexistent/rivect-sandbox-helper");
+        let mut exit = ExitClass::default();
+        let deferred = command_frame(&session, "project.init", 1);
+        assert_eq!(
+            handle_event(
+                LoopEvent::Frame(deferred),
+                &mut runtime,
+                root.path(),
+                &mut exit
+            ),
+            Step::Continue
+        );
+        assert_eq!(
+            exit.status(),
+            rivect::commands::EXIT_PENDING,
+            "the answer is still owed"
+        );
+        assert_eq!(
+            handle_event(LoopEvent::InputClosed, &mut runtime, root.path(), &mut exit),
+            Step::Stop
+        );
+        assert_eq!(
+            exit.status(),
+            3,
+            "the landed error's own class replaced pending"
+        );
+        release_runtime(runtime);
+        Ok(())
+    }
+
+    /// A landed success replaces the pending class with success: the loop does
+    /// not keep the `pending` exit after the answer was written.
+    #[test]
+    fn a_landed_success_replaces_pending() {
+        let mut exit = ExitClass::default();
+        exit.defer();
+        assert_eq!(exit.status(), rivect::commands::EXIT_PENDING);
+        exit.landed("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+        assert_eq!(exit.status(), 0, "the landed answer's own class wins");
+    }
+
+    /// An error frame without the typed code is internal, never success: an
+    /// unreadable refusal must not read as a clean run.
+    #[test]
+    fn an_untyped_error_frame_is_internal() {
+        let frame =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"transport\"}}";
+        assert_eq!(rivect::commands::response_status(frame), 1);
     }
 }

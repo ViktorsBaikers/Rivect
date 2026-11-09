@@ -1009,6 +1009,14 @@ pub fn read_key_hint() -> String {
     format!("{carriers}; document-only, declare in the config file: {DOCUMENT_ONLY_SHAPES}")
 }
 
+/// The declared carriers as `(pattern, sample)` pairs, in table order: the
+/// concrete key each pattern addresses, so a listing never invents one.
+pub fn carrier_samples() -> impl Iterator<Item = (&'static str, &'static str)> {
+    CONFIG_CARRIERS
+        .iter()
+        .map(|carrier| (carrier.pattern, carrier.sample))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Parse,

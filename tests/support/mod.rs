@@ -1508,6 +1508,27 @@ pub fn corpus_command_execute(session: &SessionId, kind: &str, id: Value) -> Str
     .to_string()
 }
 
+/// One `command.execute` frame with the caller's own extra params, so a case
+/// names the command's fields without re-spelling the envelope. The extras are
+/// merged at the params level, which is where every local handler reads its
+/// arguments.
+pub fn command_execute(session: &SessionId, kind: &str, extra: Value) -> String {
+    let mut params = json!({
+        "schema_version": 1,
+        "session_id": session.0,
+        "command": { "kind": kind },
+    });
+    if let (Some(target), Some(source)) = (params.as_object_mut(), extra.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "command.execute", "params": params
+    })
+    .to_string()
+}
+
 /// The search fixture tree: a `.git` marker so `.gitignore` rules bind,
 /// ignore rules excluding `build/` and `secret.txt`, a hidden directory,
 /// UTF-8 and single-byte (windows-1251) sources, a doc outside the

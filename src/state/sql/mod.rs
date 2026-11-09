@@ -149,6 +149,43 @@ pub const SESSION_GENERATION: &str =
     "SELECT COALESCE(MAX(revision), 0) FROM tasks WHERE session_id = ?1";
 pub const TASKS_FOR_SESSION_PAGE: &str = "SELECT task_id, revision, intent_revision, lifecycle FROM tasks WHERE session_id = ?1 ORDER BY rowid LIMIT ?2 OFFSET ?3";
 pub const TODO_FOR_SESSION_PAGE: &str = "SELECT tp.task_id, tp.revision, tp.lifecycle FROM todo_projection tp JOIN tasks t ON t.task_id = tp.task_id WHERE t.session_id = ?1 ORDER BY t.rowid LIMIT ?2 OFFSET ?3";
+/// The session listing's generation: the newest session row this data root
+/// recorded. `session_revision` counts attachments within one session, so it
+/// is 1 for every ordinary root and cannot tell one population from another;
+/// the newest `rowid` moves with every inserted session, so a cursor minted
+/// under another population conflicts instead of continuing into it.
+pub const SESSIONS_GENERATION: &str = "SELECT COALESCE(MAX(rowid), 0) FROM sessions";
+/// The search surface's generation: the newest task row this data root
+/// recorded. The query reads tasks, so a task insert changes which sessions
+/// match even when no session row moves; a cursor minted under the previous
+/// task population is refused instead of continuing into the new one. The
+/// listing keeps its own session-row generation.
+pub const SESSIONS_SEARCH_GENERATION: &str = "SELECT COALESCE(MAX(rowid), 0) FROM tasks";
+pub const SESSIONS_PAGE: &str = "SELECT session_id, session_revision, created_at FROM sessions ORDER BY rowid DESC LIMIT ?1 OFFSET ?2";
+/// Session search over the durable goal bytes: an ASCII case-insensitive
+/// substring match — SQLite's `lower()` folds ASCII only, so a non-ASCII goal
+/// matches its own spelling exactly — with the query one bound parameter and
+/// never a pattern the caller writes into the statement.
+pub const SESSIONS_SEARCH_PAGE: &str =
+    "SELECT s.session_id, s.session_revision, s.created_at FROM sessions s
+     WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.session_id = s.session_id
+                   AND instr(lower(CAST(t.goal_bytes AS TEXT)), lower(?1)) > 0)
+     ORDER BY s.rowid DESC LIMIT ?2 OFFSET ?3";
+/// The goals a fork copies: one row per task, in creation order, bounded by
+/// the caller's limit so a session larger than the fork's page is refused
+/// before any task is created.
+pub const GOALS_FOR_SESSION: &str =
+    "SELECT goal_bytes FROM tasks WHERE session_id = ?1 ORDER BY rowid LIMIT ?2";
+/// The attachment a close moves: only an attached row changes, so a repeated
+/// close is distinguishable from the first one.
+pub const CLOSE_ATTACHMENT: &str = "UPDATE attachments SET state = 'closed' WHERE attachment_id = ?1 AND session_id = ?2 AND state = 'attached'";
+pub const ATTACHMENT_STATE: &str =
+    "SELECT state FROM attachments WHERE attachment_id = ?1 AND session_id = ?2";
+pub const SESSION_REVISION: &str = "SELECT session_revision FROM sessions WHERE session_id = ?1";
+/// The lifecycle population of one session, counted by the engine rather than
+/// over whatever page a surface happened to read.
+pub const LIFECYCLE_COUNTS_FOR_SESSION: &str =
+    "SELECT lifecycle, COUNT(*) FROM tasks WHERE session_id = ?1 GROUP BY lifecycle";
 fn task_placeholders(count: usize) -> String {
     (1..=count)
         .map(|index| format!("?{index}"))

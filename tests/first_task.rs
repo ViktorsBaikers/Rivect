@@ -1689,12 +1689,11 @@ fn consumer_public_ingress() {
     }));
     assert_eq!(spoof["error"]["code"], -32601);
 
-    // Known-but-unavailable command kinds never fake success. `doctor`
-    // is the kind that still carries the invariant: it is recorded to
-    // `PLANNED_LOCAL_KINDS` and stays unavailable until its own owner
-    // (SLICE-076), so a dispatch of it must answer the typed refusal and
-    // no result at all. `project.init` no longer carries it — that kind
-    // was promoted, so it now has a handler and a real descriptor.
+    // Known-but-unavailable command kinds never fake success. The library
+    // dispatcher still answers `doctor` typed-unavailable — its carrier is the
+    // CLI and the pre-open loop — so a dispatch of it must answer the typed
+    // refusal and no result at all. `project.init` no longer carries it: that
+    // kind was promoted, so it now has a handler and a real descriptor.
     let unavailable = world.dispatch(&json!({
         "jsonrpc": "2.0", "id": 23, "method": "command.execute",
         "params": { "schema_version": 1, "session_id": session.0, "command": { "kind": "doctor" } }
@@ -1719,8 +1718,8 @@ fn consumer_public_ingress() {
     );
     // The catalog half of the same invariant: the promoted kind reports
     // itself available with a real description and no unavailability
-    // reason, while a still-planned kind keeps `available: false` and
-    // names why.
+    // reason, while the one tolerated unbuilt row keeps `available: false`
+    // and names its exact reason.
     let project_init = items
         .iter()
         .find(|d| d["canonical_id"] == "project.init")
@@ -1734,17 +1733,21 @@ fn consumer_public_ingress() {
                 .is_empty(),
         "an available kind advertises itself: {project_init}"
     );
-    let planned = items
+    let unavailable_rows = items
         .iter()
-        .find(|d| d["canonical_id"] == "doctor")
-        .expect("a still-planned kind stays in the catalog");
-    assert_eq!(planned["available"], false, "{planned}");
-    assert!(
-        !planned["unavailability_reason"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "an unbuilt kind names why: {planned}"
+        .filter(|d| d["available"] == false)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        unavailable_rows
+            .iter()
+            .map(|d| d["canonical_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["docs.status"],
+        "exactly one catalog row is tolerated as unbuilt: {unavailable_rows:?}"
+    );
+    assert_eq!(
+        unavailable_rows[0]["unavailability_reason"], "docs owner not installed",
+        "the one unbuilt row names its exact reason: {unavailable_rows:?}"
     );
 
     let _ = question;
@@ -3443,6 +3446,34 @@ fn new_and_clear_create_an_independent_conversation_p4() {
             .expect("pty read"),
         "alternate screen must be entered on start"
     );
+
+    // A conversation with no running task: /clear is /new's alias, so the
+    // transcript the operator was reading is cleared and a new conversation is
+    // announced. A reroute back to the removed `view.clear` would keep the
+    // help rows and announce nothing.
+    pty.send(b"/help\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains("Commands:"),
+        "help paints the transcript first: {visible:?}"
+    );
+    pty.send(b"/clear\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "New conversation: ", Duration::from_secs(10))
+        .expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert!(
+        screen.contains("New conversation: "),
+        "Enter on /clear announces the new conversation: {screen:?}"
+    );
+    assert!(
+        !screen.contains("Commands:"),
+        "/clear drops the transcript rows: {screen:?}"
+    );
+
+    // A running task refuses the switch typed: nothing pauses a running task
+    // on a session switch in this build, so the composer names the task and
+    // the conversation the operator is reading stays addressable.
     pty.send(b"stored conversation\r").expect("pty send");
     let visible = wait_for_visible_tui_text(
         &pty,
@@ -3462,20 +3493,17 @@ fn new_and_clear_create_an_independent_conversation_p4() {
         })
         .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
 
-    // /clear from the composer: the rows the operator was reading go. The
-    // dock is a projection of live task state, not a row of that reading
-    // surface, so it stays.
     pty.send(b"/clear\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "View cleared", Duration::from_secs(10))
-        .expect("pty screen");
+    let visible =
+        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
     let screen = support::squashed(&visible);
     assert!(
-        screen.contains("View cleared"),
-        "Enter on /clear runs the command: {screen:?}"
+        screen.contains(&format!("/clear refused: task {running} is running")),
+        "a running task refuses the switch with its own typed cause: {screen:?}"
     );
     assert!(
-        !screen.contains("Submitted task:"),
-        "/clear drops the transcript rows: {screen:?}"
+        screen.contains("Submitted task: stored conversation"),
+        "a refused switch keeps the transcript: {screen:?}"
     );
     assert!(
         screen.contains(&format!("task {running}: running")),
@@ -3517,6 +3545,29 @@ fn new_and_clear_create_an_independent_conversation_p5() {
         "alternate screen must be entered on start"
     );
 
+    // A typed /clear with nothing running is /new's alias: the transcript is
+    // cleared and the new conversation is announced.
+    pty.send(b"/help\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Commands:", Duration::from_secs(10)).expect("pty screen");
+    assert!(
+        visible.contains("Commands:"),
+        "help paints the transcript first: {visible:?}"
+    );
+    pty.send(b"/clear\r").expect("pty send");
+    let visible = wait_for_visible_tui_text(&pty, "New conversation: ", Duration::from_secs(10))
+        .expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert!(
+        screen.contains("New conversation: "),
+        "a typed /clear runs the command: {screen:?}"
+    );
+    assert!(
+        !screen.contains("Commands:"),
+        "a typed /clear drops the transcript rows: {screen:?}"
+    );
+    let announcements = visible.matches("New conversation: ").count();
+
     // A document pasted as one bracketed paste is text, line breaks
     // included: the /clear inside it is not the command.
     pty.send("\x1b[200~notes\n/clear\nend\x1b[201~".as_bytes())
@@ -3527,8 +3578,9 @@ fn new_and_clear_create_an_independent_conversation_p5() {
         visible.contains("> notes /clear end"),
         "the pasted document is composer text: {visible:?}"
     );
-    assert!(
-        !support::squashed(&visible).contains("View cleared"),
+    assert_eq!(
+        visible.matches("New conversation: ").count(),
+        announcements,
         "a pasted /clear never runs: {visible:?}"
     );
 
@@ -3546,14 +3598,74 @@ fn new_and_clear_create_an_independent_conversation_p5() {
         1,
         "the pasted document became one task: {visible:?}"
     );
+    let running = visible
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("task ")
+                .and_then(|rest| rest.strip_suffix(": running"))
+        })
+        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
 
-    // Only an exactly typed command clears the view.
+    // Only an exactly typed command reaches the dispatcher, and a running
+    // task refuses the switch with its own typed cause instead of faking it.
     pty.send(b"/clear\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(&pty, "View cleared", Duration::from_secs(10))
-        .expect("pty screen");
+    let visible =
+        wait_for_visible_tui_text(&pty, "is running", Duration::from_secs(10)).expect("pty screen");
+    let screen = support::squashed(&visible);
     assert!(
-        support::squashed(&visible).contains("View cleared"),
-        "a typed /clear runs the command: {visible:?}"
+        screen.contains(&format!("/clear refused: task {running} is running")),
+        "a typed /clear while a task runs is refused typed: {screen:?}"
+    );
+    assert!(
+        screen.contains("Submitted task: notes /clear end"),
+        "the refused switch keeps the transcript: {screen:?}"
+    );
+
+    pty.send(b"\x1b").expect("pty send");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn composer_settings_paints_the_served_entries_and_config_is_its_alias() {
+    let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "alternate screen must be entered on start"
+    );
+
+    // `/settings` paints the dispatcher's own `settings.open` answer: the
+    // three base-supplied keys every settings view edits. A hand-written
+    // projection that painted an empty or invented list would not name them.
+    pty.send(b"/settings\r").expect("pty send");
+    let visible =
+        wait_for_visible_tui_text(&pty, "Settings:", Duration::from_secs(10)).expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert!(
+        screen.contains("Settings:"),
+        "/settings opens the settings surface: {screen:?}"
+    );
+    for key in ["workflow.enabled", "decisions.mode", "context.auto_compact"] {
+        assert!(
+            screen.contains(&format!("{key} = ")),
+            "/settings names its served key {key}: {screen:?}"
+        );
+    }
+
+    // `/config` is the same alias and the same served answer: a second
+    // `Settings:` block is painted, not a second hand-written view.
+    pty.send(b"/config\r").expect("pty send");
+    let visible = wait_for_repeated_tui_text(&pty, "Settings:", 2, Duration::from_secs(10))
+        .expect("pty screen");
+    let screen = support::squashed(&visible);
+    assert_eq!(
+        visible.matches("Settings:").count(),
+        2,
+        "/config opens the same settings surface: {screen:?}"
     );
 
     pty.send(b"\x1b").expect("pty send");
@@ -3599,7 +3711,7 @@ fn misused_slash_command_is_a_usage_line_not_a_task_p6() {
         "a misuse never becomes a task: {screen:?}"
     );
     assert!(
-        !screen.contains("View cleared"),
+        !screen.contains("New conversation: "),
         "neither misuse runs /clear: {screen:?}"
     );
 

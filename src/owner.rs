@@ -103,10 +103,26 @@ fn elect_lock(data_root: &Path) -> Result<(PathBuf, Election), OwnerError> {
         .truncate(false)
         .write(true)
         .open(data_root.join(OWNER_LOCK))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Err(OwnerError::AlreadyOwned),
-        Err(err) => return Err(OwnerError::Io(io::Error::other(err))),
+    // A shared probe — `rivect doctor`'s non-creating shared lock (TD-05) —
+    // blocks an exclusive acquisition for the one `try_lock` call it is held,
+    // while a real second writer holds it for its whole lifetime. The bounded
+    // yield retry separates the transient probe from a live election: without
+    // it a concurrent doctor makes an ownerless root fail `AlreadyOwned`. The
+    // window is wall-clock, so the retry is observable and the refusal bounded;
+    // there is no sleep and no second thread.
+    const ELECTION_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if started.elapsed() >= ELECTION_WINDOW {
+                    return Err(OwnerError::AlreadyOwned);
+                }
+                std::thread::yield_now();
+            }
+            Err(err) => return Err(OwnerError::Io(io::Error::other(err))),
+        }
     }
     Ok((runtime_dir, Election(lock)))
 }
