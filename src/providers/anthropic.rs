@@ -373,6 +373,19 @@ pub(crate) struct RequestBinding {
     pub(crate) drop_block: bool,
 }
 
+/// One refused Messages leg: the frozen request the peer turned down and
+/// the replay decision that travelled with it.
+pub(crate) struct RefusedMessages<'a> {
+    /// The frozen manifest the leg sent.
+    pub(crate) manifest: &'a RequestManifest,
+    /// The model the manifest resolved to.
+    pub(crate) fixed: &'a FixedModel,
+    /// The replay decision the request carried.
+    pub(crate) binding: &'a RequestBinding,
+    /// The refused response whose body decides the retry.
+    pub(crate) response: reqwest::blocking::Response,
+}
+
 /// The replay block state of one content block while it streams.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BlockKind {
@@ -661,10 +674,14 @@ impl MessagesProvider {
             .client
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json");
-        let mut response = self
-            .authenticated(request, token)
-            .send()
-            .map_err(|err| transport(&self.connection, err))?;
+        let mut response = authenticated(
+            request,
+            self.credential_rule(),
+            self.auth.forwarded(),
+            token,
+        )
+        .send()
+        .map_err(|err| transport(&self.connection, err))?;
         if !response.status().is_success() {
             return Err(transport_status(&self.connection, response.status()));
         }
@@ -847,38 +864,15 @@ impl MessagesProvider {
         Ok(token)
     }
 
-    fn authenticated(
-        &self,
-        request: reqwest::blocking::RequestBuilder,
-        token: Option<&str>,
-    ) -> reqwest::blocking::RequestBuilder {
-        let rule = if self.subscription {
-            // A subscription token is an OAuth access token: it rides
-            // `Authorization: Bearer`, never `x-api-key`.
+    /// The credential header class this declaration authenticates with: a
+    /// subscription token is an OAuth access token and rides
+    /// `Authorization: Bearer`, never `x-api-key`.
+    fn credential_rule(&self) -> CredentialRule {
+        if self.subscription {
             CredentialRule::Bearer
         } else {
             self.contract.credential
-        };
-        let Some(token) = token else {
-            // The recorded custom-origin form: an absent binding sends no
-            // credential header, while the dialect's mandatory version
-            // header still rides the request.
-            return request
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .headers(forwarded_header_map(self.auth.forwarded()));
-        };
-        match rule {
-            CredentialRule::ApiKey => request
-                .header("x-api-key", token)
-                .header("anthropic-version", ANTHROPIC_VERSION),
-            CredentialRule::CloudflareGateway => request
-                .header("cf-aig-authorization", format!("Bearer {token}"))
-                .header("anthropic-version", ANTHROPIC_VERSION),
-            CredentialRule::Bearer => request
-                .bearer_auth(token)
-                .header("anthropic-version", ANTHROPIC_VERSION),
         }
-        .headers(forwarded_header_map(self.auth.forwarded()))
     }
 }
 
@@ -905,6 +899,11 @@ impl MessagesCodec {
             lineages: BTreeMap::new(),
             dropped_reasoning: 0,
         }
+    }
+
+    /// How many replayed thinking blocks the peer reported dropping.
+    pub(crate) fn dropped_reasoning(&self) -> u64 {
+        self.dropped_reasoning
     }
 
     /// The frozen manifest as the Messages wire request: `system`
@@ -983,6 +982,86 @@ impl MessagesCodec {
             replay: Vec::new(),
             drop_block: false,
         }
+    }
+
+    /// Handles a refused Messages leg: a `400` whose body names an invalid
+    /// thinking signature strips the replayed blocks for exactly one retry,
+    /// clears the lineage so the same epoch never replays that body again,
+    /// and settles the retry count; every other refusal keeps the transport
+    /// class. `post` is the caller's own leg identity and authentication.
+    pub(crate) fn retry_invalid_signature<F>(
+        &mut self,
+        refused: RefusedMessages<'_>,
+        deadline: Duration,
+        started: Instant,
+        mut post: F,
+    ) -> Result<ProviderReply, ProviderError>
+    where
+        F: FnMut(Vec<u8>, bool) -> Result<reqwest::blocking::Response, ProviderError>,
+    {
+        let RefusedMessages {
+            manifest,
+            fixed,
+            binding,
+            mut response,
+        } = refused;
+        let status = response.status();
+        if status == reqwest::StatusCode::BAD_REQUEST && !binding.replay.is_empty() {
+            let failed = read_catalog_body(&self.connection, deadline, &mut response, started)?;
+            if names_invalid_signature(&failed) {
+                // The body is permanently invalid; never replay its blocks
+                // on a later send even when the stripped retry also fails.
+                self.lineages.remove(&lineage_key(manifest));
+                let stripped = RequestBinding {
+                    replay: Vec::new(),
+                    drop_block: binding.drop_block,
+                };
+                let retry_body = self.request_body(manifest, fixed, &stripped);
+                // Defensive: the HTTP seam cannot reach these two checks — the
+                // first leg's refusable body read already enforces the shared
+                // clock — so neither failure may ever be counted as a retry.
+                let retry_bytes = wire_body(&self.connection, &retry_body)?;
+                check_deadline(&self.connection, deadline, started)?;
+                let retry = match post(retry_bytes, stripped.drop_block) {
+                    Ok(retry) => retry,
+                    Err(source) => {
+                        // The corrected leg's POST is the second crossed
+                        // leg even when it fails before a response: the
+                        // count rides the failure beside its class.
+                        return Err(ProviderError::Retried {
+                            wire_retries: 1,
+                            source: Box::new(source),
+                        });
+                    }
+                };
+                let retry_status = retry.status();
+                if !retry_status.is_success() {
+                    // The corrected leg crossed the wire and was refused:
+                    // the settlement keeps the count beside the class.
+                    return Err(ProviderError::Retried {
+                        wire_retries: 1,
+                        source: Box::new(transport_status(&self.connection, retry_status)),
+                    });
+                }
+                // The correction is this child's own second leg, not a
+                // second attempt: the reply carries the count and the
+                // first leg's usage stays unknown. A retried leg that
+                // fails while its body streams crossed too.
+                let mut reply =
+                    match self.read_stream(manifest, &fixed.model_id, retry, deadline, started) {
+                        Ok(reply) => reply,
+                        Err(source) => {
+                            return Err(ProviderError::Retried {
+                                wire_retries: 1,
+                                source: Box::new(source),
+                            });
+                        }
+                    };
+                reply.wire_retries = reply.wire_retries.saturating_add(1);
+                return Ok(reply);
+            }
+        }
+        Err(transport_status(&self.connection, status))
     }
 }
 
@@ -1130,18 +1209,17 @@ impl MessagesProvider {
         body: Vec<u8>,
         drop_block: bool,
     ) -> Result<reqwest::blocking::Response, ProviderError> {
-        let mut request = self
-            .client
-            .post(messages_url(&self.endpoint))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .body(body);
-        if drop_block {
-            request = request.header("anthropic-beta", THINKING_BINDING_BETA);
-        }
-        self.authenticated(request, token)
-            .send()
-            .map_err(|err| transport(&self.connection, err))
+        messages_request(
+            &self.client,
+            &self.endpoint,
+            self.credential_rule(),
+            self.auth.forwarded(),
+            token,
+            body,
+            drop_block,
+        )
+        .send()
+        .map_err(|err| transport(&self.connection, err))
     }
 
     /// Sends the frozen manifest as one physical Messages request.
@@ -1197,9 +1275,8 @@ impl MessagesProvider {
         let body = self.codec.request_body(manifest, &fixed, &binding);
         let body_bytes = wire_body(&self.connection, &body)?;
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut response = self.post(token.as_deref(), body_bytes, binding.drop_block)?;
-        let status = response.status();
-        if status.is_success() {
+        let response = self.post(token.as_deref(), body_bytes, binding.drop_block)?;
+        if response.status().is_success() {
             return self.codec.read_stream(
                 manifest,
                 &fixed.model_id,
@@ -1208,68 +1285,36 @@ impl MessagesProvider {
                 started,
             );
         }
-        if status == reqwest::StatusCode::BAD_REQUEST && !binding.replay.is_empty() {
-            let failed =
-                read_catalog_body(&self.connection, self.deadline, &mut response, started)?;
-            if names_invalid_signature(&failed) {
-                // The body is permanently invalid; never replay its blocks
-                // on a later send even when the stripped retry also fails.
-                self.codec.lineages.remove(&lineage_key(manifest));
-                let stripped = RequestBinding {
-                    replay: Vec::new(),
-                    drop_block: binding.drop_block,
-                };
-                let retry_body = self.codec.request_body(manifest, &fixed, &stripped);
-                // Defensive: the HTTP seam cannot reach these two checks — the
-                // first leg's refusable body read already enforces the shared
-                // clock — so neither failure may ever be counted as a retry.
-                let retry_bytes = wire_body(&self.connection, &retry_body)?;
-                check_deadline(&self.connection, self.deadline, started)?;
-                let retry = match self.post(token.as_deref(), retry_bytes, stripped.drop_block) {
-                    Ok(retry) => retry,
-                    Err(source) => {
-                        // The corrected leg's POST is the second crossed
-                        // leg even when it fails before a response: the
-                        // count rides the failure beside its class.
-                        return Err(ProviderError::Retried {
-                            wire_retries: 1,
-                            source: Box::new(source),
-                        });
-                    }
-                };
-                let retry_status = retry.status();
-                if !retry_status.is_success() {
-                    // The corrected leg crossed the wire and was refused:
-                    // the settlement keeps the count beside the class.
-                    return Err(ProviderError::Retried {
-                        wire_retries: 1,
-                        source: Box::new(transport_status(&self.connection, retry_status)),
-                    });
-                }
-                // The correction is this child's own second leg, not a
-                // second attempt: the reply carries the count and the
-                // first leg's usage stays unknown. A retried leg that
-                // fails while its body streams crossed too.
-                let mut reply = match self.codec.read_stream(
-                    manifest,
-                    &fixed.model_id,
-                    retry,
-                    self.deadline,
-                    started,
-                ) {
-                    Ok(reply) => reply,
-                    Err(source) => {
-                        return Err(ProviderError::Retried {
-                            wire_retries: 1,
-                            source: Box::new(source),
-                        });
-                    }
-                };
-                reply.wire_retries = reply.wire_retries.saturating_add(1);
-                return Ok(reply);
-            }
-        }
-        Err(transport_status(&self.connection, status))
+        let deadline = self.deadline;
+        let rule = self.credential_rule();
+        let client = &self.client;
+        let endpoint = self.endpoint.as_str();
+        let forwarded = self.auth.forwarded();
+        let connection = self.connection.as_str();
+        let codec = &mut self.codec;
+        codec.retry_invalid_signature(
+            RefusedMessages {
+                manifest,
+                fixed: &fixed,
+                binding: &binding,
+                response,
+            },
+            deadline,
+            started,
+            |body, drop_block| {
+                messages_request(
+                    client,
+                    endpoint,
+                    rule,
+                    forwarded,
+                    token.as_deref(),
+                    body,
+                    drop_block,
+                )
+                .send()
+                .map_err(|err| transport(connection, err))
+            },
+        )
     }
 }
 
@@ -1868,6 +1913,57 @@ fn messages_url(base: &str) -> String {
     } else {
         format!("{base}/v1/messages")
     }
+}
+
+/// The credential headers one Messages leg carries: an absent binding sends
+/// no credential header, while the dialect's mandatory version header still
+/// rides the request.
+fn authenticated(
+    request: reqwest::blocking::RequestBuilder,
+    rule: CredentialRule,
+    forwarded: &BTreeMap<String, String>,
+    token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    let Some(token) = token else {
+        return request
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .headers(forwarded_header_map(forwarded));
+    };
+    match rule {
+        CredentialRule::ApiKey => request
+            .header("x-api-key", token)
+            .header("anthropic-version", ANTHROPIC_VERSION),
+        CredentialRule::CloudflareGateway => request
+            .header("cf-aig-authorization", format!("Bearer {token}"))
+            .header("anthropic-version", ANTHROPIC_VERSION),
+        CredentialRule::Bearer => request
+            .bearer_auth(token)
+            .header("anthropic-version", ANTHROPIC_VERSION),
+    }
+    .headers(forwarded_header_map(forwarded))
+}
+
+/// The Messages POST builder for one leg: the recorded JSON/SSE headers, the
+/// drop-policy beta header when the request carries it, and the credential
+/// headers.
+fn messages_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    rule: CredentialRule,
+    forwarded: &BTreeMap<String, String>,
+    token: Option<&str>,
+    body: Vec<u8>,
+    drop_block: bool,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = client
+        .post(messages_url(endpoint))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .body(body);
+    if drop_block {
+        request = request.header("anthropic-beta", THINKING_BINDING_BETA);
+    }
+    authenticated(request, rule, forwarded, token)
 }
 
 fn lineage_key(manifest: &RequestManifest) -> LineageKey {

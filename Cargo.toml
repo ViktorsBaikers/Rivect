@@ -95,7 +95,7 @@ private_intra_doc_links = "warn"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "std"] }
 rivect-sandbox-helper = { path = "crates/rivect-sandbox-helper", version = "0.1.0" }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
@@ -190,9 +190,9 @@ vt100 = "0.16.2"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 # DEC-048 (EVID-478 §11 feature review): the `trace` feature only adds
 # rusqlite's additive `pub mod trace` (its `trace = []` gate at
-# rusqlite 0.40.2 lib.rs:150-151); the cfg(test) statement sink in
+# rusqlite 0.41.1 lib.rs:149-150); the cfg(test) statement sink in
 # src/state.rs is its single consumer and an untraced connection
 # behaves identically. Resolver 3 keeps it out of non-test builds.
-rusqlite = { version = "0.40.2", features = ["bundled", "trace"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }
 wiremock = "0.6.5"
 tempfile = "3.27.0"

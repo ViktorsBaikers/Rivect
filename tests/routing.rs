@@ -9257,3 +9257,91 @@ fn a_rotated_profile_credential_denies_changed_before_send() {
         "the rotated credential opens no settlement"
     );
 }
+
+// ----- SLICE-005: Kimi Code routed inference ------------------------------
+
+/// `kimi-code` records the two-protocol route table under the api-key
+/// class (the `research/provider-coverage.md` device-code row; DEC-031
+/// re-pinned only this roster): the Messages default is its dialect, a
+/// bound api-key pin is offline-eligible without a separate live grant,
+/// both recorded routes stay declared, and an unresolved binding is the
+/// typed live-grant denial — never a plaintext or env path.
+#[test]
+fn kimi_code_offline_eligibility_is_binding_level_typed() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.kimi-code]\nkind = \"api_key\"\nendpoint = \"https://api.kimi.com/coding/v1\"\ncredential_ref = \"keyring:rivect/kimi-device\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    assert_eq!(
+        rivect::providers::dialect_for("kimi-code"),
+        Some(Dialect::Messages),
+        "the literal id keeps the recorded Messages default"
+    );
+    assert_eq!(
+        rivect::providers::routes_for("kimi-code"),
+        [Dialect::Messages, Dialect::ChatCompletions],
+        "the id records both protocols; the model's listing selects one"
+    );
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "kimi-code".to_string(),
+        model_id: "kimi-k3".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a bound api_key pin is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "kimi-code",
+    ));
+
+    let undeclared = ModelAssign::Fixed(FixedModel {
+        connection: "kimi-missing".to_string(),
+        model_id: "kimi-k3".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(&undeclared, &config.connections, &config.profiles,),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared pin is the typed denial"
+    );
+
+    let mismatched = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.kimi-code]\nkind = \"api_key\"\nendpoint = \"https://api.kimi.com/coding/v1\"\ncredential_ref = \"keyring:rivect/kimi-device\"\nprofile = \"kimi-device\"\n\
+         [profiles.kimi-device]\ncredential_ref = \"keyring:rivect/other\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "kimi-code".to_string(),
+        model_id: "kimi-k3".to_string(),
+    });
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &mismatched.connections,
+                &mismatched.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(
+            &mismatched.connections,
+            &mismatched.profiles,
+            "kimi-code",
+        ),
+        "only the resolvable binding is the api-key form"
+    );
+}

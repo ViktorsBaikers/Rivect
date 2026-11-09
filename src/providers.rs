@@ -90,6 +90,16 @@
 //! table has no route at all; [`copilot`] is the only owner that builds
 //! its codec, because the API base and the CAPI identity come from the
 //! stored credential rather than a fixed proxy.
+//!
+//! `kimi-code` records the Kimi Code device/API-key form (the
+//! `research/provider-coverage.md` device-code row, OMP
+//! `rules/auth/kimi-code.kdl` and `providers/kimi.ts`; DEC-031 re-pinned
+//! only this roster): the Messages default covers rows whose listing names
+//! no `protocol`, a `chat` row rides Chat Completions, and [`kimi`] owns
+//! both legs because the protocol is resolved from the model's catalogue
+//! row — never from the credential class. Its Messages leg is the shared
+//! `anthropic::MessagesCodec`, so the reasoning lineage is the one
+//! adapter's.
 
 use crate::config::{Config, ConnKind, Connection, EffortLevel, ModelAssign, Profile};
 use crate::model::RequestManifest;
@@ -118,6 +128,7 @@ pub mod gemini;
 pub mod gemini_cli_login;
 pub mod gitlab_agent_login;
 pub mod gitlab_workflow;
+pub mod kimi;
 pub mod local;
 pub(crate) mod login_common;
 pub mod muse_login;
@@ -1617,6 +1628,10 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "cloudflare-ai-gateway" => Some(Dialect::Messages),
         "custom-messages" => Some(Dialect::Messages),
         "vercel-ai-gateway" => Some(Dialect::Messages),
+        // The recorded Messages default: a catalogue row that names no
+        // `protocol` keeps the Anthropic-compatible leg, and the row's
+        // declared protocol decides the actual send.
+        "kimi-code" => Some(Dialect::Messages),
         "gitlab-duo" => Some(Dialect::ChatCompletions),
         "github-copilot" => Some(Dialect::ChatCompletions),
         "opencode-go" => Some(Dialect::ChatCompletions),
@@ -1677,6 +1692,7 @@ pub fn routes_for(connection: &str) -> &'static [Dialect] {
         "opencode-go" => OPENCODE_GO_ROUTES,
         "opencode-zen" => OPENCODE_ZEN_ROUTES,
         "zenmux" => ZENMUX_ROUTES,
+        "kimi-code" => kimi::dialects(),
         _ => &[],
     }
 }
@@ -2242,6 +2258,14 @@ impl ConfiguredProvider {
         store: &Arc<dyn CredentialStore>,
     ) -> Result<Box<dyn Provider>, ProviderError> {
         let store = Arc::clone(store);
+        // The Kimi owner builds its own literal adapter: its two protocols
+        // are resolved per model from the catalogue listing, so it is not
+        // one of the single-dialect codec arms below.
+        if connection == kimi::CONNECTION {
+            return Ok(Box::new(kimi::KimiProvider::new(
+                config, connection, store,
+            )?));
+        }
         match dialect {
             Dialect::Responses => Ok(Box::new(openai::OpenAiProvider::new(
                 config, connection, store,

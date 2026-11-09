@@ -5536,11 +5536,11 @@ mod plan_selection {
     use super::{action_ctx, decision_config, support};
     use rivect::actions::{
         ASSESS_PLAN, ASSESS_READINESS, ASSESS_SECURITY, AUDIT_TESTS, ActionError, ActionInput,
-        ActionOutcome, ActionRegistry, Assessment, CHALLENGE_DIRECTION, ContractBasis,
-        DELIVER_CHANGE, DESIGN_CONTRACTS, DIAGNOSE_ISSUE, Declined, FRAME_GOAL, FrameUnknown,
-        IMPLEMENT_CHANGE, INSPECT_SYSTEM, PLAN_STAGES, PLAN_WORK, PlanFinding, PlanGate,
-        PlanRequest, RESOLVE_DECISION, REVIEW_CHANGE, RequestKind, Route, RouteBlock, Selection,
-        SkipReason, Surface, SurfaceScan, WorkPart, plan_gate,
+        ActionOutcome, ActionRegistry, AssessReadinessInput, Assessment, CHALLENGE_DIRECTION,
+        ContractBasis, DELIVER_CHANGE, DESIGN_CONTRACTS, DIAGNOSE_ISSUE, Declined, FRAME_GOAL,
+        FrameUnknown, IMPLEMENT_CHANGE, INSPECT_SYSTEM, Implementation, PLAN_STAGES, PLAN_WORK,
+        PlanFinding, PlanGate, PlanRequest, RESOLVE_DECISION, REVIEW_CHANGE, RequestKind, Route,
+        Selection, SkipReason, Surface, SurfaceScan, WorkPart, plan_gate,
     };
     use rivect::contracts::{
         ARRAY_MAX_ITEMS, AnswerSelection, Blocker, CriterionId, EffectClass, ErrorCode, Lifecycle,
@@ -5827,7 +5827,7 @@ mod plan_selection {
             "{assessed:?}"
         );
         semantic_close(world, task, &selection, ASSESS_PLAN, ASSESS_PLAN);
-        semantic_close(world, task, &selection, ASSESS_READINESS, ASSESS_PLAN);
+        semantic_close(world, task, &selection, ASSESS_READINESS, ASSESS_READINESS);
         assert_eq!(gate(world, task), PlanGate::Open);
         (request, selection)
     }
@@ -5971,14 +5971,18 @@ mod plan_selection {
             ),
             "the local verdict cannot close the semantic row"
         );
-        for capability in [ASSESS_PLAN, ASSESS_READINESS] {
-            let stored = row(&world, &task, capability);
-            assert_eq!(stored.execution, ObligationExecution::Pending);
-            assert_eq!(
-                stored.blocker,
-                Some(plan_blocker(ErrorCode::CapabilityUnavailable, capability))
-            );
-        }
+        let assess = row(&world, &task, ASSESS_PLAN);
+        assert_eq!(assess.execution, ObligationExecution::Pending);
+        assert_eq!(
+            assess.blocker,
+            Some(plan_blocker(ErrorCode::CapabilityUnavailable, ASSESS_PLAN))
+        );
+        // The readiness row is local and routed: it stays pending (holding
+        // completion) without a fabricated blocker.
+        let readiness = row(&world, &task, ASSESS_READINESS);
+        assert_eq!(readiness.execution, ObligationExecution::Pending);
+        assert_eq!(readiness.handler.as_deref(), Some(ASSESS_READINESS));
+        assert_eq!(readiness.blocker, None);
         assert_eq!(provider_calls(&world), 0, "no model call anywhere");
     }
 
@@ -6094,34 +6098,32 @@ mod plan_selection {
             );
             assert!(!stored.stage, "{capability} is execution-phase");
         }
-        // Only rows whose handlers land after this position (SLICE-027)
-        // are pinned handler-less; `implement_change` gets its handler in
-        // SLICE-024.
-        let later = [AUDIT_TESTS, ASSESS_READINESS];
-        for capability in later {
+        // Every required execution row routes to its own handler now; an
+        // unclosed row holds completion without a fabricated blocker.
+        let routed = [AUDIT_TESTS, ASSESS_READINESS];
+        for capability in routed {
             let stored = row(&world, &sufficient_task, capability);
-            assert_eq!(
-                stored.handler, None,
-                "{capability}'s handler lands after this position"
-            );
-            assert_eq!(
-                stored.blocker,
-                Some(plan_blocker(ErrorCode::CapabilityUnavailable, capability))
-            );
+            assert_eq!(stored.handler.as_deref(), Some(capability));
+            assert_eq!(stored.blocker, None);
         }
-        // A handler-less execution row never moves the lifecycle...
+        // A routed execution row never moves the lifecycle...
         let running = plan_snapshot(&world, &sufficient_task);
         assert_eq!(running.lifecycle, Lifecycle::Running);
         assert_eq!(running.blockers, None);
-        // ...it holds completion only: the guard parks the task, and the
-        // exact blockers of the later-position rows project.
+        // ...it holds completion only: the guard parks the task while the
+        // required row stays pending, and no blocker is invented for it.
         let parked = park(&mut world, &session, &sufficient_task);
         assert_eq!(parked.lifecycle, Lifecycle::Waiting);
-        for capability in later {
+        for capability in routed {
+            let id = format!("plan:{capability}");
             assert!(
-                plan_blockers(&parked)
-                    .contains(&plan_blocker(ErrorCode::CapabilityUnavailable, capability)),
-                "{capability} is the exact reason completion waits: {:?}",
+                parked
+                    .obligations
+                    .items
+                    .iter()
+                    .any(|obligation| obligation.id == id
+                        && obligation.execution == ObligationExecution::Pending),
+                "{capability} stays pending and is what completion waits on: {:?}",
                 parked.blockers
             );
         }
@@ -6268,7 +6270,7 @@ mod plan_selection {
                 .find(|obligation| obligation.capability == ASSESS_SECURITY)
                 .unwrap_or_else(|| panic!("{label} requires assess_security"));
             assert_eq!(security.applicability, ObligationApplicability::Required);
-            assert_eq!(security.route, Route::Blocked(RouteBlock::NotInBuild));
+            assert_eq!(security.route, Route::Local(ASSESS_SECURITY));
             // Every trigger class is a risk surface: without an approved
             // contract both semantic stages precede the effect and the gate
             // stays paused on them.
@@ -6331,13 +6333,12 @@ mod plan_selection {
             .iter()
             .find(|obligation| obligation.capability == ASSESS_SECURITY)
             .expect("secrets requires assess_security");
-        assert_eq!(security.route, Route::Blocked(RouteBlock::NotInBuild));
+        assert_eq!(security.route, Route::Local(ASSESS_SECURITY));
         let stored = row(&world, &covered, ASSESS_SECURITY);
         assert_eq!(stored.applicability, ObligationApplicability::Required);
         assert_eq!(stored.execution, ObligationExecution::Pending);
-        assert_eq!(stored.handler, None);
-        let exact = plan_blocker(ErrorCode::CapabilityUnavailable, ASSESS_SECURITY);
-        assert_eq!(stored.blocker, Some(exact.clone()));
+        assert_eq!(stored.handler.as_deref(), Some(ASSESS_SECURITY));
+        assert_eq!(stored.blocker, None);
         assert_eq!(
             plan_snapshot(&world, &covered).lifecycle,
             Lifecycle::Running
@@ -6345,8 +6346,11 @@ mod plan_selection {
         let parked = park(&mut world, &session, &covered);
         assert_eq!(parked.lifecycle, Lifecycle::Waiting);
         assert!(
-            plan_blockers(&parked).contains(&exact),
-            "completion waits on assess_security: {:?}",
+            parked.obligations.items.iter().any(|obligation| {
+                obligation.id == format!("plan:{ASSESS_SECURITY}")
+                    && obligation.execution == ObligationExecution::Pending
+            }),
+            "completion waits on the pending assess_security row: {:?}",
             parked.blockers
         );
     }
@@ -6514,7 +6518,13 @@ mod plan_selection {
         // A stored revision without a passing verdict: even with every
         // required row closed, the revision conjunct keeps the gate paused.
         semantic_close(&mut world, &task, &selection, ASSESS_PLAN, ASSESS_PLAN);
-        semantic_close(&mut world, &task, &selection, ASSESS_READINESS, ASSESS_PLAN);
+        semantic_close(
+            &mut world,
+            &task,
+            &selection,
+            ASSESS_READINESS,
+            ASSESS_READINESS,
+        );
         assert!(
             rows(&world, &task)
                 .iter()
@@ -6536,20 +6546,28 @@ mod plan_selection {
         let (mut world, session, task) = plan_world("plan-new-revision", &PLAN_CRITERIA);
         let (request, _) = drive_plan_only_open(&mut world, &session, &task);
         assert_eq!(plan_snapshot(&world, &task).lifecycle, Lifecycle::Running);
-        let replanned = run(&mut world, &session, ActionInput::PlanWork(request)).expect("replan");
+        let replanned =
+            run(&mut world, &session, ActionInput::PlanWork(request.clone())).expect("replan");
         assert!(matches!(
             replanned,
             ActionOutcome::Planned { revision: 2, .. }
         ));
-        for capability in [ASSESS_PLAN, ASSESS_READINESS] {
-            let stored = row(&world, &task, capability);
-            assert_eq!(
-                stored.execution,
-                ObligationExecution::Pending,
-                "revision 2 reopens {capability}"
-            );
-            assert_eq!(stored.outcome_json, None);
-        }
+        let assess = row(&world, &task, ASSESS_PLAN);
+        assert_eq!(
+            assess.execution,
+            ObligationExecution::Pending,
+            "revision 2 reopens the assessment"
+        );
+        assert_eq!(assess.outcome_json, None);
+        // A satisfied readiness verdict cannot ride the replaced revision: the
+        // re-check records the failing verdict and holds completion on it.
+        let readiness = row(&world, &task, ASSESS_READINESS);
+        assert_eq!(readiness.execution, ObligationExecution::Failed);
+        assert_eq!(
+            readiness.blocker,
+            Some(plan_blocker(ErrorCode::DependencyBlocked, ASSESS_READINESS)),
+            "the invalidated readiness carries its exact blocker: {readiness:?}"
+        );
         assert_eq!(
             gate(&world, &task),
             PlanGate::Paused {
@@ -6576,6 +6594,26 @@ mod plan_selection {
             ),
             "{refused}"
         );
+        // The invalidated readiness verdict is re-verifiable: once the new
+        // revision is assessed, the row re-runs and clears its own blocker
+        // instead of deadlocking on it.
+        let close = select(&mut world, &session, &request, &[]);
+        semantic_close(&mut world, &task, &close, ASSESS_PLAN, ASSESS_PLAN);
+        let rechecked = run(
+            &mut world,
+            &session,
+            ActionInput::AssessReadiness(AssessReadinessInput {
+                request: request.clone(),
+            }),
+        )
+        .expect("the readiness re-check runs");
+        assert!(
+            matches!(rechecked, ActionOutcome::Readiness { ready: true, .. }),
+            "{rechecked:?}"
+        );
+        let readiness = row(&world, &task, ASSESS_READINESS);
+        assert_eq!(readiness.execution, ObligationExecution::Satisfied);
+        assert_eq!(readiness.blocker, None);
     }
 
     #[test]
@@ -6826,7 +6864,13 @@ mod plan_selection {
         )
         .expect("frame");
         semantic_close(&mut world, &task, &second, ASSESS_PLAN, ASSESS_PLAN);
-        semantic_close(&mut world, &task, &second, ASSESS_READINESS, ASSESS_PLAN);
+        semantic_close(
+            &mut world,
+            &task,
+            &second,
+            ASSESS_READINESS,
+            ASSESS_READINESS,
+        );
         assert_eq!(
             gate(&world, &task),
             PlanGate::Paused {
@@ -7900,8 +7944,20 @@ mod plan_selection {
         run(&mut world, &session, ActionInput::PlanWork(request.clone())).expect("plan");
         run(&mut world, &session, ActionInput::AssessPlan(request)).expect("assess");
         semantic_close(&mut world, &task, &selection, ASSESS_PLAN, ASSESS_PLAN);
-        assert_eq!(plan_snapshot(&world, &task).lifecycle, Lifecycle::Blocked);
-        semantic_close(&mut world, &task, &selection, ASSESS_READINESS, ASSESS_PLAN);
+        // The semantic close releases the purpose blocker; the still-pending
+        // readiness row holds completion without inventing one.
+        assert_eq!(plan_snapshot(&world, &task).lifecycle, Lifecycle::Running);
+        assert_eq!(
+            row(&world, &task, ASSESS_READINESS).execution,
+            ObligationExecution::Pending
+        );
+        semantic_close(
+            &mut world,
+            &task,
+            &selection,
+            ASSESS_READINESS,
+            ASSESS_READINESS,
+        );
         assert_eq!(gate(&world, &task), PlanGate::Open);
         let released = plan_snapshot(&world, &task);
         assert_eq!(released.lifecycle, Lifecycle::Running);
@@ -8333,7 +8389,7 @@ mod plan_selection {
             &recover,
             &recorded,
             ASSESS_READINESS,
-            ASSESS_PLAN,
+            ASSESS_READINESS,
         );
         assert_eq!(
             row(&world, &recover, ASSESS_READINESS).execution,
@@ -8800,7 +8856,7 @@ mod plan_selection {
     }
 
     #[test]
-    fn disabled_or_incompatible_handler_yields_visible_obligation_or_exact_blocker() {
+    fn every_required_row_routes_to_its_own_handler_and_stays_visible() {
         let (mut world, session, change_task) = plan_world("plan-routes", &PLAN_CRITERIA);
         let plan_task = submit_plan_task(
             &mut world,
@@ -8826,25 +8882,20 @@ mod plan_selection {
         };
         let request = material(&world, &change_task);
         let change = select(&mut world, &session, &request, &[]);
-        // No handler in this build: a visible obligation with its exact
-        // blocker, never dropped.
+        // Every required row routes to its own registered handler: no
+        // obligation waits for a handler this build does not ship, and none
+        // is dropped.
         assert_eq!(
             route(&change, ASSESS_SECURITY),
-            Route::Blocked(RouteBlock::NotInBuild)
+            Route::Local(ASSESS_SECURITY)
         );
         assert_eq!(
             route(&change, ASSESS_READINESS),
-            Route::Blocked(RouteBlock::NotInBuild)
+            Route::Local(ASSESS_READINESS)
         );
         let security = row(&world, &change_task, ASSESS_SECURITY);
-        assert_eq!(security.handler, None);
-        assert_eq!(
-            security.blocker,
-            Some(plan_blocker(
-                ErrorCode::CapabilityUnavailable,
-                ASSESS_SECURITY
-            ))
-        );
+        assert_eq!(security.handler.as_deref(), Some(ASSESS_SECURITY));
+        assert_eq!(security.blocker, None);
         let snapshot = plan_snapshot(&world, &change_task);
         assert!(
             snapshot
@@ -8854,33 +8905,27 @@ mod plan_selection {
                 .any(|obligation| obligation.id == "plan:assess_security"),
             "the obligation stays visible"
         );
-        assert!(plan_blockers(&snapshot).contains(&plan_blocker(
-            ErrorCode::CapabilityUnavailable,
-            ASSESS_SECURITY
-        )));
-        // A plan artifact's readiness has an allowed local equivalent.
+        assert!(
+            ActionRegistry::new()
+                .definitions()
+                .all(|row| row.implementation != Implementation::Unavailable),
+            "every catalog row is executable: a registered name without a handler is not a control"
+        );
+        // A plan-only readiness row also routes to its own handler: the
+        // allowed equivalent never stands in for a registered local handler.
         let request = plan_only(&world, &plan_task);
         let plan = select(&mut world, &session, &request, &[]);
         assert_eq!(
             route(&plan, ASSESS_READINESS),
-            Route::Equivalent(ASSESS_PLAN)
+            Route::Local(ASSESS_READINESS)
         );
         let readiness = row(&world, &plan_task, ASSESS_READINESS);
-        assert_eq!(readiness.handler.as_deref(), Some(ASSESS_PLAN));
+        assert_eq!(readiness.handler.as_deref(), Some(ASSESS_READINESS));
         assert_eq!(readiness.blocker, None);
-        // The registered-vs-missing contrast, after this slice's mandated
-        // `inspect_system` promotion (D-095/FP-032-B) gave that row a local
-        // handler: it is registered AND runnable, so it routes local and its
-        // plan row carries that handler with no route blocker.
-        //
-        // The 'registered but this build cannot execute it' arm —
-        // `Route::Blocked(RouteBlock::Unavailable)`, and with it
-        // `Implementation::Unavailable` — is a live contract shape that now
-        // has NO catalog subject: every row is Local, Purpose or
-        // LocalAndPurpose. The missing half of the contrast is the
-        // `ASSESS_SECURITY` to `NotInBuild` case asserted above. This
-        // comment is why the `Unavailable` arm must not be read as dead code
-        // and deleted when the next row is registered unbuilt.
+        // The registered-but-unbuilt contrast has no catalog subject: every
+        // row is Local, Purpose or LocalAndPurpose. `Route::Blocked` stays a
+        // live contract shape for a catalog that registers a row unbuilt, so
+        // the arm is not dead code to delete when no row currently uses it.
         let request = undecided(&world, &unknown_task);
         let unknown = select(&mut world, &session, &request, &[]);
         assert_eq!(
@@ -8940,29 +8985,27 @@ mod plan_selection {
                 .map(|capability| format!("plan:{capability}"))
                 .collect::<Vec<_>>()
         );
-        // Once the completion guard parks the task, its todo lists the
-        // open required rows' blockers — each at most once, none for a
-        // catalog row the facts did not select.
+        // Once the completion guard parks the task, its todo lists only the
+        // selected rows' own reasons: no unselected catalog row appears and
+        // no selected row invents a blocker it does not have.
         park(&mut world, &session, &task);
         let status = wire_status(&mut world, &session);
-        let named: Vec<&str> = todo_item(&status, &task)["blockers"]
+        let blockers = todo_item(&status, &task)["blockers"]
             .as_array()
-            .expect("a parked task lists its blockers")
+            .cloned()
+            .unwrap_or_default();
+        let named: Vec<&str> = blockers
             .iter()
             .filter_map(|blocker| blocker["condition"]["action_id"].as_str())
             .collect();
         assert!(
             named.iter().all(|capability| required.contains(capability)),
-            "{named:?}"
+            "only selected rows may be named: {named:?}"
         );
-        assert_eq!(
-            named.iter().collect::<BTreeSet<_>>().len(),
-            named.len(),
-            "one todo blocker per required row, no more: {named:?}"
+        assert!(
+            blockers.is_empty(),
+            "every required row is routed, so none carries an invented blocker: {blockers:?}"
         );
-        for later in [AUDIT_TESTS, ASSESS_READINESS] {
-            assert!(named.contains(&later), "{later} is listed: {named:?}");
-        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ use rivect::providers::anthropic_login::{
     LoginError, begin_login, challenge_for, clear_subscription, complete_login, read_subscription,
     refresh_login,
 };
+use rivect::providers::kimi;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::openai_login::{
     self, DeviceEndpoints, LoginError as CodexLoginError, challenge_for as codex_challenge_for,
@@ -6616,5 +6617,386 @@ fn custom_messages_configured_auth_resolves_and_admits_the_absent_binding() {
             Err(ProviderError::CredentialProfileMismatch { .. })
         ),
         "profile/scope disagreement is CredentialProfileMismatch"
+    );
+}
+
+// ----- Kimi Code profiles and lifecycle (SLICE-005) -----------------------
+
+const KIMI_DEVICE_REF: &str = "keyring:rivect-test/kimi-device";
+const KIMI_API_REF: &str = "keyring:rivect-test/kimi-api";
+const KIMI_API_MATERIAL: &str = "sk-kimi-api-fixture-not-real";
+
+fn kimi_profile_config() -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.kimi-code]\n\
+         kind = \"api_key\"\n\
+         endpoint = \"https://api.kimi.com/coding/v1\"\n\
+         credential_ref = \"{KIMI_DEVICE_REF}\"\n\
+         profile = \"kimi-device\"\n\
+         [profiles.kimi-device]\n\
+         credential_ref = \"{KIMI_DEVICE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n"
+    )
+}
+
+fn kimi_material(access: &str, refresh: &str, account: &str) -> String {
+    json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": 1_900_000_000u64,
+        "account_id": account,
+    })
+    .to_string()
+}
+
+/// The device profile and the pasted-key profile are separate scopes: a
+/// refresh replaces only the device scope, a bare key is not refreshable,
+/// a foreign origin is refused before the peer, and a local logout removes
+/// only the named scope.
+#[tokio::test]
+async fn kimi_refresh_and_logout_keep_the_other_profile_usable() {
+    let config = Config::parse_validated(&kimi_profile_config()).expect("the kimi config parses");
+    let device_ref = kimi::credential_reference(&config, "kimi-code").expect("the device ref");
+    assert_eq!(device_ref.scope(), "rivect-test/kimi-device");
+    let api_ref = SecretRef::parse(KIMI_API_REF).expect("the api-key ref");
+    let prior = kimi_material("prior-access", "prior-refresh", "user-kimi-1");
+    let store = Arc::new(support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[
+            (KIMI_DEVICE_REF, prior.as_str()),
+            (KIMI_API_REF, KIMI_API_MATERIAL),
+        ],
+    ));
+
+    // Each class reads as itself; the other shape is a typed refusal.
+    let credential =
+        kimi::read_credential(store.as_ref(), &device_ref).expect("the device profile");
+    assert_eq!(credential.account_id(), "user-kimi-1");
+    assert!(matches!(
+        kimi::read_credential(store.as_ref(), &api_ref),
+        Err(kimi::KimiLoginError::StoredCredentialMalformed { .. })
+    ));
+
+    // A refresh reply without a new refresh token keeps the prior one; the
+    // request body proves which token was presented.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=prior-refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "fresh-access-fixture",
+            "expires_in": 3600u64,
+            "user_id": "user-kimi-1",
+        })))
+        .mount(&server)
+        .await;
+    let endpoints = kimi::Endpoints {
+        device_authorization: format!("{}/device_authorization", server.uri()),
+        token: format!("{}/token", server.uri()),
+    };
+    let refreshed = {
+        let store = Arc::clone(&store);
+        let device_ref = device_ref.clone();
+        let endpoints = endpoints.clone();
+        std::thread::spawn(move || {
+            kimi::refresh_credential(store.as_ref(), &device_ref, &endpoints)
+        })
+        .join()
+        .expect("the refresh thread joins")
+    };
+    refreshed.expect("the refresh replaces the device scope");
+    let fresh = kimi::read_credential(store.as_ref(), &device_ref).expect("the fresh profile");
+    assert_eq!(fresh.access_token(), "fresh-access-fixture");
+    assert_eq!(fresh.account_id(), "user-kimi-1");
+    assert_eq!(
+        store.resolve(&api_ref).expect("the api-key scope"),
+        KIMI_API_MATERIAL.as_bytes(),
+        "the other profile stays byte-identical"
+    );
+
+    // A reply that omits the refresh token keeps the prior one; the second
+    // refresh therefore presents that same stored token.
+    let second = {
+        let store = Arc::clone(&store);
+        let device_ref = device_ref.clone();
+        let endpoints = endpoints.clone();
+        std::thread::spawn(move || {
+            kimi::refresh_credential(store.as_ref(), &device_ref, &endpoints)
+        })
+        .join()
+        .expect("the second refresh thread joins")
+    };
+    second.expect("the second refresh succeeds");
+    let presented = server.received_requests().await.expect("recorded");
+    assert_eq!(presented.len(), 2);
+    for request in &presented {
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            body.contains("grant_type=refresh_token")
+                && body.contains("refresh_token=prior-refresh"),
+            "each refresh presents the stored token: {body}"
+        );
+    }
+
+    // A bare key has no refresh leg and reaches no peer; a foreign origin
+    // is refused before the peer too.
+    let bare = {
+        let store = Arc::clone(&store);
+        let api_ref = api_ref.clone();
+        let endpoints = endpoints.clone();
+        std::thread::spawn(move || kimi::refresh_credential(store.as_ref(), &api_ref, &endpoints))
+            .join()
+            .expect("the refusal thread joins")
+    };
+    assert!(matches!(
+        bare,
+        Err(kimi::KimiLoginError::NotRefreshable { .. })
+    ));
+    let foreign = {
+        let store = Arc::clone(&store);
+        let device_ref = device_ref.clone();
+        std::thread::spawn(move || {
+            kimi::refresh_credential(
+                store.as_ref(),
+                &device_ref,
+                &kimi::Endpoints {
+                    device_authorization: "http://127.0.0.1:1/device".to_string(),
+                    token: "https://evil.example/token".to_string(),
+                },
+            )
+        })
+        .join()
+        .expect("the origin thread joins")
+    };
+    assert!(matches!(
+        foreign,
+        Err(kimi::KimiLoginError::EndpointNotRecorded { .. })
+    ));
+    assert_eq!(
+        server.received_requests().await.expect("recorded").len(),
+        2,
+        "only the accepted refreshes crossed the wire"
+    );
+
+    // Local logout deletes the named scope only; the device profile stays
+    // readable. This is not a server revocation and claims none.
+    kimi::logout_local(store.as_ref(), &api_ref).expect("the local logout runs");
+    assert!(!store.occupied(&api_ref).expect("the store answers"));
+    let kept = kimi::read_credential(store.as_ref(), &device_ref).expect("the device profile");
+    assert_eq!(kept.access_token(), "fresh-access-fixture");
+
+    // A re-enrolled key then revoked locally leaves the device profile
+    // usable too; neither call claims a provider-side revocation.
+    store
+        .login(&api_ref, KIMI_API_MATERIAL.as_bytes())
+        .expect("the key scope is free after logout");
+    kimi::revoke_local(store.as_ref(), &api_ref).expect("the local revoke runs");
+    assert!(!store.occupied(&api_ref).expect("the store answers"));
+    let kept = kimi::read_credential(store.as_ref(), &device_ref).expect("the device profile");
+    assert_eq!(kept.access_token(), "fresh-access-fixture");
+}
+
+/// A rotated refresh token is stored and presented on the next refresh; a
+/// reply bound to another account denies and leaves the stored profile
+/// byte-identical.
+#[tokio::test]
+async fn kimi_refresh_rotates_the_token_and_refuses_another_account() {
+    let prior = kimi_material("prior-access", "prior-refresh", "user-kimi-1");
+    let store = Arc::new(support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[(KIMI_DEVICE_REF, prior.as_str())],
+    ));
+    let config = Config::parse_validated(&kimi_profile_config()).expect("the kimi config parses");
+    let device_ref = kimi::credential_reference(&config, "kimi-code").expect("the device ref");
+
+    // The first reply rotates the refresh token; the second refresh must
+    // present the rotated one.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("refresh_token=prior-refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "rotated-access-fixture",
+            "refresh_token": "rotated-refresh-fixture",
+            "expires_in": 3600u64,
+            "user_id": "user-kimi-1",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "refresh_token=rotated-refresh-fixture",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "after-rotation-fixture",
+            "expires_in": 3600u64,
+            "user_id": "user-kimi-1",
+        })))
+        .mount(&server)
+        .await;
+    let endpoints = kimi::Endpoints {
+        device_authorization: format!("{}/device_authorization", server.uri()),
+        token: format!("{}/token", server.uri()),
+    };
+    for _turn in 0..2 {
+        let store = Arc::clone(&store);
+        let device_ref = device_ref.clone();
+        let endpoints = endpoints.clone();
+        std::thread::spawn(move || {
+            kimi::refresh_credential(store.as_ref(), &device_ref, &endpoints)
+        })
+        .join()
+        .expect("the rotation thread joins")
+        .expect("the rotation succeeds");
+    }
+    let rotated = kimi::read_credential(store.as_ref(), &device_ref).expect("the rotated profile");
+    assert_eq!(rotated.access_token(), "after-rotation-fixture");
+    let bodies: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).to_string())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[0].contains("refresh_token=prior-refresh"),
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains("refresh_token=rotated-refresh-fixture"),
+        "the rotated token is the one presented next: {}",
+        bodies[1]
+    );
+
+    // A reply bound to another account denies instead of re-keying the
+    // scope, and the stored bytes stay exactly as they were.
+    let account_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "other-account-fixture",
+            "refresh_token": "other-refresh-fixture",
+            "expires_in": 3600u64,
+            "user_id": "user-kimi-2",
+        })))
+        .mount(&account_server)
+        .await;
+    let foreign_endpoints = kimi::Endpoints {
+        device_authorization: format!("{}/device_authorization", account_server.uri()),
+        token: format!("{}/token", account_server.uri()),
+    };
+    let before = store.resolve(&device_ref).expect("the stored profile");
+    let outcome = {
+        let store = Arc::clone(&store);
+        let device_ref = device_ref.clone();
+        std::thread::spawn(move || {
+            kimi::refresh_credential(store.as_ref(), &device_ref, &foreign_endpoints)
+        })
+        .join()
+        .expect("the refusal thread joins")
+    };
+    assert!(matches!(
+        outcome,
+        Err(kimi::KimiLoginError::AccountMismatch)
+    ));
+    assert_eq!(
+        store.resolve(&device_ref).expect("the profile"),
+        before,
+        "the stored profile is byte-identical after the refusal"
+    );
+    assert_eq!(
+        account_server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .len(),
+        1,
+        "the refused refresh crossed exactly one leg"
+    );
+}
+
+/// A profile binding whose scope names another profile is the seam's typed
+/// mismatch, and a second device enrollment at an occupied scope is the
+/// store's create-only conflict that leaves the bytes untouched.
+#[tokio::test]
+async fn kimi_wrong_profile_and_create_only_enrollment_deny_typed() {
+    let mismatched = Config::parse_validated(&kimi_profile_config().replace(
+        "profiles.kimi-device]\ncredential_ref = \"keyring:rivect-test/kimi-device\"",
+        "profiles.kimi-device]\ncredential_ref = \"keyring:rivect-test/kimi-api\"",
+    ))
+    .expect("the divergent config parses");
+    assert!(matches!(
+        kimi::credential_reference(&mismatched, "kimi-code"),
+        Err(kimi::KimiLoginError::Provider(
+            ProviderError::CredentialProfileMismatch { .. }
+        ))
+    ));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/device_authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "device-handle-fixture",
+            "user_code": "KIMI-CODE",
+            "verification_uri": "https://www.kimi.com/code/authorize",
+            "interval": "1",
+            "expires_in": 10,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "second-access-fixture",
+            "refresh_token": "second-refresh-fixture",
+            "expires_in": 3600u64,
+            "user_id": "user-kimi-1",
+        })))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&kimi_profile_config()).expect("the kimi config parses");
+    let device_ref = kimi::credential_reference(&config, "kimi-code").expect("the device ref");
+    let prior = kimi_material("prior-access", "prior-refresh", "user-kimi-1");
+    let store = Arc::new(support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[(KIMI_DEVICE_REF, prior.as_str())],
+    ));
+    let endpoints = kimi::Endpoints {
+        device_authorization: format!("{}/device_authorization", server.uri()),
+        token: format!("{}/token", server.uri()),
+    };
+    let outcome = {
+        let config = config.clone();
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let mut device =
+                kimi::begin_device_login(&config, "kimi-code", endpoints).expect("the leg begins");
+            kimi::advance_device_login(&config, "kimi-code", &mut device, store.as_ref())
+        })
+        .join()
+        .expect("the enrollment thread joins")
+    };
+    assert!(
+        matches!(
+            outcome,
+            Err(kimi::KimiLoginError::Provider(
+                ProviderError::CredentialOccupied { .. }
+            ))
+        ),
+        "enrollment is create-only: {outcome:?}"
+    );
+    assert_eq!(
+        store.resolve(&device_ref).expect("the enrolled profile"),
+        prior.as_bytes(),
+        "the prior profile is byte-identical"
     );
 }

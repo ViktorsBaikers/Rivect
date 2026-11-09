@@ -22096,3 +22096,1531 @@ async fn zenmux_cc_auto_pick_skips_the_messages_class() {
         "the CC codec never crosses into the Messages route"
     );
 }
+
+// ----- Kimi Code routed inference (SLICE-005) -----------------------------
+
+mod kimi_contract {
+    use super::*;
+    use rivect::providers::kimi::{self, KimiProvider, Protocol};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
+
+    const KIMI_REF: &str = "keyring:rivect-test/kimi-provider";
+    const KIMI_KEY: &str = "sk-kimi-provider-fixture-not-real";
+
+    /// One scripted reply: the status, the whole body, and the maximum
+    /// bytes per write — `1` forces a split inside every code point,
+    /// escape and SSE block.
+    struct Reply {
+        status: u16,
+        body: String,
+        chunk: usize,
+    }
+
+    impl Reply {
+        fn json(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: body.into(),
+                chunk: 4096,
+            }
+        }
+
+        fn sse(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: body.into(),
+                chunk: 4096,
+            }
+        }
+
+        fn split(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: body.into(),
+                chunk: 1,
+            }
+        }
+    }
+
+    /// One recorded request: method, path, raw head and body.
+    type PeerLog = Vec<(String, String, String, String)>;
+
+    struct KimiPeer {
+        base: String,
+        address: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        log: Arc<Mutex<PeerLog>>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl KimiPeer {
+        fn start<F>(handler: F) -> Self
+        where
+            F: Fn(&str, &str, &str) -> Reply + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the kimi peer");
+            listener.set_nonblocking(true).expect("nonblocking peer");
+            let address = listener.local_addr().expect("peer address");
+            let base = format!("http://{address}");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let entries = Arc::clone(&log);
+            let handler = Arc::new(handler);
+            let handle = std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _address)) => serve(stream, handler.as_ref(), &entries),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::park_timeout(Duration::from_millis(2));
+                        }
+                        Err(_error) => break,
+                    }
+                }
+            });
+            Self {
+                base,
+                address,
+                stop,
+                log,
+                handle: Some(handle),
+            }
+        }
+
+        fn inference_paths(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .expect("peer log")
+                .iter()
+                .filter(|(method, _, _, _)| method == "POST")
+                .map(|(_, path, _, _)| path.clone())
+                .collect()
+        }
+
+        fn requests(&self) -> Vec<(String, String, String, String)> {
+            self.log.lock().expect("peer log").clone()
+        }
+    }
+
+    impl Drop for KimiPeer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// One request/response on its own connection: the head decides the
+    /// body length, and the reply is written in the scripted slices.
+    fn serve<F: Fn(&str, &str, &str) -> Reply + ?Sized>(
+        mut stream: TcpStream,
+        handler: &F,
+        log: &Mutex<PeerLog>,
+    ) {
+        stream.set_nonblocking(false).expect("peer blocking mode");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let Ok(read) = stream.read(&mut chunk) else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = head_end + 4;
+        while buffer.len() < body_start + length {
+            let Ok(read) = stream.read(&mut chunk) else {
+                return;
+            };
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = String::from_utf8_lossy(&buffer[body_start..buffer.len()]).to_string();
+        let method = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_default()
+            .to_string();
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        log.lock().expect("peer log").push((
+            method.clone(),
+            path.clone(),
+            head.clone(),
+            body.clone(),
+        ));
+        let reply = handler(&method, &path, &body);
+        let reason = if reply.status == 200 { "OK" } else { "Error" };
+        let head = format!(
+            "HTTP/1.1 {} {reason}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            reply.status,
+            reply.body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for piece in reply.body.as_bytes().chunks(reply.chunk.max(1)) {
+            if stream.write_all(piece).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn chat_stream(text: &str) -> String {
+        format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 25}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        )
+    }
+
+    /// One Chat stream carrying reasoning beside its answer, in the member
+    /// the recorded K3 contract returns as-is on a multi-turn replay.
+    fn reasoning_chat_stream(text: &str, reasoning: &str) -> String {
+        format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        )
+    }
+
+    fn messages_stop_event(stop: Option<&str>) -> String {
+        let delta = match stop {
+            Some(reason) => {
+                json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 3}})
+            }
+            None => json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 3}}),
+        };
+        format!("event: message_delta\ndata: {delta}\n\n")
+    }
+
+    fn messages_stream(text: &str) -> String {
+        messages_stream_with_stop(text, Some("end_turn"))
+    }
+
+    fn messages_stream_with_stop(text: &str, stop: Option<&str>) -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             {}\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": 2}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            messages_stop_event(stop),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    /// One Messages stream minting a replayable thinking block before its
+    /// text.
+    fn thinking_messages_stream(text: &str, thinking: &str, signature: &str) -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             {}\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": signature}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            messages_stop_event(Some("end_turn")),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    /// One Messages stream whose `message_start` reports a dropped replayed
+    /// block.
+    fn mutated_messages_stream() -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             {}\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {"input_tokens": 9},
+                    "input_transformations": [{"type": "prefix_binding_mismatch"}],
+                },
+            }),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "dropped"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            messages_stop_event(Some("end_turn")),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    /// One Messages tool call split across two `input_json_delta` frames;
+    /// `closed` false ends the stream inside the block instead of closing
+    /// it.
+    fn tool_messages_stream(closed: bool) -> String {
+        let tail = if closed {
+            format!(
+                "event: content_block_stop\n\
+                 data: {}\n\n\
+                 {}\
+                 event: message_stop\n\
+                 data: {}\n\n",
+                json!({"type": "content_block_stop", "index": 0}),
+                messages_stop_event(Some("tool_use")),
+                json!({"type": "message_stop"}),
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             {tail}",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 6}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"a/b\"}"}}),
+        )
+    }
+
+    /// The catalogue the recorded listing answers: two rows select
+    /// Messages and Chat explicitly, two keep the Messages default, and one
+    /// forward-compatible row names a protocol this build does not know —
+    /// it is never selected, so it must not deny another row's send.
+    fn models_listing() -> String {
+        json!({
+            "data": [
+                {"id": "kimi-k3"},
+                {"id": "kimi-k2.7-code", "protocol": "chat"},
+                {"id": "kimi-legacy"},
+                {"id": "kimi-anthropic", "protocol": "anthropic"},
+                {"id": "kimi-future", "protocol": "grpc"},
+            ],
+        })
+        .to_string()
+    }
+
+    fn kimi_config(base: &str, model: &str) -> Config {
+        Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.kimi-code]\n\
+             kind = \"api_key\"\n\
+             endpoint = \"{base}/v1\"\n\
+             credential_ref = \"{KIMI_REF}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"kimi-code\", model_id = \"{model}\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"auto\" }}\n"
+        ))
+        .expect("the kimi config parses")
+    }
+
+    fn kimi_store() -> Arc<support::MapStore> {
+        Arc::new(support::MapStore::seeded(
+            StoreKind::Keychain,
+            &[(KIMI_REF, KIMI_KEY)],
+        ))
+    }
+
+    fn send(
+        config: &Config,
+        model: &str,
+    ) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
+        let provider =
+            KimiProvider::new(config, "kimi-code", kimi_store()).expect("the adapter builds");
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare(
+                "main",
+                config,
+                "/world/kimi",
+                &format!("goal: kimi {model}"),
+            )
+            .expect("the kimi pin passes DEC-011 eligibility");
+        dispatch(broker, "/world/kimi", manifest)
+    }
+
+    /// Several frozen manifests through one adapter, so an epoch's replay
+    /// state lives across turns; each turn is here one prepare.
+    fn send_turns(
+        config: &Config,
+        prompts: &[&str],
+    ) -> (
+        Broker,
+        Vec<Result<rivect::providers::ProviderReply, ModelError>>,
+    ) {
+        let provider =
+            KimiProvider::new(config, "kimi-code", kimi_store()).expect("the adapter builds");
+        let mut broker = Broker::new(Box::new(provider));
+        let mut outcomes = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let manifest = broker
+                .prepare("main", config, "/world/kimi", prompt)
+                .expect("the kimi pin prepares");
+            let (next, outcome) = dispatch(broker, "/world/kimi", manifest);
+            broker = next;
+            outcomes.push(outcome);
+        }
+        (broker, outcomes)
+    }
+
+    /// The same turns, with the final prepare forced through the prefix
+    /// mutation the Broker records when the envelope changes. The manifest
+    /// is sent through the adapter directly: a post-prepare mutation is not
+    /// an admitted dispatch, and the replay policy is the codec's own. The
+    /// adapter comes back with the outcomes so the codec's accounting stays
+    /// observable.
+    fn send_turns_with_mutation(
+        config: &Config,
+        prompts: &[&str],
+    ) -> (
+        KimiProvider,
+        Vec<Result<rivect::providers::ProviderReply, ProviderError>>,
+    ) {
+        let provider =
+            KimiProvider::new(config, "kimi-code", kimi_store()).expect("the adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let mut manifests: Vec<RequestManifest> = prompts
+            .iter()
+            .map(|prompt| {
+                control
+                    .prepare("main", config, "/world/kimi", prompt)
+                    .expect("the kimi pin prepares")
+            })
+            .collect();
+        if let Some(last) = manifests.last_mut() {
+            last.mutation_reason = Some("instructions".to_string());
+        }
+        std::thread::spawn(move || {
+            let mut provider = provider;
+            let mut outcomes = Vec::with_capacity(manifests.len());
+            for manifest in &manifests {
+                outcomes.push(provider.send(manifest));
+            }
+            (provider, outcomes)
+        })
+        .join()
+        .expect("the send thread joins")
+    }
+
+    /// The selected catalogue row's `protocol` selects the wire leg: the
+    /// Messages default for an absent protocol, Chat Completions for a
+    /// `chat` row, and the Anthropic spelling for `anthropic`. A sibling
+    /// row naming an unknown protocol never denies another row's send, and
+    /// each entered send reads the listing once and crosses one inference
+    /// leg.
+    #[test]
+    fn kimi_model_protocol_selects_the_wire_leg() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(messages_stream("messages answer")),
+            ("POST", "/v1/chat/completions") => Reply::sse(chat_stream("chat answer")),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+
+        let (broker, outcome) = send(&config, "kimi-k3");
+        let reply = outcome.expect("the Messages default sends");
+        assert_eq!(reply.text, "messages answer");
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Legs {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(3),
+                reasoning_tokens: None,
+                cache_read_tokens: Some(2),
+                cache_write_tokens: None,
+                total_tokens: Some(8),
+            }
+        );
+        assert_eq!(broker.accounted_requests(), 1);
+        drop_blocking(broker);
+
+        let chat = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&chat, "kimi-k2.7-code");
+        let reply = outcome.expect("the chat row sends on Chat Completions");
+        assert_eq!(reply.text, "chat answer");
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Exact {
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                total_tokens: 25,
+            }
+        );
+        assert_eq!(broker.accounted_requests(), 1);
+        drop_blocking(broker);
+
+        let anthropic = kimi_config(&peer.base, "kimi-anthropic");
+        let (broker, outcome) = send(&anthropic, "kimi-anthropic");
+        outcome.expect("the anthropic row keeps the Messages leg");
+        drop_blocking(broker);
+
+        let legacy = kimi_config(&peer.base, "kimi-legacy");
+        let (broker, outcome) = send(&legacy, "kimi-legacy");
+        outcome.expect("a row without a protocol keeps the Messages default");
+        drop_blocking(broker);
+
+        let requests = peer.requests();
+        let gets = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "GET")
+            .count();
+        assert_eq!(gets, 4, "each send resolves its row from one listing read");
+        let posts: Vec<&str> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .map(|(_, path, _, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            posts,
+            vec![
+                "/v1/messages",
+                "/v1/chat/completions",
+                "/v1/messages",
+                "/v1/messages",
+            ],
+            "each send crosses exactly one inference leg"
+        );
+        let chat_request = requests
+            .iter()
+            .find(|(_, path, _, _)| path == "/v1/chat/completions")
+            .expect("the chat request");
+        let body: Value = serde_json::from_str(&chat_request.3).expect("the chat body is json");
+        assert_eq!(body["model"], "kimi-k2.7-code");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        // The identity is Rivect's own; no foreign client name or install id
+        // rides the request.
+        let head = chat_request.2.to_ascii_lowercase();
+        assert!(head.contains("x-msh-platform: rivect"), "{head}");
+        assert!(head.contains("user-agent: rivect/"), "{head}");
+        assert!(!head.contains("kimicli"), "{head}");
+    }
+
+    /// A listing that declares one id twice is a catalogue violation before
+    /// any inference leg: the second row would otherwise silently replace
+    /// the first.
+    #[test]
+    fn kimi_duplicate_catalogue_ids_deny_before_any_inference_request() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(
+                json!({
+                    "data": [
+                        {"id": "kimi-k3"},
+                        {"id": "kimi-k3", "protocol": "chat"},
+                    ],
+                })
+                .to_string(),
+            ),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcome) = send(&config, "kimi-k3");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+            ),
+            "a duplicate catalogue id is a listing violation: {outcome:?}"
+        );
+        assert!(
+            peer.inference_paths().is_empty(),
+            "the violation lands before any inference request"
+        );
+        assert_eq!(broker.accounted_requests(), 0);
+        drop_blocking(broker);
+    }
+
+    /// The adapter serves the recorded api-key class alone: a subscription
+    /// declaration is a live grant this adapter has no semantics for, and a
+    /// local declaration with a profile binding is the contradictory form.
+    /// Both deny before any wire leg.
+    #[test]
+    fn kimi_unrecorded_declaration_classes_deny_before_any_request() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let subscription = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.kimi-code]\n\
+             kind = \"subscription\"\n\
+             endpoint = \"{}/v1\"\n\
+             credential_ref = \"{KIMI_REF}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"auto\" }}\n",
+            peer.base
+        ))
+        .expect("the subscription row parses");
+        let error = KimiProvider::new(&subscription, "kimi-code", kimi_store())
+            .expect_err("a subscription row has no adapter semantics");
+        assert!(
+            matches!(
+                error,
+                ProviderError::LiveGrantRequired {
+                    kind: rivect::config::ConnKind::Subscription
+                }
+            ),
+            "{error:?}"
+        );
+
+        let local = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.kimi-code]\n\
+             kind = \"local\"\n\
+             endpoint = \"{}/v1\"\n\
+             profile = \"kimi-device\"\n\
+             [profiles.kimi-device]\n\
+             credential_ref = \"{KIMI_REF}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"auto\" }}\n",
+            peer.base
+        ))
+        .expect("the local row parses");
+        let error = KimiProvider::new(&local, "kimi-code", kimi_store())
+            .expect_err("a local row binding a profile is contradictory");
+        assert!(
+            matches!(error, ProviderError::LocalProfileDeclared { .. }),
+            "{error:?}"
+        );
+        assert!(
+            peer.requests().is_empty(),
+            "a refused declaration crosses no wire at all"
+        );
+    }
+
+    /// A stream split inside a UTF-8 code point, a JSON member and an SSE
+    /// block still yields the one complete call; a confirmed usage reported
+    /// twice is charged once, and a truncated stream executes nothing.
+    #[test]
+    fn kimi_split_streams_settle_once_and_never_execute_an_incomplete_call() {
+        let split = format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "héllo "}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"pa"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "th\":\"a/b\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            // The usage reports twice: the last one is the physical
+            // charge, never a sum of the two.
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::split(split.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        let reply = outcome.expect("the split stream completes one call");
+        assert_eq!(reply.text, "héllo ");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].tool, "read_file");
+        assert_eq!(reply.tool_calls[0].path.as_deref(), Some("a/b"));
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Exact {
+                prompt_tokens: 5,
+                completion_tokens: 3,
+                total_tokens: 8,
+            },
+            "the last confirmed report is the one charge"
+        );
+        assert_eq!(broker.accounted_requests(), 1, "one physical usage");
+        drop_blocking(broker);
+    }
+
+    /// A stream ending without a classifiable terminal is never success,
+    /// on either protocol, and an incomplete tool call is never executed.
+    #[test]
+    fn kimi_unknown_terminals_are_not_success() {
+        let truncated_chat = format!(
+            "data: {}\n\n\
+             data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"name": "read_file", "arguments": "{\"path\":"}}]}, "finish_reason": null}]}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(truncated_chat.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+            ),
+            "a truncated chat stream is never success: {outcome:?}"
+        );
+        assert_eq!(
+            peer.inference_paths(),
+            vec!["/v1/chat/completions".to_string()],
+            "the failed send crossed one inference leg and no retry"
+        );
+        drop_blocking(broker);
+
+        let truncated_messages = format!(
+            "event: message_start\ndata: {}\n\n\
+             event: content_block_start\ndata: {}\n\n\
+             event: content_block_delta\ndata: {}\n\n\
+             event: content_block_stop\ndata: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 4}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(truncated_messages.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcome) = send(&config, "kimi-k3");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+            ),
+            "a truncated messages stream is never success: {outcome:?}"
+        );
+        drop_blocking(broker);
+
+        // An unclassified or absent Messages `stop_reason` is unknown, never
+        // success: deleting the whitelist cannot leave a false pass.
+        for stop in [Some("mystery"), None] {
+            let body = messages_stream_with_stop("partial", stop);
+            let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+                ("GET", "/v1/models") => Reply::json(models_listing()),
+                ("POST", "/v1/messages") => Reply::sse(body.clone()),
+                _ => Reply {
+                    status: 404,
+                    body: "{}".to_string(),
+                    chunk: 4096,
+                },
+            });
+            let config = kimi_config(&peer.base, "kimi-k3");
+            let (broker, outcome) = send(&config, "kimi-k3");
+            assert!(
+                matches!(
+                    outcome,
+                    Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+                ),
+                "a {stop:?} stop reason is never success: {outcome:?}"
+            );
+            assert_eq!(
+                peer.inference_paths(),
+                vec!["/v1/messages".to_string()],
+                "the failed send crossed one inference leg and no retry"
+            );
+            drop_blocking(broker);
+        }
+
+        // An unclassified `finish_reason` is unknown, never success.
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "mystery"}]})
+            )),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        assert!(matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ));
+        drop_blocking(broker);
+
+        // The recorded failure reasons are the peer's own verdict, never
+        // success even when earlier chunks carried valid content.
+        for reason in [
+            "content_filter",
+            "network_error",
+            "error",
+            "insufficient_system_resource",
+        ] {
+            let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+                ("GET", "/v1/models") => Reply::json(models_listing()),
+                ("POST", "/v1/chat/completions") => Reply::sse(format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": null}]}),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}),
+                )),
+                _ => Reply {
+                    status: 404,
+                    body: "{}".to_string(),
+                    chunk: 4096,
+                },
+            });
+            let config = kimi_config(&peer.base, "kimi-k2.7-code");
+            let (broker, outcome) = send(&config, "kimi-k2.7-code");
+            assert!(
+                matches!(
+                    outcome,
+                    Err(ModelError::Provider(ProviderError::ProviderFailed { .. }))
+                ),
+                "finish reason {reason} is a provider failure: {outcome:?}"
+            );
+            assert_eq!(
+                peer.inference_paths(),
+                vec!["/v1/chat/completions".to_string()],
+                "the failure crossed one inference leg and no retry"
+            );
+            drop_blocking(broker);
+        }
+
+        // A `tool_use` terminal with no tool call is a wire violation.
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(format!(
+                "event: message_start\ndata: {}\n\n\
+                 event: message_delta\ndata: {}\n\n\
+                 event: message_stop\ndata: {}\n\n",
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 4, "output_tokens": 1}}}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}),
+                json!({"type": "message_stop"}),
+            )),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcome) = send(&config, "kimi-k3");
+        assert!(matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+        ));
+        drop_blocking(broker);
+    }
+
+    /// A pin outside the listing is denied after its one admitted catalogue
+    /// read and sends no inference request; a divergent profile binding
+    /// denies before the adapter exists and crosses no wire at all.
+    #[test]
+    fn kimi_wrong_model_and_profile_deny_before_any_inference_request() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "outside-listing");
+        let (broker, outcome) = send(&config, "outside-listing");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::FallbackExhausted { ref source, .. })
+                    if matches!(**source, ProviderError::UnsupportedParameter {
+                        parameter: "model",
+                        ..
+                    })
+            ),
+            "a row outside the listing has no protocol: {outcome:?}"
+        );
+        let requests = peer.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the catalogue read is the one admitted pre-send leg"
+        );
+        assert_eq!(
+            (requests[0].0.as_str(), requests[0].1.as_str()),
+            ("GET", "/v1/models"),
+            "the protocol denial reads the listing and nothing else"
+        );
+        assert!(
+            peer.inference_paths().is_empty(),
+            "no inference request crossed the wire"
+        );
+        drop_blocking(broker);
+
+        let divergent = Config::parse_validated(
+            &format!(
+                "config_version = 1\n\
+                 [connections.kimi-code]\n\
+                 kind = \"api_key\"\n\
+                 endpoint = \"{}/v1\"\n\
+                 credential_ref = \"{KIMI_REF}\"\n\
+                 profile = \"kimi-device\"\n\
+                 [profiles.kimi-device]\n\
+                 credential_ref = \"keyring:rivect-test/kimi-api\"\n\
+                 [models.defaults]\n\
+                 model = {{ mode = \"fixed\", connection = \"kimi-code\", model_id = \"kimi-k3\" }}\n\
+                 effort = {{ mode = \"auto\" }}\n\
+                 fallback = {{ mode = \"auto\" }}\n",
+                peer.base
+            ),
+        )
+        .expect("the divergent config parses");
+        let before = peer.requests().len();
+        let error = KimiProvider::new(&divergent, "kimi-code", kimi_store())
+            .expect_err("the divergent scope is refused before the adapter");
+        assert!(matches!(
+            error,
+            ProviderError::CredentialProfileMismatch { .. }
+        ));
+        assert_eq!(
+            peer.requests().len(),
+            before,
+            "a refused adapter crosses no wire at all"
+        );
+    }
+
+    /// The production factory builds the literal row and the Broker sends
+    /// through it; the adapter serves only its own id.
+    #[test]
+    fn kimi_configured_provider_serves_the_literal_row() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(messages_stream("factory answer")),
+            ("POST", "/v1/chat/completions") => Reply::sse(chat_stream("factory chat")),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let store: Arc<dyn CredentialStore> = kimi_store();
+        let build = rivect::providers::configured_provider(&config, &store)
+            .expect("the configured set builds");
+        assert!(build.refusals.is_empty(), "{:?}", build.refusals);
+        let mut broker = Broker::new(build.provider);
+        let manifest = broker
+            .prepare("main", &config, "/world/kimi", "goal: factory")
+            .expect("the configured pin prepares");
+        let (broker, outcome) = dispatch(broker, "/world/kimi", manifest);
+        let reply = outcome.expect("the configured factory serves the send");
+        assert_eq!(reply.text, "factory answer");
+        assert_eq!(broker.accounted_requests(), 1);
+        drop_blocking(broker);
+        assert_eq!(peer.inference_paths(), vec!["/v1/messages"]);
+    }
+
+    /// The device profile's stored JSON never rides the wire: the adapter
+    /// presents its access token as the one bearer, and the credential
+    /// class does not change the model-selected protocol.
+    #[test]
+    fn kimi_device_profile_sends_its_access_token_as_the_bearer() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(messages_stream("device answer")),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let credential = json!({
+            "access_token": "device-access-fixture",
+            "refresh_token": "device-refresh-fixture",
+            "expires_at": 1_900_000_000u64,
+            "account_id": "user-kimi-1",
+        })
+        .to_string();
+        let store = Arc::new(support::MapStore::seeded(
+            StoreKind::Keychain,
+            &[(KIMI_REF, credential.as_str())],
+        ));
+        let provider =
+            KimiProvider::new(&config, "kimi-code", store).expect("the device profile builds");
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/kimi", "goal: device profile")
+            .expect("the device-profile pin prepares");
+        let (broker, outcome) = dispatch(broker, "/world/kimi", manifest);
+        let reply = outcome.expect("the device profile sends");
+        assert_eq!(reply.text, "device answer");
+        drop_blocking(broker);
+
+        let requests = peer.requests();
+        let post = requests
+            .iter()
+            .find(|(method, _, _, _)| method == "POST")
+            .expect("one inference request");
+        let head = post.2.to_ascii_lowercase();
+        let authorization = head
+            .lines()
+            .find(|line| line.starts_with("authorization:"))
+            .expect("the request carries one authorization header");
+        assert!(authorization.ends_with("device-access-fixture"), "{head}");
+        assert!(!head.contains("device-refresh-fixture"), "{head}");
+        assert!(!head.contains("account_id"), "{head}");
+        assert_eq!(
+            post.1, "/v1/messages",
+            "the credential class never selects the protocol"
+        );
+    }
+
+    #[test]
+    fn kimi_protocol_maps_to_the_recorded_dialects() {
+        use rivect::providers::Dialect;
+        assert_eq!(
+            Protocol::ChatCompletions.dialect(),
+            Dialect::ChatCompletions
+        );
+        assert_eq!(Protocol::Messages.dialect(), Dialect::Messages);
+        assert_eq!(
+            kimi::dialects(),
+            &[Dialect::Messages, Dialect::ChatCompletions][..]
+        );
+        assert_eq!(kimi::CONNECTION, "kimi-code");
+    }
+
+    /// The Messages leg is the shared codec: a thinking block with its
+    /// signature captured in one turn replays byte-identical inside the
+    /// unchanged epoch, with no drop policy requested.
+    #[test]
+    fn kimi_messages_thinking_replays_bytewise_in_its_epoch() {
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply::sse(messages_stream("replayed"))
+                }
+            }
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcomes) = send_turns(&config, &["goal: one", "goal: two"]);
+        assert_eq!(outcomes.len(), 2);
+        let first = outcomes[0].as_ref().expect("the capture turn answers");
+        assert_eq!(first.text, "captured");
+        let second = outcomes[1].as_ref().expect("the replay turn answers");
+        assert_eq!(second.text, "replayed");
+        assert_eq!(broker.accounted_requests(), 2);
+        drop_blocking(broker);
+
+        let requests = peer.requests();
+        let posts: Vec<&(String, String, String, String)> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 2, "one inference leg per turn");
+        let body: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        assert_eq!(
+            body["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "plan", "signature": "sig-fixture"}],
+                },
+                {"role": "user", "content": "goal: two"},
+            ]),
+            "the captured thinking block replays byte-identical in its epoch"
+        );
+        assert!(
+            body["thinking"].is_null(),
+            "an unchanged epoch asks no drop policy"
+        );
+        let head = posts[1].2.to_ascii_lowercase();
+        assert!(!head.contains("anthropic-beta"), "{head}");
+    }
+
+    /// A prefix mutation drops the epoch's replay and requests the recorded
+    /// drop policy on the wire, so a post-mutation send never replays a
+    /// block the peer would have to discard.
+    #[test]
+    fn kimi_messages_prefix_mutation_requests_the_drop_policy() {
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply::sse(mutated_messages_stream())
+                }
+            }
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (provider, outcomes) =
+            send_turns_with_mutation(&config, &["goal: one", "goal: mutated"]);
+        outcomes[0].as_ref().expect("the capture turn answers");
+        outcomes[1].as_ref().expect("the mutated turn answers");
+        assert_eq!(
+            provider.dropped_reasoning(),
+            1,
+            "the peer's input_transformations count the dropped reasoning"
+        );
+
+        let requests = peer.requests();
+        let posts: Vec<&(String, String, String, String)> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .collect();
+        let body: Value = serde_json::from_str(&posts[1].3).expect("the mutated body is json");
+        assert!(
+            body["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a mutated prefix replays no block: {body}"
+        );
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            json!("drop_block"),
+            "the dialect policy rides the mutated request"
+        );
+        let head = posts[1].2.to_ascii_lowercase();
+        assert!(
+            head.contains("anthropic-beta: thinking-binding-controls-2026-08-01"),
+            "{head}"
+        );
+        drop_blocking(provider);
+    }
+
+    /// A `400` naming an invalid thinking signature strips the replayed
+    /// blocks for exactly one retry, settles the retry count, and clears the
+    /// lineage so the same epoch never replays or retries again.
+    #[test]
+    fn kimi_messages_signature_400_strips_once_and_clears_the_epoch() {
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply {
+                        status: 400,
+                        body: "Invalid signature: thinking block bound to a different conversation"
+                            .to_string(),
+                        chunk: 4096,
+                    }
+                }
+            }
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let provider =
+            KimiProvider::new(&config, "kimi-code", kimi_store()).expect("the adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let first = control
+            .prepare("main", &config, "/world/kimi", "goal: one")
+            .expect("the kimi pin prepares");
+        let second = control
+            .prepare("main", &config, "/world/kimi", "goal: two")
+            .expect("the kimi pin prepares");
+        let third = control
+            .prepare("main", &config, "/world/kimi", "goal: three")
+            .expect("the kimi pin prepares");
+        let (provider, first) = send_on_thread(provider, first);
+        let (provider, second) = send_on_thread(provider, second);
+        let (provider, third) = send_on_thread(provider, third);
+        assert_eq!(first.expect("the capture turn answers").text, "captured");
+        match &second {
+            Err(ProviderError::Retried {
+                wire_retries,
+                source,
+            }) => {
+                assert_eq!(*wire_retries, 1, "the corrected retry is counted");
+                assert!(matches!(
+                    source.as_ref(),
+                    ProviderError::Transport {
+                        cause: TransportCause::Status { .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("the permanent signature error keeps its class: {other:?}"),
+        }
+        assert!(
+            matches!(
+                &third,
+                Err(ProviderError::Transport {
+                    cause: TransportCause::Status { .. },
+                    ..
+                })
+            ),
+            "the cleared lineage denies without a retry: {third:?}"
+        );
+        drop_blocking(provider);
+
+        let requests = peer.requests();
+        let posts: Vec<&(String, String, String, String)> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .collect();
+        assert_eq!(
+            posts.len(),
+            4,
+            "capture, replay, exactly one stripped retry, then one clean attempt"
+        );
+        let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        assert_eq!(
+            replay["messages"][0]["role"],
+            json!("assistant"),
+            "the refused leg replayed the captured thinking block"
+        );
+        let retry: Value = serde_json::from_str(&posts[2].3).expect("the retry body is json");
+        assert!(
+            retry["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "the retry strips the replayed thinking blocks"
+        );
+        assert!(
+            retry["thinking"].is_null(),
+            "the stripped retry keeps the epoch's unchanged drop policy"
+        );
+        let next: Value = serde_json::from_str(&posts[3].3).expect("the next body is json");
+        assert!(
+            next["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "the cleared lineage is never replayed by a later same-epoch send"
+        );
+    }
+
+    /// A Messages tool call split across two `input_json_delta` frames
+    /// yields exactly one typed call and one physical usage.
+    #[test]
+    fn kimi_messages_split_tool_call_settles_once() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::split(tool_messages_stream(true)),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcome) = send(&config, "kimi-k3");
+        let reply = outcome.expect("the split tool stream completes one call");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].tool, "read_file");
+        assert_eq!(reply.tool_calls[0].path.as_deref(), Some("a/b"));
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Exact {
+                prompt_tokens: 6,
+                completion_tokens: 3,
+                total_tokens: 9,
+            }
+        );
+        assert_eq!(broker.accounted_requests(), 1, "one physical usage");
+        drop_blocking(broker);
+        assert_eq!(peer.inference_paths(), vec!["/v1/messages"]);
+    }
+
+    /// A Messages stream that ends inside its tool block is refused whole:
+    /// the incomplete call is never executed and the send is no success.
+    #[test]
+    fn kimi_messages_truncated_tool_call_is_refused() {
+        let peer = KimiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/messages") => Reply::sse(tool_messages_stream(false)),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k3");
+        let (broker, outcome) = send(&config, "kimi-k3");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+            ),
+            "a stream ending mid tool block is a violation: {outcome:?}"
+        );
+        assert_eq!(
+            broker.accounted_requests(),
+            0,
+            "a refused stream settles no usage"
+        );
+        drop_blocking(broker);
+        assert_eq!(peer.inference_paths(), vec!["/v1/messages"]);
+    }
+
+    /// Two declared calls reusing one stream index are never merged: the
+    /// second call's id cannot re-key the first, so its fragments cannot
+    /// corrupt the first call's arguments.
+    #[test]
+    fn kimi_chat_two_ids_on_one_index_deny() {
+        let stream = format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "/b\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(stream.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+            ),
+            "a second id on one block is a malformed stream: {outcome:?}"
+        );
+        assert_eq!(
+            broker.accounted_requests(),
+            0,
+            "a refused stream settles no usage"
+        );
+        drop_blocking(broker);
+        assert_eq!(peer.inference_paths(), vec!["/v1/chat/completions"]);
+    }
+
+    /// A single-entry delta that omits `index` continues the last-opened
+    /// call instead of being denied: the canonical Chat reduction accepts
+    /// that continuation, so this adapter must too.
+    #[test]
+    fn kimi_chat_index_less_continuation_joins_its_call() {
+        let stream = format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a/"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"function": {"arguments": "b\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(stream.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        let reply = outcome.expect("the index-less continuation joins its call");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].tool, "read_file");
+        assert_eq!(reply.tool_calls[0].path.as_deref(), Some("a/b"));
+        assert_eq!(broker.accounted_requests(), 1);
+        drop_blocking(broker);
+    }
+
+    /// The Chat leg carries the recorded `reasoning_content` through the
+    /// stream and replays it as-is in the next turn of the same epoch; a
+    /// prefix mutation replays nothing even though the prior turn carried
+    /// reasoning.
+    #[test]
+    fn kimi_chat_reasoning_replays_as_is_in_an_unchanged_epoch() {
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => {
+                let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                Reply::sse(reasoning_chat_stream(
+                    &format!("answer-{turn}"),
+                    &format!("think-{turn}"),
+                ))
+            }
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (provider, outcomes) =
+            send_turns_with_mutation(&config, &["goal: one", "goal: two", "goal: mutated"]);
+        assert_eq!(outcomes[0].as_ref().expect("capture turn").text, "answer-1");
+        assert_eq!(outcomes[1].as_ref().expect("replay turn").text, "answer-2");
+        assert_eq!(outcomes[2].as_ref().expect("mutated turn").text, "answer-3");
+
+        let requests = peer.requests();
+        let posts: Vec<&(String, String, String, String)> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 3, "one inference leg per turn");
+        let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        let messages = replay["messages"].as_array().expect("messages is an array");
+        assert_eq!(messages.len(), 3, "{replay}");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[1],
+            json!({
+                "role": "assistant",
+                "content": "answer-1",
+                "reasoning_content": "think-1",
+            }),
+            "the recorded reasoning member returns as-is in the next turn"
+        );
+        assert_eq!(messages[2], json!({"role": "user", "content": "goal: two"}));
+        let mutated: Value = serde_json::from_str(&posts[2].3).expect("the mutated body is json");
+        assert!(
+            mutated["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a mutated prefix replays nothing even with a reasoning lineage: {mutated}"
+        );
+        drop_blocking(provider);
+    }
+}

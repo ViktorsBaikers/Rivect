@@ -33,9 +33,9 @@ use crate::config::{Config, DecisionMode};
 use crate::context::QueryKind;
 use crate::contracts::{
     ARRAY_MAX_ITEMS, AnswerAttemptOutcome, AnswerSelection, Availability, Blocker, CommandResult,
-    Criterion, CriterionId, ErrorCode, ObligationApplicability, ObligationExecution, OptionId,
-    Question, QuestionId, QuestionOption, ResumeCondition, SessionId, TEXT_MAX_BYTES, TaskId,
-    TaskSnapshot,
+    Criterion, CriterionId, DeliveryIntent, DeliveryOutcome, DeliveryReceipt, EffectClass,
+    ErrorCode, Lifecycle, ObligationApplicability, ObligationExecution, OptionId, Question,
+    QuestionId, QuestionOption, ResumeCondition, SessionId, TEXT_MAX_BYTES, TaskId, TaskSnapshot,
 };
 use crate::index::SearchBackend;
 use crate::index::{Completeness, GenerationState, MatchKind, PartialReason, QueryResult};
@@ -98,10 +98,9 @@ pub const PLAN_STAGES: [&str; 5] = [
     PLAN_WORK,
     ASSESS_PLAN,
 ];
-/// Execution-phase checks a request can require that have no catalog row
-/// in this build. An obligation naming one stays visible with an exact
-/// blocker — it is never dropped and never closed by an unrelated
-/// handler.
+/// Execution-phase capabilities the selection weighs, in dependency
+/// order. Each is a registered local handler; a required row is visible
+/// from selection to close and is never dropped.
 pub const ASSESS_SECURITY: &str = "assess_security";
 pub const AUDIT_TESTS: &str = "audit_tests";
 pub const ASSESS_READINESS: &str = "assess_readiness";
@@ -109,6 +108,63 @@ pub const IMPLEMENT_CHANGE: &str = "implement_change";
 pub const DELIVER_CHANGE: &str = "deliver_change";
 pub const REVIEW_CHANGE: &str = "review_change";
 pub const DIAGNOSE_ISSUE: &str = "diagnose_issue";
+
+/// The evidence and diagnosis rows: they fire on a typed observation,
+/// never on their place in the list.
+pub const RESEARCH_EVIDENCE: &str = "research_evidence";
+pub const REPRODUCE_ISSUE: &str = "reproduce_issue";
+pub const AUTHOR_TEST: &str = "author_test";
+pub const REFACTOR_STRUCTURE: &str = "refactor_structure";
+pub const VALIDATE_CHANGE: &str = "validate_change";
+pub const ASSESS_PERFORMANCE: &str = "assess_performance";
+pub const ASSESS_EXPERIENCE: &str = "assess_experience";
+pub const VALIDATE_INTEGRATION: &str = "validate_integration";
+pub const RECONCILE_FINDINGS: &str = "reconcile_findings";
+pub const REPAIR_APPROACH: &str = "repair_approach";
+pub const EXPLAIN_RESULT: &str = "explain_result";
+pub const PREPARE_DELIVERY: &str = "prepare_delivery";
+pub const OBSERVE_OUTCOME: &str = "observe_outcome";
+pub const PREPARE_HANDOFF: &str = "prepare_handoff";
+pub const IMPROVE_PROCEDURE: &str = "improve_procedure";
+pub const DIAGNOSE_HARNESS: &str = "diagnose_harness";
+
+/// The 32 semantic capabilities in their catalog order. The registry
+/// must serve exactly these rows, and every row's implementation is a
+/// local handler or a Broker purpose — never a name without a handler.
+pub const SEMANTIC_CAPABILITIES: [&str; 32] = [
+    FRAME_GOAL,
+    INSPECT_SYSTEM,
+    RESEARCH_EVIDENCE,
+    RESOLVE_DECISION,
+    CHALLENGE_DIRECTION,
+    DESIGN_CONTRACTS,
+    PLAN_WORK,
+    ASSESS_PLAN,
+    TEST_ASSUMPTION,
+    REPRODUCE_ISSUE,
+    DIAGNOSE_ISSUE,
+    PREPARE_ENVIRONMENT,
+    AUTHOR_TEST,
+    IMPLEMENT_CHANGE,
+    REFACTOR_STRUCTURE,
+    VALIDATE_CHANGE,
+    AUDIT_TESTS,
+    REVIEW_CHANGE,
+    ASSESS_SECURITY,
+    ASSESS_PERFORMANCE,
+    ASSESS_EXPERIENCE,
+    VALIDATE_INTEGRATION,
+    RECONCILE_FINDINGS,
+    REPAIR_APPROACH,
+    ASSESS_READINESS,
+    EXPLAIN_RESULT,
+    PREPARE_DELIVERY,
+    DELIVER_CHANGE,
+    OBSERVE_OUTCOME,
+    PREPARE_HANDOFF,
+    IMPROVE_PROCEDURE,
+    DIAGNOSE_HARNESS,
+];
 
 /// How this build runs a catalog row (§5.20, PROH-004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +409,29 @@ pub enum ActionInput {
     AssessPlan(PlanRequest),
     TestAssumption(TestAssumptionInput),
     PrepareEnvironment(PrepareEnvironmentInput),
+    ResearchEvidence(ResearchEvidenceInput),
+    ReproduceIssue(ReproduceIssueInput),
+    DiagnoseIssue(DiagnoseIssueInput),
+    AuthorTest(AuthorTestInput),
+    ImplementChange(ImplementChangeInput),
+    RefactorStructure(RefactorStructureInput),
+    ValidateChange(ValidateChangeInput),
+    AuditTests(AuditTestsInput),
+    ReviewChange(ReviewChangeInput),
+    AssessSecurity(AssessSecurityInput),
+    AssessPerformance(AssessPerformanceInput),
+    AssessExperience(AssessExperienceInput),
+    ValidateIntegration(ValidateIntegrationInput),
+    ReconcileFindings(ReconcileFindingsInput),
+    RepairApproach(RepairApproachInput),
+    AssessReadiness(AssessReadinessInput),
+    ExplainResult(ExplainResultInput),
+    PrepareDelivery(PrepareDeliveryInput),
+    DeliverChange(DeliverChangeInput),
+    ObserveOutcome(ObserveOutcomeInput),
+    PrepareHandoff(PrepareHandoffInput),
+    ImproveProcedure(ImproveProcedureInput),
+    DiagnoseHarness(DiagnoseHarnessInput),
 }
 
 /// One check result for a named assumption. The expected result and
@@ -420,6 +499,387 @@ impl std::fmt::Debug for EnvironmentRestore {
             .field("replacement_bytes", &self.replacement.len())
             .finish()
     }
+}
+
+/// One recorded evidence package the `research_evidence` row reuses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResearchEvidenceInput {
+    pub task_id: TaskId,
+    /// The evidence scope to collect; only current rows of this scope count.
+    pub scope: String,
+}
+
+/// One reproduction attempt: the assertion and the observation the check
+/// reported. A reproduction expects the defect (`fail`) to be observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReproduceIssueInput {
+    pub task_id: TaskId,
+    pub check_id: String,
+    pub assertion: String,
+    pub observation: CheckObservation,
+}
+
+/// One hypothesis and the signal the last run produced for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosisObservation {
+    pub hypothesis: String,
+    pub signal: String,
+}
+
+/// The symptom and the observations `diagnose_issue` separates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnoseIssueInput {
+    pub task_id: TaskId,
+    pub symptom: String,
+    pub observations: Vec<DiagnosisObservation>,
+}
+
+/// Why a test is authored: changed behavior, a preserved refactor, or a
+/// typo that needs no behavior test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeMode {
+    Behavior,
+    Refactor,
+    Typo,
+}
+
+/// The test the caller authored, its independent expectation and the RED
+/// it observed (or the baseline a refactor keeps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorTestInput {
+    pub task_id: TaskId,
+    pub mode: ChangeMode,
+    pub check_id: String,
+    pub expected: ExpectedResult,
+    pub red_observed: bool,
+    pub baseline: Option<String>,
+}
+
+/// The exact parts the implementation applied under the open selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplementChangeInput {
+    pub request: PlanRequest,
+    pub parts: Vec<String>,
+}
+
+/// A requested structure refactor: the behavior-preserving baseline, and
+/// any test the change would weaken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefactorStructureInput {
+    pub task_id: TaskId,
+    pub requested: bool,
+    pub baseline: String,
+    pub weakened_tests: Vec<String>,
+}
+
+/// The class of one validation check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckKind {
+    Static,
+    Tests,
+    Runtime,
+    Surface,
+}
+
+/// One executed check: its exit, the cases it selected and the output it
+/// produced — an exit 0 alone is not success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckResult {
+    pub name: String,
+    pub kind: CheckKind,
+    pub exit_code: i32,
+    /// `None` for checks that select no test cases.
+    pub selected: Option<u64>,
+    pub output_bytes: u64,
+}
+
+/// Why a check result does not prove the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "gap", rename_all = "snake_case")]
+pub enum ValidationGap {
+    NonZeroExit { name: String, code: i32 },
+    ZeroSelection { name: String },
+    EmptyOutput { name: String },
+}
+
+/// The checks run against the changed behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateChangeInput {
+    pub task_id: TaskId,
+    pub checks: Vec<CheckResult>,
+}
+
+/// The mutation observation `audit_tests` requires before it closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTestsInput {
+    pub request: PlanRequest,
+    pub killed: bool,
+    pub alternative_accepted: bool,
+}
+
+/// One review axis's verdict and the evidence basis it rests on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub axis: String,
+    pub basis: String,
+    pub text: String,
+}
+
+/// The independent review findings of one audit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewChangeInput {
+    pub request: PlanRequest,
+    pub findings: Vec<ReviewFinding>,
+}
+
+/// One negative check for a security-triggering surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityCheck {
+    pub surface: Surface,
+    pub negative_check: String,
+    pub confidence: String,
+}
+
+/// The security checks the impact scan's trigger classes require.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssessSecurityInput {
+    pub request: PlanRequest,
+    pub checks: Vec<SecurityCheck>,
+}
+
+/// One comparable measurement: the sample count and the elapsed nanos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measurement {
+    pub samples: u64,
+    pub nanos: u64,
+}
+
+/// The baseline and candidate measurements under one load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssessPerformanceInput {
+    pub task_id: TaskId,
+    pub load: String,
+    pub baseline: Measurement,
+    pub candidate: Measurement,
+}
+
+/// The product surface one experience check covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceSurface {
+    Tui,
+    Cli,
+    Library,
+    Install,
+    Docs,
+}
+
+impl ExperienceSurface {
+    /// The wire label the catalog reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Cli => "cli",
+            Self::Library => "library",
+            Self::Install => "install",
+            Self::Docs => "docs",
+        }
+    }
+}
+
+/// One entered journey: what was entered, its exit and its output size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Journey {
+    pub entered: String,
+    pub exit_code: i32,
+    pub output_bytes: u64,
+}
+
+/// The journeys run on one surface, and whether a screenshot was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssessExperienceInput {
+    pub task_id: TaskId,
+    pub surface: ExperienceSurface,
+    pub journeys: Vec<Journey>,
+    pub screenshot: bool,
+}
+
+/// Candidate-level integration evidence: the exact candidate, the
+/// consumers it touches, and the compatibility it keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateEvidence {
+    pub digest: String,
+    pub consumers: Vec<String>,
+    pub compatibility: Vec<String>,
+}
+
+/// The integration evidence and the local passes it must not stand in for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidateIntegrationInput {
+    pub task_id: TaskId,
+    pub candidate: CandidateEvidence,
+    pub local_passes: Vec<String>,
+}
+
+/// The disposition of one finding after reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingStatus {
+    Confirmed,
+    Refuted,
+    Stale,
+    Duplicate,
+}
+
+/// One finding and the disposition the reconciliation assigned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileFinding {
+    pub id: String,
+    pub status: FindingStatus,
+}
+
+/// The findings `reconcile_findings` classifies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconcileFindingsInput {
+    pub task_id: TaskId,
+    pub findings: Vec<ReconcileFinding>,
+}
+
+/// One part of the approach replaced, leaving every obligation it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairApproachInput {
+    pub request: PlanRequest,
+    pub part: String,
+    pub replacement: WorkPart,
+}
+
+/// The readiness check over the current selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssessReadinessInput {
+    pub request: PlanRequest,
+}
+
+/// One claim and the recorded evidence it cites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationClaim {
+    pub text: String,
+    pub evidence: Option<String>,
+}
+
+/// The claims an explanation makes; each must cite recorded evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainResultInput {
+    pub task_id: TaskId,
+    pub claims: Vec<ExplanationClaim>,
+}
+
+/// The exact delivery intent preparation admits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepareDeliveryInput {
+    pub task_id: TaskId,
+    pub intent: DeliveryIntent,
+}
+
+/// One prepared delivery and the exact candidate bytes it moves.
+#[derive(Clone, PartialEq)]
+pub struct DeliverChangeInput {
+    pub request: PlanRequest,
+    pub intent: DeliveryIntent,
+    pub candidate: Vec<u8>,
+}
+
+impl std::fmt::Debug for DeliverChangeInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeliverChangeInput")
+            .field("request", &self.request)
+            .field("intent", &self.intent)
+            .field("candidate_bytes", &self.candidate.len())
+            .finish()
+    }
+}
+
+/// One observed sample of a bounded outcome window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationSample {
+    pub signal: String,
+}
+
+/// The bounded observation window and the samples it collected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObserveOutcomeInput {
+    pub task_id: TaskId,
+    /// The window's exclusive end, in Unix seconds.
+    pub budget_end_unix: u64,
+    pub samples: Vec<ObservationSample>,
+}
+
+/// The bounded continuation checkpoint a handoff carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffCheckpoint {
+    pub task_id: TaskId,
+    pub revision: u64,
+    pub intent_revision: u64,
+    pub lifecycle: Lifecycle,
+    pub criteria: usize,
+    pub open_obligations: Vec<String>,
+    pub pending_question: Option<QuestionId>,
+}
+
+/// The task a handoff checkpoint is built for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareHandoffInput {
+    pub task_id: TaskId,
+}
+
+/// The executed plan a procedure candidate is derived from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImproveProcedureInput {
+    pub task_id: TaskId,
+}
+
+/// The component a harness defect is attributed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessComponent {
+    /// The user's own code, which is not a harness defect.
+    UserCode,
+    Adapter,
+    Migration,
+    Scheduler,
+    Rendering,
+    Policy,
+}
+
+impl HarnessComponent {
+    /// The wire label the trace attribution reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserCode => "user_code",
+            Self::Adapter => "adapter",
+            Self::Migration => "migration",
+            Self::Scheduler => "scheduler",
+            Self::Rendering => "rendering",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+/// One safe trace signal naming a harness component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSignal {
+    pub component: HarnessComponent,
+    pub signal: String,
+}
+
+/// The harness fault and the safe trace signals collected for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagnoseHarnessInput {
+    pub task_id: TaskId,
+    pub fault: HarnessComponent,
+    pub signals: Vec<HarnessSignal>,
 }
 
 /// Why no allowed handler can close an obligation.
@@ -592,6 +1052,147 @@ pub enum ActionOutcome {
     EnvironmentRequested {
         restore: EnvironmentRestore,
         original: AssumptionCheckRecord,
+    },
+    /// The current evidence package of one scope, reused instead of a
+    /// provider fan-out.
+    Researched {
+        scope: String,
+        evidence: Vec<crate::contracts::Evidence>,
+        attempt_id: String,
+    },
+    /// One reproduction attempt and the classification its observation
+    /// earned; a setup gap is never a reproduced product defect.
+    Reproduced {
+        check_id: String,
+        classification: AssumptionClassification,
+        attempt_id: String,
+    },
+    /// The separable hypotheses of one symptom, with the confirmed one and
+    /// the ones the last run left without a new signal.
+    Diagnosed {
+        symptom: String,
+        confirmed: Vec<String>,
+        unresolved: Vec<String>,
+        attempt_id: String,
+    },
+    /// One authored test with its independent expectation and baseline.
+    TestAuthored {
+        check_id: String,
+        mode: ChangeMode,
+        expected: ExpectedResult,
+        baseline: Option<String>,
+        attempt_id: String,
+    },
+    /// The parts the implementation applied; the row closes only itself.
+    Implemented {
+        parts: Vec<String>,
+        attempt_id: String,
+    },
+    /// The requested refactor and the baseline its behavior keeps.
+    RefactorPlanned {
+        baseline: String,
+        attempt_id: String,
+    },
+    /// The executed checks, their gaps, and whether they prove the change.
+    Validated {
+        checks: Vec<CheckResult>,
+        gaps: Vec<ValidationGap>,
+        attempt_id: String,
+    },
+    /// The mutation and alternative results the test audit observed.
+    Audited {
+        killed: bool,
+        alternative_accepted: bool,
+        attempt_id: String,
+    },
+    /// The independent review findings the change was reviewed against.
+    Reviewed {
+        findings: Vec<ReviewFinding>,
+        attempt_id: String,
+    },
+    /// The negative checks covering every security-triggering surface.
+    SecurityAssessed {
+        checks: Vec<SecurityCheck>,
+        attempt_id: String,
+    },
+    /// The comparable measurements and their delta.
+    PerformanceAssessed {
+        load: String,
+        baseline: Measurement,
+        candidate: Measurement,
+        improved: bool,
+        attempt_id: String,
+    },
+    /// The journeys a surface answered.
+    ExperienceAssessed {
+        surface: ExperienceSurface,
+        journeys: Vec<Journey>,
+        screenshot: bool,
+        attempt_id: String,
+    },
+    /// Candidate-level integration evidence, not a local-pass proxy.
+    IntegrationValidated {
+        candidate: CandidateEvidence,
+        local_passes: Vec<String>,
+        attempt_id: String,
+    },
+    /// The reconciled findings and the repairs they require.
+    Reconciled {
+        confirmed: usize,
+        refuted: usize,
+        stale: usize,
+        duplicates: usize,
+        required_fixes: Vec<String>,
+        attempt_id: String,
+    },
+    /// The single part a repair changed, with every criterion it keeps.
+    ApproachRepaired {
+        part: String,
+        criteria: Vec<CriterionId>,
+        attempt_id: String,
+    },
+    /// Whether the task is ready, and exactly what remains when it is not.
+    Readiness {
+        ready: bool,
+        remaining: Vec<String>,
+        attempt_id: Option<String>,
+    },
+    /// The claims an explanation grounds in recorded evidence.
+    Explained {
+        claims: Vec<ExplanationClaim>,
+        attempt_id: String,
+    },
+    /// One prepared delivery intent; preparation is not authorization.
+    DeliveryPrepared {
+        intent: DeliveryIntent,
+        attempt_id: String,
+    },
+    /// One delivered candidate and the receipt that records it.
+    Delivered {
+        receipt: DeliveryReceipt,
+        attempt_id: String,
+    },
+    /// One bounded observation window and its substantive signal.
+    Observed {
+        signal: String,
+        window_end_unix: u64,
+        attempt_id: String,
+    },
+    /// The continuation checkpoint a session switch carries.
+    Handoff {
+        checkpoint: HandoffCheckpoint,
+        attempt_id: String,
+    },
+    /// The segment derived from the plan that already ran.
+    ProcedureImproved {
+        segment: crate::procedure::SegmentTemplate,
+        attempt_id: String,
+    },
+    /// The harness component a safe trace attributes the defect to.
+    HarnessDiagnosed {
+        component: HarnessComponent,
+        signals: Vec<String>,
+        attempt_id: String,
     },
     /// The handler's row is not open on these facts.
     Skipped {
@@ -768,8 +1369,9 @@ pub const BOUNDARY_PROBE_NAME: &str = "__rivect_boundary_probe";
 
 /// Borrowed surfaces a handler needs: the owning store (question
 /// publication and answer), the session events attach to, the
-/// effective config the mode reads from, and the index seam every
-/// runtime parse rides.
+/// effective config the mode reads from, the index seam every runtime
+/// parse rides, and the runtime's own grant policy the delivery legs
+/// admit against.
 ///
 /// ```compile_fail
 /// use rivect::{commands::Runtime, config::Config, contracts::SessionId};
@@ -824,6 +1426,9 @@ pub struct ActionContext<'a> {
     /// for the whole runtime, so a handler and the dispatcher can never
     /// disagree about what is being read or what parses it (DEC-031).
     pub index: &'a crate::commands::IndexSeam,
+    /// The runtime's own grant and deny policy: a delivery handler admits
+    /// the effect against the same rights the runtime checks, never a copy.
+    pub policy: &'a crate::policy::Policy,
 }
 
 impl<'a> ActionContext<'a> {
@@ -834,12 +1439,14 @@ impl<'a> ActionContext<'a> {
         session_id: &'a SessionId,
         config: &'a Config,
         index: &'a crate::commands::IndexSeam,
+        policy: &'a crate::policy::Policy,
     ) -> Self {
         Self {
             store,
             session_id,
             config,
             index,
+            policy,
         }
     }
 }
@@ -908,6 +1515,36 @@ pub enum ActionError {
     AssumptionNotRecorded,
     #[error("environment preparation does not apply to this result")]
     EnvironmentNotNeeded,
+    #[error("action {action} input is empty")]
+    EmptyInput { action: &'static str },
+    #[error("action {action} input exceeds {max} items or bytes")]
+    InputOverLimit { action: &'static str, max: usize },
+    #[error("measurement {label} carries no usable samples")]
+    MeasurementWithoutSamples { label: &'static str },
+    #[error("a behavior test must observe its RED before it is authored")]
+    TestWithoutRed,
+    #[error("a refactor requires a behavior-preserving baseline")]
+    RefactorWithoutBaseline,
+    #[error("refactor would weaken {tests} tests")]
+    RefactorWeakensTests { tests: usize },
+    #[error("duplicate diagnosis hypothesis {hypothesis}")]
+    DuplicateHypothesis { hypothesis: String },
+    #[error("review axes share one evidence basis")]
+    SharedReviewBasis,
+    #[error("security surface {surface} has no negative check")]
+    MissingSecurityCheck { surface: &'static str },
+    #[error("mutation survived or the alternative was rejected")]
+    AuditInsufficient,
+    #[error("duplicate finding id {finding}")]
+    DuplicateFinding { finding: String },
+    #[error("repair would drop criterion {criterion}")]
+    RepairDropsCriterion { criterion: String },
+    #[error("explanation claim {index} cites no recorded evidence")]
+    UnsupportedClaim { index: usize },
+    #[error("delivery refused")]
+    Delivery(#[from] crate::update::DeliveryError),
+    #[error("procedure segment could not be derived")]
+    Procedure(#[from] crate::procedure::ProcedureError),
     #[error("semantic purpose {action} did not answer")]
     SemanticDispatch {
         action: &'static str,
@@ -938,7 +1575,22 @@ impl ActionError {
             Self::PlanRecord(_) => ErrorCode::StorageUnavailable,
             Self::AssumptionNotRecorded => ErrorCode::NotFound,
             Self::EnvironmentNotNeeded => ErrorCode::Conflict,
-            Self::EmptyPrompt
+            Self::Delivery(source) => source.code(),
+            Self::RefactorWeakensTests { .. }
+            | Self::SharedReviewBasis
+            | Self::MissingSecurityCheck { .. }
+            | Self::AuditInsufficient
+            | Self::Procedure(_) => ErrorCode::DependencyBlocked,
+            Self::RepairDropsCriterion { .. } => ErrorCode::Conflict,
+            Self::EmptyInput { .. }
+            | Self::InputOverLimit { .. }
+            | Self::MeasurementWithoutSamples { .. }
+            | Self::TestWithoutRed
+            | Self::RefactorWithoutBaseline
+            | Self::DuplicateHypothesis { .. }
+            | Self::DuplicateFinding { .. }
+            | Self::UnsupportedClaim { .. }
+            | Self::EmptyPrompt
             | Self::InvalidCheckId
             | Self::InvalidAssertion { .. }
             | Self::MissingEnvironmentGrant
@@ -1024,6 +1676,9 @@ impl ActionRegistry {
         for definition in plan_definitions() {
             definitions.insert(definition.id, definition);
         }
+        for definition in execution_definitions() {
+            definitions.insert(definition.id, definition);
+        }
         Self { definitions }
     }
 
@@ -1096,6 +1751,29 @@ impl ActionRegistry {
             ActionInput::AssessPlan(request) => assess_plan(&request, ctx),
             ActionInput::TestAssumption(input) => test_assumption(input, ctx),
             ActionInput::PrepareEnvironment(input) => prepare_environment(input, ctx),
+            ActionInput::ResearchEvidence(input) => research_evidence(input, ctx),
+            ActionInput::ReproduceIssue(input) => reproduce_issue(input, ctx),
+            ActionInput::DiagnoseIssue(input) => diagnose_issue(input, ctx),
+            ActionInput::AuthorTest(input) => author_test(input, ctx),
+            ActionInput::ImplementChange(input) => implement_change(input, ctx),
+            ActionInput::RefactorStructure(input) => refactor_structure(input, ctx),
+            ActionInput::ValidateChange(input) => validate_change(input, ctx),
+            ActionInput::AuditTests(input) => audit_tests(input, ctx),
+            ActionInput::ReviewChange(input) => review_change(input, ctx),
+            ActionInput::AssessSecurity(input) => assess_security(input, ctx),
+            ActionInput::AssessPerformance(input) => assess_performance(input, ctx),
+            ActionInput::AssessExperience(input) => assess_experience(input, ctx),
+            ActionInput::ValidateIntegration(input) => validate_integration(input, ctx),
+            ActionInput::ReconcileFindings(input) => reconcile_findings(input, ctx),
+            ActionInput::RepairApproach(input) => repair_approach(input, ctx),
+            ActionInput::AssessReadiness(input) => assess_readiness(input, ctx),
+            ActionInput::ExplainResult(input) => explain_result(input, ctx),
+            ActionInput::PrepareDelivery(input) => prepare_delivery(input, ctx),
+            ActionInput::DeliverChange(input) => deliver_change(input, ctx),
+            ActionInput::ObserveOutcome(input) => observe_outcome(input, ctx),
+            ActionInput::PrepareHandoff(input) => prepare_handoff(input, ctx),
+            ActionInput::ImproveProcedure(input) => improve_procedure(input, ctx),
+            ActionInput::DiagnoseHarness(input) => diagnose_harness(input, ctx),
         }
     }
 
@@ -1849,6 +2527,14 @@ fn plan_work(
             body_json: &body_json,
         },
     )?;
+    // The reopened assessment invalidates a satisfied readiness verdict:
+    // re-check it now, so completion never rides the replaced revision.
+    assess_readiness(
+        AssessReadinessInput {
+            request: request.clone(),
+        },
+        ctx,
+    )?;
     Ok(ActionOutcome::Planned { revision, plan })
 }
 
@@ -2160,6 +2846,1245 @@ fn prepare_environment(
             replacement: input.replacement,
         },
         original,
+    })
+}
+
+// ----- execution-phase semantic handlers -----
+
+/// Rejects an input the row cannot act on.
+fn non_empty(action: &'static str, value: &str) -> Result<(), ActionError> {
+    if value.trim().is_empty() {
+        Err(ActionError::EmptyInput { action })
+    } else {
+        Ok(())
+    }
+}
+
+/// Rejects an input past the shared byte bound.
+fn bounded(action: &'static str, len: usize, max: usize) -> Result<(), ActionError> {
+    if len > max {
+        Err(ActionError::InputOverLimit { action, max })
+    } else {
+        Ok(())
+    }
+}
+
+/// The durable identity one invocation records: the action and a digest of
+/// its typed facts, never the caller's prose.
+fn attempt_digest(action: &'static str, facts: &[&str]) -> String {
+    let mut canonical = String::from(action);
+    for fact in facts {
+        canonical.push('\n');
+        canonical.push_str(fact);
+    }
+    canonical.push('\n');
+    crate::config::hex(&sha2::Sha256::digest(canonical.as_bytes()))
+}
+
+/// Journals one settled local attempt under the task's effect ledger.
+fn record_attempt(
+    ctx: &mut ActionContext<'_>,
+    task_id: &TaskId,
+    action: &'static str,
+    class: EffectClass,
+    digest: &str,
+) -> Result<String, ActionError> {
+    let attempt = ctx
+        .store
+        .plan_attempt(task_id, class, &format!("{action}:{digest}"))?;
+    ctx.store.attempt_running(&attempt)?;
+    ctx.store.attempt_confirmed(&attempt)?;
+    Ok(attempt)
+}
+
+/// The one plan-row close a local handler owns.
+fn close_row(
+    request: &PlanRequest,
+    ctx: &mut ActionContext<'_>,
+    capability: &'static str,
+    bound: &Bound,
+    execution: ObligationExecution,
+    outcome_json: &str,
+) -> Result<(), ActionError> {
+    ctx.store.update_plan_row(
+        &request.task_id,
+        &PlanRowUpdate {
+            capability,
+            handler: capability,
+            selection_revision: bound.selection.revision,
+            facts_digest: &bound.facts_digest,
+            change: PlanRowChange::Close {
+                execution,
+                outcome_json: outcome_json.to_string(),
+            },
+        },
+    )?;
+    Ok(())
+}
+
+/// Reuses the current evidence package of one scope; it never fans out to
+/// providers a package already answers.
+fn research_evidence(
+    input: ResearchEvidenceInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    non_empty(RESEARCH_EVIDENCE, &input.scope)?;
+    bounded(RESEARCH_EVIDENCE, input.scope.len(), TEXT_MAX_BYTES)?;
+    ctx.store.snapshot(&input.task_id)?;
+    let evidence: Vec<crate::contracts::Evidence> = ctx
+        .store
+        .evidence_for_task(&input.task_id)?
+        .into_iter()
+        .filter(|row| {
+            row.scope == input.scope && row.validity == crate::contracts::EvidenceValidity::Current
+        })
+        .collect();
+    if evidence.is_empty() {
+        return Ok(skip(RESEARCH_EVIDENCE, SkipReason::NeedsInformation));
+    }
+    let digest = attempt_digest(
+        RESEARCH_EVIDENCE,
+        &[&input.scope, &evidence.len().to_string()],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        RESEARCH_EVIDENCE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Researched {
+        scope: input.scope,
+        evidence,
+        attempt_id,
+    })
+}
+
+/// Records one reproduction attempt; only an observed target failure is a
+/// reproduction, never a setup gap.
+fn reproduce_issue(
+    input: ReproduceIssueInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if !legal_id(&input.check_id) {
+        return Err(ActionError::InvalidCheckId);
+    }
+    non_empty(REPRODUCE_ISSUE, &input.assertion)?;
+    bounded(REPRODUCE_ISSUE, input.assertion.len(), TEXT_MAX_BYTES)?;
+    let classification =
+        crate::verification::classify_assumption(ExpectedResult::Fail, input.observation);
+    let retained = match classification {
+        AssumptionClassification::Confirmed => None,
+        AssumptionClassification::SetupGap(cause) => Some(crate::verification::setup_gap_evidence(
+            &input.task_id,
+            &input.check_id,
+            cause,
+        )),
+        AssumptionClassification::NotReproduced => Some(crate::verification::assumption_evidence(
+            &input.task_id,
+            &input.check_id,
+            AssumptionSeam::NotReproduced,
+            "not_reproduced",
+        )),
+        AssumptionClassification::ProductDefect => Some(crate::verification::assumption_evidence(
+            &input.task_id,
+            &input.check_id,
+            AssumptionSeam::ProductDefect,
+            "product_defect",
+        )),
+    };
+    let record = AssumptionCheckRecord {
+        session_id: ctx.session_id.clone(),
+        task_id: input.task_id.clone(),
+        check_id: input.check_id.clone(),
+        expected_result: ExpectedResult::Fail,
+        assertion_digest: crate::config::hex(&sha2::Sha256::digest(input.assertion.as_bytes())),
+        observation: input.observation,
+        classification,
+        boundary_id: retained
+            .as_ref()
+            .map(|evidence| evidence.boundary_id.clone()),
+    };
+    ctx.store.record_assumption(&record, retained.as_ref())?;
+    if classification != AssumptionClassification::Confirmed {
+        return Ok(skip(REPRODUCE_ISSUE, SkipReason::NeedsInformation));
+    }
+    let digest = attempt_digest(REPRODUCE_ISSUE, &[&input.check_id]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        REPRODUCE_ISSUE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Reproduced {
+        check_id: input.check_id,
+        classification,
+        attempt_id,
+    })
+}
+
+/// Separates the hypotheses a symptom still leaves open from the one a new
+/// signal confirmed; a repeated signal is not progress.
+fn diagnose_issue(
+    input: DiagnoseIssueInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    non_empty(DIAGNOSE_ISSUE, &input.symptom)?;
+    if input.observations.is_empty() {
+        return Ok(skip(DIAGNOSE_ISSUE, SkipReason::NeedsInformation));
+    }
+    if input.observations.len() > ARRAY_MAX_ITEMS {
+        return Err(ActionError::InputOverLimit {
+            action: DIAGNOSE_ISSUE,
+            max: ARRAY_MAX_ITEMS,
+        });
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let mut hypotheses = BTreeSet::new();
+    let mut confirmed = Vec::new();
+    let mut unresolved = Vec::new();
+    for observation in &input.observations {
+        non_empty(DIAGNOSE_ISSUE, &observation.hypothesis)?;
+        bounded(DIAGNOSE_ISSUE, observation.signal.len(), TEXT_MAX_BYTES)?;
+        if !hypotheses.insert(observation.hypothesis.as_str()) {
+            return Err(ActionError::DuplicateHypothesis {
+                hypothesis: observation.hypothesis.clone(),
+            });
+        }
+        if observation.signal.trim().is_empty() {
+            unresolved.push(observation.hypothesis.clone());
+        } else {
+            confirmed.push(observation.hypothesis.clone());
+        }
+    }
+    if confirmed.is_empty() {
+        return Ok(skip(DIAGNOSE_ISSUE, SkipReason::NeedsInformation));
+    }
+    let digest = attempt_digest(DIAGNOSE_ISSUE, &[&input.symptom, &confirmed.join(",")]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        DIAGNOSE_ISSUE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Diagnosed {
+        symptom: input.symptom,
+        confirmed,
+        unresolved,
+        attempt_id,
+    })
+}
+
+/// Records one authored test with its independent expectation: behavior
+/// needs its RED, a refactor its baseline, a typo no behavior test at all.
+fn author_test(
+    input: AuthorTestInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if input.mode == ChangeMode::Typo {
+        return Ok(skip(AUTHOR_TEST, SkipReason::NotNeeded));
+    }
+    if !legal_id(&input.check_id) {
+        return Err(ActionError::InvalidCheckId);
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    if input.mode == ChangeMode::Behavior && !input.red_observed {
+        return Err(ActionError::TestWithoutRed);
+    }
+    let baseline = match input.mode {
+        ChangeMode::Refactor => {
+            let baseline = input
+                .baseline
+                .as_deref()
+                .filter(|baseline| !baseline.trim().is_empty())
+                .ok_or(ActionError::RefactorWithoutBaseline)?;
+            Some(baseline.to_string())
+        }
+        ChangeMode::Behavior | ChangeMode::Typo => None,
+    };
+    let digest = attempt_digest(AUTHOR_TEST, &[&input.check_id, input.expected.as_str()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        AUTHOR_TEST,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::TestAuthored {
+        check_id: input.check_id,
+        mode: input.mode,
+        expected: input.expected,
+        baseline,
+        attempt_id,
+    })
+}
+
+/// Closes `implement_change` on the exact plan parts it applied; the
+/// executor's result is never the whole task's readiness.
+fn implement_change(
+    input: ImplementChangeInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    match row_state(&input.request, IMPLEMENT_CHANGE, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(IMPLEMENT_CHANGE, reason)),
+        RowState::Unresolved => return Ok(skip(IMPLEMENT_CHANGE, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => {
+            return Ok(skip(IMPLEMENT_CHANGE, SkipReason::AlreadySatisfied));
+        }
+        RowState::Open(_) => {}
+    }
+    if input.parts.is_empty() {
+        return Err(ActionError::EmptyInput {
+            action: IMPLEMENT_CHANGE,
+        });
+    }
+    for part in &input.parts {
+        if !legal_id(part)
+            || (!input.request.parts.is_empty()
+                && !input.request.parts.iter().any(|known| known.id == *part))
+        {
+            return Err(ActionError::InvalidPartId { part: part.clone() });
+        }
+    }
+    let facts: Vec<&str> = input.parts.iter().map(String::as_str).collect();
+    let digest = attempt_digest(IMPLEMENT_CHANGE, &facts);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        IMPLEMENT_CHANGE,
+        EffectClass::Control,
+        &digest,
+    )?;
+    let outcome_json =
+        serde_json::json!({ "parts": input.parts, "attempt_id": attempt_id }).to_string();
+    close_row(
+        &input.request,
+        ctx,
+        IMPLEMENT_CHANGE,
+        &bound,
+        ObligationExecution::Satisfied,
+        &outcome_json,
+    )?;
+    Ok(ActionOutcome::Implemented {
+        parts: input.parts,
+        attempt_id,
+    })
+}
+
+/// Records a requested behavior-preserving refactor and refuses a change
+/// that would weaken tests.
+fn refactor_structure(
+    input: RefactorStructureInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if !input.requested {
+        return Ok(skip(REFACTOR_STRUCTURE, SkipReason::NotNeeded));
+    }
+    if !input.weakened_tests.is_empty() {
+        return Err(ActionError::RefactorWeakensTests {
+            tests: input.weakened_tests.len(),
+        });
+    }
+    if input.baseline.trim().is_empty() {
+        return Err(ActionError::RefactorWithoutBaseline);
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let digest = attempt_digest(REFACTOR_STRUCTURE, &[&input.baseline]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        REFACTOR_STRUCTURE,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::RefactorPlanned {
+        baseline: input.baseline,
+        attempt_id,
+    })
+}
+
+/// Evaluates the executed checks: an exit 0 with zero selected tests or no
+/// output is a gap, never success.
+fn validate_change(
+    input: ValidateChangeInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if input.checks.is_empty() {
+        return Ok(skip(VALIDATE_CHANGE, SkipReason::NeedsInformation));
+    }
+    if input.checks.len() > ARRAY_MAX_ITEMS {
+        return Err(ActionError::InputOverLimit {
+            action: VALIDATE_CHANGE,
+            max: ARRAY_MAX_ITEMS,
+        });
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let mut gaps = Vec::new();
+    for check in &input.checks {
+        non_empty(VALIDATE_CHANGE, &check.name)?;
+        if check.exit_code != 0 {
+            gaps.push(ValidationGap::NonZeroExit {
+                name: check.name.clone(),
+                code: check.exit_code,
+            });
+        }
+        if check.selected == Some(0) {
+            gaps.push(ValidationGap::ZeroSelection {
+                name: check.name.clone(),
+            });
+        }
+        if check.output_bytes == 0 && check.kind != CheckKind::Static {
+            gaps.push(ValidationGap::EmptyOutput {
+                name: check.name.clone(),
+            });
+        }
+    }
+    let digest = attempt_digest(
+        VALIDATE_CHANGE,
+        &[&input.checks.len().to_string(), &gaps.len().to_string()],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        VALIDATE_CHANGE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Validated {
+        checks: input.checks,
+        gaps,
+        attempt_id,
+    })
+}
+
+/// Closes `audit_tests` only on an observed mutation kill and an accepted
+/// correct alternative.
+fn audit_tests(
+    input: AuditTestsInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    match row_state(&input.request, AUDIT_TESTS, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(AUDIT_TESTS, reason)),
+        RowState::Unresolved => return Ok(skip(AUDIT_TESTS, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => {
+            return Ok(skip(AUDIT_TESTS, SkipReason::AlreadySatisfied));
+        }
+        RowState::Open(_) => {}
+    }
+    if !input.killed || !input.alternative_accepted {
+        return Err(ActionError::AuditInsufficient);
+    }
+    let digest = attempt_digest(AUDIT_TESTS, &["killed", "alternative_accepted"]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        AUDIT_TESTS,
+        EffectClass::Read,
+        &digest,
+    )?;
+    let outcome_json =
+        serde_json::json!({ "killed": true, "alternative_accepted": true, "attempt_id": attempt_id })
+            .to_string();
+    close_row(
+        &input.request,
+        ctx,
+        AUDIT_TESTS,
+        &bound,
+        ObligationExecution::Satisfied,
+        &outcome_json,
+    )?;
+    Ok(ActionOutcome::Audited {
+        killed: input.killed,
+        alternative_accepted: input.alternative_accepted,
+        attempt_id,
+    })
+}
+
+/// Closes `review_change` on findings that keep separate axes and separate
+/// evidence bases; one shared log is not several reviews.
+fn review_change(
+    input: ReviewChangeInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    match row_state(&input.request, REVIEW_CHANGE, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(REVIEW_CHANGE, reason)),
+        RowState::Unresolved => return Ok(skip(REVIEW_CHANGE, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => {
+            return Ok(skip(REVIEW_CHANGE, SkipReason::AlreadySatisfied));
+        }
+        RowState::Open(_) => {}
+    }
+    if input.findings.is_empty() {
+        return Ok(skip(REVIEW_CHANGE, SkipReason::NeedsInformation));
+    }
+    let mut bases = BTreeMap::new();
+    for finding in &input.findings {
+        non_empty(REVIEW_CHANGE, &finding.axis)?;
+        non_empty(REVIEW_CHANGE, &finding.basis)?;
+        if let Some(previous) = bases.insert(finding.axis.as_str(), finding.basis.as_str())
+            && previous != finding.basis
+        {
+            return Err(ActionError::SharedReviewBasis);
+        }
+    }
+    let distinct_bases: BTreeSet<&str> = input
+        .findings
+        .iter()
+        .map(|finding| finding.basis.as_str())
+        .collect();
+    if input.findings.len() > 1 && distinct_bases.len() == 1 {
+        return Err(ActionError::SharedReviewBasis);
+    }
+    let digest = attempt_digest(
+        REVIEW_CHANGE,
+        &[
+            &input.findings.len().to_string(),
+            &distinct_bases.len().to_string(),
+        ],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        REVIEW_CHANGE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    let axes: Vec<&str> = input
+        .findings
+        .iter()
+        .map(|finding| finding.axis.as_str())
+        .collect();
+    let outcome_json =
+        serde_json::json!({ "axes": axes, "findings": input.findings.len(), "attempt_id": attempt_id })
+            .to_string();
+    close_row(
+        &input.request,
+        ctx,
+        REVIEW_CHANGE,
+        &bound,
+        ObligationExecution::Satisfied,
+        &outcome_json,
+    )?;
+    Ok(ActionOutcome::Reviewed {
+        findings: input.findings,
+        attempt_id,
+    })
+}
+
+/// Closes `assess_security` only when every security-triggering surface
+/// carries its own negative check.
+fn assess_security(
+    input: AssessSecurityInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    match row_state(&input.request, ASSESS_SECURITY, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(ASSESS_SECURITY, reason)),
+        RowState::Unresolved => return Ok(skip(ASSESS_SECURITY, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => {
+            return Ok(skip(ASSESS_SECURITY, SkipReason::AlreadySatisfied));
+        }
+        RowState::Open(_) => {}
+    }
+    for check in &input.checks {
+        non_empty(ASSESS_SECURITY, &check.negative_check)?;
+        non_empty(ASSESS_SECURITY, &check.confidence)?;
+    }
+    let selected = input.request.surfaces.decided();
+    for surface in selected
+        .into_iter()
+        .flatten()
+        .filter(|surface| surface.triggers_security())
+    {
+        if !input
+            .checks
+            .iter()
+            .any(|check| check.surface == *surface && !check.negative_check.trim().is_empty())
+        {
+            return Err(ActionError::MissingSecurityCheck {
+                surface: surface.as_str(),
+            });
+        }
+    }
+    let digest = attempt_digest(ASSESS_SECURITY, &[&input.checks.len().to_string()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        ASSESS_SECURITY,
+        EffectClass::Read,
+        &digest,
+    )?;
+    let outcome_json = serde_json::json!({
+        "checks": input.checks.len(),
+        "attempt_id": attempt_id,
+    })
+    .to_string();
+    close_row(
+        &input.request,
+        ctx,
+        ASSESS_SECURITY,
+        &bound,
+        ObligationExecution::Satisfied,
+        &outcome_json,
+    )?;
+    Ok(ActionOutcome::SecurityAssessed {
+        checks: input.checks,
+        attempt_id,
+    })
+}
+
+/// Compares a baseline against a candidate under one load; a missing
+/// baseline or a single sample is not an improvement.
+fn assess_performance(
+    input: AssessPerformanceInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    non_empty(ASSESS_PERFORMANCE, &input.load)?;
+    if input.baseline.samples == 0 {
+        return Ok(skip(ASSESS_PERFORMANCE, SkipReason::NeedsInformation));
+    }
+    if input.candidate.samples < 2 {
+        return Ok(skip(ASSESS_PERFORMANCE, SkipReason::NeedsInformation));
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let digest = attempt_digest(
+        ASSESS_PERFORMANCE,
+        &[
+            &input.load,
+            &input.baseline.nanos.to_string(),
+            &input.candidate.nanos.to_string(),
+        ],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        ASSESS_PERFORMANCE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::PerformanceAssessed {
+        load: input.load,
+        baseline: input.baseline,
+        candidate: input.candidate,
+        improved: input.candidate.nanos < input.baseline.nanos,
+        attempt_id,
+    })
+}
+
+/// Evaluates entered journeys on one surface; a screenshot alone is not a
+/// journey.
+fn assess_experience(
+    input: AssessExperienceInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    ctx.store.snapshot(&input.task_id)?;
+    for journey in &input.journeys {
+        non_empty(ASSESS_EXPERIENCE, &journey.entered)?;
+    }
+    let answered = input
+        .journeys
+        .iter()
+        .any(|journey| journey.exit_code == 0 && journey.output_bytes > 0);
+    if !answered {
+        return Ok(skip(ASSESS_EXPERIENCE, SkipReason::NeedsInformation));
+    }
+    let digest = attempt_digest(
+        ASSESS_EXPERIENCE,
+        &[
+            input.surface.as_str(),
+            &input.journeys.len().to_string(),
+            if input.screenshot {
+                "screenshot"
+            } else {
+                "no_screenshot"
+            },
+        ],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        ASSESS_EXPERIENCE,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::ExperienceAssessed {
+        surface: input.surface,
+        journeys: input.journeys,
+        screenshot: input.screenshot,
+        attempt_id,
+    })
+}
+
+/// Accepts integration evidence only at the candidate level; local passes
+/// alone are not a shared-candidate proof.
+fn validate_integration(
+    input: ValidateIntegrationInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    non_empty(VALIDATE_INTEGRATION, &input.candidate.digest)?;
+    if input.candidate.consumers.is_empty() || input.candidate.compatibility.is_empty() {
+        return Ok(skip(VALIDATE_INTEGRATION, SkipReason::NeedsInformation));
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let digest = attempt_digest(
+        VALIDATE_INTEGRATION,
+        &[
+            &input.candidate.digest,
+            &input.candidate.consumers.len().to_string(),
+        ],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        VALIDATE_INTEGRATION,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::IntegrationValidated {
+        candidate: input.candidate,
+        local_passes: input.local_passes,
+        attempt_id,
+    })
+}
+
+/// Classifies findings into confirmed, refuted, stale and duplicate, and
+/// names the repairs the confirmed ones require.
+fn reconcile_findings(
+    input: ReconcileFindingsInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if input.findings.is_empty() {
+        return Ok(skip(RECONCILE_FINDINGS, SkipReason::NotNeeded));
+    }
+    if input.findings.len() > ARRAY_MAX_ITEMS {
+        return Err(ActionError::InputOverLimit {
+            action: RECONCILE_FINDINGS,
+            max: ARRAY_MAX_ITEMS,
+        });
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let mut seen = BTreeSet::new();
+    let mut required_fixes = Vec::new();
+    let (mut confirmed, mut refuted, mut stale, mut duplicates) = (0_usize, 0, 0, 0);
+    for finding in &input.findings {
+        non_empty(RECONCILE_FINDINGS, &finding.id)?;
+        if !seen.insert(finding.id.as_str()) {
+            return Err(ActionError::DuplicateFinding {
+                finding: finding.id.clone(),
+            });
+        }
+        match finding.status {
+            FindingStatus::Confirmed => {
+                confirmed += 1;
+                required_fixes.push(finding.id.clone());
+            }
+            FindingStatus::Refuted => refuted += 1,
+            FindingStatus::Stale => stale += 1,
+            FindingStatus::Duplicate => duplicates += 1,
+        }
+    }
+    let digest = attempt_digest(
+        RECONCILE_FINDINGS,
+        &[
+            &input.findings.len().to_string(),
+            &required_fixes.len().to_string(),
+        ],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        RECONCILE_FINDINGS,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Reconciled {
+        confirmed,
+        refuted,
+        stale,
+        duplicates,
+        required_fixes,
+        attempt_id,
+    })
+}
+
+/// Replaces exactly one approach part and refuses a repair that would drop
+/// an obligation; a code fix stays `implement_change`.
+fn repair_approach(
+    input: RepairApproachInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if input.replacement.id != input.part {
+        return Err(ActionError::InvalidPartId {
+            part: input.replacement.id,
+        });
+    }
+    if !input.request.parts.iter().any(|part| part.id == input.part) {
+        return Err(ActionError::InvalidPartId { part: input.part });
+    }
+    let mut before: Vec<CriterionId> = Vec::new();
+    let mut after: Vec<CriterionId> = Vec::new();
+    for part in &input.request.parts {
+        for criterion in &part.criteria {
+            if !before.contains(criterion) {
+                before.push(criterion.clone());
+            }
+        }
+        let changed = if part.id == input.part {
+            &input.replacement.criteria
+        } else {
+            &part.criteria
+        };
+        for criterion in changed {
+            if !after.contains(criterion) {
+                after.push(criterion.clone());
+            }
+        }
+    }
+    if let Some(dropped) = before.iter().find(|criterion| !after.contains(criterion)) {
+        return Err(ActionError::RepairDropsCriterion {
+            criterion: dropped.0.clone(),
+        });
+    }
+    ctx.store.snapshot(&input.request.task_id)?;
+    let digest = attempt_digest(REPAIR_APPROACH, &[&input.part, &after.len().to_string()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        REPAIR_APPROACH,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::ApproachRepaired {
+        part: input.part,
+        criteria: after.into_iter().collect(),
+        attempt_id,
+    })
+}
+
+/// Reports readiness from the current selection's rows and blockers: an
+/// empty queue or a green todo list is not proof.
+fn assess_readiness(
+    input: AssessReadinessInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    let already = match row_state(&input.request, ASSESS_READINESS, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(ASSESS_READINESS, reason)),
+        RowState::Unresolved => return Ok(skip(ASSESS_READINESS, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => true,
+        RowState::Open(_) => false,
+    };
+    let mut remaining = Vec::new();
+    for row in ctx.store.plan_obligations(&input.request.task_id)? {
+        if row.capability == ASSESS_READINESS || row.execution == ObligationExecution::Satisfied {
+            continue;
+        }
+        remaining.push(row.capability);
+    }
+    let blockers = ctx
+        .store
+        .snapshot(&input.request.task_id)?
+        .blockers
+        .unwrap_or_default();
+    let foreign_blockers = blockers
+        .iter()
+        .filter(|blocker| {
+            !matches!(
+                &blocker.condition,
+                ResumeCondition::Dependency { action_id } if action_id.0 == ASSESS_READINESS
+            )
+        })
+        .count();
+    if foreign_blockers > 0 {
+        remaining.push("blockers".to_string());
+    }
+    if !remaining.is_empty() {
+        if already {
+            // A satisfied verdict no longer holds: record the failing
+            // re-check and hold completion on it instead of leaving a stale
+            // ready row behind a new plan revision or reopened obligation.
+            close_row(
+                &input.request,
+                ctx,
+                ASSESS_READINESS,
+                &bound,
+                ObligationExecution::Failed,
+                &serde_json::json!({ "ready": false, "remaining": remaining }).to_string(),
+            )?;
+            let blocker = plan_blocker(ErrorCode::DependencyBlocked, ASSESS_READINESS);
+            ctx.store.update_plan_row(
+                &input.request.task_id,
+                &PlanRowUpdate {
+                    capability: ASSESS_READINESS,
+                    handler: ASSESS_READINESS,
+                    selection_revision: bound.selection.revision,
+                    facts_digest: &bound.facts_digest,
+                    change: PlanRowChange::Block(blocker),
+                },
+            )?;
+        }
+        return Ok(ActionOutcome::Readiness {
+            ready: false,
+            remaining,
+            attempt_id: None,
+        });
+    }
+    if already {
+        return Ok(skip(ASSESS_READINESS, SkipReason::AlreadySatisfied));
+    }
+    let digest = attempt_digest(ASSESS_READINESS, &[&bound.selection.revision.to_string()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        ASSESS_READINESS,
+        EffectClass::Read,
+        &digest,
+    )?;
+    close_row(
+        &input.request,
+        ctx,
+        ASSESS_READINESS,
+        &bound,
+        ObligationExecution::Satisfied,
+        &serde_json::json!({ "ready": true }).to_string(),
+    )?;
+    Ok(ActionOutcome::Readiness {
+        ready: true,
+        remaining,
+        attempt_id: Some(attempt_id),
+    })
+}
+
+/// Grounds every explanation claim in a recorded evidence row; an
+/// unsupported claim is refused rather than written as prose.
+fn explain_result(
+    input: ExplainResultInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    if input.claims.is_empty() {
+        return Ok(skip(EXPLAIN_RESULT, SkipReason::NotNeeded));
+    }
+    if input.claims.len() > ARRAY_MAX_ITEMS {
+        return Err(ActionError::InputOverLimit {
+            action: EXPLAIN_RESULT,
+            max: ARRAY_MAX_ITEMS,
+        });
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let recorded: BTreeSet<String> = ctx
+        .store
+        .evidence_for_task(&input.task_id)?
+        .into_iter()
+        .map(|row| row.evidence_id.0)
+        .collect();
+    for (index, claim) in input.claims.iter().enumerate() {
+        non_empty(EXPLAIN_RESULT, &claim.text)?;
+        bounded(EXPLAIN_RESULT, claim.text.len(), TEXT_MAX_BYTES)?;
+        let cited = claim
+            .evidence
+            .as_ref()
+            .filter(|evidence| recorded.contains(*evidence));
+        if cited.is_none() {
+            return Err(ActionError::UnsupportedClaim { index });
+        }
+    }
+    let digest = attempt_digest(EXPLAIN_RESULT, &[&input.claims.len().to_string()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        EXPLAIN_RESULT,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Explained {
+        claims: input.claims,
+        attempt_id,
+    })
+}
+
+/// Prepares one delivery through the owner's own seam: preparation is not
+/// authorization and writes no destination byte.
+fn prepare_delivery(
+    input: PrepareDeliveryInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    ctx.store.snapshot(&input.task_id)?;
+    let intent =
+        crate::update::prepare_delivery(&mut ctx.store.writer(), ctx.policy, input.intent)?;
+    let digest = attempt_digest(
+        PREPARE_DELIVERY,
+        &[&intent.candidate.digest, &intent.destination],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        PREPARE_DELIVERY,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::DeliveryPrepared { intent, attempt_id })
+}
+
+/// Delivers one prepared intent through the publication journal and closes
+/// its selection row on the retained receipt.
+fn deliver_change(
+    input: DeliverChangeInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let bound = bind(&input.request, ctx)?;
+    match row_state(&input.request, DELIVER_CHANGE, ctx)? {
+        RowState::Absent(reason) => return Ok(skip(DELIVER_CHANGE, reason)),
+        RowState::Unresolved => return Ok(skip(DELIVER_CHANGE, SkipReason::NeedsInformation)),
+        RowState::Open(ObligationExecution::Satisfied) => {
+            return Ok(skip(DELIVER_CHANGE, SkipReason::AlreadySatisfied));
+        }
+        RowState::Open(_) => {}
+    }
+    let receipt = crate::update::deliver_change(
+        &mut ctx.store.writer(),
+        ctx.policy,
+        &input.intent,
+        &input.candidate,
+    )?;
+    let digest = attempt_digest(
+        DELIVER_CHANGE,
+        &[&receipt.intended_digest, &receipt.admission_seq.to_string()],
+    );
+    let outcome_json = serde_json::to_string(&receipt)?;
+    if receipt.outcome == DeliveryOutcome::Unknown {
+        // The effect cannot be proven either way: the journal row stays
+        // pending and the task waits on reconciliation, never on a
+        // satisfied row built from unknown bytes.
+        let attempt_id = ctx.store.plan_attempt(
+            &input.request.task_id,
+            EffectClass::Write,
+            &format!("{DELIVER_CHANGE}:{digest}"),
+        )?;
+        ctx.store.attempt_running(&attempt_id)?;
+        ctx.store.attempt_unknown(&attempt_id, "outcome_unknown")?;
+        close_row(
+            &input.request,
+            ctx,
+            DELIVER_CHANGE,
+            &bound,
+            ObligationExecution::Failed,
+            &outcome_json,
+        )?;
+        let blocker = Blocker {
+            reason: ErrorCode::OutcomeUnknown,
+            owner: PLAN_BLOCKER_OWNER.to_string(),
+            condition: ResumeCondition::Reconciliation {
+                action_id: crate::contracts::ActionId(DELIVER_CHANGE.to_string()),
+            },
+        };
+        ctx.store.update_plan_row(
+            &input.request.task_id,
+            &PlanRowUpdate {
+                capability: DELIVER_CHANGE,
+                handler: DELIVER_CHANGE,
+                selection_revision: bound.selection.revision,
+                facts_digest: &bound.facts_digest,
+                change: PlanRowChange::Block(blocker),
+            },
+        )?;
+        return Ok(ActionOutcome::Delivered {
+            receipt,
+            attempt_id,
+        });
+    }
+    let attempt_id = record_attempt(
+        ctx,
+        &input.request.task_id,
+        DELIVER_CHANGE,
+        EffectClass::Write,
+        &digest,
+    )?;
+    close_row(
+        &input.request,
+        ctx,
+        DELIVER_CHANGE,
+        &bound,
+        ObligationExecution::Satisfied,
+        &outcome_json,
+    )?;
+    Ok(ActionOutcome::Delivered {
+        receipt,
+        attempt_id,
+    })
+}
+
+/// Reports the substantive signal of a bounded observation window; an
+/// expired window is never renewed and no timer polls a model.
+fn observe_outcome(
+    input: ObserveOutcomeInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return Ok(skip(OBSERVE_OUTCOME, SkipReason::NeedsInformation));
+    };
+    if elapsed.as_secs() > input.budget_end_unix {
+        return Ok(skip(OBSERVE_OUTCOME, SkipReason::NeedsInformation));
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let Some(signal) = input
+        .samples
+        .iter()
+        .rev()
+        .map(|sample| sample.signal.as_str())
+        .find(|signal| !signal.trim().is_empty())
+    else {
+        return Ok(skip(OBSERVE_OUTCOME, SkipReason::NeedsInformation));
+    };
+    let signal = signal.to_string();
+    let digest = attempt_digest(
+        OBSERVE_OUTCOME,
+        &[&signal, &input.samples.len().to_string()],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        OBSERVE_OUTCOME,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Observed {
+        signal,
+        window_end_unix: input.budget_end_unix,
+        attempt_id,
+    })
+}
+
+/// Builds a bounded continuation checkpoint from the store; nothing is
+/// summarized by a paid model.
+fn prepare_handoff(
+    input: PrepareHandoffInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let snapshot = ctx.store.snapshot(&input.task_id)?;
+    let pending_question = ctx
+        .store
+        .current_question(&input.task_id)?
+        .map(|(question, _)| question.question_id);
+    let open_obligations: Vec<String> = snapshot
+        .obligations
+        .items
+        .iter()
+        .filter(|obligation| obligation.execution != ObligationExecution::Satisfied)
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    if snapshot.lifecycle.is_terminal() && open_obligations.is_empty() && pending_question.is_none()
+    {
+        return Ok(skip(PREPARE_HANDOFF, SkipReason::NotNeeded));
+    }
+    let digest = attempt_digest(PREPARE_HANDOFF, &[&snapshot.revision.to_string()]);
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        PREPARE_HANDOFF,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::Handoff {
+        checkpoint: HandoffCheckpoint {
+            task_id: snapshot.task_id,
+            revision: snapshot.revision,
+            intent_revision: snapshot.intent_revision,
+            lifecycle: snapshot.lifecycle,
+            criteria: snapshot.criteria.items.len(),
+            open_obligations,
+            pending_question,
+        },
+        attempt_id,
+    })
+}
+
+/// Derives a procedure candidate only from a plan that actually executed;
+/// every tool output is not a learning trigger.
+fn improve_procedure(
+    input: ImproveProcedureInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    let segment = match ctx.store.record_procedure_segment(&input.task_id) {
+        Ok(segment) => segment,
+        Err(
+            crate::procedure::ProcedureError::PlanMissing { .. }
+            | crate::procedure::ProcedureError::NoExecutedSteps { .. }
+            | crate::procedure::ProcedureError::PlanSuperseded { .. },
+        ) => return Ok(skip(IMPROVE_PROCEDURE, SkipReason::NeedsInformation)),
+        Err(error) => return Err(error.into()),
+    };
+    let digest = attempt_digest(
+        IMPROVE_PROCEDURE,
+        &[&segment.procedure_id, &segment.plan_revision.to_string()],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        IMPROVE_PROCEDURE,
+        EffectClass::Control,
+        &digest,
+    )?;
+    Ok(ActionOutcome::ProcedureImproved {
+        segment,
+        attempt_id,
+    })
+}
+
+/// Attributes a harness defect to a component from safe trace signals; a
+/// user-code defect is not this row, and no path rewrites the runtime.
+fn diagnose_harness(
+    input: DiagnoseHarnessInput,
+    ctx: &mut ActionContext<'_>,
+) -> Result<ActionOutcome, ActionError> {
+    for signal in &input.signals {
+        non_empty(DIAGNOSE_HARNESS, &signal.signal)?;
+        bounded(DIAGNOSE_HARNESS, signal.signal.len(), TEXT_MAX_BYTES)?;
+    }
+    if input.fault == HarnessComponent::UserCode {
+        return Ok(skip(DIAGNOSE_HARNESS, SkipReason::NotNeeded));
+    }
+    ctx.store.snapshot(&input.task_id)?;
+    let attributed: Vec<String> = input
+        .signals
+        .iter()
+        .filter(|signal| signal.component == input.fault)
+        .map(|signal| signal.signal.clone())
+        .collect();
+    if attributed.is_empty() {
+        let user_code_only = !input.signals.is_empty()
+            && input
+                .signals
+                .iter()
+                .all(|signal| signal.component == HarnessComponent::UserCode);
+        return Ok(skip(
+            DIAGNOSE_HARNESS,
+            if user_code_only {
+                SkipReason::NotNeeded
+            } else {
+                SkipReason::NeedsInformation
+            },
+        ));
+    }
+    let digest = attempt_digest(
+        DIAGNOSE_HARNESS,
+        &[input.fault.as_str(), &attributed.len().to_string()],
+    );
+    let attempt_id = record_attempt(
+        ctx,
+        &input.task_id,
+        DIAGNOSE_HARNESS,
+        EffectClass::Read,
+        &digest,
+    )?;
+    Ok(ActionOutcome::HarnessDiagnosed {
+        component: input.fault,
+        signals: attributed,
+        attempt_id,
     })
 }
 
@@ -2915,6 +4840,197 @@ fn plan_definitions() -> [ActionDefinition; 5] {
     ]
 }
 
+/// The 23 execution-phase rows: each names its own trigger, the case it
+/// must never answer, and the typed outcome it produces.
+fn execution_definitions() -> [ActionDefinition; 23] {
+    [
+        ActionDefinition {
+            id: RESEARCH_EVIDENCE,
+            revision: 1,
+            trigger: "a decision needs the current recorded evidence package of one scope",
+            negative_trigger: "not when the scope holds no current evidence package — external acquisition is not run (NOT_RUN) and never fans out to every provider",
+            outcome: "the current recorded evidence of one scope with its attempt, reused instead of re-acquired",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: REPRODUCE_ISSUE,
+            revision: 1,
+            trigger: "a bug, regression or wrong result needs its original symptom confirmed",
+            negative_trigger: "an unrelated setup error is not the target RED and is never reported as reproduced",
+            outcome: "one reproduction record: the observed target failure, or the classification that ended observation",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: DIAGNOSE_ISSUE,
+            revision: 1,
+            trigger: "a confirmed problem, unclear cause or repeated failure needs separable hypotheses",
+            negative_trigger: "an identical retry without a new signal is not progress",
+            outcome: "the confirmed hypotheses, the unresolved ones and the next grounded repair",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: AUTHOR_TEST,
+            revision: 1,
+            trigger: "behavior changes, a bug is fixed, or a discriminating test is missing",
+            negative_trigger: "a typo needs no behavior test, and a refactor uses its baseline instead of a fake RED",
+            outcome: "one authored test with its independent expectation, RED observation or preserved baseline",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: IMPLEMENT_CHANGE,
+            revision: 1,
+            trigger: "the goal, decisions, scope, inputs and TDD conditions are sufficient for the edit",
+            negative_trigger: "a plan-only request or an insufficient decision authorizes no edit",
+            outcome: "the exact plan parts the implementation applied; the executor's result is not task readiness",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: REFACTOR_STRUCTURE,
+            revision: 1,
+            trigger: "a refactor is requested or provably needed inside the authorized task",
+            negative_trigger: "no unrequested whole-project rewrite or abstraction, and no weakened tests",
+            outcome: "the requested structure change with the behavior-preserving baseline it keeps",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: VALIDATE_CHANGE,
+            revision: 1,
+            trigger: "behavior or presentation changed, or the evidence is absent or no longer current",
+            negative_trigger: "exit 0 with an empty selection or no output is not success",
+            outcome: "the real static, test, runtime and surface checks with their gaps, exit and selection distinguished",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: AUDIT_TESTS,
+            revision: 1,
+            trigger: "tautology, fake PASS, a fragile oracle, missing coverage or a verifier change is at risk",
+            negative_trigger: "not a universal mutation run on every line",
+            outcome: "the observed mutation kill and accepted correct alternative, closing only this row",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: REVIEW_CHANGE,
+            revision: 1,
+            trigger: "a semantic spec or standards review, or an independent look by risk, is needed",
+            negative_trigger: "one shared log is not several independent reviews",
+            outcome: "findings with separate axes and separate evidence bases",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: ASSESS_SECURITY,
+            revision: 1,
+            trigger: "rights, secrets, trust, input, isolation, dependencies or private data are touched",
+            negative_trigger: "no arbitrary external pentest, and a label is not a safety proof",
+            outcome: "the applicable negative checks and their confidence bounds for every security-triggering surface",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: ASSESS_PERFORMANCE,
+            revision: 1,
+            trigger: "a regression, a performance goal or a changed critical path needs measuring",
+            negative_trigger: "reading code or one lucky sample does not prove an improvement",
+            outcome: "baseline and candidate measurements under one load with the resulting delta",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: ASSESS_EXPERIENCE,
+            revision: 1,
+            trigger: "TUI, CLI, library, accessibility, install or documentation surfaces changed",
+            negative_trigger: "a screenshot alone is not journey proof",
+            outcome: "the entered journeys, their exits and output sizes, and whether a capture accompanied them",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: VALIDATE_INTEGRATION,
+            revision: 1,
+            trigger: "parts interact, or a consumer/provider contract, schema, protocol or migration changed",
+            negative_trigger: "no Git conflict and a sum of local passes is not shared-candidate proof",
+            outcome: "candidate-level evidence with the consumers and compatibility it keeps",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: RECONCILE_FINDINGS,
+            revision: 1,
+            trigger: "several findings, conflicting assessments or a repair result need reconciliation",
+            negative_trigger: "no model vote and no automatic work per style suggestion",
+            outcome: "confirmed, refuted, stale and duplicate findings with the repairs the confirmed ones require",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: REPAIR_APPROACH,
+            revision: 1,
+            trigger: "the current decomposition is wrong, a criterion dropped out, or a new dependency blocks it",
+            negative_trigger: "no restart of the whole lifecycle and no code rewrite by a plan handler",
+            outcome: "exactly the changed approach part, with every obligation it carries preserved",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: ASSESS_READINESS,
+            revision: 1,
+            trigger: "an executor reports done, or the remaining work needs a check against the goal",
+            negative_trigger: "an empty queue, an all-green todo list or the word done is not proof",
+            outcome: "the remaining required rows and blockers reported against the current selection",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: EXPLAIN_RESULT,
+            revision: 1,
+            trigger: "a user asked for an explanation, plan or research result, or the task completed",
+            negative_trigger: "no separate prose agent per message, and an unsupported claim is rejected",
+            outcome: "the requested-depth answer with its factual limits and recorded evidence references",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: PREPARE_DELIVERY,
+            revision: 1,
+            trigger: "publication, commit, PR or deploy is actually part of the request",
+            negative_trigger: "an ordinary code change needs no delivery, and preparation grants no permission",
+            outcome: "one prepared intent: the exact candidate, its preflight checks and the disclosed effect plan",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: DELIVER_CHANGE,
+            revision: 1,
+            trigger: "a current sufficient grant and its mandatory conditions are in hand",
+            negative_trigger: "an expired or mismatched grant publishes nothing, and a lost receipt is never repeated blindly",
+            outcome: "the retained delivery receipt or outcome_unknown, with the journal row that records it",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: OBSERVE_OUTCOME,
+            revision: 1,
+            trigger: "a user asked to observe, or observation is part of the authorized operation's criteria",
+            negative_trigger: "no endless monitoring, automatic renewal, model timer or repair permission",
+            outcome: "the bounded window and the substantive signal it observed",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: PREPARE_HANDOFF,
+            revision: 1,
+            trigger: "a session ends, the executor changes, work pauses or resources run out",
+            negative_trigger: "not a paid summary on every tool action",
+            outcome: "a bounded continuation checkpoint and the artifacts available to the next executor",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: IMPROVE_PROCEDURE,
+            revision: 1,
+            trigger: "a significant verified observation or an explicit improvement request exists",
+            negative_trigger: "every tool output is not a costly learning trigger, and an unsafe trigger is rejected",
+            outcome: "a derived procedure candidate only from a plan that actually executed",
+            implementation: Implementation::Local,
+        },
+        ActionDefinition {
+            id: DIAGNOSE_HARNESS,
+            revision: 1,
+            trigger: "evidence names an adapter, migration, scheduler, rendering or policy defect, not user code",
+            negative_trigger: "user code is not a harness defect and the runtime never rewrites its own executable code",
+            outcome: "the attributed component and the safe trace signals that classify it",
+            implementation: Implementation::Local,
+        },
+    ]
+}
+
 /// Publishes the fork — or, when the identical fork is already pending,
 /// serves the live question instead of minting a second one. The store
 /// admits `publish_question` only on a running task, so the dedupe reads
@@ -3099,11 +5215,13 @@ mod tests {
         if close_store {
             store.close()?;
         }
+        let policy = crate::policy::Policy::default();
         let mut context = ActionContext {
             store: &mut store,
             session_id: &session,
             config: &config,
             index: &index,
+            policy: &policy,
         };
         let outcome = ActionRegistry::new().execute(
             ActionInput::InspectSystem(InspectSystemInput::default()),
@@ -3211,16 +5329,19 @@ mod closed_surface_twins {
     }
 
     fn literal(store: &mut TaskStore, session: &SessionId, config: &Config, index: &IndexSeam) {
+        let policy = crate::policy::Policy::default();
         let _ctx = ActionContext {
             store,
             session_id: session,
             config,
             index,
+            policy: &policy,
         };
     }
 
     fn constructor(store: &mut TaskStore, session: &SessionId, config: &Config, index: &IndexSeam) {
-        let _ctx = ActionContext::new(store, session, config, index);
+        let policy = crate::policy::Policy::default();
+        let _ctx = ActionContext::new(store, session, config, index, &policy);
     }
 
     #[test]

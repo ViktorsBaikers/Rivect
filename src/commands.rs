@@ -265,6 +265,7 @@ pub struct Runtime {
 enum PendingLogin {
     Browser(crate::providers::openai_login::LoginSession),
     Device(crate::providers::openai_login::DeviceLoginSession),
+    KimiDevice(crate::providers::kimi::DeviceLoginSession),
 }
 
 impl PendingLogin {
@@ -272,6 +273,7 @@ impl PendingLogin {
         match self {
             Self::Browser(session) => session.state(),
             Self::Device(device) => device.state(),
+            Self::KimiDevice(device) => device.state(),
         }
     }
 }
@@ -1001,7 +1003,13 @@ impl Runtime {
         session_id: &'a SessionId,
         config: &'a config::Config,
     ) -> crate::actions::ActionContext<'a> {
-        crate::actions::ActionContext::new(&mut self.owner.store, session_id, config, &self.index)
+        crate::actions::ActionContext::new(
+            &mut self.owner.store,
+            session_id,
+            config,
+            &self.index,
+            &self.policy,
+        )
     }
 }
 
@@ -2210,6 +2218,9 @@ const METHODS: &[&str] = &[
     "auth.login.begin",
     "auth.login.complete",
     "auth.login.cancel",
+    "auth.refresh",
+    "auth.logout",
+    "auth.revoke",
     "sharing.grant.open",
     "sharing.attach",
     "sharing.grant.revoke",
@@ -5146,6 +5157,9 @@ fn handle_method(
         "auth.login.begin" => auth_login_begin(rt, ingress, &params, id),
         "auth.login.complete" => auth_login_complete(rt, ingress, &params, id),
         "auth.login.cancel" => auth_login_cancel(rt, ingress, &params, id),
+        "auth.refresh" => auth_refresh(rt, ingress, &params, id),
+        "auth.logout" => auth_logout(rt, ingress, &params, id),
+        "auth.revoke" => auth_revoke(rt, ingress, &params, id),
         "sharing.grant.open" => sharing_grant_open(rt, ingress, &params, id),
         "sharing.attach" => sharing_attach(rt, &params, id),
         "sharing.grant.revoke" => sharing_grant_revoke(rt, ingress, &params, id),
@@ -7050,6 +7064,50 @@ fn auth_login_begin(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Valu
     let endpoints = recorded;
     let config = rt.config_for_broker();
     match mode {
+        "browser" if connection == crate::providers::kimi::CONNECTION => request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: "auth.login.begin".to_string(),
+                reason: "kimi-code records device-code login only".to_string(),
+            },
+        ),
+        "device" if connection == crate::providers::kimi::CONNECTION => {
+            let recorded = crate::providers::kimi::Endpoints::recorded();
+            #[cfg(any(test, debug_assertions))]
+            let endpoints = {
+                let device_authorization = match optional_string(params, "usercode_endpoint") {
+                    Ok(value) => value
+                        .unwrap_or(recorded.device_authorization.as_str())
+                        .to_string(),
+                    Err(error) => return request_error(id, error),
+                };
+                let token = match optional_string(params, "device_token_endpoint") {
+                    Ok(value) => value.unwrap_or(recorded.token.as_str()).to_string(),
+                    Err(error) => return request_error(id, error),
+                };
+                crate::providers::kimi::Endpoints {
+                    device_authorization,
+                    token,
+                }
+            };
+            #[cfg(not(any(test, debug_assertions)))]
+            let endpoints = recorded;
+            match crate::providers::kimi::begin_device_login(&config, connection, endpoints) {
+                Ok(device) => {
+                    let result = json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "state": device.state(),
+                        "verification_url": device.verification_url(),
+                        "verification_uri_complete": device.verification_uri_complete(),
+                        "user_code": device.user_code(),
+                        "expires_in": device.expires_in(),
+                    });
+                    rt.pending_login = Some(PendingLogin::KimiDevice(device));
+                    RpcResponse::ok(id, result)
+                }
+                Err(error) => kimi_login_error(id, &error),
+            }
+        }
         "browser" => {
             match crate::providers::openai_login::begin_login(
                 &config,
@@ -7219,6 +7277,54 @@ fn auth_login_complete(
                 }
             }
         }
+        PendingLogin::KimiDevice(mut device) => {
+            let connection = device.connection().to_string();
+            let store = match crate::providers::kimi::login_store(
+                &config,
+                &connection,
+                rt.login_credentials.as_ref(),
+            ) {
+                Ok(store) => store,
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::KimiDevice(device));
+                    return kimi_login_error(id, &error);
+                }
+            };
+            match crate::providers::kimi::advance_device_login(
+                &config,
+                &connection,
+                &mut device,
+                store.as_ref(),
+            ) {
+                Ok(crate::providers::kimi::DeviceAdvance::Complete(profile)) => RpcResponse::ok(
+                    id,
+                    json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "profile": profile,
+                    }),
+                ),
+                Ok(advance) => {
+                    let state =
+                        if matches!(advance, crate::providers::kimi::DeviceAdvance::SlowDown) {
+                            "slow_down"
+                        } else {
+                            "pending"
+                        };
+                    rt.pending_login = Some(PendingLogin::KimiDevice(device));
+                    RpcResponse::ok(
+                        id,
+                        json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "state": state,
+                        }),
+                    )
+                }
+                Err(error) => {
+                    rt.pending_login = Some(PendingLogin::KimiDevice(device));
+                    kimi_login_error(id, &error)
+                }
+            }
+        }
     }
 }
 
@@ -7240,6 +7346,173 @@ fn auth_login_cancel(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Val
             "state": if cancelled { "cancelled" } else { "none" },
         }),
     )
+}
+
+/// The `auth.refresh`/`auth.logout`/`auth.revoke` parameter set: the one
+/// connection whose scoped profile the op names. The token endpoint override
+/// joins the set only under the same debug/test gate as the login legs, so a
+/// release caller cannot redirect the refresh.
+const AUTH_LIFECYCLE_PARAMS: &[&str] = &["schema_version", "connection"];
+const AUTH_LIFECYCLE_ENDPOINT_PARAMS: &[&str] = &["device_token_endpoint"];
+
+/// The first unknown key of one lifecycle request, under the login legs'
+/// endpoint-override gate.
+fn unknown_auth_lifecycle_param(params: &Value) -> Option<RequestError> {
+    if LOGIN_ENDPOINT_OVERRIDE {
+        return params
+            .as_object()?
+            .keys()
+            .find(|key| {
+                !AUTH_LIFECYCLE_PARAMS.contains(&key.as_str())
+                    && !AUTH_LIFECYCLE_ENDPOINT_PARAMS.contains(&key.as_str())
+            })
+            .map(|name| RequestError::UnknownParameter { name: name.clone() });
+    }
+    unknown_param(params, AUTH_LIFECYCLE_PARAMS)
+}
+
+/// The one declared credential lifecycle this surface serves: the Kimi Code
+/// row's scoped reference, the store its login wrote through, and the
+/// recorded refresh endpoint. Every other connection denies typed here, so a
+/// lifecycle call can never steer another owner's credential.
+fn kimi_lifecycle(
+    rt: &mut Runtime,
+    params: &Value,
+    method: &'static str,
+    id: Value,
+) -> Result<
+    (
+        crate::providers::SecretRef,
+        Arc<dyn crate::providers::CredentialStore>,
+        crate::providers::kimi::Endpoints,
+    ),
+    Box<RpcResponse>,
+> {
+    let connection = match optional_string(params, "connection") {
+        Ok(Some(value)) => value,
+        Ok(None) => crate::providers::kimi::CONNECTION,
+        Err(error) => return Err(Box::new(request_error(id, error))),
+    };
+    if connection != crate::providers::kimi::CONNECTION {
+        return Err(Box::new(request_error(
+            id,
+            RequestError::CommandUnavailable {
+                command: method.to_string(),
+                reason: format!("{connection} records no credential lifecycle here"),
+            },
+        )));
+    }
+    let config = rt.config_for_broker();
+    let reference = match crate::providers::kimi::credential_reference(&config, connection) {
+        Ok(reference) => reference,
+        Err(error) => return Err(Box::new(kimi_login_error(id, &error))),
+    };
+    let store = match crate::providers::kimi::login_store(
+        &config,
+        connection,
+        rt.login_credentials.as_ref(),
+    ) {
+        Ok(store) => store,
+        Err(error) => return Err(Box::new(kimi_login_error(id, &error))),
+    };
+    let recorded = crate::providers::kimi::Endpoints::recorded();
+    #[cfg(any(test, debug_assertions))]
+    let endpoints = {
+        let token = match optional_string(params, "device_token_endpoint") {
+            Ok(Some(value)) => value.to_string(),
+            Ok(None) => recorded.token.clone(),
+            Err(error) => return Err(Box::new(request_error(id, error))),
+        };
+        crate::providers::kimi::Endpoints {
+            device_authorization: recorded.device_authorization,
+            token,
+        }
+    };
+    #[cfg(not(any(test, debug_assertions)))]
+    let endpoints = recorded;
+    Ok((reference, store, endpoints))
+}
+
+/// `auth.refresh` (AC-040): refreshes the stored device profile at its scoped
+/// reference. The reply replaces that one scope; a token bound to another
+/// account denies and leaves the stored bytes untouched, and the neighbour
+/// profile's scope is never read or rewritten.
+fn auth_refresh(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.refresh") {
+        return response;
+    }
+    if let Some(error) = unknown_auth_lifecycle_param(params) {
+        return request_error(id, error);
+    }
+    let (reference, store, endpoints) = match kimi_lifecycle(rt, params, "auth.refresh", id.clone())
+    {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    match crate::providers::kimi::refresh_credential(store.as_ref(), &reference, &endpoints) {
+        Ok(()) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "profile": reference.profile(),
+            }),
+        ),
+        Err(error) => kimi_login_error(id, &error),
+    }
+}
+
+/// `auth.logout` (AC-040): deletes the stored profile at its scoped
+/// reference. This is local entry removal — no provider-side revocation is
+/// claimed — and the neighbour profile's scope is untouched.
+fn auth_logout(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.logout") {
+        return response;
+    }
+    if let Some(error) = unknown_auth_lifecycle_param(params) {
+        return request_error(id, error);
+    }
+    let (reference, store, _endpoints) = match kimi_lifecycle(rt, params, "auth.logout", id.clone())
+    {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    match crate::providers::kimi::logout_local(store.as_ref(), &reference) {
+        Ok(()) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "profile": reference.profile(),
+            }),
+        ),
+        Err(error) => kimi_login_error(id, &error),
+    }
+}
+
+/// `auth.revoke` (AC-040): deletes the stored profile through the store's
+/// revocation channel. Like `auth.logout` this is local entry removal; the
+/// neighbour profile's scope is untouched.
+fn auth_revoke(rt: &mut Runtime, ingress: Ingress, params: &Value, id: Value) -> RpcResponse {
+    if let Some(response) = observer_ingress_denied(ingress, id.clone(), "auth.revoke") {
+        return response;
+    }
+    if let Some(error) = unknown_auth_lifecycle_param(params) {
+        return request_error(id, error);
+    }
+    let (reference, store, _endpoints) = match kimi_lifecycle(rt, params, "auth.revoke", id.clone())
+    {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
+    };
+    match crate::providers::kimi::revoke_local(store.as_ref(), &reference) {
+        Ok(()) => RpcResponse::ok(
+            id,
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "profile": reference.profile(),
+            }),
+        ),
+        Err(error) => kimi_login_error(id, &error),
+    }
 }
 
 /// The credential seam a login writes through: the injected store, or the
@@ -7309,6 +7582,51 @@ fn login_error(id: Value, error: &crate::providers::openai_login::LoginError) ->
         | Login::DeviceIntervalOutOfRange { .. }
         | Login::MalformedField { .. }
         | Login::ConnectionMissing { .. } => ErrorCode::InvalidInput,
+    };
+    envelope_error(id, code, -32000, &error.to_string())
+}
+
+/// One Kimi login refusal mapped to the same wire classes the Codex legs
+/// use: store conditions are storage failures, denied/expired legs are
+/// denials, and a malformed binding or reply is invalid input.
+fn kimi_login_error(id: Value, error: &crate::providers::kimi::KimiLoginError) -> RpcResponse {
+    use crate::providers::kimi::KimiLoginError as Kimi;
+    let code = match error {
+        Kimi::Provider(inner) => match inner {
+            ProviderError::StoreUnavailable { .. }
+            | ProviderError::StoreAmbiguous { .. }
+            | ProviderError::CredentialOutsideNamespace { .. }
+            | ProviderError::CredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+            ProviderError::CredentialOccupied { .. } => ErrorCode::Conflict,
+            ProviderError::Transport { .. }
+            | ProviderError::ProviderFailed { .. }
+            | ProviderError::UnknownTerminal { .. }
+            | ProviderError::StreamViolation { .. }
+            | ProviderError::IncompatibleOutput { .. }
+            | ProviderError::Retried { .. } => ErrorCode::OutcomeUnknown,
+            _ => ErrorCode::InvalidInput,
+        },
+        Kimi::DeviceDenied
+        | Kimi::DeviceExpired
+        | Kimi::Denied { .. }
+        | Kimi::TokenRejected { .. }
+        | Kimi::AccountMismatch => ErrorCode::Denied,
+        Kimi::StoredCredentialMalformed { .. } => ErrorCode::StorageUnavailable,
+        Kimi::Entropy { .. } | Kimi::Clock { .. } | Kimi::Serialization { .. } => {
+            ErrorCode::InternalError
+        }
+        Kimi::ConnectionMissing { .. }
+        | Kimi::NotApiKey { .. }
+        | Kimi::EndpointNotRecorded { .. }
+        | Kimi::MissingField { .. }
+        | Kimi::MalformedField { .. }
+        | Kimi::MalformedResponse { .. }
+        | Kimi::ResponseTooLarge
+        | Kimi::DeviceExpiryOutOfRange { .. }
+        | Kimi::DeviceIntervalOutOfRange { .. }
+        | Kimi::TokenExpiryOutOfRange { .. }
+        | Kimi::MissingIdentity
+        | Kimi::NotRefreshable { .. } => ErrorCode::InvalidInput,
     };
     envelope_error(id, code, -32000, &error.to_string())
 }

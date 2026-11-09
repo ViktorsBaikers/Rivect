@@ -1,7 +1,7 @@
 //! The recorded dialect roster (AC-011): every literal id `dialect_for`
-//! answers, pinned exactly. The roster is the 68 pre-band ids plus the
-//! admitted vertex and two CloudCode arms, and only a recorded id may add
-//! to it.
+//! answers, pinned exactly. The roster is the recorded pre-band ids plus
+//! the admitted vertex, two CloudCode arms and the Kimi Code row, and
+//! only a recorded id may add to it.
 
 #![allow(
     clippy::expect_used,
@@ -28,7 +28,7 @@ fn bedrock_ids_map_to_their_recorded_dialects() {
 }
 
 /// The exact current roster `dialect_for` answers, in source order.
-const RECORDED_ROSTER: [(&str, Dialect); 71] = [
+const RECORDED_ROSTER: [(&str, Dialect); 72] = [
     ("openai", Dialect::Responses),
     ("abliteration", Dialect::Responses),
     ("meta", Dialect::Responses),
@@ -56,6 +56,9 @@ const RECORDED_ROSTER: [(&str, Dialect); 71] = [
     ("cloudflare-ai-gateway", Dialect::Messages),
     ("custom-messages", Dialect::Messages),
     ("vercel-ai-gateway", Dialect::Messages),
+    // Kimi Code records Messages as the default over its two-protocol
+    // route table (its `/models` rows select Chat per model).
+    ("kimi-code", Dialect::Messages),
     ("gitlab-duo", Dialect::ChatCompletions),
     ("github-copilot", Dialect::ChatCompletions),
     ("opencode-go", Dialect::ChatCompletions),
@@ -125,6 +128,11 @@ fn roster_matches_the_recorded_dialect_arms() {
         dialect_for("google-gemini-cli"),
         Some(Dialect::CloudCode),
         "the second CloudCode id reuses the one recorded variant"
+    );
+    assert_eq!(
+        rivect::providers::routes_for("kimi-code"),
+        [Dialect::Messages, Dialect::ChatCompletions],
+        "the Kimi row declares exactly its two recorded protocols"
     );
     assert_eq!(Dialect::CloudCode.to_string(), "cloudcode");
 }

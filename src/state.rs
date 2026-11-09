@@ -1463,9 +1463,9 @@ impl TaskStore {
 
     /// (g)-(h): the path must still name the admitted inode before the
     /// first settings statement; a failure drops the connection.
-    fn settle_admitted(conn: Connection, db: &Path, id: FileId) -> Result<Connection> {
+    fn settle_admitted(mut conn: Connection, db: &Path, id: FileId) -> Result<Connection> {
         use std::os::unix::fs::MetadataExt as _;
-        proof::install(&conn);
+        proof::install(&mut conn).map_err(storage)?;
         if proof::settle_fault() {
             return Err(storage(ConnectionLifecycleError::FileCheck {
                 file: "db",
@@ -15692,7 +15692,13 @@ mod proof {
     pub(super) fn fault(_: Site) -> rusqlite::Result<()> {
         Ok(())
     }
-    pub(super) fn install(_: &rusqlite::Connection) {}
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the test twin answers the trace seam's result, so the open path has one shape"
+    )]
+    pub(super) fn install(_: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+        Ok(())
+    }
     pub(super) fn after_guard(_: &std::path::Path) {}
     pub(super) fn built(_: &super::RetainedAttempt) {}
     pub(super) fn carry(_: &super::RetainedAttempt) {}
@@ -15900,11 +15906,12 @@ pub mod proof {
         }
     }
 
-    pub(crate) fn install(conn: &rusqlite::Connection) {
+    pub(crate) fn install(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
         let armed = SINK.with(|sink| sink.borrow().is_some());
         if armed {
-            conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_stmt));
+            return conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_stmt));
         }
+        Ok(())
     }
 
     /// Arms the after-guard swap: the next guarded open finds `<db>`
