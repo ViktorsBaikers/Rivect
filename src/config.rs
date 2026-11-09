@@ -796,7 +796,7 @@ impl BaseError {
         match self {
             Self::Store(error) => error.code(),
             Self::Document(error) => match error.stage {
-                Stage::Parse | Stage::Schema => ErrorCode::InvalidInput,
+                Stage::Parse | Stage::Schema | Stage::Provider => ErrorCode::InvalidInput,
                 Stage::Resolve => ErrorCode::Conflict,
             },
             Self::InvalidPage { .. } => ErrorCode::InvalidInput,
@@ -1014,6 +1014,9 @@ pub enum Stage {
     Parse,
     Schema,
     Resolve,
+    /// The document validated, but a declared connection names a provider
+    /// this build cannot construct from it (TD-01).
+    Provider,
 }
 
 impl std::fmt::Display for Stage {
@@ -1022,6 +1025,7 @@ impl std::fmt::Display for Stage {
             Self::Parse => "parse",
             Self::Schema => "schema",
             Self::Resolve => "resolve",
+            Self::Provider => "provider",
         })
     }
 }
@@ -1166,6 +1170,12 @@ pub enum ConfigIssue {
         "endpoint must be an https URL, an http URL on a loopback host, or empty for the class default"
     )]
     EndpointNotAllowed,
+    /// A document that validates but names a connection the production
+    /// provider cannot be built from (TD-01). The typed provider cause stays
+    /// the `source()`, so the class is the document's, never the store's —
+    /// boxed because it is far larger than every other issue.
+    #[error("provider build: {0}")]
+    ProviderBuild(#[source] Box<crate::providers::ProviderError>),
 }
 
 #[derive(Debug)]
@@ -1199,6 +1209,17 @@ impl ConfigError {
             stage: Stage::Resolve,
             key: Some(key.into()),
             issue,
+        }
+    }
+
+    /// A whole-build refusal from the provider factory: no single row named
+    /// the contradiction, so the key stays absent and the typed
+    /// [`crate::providers::ProviderError`] is the issue's own source.
+    pub(crate) fn provider(error: crate::providers::ProviderError) -> Self {
+        Self {
+            stage: Stage::Provider,
+            key: None,
+            issue: ConfigIssue::ProviderBuild(Box::new(error)),
         }
     }
 }
@@ -1235,7 +1256,7 @@ impl std::fmt::Display for ConnKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     pub kind: ConnKind,
     pub endpoint: String,
@@ -4764,6 +4785,10 @@ pub struct ConfigMutationResult {
     pub digest: String,
     pub owner: String,
     pub admission_seq: u64,
+    /// Rows the rebuilt provider set left uninstalled when this edit was
+    /// served. The edit applied — the list names why each refused connection
+    /// is denied before any send, and the receipt replays it verbatim.
+    pub diagnostics: Vec<String>,
 }
 
 // ----- crash-safe publication -----

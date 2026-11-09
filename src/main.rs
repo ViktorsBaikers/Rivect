@@ -12,8 +12,7 @@
 )]
 
 use crossterm::tty::IsTty;
-use rivect::commands::{DispatchStep, Ingress, LoopEvent, Runtime};
-use rivect::providers::LoopbackProvider;
+use rivect::commands::{DispatchStep, Ingress, LoopEvent, OpenError, Runtime};
 use std::io::{self, BufRead, ErrorKind, Read, StdinLock, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -194,8 +193,15 @@ fn read_stdin(events: SyncSender<LoopEvent>, mut reader: StdinLock<'static>) {
     }
 }
 
+/// The headless entry opens through the configured factory: the provider is
+/// built inside the open from the admitted config (TD-01), never from the
+/// offline fixture, and the same factory is retained for config reloads.
+fn open_headless(data_root: &Path) -> Result<Runtime, OpenError> {
+    Runtime::open_configured(data_root, rivect::providers::configured_provider)
+}
+
 fn run_headless(data_root: &Path) -> i32 {
-    let mut runtime = match Runtime::open(data_root, Box::new(LoopbackProvider::new())) {
+    let mut runtime = match open_headless(data_root) {
         Ok(runtime) => runtime,
         // The failed open already emitted the collected verdicts to
         // stderr and carries them for surfaces that need their own
@@ -338,5 +344,108 @@ fn report_cli_error(error: &CliError) {
 fn release_runtime(runtime: Runtime) {
     for line in runtime.release() {
         report_boot_diagnostic(&line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One fixture config: a local peer the production set builds no adapter
+    /// for, so the headless open never touches a wire — the factory path, not
+    /// a send, is what the case observes.
+    fn config_for(endpoint: &str) -> String {
+        format!(
+            "config_version = 1\n\
+             [connections.fixture-local]\nkind = \"local\"\nendpoint = \"{endpoint}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"fixture-local\", model_id = \"fixture-model\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"off\" }}\n"
+        )
+    }
+
+    /// Counts the ledger seam's two calls, so "the denied dispatch settled
+    /// nothing" has an oracle instead of a no-op that would report zero for
+    /// any path.
+    #[derive(Debug, Default)]
+    struct CountingLedger {
+        begun: u64,
+        finished: u64,
+    }
+
+    impl rivect::model::Ledger for CountingLedger {
+        fn begin_send(
+            &mut self,
+            _context: &rivect::model::SendContext,
+            manifest: &rivect::model::RequestManifest,
+        ) -> Result<rivect::model::SendTicket, rivect::model::LedgerError> {
+            self.begun += 1;
+            Ok(rivect::model::SendTicket {
+                attempt_id: manifest.attempt_id.clone(),
+                cost_bound: manifest.cost_bound,
+                reserved: false,
+            })
+        }
+
+        fn finish_send(
+            &mut self,
+            _ticket: &rivect::model::SendTicket,
+            _outcome: &rivect::model::SendOutcome,
+        ) -> Result<(), rivect::model::LedgerError> {
+            self.finished += 1;
+            Ok(())
+        }
+    }
+
+    /// The headless entry builds its provider through the configured factory
+    /// and a connection edited after admission denies typed before any send:
+    /// the frozen entry, not the latest document, is what the request kept.
+    #[test]
+    fn headless_factory_denies_a_connection_edited_after_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-headless-activation-")?;
+        std::fs::write(
+            root.path().join("config.toml"),
+            config_for("http://127.0.0.1:11434"),
+        )?;
+        let mut runtime = open_headless(root.path())?;
+        assert_eq!(
+            runtime.broker.provider_name(),
+            "configured",
+            "the headless open must install the configured provider set"
+        );
+        let manifest = runtime.broker.prepare(
+            "main",
+            &runtime.config_for_broker(),
+            "/world/headless",
+            "goal: fixture",
+        )?;
+        std::fs::write(
+            root.path().join("config.toml"),
+            config_for("http://127.0.0.1:11435"),
+        )?;
+        runtime.reload_config()?;
+        let mut ledger = CountingLedger::default();
+        match runtime
+            .broker
+            .dispatch(&mut ledger, "/world/headless", &manifest)
+        {
+            Err(rivect::model::ModelError::ConnectionChanged { connection, .. }) => {
+                assert_eq!(connection, "fixture-local");
+            }
+            other => {
+                return Err(
+                    io::Error::other(format!("expected ConnectionChanged, got {other:?}")).into(),
+                );
+            }
+        }
+        assert_eq!(
+            (ledger.begun, ledger.finished),
+            (0, 0),
+            "the denied dispatch never opened or closed a settlement"
+        );
+        assert_eq!(runtime.broker.accounted_requests(), 0);
+        Ok(())
     }
 }

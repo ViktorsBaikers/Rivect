@@ -4007,9 +4007,10 @@ fn profile_switch_surfaces_pending_versus_active_on_the_existing_status_surface(
     assert_eq!(status["result"]["profile"]["pending"], json!("p2"));
 }
 
-/// AC-047: a profile change never replaces draft or task state — the
-/// task snapshot, the pending question, and the in-flight manifest all
-/// survive the edit byte-for-byte.
+/// AC-047/DEC-025: a profile change never replaces draft or task state —
+/// the task snapshot and the pending question survive byte-for-byte, while
+/// the in-flight manifest is denied `ConnectionChanged` before the wire:
+/// the edit neither rebinds, sends nor settles the admitted request.
 #[test]
 fn profile_change_does_not_replace_draft_or_task_state() {
     support::ensure_helper();
@@ -4057,14 +4058,42 @@ fn profile_change_does_not_replace_draft_or_task_state() {
         served.question_id, published.question_id,
         "the pending decision is preserved"
     );
-    // the frozen manifest still dispatches its own bytes — the edit
-    // never reached back into an in-flight request
-    world
+    // TD-01: the edit moved the frozen entry's profile, so the in-flight
+    // manifest is denied before the reservation — nothing is sent or
+    // settled, and the draft state above is all that remains
+    let mut ledger = support::CountingLedger::new();
+    let error = world
         .runtime
         .broker
-        .dispatch(&mut rivect::model::NullLedger, "/world/draft", &manifest)
-        .expect("dispatch");
-    assert_eq!(world.last_manifest().as_ref(), Some(&manifest));
+        .dispatch(&mut ledger, "/world/draft", &manifest)
+        .expect_err("the edited profile denies the admitted request");
+    match error {
+        rivect::model::ModelError::ConnectionChanged {
+            attempt_id,
+            connection,
+        } => {
+            assert_eq!(attempt_id, manifest.attempt_id);
+            assert_eq!(connection, "local");
+        }
+        other => panic!("expected ConnectionChanged, got {other:?}"),
+    }
+    assert_eq!(
+        (ledger.begun, ledger.finished),
+        (0, 0),
+        "nothing was reserved or settled"
+    );
+    assert!(
+        world.last_manifest().is_none(),
+        "the denied request never reached the provider"
+    );
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the provider was never called"
+    );
+    assert_eq!(world.runtime.broker.accounted_requests(), 0);
 }
 
 /// DEC-013/AC-047: the additive connection `region`/`profile` keys and

@@ -8952,3 +8952,308 @@ fn manual_fallback_still_pauses_on_an_unknown_primary_outcome() {
         "the paused primary stays admitted for the human's answer"
     );
 }
+
+/// One declaration carrying every frozen field: kind, endpoint, credential
+/// reference, region and profile all present on the pinned row.
+fn frozen_entry_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [profiles.pinned]\ncredential_ref = \"keyring:rivect-test/pinned\"\n\
+         [connections.pinned]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\n\
+         credential_ref = \"keyring:rivect-test/pinned\"\nregion = \"eu-west-1\"\nprofile = \"pinned\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"pinned\", model_id = \"pinned-model\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// TD-01: the admission freezes the whole connection entry the ranking
+/// read — kind, endpoint, credential reference, region and profile — so
+/// the dispatch re-check compares the admitted config, never a later
+/// document.
+#[test]
+fn admission_freezes_the_connection_entry_fields() {
+    let config = Config::parse_validated(&frozen_entry_config("https://api.example.invalid/v1"))
+        .expect("valid");
+    let (mut broker, _sent) = recording_broker();
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/activation",
+            "goal: frozen connection entry",
+        )
+        .expect("manifest");
+    let admission = broker.admission(&manifest.attempt_id).expect("admitted");
+    let declared = config.connections.get("pinned").expect("declared");
+    assert_eq!(&admission.connection_entry, declared);
+    assert_eq!(admission.connection_entry.kind, ConnKind::ApiKey);
+    assert_eq!(
+        admission.connection_entry.endpoint,
+        "https://api.example.invalid/v1"
+    );
+    assert_eq!(
+        admission.connection_entry.credential_ref.as_deref(),
+        Some("keyring:rivect-test/pinned")
+    );
+    assert_eq!(
+        admission.connection_entry.region.as_deref(),
+        Some("eu-west-1")
+    );
+    assert_eq!(
+        admission.connection_entry.profile.as_deref(),
+        Some("pinned")
+    );
+}
+
+/// TD-01: a differing current view entry denies `ConnectionChanged`
+/// before the reservation or any provider call — the admitted request
+/// keeps the config it was ranked on.
+#[test]
+fn a_differing_current_connection_view_denies_changed_before_send() {
+    let config = Config::parse_validated(&local_config(
+        "fixture-model",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let (mut broker, sent) = recording_broker();
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/activation",
+            "goal: stale connection view",
+        )
+        .expect("manifest");
+
+    let mut edited = config.clone();
+    let entry = edited.connections.get_mut("local").expect("declared");
+    entry.endpoint = "http://127.0.0.1:11435".to_string();
+    entry.region = Some("eu-west-1".to_string());
+    broker.set_config(&edited);
+
+    let mut ledger = support::CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, "/world/activation", &manifest)
+        .expect_err("the differing entry must deny the admitted request");
+    match error {
+        ModelError::ConnectionChanged {
+            attempt_id,
+            connection,
+        } => {
+            assert_eq!(attempt_id, manifest.attempt_id);
+            assert_eq!(connection, "local");
+        }
+        other => panic!("expected ConnectionChanged, got {other:?}"),
+    }
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "a denied dispatch never reaches the provider"
+    );
+    assert_eq!(
+        (ledger.begun, ledger.finished),
+        (0, 0),
+        "a denied dispatch opens no settlement"
+    );
+    assert_eq!(broker.accounted_requests(), 0);
+}
+
+/// TD-01: only the admitted connection's entry is compared — an edit to
+/// another view entry never blocks an in-flight request.
+#[test]
+fn an_unrelated_view_edit_keeps_the_admitted_request_sendable() {
+    let config = Config::parse_validated(&local_config(
+        "fixture-model",
+        "{ mode = \"fixed\", value = \"medium\" }",
+    ))
+    .expect("valid");
+    let (mut broker, sent) = recording_broker();
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/activation",
+            "goal: unrelated view edit",
+        )
+        .expect("manifest");
+
+    let mut edited = config.clone();
+    edited.connections.insert(
+        "later".to_string(),
+        rivect::config::Connection {
+            kind: ConnKind::Local,
+            endpoint: "http://127.0.0.1:11436".to_string(),
+            credential_ref: None,
+            region: None,
+            profile: None,
+        },
+    );
+    broker.set_config(&edited);
+
+    let mut ledger = support::CountingLedger::new();
+    let reply = broker
+        .dispatch(&mut ledger, "/world/activation", &manifest)
+        .expect("the admitted entry is unchanged, so the request still sends");
+    assert!(!reply.text.is_empty());
+    assert_eq!(
+        sent.lock().expect("wire log lock").len(),
+        1,
+        "the unchanged entry still reaches the provider"
+    );
+    assert_eq!((ledger.begun, ledger.finished), (1, 1));
+}
+
+/// TD-01: every field of the admitted connection entry is frozen, not only
+/// the endpoint pair a multi-field edit moves: each single-field mutation —
+/// kind, endpoint, credential reference, region, profile — and removal of
+/// the admitted entry itself denies `ConnectionChanged` before any
+/// reservation, provider call or settlement.
+#[test]
+fn every_single_frozen_entry_field_and_removal_denies_changed_before_send() {
+    type EntryMutation = (&'static str, fn(&mut Config));
+    let mutations: [EntryMutation; 6] = [
+        ("kind", |config| {
+            config.connections.get_mut("pinned").expect("declared").kind = ConnKind::Local;
+        }),
+        ("endpoint", |config| {
+            config
+                .connections
+                .get_mut("pinned")
+                .expect("declared")
+                .endpoint = "https://api.example.invalid/v2".to_string();
+        }),
+        ("credential_ref", |config| {
+            config
+                .connections
+                .get_mut("pinned")
+                .expect("declared")
+                .credential_ref = Some("keyring:rivect-test/rotated".to_string());
+        }),
+        ("region", |config| {
+            config
+                .connections
+                .get_mut("pinned")
+                .expect("declared")
+                .region = Some("us-east-2".to_string());
+        }),
+        ("profile", |config| {
+            config
+                .connections
+                .get_mut("pinned")
+                .expect("declared")
+                .profile = Some("rotated".to_string());
+        }),
+        ("removal", |config| {
+            config.connections.remove("pinned");
+        }),
+    ];
+    for (field, mutate) in mutations {
+        let config =
+            Config::parse_validated(&frozen_entry_config("https://api.example.invalid/v1"))
+                .expect("valid");
+        let (mut broker, sent) = recording_broker();
+        let manifest = broker
+            .prepare(
+                "main",
+                &config,
+                "/world/activation",
+                "goal: frozen entry field",
+            )
+            .expect("manifest");
+        let mut edited = config.clone();
+        mutate(&mut edited);
+        broker.set_config(&edited);
+
+        let mut ledger = support::CountingLedger::new();
+        let error = broker
+            .dispatch(&mut ledger, "/world/activation", &manifest)
+            .expect_err("the edited entry must deny the admitted request");
+        match error {
+            ModelError::ConnectionChanged {
+                attempt_id,
+                connection,
+            } => {
+                assert_eq!(attempt_id, manifest.attempt_id, "{field}");
+                assert_eq!(connection, "pinned", "{field}");
+            }
+            other => panic!("expected ConnectionChanged for the {field} edit, got {other:?}"),
+        }
+        assert!(
+            sent.lock().expect("wire log lock").is_empty(),
+            "the {field} edit never reaches the provider"
+        );
+        assert_eq!(
+            (ledger.begun, ledger.finished),
+            (0, 0),
+            "the {field} edit opens no settlement"
+        );
+        assert_eq!(
+            broker.accounted_requests(),
+            0,
+            "the {field} edit spends nothing"
+        );
+    }
+}
+
+/// TD-01/A2: a profile's own `credential_ref` is the binding the send
+/// resolves, so rotating it denies the admitted request even though the
+/// connection entry is byte-identical — the frozen credential, not the row,
+/// is what an edit to the profile moves.
+#[test]
+fn a_rotated_profile_credential_denies_changed_before_send() {
+    let config = Config::parse_validated(&frozen_entry_config("https://api.example.invalid/v1"))
+        .expect("valid");
+    let (mut broker, sent) = recording_broker();
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/activation",
+            "goal: rotated profile credential",
+        )
+        .expect("manifest");
+    let admission = broker.admission(&manifest.attempt_id).expect("admitted");
+    assert_eq!(
+        admission.credential.as_deref(),
+        Some("keyring:rivect-test/pinned"),
+        "the ranking's effective credential is frozen on the admission"
+    );
+
+    let mut edited = config.clone();
+    edited
+        .profiles
+        .get_mut("pinned")
+        .expect("declared")
+        .credential_ref = Some("keyring:rivect-test/rotated/pinned".to_string());
+    broker.set_config(&edited);
+    assert_eq!(
+        edited.connections.get("pinned"),
+        config.connections.get("pinned"),
+        "the connection row is untouched, so only the credential comparison can deny"
+    );
+
+    let mut ledger = support::CountingLedger::new();
+    let error = broker
+        .dispatch(&mut ledger, "/world/activation", &manifest)
+        .expect_err("the rotated credential must deny the admitted request");
+    match error {
+        ModelError::ConnectionChanged {
+            attempt_id,
+            connection,
+        } => {
+            assert_eq!(attempt_id, manifest.attempt_id);
+            assert_eq!(connection, "pinned");
+        }
+        other => panic!("expected ConnectionChanged, got {other:?}"),
+    }
+    assert!(
+        sent.lock().expect("wire log lock").is_empty(),
+        "the rotated credential never reaches the provider"
+    );
+    assert_eq!(
+        (ledger.begun, ledger.finished),
+        (0, 0),
+        "the rotated credential opens no settlement"
+    );
+}

@@ -14,14 +14,29 @@ use crate::owner::OwnerError;
 use crate::policy::{
     ModeDecision, canonical_egress_target, grant_id_is_key_safe, preapproval_scope,
 };
+#[cfg(test)]
 use crate::providers::LoopbackProvider;
 
-/// The provider the TUI's one runtime dispatches through. Production is the
-/// offline loopback, full stop; the test twin below is the seam the card
+/// The TUI's one runtime is opened through the same configured factory the
+/// headless entry uses (TD-01). Production binds the provider set the
+/// admitted config describes; the test twin below is the seam the card
 /// driver's child uses to install a slow peer.
 #[cfg(not(test))]
-fn test_provider() -> Box<dyn crate::providers::Provider> {
-    Box::new(LoopbackProvider::new())
+fn open_runtime(data_root: &Path) -> Result<Runtime, crate::commands::OpenError> {
+    Runtime::open_configured(data_root, crate::providers::configured_provider)
+}
+
+/// Test twin of the configured open: the factory returns the same test
+/// provider the card driver arms, so the TUI's open path is the production
+/// `open_configured` seam without a wire.
+#[cfg(test)]
+fn open_runtime(data_root: &Path) -> Result<Runtime, crate::commands::OpenError> {
+    Runtime::open_configured(data_root, |_config, _store| {
+        Ok(crate::providers::ProviderBuild {
+            provider: test_provider(),
+            refusals: Vec::new(),
+        })
+    })
 }
 
 /// The env marker arming the card driver's slow peer, in milliseconds.
@@ -1518,13 +1533,13 @@ struct TuiDispatch {
 
 impl TuiDispatch {
     fn open(data_root: &Path) -> Result<Self, TuiOpenError> {
-        // `Runtime::open` already emitted the collected verdicts and the
+        // The configured open already emitted the collected verdicts and the
         // release lines to stderr inside the failed open — emitting here
         // would double the channel — and also carries them on its error,
         // so this arm fills the same transcript/error channels the
         // sibling arms do for a discarded runtime. The cause stays an
         // object under its context; `failure_report` joins them.
-        let mut runtime = Runtime::open(data_root, test_provider()).map_err(|carrier| {
+        let mut runtime = open_runtime(data_root).map_err(|carrier| {
             let boot_diagnostics = carrier.diagnostics().to_vec();
             TuiOpenError {
                 error: io::Error::other(RuntimeOpenFailure(carrier.into_source())),
@@ -9558,6 +9573,32 @@ fallback = { mode = \"off\" }\n";
                 );
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod activation_factory {
+    /// The TUI's open path is the shared configured seam: a config fixture is
+    /// admitted and the runtime the loop dispatches through is the one the
+    /// factory built.
+    #[test]
+    fn tui_open_runtime_consumes_the_configured_factory() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::TempDir::with_prefix("rivect-tui-factory-")?;
+        std::fs::write(
+            root.path().join("config.toml"),
+            "config_version = 1\n\
+             [connections.fixture-local]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+             [models.defaults]\n\
+             model = { mode = \"fixed\", connection = \"fixture-local\", model_id = \"fixture-model\" }\n\
+             effort = { mode = \"auto\" }\n\
+             fallback = { mode = \"off\" }\n",
+        )?;
+        let runtime = super::open_runtime(root.path())?;
+        assert_eq!(runtime.broker.provider_name(), "loopback");
+        assert!(runtime.effective().parsed.is_some());
+        drop(runtime);
         Ok(())
     }
 }

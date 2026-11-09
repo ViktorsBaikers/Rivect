@@ -58,6 +58,29 @@ pub(crate) struct BudgetWait {
     reason: String,
 }
 
+/// The provider construction seam a configured runtime keeps (TD-01): the
+/// factory runs inside the open after the effective config is resolved and
+/// before the broker exists, and again on every admitted config edit
+/// ([`Runtime::reload_config`] and the journaled config commands) before the
+/// served view moves. It is the one production construction site for the
+/// adapter the broker dispatches through. `Err` is a whole-build refusal: the
+/// open fails, and a rebuild keeps the previous config/provider pair serving.
+pub(crate) type ProviderFactory = Box<
+    dyn Fn(
+            &config::Config,
+            &Arc<dyn crate::providers::CredentialStore>,
+        ) -> Result<crate::providers::ProviderBuild, ProviderError>
+        + Send,
+>;
+
+/// What one open builds the broker's provider from: the fixed provider
+/// [`Runtime::open`] carries for fixtures, or the factory a configured
+/// entrypoint passes.
+enum ProviderSource {
+    Fixture(Box<dyn Provider>),
+    Factory(ProviderFactory),
+}
+
 /// The runtime's closed binding: the owner and the policy are read through
 /// accessors and never rebound from outside the crate.
 ///
@@ -131,6 +154,14 @@ pub struct Runtime {
     /// The one injected backend seam; defaults to the platform worker
     /// (Linux Landlock/seccomp/netns on Linux, Seatbelt elsewhere).
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
+    /// The configured provider factory (TD-01): `Some` on a runtime opened
+    /// through [`Runtime::open_configured`], where every admitted config
+    /// edit rebuilds through it; `None` on the fixture carrier
+    /// [`Runtime::open`], whose provider never changes.
+    provider_factory: Option<ProviderFactory>,
+    /// The credential seam that factory receives. The platform backend opens
+    /// on its first scope, so opening a runtime never touches a keyring.
+    provider_credentials: Arc<dyn crate::providers::CredentialStore>,
     /// The credential seam an MCP server binding resolves its declared
     /// reference through (INV-011). A surface that owns real material
     /// injects its store; while none is bound a declared reference is
@@ -1087,15 +1118,21 @@ fn system_seconds() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// The platform read worker an entrypoint-owned open uses; an injected one
+/// still goes through [`Runtime::open_with_worker`].
+fn platform_worker() -> Box<dyn crate::executor::ReadWorker> {
+    #[cfg(target_os = "linux")]
+    let worker: Box<dyn crate::executor::ReadWorker> =
+        Box::new(crate::executor::linux::LinuxWorker);
+    #[cfg(not(target_os = "linux"))]
+    let worker: Box<dyn crate::executor::ReadWorker> =
+        Box::new(crate::executor::macos::MacosReadWorker);
+    worker
+}
+
 impl Runtime {
     pub fn open(data_root: &Path, provider: Box<dyn Provider>) -> Result<Self, OpenError> {
-        #[cfg(target_os = "linux")]
-        let worker: Box<dyn crate::executor::ReadWorker> =
-            Box::new(crate::executor::linux::LinuxWorker);
-        #[cfg(not(target_os = "linux"))]
-        let worker: Box<dyn crate::executor::ReadWorker> =
-            Box::new(crate::executor::macos::MacosReadWorker);
-        Self::open_with_worker(data_root, provider, worker)
+        Self::open_with_worker(data_root, provider, platform_worker())
     }
 
     pub fn open_with_worker(
@@ -1103,10 +1140,50 @@ impl Runtime {
         provider: Box<dyn Provider>,
         read_worker: Box<dyn crate::executor::ReadWorker>,
     ) -> Result<Self, OpenError> {
-        // The owner lives inside `open_inner`, so on failure it is already
-        // dropped here and its lock release failures are drained once, after
-        // the verdicts, on the thread that dropped it.
-        Self::open_inner(data_root, provider, read_worker).map_err(|mut failure| {
+        Self::settle_open(Self::open_inner(
+            data_root,
+            ProviderSource::Fixture(provider),
+            read_worker,
+        ))
+    }
+
+    /// Opens a runtime whose provider `factory` builds from the admitted
+    /// effective config (TD-01): the factory runs after
+    /// [`config::resolve_effective`] and before the broker, so the production
+    /// adapter binds exactly the config this open admits, and the same
+    /// factory is retained for every later config edit.
+    ///
+    /// A build that refuses one declared connection does not fail the open:
+    /// that connection is left uninstalled, the broker denies it typed before
+    /// any send, and its cause joins the boot diagnostics. Only the factory's
+    /// own `Err` — a whole-set refusal — fails the open.
+    ///
+    /// # Errors
+    /// [`OpenError`] carries the same owner and config refusals
+    /// [`Runtime::open`] reports; a factory that refuses the whole build from
+    /// the admitted config fails the open with its typed [`ProviderError`]
+    /// cause.
+    pub fn open_configured(
+        data_root: &Path,
+        factory: impl Fn(
+            &config::Config,
+            &Arc<dyn crate::providers::CredentialStore>,
+        ) -> Result<crate::providers::ProviderBuild, ProviderError>
+        + Send
+        + 'static,
+    ) -> Result<Self, OpenError> {
+        Self::settle_open(Self::open_inner(
+            data_root,
+            ProviderSource::Factory(Box::new(factory)),
+            platform_worker(),
+        ))
+    }
+
+    /// The owner lives inside `open_inner`, so on failure it is already
+    /// dropped by the time this drains the lock release lines once, after
+    /// the verdicts, on the thread that dropped it.
+    fn settle_open(open: Result<Self, OpenError>) -> Result<Self, OpenError> {
+        open.map_err(|mut failure| {
             failure
                 .diagnostics
                 .extend(crate::state::take_release_lines());
@@ -1274,7 +1351,7 @@ impl Runtime {
     /// their release failures.
     fn open_inner(
         data_root: &Path,
-        provider: Box<dyn Provider>,
+        source: ProviderSource,
         read_worker: Box<dyn crate::executor::ReadWorker>,
     ) -> Result<Self, OpenError> {
         // The startup admits the store without publishing the schema: everything
@@ -1337,6 +1414,33 @@ impl Runtime {
             data_root.to_path_buf(),
         )
         .pinning(&effective);
+        // A configured open builds its provider here (TD-01): the effective
+        // config is already resolved, and the broker that will own the
+        // adapter does not exist yet, so the production provider binds the
+        // admitted config rather than a second read of the document. The
+        // factory is kept for reload; a fixture provider is installed as-is
+        // and never rebuilt.
+        let provider_credentials = crate::providers::platform_credential_store();
+        let (provider, provider_factory) = match source {
+            ProviderSource::Fixture(provider) => (provider, None),
+            ProviderSource::Factory(factory) => {
+                let build =
+                    factory(&effective.composed(), &provider_credentials).map_err(|error| {
+                        open_failure(
+                            provider_build_failure(&config_path, error),
+                            &boot_diagnostics,
+                        )
+                    })?;
+                // A refused row leaves its adapter uninstalled: the broker's
+                // send gate denies that connection typed before any request,
+                // and the cause is reported instead of swallowed. The open has
+                // no previous provider to keep, so the rest of the set serves.
+                for refusal in &build.refusals {
+                    boot_diagnostics.push(provider_refusal_diagnostic(refusal));
+                }
+                (build.provider, Some(factory))
+            }
+        };
         // The broker — and with it the injected provider, the one seam a model send
         // would cross — exists before the update path runs. The counted provider is
         // therefore live for the whole startup, so a zero measured on it after the
@@ -1391,6 +1495,8 @@ impl Runtime {
             config_path,
             provider_calls: 0,
             read_worker,
+            provider_factory,
+            provider_credentials,
             mcp_credentials: None,
             login_credentials: None,
             #[cfg(test)]
@@ -1496,6 +1602,13 @@ impl Runtime {
     /// and the broker's candidate re-check view follows. A document
     /// that cannot be read or does not validate changes nothing.
     ///
+    /// A configured runtime rebuilds its provider from the new config and
+    /// installs it through [`Broker::set_provider`] (TD-01). A row the build
+    /// refuses is left uninstalled while the rest of the set installs, and
+    /// its typed cause joins the diagnostics; a whole-build `Err` fails the
+    /// reload with its typed cause as the config failure's source and leaves
+    /// the previous config/provider pair serving.
+    ///
     /// # Errors
     /// Returns [`OwnerError::ConfigRead`], [`OwnerError::ConfigTooLarge`],
     /// or [`OwnerError::Config`]; the previous snapshot stays applied.
@@ -1507,10 +1620,55 @@ impl Runtime {
                 source,
             }
         })?;
+        let provider = self
+            .build_provider(&effective.composed())
+            .map_err(|error| provider_build_failure(&self.config_path, error))?;
         self.effective = effective;
         self.off_state.refresh(&self.effective);
-        self.broker.set_config(&self.config_for_broker());
+        self.install_provider(provider);
         Ok(())
+    }
+
+    /// Builds the provider a configured runtime would serve `config` with; a
+    /// fixture runtime never rebuilds and answers `None`.
+    ///
+    /// A per-row refusal never fails the build: the adapter is left out of
+    /// the set and its typed cause travels in [`crate::providers::ProviderBuild`],
+    /// exactly like the configured open. Only the factory's own `Err` — a
+    /// whole-set refusal — is an error, and the caller keeps the previous
+    /// config/provider pair serving for it.
+    ///
+    /// # Errors
+    /// The factory's whole-build refusal.
+    fn build_provider(
+        &self,
+        config: &config::Config,
+    ) -> Result<Option<crate::providers::ProviderBuild>, ProviderError> {
+        let Some(factory) = &self.provider_factory else {
+            return Ok(None);
+        };
+        factory(config, &self.provider_credentials).map(Some)
+    }
+
+    /// Installs the provider a pre-write build produced beside the broker's
+    /// candidate view, and reports every row the set leaves uninstalled. The
+    /// build ran before the served view moved, so nothing here can refuse.
+    fn install_provider(
+        &mut self,
+        provider: Option<crate::providers::ProviderBuild>,
+    ) -> Vec<String> {
+        self.broker.set_config(&self.config_for_broker());
+        let Some(provider) = provider else {
+            return Vec::new();
+        };
+        let diagnostics: Vec<String> = provider
+            .refusals
+            .iter()
+            .map(provider_refusal_diagnostic)
+            .collect();
+        self.boot_diagnostics.extend(diagnostics.iter().cloned());
+        self.broker.set_provider(provider.provider);
+        diagnostics
     }
 
     /// The config owner's Runtime-issued check handoff (DEC-054): binds
@@ -1657,6 +1815,20 @@ impl OpenError {
         }
         match source.downcast_ref::<crate::update::UpdateError>() {
             Some(crate::update::UpdateError::Activation { refusal, .. }) => Some(refusal),
+            _ => None,
+        }
+    }
+
+    /// The provider-build refusal this open failed on, when it failed on one
+    /// (P-001). The cause rides the config class — [`OwnerError`] has no
+    /// provider variant — so the typed [`ProviderError`] is unwrapped here
+    /// instead of being left as prose in the message.
+    pub fn provider_refusal(&self) -> Option<&ProviderError> {
+        match &self.cause {
+            OwnerError::Config { source, .. } => match &source.issue {
+                config::ConfigIssue::ProviderBuild(error) => Some(error.as_ref()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2541,6 +2713,32 @@ fn open_failure(error: OwnerError, diagnostics: &[String]) -> OpenError {
     OpenError::new(error, diagnostics.to_vec())
 }
 
+/// A factory's whole-build refusal belongs to the document that named the
+/// rows: it rides [`OwnerError::Config`] — `OwnerError` has no provider variant
+/// — with the provider stage and the typed [`ProviderError`] as the source, so
+/// the reported class is a configuration refusal rather than the store's
+/// storage slot.
+fn provider_build_failure(path: &Path, error: ProviderError) -> OwnerError {
+    OwnerError::Config {
+        path: path.to_path_buf(),
+        source: config::ConfigError::provider(error),
+    }
+}
+
+/// One diagnostic line for a declared connection the provider build
+/// refused: the row, its typed cause, and what the refusal means at dispatch.
+/// The whole line crosses the render boundary escaped — the row name and the
+/// cause both interpolate config strings — so a config spelling cannot move a
+/// cursor in the surface that prints it.
+fn provider_refusal_diagnostic(refusal: &crate::providers::ProviderRefusal) -> String {
+    let line = format!(
+        "provider build: connection {} was not installed; \
+         resolution: a dispatch to it is denied before any send ({})",
+        refusal.connection, refusal.error
+    );
+    escape_control(&line)
+}
+
 fn base_error(id: Value, err: &config::BaseError) -> RpcResponse {
     match err {
         config::BaseError::Store(source) => store_error(id, source),
@@ -2621,18 +2819,22 @@ const CONFIG_CARRIER_OWNER: &str = "cli";
 
 /// Admits one accepted edit through the singleflight journal. The read
 /// surface is refreshed first, so the retained doc and its served entries
-/// move together; a rejected admission restores `before` — the command
-/// was never journaled, so no surface may observe its edit. On success
-/// the resolved intent returns so each command shapes its own result —
-/// `config.set` reports the legacy payload, `decisions.control` the
-/// control-shaped one — while the sources digest moves with the landed
-/// bytes so a stale precondition always conflicts.
+/// move together, and the candidate provider is built from that document
+/// before any durable byte moves (TD-01): a whole-build refusal answers the
+/// command with its typed cause while the file and the previous
+/// config/provider pair stay exactly as they were. A rejected admission
+/// restores `before` — the command was never journaled, so no surface may
+/// observe its edit. On success the resolved intent returns beside the
+/// diagnostics of every row the installed set left uninstalled, so each
+/// command shapes its own result — `config.set` reports the legacy payload,
+/// `decisions.control` the control-shaped one — while the sources digest
+/// moves with the landed bytes so a stale precondition always conflicts.
 fn admit_config_edit(
     rt: &mut Runtime,
     edit: &config::ConfigEdit,
     before: RetainedView,
     error_id: Value,
-) -> Result<config::PublicationIntent, Box<RpcResponse>> {
+) -> Result<(config::PublicationIntent, Vec<String>), Box<RpcResponse>> {
     rt.effective.refresh_mode_entries(&edit.digest);
     // Every accepted effective-config transition moves the config
     // owner's generation (DEC-054): a toggle, a source replacement, a
@@ -2642,6 +2844,13 @@ fn admit_config_edit(
     // and stale pending authority refuses instead of reading as
     // current, even after a byte-identical return.
     rt.off_state.advance(&rt.effective);
+    let provider = match rt.build_provider(&rt.config_for_broker()) {
+        Ok(provider) => provider,
+        Err(error) => {
+            restore_retained_view(rt, &before);
+            return Err(Box::new(provider_error(error_id, &error)));
+        }
+    };
     let intent = match config::admit_publication(
         &mut rt.owner.store,
         CONFIG_CARRIER_OWNER,
@@ -2662,14 +2871,11 @@ fn admit_config_edit(
                     // durable and served; the next boot receipts it.
                     if !matches!(err, config::PublicationError::Journal(_)) {
                         restore_retained_view(rt, &before);
-                    } else {
-                        // The bytes landed and only the receipt failed:
-                        // the row stays pending and the typed error is
-                        // returned, but every served surface reflects
-                        // the one config now on disk.
-                        serve_landed_config(rt, &intent, edit);
+                        return Err(Box::new(publication_error(error_id, &err)));
                     }
-                    return Err(Box::new(publication_error(error_id, &err)));
+                    return Err(fail_landed_receipt(
+                        rt, provider, &intent, edit, error_id, &err,
+                    ));
                 }
             }
         }
@@ -2694,12 +2900,11 @@ fn admit_config_edit(
                     // waits for the next boot.
                     if !matches!(err, config::PublicationError::Journal(_)) {
                         restore_retained_view(rt, &before);
-                    } else {
-                        // The pending-heal tail of the same contract:
-                        // landed bytes serve while the receipt waits.
-                        serve_landed_config(rt, &pending, edit);
+                        return Err(Box::new(publication_error(error_id, &err)));
                     }
-                    return Err(Box::new(publication_error(error_id, &err)));
+                    return Err(fail_landed_receipt(
+                        rt, provider, &pending, edit, error_id, &err,
+                    ));
                 }
             }
         }
@@ -2714,23 +2919,66 @@ fn admit_config_edit(
     // The edit is durable and served: the broker's candidate re-check
     // view moves with the retained document (AC-045b) so the next
     // dispatch — or an in-flight fallback walk — checks against it.
-    serve_landed_config(rt, &intent, edit);
-    Ok(intent)
+    let diagnostics = serve_landed_config(rt, provider, &intent, edit);
+    Ok((intent, diagnostics))
 }
 
-/// Serves the one config that is actually on disk after the bytes
-/// landed: the broker's candidate view, the digest precondition, and
-/// the owner/off handoff move together with the retained document. A
-/// receipt that failed after the write (DEC-056 item 5) keeps the
-/// typed error and the pending row but must not leave a half-applied
-/// view — entries, digest, and broker all name the landed config.
-fn serve_landed_config(
+/// Shared tail of the two receipt-failure arms: the managed bytes landed, so
+/// the set built from the landed document installs and serves exactly as on
+/// success — the pending row is the only thing the receipt failure leaves —
+/// while the typed publication error is still what the command answers. The
+/// refused rows join the diagnostics through [`Runtime::install_provider`]
+/// and ride the error's own message, so a client that never reads
+/// [`Runtime::boot_diagnostics`] still learns what the landed set left out.
+fn fail_landed_receipt(
     rt: &mut Runtime,
+    provider: Option<crate::providers::ProviderBuild>,
     intent: &config::PublicationIntent,
     edit: &config::ConfigEdit,
-) {
-    let applied = rt.config_for_broker();
-    rt.broker.set_config(&applied);
+    error_id: Value,
+    err: &config::PublicationError,
+) -> Box<RpcResponse> {
+    let diagnostics = serve_landed_config(rt, provider, intent, edit);
+    Box::new(publication_error_with_diagnostics(
+        error_id,
+        err,
+        &diagnostics,
+    ))
+}
+
+/// The receipt-failure answer with every refused row the landed set left
+/// uninstalled appended to its cause.
+fn publication_error_with_diagnostics(
+    id: Value,
+    err: &config::PublicationError,
+    diagnostics: &[String],
+) -> RpcResponse {
+    let mut response = publication_error(id, err);
+    if let Some(error) = response.error.as_mut() {
+        for line in diagnostics {
+            error.data.message.push_str("; ");
+            error.data.message.push_str(line);
+        }
+    }
+    response
+}
+
+/// Serves the one config that is actually on disk after the bytes landed:
+/// the pre-write provider build installs first (its refused rows reported and
+/// left uninstalled), then the digest precondition and the owner/off handoff
+/// move with the retained document. A receipt that failed after the write
+/// (DEC-056 item 5) keeps the typed error and the pending row but must not
+/// leave a half-applied view — entries, digest, and broker all name the
+/// landed config. The build already succeeded, so this can never refuse.
+///
+/// Returns the diagnostics of the rows the installed set leaves uninstalled.
+fn serve_landed_config(
+    rt: &mut Runtime,
+    provider: Option<crate::providers::ProviderBuild>,
+    intent: &config::PublicationIntent,
+    edit: &config::ConfigEdit,
+) -> Vec<String> {
+    let diagnostics = rt.install_provider(provider);
     // The digest preconditions quote the sources this edit landed:
     // only the row whose intended bytes hold advances it — a foreign
     // winner's or a replayed older intent must never make a concurrent
@@ -2739,6 +2987,14 @@ fn serve_landed_config(
         rt.effective.sources_digest = config::sources_digest(&edit.bytes);
         rt.off_state.refresh(&rt.effective);
     }
+    diagnostics
+}
+
+/// One config edit the factory refused before it could be served: the
+/// typed [`ProviderError`] names the contradiction, and the input class
+/// distinguishes a configuration refusal from a storage failure.
+fn provider_error(id: Value, error: &ProviderError) -> RpcResponse {
+    envelope_error(id, ErrorCode::InvalidInput, -32602, &error.to_string())
 }
 
 fn admit_config_command(
@@ -2750,7 +3006,7 @@ fn admit_config_command(
     before: RetainedView,
 ) -> RpcResponse {
     match admit_config_edit(rt, edit, before, id.clone()) {
-        Ok(intent) => RpcResponse::ok(
+        Ok((intent, diagnostics)) => RpcResponse::ok(
             id,
             json!({
                 "schema_version": SCHEMA_VERSION,
@@ -2759,6 +3015,7 @@ fn admit_config_command(
                 "digest": edit.digest,
                 "owner": intent.owner,
                 "admission_seq": intent.admission_seq,
+                "diagnostics": diagnostics,
             }),
         ),
         Err(response) => *response,
@@ -3573,12 +3830,13 @@ fn decisions_control(rt: &mut Runtime, id: Value, params: &Value, ingress: Ingre
         Err(err) => return config_error(id, &err),
     };
     match admit_config_edit(rt, &edit, before, id.clone()) {
-        Ok(intent) => {
+        Ok((intent, diagnostics)) => {
             let result = config::ConfigMutationResult {
                 key: config::DECISIONS_MODE_KEY.to_string(),
                 digest: edit.digest,
                 owner: intent.owner,
                 admission_seq: intent.admission_seq,
+                diagnostics,
             };
             // The edit is durable and served; the receipt binds
             // command_id → this result so the replay never mutates

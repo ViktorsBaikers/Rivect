@@ -1,6 +1,7 @@
 //! Provider adapters. The loopback provider is the owner-brokered local
-//! fixture for offline first-task proof; live dialects arrive in later
-//! slices. Workers never hold a provider handle, only the broker does.
+//! fixture for offline proof; a production entrypoint builds the configured
+//! adapter set through [`configured_provider`]. Workers never hold a
+//! provider handle, only the broker does.
 //!
 //! The scoped credential-profile seam (SRC-010) also lives here:
 //! [`SecretRef`] is the only token that crosses into config, adapters,
@@ -615,7 +616,7 @@ impl ProviderError {
 /// The native secret-store class a credential reference resolves to
 /// (SRC-010). `keyring:` in a config ref binds the platform's native class;
 /// `keychain:`/`secret-service:` pin a class explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StoreKind {
     /// macOS Keychain (`apple-native-keyring-store`, keychain feature).
     Keychain,
@@ -2091,6 +2092,293 @@ impl Provider for LoopbackProvider {
             }),
         }
     }
+}
+
+/// The credential seam the production provider factory receives. The
+/// platform backend opens on the first scope a send resolves, so an open —
+/// and a runtime whose config declares no credentialled connection — never
+/// touches a keyring. Backends are kept per `(class, account)` so the
+/// per-profile refresh serialization holds across sends; the map is bounded
+/// by the distinct scopes config can reference.
+struct PlatformStore {
+    opened: Mutex<BTreeMap<(StoreKind, String), Arc<FlightedStore>>>,
+}
+
+impl PlatformStore {
+    fn store_for(&self, credential: &SecretRef) -> Result<Arc<FlightedStore>, ProviderError> {
+        let key = (credential.store(), credential.service().to_string());
+        // The map is a plain cache: a poisoning writer left no torn entry,
+        // so recovering the guard cannot expose a half-built backend.
+        let mut opened = self
+            .opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = opened.get(&key) {
+            return Ok(Arc::clone(store));
+        }
+        let store = Arc::new(native_store(key.0, &key.1)?);
+        opened.insert(key, Arc::clone(&store));
+        drop(opened);
+        Ok(store)
+    }
+}
+
+impl CredentialStore for PlatformStore {
+    fn kind(&self) -> StoreKind {
+        native_store_kind()
+    }
+
+    fn occupied(&self, credential: &SecretRef) -> Result<bool, ProviderError> {
+        self.store_for(credential)?.occupied(credential)
+    }
+
+    fn entry_accounts(&self, service: &str) -> Result<Vec<String>, ProviderError> {
+        native_store(native_store_kind(), service)?.entry_accounts(service)
+    }
+
+    fn login(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.store_for(credential)?.login(credential, secret)
+    }
+
+    fn resolve(&self, credential: &SecretRef) -> Result<Vec<u8>, ProviderError> {
+        self.store_for(credential)?.resolve(credential)
+    }
+
+    fn refresh(&self, credential: &SecretRef, secret: &[u8]) -> Result<(), ProviderError> {
+        self.store_for(credential)?.refresh(credential, secret)
+    }
+
+    fn revoke(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.store_for(credential)?.revoke(credential)
+    }
+
+    fn logout(&self, credential: &SecretRef) -> Result<(), ProviderError> {
+        self.store_for(credential)?.logout(credential)
+    }
+}
+
+/// The platform credential seam a configured runtime hands its provider
+/// factory: both native classes open lazily, one backend per
+/// `(class, account)` scope the config references.
+#[must_use]
+pub fn platform_credential_store() -> Arc<dyn CredentialStore> {
+    Arc::new(PlatformStore {
+        opened: Mutex::new(BTreeMap::new()),
+    })
+}
+
+/// The recorded dialect this build has an installed adapter for. `None`
+/// means the Broker's own send gate names the denial: an id with no
+/// recorded wire is a dialect mismatch, and the two agent backends without
+/// an adapter are the recorded unserved class.
+fn installed_dialect(connection: &str) -> Option<Dialect> {
+    match dialect_for(connection)? {
+        Dialect::CursorAgent | Dialect::DevinAgent => None,
+        dialect => Some(dialect),
+    }
+}
+
+/// The whole-send budget the adapters' own constructors default to; the
+/// Bedrock constructor takes it explicitly, so the configured set passes the
+/// same figure instead of inventing a second one.
+const PROVIDER_SEND_DEADLINE: Duration = Duration::from_secs(120);
+
+/// One declared connection the provider build refused: the typed cause,
+/// named by the row that produced it. The connection stays uninstalled, so
+/// the broker's send gate denies it typed before any request, and the
+/// runtime reports this cause instead of swallowing it.
+#[derive(Debug)]
+pub struct ProviderRefusal {
+    pub connection: String,
+    pub error: ProviderError,
+}
+
+/// One provider a factory built, beside every declared connection the build
+/// refused. A whole-build refusal is the factory's own `Err`; a refused row
+/// never fails the build, so one unbuildable declaration cannot brick the
+/// open around it.
+pub struct ProviderBuild {
+    pub provider: Box<dyn Provider>,
+    pub refusals: Vec<ProviderRefusal>,
+}
+
+impl std::fmt::Debug for ProviderBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderBuild")
+            .field("provider", &self.provider.name())
+            .field("refusals", &self.refusals)
+            .finish()
+    }
+}
+
+/// The production adapter set (TD-01): one [`Provider`] over the shipped
+/// codecs, built from the admitted config. Each declared connection whose
+/// recorded class has an installed adapter is constructed once here — the
+/// only production provider construction site — so a config reload builds a
+/// new set from the new config. Every adapter records the connection entry
+/// it was built from: [`Provider::serves`] answers only for that entry, so
+/// an adapter whose config diverged from the served view refuses the send
+/// instead of crossing it under bytes nobody admitted.
+/// Connections without an installed adapter are not built: the Broker's
+/// dialect claim denies them typed before any send.
+pub struct ConfiguredProvider {
+    adapters: BTreeMap<String, (Connection, Box<dyn Provider>)>,
+}
+
+impl std::fmt::Debug for ConfiguredProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfiguredProvider")
+            .field("connections", &self.adapters.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfiguredProvider {
+    /// The adapter one connection's recorded dialect names.
+    fn adapter_for(
+        config: &Config,
+        connection: &str,
+        dialect: Dialect,
+        store: &Arc<dyn CredentialStore>,
+    ) -> Result<Box<dyn Provider>, ProviderError> {
+        let store = Arc::clone(store);
+        match dialect {
+            Dialect::Responses => Ok(Box::new(openai::OpenAiProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::Messages => Ok(Box::new(anthropic::MessagesProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::ChatCompletions => match connection {
+                "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(
+                    config, connection, store,
+                )?)),
+                "gitlab-duo" | "opencode-go" | "opencode-zen" | "zenmux" => Ok(Box::new(
+                    routed::RoutedProvider::new(config, connection, store)?,
+                )),
+                _ => Ok(Box::new(local::ChatCompletionsProvider::new(
+                    config, connection, store,
+                )?)),
+            },
+            Dialect::Gemini => Ok(Box::new(gemini::GeminiProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::OllamaChat => Ok(Box::new(ollama_cloud::OllamaCloudProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::Converse => Ok(Box::new(bedrock::BedrockProvider::new(
+                config,
+                connection,
+                store,
+                PROVIDER_SEND_DEADLINE,
+            )?)),
+            Dialect::GitlabWorkflow => Ok(Box::new(gitlab_workflow::GitlabWorkflowProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::Vertex => Ok(Box::new(vertex::VertexProvider::new(
+                config, connection, store,
+            )?)),
+            Dialect::CloudCode => match connection {
+                "google-antigravity" => Ok(Box::new(cloudcode::CloudCodeProvider::new(
+                    config, connection, store,
+                )?)),
+                "google-gemini-cli" => Ok(Box::new(cloudcode::GeminiCliProvider::new(
+                    config, connection, store,
+                )?)),
+                _ => Err(ProviderError::DialectUnserved {
+                    connection: connection.to_string(),
+                    dialect,
+                }),
+            },
+            Dialect::CursorAgent | Dialect::DevinAgent => Err(ProviderError::DialectUnserved {
+                connection: connection.to_string(),
+                dialect,
+            }),
+        }
+    }
+}
+
+impl Provider for ConfiguredProvider {
+    fn name(&self) -> &'static str {
+        "configured"
+    }
+
+    /// The entry this connection's adapter was built from is the only one it
+    /// serves: a served view that moved without a rebuild refuses the send
+    /// here, before the adapter or the ledger sees the request. The dispatch
+    /// re-check already denies a moved entry as `ConnectionChanged`; this is
+    /// the adapter's own half of the same guarantee, so no divergence between
+    /// the installed set and the served view can silently cross the wire.
+    fn serves(&self, connection: &str, entry: &Connection) -> bool {
+        self.adapters
+            .get(connection)
+            .is_some_and(|(built, _)| built == entry)
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        // The Broker narrows every send to one connection before this seam;
+        // a manifest that still names a pool is a caller error, never a
+        // reason to pick one.
+        let connection = match &manifest.model {
+            ModelAssign::Fixed(fixed) => fixed.connection.as_str(),
+            ModelAssign::Auto { pool: Some(pool) } if pool.len() == 1 => pool[0].as_str(),
+            _ => {
+                return Err(ProviderError::UnsendableRequest {
+                    connection: "manifest".to_string(),
+                    reason: "the model assignment names no single connection".to_string(),
+                });
+            }
+        };
+        let Some((_, adapter)) = self.adapters.get_mut(connection) else {
+            return Err(ProviderError::DialectMismatch {
+                connection: connection.to_string(),
+            });
+        };
+        adapter.send(manifest)
+    }
+}
+
+/// Builds the production provider for the admitted config (TD-01): the one
+/// construction site both entrypoints pass to `Runtime::open_configured`,
+/// and the one a config reload re-runs.
+///
+/// A declared connection whose recorded class refuses to build — an unknown
+/// or region-mismatched declaration, a local row binding a profile, an
+/// unresolvable credential binding — is left uninstalled and its typed cause
+/// is recorded in [`ProviderBuild::refusals`], so one unbuildable row never
+/// refuses the whole set and the runtime reports the cause. A connection with
+/// no installed adapter is not a refusal either: the Broker denies it before
+/// any send.
+///
+/// # Errors
+/// Nothing today: the set is total, and every refusal is per connection. The
+/// seam keeps the whole-build refusal so a factory that cannot build any
+/// provider fails the open and the rebuild closed instead of installing
+/// nothing.
+pub fn configured_provider(
+    config: &Config,
+    store: &Arc<dyn CredentialStore>,
+) -> Result<ProviderBuild, ProviderError> {
+    let mut adapters: BTreeMap<String, (Connection, Box<dyn Provider>)> = BTreeMap::new();
+    let mut refusals = Vec::new();
+    for (connection, entry) in &config.connections {
+        let Some(dialect) = installed_dialect(connection) else {
+            continue;
+        };
+        match ConfiguredProvider::adapter_for(config, connection, dialect, store) {
+            Ok(adapter) => {
+                adapters.insert(connection.clone(), (entry.clone(), adapter));
+            }
+            Err(error) => refusals.push(ProviderRefusal {
+                connection: connection.clone(),
+                error,
+            }),
+        }
+    }
+    Ok(ProviderBuild {
+        provider: Box::new(ConfiguredProvider { adapters }),
+        refusals,
+    })
 }
 
 /// Whether a literal connection id records the credential-optional

@@ -157,6 +157,13 @@ pub enum ModelError {
         "dispatch rejected for attempt {attempt_id}: presented manifest does not match the admitted one"
     )]
     AdmissionMismatch { attempt_id: String },
+    #[error(
+        "dispatch rejected for attempt {attempt_id}: connection {connection} changed since admission"
+    )]
+    ConnectionChanged {
+        attempt_id: String,
+        connection: String,
+    },
     #[error("attempt {attempt_id} already accounted: one physical request per attempt id")]
     AttemptAlreadyAccounted { attempt_id: String },
     #[error(
@@ -378,6 +385,22 @@ pub struct AdmissionRecord {
     /// carry connections, not model ids — the live endpoint catalogue
     /// names the model later.
     pub connection: String,
+    /// The connection entry frozen at prepare (TD-01): its kind, endpoint,
+    /// credential reference, region and profile are the config an admitted
+    /// request is bound to. Dispatch compares them with the broker's current
+    /// view and denies [`ModelError::ConnectionChanged`] on any difference,
+    /// so a later edit never moves an in-flight request's wire target; an
+    /// edit to an unrelated config key leaves this entry equal.
+    pub connection_entry: Connection,
+    /// The scoped credential the ranking's eligibility resolution read for the
+    /// frozen connection, in its canonical `store:service/profile` text — the
+    /// binding the send resolves. The profile's own `credential_ref` can move
+    /// without touching [`Self::connection_entry`], so dispatch compares this
+    /// too and a rotated or re-pointed credential denies
+    /// [`ModelError::ConnectionChanged`] instead of sending under one the
+    /// ranking never admitted. `None` is the absent-binding form and the
+    /// unresolved state alike.
+    pub credential: Option<String>,
     pub model_id: Option<String>,
     pub model_source: String,
     /// The choosing basis the ranking froze on this attempt (AC-096); `None`
@@ -918,6 +941,14 @@ impl Broker {
         self.observe_config(config);
     }
 
+    /// Installs the adapter a config reload rebuilt (TD-01). The caller
+    /// builds the new provider from the new config before this seam runs,
+    /// so a build refusal leaves the previous config/provider pair intact
+    /// and the broker never dispatches through half an install.
+    pub fn set_provider(&mut self, provider: Box<dyn Provider>) {
+        self.provider = provider;
+    }
+
     fn observe_config(&mut self, config: &Config) {
         self.view_connections = config.connections.clone();
         self.view_profiles = config.profiles.clone();
@@ -1211,6 +1242,15 @@ impl Broker {
             None => resolved.effort.clone(),
         };
         let connection = choice.connection;
+        // The ranking admits a declared connection, so its entry is the
+        // config this request freezes; an id outside the catalogue is the
+        // same typed denial the ranking's own walk reports.
+        let Some(connection_entry) = config.connections.get(&connection).cloned() else {
+            return Err(ModelError::Provider(ProviderError::UnknownConnection {
+                connection,
+            }));
+        };
+        let credential = frozen_credential(&config.connections, &config.profiles, &connection);
         let accounted = wire_composition(
             request.instructions,
             &model,
@@ -1257,6 +1297,8 @@ impl Broker {
             AdmissionRecord {
                 purpose: purpose.to_string(),
                 connection: connection.clone(),
+                connection_entry,
+                credential,
                 model_id: choice.model_id,
                 model_source: resolved.model_source,
                 ranking_basis: choice.basis,
@@ -1303,7 +1345,10 @@ impl Broker {
     /// attempt was tombstoned by a cancel, [`ModelError::NoAdmission`]
     /// when this broker ranked no manifest with that attempt id,
     /// [`ModelError::AdmissionMismatch`] when the presented manifest is
-    /// not the one the ranking admitted, [`ModelError::EligibilityStale`]
+    /// not the one the ranking admitted, [`ModelError::ConnectionChanged`]
+    /// when the frozen connection's entry or its resolved credential differs
+    /// from the config now served (a later edit never moves an in-flight
+    /// request's wire target), [`ModelError::EligibilityStale`]
     /// when the entitlement snapshot changed since ranking,
     /// [`ModelError::ManualFallbackPending`] when the frozen fallback is
     /// `manual` and the send failed — the pending choice rides
@@ -1377,6 +1422,26 @@ impl Broker {
                 connection: admission.connection.clone(),
                 frozen: admission.snapshot_version,
                 current: current_version,
+            });
+        }
+        // The frozen entry is the only connection config this admitted
+        // request reads (TD-01): a later edit that moved its endpoint,
+        // credential reference, region or profile — or removed it — denies
+        // before the reservation, so the frozen bytes never reach a target
+        // the ranking did not admit. The credential binding is compared the
+        // same way, because a profile's own `credential_ref` can move without
+        // touching the connection row. Only these fields are compared, so an
+        // edit to an unrelated config key never blocks an in-flight request.
+        if self.view_connections.get(&admission.connection) != Some(&admission.connection_entry)
+            || frozen_credential(
+                &self.view_connections,
+                &self.view_profiles,
+                &admission.connection,
+            ) != admission.credential
+        {
+            return Err(ModelError::ConnectionChanged {
+                attempt_id: manifest.attempt_id.clone(),
+                connection: admission.connection.clone(),
             });
         }
         match self.complete_send(ledger, manifest, &admission.connection, None) {
@@ -1638,6 +1703,16 @@ impl Broker {
                 cause,
             });
         }
+        // The substitute freezes the entry the re-check above just admitted,
+        // so its admission carries the same config binding every other one
+        // does.
+        let Some(connection_entry) = self.view_connections.get(connection).cloned() else {
+            return Err(ModelError::ManualChoiceRejected {
+                attempt_id: attempt_id.to_string(),
+                connection: connection.to_string(),
+                cause: RejectionCause::UnknownConnection,
+            });
+        };
         // A fixed pin's model_id crosses verbatim onto the picked
         // connection — the recorded F22 semantic: the pin survives the
         // substitution, and a peer that does not serve that id answers
@@ -1653,7 +1728,8 @@ impl Broker {
                 pool: Some(vec![connection.to_string()]),
             },
         };
-        let (substitute, displaced) = self.mint_substitute(&admission, model, connection, "manual");
+        let (substitute, displaced) =
+            self.mint_substitute(&admission, model, connection, connection_entry, "manual");
         match self.complete_send(ledger, &substitute, connection, Some(attempt_id)) {
             Ok(reply) => {
                 // The substitute answered the intent: the paused
@@ -1819,12 +1895,26 @@ impl Broker {
                         });
                         continue;
                     }
+                    let Some(connection_entry) =
+                        self.view_connections.get(&entry.connection).cloned()
+                    else {
+                        rejected.push(CandidateRejection {
+                            connection: entry.connection.clone(),
+                            cause: RejectionCause::UnknownConnection,
+                        });
+                        continue;
+                    };
                     let model = ModelAssign::Fixed(FixedModel {
                         connection: entry.connection.clone(),
                         model_id: entry.model_id.clone(),
                     });
-                    let (fallback_manifest, displaced) =
-                        self.mint_substitute(admission, model, &entry.connection, "fallback");
+                    let (fallback_manifest, displaced) = self.mint_substitute(
+                        admission,
+                        model,
+                        &entry.connection,
+                        connection_entry,
+                        "fallback",
+                    );
                     attempted.push(entry.connection.clone());
                     match self.complete_send(
                         ledger,
@@ -1897,6 +1987,7 @@ impl Broker {
         admission: &AdmissionRecord,
         model: ModelAssign,
         connection: &str,
+        connection_entry: Connection,
         leg: &str,
     ) -> (RequestManifest, Option<EpochState>) {
         let displaced = self.epochs.get(&admission.purpose).cloned();
@@ -1923,6 +2014,12 @@ impl Broker {
             AdmissionRecord {
                 purpose: admission.purpose.clone(),
                 connection: connection.to_string(),
+                connection_entry,
+                credential: frozen_credential(
+                    &self.view_connections,
+                    &self.view_profiles,
+                    connection,
+                ),
                 model_id,
                 model_source: format!("{}.{leg}", admission.fallback_source),
                 // No ranking chose this connection: the substitute inherits
@@ -2706,6 +2803,34 @@ fn model_wire_id(model: &ModelAssign) -> String {
             Some(names) => format!("auto:{}", names.join("+")),
         },
         ModelAssign::Fixed(fixed) => format!("fixed:{}/{}", fixed.connection, fixed.model_id),
+    }
+}
+
+/// The scoped credential the ranking's eligibility resolution reads for one
+/// connection, in the canonical text the send resolves: `profiles.<p>` first,
+/// else the connection's own reference. Frozen on the admission and compared
+/// before every send, so a profile-content or rotated-ref edit denies
+/// [`ModelError::ConnectionChanged`] instead of sending under a credential the
+/// ranking never admitted.
+///
+/// [`None`] is the frozen value both for a declaration that binds nothing and
+/// for a binding this config cannot resolve. The comparison asks one question —
+/// did the effective binding move — and neither state names a scoped credential
+/// the send would carry, so folding the resolution cause in cannot admit a
+/// send: the production set installs no adapter for a connection whose binding
+/// does not resolve (the constructor's own typed denial leaves the row
+/// uninstalled), so the dispatch's `serves` gate denies it before the wire, and
+/// the fixture carrier serves no dialect-reserved id. The typed resolution
+/// denial therefore stays where it is raised, at the adapter build and the send
+/// seam, and is never restated as a credential here.
+fn frozen_credential(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+    connection: &str,
+) -> Option<String> {
+    match providers::resolve_optional_credential_in(connections, profiles, connection) {
+        Ok(credential) => credential.map(|reference| reference.to_string()),
+        Err(_) => None,
     }
 }
 
