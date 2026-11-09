@@ -633,6 +633,39 @@ impl Runtime {
         self.owner.store.writer()
     }
 
+    /// Prepares one delivery of this runtime's exact serving base: the
+    /// candidate, destination, retention bound, current grant and the
+    /// provenance/integrity/compatibility checks all run before the publication
+    /// journal records the intent. No destination byte is written.
+    ///
+    /// # Errors
+    /// See [`crate::update::prepare_delivery`].
+    pub fn prepare_delivery(
+        &mut self,
+        intent: crate::contracts::DeliveryIntent,
+    ) -> Result<crate::contracts::DeliveryIntent, crate::update::DeliveryError> {
+        crate::update::prepare_delivery(&mut self.owner.store.writer(), &self.policy, intent)
+    }
+
+    /// Delivers one prepared intent through the runtime's publication journal:
+    /// at most one local effect and one retained receipt, and the current grant
+    /// re-checked immediately before the effect.
+    ///
+    /// # Errors
+    /// See [`crate::update::deliver_change`].
+    pub fn deliver_change(
+        &mut self,
+        intent: &crate::contracts::DeliveryIntent,
+        candidate: &[u8],
+    ) -> Result<crate::contracts::DeliveryReceipt, crate::update::DeliveryError> {
+        crate::update::deliver_change(
+            &mut self.owner.store.writer(),
+            &self.policy,
+            intent,
+            candidate,
+        )
+    }
+
     /// Activates one learned delta and installs the definition the store now
     /// composes on this runtime's broker, so the request seam and the selection
     /// seam read one definition inside one process: an activation takes effect
@@ -2877,8 +2910,9 @@ fn config_error(id: Value, err: &config::ConfigError) -> RpcResponse {
 }
 
 /// Journal owner string for the CLI carrier; the file surface admits with
-/// its own owner spelling through the same singleflight.
-const CONFIG_CARRIER_OWNER: &str = "cli";
+/// its own owner spelling through the same singleflight, and the journal's own
+/// carrier set names both.
+const CONFIG_CARRIER_OWNER: &str = config::CONFIG_CLI_OWNER;
 
 /// Admits one accepted edit through the singleflight journal. The read
 /// surface is refreshed first, so the retained doc and its served entries
@@ -3351,9 +3385,17 @@ fn recovery_diagnostic(recovery: &config::PublicationRecovery) -> Option<String>
         config::PublicationVerdict::Absent => "absent",
         config::PublicationVerdict::Unknown => "unknown",
     };
+    // The row's owner names the retry: a delivery row is settled by running that
+    // delivery again, while a configuration edit owns nothing in a delivery
+    // row — naming it would send an operator to a command that never stages it.
+    let resolution = if recovery.intent.owner == crate::update::DELIVERY_OWNER {
+        "re-run the delivery for that destination"
+    } else {
+        "re-run the configuration edit that owns the pending publication"
+    };
     Some(format!(
         "publication recovery: {verdict} verdict stays pending at {}; \
-         resolution: inspect the target, then re-run the configuration edit that owns the pending publication",
+         resolution: inspect the target, then {resolution}",
         crate::resources::sanitize_status_cause(&recovery.intent.target).replace('\n', "␤")
     ))
 }
@@ -8005,6 +8047,180 @@ mod tests {
             text.contains('␤'),
             "a newline in the target survives as one inert glyph — the diagnostic stays one line: {text}"
         );
+    }
+
+    #[test]
+    fn recovery_diagnostic_names_the_owner_that_can_settle_the_row() {
+        let mut delivery = recovery(
+            config::PublicationVerdict::Conflicting,
+            "/operator/delivered-base.toml",
+        );
+        delivery.intent.owner = crate::update::DELIVERY_OWNER.to_string();
+        let Some(text) = recovery_diagnostic(&delivery) else {
+            unreachable!("an unhealed delivery row must surface a diagnostic");
+        };
+        assert!(
+            text.contains("re-run the delivery for that destination"),
+            "a delivery row names the delivery that settles it: {text}"
+        );
+        assert!(
+            !text.contains("configuration edit"),
+            "a delivery row never names the config carrier: {text}"
+        );
+        let Some(config_row) = recovery_diagnostic(&recovery(
+            config::PublicationVerdict::Old,
+            "/data/config.toml",
+        )) else {
+            unreachable!("an unhealed config row must surface a diagnostic");
+        };
+        assert!(
+            config_row.contains("re-run the configuration edit"),
+            "a config row keeps the correction that names its carrier: {config_row}"
+        );
+    }
+
+    /// The destination's durable mark: the identity, length and timestamps an
+    /// in-place rewrite moves, and a receipt-only completion leaves alone.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurableMark {
+        dev: u64,
+        ino: u64,
+        len: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+
+    fn durable_mark(path: impl AsRef<std::path::Path>) -> DurableMark {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path.as_ref()).expect("destination metadata");
+        DurableMark {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    /// AC-080: the crash window between the managed write and its receipt. The
+    /// write lands and only the receipt fails, so the answer is an unknown
+    /// outcome — never a clean publish and never a blind retry — and the next
+    /// boot receipts exactly that landed write without rewriting the file.
+    #[test]
+    fn a_lost_delivery_receipt_is_unknown_and_receipted_once_after_a_restart() -> TestResult {
+        use crate::contracts::{DeliveryCandidate, DeliveryIntent, DeliveryOutcome, EffectClass};
+        use crate::update::{DELIVERY_OWNER, DeliveryError};
+
+        // The effect crosses the confined managed write, so this unit test
+        // builds the helper its own suite would otherwise never produce.
+        crate::executor::test_helper::ensure_helper();
+        let root = tempfile::TempDir::with_prefix("rivect-delivery-lost-receipt-")?;
+        let scope = tempfile::TempDir::with_prefix("rivect-delivery-lost-scope-")?;
+        let destination = scope.path().join("delivered-base.toml");
+        std::fs::write(&destination, b"the previous release bytes")?;
+        let destination = destination
+            .to_str()
+            .ok_or("the fixture destination is utf-8")?
+            .to_string();
+        let candidate = DeliveryCandidate {
+            base_version: config::SHIPPED_BASE_VERSION,
+            digest: config::shipped_revision(),
+        };
+        let bytes = config::SHIPPED_DEFAULTS_TOML.as_bytes().to_vec();
+        let rows = |runtime: &super::Runtime| -> Result<(usize, usize), StoreError> {
+            let count = |rows: Vec<config::PublicationIntent>| {
+                rows.into_iter()
+                    .filter(|row| row.owner == DELIVERY_OWNER && row.target == destination)
+                    .count()
+            };
+            Ok((
+                count(runtime.store().pending_publications()?),
+                count(runtime.store().applied_publications()?),
+            ))
+        };
+
+        let landed = {
+            let mut runtime = super::Runtime::open_with_worker(
+                root.path(),
+                Box::new(crate::providers::LoopbackProvider::new()),
+                Box::new(RecoveryNoWorker),
+            )?;
+            let grant = runtime
+                .policy_writer()
+                .grant_classes(scope.path().to_path_buf(), vec![EffectClass::Write]);
+            let prepared = runtime
+                .prepare_delivery(DeliveryIntent {
+                    candidate: candidate.clone(),
+                    destination: destination.clone(),
+                    grant_id: grant,
+                    admission_seq: None,
+                })
+                .expect("the exact serving base is prepared");
+
+            crate::state::proof::arm_fault(crate::state::proof::Site::PublicationReceipt);
+            let error = runtime
+                .deliver_change(&prepared, &bytes)
+                .expect_err("a receipt that cannot be written is not a published outcome");
+            assert!(
+                matches!(&error, DeliveryError::ReceiptLost { .. }),
+                "wrong lost-receipt refusal: {error}"
+            );
+            assert_eq!(
+                error.code(),
+                ErrorCode::OutcomeUnknown,
+                "a lost receipt names the unknown outcome"
+            );
+            assert_eq!(
+                std::fs::read(&destination)?,
+                bytes,
+                "the effect landed although its receipt did not"
+            );
+            assert_eq!(
+                rows(&runtime)?,
+                (1, 0),
+                "the landed effect keeps its pending intent for reconciliation"
+            );
+            durable_mark(&destination)
+        };
+
+        let mut runtime = super::Runtime::open_with_worker(
+            root.path(),
+            Box::new(crate::providers::LoopbackProvider::new()),
+            Box::new(RecoveryNoWorker),
+        )?;
+        assert_eq!(
+            rows(&runtime)?,
+            (0, 1),
+            "the boot receipts the landed write exactly once"
+        );
+        assert_eq!(
+            durable_mark(&destination),
+            landed,
+            "the boot never rewrites the bytes it receipts"
+        );
+
+        let grant = runtime
+            .policy_writer()
+            .grant_classes(scope.path().to_path_buf(), vec![EffectClass::Write]);
+        let prepared = runtime
+            .prepare_delivery(DeliveryIntent {
+                candidate,
+                destination,
+                grant_id: grant,
+                admission_seq: None,
+            })
+            .expect("the receipted delivery is reused");
+        let retained = runtime
+            .deliver_change(&prepared, &bytes)
+            .expect("the retained receipt answers");
+        assert_eq!(retained.outcome, DeliveryOutcome::Retained);
+        assert!(retained.applied, "the retained receipt is the applied one");
+        assert_eq!(
+            std::fs::read(&prepared.destination)?,
+            bytes,
+            "a retry after the receipt moves no byte"
+        );
+        Ok(())
     }
 
     #[test]

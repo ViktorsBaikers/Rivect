@@ -9,10 +9,17 @@
 //! so neither a rollback nor a snapshot cleanup can erase the cause an
 //! operator still has to act on.
 
-use crate::contracts::{ErrorCode, WireError};
-use crate::state::TaskStore;
+use crate::config::{FileAttribution, TargetOpen, TargetRefusal, attribute};
+use crate::contracts::{
+    DeliveryCandidate, DeliveryIntent, DeliveryOutcome, DeliveryReceipt, EffectClass, ErrorCode,
+    WireError,
+};
+use crate::executor::{Unattested, WorkerError, WriteIdentity};
+use crate::policy::Policy;
+use crate::state::{StoreWriter, TaskStore};
 use rivect_sandbox_helper::{ANCHOR_O_NOFOLLOW, OPEN_NONBLOCK};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -1130,6 +1137,484 @@ pub fn owner_refusal_diagnostics(error: &crate::owner::OwnerError) -> Vec<String
     ]
 }
 
+// ----- delivery (original SLICE-077 obligation, AC-080) -----
+
+/// The journal owner every delivery row is admitted under. A fixed label, not
+/// caller input: `(owner, target, admission_seq)` is the journal's key, so a
+/// caller-chosen owner could address a row it never admitted.
+pub const DELIVERY_OWNER: &str = "delivery";
+
+/// The bound one destination is observed under: the same ceiling the managed
+/// write enforces on the bytes it lands.
+const DELIVERY_MAX_BYTES: usize = 1 << 20;
+
+/// One destination as it stands: the digest of its bytes and the identity of
+/// the file they came from, both taken through one opened handle so a swap
+/// between two opens cannot pair one file's bytes with another file's
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryTarget {
+    digest: String,
+    identity: WriteIdentity,
+}
+
+/// Why one delivery refused or cannot prove its effect. Each variant is the
+/// seam an operator acts on; [`DeliveryError::code`] is the one wire mapping.
+#[derive(Debug, thiserror::Error)]
+pub enum DeliveryError {
+    #[error("delivery candidate: {0}")]
+    Candidate(#[from] crate::config::BaseError),
+    #[error("delivery candidate: the recorded digest is not the offered one")]
+    DigestMismatch,
+    #[error("delivery candidate: base {base_version} is not the serving base")]
+    NotServing { base_version: u64 },
+    #[error("delivery intent was never prepared")]
+    NotPrepared,
+    #[error("delivery destination {target} is not an absolute path")]
+    NotAbsolute { target: String },
+    #[error("delivery destination {target} cannot be observed: {source}")]
+    Target {
+        target: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("delivery destination {target} is not a regular file")]
+    TargetNotRegular { target: String },
+    #[error("delivery destination {target} exceeds the {limit} byte bound")]
+    TargetTooLarge { target: String, limit: usize },
+    #[error("delivery destination {target} is denied by policy")]
+    Denied { target: String },
+    #[error("delivery grant: {0}")]
+    Grant(#[from] crate::policy::PolicyError),
+    #[error("delivery candidate bytes do not match the recorded digest")]
+    Integrity,
+    #[error("delivery journal: {0}")]
+    Journal(#[from] crate::state::StoreError),
+    #[error("delivery journal row does not match the prepared intent")]
+    JournalMismatch,
+    #[error("delivery destination no longer holds the retained bytes")]
+    Differing,
+    #[error("delivery outcome is unknown: the receipt could not be recorded")]
+    ReceiptLost {
+        #[source]
+        source: Box<DeliveryError>,
+    },
+    #[error("delivery write: {0}")]
+    Write(#[from] WorkerError),
+}
+
+impl DeliveryError {
+    /// The wire class of this refusal (P-001): one mapping site, so the
+    /// delivery family cannot spell the same cause two ways.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Candidate(error) => error.code(),
+            Self::DigestMismatch
+            | Self::NotServing { .. }
+            | Self::NotPrepared
+            | Self::NotAbsolute { .. }
+            | Self::TargetNotRegular { .. }
+            | Self::TargetTooLarge { .. }
+            | Self::Integrity
+            | Self::JournalMismatch => ErrorCode::InvalidInput,
+            Self::Target { .. } | Self::Journal(_) => ErrorCode::StorageUnavailable,
+            Self::Differing => ErrorCode::Conflict,
+            Self::Denied { .. } => ErrorCode::Denied,
+            Self::Grant(error) => match error {
+                crate::policy::PolicyError::UnknownGrant { .. }
+                | crate::policy::PolicyError::Revoked { .. }
+                | crate::policy::PolicyError::ClassNotAdmitted { .. } => ErrorCode::Denied,
+                crate::policy::PolicyError::InvalidPath
+                | crate::policy::PolicyError::PathInspection { .. }
+                | crate::policy::PolicyError::SymlinkRead { .. }
+                | crate::policy::PolicyError::SymlinkLoop => ErrorCode::InvalidInput,
+            },
+            Self::ReceiptLost { .. } => ErrorCode::OutcomeUnknown,
+            Self::Write(error) => crate::executor::worker_error_code(error),
+        }
+    }
+}
+
+/// Prepares one delivery of the exact serving base (REQ-066, AC-080).
+///
+/// Every check runs before any write: the ledger holds an *active* receipt for
+/// the candidate, its digest is the offered one, the base it names is the base
+/// serving now, the destination is an existing regular file inside the current
+/// grant's canonical scope, and that grant admits a write. The destination
+/// itself is the retention: the exact bytes are retained in place, so nothing
+/// is created or discarded here. Only then is the publication-journal intent
+/// staged, with the destination's pre-effect digest and occupant identity, so
+/// the effect can be attributed and reconciled after a crash.
+///
+/// Preparation is not authorization and not an effect: no destination byte is
+/// written here, and an absent, revoked or mismatched grant writes nothing at
+/// all — not even a journal row. The activation record stays the ledger's
+/// [`crate::config::UpdateReceipt`]; nothing is copied from it. The durable
+/// carrier is the existing publication journal, so a retry of the same exact
+/// candidate reuses the staged row instead of minting a second intent.
+///
+/// # Errors
+/// [`DeliveryError::Candidate`] when the ledger refuses the receipt,
+/// [`DeliveryError::DigestMismatch`] or [`DeliveryError::NotServing`] when the
+/// offered candidate is not the active one, [`DeliveryError::Grant`] for an
+/// absent, revoked or class-mismatched grant, the destination variants when the
+/// path cannot be the exact local file, and [`DeliveryError::Journal`] when the
+/// intent cannot be staged.
+pub fn prepare_delivery(
+    writer: &mut StoreWriter<'_>,
+    policy: &Policy,
+    mut intent: DeliveryIntent,
+) -> Result<DeliveryIntent, DeliveryError> {
+    let target = intent.destination.as_str();
+    if !Path::new(target).is_absolute() {
+        return Err(DeliveryError::NotAbsolute {
+            target: target.to_string(),
+        });
+    }
+    verify_candidate(writer.store(), &intent.candidate)?;
+    let grant = policy.admit(&intent.grant_id, EffectClass::Write)?;
+    if policy.covers(target) {
+        return Err(DeliveryError::Denied {
+            target: target.to_string(),
+        });
+    }
+    // The grant's own identity read: it canonicalizes the target, refuses a
+    // path outside the scope and takes the occupant from one opened handle. The
+    // occupant equality that matters is the managed write's — `write_once`
+    // confirms the staged identity against the handle it writes through — so a
+    // second comparison here would only restate it across two opens.
+    crate::executor::write_target_identity(&grant.scope_root, Path::new(target))?;
+    let observed = observe_delivery_target(target)?;
+    let digest = intent.candidate.digest.as_str();
+    let pending = writer.store().pending_publications()?;
+    let mut unattested_row = None;
+    for row in pending.iter().filter(|row| {
+        row.owner == DELIVERY_OWNER && row.target == target && row.intended_digest == digest
+    }) {
+        match row
+            .publish_identity
+            .map(|staged| attribute(staged, observed.identity))
+        {
+            Some(FileAttribution::Same) => {
+                intent.admission_seq = Some(row.admission_seq);
+                return Ok(intent);
+            }
+            Some(FileAttribution::Unverifiable(cause)) => {
+                unattested_row.get_or_insert(cause);
+            }
+            Some(FileAttribution::Different) | None => {}
+        }
+    }
+    // A row that may own the current bytes but no reuse token can confirm is
+    // neither this intent's row nor room for a second one: its own publisher
+    // refuses the unattested write, and so does this admission.
+    if let Some(cause) = unattested_row {
+        return Err(unattested(cause));
+    }
+    let applied = writer.store().applied_publications()?;
+    if let Some(row) = applied.iter().find(|row| {
+        row.owner == DELIVERY_OWNER && row.target == target && row.intended_digest == digest
+    }) {
+        let staged = row.publish_identity.ok_or(DeliveryError::JournalMismatch)?;
+        if observed.digest != digest {
+            return Err(DeliveryError::Differing);
+        }
+        match attribute(staged, observed.identity) {
+            FileAttribution::Same => {
+                intent.admission_seq = Some(row.admission_seq);
+                return Ok(intent);
+            }
+            FileAttribution::Different => return Err(DeliveryError::Differing),
+            FileAttribution::Unverifiable(cause) => return Err(unattested(cause)),
+        }
+    }
+    let admission_seq = writer.append_publication(
+        DELIVERY_OWNER,
+        target,
+        digest,
+        Some(observed.digest.as_str()),
+        Some(observed.identity),
+    )?;
+    intent.admission_seq = Some(admission_seq);
+    Ok(intent)
+}
+
+/// Delivers one prepared intent: at most one admitted local effect and one
+/// retained journal receipt for the exact candidate.
+///
+/// Every check preparation made is repeated against the current state before a
+/// byte moves — the candidate receipt, the bytes' digest, the current grant, the
+/// destination occupant and the journal row. The destination is then classified
+/// against the row preparation staged: the intended bytes already holding are
+/// the retained effect (the receipt is completed, nothing is written); the
+/// recorded base bytes mean the effect never landed at the target and may be
+/// written exactly once; anything else is unknown, so nothing is written and the
+/// caller must reconcile the retained intent before any retry. An applied effect
+/// is answered from its retained row and is never repeated. Because completing a
+/// receipt is itself an effect, every answer that completes one or reports the
+/// retained bytes re-derives the destination under the *current* grant's
+/// canonical scope and requires it to still be the staged occupant: a grant that
+/// excludes the destination writes no byte and completes no receipt, exactly as
+/// an absent grant does. The one write runs
+/// through the production checked-fd managed write
+/// ([`crate::executor::write_once`]) under the grant admission and the deny
+/// re-check — the same boundary the executor's managed-write leg crosses.
+/// Delivery owns no task attempt, so no agent-effect ledger row is invented.
+///
+/// # Errors
+/// [`DeliveryError::NotPrepared`] for an intent without a journal row,
+/// [`DeliveryError::Integrity`] when the bytes are not the recorded candidate,
+/// [`DeliveryError::Grant`] or [`DeliveryError::Denied`] when the current policy
+/// no longer admits the destination, [`DeliveryError::JournalMismatch`] when the
+/// row belongs to another candidate, [`DeliveryError::Differing`] when an applied
+/// destination no longer holds its bytes, [`DeliveryError::Write`] when the
+/// managed write refuses or its outcome is unproven, and
+/// [`DeliveryError::ReceiptLost`] when the effect landed and its receipt could
+/// not be recorded.
+pub fn deliver_change(
+    writer: &mut StoreWriter<'_>,
+    policy: &Policy,
+    intent: &DeliveryIntent,
+    candidate: &[u8],
+) -> Result<DeliveryReceipt, DeliveryError> {
+    let admission_seq = intent.admission_seq.ok_or(DeliveryError::NotPrepared)?;
+    let target = intent.destination.as_str();
+    if !Path::new(target).is_absolute() {
+        return Err(DeliveryError::NotAbsolute {
+            target: target.to_string(),
+        });
+    }
+    verify_candidate(writer.store(), &intent.candidate)?;
+    let digest = crate::config::hex(&Sha256::digest(candidate));
+    if digest != intent.candidate.digest {
+        return Err(DeliveryError::Integrity);
+    }
+    let grant = policy.admit(&intent.grant_id, EffectClass::Write)?;
+    if policy.covers(target) {
+        return Err(DeliveryError::Denied {
+            target: target.to_string(),
+        });
+    }
+    let (row, applied) = journal_intent(writer.store(), target, admission_seq)?;
+    if row.intended_digest != digest {
+        return Err(DeliveryError::JournalMismatch);
+    }
+    let staged = row.publish_identity.ok_or(DeliveryError::JournalMismatch)?;
+    let base_digest = row.base_digest.ok_or(DeliveryError::JournalMismatch)?;
+    let observed = observe_delivery_target(target);
+    if applied {
+        let Ok(observed) = observed else {
+            return Err(DeliveryError::Differing);
+        };
+        if observed.digest != digest {
+            return Err(DeliveryError::Differing);
+        }
+        return match rederive_occupant(&grant.scope_root, target, staged)? {
+            FileAttribution::Same => Ok(delivery_receipt(
+                intent,
+                admission_seq,
+                true,
+                DeliveryOutcome::Retained,
+            )),
+            FileAttribution::Different => Err(DeliveryError::Differing),
+            FileAttribution::Unverifiable(cause) => Err(unattested(cause)),
+        };
+    }
+    let Ok(observed) = observed else {
+        // An unreadable destination proves nothing about the effect; the
+        // retained intent stays pending for reconciliation.
+        return Ok(delivery_receipt(
+            intent,
+            admission_seq,
+            false,
+            DeliveryOutcome::Unknown,
+        ));
+    };
+    if observed.digest == digest {
+        match rederive_occupant(&grant.scope_root, target, staged)? {
+            FileAttribution::Same => {}
+            FileAttribution::Different => {
+                return Ok(delivery_receipt(
+                    intent,
+                    admission_seq,
+                    false,
+                    DeliveryOutcome::Unknown,
+                ));
+            }
+            FileAttribution::Unverifiable(cause) => return Err(unattested(cause)),
+        }
+        record_receipt(writer, target, admission_seq).map_err(|source| {
+            DeliveryError::ReceiptLost {
+                source: Box::new(source),
+            }
+        })?;
+        return Ok(delivery_receipt(
+            intent,
+            admission_seq,
+            true,
+            DeliveryOutcome::Retained,
+        ));
+    }
+    if observed.digest != base_digest {
+        return Ok(delivery_receipt(
+            intent,
+            admission_seq,
+            false,
+            DeliveryOutcome::Unknown,
+        ));
+    }
+    crate::executor::write_once(&grant.scope_root, Path::new(target), staged, candidate)?;
+    record_receipt(writer, target, admission_seq).map_err(|source| DeliveryError::ReceiptLost {
+        source: Box::new(source),
+    })?;
+    Ok(delivery_receipt(
+        intent,
+        admission_seq,
+        true,
+        DeliveryOutcome::Published,
+    ))
+}
+
+/// The ledger's activation record must name the exact candidate and stay the
+/// base serving now: a receipt an update staged but never activated is not a
+/// delivery's provenance, and a different active base is a compatibility
+/// mismatch. The serving half is the `base_state` row alone — a staged or
+/// retired receipt is never the active one, so it refuses there, which is the
+/// case the retired-base proof drives — and the digest half names the
+/// candidate. This checks the ledger's own record only; release signing is a
+/// different proof and is not claimed here.
+fn verify_candidate(store: &TaskStore, candidate: &DeliveryCandidate) -> Result<(), DeliveryError> {
+    let receipt = store.update_receipt(candidate.base_version)?;
+    if receipt.digest != candidate.digest {
+        return Err(DeliveryError::DigestMismatch);
+    }
+    match store.active_base()? {
+        Some(base) if base.version == candidate.base_version && base.digest == candidate.digest => {
+            Ok(())
+        }
+        _ => Err(DeliveryError::NotServing {
+            base_version: candidate.base_version,
+        }),
+    }
+}
+
+/// The journal row one prepared intent names, and whether it already reached the
+/// applied state.
+fn journal_intent(
+    store: &TaskStore,
+    target: &str,
+    admission_seq: u64,
+) -> Result<(crate::config::PublicationIntent, bool), DeliveryError> {
+    let pending = store.pending_publications()?;
+    if let Some(row) = pending.into_iter().find(|row| {
+        row.owner == DELIVERY_OWNER && row.target == target && row.admission_seq == admission_seq
+    }) {
+        return Ok((row, false));
+    }
+    let applied = store.applied_publications()?;
+    applied
+        .into_iter()
+        .find(|row| {
+            row.owner == DELIVERY_OWNER
+                && row.target == target
+                && row.admission_seq == admission_seq
+        })
+        .map(|row| (row, true))
+        .ok_or(DeliveryError::JournalMismatch)
+}
+
+/// Records the receipt for one staged row. A row that left the pending state
+/// underneath the caller is the retained answer when this owner and key already
+/// receipted it — the journal's only transition — so a concurrent completion is
+/// never mistaken for a failure and never causes a second effect.
+fn record_receipt(
+    writer: &mut StoreWriter<'_>,
+    target: &str,
+    admission_seq: u64,
+) -> Result<(), DeliveryError> {
+    if let Err(source) = writer.complete_publication(DELIVERY_OWNER, target, admission_seq) {
+        let applied = writer.store().applied_publications()?;
+        let receipted = applied.iter().any(|row| {
+            row.owner == DELIVERY_OWNER
+                && row.target == target
+                && row.admission_seq == admission_seq
+        });
+        if !receipted {
+            return Err(DeliveryError::Journal(source));
+        }
+    }
+    Ok(())
+}
+
+/// One destination observed through the journal's bounded read: one opened
+/// handle produces both its bytes' digest and the identity they came from, a
+/// FIFO swapped onto the path can neither hang the open nor slip past the
+/// regular-file check, and a symlink swapped onto a delivery destination is
+/// refused instead of followed. The identity rule is the journal's, so a
+/// delivery and a carrier cannot attribute one file two ways.
+fn observe_delivery_target(target: &str) -> Result<DeliveryTarget, DeliveryError> {
+    let observation =
+        crate::config::read_target_once(target, TargetOpen::NoFollow).map_err(|refusal| {
+            match refusal {
+                TargetRefusal::NotRegular => DeliveryError::TargetNotRegular {
+                    target: target.to_string(),
+                },
+                TargetRefusal::TooLarge => DeliveryError::TargetTooLarge {
+                    target: target.to_string(),
+                    limit: DELIVERY_MAX_BYTES,
+                },
+                TargetRefusal::Io(source) => DeliveryError::Target {
+                    target: target.to_string(),
+                    source,
+                },
+            }
+        })?;
+    Ok(DeliveryTarget {
+        digest: observation.digest,
+        identity: observation.identity,
+    })
+}
+
+/// The destination re-derived under the current grant's canonical scope, so a
+/// receipt is completed only under the grant that admits this exact file now:
+/// a grant whose scope excludes the destination writes no byte and completes
+/// no receipt, exactly as an absent grant does.
+fn rederive_occupant(
+    grant_scope: &Path,
+    target: &str,
+    staged: WriteIdentity,
+) -> Result<FileAttribution, DeliveryError> {
+    let current = crate::executor::write_target_identity(grant_scope, Path::new(target))?;
+    Ok(attribute(staged, current))
+}
+
+/// The capability refusal one unattested occupant carries: the filesystem
+/// cannot prove which file holds the bytes, so neither a write nor a receipt
+/// may claim it — and the cause names the environment, not a changed target.
+fn unattested(cause: Unattested) -> DeliveryError {
+    DeliveryError::Write(WorkerError::WriteIdentityUnattested { cause })
+}
+
+/// The retained projection of one answered delivery: the candidate reference
+/// plus the journal row's own fields. An `unknown` receipt is never a delivered
+/// one — `applied` stays `false` and the row remains pending for reconciliation.
+fn delivery_receipt(
+    intent: &DeliveryIntent,
+    admission_seq: u64,
+    applied: bool,
+    outcome: DeliveryOutcome,
+) -> DeliveryReceipt {
+    DeliveryReceipt {
+        candidate: intent.candidate.clone(),
+        target: intent.destination.clone(),
+        intended_digest: intent.candidate.digest.clone(),
+        admission_seq,
+        applied,
+        outcome,
+    }
+}
+
 /// The ledger's status with the newest retained attempt projected onto it — the
 /// one place the status surface reads both owners, so `runtime.status` and a
 /// test reading a recovered data root answer the same shape.
@@ -2051,4 +2536,170 @@ fn sync_snapshot(target: &Path) -> Result<u64, UpdateError> {
         .and_then(|dir| dir.sync_all())
         .map_err(|source| UpdateError::Sync { source })?;
     Ok(metadata.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BaseInstall, BaseSource};
+
+    /// AC-080: a candidate the ledger no longer serves is not a delivery's
+    /// candidate. Retiring the base — a newer one serves now, so the shipped
+    /// receipt is `retired` — refuses the older intent before any journal row or
+    /// destination byte exists, which is the compatibility check a regression
+    /// that only compared digests would skip.
+    #[test]
+    fn a_retired_base_is_not_a_delivery_candidate() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-delivery-retired-")?;
+        let scope = tempfile::TempDir::with_prefix("rivect-delivery-retired-scope-")?;
+        let mut store = TaskStore::open(&root.path().join("state.db"))?;
+        let config_path = root.path().join("config.toml");
+        std::fs::write(&config_path, crate::config::SHIPPED_DEFAULTS_TOML)?;
+        store.serve_base(&BaseInstall::new(
+            BaseSource::SHIPPED,
+            &config_path,
+            root.path(),
+        ))?;
+        store.serve_base(&BaseInstall::new(
+            BaseSource::new(
+                crate::config::SHIPPED_BASE_VERSION + 1,
+                crate::config::SHIPPED_DEFAULTS_TOML,
+            ),
+            &config_path,
+            root.path(),
+        ))?;
+
+        let seed = b"the previous release bytes";
+        let destination = scope.path().join("delivered-base.toml");
+        std::fs::write(&destination, seed)?;
+        let destination = destination
+            .to_str()
+            .ok_or("the fixture destination is utf-8")?
+            .to_string();
+        let mut policy = Policy::default();
+        let grant = policy.grant_classes(scope.path().to_path_buf(), vec![EffectClass::Write]);
+        let intent = DeliveryIntent {
+            candidate: DeliveryCandidate {
+                base_version: crate::config::SHIPPED_BASE_VERSION,
+                digest: crate::config::shipped_revision(),
+            },
+            destination: destination.clone(),
+            grant_id: grant,
+            admission_seq: None,
+        };
+
+        let error = prepare_delivery(&mut store.writer(), &policy, intent)
+            .expect_err("a retired base is not the serving base");
+        assert!(
+            matches!(
+                error,
+                DeliveryError::NotServing { base_version }
+                    if base_version == crate::config::SHIPPED_BASE_VERSION
+            ),
+            "wrong compatibility refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&destination)?,
+            seed,
+            "a refused intent moves no destination byte"
+        );
+        assert!(
+            store
+                .pending_publications()?
+                .iter()
+                .chain(store.applied_publications()?.iter())
+                .all(|row| row.target != destination),
+            "a refused intent stages no journal row"
+        );
+        Ok(())
+    }
+
+    /// AC-080: the serving check is the `base_state` row, so a base that was
+    /// only ever staged is refused by the same comparison even though its own
+    /// receipt exists. It is the case the deleted receipt-state arm could not
+    /// have answered differently.
+    #[test]
+    fn a_staged_base_that_never_served_is_not_a_delivery_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-delivery-staged-")?;
+        let scope = tempfile::TempDir::with_prefix("rivect-delivery-staged-scope-")?;
+        let mut store = TaskStore::open(&root.path().join("state.db"))?;
+        let config_path = root.path().join("config.toml");
+        std::fs::write(&config_path, crate::config::SHIPPED_DEFAULTS_TOML)?;
+        store.stage_base(&BaseInstall::new(
+            BaseSource::SHIPPED,
+            &config_path,
+            root.path(),
+        ))?;
+        assert!(
+            store.active_base()?.is_none(),
+            "a staged base serves nothing"
+        );
+
+        let seed = b"the previous release bytes";
+        let destination = scope.path().join("delivered-base.toml");
+        std::fs::write(&destination, seed)?;
+        let destination = destination
+            .to_str()
+            .ok_or("the fixture destination is utf-8")?
+            .to_string();
+        let mut policy = Policy::default();
+        let grant = policy.grant_classes(scope.path().to_path_buf(), vec![EffectClass::Write]);
+        let intent = DeliveryIntent {
+            candidate: DeliveryCandidate {
+                base_version: crate::config::SHIPPED_BASE_VERSION,
+                digest: crate::config::shipped_revision(),
+            },
+            destination: destination.clone(),
+            grant_id: grant,
+            admission_seq: None,
+        };
+
+        let error = prepare_delivery(&mut store.writer(), &policy, intent)
+            .expect_err("a staged base is not the serving base");
+        assert!(
+            matches!(
+                error,
+                DeliveryError::NotServing { base_version }
+                    if base_version == crate::config::SHIPPED_BASE_VERSION
+            ),
+            "wrong staged-base refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&destination)?,
+            seed,
+            "a refused intent moves no destination byte"
+        );
+        Ok(())
+    }
+
+    /// AC-080: an occupant no reuse token can confirm answers the capability
+    /// cause itself. Collapsing it into "different" would name a swap that never
+    /// happened, and answering `retained` from it would certify bytes no rule
+    /// proved are ours.
+    #[test]
+    fn an_unattested_occupant_reports_the_capability_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::TempDir::with_prefix("rivect-delivery-unattested-")?;
+        let path = root.path().join("delivered-base.toml");
+        std::fs::write(&path, b"the previous release bytes")?;
+        let file = std::fs::File::open(&path)?;
+        let staged = WriteIdentity::new(
+            crate::executor::FileIdentity::from_metadata(&file.metadata()?),
+            Err(Unattested::Unsupported),
+        );
+        let target = path.to_str().ok_or("the fixture destination is utf-8")?;
+
+        assert_eq!(
+            rederive_occupant(root.path(), target, staged)?,
+            FileAttribution::Unverifiable(Unattested::Unsupported),
+            "a file no reuse token confirms is not a changed target"
+        );
+        assert_eq!(
+            unattested(Unattested::Unsupported).code(),
+            ErrorCode::CapabilityUnavailable,
+            "the refusal names the capability, never a conflict"
+        );
+        Ok(())
+    }
 }

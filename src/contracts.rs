@@ -644,6 +644,73 @@ pub struct ProjectInitResult {
     pub graph: ProjectGraph,
 }
 
+/// The exact candidate one delivery moves: the `(base_version, digest)` pair
+/// [`crate::config::UpdateReceipt`] is keyed by. It is the whole activation
+/// fact a delivery consumes — the receipt's state, assets and generations stay
+/// the ledger's and are never copied here, so the build keeps exactly one
+/// activation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryCandidate {
+    pub base_version: u64,
+    /// The base document's byte digest, as the ledger recorded it.
+    pub digest: String,
+}
+
+/// One delivery request (REQ-066, AC-080): the exact candidate, the
+/// operator-owned local destination it lands in, and the current grant that
+/// admits the write. `admission_seq` names the publication-journal row
+/// [`crate::update::prepare_delivery`] staged; an intent without one was never
+/// prepared and may run no effect.
+///
+/// Preparation is not authorization: the destination and the grant are
+/// checked again against the current policy immediately before the effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryIntent {
+    pub candidate: DeliveryCandidate,
+    /// The absolute path of the existing local destination file.
+    pub destination: String,
+    pub grant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_seq: Option<u64>,
+}
+
+/// What one delivery call did with its admitted effect. `published` landed the
+/// exact candidate bytes in this call; `retained` found the journal receipt and
+/// the intended bytes already in place and wrote nothing; `unknown` could not
+/// prove either, so nothing was written and the retained intent must be
+/// reconciled before any retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOutcome {
+    Published,
+    Retained,
+    Unknown,
+}
+
+/// The retained projection of one delivery: the exact candidate it belongs
+/// to, the publication-journal row that recorded it (`target`,
+/// `intended_digest`, `admission_seq`, `applied`) and the effect's outcome.
+///
+/// It references the activation record through [`DeliveryCandidate`] and
+/// carries none of [`crate::config::UpdateReceipt`]'s fields. It also carries
+/// no provider-bound bytes: a delivery is local-only, and a refusal answers its
+/// fixed [`ErrorCode`] rather than an opaque artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryReceipt {
+    pub candidate: DeliveryCandidate,
+    /// The journal row's target spelling, exactly as it was admitted.
+    pub target: String,
+    pub intended_digest: String,
+    pub admission_seq: u64,
+    /// The journal row reached its terminal state. `false` is the honest
+    /// projection of an intent whose outcome is [`DeliveryOutcome::Unknown`].
+    pub applied: bool,
+    pub outcome: DeliveryOutcome,
+}
+
 /// JSON-RPC envelope for the corpus-driven ingress tests.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcRequest {

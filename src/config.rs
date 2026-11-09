@@ -4902,20 +4902,6 @@ fn journal_error(error: StoreError) -> PublicationError {
     PublicationError::Journal(error)
 }
 
-fn target_too_large() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "publication target exceeds the size ceiling",
-    )
-}
-
-fn target_not_regular() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "publication target is not a regular file",
-    )
-}
-
 /// Stages one publication intent: journals the intended digest together
 /// with the target's current bytes digest and write identity (`(dev, ino)`
 /// plus the reuse token), so a crash between bytes and receipt stays
@@ -4939,13 +4925,21 @@ pub fn stage_publication(
         .to_string();
     // One opened handle produces the whole durable pair, so no mid-staging
     // swap of the path can splice one inode onto another file's digest.
-    let observation = read_target_once(&target_key).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            PublicationError::TargetAbsent(target_key.clone())
-        } else {
-            PublicationError::Target(error)
-        }
-    })?;
+    let observation =
+        read_target_once(&target_key, TargetOpen::Follow).map_err(|refusal| match refusal {
+            TargetRefusal::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PublicationError::TargetAbsent(target_key.clone())
+            }
+            TargetRefusal::Io(error) => PublicationError::Target(error),
+            TargetRefusal::NotRegular => PublicationError::Target(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication target is not a regular file",
+            )),
+            TargetRefusal::TooLarge => PublicationError::Target(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "publication target exceeds the size ceiling",
+            )),
+        })?;
     let base_digest = Some(observation.digest);
     let publish_identity = Some(observation.identity);
     let admission_seq = store
@@ -4967,11 +4961,22 @@ pub fn stage_publication(
     })
 }
 
+/// The CLI surface's owner spelling in the one config singleflight.
+pub(crate) const CONFIG_CLI_OWNER: &str = "cli";
+/// The file surface's owner spelling in the same singleflight.
+pub(crate) const CONFIG_FILE_OWNER: &str = "file";
+/// Both config-carrier spellings. A pending row of either is a configuration
+/// edit's own row; a row of any other owner is not.
+pub(crate) const CONFIG_CARRIER_OWNERS: [&str; 2] = [CONFIG_CLI_OWNER, CONFIG_FILE_OWNER];
+
 /// Singleflight admission for one config command (AC-095): the file and
 /// CLI carriers both admit here, keyed on the target's file identity —
 /// `(dev, ino)` plus its reuse token — and the intended digest. A command that is still pending is never
 /// journaled twice — the replay observes the pending intent (one control
-/// event), so the command can later complete exactly once. A replay of a
+/// event), so the command can later complete exactly once. Only the carrier's
+/// own spellings are candidates: a row another owner admitted (a delivery
+/// intent, say) is not this command's outcome, so it can neither answer the
+/// edit nor stand in for its write. A replay of a
 /// command whose intent already went terminal returns that terminal
 /// result, but only while the bytes the row intended still hold at the
 /// file: the row that produced the current bytes is the terminal winner,
@@ -5009,6 +5014,14 @@ pub fn admit_publication(
     let sight = observe_target(&target_key);
     let pending = store.pending_publications().map_err(journal_error)?;
     for intent in pending {
+        // A pending row belongs to the carrier that admitted it: another
+        // owner's row names no outcome this admission may answer, so it never
+        // satisfies an edit — a delivery intent whose bytes happen to equal this
+        // edit would otherwise report the edit served while the target keeps its
+        // old bytes. The carrier's own two surfaces still share one singleflight.
+        if !CONFIG_CARRIER_OWNERS.contains(&intent.owner.as_str()) {
+            continue;
+        }
         // A pending row whose file match no reuse token can confirm is
         // still returned instead of staging a second row: its owning
         // publish or recovery refuses the unattested write itself.
@@ -5112,8 +5125,11 @@ pub fn resolve_pending_publication(
 }
 
 /// How one staged write identity relates to the identity now at a target.
+/// The one attribution rule this build has: the carrier's singleflight and
+/// a delivery both key on it, so an occupant question cannot answer two
+/// ways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileAttribution {
+pub(crate) enum FileAttribution {
     /// Another file: a different `(dev, ino)`, or the same pair under a
     /// different reuse token — a later file reusing the pair.
     Different,
@@ -5127,7 +5143,7 @@ enum FileAttribution {
 
 /// Same-file attribution between a staged and a current identity: only an
 /// equal `(dev, ino)` with equal reuse tokens on both sides proves it.
-fn attribute(staged: WriteIdentity, current: WriteIdentity) -> FileAttribution {
+pub(crate) fn attribute(staged: WriteIdentity, current: WriteIdentity) -> FileAttribution {
     if staged.file() != current.file() {
         return FileAttribution::Different;
     }
@@ -5178,10 +5194,28 @@ fn spelled_same_file(a: &str, b: &str) -> bool {
 /// One consistent snapshot of the target: the write identity, its reuse
 /// token included, and the digested bytes were taken through the same
 /// opened handle.
-struct TargetObservation {
-    digest: String,
-    identity: WriteIdentity,
-    bytes: Vec<u8>,
+pub(crate) struct TargetObservation {
+    pub(crate) digest: String,
+    pub(crate) identity: WriteIdentity,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// How one observation opens its target: the config carrier follows the
+/// operator's own spelling, while an effect that must land in one exact
+/// file refuses a symlink swapped onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetOpen {
+    Follow,
+    NoFollow,
+}
+
+/// Why one bounded read produced no observation: the two typed refusals a
+/// caller answers apart from an I/O failure.
+#[derive(Debug)]
+pub(crate) enum TargetRefusal {
+    NotRegular,
+    TooLarge,
+    Io(std::io::Error),
 }
 
 /// Opens the target exactly once and reads it through that same handle,
@@ -5193,28 +5227,37 @@ struct TargetObservation {
 /// instead of being read unbounded. The reuse token comes from that same
 /// handle: a filesystem without one leaves the identity explicitly
 /// unattested, and any other token failure fails the observation.
-fn read_target_once(path: &str) -> std::io::Result<TargetObservation> {
+pub(crate) fn read_target_once(
+    path: &str,
+    open: TargetOpen,
+) -> Result<TargetObservation, TargetRefusal> {
+    let flags = match open {
+        TargetOpen::Follow => O_NONBLOCK,
+        TargetOpen::NoFollow => O_NONBLOCK | rivect_sandbox_helper::ANCHOR_O_NOFOLLOW,
+    };
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
+        .custom_flags(flags)
+        .open(path)
+        .map_err(TargetRefusal::Io)?;
+    let metadata = file.metadata().map_err(TargetRefusal::Io)?;
     if !metadata.is_file() {
-        return Err(target_not_regular());
+        return Err(TargetRefusal::NotRegular);
     }
     if metadata.len() > PUBLICATION_MAX_BYTES as u64 {
-        return Err(target_too_large());
+        return Err(TargetRefusal::TooLarge);
     }
     let reuse = match rivect_sandbox_helper::reuse_token(&file) {
         Ok(token) => Ok(token),
         Err(rivect_sandbox_helper::ReuseTokenError::Unsupported) => Err(Unattested::Unsupported),
-        Err(error) => return Err(std::io::Error::other(error)),
+        Err(error) => return Err(TargetRefusal::Io(std::io::Error::other(error))),
     };
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.take(PUBLICATION_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(TargetRefusal::Io)?;
     if bytes.len() > PUBLICATION_MAX_BYTES {
-        return Err(target_too_large());
+        return Err(TargetRefusal::TooLarge);
     }
     Ok(TargetObservation {
         digest: hex(&Sha256::digest(&bytes)),
@@ -5236,13 +5279,15 @@ enum TargetSight {
 /// Observes the target through one opened handle, so the identity and the
 /// bytes come from the same file even if the path is swapped mid-read.
 fn observe_target(target: &str) -> TargetSight {
-    match read_target_once(target) {
+    match read_target_once(target, TargetOpen::Follow) {
         Ok(observation) => TargetSight::Present {
             digest: observation.digest,
             identity: Some(observation.identity),
             bytes: observation.bytes,
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TargetSight::Absent,
+        Err(TargetRefusal::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            TargetSight::Absent
+        }
         // An unreadable, non-regular or oversized target leaves any write
         // unattributable — recovery classifies it, it never hangs on it.
         Err(_) => TargetSight::Unknown,
