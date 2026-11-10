@@ -1,7 +1,7 @@
 //! The recorded dialect roster (AC-011): every literal id `dialect_for`
 //! answers, pinned exactly. The roster is the recorded pre-band ids plus
-//! the admitted vertex, two CloudCode arms and the Kimi Code row, and
-//! only a recorded id may add to it.
+//! the admitted vertex, two CloudCode arms and the Kimi Code and Z.AI
+//! alias rows, and only a recorded id may add to it.
 
 #![allow(
     clippy::expect_used,
@@ -28,7 +28,7 @@ fn bedrock_ids_map_to_their_recorded_dialects() {
 }
 
 /// The exact current roster `dialect_for` answers, in source order.
-const RECORDED_ROSTER: [(&str, Dialect); 72] = [
+const RECORDED_ROSTER: [(&str, Dialect); 74] = [
     ("openai", Dialect::Responses),
     ("abliteration", Dialect::Responses),
     ("meta", Dialect::Responses),
@@ -59,6 +59,10 @@ const RECORDED_ROSTER: [(&str, Dialect); 72] = [
     // Kimi Code records Messages as the default over its two-protocol
     // route table (its `/models` rows select Chat per model).
     ("kimi-code", Dialect::Messages),
+    // Z.AI's canonical row and sign-in alias share the Messages default
+    // over the same two recorded coding-plan transports.
+    ("zai", Dialect::Messages),
+    ("zai-coding-plan", Dialect::Messages),
     ("gitlab-duo", Dialect::ChatCompletions),
     ("github-copilot", Dialect::ChatCompletions),
     ("opencode-go", Dialect::ChatCompletions),
@@ -133,6 +137,16 @@ fn roster_matches_the_recorded_dialect_arms() {
         rivect::providers::routes_for("kimi-code"),
         [Dialect::Messages, Dialect::ChatCompletions],
         "the Kimi row declares exactly its two recorded protocols"
+    );
+    assert_eq!(
+        rivect::providers::routes_for("zai"),
+        [Dialect::Messages, Dialect::ChatCompletions],
+        "the Z.AI row declares exactly its two recorded coding-plan transports"
+    );
+    assert_eq!(
+        rivect::providers::routes_for("zai-coding-plan"),
+        [Dialect::Messages, Dialect::ChatCompletions],
+        "the sign-in alias resolves the same two recorded transports"
     );
     assert_eq!(Dialect::CloudCode.to_string(), "cloudcode");
 }

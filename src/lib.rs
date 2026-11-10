@@ -6,6 +6,7 @@ pub mod config;
 pub mod context;
 pub mod contracts;
 pub mod controller;
+pub mod docs;
 pub mod executor;
 pub mod identity;
 pub mod index;

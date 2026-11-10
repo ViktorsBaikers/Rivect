@@ -6,7 +6,7 @@
 use crate::contracts::{ErrorCode, Event};
 use crate::executor::{FileIdentity, ReadObservation};
 use crate::policy::PermissionMode;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
@@ -983,4 +983,467 @@ fn is_stripped_format(ch: char) -> bool {
             | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}'
     )
+}
+
+// ----- the frozen release measurement (AC-003) -----
+
+/// One leg of the frozen AC-003 corpus, in the order the budget declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CorpusLeg {
+    Startup,
+    Input,
+    Cancel,
+    Search,
+    Index,
+    LongSession,
+    Install,
+}
+
+impl CorpusLeg {
+    /// Every leg, in declaration order; [`ReleaseLimits::leg`] indexes by the
+    /// same position.
+    pub const ALL: [Self; 7] = [
+        Self::Startup,
+        Self::Input,
+        Self::Cancel,
+        Self::Search,
+        Self::Index,
+        Self::LongSession,
+        Self::Install,
+    ];
+
+    /// The frozen corpus spelling of the leg.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Input => "input",
+            Self::Cancel => "cancel",
+            Self::Search => "search",
+            Self::Index => "index",
+            Self::LongSession => "long-session",
+            Self::Install => "install",
+        }
+    }
+
+    /// The leg one frozen corpus spelling names.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|leg| leg.as_str() == raw)
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The three percentiles the frozen declaration requires per leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Percentile {
+    P50,
+    P95,
+    P99,
+}
+
+impl Percentile {
+    /// The whole-percent figure the frozen nearest-rank rule takes.
+    #[must_use]
+    pub const fn percent(self) -> u32 {
+        match self {
+            Self::P50 => 50,
+            Self::P95 => 95,
+            Self::P99 => 99,
+        }
+    }
+
+    /// The leg report's spelling of the percentile.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::P50 => "p50",
+            Self::P95 => "p95",
+            Self::P99 => "p99",
+        }
+    }
+}
+
+/// The pre-declared latency limits of one corpus leg, in nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegLimit {
+    pub p50_nanos: u64,
+    pub p95_nanos: u64,
+    pub p99_nanos: u64,
+}
+
+/// The limits one release measurement is judged against, declared before the
+/// candidate is measured. The values are read from the frozen declaration in
+/// `docs/release-budgets.md`; changing them after a result is a new
+/// declaration, not a correction of the measurement already produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseLimits {
+    /// One limit per [`CorpusLeg::ALL`] position.
+    pub legs: [LegLimit; CorpusLeg::ALL.len()],
+    /// The fewest samples a leg must hold before its p99 is eligible.
+    pub p99_min_samples: u64,
+    pub owned_cpu_nanos: u64,
+    pub owned_rss_bytes: u64,
+    pub disk_bytes: u64,
+    pub package_bytes: u64,
+    pub package_files: u64,
+    pub install_nanos: u64,
+}
+
+impl ReleaseLimits {
+    /// The limits declared for one leg.
+    #[must_use]
+    pub fn leg(&self, leg: CorpusLeg) -> LegLimit {
+        self.legs[leg.index()]
+    }
+}
+
+/// One leg's collected samples, sorted once so every percentile is a rank
+/// lookup. The nearest-rank rule is frozen with the budget: rank
+/// `ceil(p/100 * n)`, one-based, clamped to `n`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegSamples {
+    pub leg: CorpusLeg,
+    nanos: Vec<u64>,
+}
+
+impl LegSamples {
+    /// Sorts one leg's samples; the caller's vector is taken, so no second
+    /// copy of a long sample set is held.
+    #[must_use]
+    pub fn new(leg: CorpusLeg, mut nanos: Vec<u64>) -> Self {
+        nanos.sort_unstable();
+        Self { leg, nanos }
+    }
+
+    /// How many samples the leg collected.
+    #[must_use]
+    pub fn samples(&self) -> usize {
+        self.nanos.len()
+    }
+
+    /// The frozen nearest-rank percentile, or `None` for an unmeasured leg.
+    #[must_use]
+    pub fn percentile(&self, percentile: Percentile) -> Option<u64> {
+        if self.nanos.is_empty() {
+            return None;
+        }
+        let samples = u64::try_from(self.nanos.len()).unwrap_or(u64::MAX);
+        let rank = samples
+            .saturating_mul(u64::from(percentile.percent()))
+            .div_ceil(100)
+            .clamp(1, samples);
+        let index = usize::try_from(rank.saturating_sub(1)).unwrap_or(usize::MAX);
+        self.nanos.get(index).copied()
+    }
+
+    /// The p99 only when the leg holds the pre-declared sample count: an
+    /// under-populated tail is no p99, never a rounded one.
+    #[must_use]
+    pub fn eligible_p99(&self, min_samples: u64) -> Option<u64> {
+        let samples = u64::try_from(self.nanos.len()).unwrap_or(u64::MAX);
+        if samples < min_samples {
+            return None;
+        }
+        self.percentile(Percentile::P99)
+    }
+}
+
+/// One observation of an owned process: the CPU time it had consumed when the
+/// measurement last read it. Resident bytes are summed across the group per
+/// poll by the caller, so no single process's peak is mistaken for the group's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedSample {
+    pub pid: u32,
+    pub cpu_nanos: u64,
+}
+
+/// The owned processes' totals, each pid counted once: the largest CPU time
+/// observed for it, summed across the group, and the largest summed resident
+/// set one owned group was observed holding. A process the sampler never saw
+/// is missing from the total, never invented as zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnedTotals {
+    pub counted: usize,
+    pub cpu_nanos: u64,
+    pub rss_bytes: u64,
+}
+
+impl OwnedTotals {
+    /// Folds repeated observations: each pid's consumed CPU is counted once,
+    /// and `peak_rss_bytes` is the largest summed resident set the caller
+    /// observed for one owned group — a per-process peak sum across a corpus
+    /// would describe no moment that ever existed.
+    pub fn tally(samples: &[OwnedSample], peak_rss_bytes: u64) -> Self {
+        let mut by_pid: BTreeMap<u32, u64> = BTreeMap::new();
+        for sample in samples {
+            let cpu = by_pid.entry(sample.pid).or_default();
+            *cpu = (*cpu).max(sample.cpu_nanos);
+        }
+        let mut totals = Self {
+            counted: by_pid.len(),
+            cpu_nanos: 0,
+            rss_bytes: peak_rss_bytes,
+        };
+        for cpu_nanos in by_pid.values() {
+            totals.cpu_nanos = totals.cpu_nanos.saturating_add(*cpu_nanos);
+        }
+        totals
+    }
+}
+
+/// The installed kit's on-disk and build-install figures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KitMeasurement {
+    pub disk_bytes: u64,
+    pub package_bytes: u64,
+    pub package_files: u64,
+    pub install_nanos: u64,
+}
+
+/// The AC-058 provider-cache trial row. It may stay absent only with its
+/// exact missing prerequisite.
+pub const PROVIDER_CACHE_TRIALS: &str = "AC-058 provider-cache trials";
+/// The AC-048 provider leg row, absent under the same rule.
+pub const PROVIDER_LEGS: &str = "AC-048 provider legs";
+
+/// One evidence row that did not run, with the exact prerequisite that kept
+/// it out. Only the two provider rows are permitted; every other absence is a
+/// measurement gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotRun {
+    pub name: String,
+    pub prerequisite: String,
+}
+
+impl NotRun {
+    /// One absent row and the exact grant it waits on.
+    #[must_use]
+    pub fn new(name: impl Into<String>, prerequisite: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            prerequisite: prerequisite.into(),
+        }
+    }
+
+    fn is_permitted(&self) -> bool {
+        !self.prerequisite.trim().is_empty()
+            && matches!(self.name.as_str(), PROVIDER_CACHE_TRIALS | PROVIDER_LEGS)
+    }
+}
+
+/// The platform the corpus ran on. An unavailable platform can supply no
+/// measurement, so it never earns a PASS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Platform {
+    Available { name: String },
+    Unavailable { reason: String },
+}
+
+/// One candidate measurement (AC-003): the identity and conditions it was
+/// produced under, every corpus leg's samples, the owned processes' totals and
+/// the installed kit, plus the rows that legitimately stayed absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseReport {
+    pub candidate: String,
+    pub candidate_digest: String,
+    pub baseline: String,
+    pub conditions: String,
+    pub platform: Platform,
+    pub legs: Vec<LegSamples>,
+    pub owned: OwnedTotals,
+    pub kit: KitMeasurement,
+    pub not_run: Vec<NotRun>,
+}
+
+/// One mandatory limit a measured figure exceeded. The release is blocked,
+/// never announced as a PASS with a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitBreach {
+    Latency {
+        leg: CorpusLeg,
+        percentile: Percentile,
+        measured_nanos: u64,
+        limit_nanos: u64,
+    },
+    OwnedCpu {
+        measured_nanos: u64,
+        limit_nanos: u64,
+    },
+    OwnedRss {
+        measured_bytes: u64,
+        limit_bytes: u64,
+    },
+    Disk {
+        measured_bytes: u64,
+        limit_bytes: u64,
+    },
+    PackageBytes {
+        measured_bytes: u64,
+        limit_bytes: u64,
+    },
+    PackageFiles {
+        measured: u64,
+        limit: u64,
+    },
+    Install {
+        measured_nanos: u64,
+        limit_nanos: u64,
+    },
+}
+
+/// Why a measurement cannot earn a PASS without any limit being exceeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeasurementGap {
+    PlatformUnavailable {
+        reason: String,
+    },
+    MissingLeg {
+        leg: CorpusLeg,
+    },
+    IneligibleP99 {
+        leg: CorpusLeg,
+        samples: usize,
+        required: u64,
+    },
+    /// No owned process was observed: an unmeasured group is never taken as
+    /// under budget.
+    OwnedUnmeasured {
+        reason: String,
+    },
+    NotRunWithoutPrerequisite {
+        name: String,
+    },
+}
+
+/// The one verdict the frozen limits decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseVerdict {
+    Pass,
+    /// A measured figure exceeded a mandatory limit: the release is blocked.
+    Blocked(Vec<LimitBreach>),
+    /// No limit was exceeded, but the measurement is incomplete: not a PASS.
+    NotPass(Vec<MeasurementGap>),
+}
+
+impl ReleaseVerdict {
+    /// Whether the verdict is a full PASS. Only that value releases.
+    #[must_use]
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
+impl ReleaseReport {
+    /// Applies the pre-declared limits. An over-limit figure blocks the
+    /// release even when another leg is also incomplete; an incomplete
+    /// measurement without a breach is not a PASS.
+    #[must_use]
+    pub fn verdict(&self, limits: &ReleaseLimits) -> ReleaseVerdict {
+        let mut gaps = Vec::new();
+        if let Platform::Unavailable { reason } = &self.platform {
+            gaps.push(MeasurementGap::PlatformUnavailable {
+                reason: reason.clone(),
+            });
+        }
+        for not_run in &self.not_run {
+            if !not_run.is_permitted() {
+                gaps.push(MeasurementGap::NotRunWithoutPrerequisite {
+                    name: not_run.name.clone(),
+                });
+            }
+        }
+        let mut breaches = Vec::new();
+        for leg in CorpusLeg::ALL {
+            let Some(samples) = self.legs.iter().find(|held| held.leg == leg) else {
+                gaps.push(MeasurementGap::MissingLeg { leg });
+                continue;
+            };
+            let limit = limits.leg(leg);
+            for (percentile, bound) in [
+                (Percentile::P50, limit.p50_nanos),
+                (Percentile::P95, limit.p95_nanos),
+            ] {
+                if let Some(measured_nanos) = samples.percentile(percentile)
+                    && measured_nanos > bound
+                {
+                    breaches.push(LimitBreach::Latency {
+                        leg,
+                        percentile,
+                        measured_nanos,
+                        limit_nanos: bound,
+                    });
+                }
+            }
+            match samples.eligible_p99(limits.p99_min_samples) {
+                Some(measured_nanos) => {
+                    if measured_nanos > limit.p99_nanos {
+                        breaches.push(LimitBreach::Latency {
+                            leg,
+                            percentile: Percentile::P99,
+                            measured_nanos,
+                            limit_nanos: limit.p99_nanos,
+                        });
+                    }
+                }
+                None => gaps.push(MeasurementGap::IneligibleP99 {
+                    leg,
+                    samples: samples.samples(),
+                    required: limits.p99_min_samples,
+                }),
+            }
+        }
+        if self.owned.counted == 0 {
+            gaps.push(MeasurementGap::OwnedUnmeasured {
+                reason: "no owned process was observed; an unmeasured group is never taken as under budget"
+                    .to_string(),
+            });
+        }
+        if self.owned.cpu_nanos > limits.owned_cpu_nanos {
+            breaches.push(LimitBreach::OwnedCpu {
+                measured_nanos: self.owned.cpu_nanos,
+                limit_nanos: limits.owned_cpu_nanos,
+            });
+        }
+        if self.owned.rss_bytes > limits.owned_rss_bytes {
+            breaches.push(LimitBreach::OwnedRss {
+                measured_bytes: self.owned.rss_bytes,
+                limit_bytes: limits.owned_rss_bytes,
+            });
+        }
+        if self.kit.disk_bytes > limits.disk_bytes {
+            breaches.push(LimitBreach::Disk {
+                measured_bytes: self.kit.disk_bytes,
+                limit_bytes: limits.disk_bytes,
+            });
+        }
+        if self.kit.package_bytes > limits.package_bytes {
+            breaches.push(LimitBreach::PackageBytes {
+                measured_bytes: self.kit.package_bytes,
+                limit_bytes: limits.package_bytes,
+            });
+        }
+        if self.kit.package_files > limits.package_files {
+            breaches.push(LimitBreach::PackageFiles {
+                measured: self.kit.package_files,
+                limit: limits.package_files,
+            });
+        }
+        if self.kit.install_nanos > limits.install_nanos {
+            breaches.push(LimitBreach::Install {
+                measured_nanos: self.kit.install_nanos,
+                limit_nanos: limits.install_nanos,
+            });
+        }
+        if !breaches.is_empty() {
+            return ReleaseVerdict::Blocked(breaches);
+        }
+        if !gaps.is_empty() {
+            return ReleaseVerdict::NotPass(gaps);
+        }
+        ReleaseVerdict::Pass
+    }
 }

@@ -10,7 +10,11 @@ pub mod linux;
 pub mod macos;
 
 use crate::config::hex;
-use crate::contracts::{EffectClass, ErrorCode, TaskId};
+use crate::contracts::{
+    EffectClass, ErrorCode, RELEASE_EXECUTABLE_NAME, RELEASE_HELPER_NAME,
+    RELEASE_MANIFEST_MAX_BYTES, RELEASE_MANIFEST_NAME, RELEASE_MANIFEST_SCHEMA, ReleaseActivation,
+    ReleaseArtifact, ReleaseManifest, TaskId,
+};
 use crate::policy::{
     AdmissionContext, ModeDecision, PermissionMode, Policy, PolicyError, canonical_egress_target,
     preapproval_scope,
@@ -6870,6 +6874,230 @@ fn read_inventory_file(path: &Path, rel: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+/// Verifies one installed release bundle before anything activates it.
+///
+/// The inventory is exact — [`RELEASE_EXECUTABLE_NAME`],
+/// [`RELEASE_HELPER_NAME`] and [`RELEASE_MANIFEST_NAME`] and nothing else — so
+/// a checkout tree, a stray resource or a missing half never reads as an
+/// authentic candidate. The manifest is bounded and strictly parsed, both
+/// artifact names and digest shapes are checked, and each artifact's actual
+/// bytes must hash to the digest the manifest records. The returned
+/// [`ReleaseActivation`] carries the manifest's own byte digest, which is the
+/// identity installed producers bind to.
+///
+/// Nothing here writes: a refusal leaves the bundle and any previous release
+/// exactly as they were.
+///
+/// # Errors
+/// [`ReleaseError::NotDirectory`] when the root is not a directory,
+/// [`ReleaseError::Inventory`], [`ReleaseError::UnexpectedEntry`] or
+/// [`ReleaseError::Missing`] when the inventory is not the exact set,
+/// [`ReleaseError::Manifest`], [`ReleaseError::ManifestTooLarge`],
+/// [`ReleaseError::ManifestJson`] or [`ReleaseError::Schema`] when the
+/// manifest cannot be read as this schema, and
+/// [`ReleaseError::ArtifactName`], [`ReleaseError::DigestShape`],
+/// [`ReleaseError::Artifact`], [`ReleaseError::Digest`] or
+/// [`ReleaseError::NotExecutable`] when an artifact does not match its
+/// manifest entry.
+pub fn verify_release_bundle(root: &Path) -> Result<ReleaseActivation, ReleaseError> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(ReleaseError::NotDirectory {
+                path: root.display().to_string(),
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ReleaseError::NotDirectory {
+                path: root.display().to_string(),
+            });
+        }
+        Err(source) => return Err(ReleaseError::Inventory { source }),
+    }
+    release_inventory(root)?;
+    let manifest_path = root.join(RELEASE_MANIFEST_NAME);
+    let manifest_bytes = read_inventory_file(&manifest_path, Path::new(RELEASE_MANIFEST_NAME))
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::FileTooLarge {
+                ReleaseError::ManifestTooLarge {
+                    limit: RELEASE_MANIFEST_MAX_BYTES,
+                }
+            } else {
+                ReleaseError::Manifest { source }
+            }
+        })?;
+    if u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX) > RELEASE_MANIFEST_MAX_BYTES {
+        return Err(ReleaseError::ManifestTooLarge {
+            limit: RELEASE_MANIFEST_MAX_BYTES,
+        });
+    }
+    let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|source| ReleaseError::ManifestJson { source })?;
+    if manifest.schema_version != RELEASE_MANIFEST_SCHEMA {
+        return Err(ReleaseError::Schema {
+            found: manifest.schema_version,
+            expected: RELEASE_MANIFEST_SCHEMA,
+        });
+    }
+    release_artifact(root, RELEASE_EXECUTABLE_NAME, &manifest.executable)?;
+    release_artifact(root, RELEASE_HELPER_NAME, &manifest.helper)?;
+    Ok(ReleaseActivation {
+        manifest_sha256: hex(&sha2::Sha256::digest(&manifest_bytes)),
+        build: manifest.build,
+        executable_sha256: manifest.executable.sha256,
+        helper_sha256: manifest.helper.sha256,
+    })
+}
+
+/// The exact three-name inventory, refused before any digest is read.
+fn release_inventory(root: &Path) -> Result<(), ReleaseError> {
+    let entries = std::fs::read_dir(root).map_err(|source| ReleaseError::Inventory { source })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ReleaseError::Inventory { source })?;
+        let name = entry.file_name();
+        if name != std::ffi::OsStr::new(RELEASE_EXECUTABLE_NAME)
+            && name != std::ffi::OsStr::new(RELEASE_HELPER_NAME)
+            && name != std::ffi::OsStr::new(RELEASE_MANIFEST_NAME)
+        {
+            return Err(ReleaseError::UnexpectedEntry {
+                name: name.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    for name in [
+        RELEASE_EXECUTABLE_NAME,
+        RELEASE_HELPER_NAME,
+        RELEASE_MANIFEST_NAME,
+    ] {
+        match std::fs::symlink_metadata(root.join(name)) {
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ReleaseError::Missing { name });
+            }
+            Err(source) => return Err(ReleaseError::Inventory { source }),
+        }
+    }
+    Ok(())
+}
+
+/// One artifact's identity: its manifest name, its digest shape, its actual
+/// bytes and its execute bit.
+fn release_artifact(
+    root: &Path,
+    expected: &'static str,
+    artifact: &ReleaseArtifact,
+) -> Result<(), ReleaseError> {
+    if artifact.name != expected {
+        return Err(ReleaseError::ArtifactName {
+            expected,
+            found: artifact.name.clone(),
+        });
+    }
+    if !is_sha256_lower_hex(&artifact.sha256) {
+        return Err(ReleaseError::DigestShape { name: expected });
+    }
+    let path = root.join(expected);
+    let digest = hash_file(&path).map_err(|source| ReleaseError::Artifact {
+        name: expected,
+        source,
+    })?;
+    if digest != artifact.sha256 {
+        return Err(ReleaseError::Digest { name: expected });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = std::fs::metadata(&path).map_err(|source| ReleaseError::Artifact {
+            name: expected,
+            source,
+        })?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(ReleaseError::NotExecutable { name: expected });
+        }
+    }
+    Ok(())
+}
+
+fn is_sha256_lower_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Why one installed release bundle is refused. Every variant is the operator
+/// action that fixes it; [`ReleaseError::code`] is the one wire mapping.
+#[derive(Debug, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("release root {path} is not a directory")]
+    NotDirectory { path: String },
+    #[error("release inventory cannot be read: {source}")]
+    Inventory {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("release inventory carries an unexpected entry {name}")]
+    UnexpectedEntry { name: String },
+    #[error("release inventory is missing {name}")]
+    Missing { name: &'static str },
+    #[error("release manifest cannot be read: {source}")]
+    Manifest {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("release manifest exceeds the {limit} byte bound")]
+    ManifestTooLarge { limit: u64 },
+    #[error("release manifest is not valid JSON: {source}")]
+    ManifestJson {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("release manifest schema {found} is not {expected}")]
+    Schema { found: u32, expected: u32 },
+    #[error("release manifest names {found} where {expected} belongs")]
+    ArtifactName {
+        expected: &'static str,
+        found: String,
+    },
+    #[error("release manifest digest for {name} is not 64 lowercase hex digits")]
+    DigestShape { name: &'static str },
+    #[error("release artifact {name} cannot be inspected: {source}")]
+    Artifact {
+        name: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("release artifact {name} digest does not match its bytes")]
+    Digest { name: &'static str },
+    #[error("release artifact {name} is not executable")]
+    NotExecutable { name: &'static str },
+}
+
+impl ReleaseError {
+    /// The wire class of this refusal (P-001): one mapping site, so the
+    /// release family cannot spell the same cause two ways.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::Missing { .. } => ErrorCode::NotFound,
+            Self::Schema { .. } => ErrorCode::UnsupportedVersion,
+            Self::Inventory { .. } | Self::Manifest { .. } => ErrorCode::StorageUnavailable,
+            Self::Artifact { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                ErrorCode::NotFound
+            }
+            Self::Artifact { .. } => ErrorCode::StorageUnavailable,
+            Self::NotDirectory { .. }
+            | Self::UnexpectedEntry { .. }
+            | Self::ManifestTooLarge { .. }
+            | Self::ManifestJson { .. }
+            | Self::ArtifactName { .. }
+            | Self::DigestShape { .. }
+            | Self::Digest { .. }
+            | Self::NotExecutable { .. } => ErrorCode::InvalidInput,
+        }
+    }
 }
 
 /// Copies the inventoried tree into a fresh destination without following

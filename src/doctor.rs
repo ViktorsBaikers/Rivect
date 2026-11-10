@@ -6,7 +6,7 @@
 //! mutate, lock or elect.
 
 use rivect::config;
-use rivect::contracts::SCHEMA_VERSION;
+use rivect::contracts::{RELEASE_MANIFEST_NAME, SCHEMA_VERSION};
 use rivect::owner::OWNER_LOCK;
 use rivect::state::inspect_read_only;
 use serde_json::{Value, json};
@@ -144,6 +144,7 @@ pub fn inspect(data_root: &Path, project: Option<&Path>, own_lock: bool) -> Doct
     let runtime_dir = data_root.join("runtime");
     let checks = vec![
         exe_check(),
+        release_check(),
         config_check(data_root),
         runtime_dir_check(&runtime_dir),
         owner_lock_check(data_root, own_lock),
@@ -186,6 +187,62 @@ fn exe_check() -> DoctorCheck {
             name: "exe",
             state: CheckState::Degraded,
             detail: format!("the running executable cannot be named: {error}"),
+        },
+    }
+}
+
+/// The packaged release identity beside the running executable. A build that
+/// ships no manifest is a checkout binary, not an installed release; one that
+/// does ship a manifest must pass the same exact-inventory and digest check
+/// activation uses, so a broken bundle answers degraded instead of ready.
+fn release_check() -> DoctorCheck {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            return DoctorCheck {
+                name: "release",
+                state: CheckState::Degraded,
+                detail: format!("the running executable cannot be named: {error}"),
+            };
+        }
+    };
+    let Some(directory) = exe.parent() else {
+        return DoctorCheck {
+            name: "release",
+            state: CheckState::Degraded,
+            detail: "the running executable has no directory".to_string(),
+        };
+    };
+    match std::fs::symlink_metadata(directory.join(RELEASE_MANIFEST_NAME)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DoctorCheck {
+            name: "release",
+            state: CheckState::Ready,
+            detail: "no release manifest beside the executable; this is not a packaged install"
+                .to_string(),
+        },
+        Err(error) => DoctorCheck {
+            name: "release",
+            state: CheckState::Degraded,
+            detail: format!("the release manifest cannot be stat-ed: {error}"),
+        },
+        Ok(_) => match rivect::executor::verify_release_bundle(directory) {
+            Ok(activation) => DoctorCheck {
+                name: "release",
+                state: CheckState::Ready,
+                detail: format!(
+                    "packaged release {} (manifest sha256 {})",
+                    activation.build,
+                    activation
+                        .manifest_sha256
+                        .get(..12)
+                        .unwrap_or(&activation.manifest_sha256)
+                ),
+            },
+            Err(error) => DoctorCheck {
+                name: "release",
+                state: CheckState::Degraded,
+                detail: format!("the packaged release is refused: {error}"),
+            },
         },
     }
 }

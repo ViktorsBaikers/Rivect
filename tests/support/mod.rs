@@ -1151,6 +1151,7 @@ pub fn path_str(path: &Path) -> String {
 }
 
 mod helper;
+pub mod release;
 
 pub use helper::ensure_helper;
 

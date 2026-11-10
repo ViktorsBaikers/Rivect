@@ -868,6 +868,75 @@ fn no_external_rg_or_fd_invoked() {
 }
 
 #[test]
+fn five_source_admitted_search_rows_stay_conjunctive() {
+    // Every source-admitted search row is proven on the same corpus: dropping
+    // one row's fixture or handler leaves a zero-cell, and a zero-cell is not
+    // a smaller proof — the row would stop being conjunctive.
+    let corpus = search_corpus("conjunction");
+    let rows = [
+        (QueryKind::Text, "shared_marker", SearchBackend::Text),
+        (QueryKind::Path, "*.rs", SearchBackend::Path),
+        (QueryKind::Source, "src/lib.rs", SearchBackend::Source),
+        (QueryKind::Ast, "fn $NAME() {}", SearchBackend::Ast),
+        (QueryKind::Symbol, "shared_marker", SearchBackend::Symbol),
+    ];
+    let mut counts = Vec::new();
+    for (kind, pattern, backend) in rows {
+        // Facet 1: the dispatch table is mechanical.
+        assert_eq!(
+            backend_for(kind),
+            Some(backend),
+            "{kind:?} dispatches to its admitted backend"
+        );
+        let mut request = search_query(kind, &corpus.path, pattern);
+        if kind == QueryKind::Symbol {
+            request.symbol_op = Some(SymbolOp::Definition);
+        }
+        // Facet 2/3: the result names that backend and carries its own typed
+        // payload, never a text row relabelled as another kind.
+        let result = query(&request).expect("the admitted row answers");
+        assert_eq!(result.backend, backend, "{kind:?}");
+        assert!(!result.matches.is_empty(), "{kind:?} serves nonzero rows");
+        // The payload is the row's own. The symbol leg may carry labelled
+        // text hints beside its typed rows (the non-exact fallback), so the
+        // facet counts its own payload and never another kind's row.
+        let typed = result
+            .matches
+            .iter()
+            .filter(|hit| {
+                matches!(
+                    (backend, &hit.kind),
+                    (SearchBackend::Text, MatchKind::Text { .. })
+                        | (SearchBackend::Path, MatchKind::Path)
+                        | (SearchBackend::Source, MatchKind::Source { .. })
+                        | (SearchBackend::Ast, MatchKind::Ast { .. })
+                        | (SearchBackend::Symbol, MatchKind::Symbol(_))
+                )
+            })
+            .count();
+        assert!(typed > 0, "{kind:?} serves its own typed payload");
+        // Facet 4: completeness is typed, and no row comes from a path the
+        // ignore/hidden rules would have excluded.
+        assert!(
+            matches!(
+                result.completeness,
+                Completeness::Complete | Completeness::Partial { .. }
+            ),
+            "{kind:?} states its coverage"
+        );
+        assert!(
+            result.matches.iter().all(|hit| !hit.source.ignored),
+            "{kind:?} serves no include-ignored row by default"
+        );
+        counts.push((kind, result.matches.len()));
+    }
+    assert_eq!(counts.len(), 5, "five rows, not one representative");
+    for (kind, count) in counts {
+        assert!(count > 0, "{kind:?} has a nonzero case count");
+    }
+}
+
+#[test]
 fn search_names_are_not_command_execute_kinds() {
     let mut world = open_world("kinds", None);
     let session = world.open_session("kinds-session");

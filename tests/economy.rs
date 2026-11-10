@@ -30,7 +30,10 @@ use rivect::learning::{
     FeedbackCause, FeedbackOutcome, FeedbackRecord, FeedbackReward, FeedbackVerdict,
     VersionEvidence,
 };
-use rivect::model::{Broker, ModelError, RequestManifest, SendContext, SendOutcome, SendTicket};
+use rivect::model::{
+    Broker, MatchedStrategy, MatchedTrial, ModelError, RequestManifest, SendContext, SendOutcome,
+    SendTicket, matched_ranking,
+};
 use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::{Exactness, UsageDelta};
 use rivect::state::{
@@ -3858,4 +3861,162 @@ fn auto_explanation_basis_is_settled_and_visible() {
         "the source names the ranking: {economy}"
     );
     assert_eq!(economy["model"], json!("deepseek-flash-v4"));
+}
+
+/// AC-048: the matched evaluation charges the whole route, not the tariff
+/// alone — context, provider cache legs, repair and proof attempts — and an
+/// unknown leg makes the trial uncertain instead of free. A single available
+/// model serves the ordinary send without any separate router subscription.
+#[test]
+fn matched_strategies_charge_context_cache_repair_and_proof() {
+    let base = MatchedTrial {
+        strategy: MatchedStrategy::KeepModel,
+        attempt_tokens: Some(120),
+        context_tokens: Some(80),
+        cache_read_tokens: Some(20),
+        cache_write_tokens: Some(0),
+        repair_tokens: Some(0),
+        proof_tokens: Some(20),
+    };
+    // Effort-only has the cheapest single attempt and the most expensive full
+    // route: its repair leg and the re-sent context decide the account.
+    let effort_only = MatchedTrial {
+        strategy: MatchedStrategy::EffortOnly,
+        attempt_tokens: Some(60),
+        context_tokens: Some(50),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(10),
+        repair_tokens: Some(80),
+        proof_tokens: Some(20),
+    };
+    let handoff = MatchedTrial {
+        strategy: MatchedStrategy::Handoff,
+        attempt_tokens: Some(90),
+        context_tokens: Some(90),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        repair_tokens: Some(30),
+        proof_tokens: Some(50),
+    };
+    let escalation = MatchedTrial {
+        strategy: MatchedStrategy::Escalation,
+        attempt_tokens: Some(100),
+        context_tokens: Some(60),
+        cache_read_tokens: Some(10),
+        cache_write_tokens: Some(5),
+        repair_tokens: Some(0),
+        proof_tokens: Some(40),
+    };
+    let trials = [base, effort_only, handoff, escalation];
+    for trial in trials {
+        assert!(trial.complete(), "the trial has a full account: {trial:?}");
+        // The attempt's total already carries its own context and cache legs;
+        // only the repair and proof attempts are added beside it.
+        assert!(
+            trial.context_tokens.unwrap_or(0) <= trial.attempt_tokens.unwrap_or(0),
+            "the context leg is the attempt's own breakdown: {trial:?}"
+        );
+        assert_eq!(
+            trial.total_tokens(),
+            Some(
+                trial.attempt_tokens.unwrap_or(0)
+                    + trial.repair_tokens.unwrap_or(0)
+                    + trial.proof_tokens.unwrap_or(0)
+            ),
+            "repair and proof are added once: {trial:?}"
+        );
+    }
+    assert_eq!(base.total_tokens(), Some(140));
+    assert_eq!(effort_only.total_tokens(), Some(160));
+    assert_eq!(handoff.total_tokens(), Some(170));
+    assert_eq!(escalation.total_tokens(), Some(140));
+
+    // Tariff-only ordering would put the effort-only attempt first (60); the
+    // full account does not.
+    let mut tariff: Vec<(MatchedStrategy, u64)> = trials
+        .iter()
+        .map(|trial| (trial.strategy, trial.attempt_tokens.unwrap_or(u64::MAX)))
+        .collect();
+    tariff.sort_by_key(|(_, tokens)| *tokens);
+    assert_eq!(
+        tariff[0].0,
+        MatchedStrategy::EffortOnly,
+        "the single-attempt tariff ranks the effort-only trial first"
+    );
+    let ranked = matched_ranking(&trials);
+    assert_eq!(
+        ranked,
+        vec![
+            MatchedStrategy::KeepModel,
+            MatchedStrategy::Escalation,
+            MatchedStrategy::EffortOnly,
+            MatchedStrategy::Handoff,
+        ],
+        "context/cache/repair/proof decide the matched order"
+    );
+    assert_ne!(
+        ranked[0], tariff[0].0,
+        "a tariff-only comparison would have chosen another strategy"
+    );
+
+    // An unknown leg keeps the account uncertain: it is never read as a
+    // fabricated zero and never ranks cheaper than a complete trial.
+    let uncertain = MatchedTrial {
+        cache_read_tokens: None,
+        ..escalation
+    };
+    assert!(!uncertain.complete());
+    assert_eq!(uncertain.total_tokens(), None);
+    let with_uncertain = [base, effort_only, handoff, uncertain];
+    let ranked = matched_ranking(&with_uncertain);
+    assert_eq!(ranked.last(), Some(&MatchedStrategy::Escalation));
+    assert!(
+        ranked[..3]
+            .iter()
+            .all(|strategy| *strategy != MatchedStrategy::Escalation)
+    );
+
+    // One available model serves the ordinary request: the single recorded
+    // connection is enough, with no router subscription row.
+    let mut world = support::open_world("economy-matched", Some(config_text()));
+    let session = world.open_session("bootstrap-economy-matched");
+    let manifest = settle_through_runtime(
+        &mut world,
+        "matched-scope",
+        UsageDelta::Legs {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(20),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(20),
+            cache_write_tokens: Some(0),
+            total_tokens: Some(140),
+        },
+    );
+    let settlement = world
+        .runtime
+        .store()
+        .settlement(&manifest.attempt_id)
+        .expect("the single-model send settled");
+    assert_eq!(settlement.bins.total_tokens, Some(140));
+    assert_eq!(
+        settlement.bins.cache_read_tokens,
+        Some(20),
+        "the provider cache leg is recorded beside the attempt total"
+    );
+    world
+        .runtime
+        .refresh_economy(Some(&manifest))
+        .expect("the projection refreshes");
+    let economy = economy_status(&mut world, &session);
+    assert_eq!(economy["settled_tokens"], json!(140));
+    assert_eq!(
+        economy["model"],
+        json!("fixture-model"),
+        "the only available model served the request without a router subscription"
+    );
+    assert_eq!(
+        config_text().matches("[connections.").count(),
+        1,
+        "one declared connection serves the matched send"
+    );
 }

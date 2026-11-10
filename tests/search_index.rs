@@ -1119,13 +1119,10 @@ fn catalogue_reports_session_new_and_view_clear_available_p7() {
     // catalog's one unbuilt row carries.
     let page = rivect::tools::describe();
     let unavailable = rivect::tools::unavailable_rows();
-    let planned_description = page
-        .items
-        .iter()
-        .find(|entry| !entry.available)
-        .expect("a still-planned kind stays on the page")
-        .description
-        .clone();
+    assert!(
+        unavailable.is_empty(),
+        "no catalog row remains planned: {unavailable:?}"
+    );
     for kind in ["session.new", "view.clear"] {
         let entry = page
             .items
@@ -1135,14 +1132,19 @@ fn catalogue_reports_session_new_and_view_clear_available_p7() {
         assert!(entry.available, "{kind} is built: {entry:?}");
         assert!(entry.unavailability_reason.is_none(), "{kind}: {entry:?}");
         assert!(!entry.description.is_empty(), "{kind}: {entry:?}");
-        assert_ne!(
-            entry.description, planned_description,
-            "{kind} describes itself instead of borrowing the planned line"
+        let borrowed = page
+            .items
+            .iter()
+            .filter(|other| other.canonical_id != kind && other.description == entry.description)
+            .count();
+        assert_eq!(
+            borrowed, 0,
+            "{kind} describes itself instead of borrowing another row's line"
         );
         assert!(!entry.busy_policy.is_empty(), "{kind}: {entry:?}");
         assert!(
             !unavailable.iter().any(|row| row.canonical_id == kind),
-            "a promoted kind leaves the unavailable set: {kind}"
+            "a promoted kind is never in the unavailable set: {kind}"
         );
     }
 
@@ -1177,13 +1179,10 @@ fn catalogue_reports_context_compact_available_p7() {
     // row carries, and it is not in the unavailable set.
     let page = rivect::tools::describe();
     let unavailable = rivect::tools::unavailable_rows();
-    let planned_description = page
-        .items
-        .iter()
-        .find(|entry| !entry.available)
-        .expect("a still-planned kind stays on the page")
-        .description
-        .clone();
+    assert!(
+        unavailable.is_empty(),
+        "no catalog row remains planned: {unavailable:?}"
+    );
     let kind = "context.compact";
     let entry = page
         .items
@@ -1193,14 +1192,19 @@ fn catalogue_reports_context_compact_available_p7() {
     assert!(entry.available, "{kind} is built: {entry:?}");
     assert!(entry.unavailability_reason.is_none(), "{kind}: {entry:?}");
     assert!(!entry.description.is_empty(), "{kind}: {entry:?}");
-    assert_ne!(
-        entry.description, planned_description,
-        "{kind} describes itself instead of borrowing the planned line"
+    let borrowed = page
+        .items
+        .iter()
+        .filter(|other| other.canonical_id != kind && other.description == entry.description)
+        .count();
+    assert_eq!(
+        borrowed, 0,
+        "{kind} describes itself instead of borrowing another row's line"
     );
     assert!(!entry.busy_policy.is_empty(), "{kind}: {entry:?}");
     assert!(
         !unavailable.iter().any(|row| row.canonical_id == kind),
-        "a promoted kind leaves the unavailable set: {kind}"
+        "a promoted kind is never in the unavailable set: {kind}"
     );
 
     // Consumer side: the same canonical id reaches a handler, and the fold
@@ -1313,21 +1317,16 @@ fn promoted_rows_resolve_through_their_declared_carrier() {
         }
     }
 
-    // The one row without a handler stays typed-unavailable with its exact
-    // reason, and doctor — served by the CLI and the pre-open loop — still
-    // refuses the library dispatcher typed rather than as unknown.
+    // The docs owner answers its own status; doctor — served by the CLI and
+    // the pre-open loop — still refuses the library dispatcher typed rather
+    // than as unknown.
     let mut world = open_world("init-planned", None);
     let session = world.open_session("planned-session");
     let response = world.dispatch(&corpus_command_execute(&session, "docs.status", json!(1)));
-    assert_eq!(
-        response["error"]["data"]["code"], "capability_unavailable",
-        "{response}"
-    );
-    assert_eq!(
-        response["error"]["data"]["message"],
-        "docs.status is unavailable: docs owner not installed",
-        "{response}"
-    );
+    assert_eq!(response["result"]["kind"], "docs.status", "{response}");
+    assert_eq!(response["result"]["owner"], "src/docs.rs", "{response}");
+    assert_eq!(response["result"]["version_aware"], true, "{response}");
+    assert_eq!(response["result"]["quota"], "unknown", "{response}");
     let doctor = world.dispatch(&corpus_command_execute(&session, "doctor", json!(1)));
     assert_eq!(
         doctor["error"]["data"]["code"], "capability_unavailable",
@@ -3322,38 +3321,10 @@ fn every_catalog_row_is_swept_for_availability_not_a_spot_check() {
     // promoting a row — or dropping a descriptor — turns this red instead
     // of leaving hand-picked entries green.
     let page = rivect::tools::describe();
-    let unavailable = rivect::tools::unavailable_rows();
-    assert_eq!(
-        unacceptable_rows(&unavailable),
-        vec!["docs.status"],
-        "the contract tolerates exactly one unbuilt row, with its named reason"
+    assert!(
+        rivect::tools::unavailable_rows().is_empty(),
+        "every catalog row is served"
     );
-    for row in &unavailable {
-        let entry = page
-            .items
-            .iter()
-            .find(|entry| entry.canonical_id == row.canonical_id)
-            .unwrap_or_else(|| panic!("{} stays visible in the catalog", row.canonical_id));
-        assert!(!entry.available, "{} is unbuilt", row.canonical_id);
-        assert_eq!(
-            entry.unavailability_reason.as_deref(),
-            row.unavailable,
-            "{} carries its exact reason",
-            row.canonical_id
-        );
-        assert!(!entry.description.is_empty(), "{}", row.canonical_id);
-        assert!(!entry.busy_policy.is_empty(), "{}", row.canonical_id);
-        assert!(
-            matches!(
-                rivect::tools::local_command_kind(row.canonical_id),
-                rivect::tools::LocalKind::PlannedUnimplemented
-            ),
-            "{} dispatches typed-unavailable",
-            row.canonical_id
-        );
-    }
-    // Every canonical row is on the page exactly once, and a served row is
-    // not in the unbuilt set, so the sweep cannot pass over a stale entry.
     assert_eq!(
         rivect::tools::CATALOG.len(),
         36,
@@ -3366,29 +3337,41 @@ fn every_catalog_row_is_swept_for_availability_not_a_spot_check() {
             .filter(|entry| entry.canonical_id == row.canonical_id)
             .count();
         assert_eq!(listed, 1, "{} is listed exactly once", row.canonical_id);
-        if row.available() {
-            assert!(
-                !unavailable
-                    .iter()
-                    .any(|planned| planned.canonical_id == row.canonical_id),
-                "a promoted kind leaves the unavailable set: {}",
+        let entry = page
+            .items
+            .iter()
+            .find(|entry| entry.canonical_id == row.canonical_id)
+            .unwrap_or_else(|| panic!("{} stays visible in the catalog", row.canonical_id));
+        assert!(entry.available, "{} is served", row.canonical_id);
+        assert!(
+            entry.unavailability_reason.is_none(),
+            "{} carries no reason",
+            row.canonical_id
+        );
+        assert!(!entry.description.is_empty(), "{}", row.canonical_id);
+        assert!(!entry.busy_policy.is_empty(), "{}", row.canonical_id);
+        match row.carrier {
+            rivect::tools::Carrier::Local => assert!(
+                !matches!(
+                    rivect::tools::local_command_kind(row.canonical_id),
+                    rivect::tools::LocalKind::Unknown
+                        | rivect::tools::LocalKind::PlannedUnimplemented
+                ),
+                "{} reaches a handler",
                 row.canonical_id
-            );
+            ),
+            rivect::tools::Carrier::Rpc(method) => assert!(
+                rivect::commands::served_methods().contains(&method),
+                "{}'s carrier {method} is a served method",
+                row.canonical_id
+            ),
+            rivect::tools::Carrier::Cli(command) => assert!(
+                command.starts_with("rivect "),
+                "{}'s carrier is the executable's own entry: {command}",
+                row.canonical_id
+            ),
         }
     }
-    assert!(
-        !unavailable
-            .iter()
-            .any(|row| row.canonical_id == "project.init"),
-        "a promoted kind leaves the unavailable set"
-    );
-}
-
-/// The canonical ids of the rows a catalog carries without a handler, in
-/// catalog order. A helper rather than an inline map so the sweep states the
-/// one tolerated row once.
-fn unacceptable_rows(rows: &[&rivect::tools::CatalogRow]) -> Vec<&'static str> {
-    rows.iter().map(|row| row.canonical_id).collect()
 }
 
 #[test]

@@ -8302,3 +8302,320 @@ fn saturated_tree_still_opens_the_offered_base() {
         refused.correction()
     );
 }
+
+// ----- the upgrade chain: N -> N+1 -> N+2 -----
+
+const REVOKED: &str = "carry-withdrawn-form";
+const REVOKED_TEXT: &str = "carry the withdrawn form into the review paragraph";
+
+/// The second personal delta: it is activated and then withdrawn before the
+/// chain runs, so the chain must keep both the active personal delta and the
+/// withdrawal that outranks it.
+fn revoked_candidate() -> DeltaCandidate {
+    candidate(REVOKED, instruction(REVOKED_TEXT, Some(PROBE_PURPOSE)))
+}
+
+fn revoked_corpus() -> Vec<CorpusCase> {
+    vec![
+        CorpusCase::Transfer {
+            facts: ConditionFacts::for_purpose(PROBE_PURPOSE),
+        },
+        CorpusCase::Composition {
+            facts: ConditionFacts::for_purpose(PROBE_PURPOSE),
+        },
+        CorpusCase::NegativeControl {
+            facts: ConditionFacts::for_purpose(SUBJECT_PURPOSE),
+            control: DELTA.to_string(),
+        },
+    ]
+}
+
+/// The third base: the second update's document, which fixes the subject
+/// purpose's model while keeping the effort and guard the previous base set.
+fn base_v3() -> String {
+    base_document(
+        "[models.purposes.main]\n\
+         model = { mode = \"fixed\", connection = \"local\", model_id = \"base-model\" }\n\
+         effort = { mode = \"fixed\", value = \"high\" }\n",
+    )
+    .replace("auto_compact = false", "auto_compact = true")
+}
+
+/// The fourth base: staged but never committed, so the third base keeps
+/// serving and the checkpoint is what the next open resumes.
+fn base_v4() -> String {
+    base_document(
+        "[models.purposes.main]\n\
+         model = { mode = \"fixed\", connection = \"local\", model_id = \"replacement-model\" }\n\
+         effort = { mode = \"fixed\", value = \"xhigh\" }\n",
+    )
+}
+
+/// AC-082/AC-054: two consecutive updates keep the newest basis and every
+/// personal fact the user owns. The third base's purpose row reaches the
+/// request, the active personal delta still applies, the withdrawn personal
+/// delta stays withdrawn, the explicit off and pin keep their layer, and the
+/// deleted guard override is not restored. An interrupted fourth update keeps
+/// the third base serving, and a downgrade to the second base is a typed
+/// refusal rather than a silent replace.
+#[test]
+fn upgrade_chain_keeps_basis_delta_deletion_and_revocation() {
+    let root = temp_root("n-plus-two");
+    std::fs::create_dir_all(root.path().join("store")).expect("store dir");
+    let mut store = open_store(&root.path().join("store"));
+    store
+        .serve_base(&install(root.path(), BaseSource::new(1, &base_v1())))
+        .expect("the first base is recorded");
+
+    // The personal delta is verified and active; a second one is activated and
+    // withdrawn, so the chain carries both an active delta and a tombstone.
+    verified_delta(&mut store);
+    store
+        .record_learning_delta(&revoked_candidate())
+        .expect("the withdrawn candidate is recorded");
+    let verdicts = store
+        .record_learning_corpus(REVOKED, &revoked_corpus())
+        .expect("the withdrawn candidate's corpus is recorded");
+    assert!(
+        verdicts.iter().all(|verdict| verdict.passed),
+        "the withdrawn delta's corpus passed before its activation: {verdicts:?}"
+    );
+    store
+        .activate_learning_delta(REVOKED, 1)
+        .expect("the second delta activates");
+    store
+        .roll_back_learning_delta(REVOKED, 2)
+        .expect("the second delta is withdrawn");
+
+    // The user's own document: an explicit off, a pin on another purpose and
+    // no `[context]` table — the guard override was deleted, not set.
+    let user = user_config(
+        "[workflow]\n\
+         enabled = false\n\
+         [models.purposes.review]\n\
+         model = { mode = \"fixed\", connection = \"local\", model_id = \"pinned-model\" }\n\
+         effort = { mode = \"fixed\", value = \"low\" }\n",
+    );
+    assert!(
+        !user.contains("[context]"),
+        "the fixture's guard override is a deletion, not a value"
+    );
+
+    // N -> N+1: the second base installs and retires the first.
+    let second = store
+        .serve_base(&install(root.path(), BaseSource::new(2, &base_v2())))
+        .expect("the second base is recorded");
+    assert_eq!(second.receipt.base_version, 2);
+    assert_eq!(second.receipt.state, UpdateState::Active);
+    let after_second = config::resolve_effective_on(BaseSource::new(2, &base_v2()), Some(&user))
+        .expect("the second base resolves");
+    assert_eq!(
+        after_second
+            .composed()
+            .resolve_purpose(SUBJECT_PURPOSE)
+            .expect("the subject purpose resolves")
+            .effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "the second base's purpose row reaches the request"
+    );
+
+    // N+1 -> N+2: the third base installs, retires the second and keeps the
+    // active personal delta beside the tombstone.
+    let third = store
+        .serve_base(&install(root.path(), BaseSource::new(3, &base_v3())))
+        .expect("the third base is recorded");
+    assert_eq!(third.receipt.base_version, 3);
+    assert_eq!(third.receipt.state, UpdateState::Active);
+    assert_eq!(
+        store
+            .active_base()
+            .expect("base read")
+            .map(|base| base.version),
+        Some(3),
+        "the ledger serves the third base"
+    );
+    assert_eq!(
+        store
+            .update_receipt(2)
+            .expect("the retired receipt reads")
+            .state,
+        UpdateState::Retired,
+        "the second base is retired, not forgotten"
+    );
+    let status = store.learning_status().expect("status");
+    assert!(
+        status.active.iter().any(|delta| delta.delta_id == DELTA),
+        "the personal delta stays active across both updates: {status:?}"
+    );
+    assert!(
+        status
+            .rolled_back
+            .iter()
+            .any(|delta| delta.delta_id == REVOKED),
+        "the withdrawal survives both updates: {status:?}"
+    );
+    let definition = store.learning_definition().expect("definition");
+    assert!(
+        definition
+            .deltas()
+            .iter()
+            .all(|delta| delta.delta_id != REVOKED),
+        "the withdrawn delta contributes nothing to the next request"
+    );
+
+    // The new basis and every personal fact reach one request after N+2.
+    let after_third = config::resolve_effective_on(BaseSource::new(3, &base_v3()), Some(&user))
+        .expect("the third base resolves");
+    assert_eq!(
+        after_third.base_version(),
+        3,
+        "the resolved layer and the ledger name the newest base"
+    );
+    let subject = after_third
+        .composed()
+        .resolve_purpose(SUBJECT_PURPOSE)
+        .expect("the subject purpose resolves");
+    assert_eq!(
+        subject.model,
+        ModelAssign::Fixed(config::FixedModel {
+            connection: "local".to_string(),
+            model_id: "base-model".to_string(),
+        }),
+        "the third base's model reaches the request"
+    );
+    assert_eq!(
+        subject.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        },
+        "the third base's effort reaches the request"
+    );
+    let review = after_third
+        .composed()
+        .resolve_purpose(PROBE_PURPOSE)
+        .expect("the pinned purpose resolves");
+    assert_eq!(
+        review.model,
+        ModelAssign::Fixed(config::FixedModel {
+            connection: "local".to_string(),
+            model_id: "pinned-model".to_string(),
+        }),
+        "the user's pin keeps its own layer across both updates"
+    );
+    assert_eq!(review.effort_source, "models.purposes.review");
+    assert_eq!(
+        after_third
+            .parsed
+            .as_ref()
+            .expect("the user document is parsed")
+            .context
+            .auto_compact,
+        None,
+        "the deleted guard override stays deleted"
+    );
+    assert!(
+        after_third.composed().auto_compact(),
+        "the newest base's guard default answers where the user deleted their override"
+    );
+    assert!(
+        !after_third.retained().auto_compact(),
+        "the base's guard default never reads as a value the user set"
+    );
+    assert_eq!(
+        after_third.workflow_entry.effective,
+        config::ConfigViewValue::Visible {
+            value: Value::Bool(false)
+        },
+        "the explicit off survives both updates"
+    );
+
+    let mut broker = broker();
+    broker.set_learning_definition(definition);
+    let prepared = broker
+        .prepare(
+            SUBJECT_PURPOSE,
+            &after_third.composed(),
+            WORLD,
+            "goal: explain",
+        )
+        .expect("the request prepares");
+    assert!(
+        prepared.instructions.contains(DELTA_TEXT),
+        "the personal delta still applies after N+2: {}",
+        prepared.instructions
+    );
+    assert_eq!(
+        prepared.effort,
+        EffortAssign::Fixed {
+            value: EffortLevel::High
+        }
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "neither update costs a model call"
+    );
+
+    // The fourth update stops after staging: the third base keeps serving and
+    // the checkpoint waits for a compatible open.
+    store
+        .stage_base(&install(root.path(), BaseSource::new(4, &base_v4())))
+        .expect("the fourth base stages");
+    assert_eq!(
+        store
+            .staged_base()
+            .expect("staged read")
+            .map(|base| base.version),
+        Some(4),
+        "the interrupted update left its checkpoint"
+    );
+    assert_eq!(
+        store
+            .active_base()
+            .expect("base read")
+            .map(|base| base.version),
+        Some(3),
+        "the serving base is untouched by the staged cutover"
+    );
+    let still_serving = config::resolve_effective_on(BaseSource::new(3, &base_v3()), Some(&user))
+        .expect("the serving base still composes");
+    assert_eq!(
+        still_serving.base_version(),
+        3,
+        "an interrupted update never half-serves the staged document"
+    );
+
+    // A downgrade to the second base is refused typed and moves nothing: the
+    // third base still serves and the fourth base's checkpoint stays.
+    let downgrade = store
+        .serve_base(&install(root.path(), BaseSource::new(2, &base_v2())))
+        .expect_err("a base downgrade is refused");
+    assert!(
+        matches!(
+            downgrade,
+            config::BaseError::NewerRecorded {
+                offered: 2,
+                recorded: 3
+            }
+        ),
+        "the downgrade names both versions: {downgrade}"
+    );
+    assert_eq!(
+        store
+            .active_base()
+            .expect("base read")
+            .map(|base| base.version),
+        Some(3),
+        "the refusal left the serving base in place"
+    );
+    assert_eq!(
+        store
+            .staged_base()
+            .expect("staged read")
+            .map(|base| base.version),
+        Some(4),
+        "the refusal left the waiting checkpoint in place"
+    );
+}

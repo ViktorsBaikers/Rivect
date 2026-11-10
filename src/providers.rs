@@ -100,6 +100,16 @@
 //! row — never from the credential class. Its Messages leg is the shared
 //! `anthropic::MessagesCodec`, so the reasoning lineage is the one
 //! adapter's.
+//!
+//! `zai` records the Z.AI GLM Coding Plan row and `zai-coding-plan` its
+//! sign-in alias (the alias stores the canonical `zai` profile rather than
+//! a second backend). [`zai`] serves both literals over the bundled
+//! catalogue's two coding-plan transports — Messages on
+//! `https://api.z.ai/api/anthropic` and native Chat Completions on
+//! `https://api.z.ai/api/coding/paas/v4` — selected by the model's recorded
+//! row and bound by the configured endpoint; the PAYG base is never
+//! admitted, a configured region denies, and the shared Messages codec
+//! carries the reasoning lineage and one-strip signature retry.
 
 use crate::config::{Config, ConnKind, Connection, EffortLevel, ModelAssign, Profile};
 use crate::model::RequestManifest;
@@ -139,6 +149,7 @@ pub mod routed;
 pub mod sse;
 pub mod vertex;
 pub mod vertex_login;
+pub mod zai;
 pub mod zai_login;
 
 /// The one catalogue record both dialect owners share (DEC-007):
@@ -1675,6 +1686,10 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "xiaomi-token-plan-sgp" => Some(Dialect::ChatCompletions),
         "yolo-auto" => Some(Dialect::ChatCompletions),
         "zenmux" => Some(Dialect::ChatCompletions),
+        // The canonical `zai` row and its `zai-coding-plan` sign-in alias
+        // are one backend: the recorded Messages default, while the model's
+        // bundled row selects the coding-plan transport per send.
+        "zai" | "zai-coding-plan" => Some(Dialect::Messages),
         "zhipu-coding-plan" => Some(Dialect::ChatCompletions),
         _ => None,
     }
@@ -1693,6 +1708,7 @@ pub fn routes_for(connection: &str) -> &'static [Dialect] {
         "opencode-zen" => OPENCODE_ZEN_ROUTES,
         "zenmux" => ZENMUX_ROUTES,
         "kimi-code" => kimi::dialects(),
+        "zai" | "zai-coding-plan" => zai::dialects(),
         _ => &[],
     }
 }
@@ -2265,6 +2281,12 @@ impl ConfiguredProvider {
             return Ok(Box::new(kimi::KimiProvider::new(
                 config, connection, store,
             )?));
+        }
+        // Z.AI's two literals resolve the bundled row's transport per model,
+        // so the literal owner builds this adapter, never a single-dialect
+        // codec arm.
+        if zai::serves_literal(connection) {
+            return Ok(Box::new(zai::ZaiProvider::new(config, connection, store)?));
         }
         match dialect {
             Dialect::Responses => Ok(Box::new(openai::OpenAiProvider::new(

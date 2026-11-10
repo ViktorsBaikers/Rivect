@@ -9345,3 +9345,89 @@ fn kimi_code_offline_eligibility_is_binding_level_typed() {
         "only the resolvable binding is the api-key form"
     );
 }
+
+// ----- SLICE-006: Z.AI coding-plan routed inference -----------------------
+
+/// `zai` and `zai-coding-plan` are one recorded backend, not two: both
+/// literals resolve the same Messages default and the same two-transport
+/// route table, a bound canonical `zai` profile is offline-eligible without
+/// a separate live grant, and an unresolved binding keeps the typed
+/// live-grant denial.
+#[test]
+fn zai_aliases_resolve_one_coding_plan_backend() {
+    let config = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.zai]\nkind = \"api_key\"\nendpoint = \"https://api.z.ai\"\ncredential_ref = \"keychain:rivect/zai\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"zai\", model_id = \"glm-5.2\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("valid");
+    for alias in ["zai", "zai-coding-plan"] {
+        assert_eq!(
+            rivect::providers::dialect_for(alias),
+            Some(Dialect::Messages),
+            "{alias} keeps the recorded Messages default"
+        );
+        assert_eq!(
+            rivect::providers::routes_for(alias),
+            [Dialect::Messages, Dialect::ChatCompletions],
+            "{alias} records exactly the two coding-plan transports"
+        );
+    }
+    assert_eq!(
+        rivect::providers::dialect_for("zai"),
+        rivect::providers::dialect_for("zai-coding-plan"),
+        "the alias is not a second backend"
+    );
+    assert_eq!(
+        rivect::providers::zai::route_for("glm-5.2"),
+        Some(Dialect::Messages),
+        "the bundled row selects the Messages transport"
+    );
+    assert_eq!(
+        rivect::providers::zai::route_for("glm-5.3-flash"),
+        Some(Dialect::ChatCompletions),
+        "the bundled row selects the Chat transport"
+    );
+
+    let pin = ModelAssign::Fixed(FixedModel {
+        connection: "zai".to_string(),
+        model_id: "glm-5.2".to_string(),
+    });
+    assert!(
+        rivect::providers::offline_eligible(&pin, &config.connections, &config.profiles).is_ok(),
+        "a bound api_key pin is usable without a separate live grant"
+    );
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "zai",
+    ));
+
+    let mismatched = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.zai]\nkind = \"api_key\"\nendpoint = \"https://api.z.ai\"\ncredential_ref = \"keychain:rivect/zai\"\n\
+         profile = \"zai\"\n\
+         [profiles.zai]\ncredential_ref = \"keychain:rivect/other\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"zai\", model_id = \"glm-5.2\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a profile-bound row is valid");
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &mismatched.connections,
+                &mismatched.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::ApiKey
+            })
+        ),
+        "a declared binding that cannot resolve is the typed live-grant denial"
+    );
+    assert!(
+        !rivect::providers::offline_usable(&mismatched.connections, &mismatched.profiles, "zai",),
+        "only the resolvable canonical binding is the api-key form"
+    );
+}

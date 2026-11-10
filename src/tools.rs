@@ -42,6 +42,7 @@ pub enum LocalKind {
     WorkflowControl,
     HarnessControl,
     McpCall,
+    DocsStatus,
     PlannedUnimplemented,
     Unknown,
 }
@@ -83,8 +84,6 @@ impl CatalogRow {
         self.unavailable.is_none()
     }
 }
-
-const UNAVAILABLE_DOCS: &str = "docs owner not installed";
 
 /// The 36 canonical rows, in their published order. This table is the one
 /// source the page, the help text, the completion scripts and the alias map
@@ -280,7 +279,7 @@ pub const CATALOG: &[CatalogRow] = &[
         description: "report the installed documentation owner's status",
         busy_policy: BUSY_READ,
         carrier: Carrier::Local,
-        unavailable: Some(UNAVAILABLE_DOCS),
+        unavailable: None,
     },
     CatalogRow {
         canonical_id: "view.clear",
@@ -373,9 +372,9 @@ pub const CATALOG: &[CatalogRow] = &[
     CatalogRow {
         canonical_id: "ui.render",
         aliases: &[],
-        description: "paint the fullscreen terminal surface",
+        description: "paint the terminal surface in fullscreen or inline mode",
         busy_policy: BUSY_READ,
-        carrier: Carrier::Cli("rivect --tui fullscreen"),
+        carrier: Carrier::Cli("rivect --tui fullscreen|inline"),
         unavailable: None,
     },
 ];
@@ -503,6 +502,7 @@ fn handler_kind(canonical_id: &str) -> LocalKind {
         "project.init" => LocalKind::ProjectInit,
         "read_file" => LocalKind::ReadFile,
         "mcp.call" => LocalKind::McpCall,
+        "docs.status" => LocalKind::DocsStatus,
         _ => LocalKind::Unknown,
     }
 }

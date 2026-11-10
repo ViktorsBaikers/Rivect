@@ -23624,3 +23624,1236 @@ mod kimi_contract {
         drop_blocking(provider);
     }
 }
+
+// ----- Z.AI coding-plan inference (SLICE-006) -----------------------------
+
+mod zai_contract {
+    use super::*;
+    use rivect::providers::zai::{self, ZaiProvider};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread::JoinHandle;
+
+    const ZAI_REF: &str = "keyring:rivect-test/zai";
+    const ZAI_PROFILE: &str = r#"{"api_key":"fixture-id","secret_key":"fixture-secret"}"#;
+    const ZAI_BEARER: &str = "fixture-id.fixture-secret";
+    const ZAI_MESSAGES_MODEL: &str = "glm-5.2";
+    const ZAI_CHAT_MODEL: &str = "glm-5.3-flash";
+
+    /// One scripted reply: the status, the whole body, and the maximum
+    /// bytes per write — `1` forces a split inside every code point,
+    /// escape and SSE block.
+    struct Reply {
+        status: u16,
+        body: String,
+        chunk: usize,
+    }
+
+    impl Reply {
+        fn sse(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: body.into(),
+                chunk: 4096,
+            }
+        }
+
+        fn split(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                body: body.into(),
+                chunk: 1,
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                body: "{}".to_string(),
+                chunk: 4096,
+            }
+        }
+    }
+
+    /// One recorded request: method, path, raw head and body.
+    type PeerLog = Vec<(String, String, String, String)>;
+
+    struct ZaiPeer {
+        base: String,
+        address: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        log: Arc<Mutex<PeerLog>>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl ZaiPeer {
+        fn start<F>(handler: F) -> Self
+        where
+            F: Fn(&str, &str, &str) -> Reply + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the zai peer");
+            listener.set_nonblocking(true).expect("nonblocking peer");
+            let address = listener.local_addr().expect("peer address");
+            let base = format!("http://{address}");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let entries = Arc::clone(&log);
+            let handler = Arc::new(handler);
+            let handle = std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _address)) => serve(stream, handler.as_ref(), &entries),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::park_timeout(Duration::from_millis(2));
+                        }
+                        Err(_error) => break,
+                    }
+                }
+            });
+            Self {
+                base,
+                address,
+                stop,
+                log,
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&self) -> Vec<(String, String, String, String)> {
+            self.log.lock().expect("peer log").clone()
+        }
+
+        fn posts(&self) -> Vec<(String, String, String, String)> {
+            self.requests()
+                .into_iter()
+                .filter(|(method, _, _, _)| method == "POST")
+                .collect()
+        }
+    }
+
+    impl Drop for ZaiPeer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// One request/response on its own connection: the head decides the
+    /// body length, and the reply is written in the scripted slices.
+    fn serve<F: Fn(&str, &str, &str) -> Reply + ?Sized>(
+        mut stream: TcpStream,
+        handler: &F,
+        log: &Mutex<PeerLog>,
+    ) {
+        stream.set_nonblocking(false).expect("peer blocking mode");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let Ok(read) = stream.read(&mut chunk) else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = head_end + 4;
+        while buffer.len() < body_start + length {
+            let Ok(read) = stream.read(&mut chunk) else {
+                return;
+            };
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = String::from_utf8_lossy(&buffer[body_start..buffer.len()]).to_string();
+        let method = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_default()
+            .to_string();
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        log.lock().expect("peer log").push((
+            method.clone(),
+            path.clone(),
+            head.clone(),
+            body.clone(),
+        ));
+        let reply = handler(&method, &path, &body);
+        let reason = if reply.status == 200 { "OK" } else { "Error" };
+        let head = format!(
+            "HTTP/1.1 {} {reason}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            reply.status,
+            reply.body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for piece in reply.body.as_bytes().chunks(reply.chunk.max(1)) {
+            if stream.write_all(piece).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+
+    fn messages_stream(text: &str) -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: message_delta\n\
+             data: {}\n\n\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    fn messages_with_stop(text: &str, stop: Option<&str>) -> String {
+        let delta = match stop {
+            Some(reason) => {
+                json!({"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": 3}})
+            }
+            None => json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 3}}),
+        };
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: message_delta\n\
+             data: {delta}\n\n\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    fn thinking_messages_stream(text: &str, thinking: &str, signature: &str) -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: message_delta\n\
+             data: {}\n\n\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": signature}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": text}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    fn mutated_messages_stream() -> String {
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_stop\n\
+             data: {}\n\n\
+             event: message_delta\n\
+             data: {}\n\n\
+             event: message_stop\n\
+             data: {}\n\n",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {"input_tokens": 9},
+                    "input_transformations": [{"type": "prefix_binding_mismatch"}],
+                },
+            }),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "dropped"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}),
+            json!({"type": "message_stop"}),
+        )
+    }
+
+    /// One Messages tool call split across two `input_json_delta` frames;
+    /// `closed` false ends the stream inside the block instead of closing
+    /// it.
+    fn tool_messages_stream(closed: bool) -> String {
+        let tail = if closed {
+            format!(
+                "event: content_block_stop\n\
+                 data: {}\n\n\
+                 event: message_delta\n\
+                 data: {}\n\n\
+                 event: message_stop\n\
+                 data: {}\n\n",
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+                json!({"type": "message_stop"}),
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "event: message_start\n\
+             data: {}\n\n\
+             event: content_block_start\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             event: content_block_delta\n\
+             data: {}\n\n\
+             {tail}",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 6}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"a/b\"}"}}),
+        )
+    }
+
+    fn chat_stream(text: &str, usage: Value) -> String {
+        format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": usage}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        )
+    }
+
+    /// One Chat stream carrying reasoning beside its answer, in the member
+    /// the recorded GLM contract returns as-is on a multi-turn replay.
+    fn reasoning_chat_stream(text: &str, reasoning: &str) -> String {
+        format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        )
+    }
+
+    /// One Chat tool call split across two deltas, followed by the usage
+    /// report and the terminal.
+    fn chat_tool_stream(closed: bool) -> String {
+        let terminal = if closed {
+            "data: {\"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n"
+                .to_string()
+        } else {
+            String::new()
+        };
+        format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             {terminal}",
+            json!({"choices": [{"index": 0, "delta": {"content": "h\u{e9}llo "}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"pa"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "th\":\"a/b\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}),
+        )
+    }
+
+    fn zai_config(alias: &str, endpoint: &str, model: &str) -> Config {
+        Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.{alias}]\n\
+             kind = \"api_key\"\n\
+             endpoint = \"{endpoint}\"\n\
+             credential_ref = \"{ZAI_REF}\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"{alias}\", model_id = \"{model}\" }}\n\
+             effort = {{ mode = \"auto\" }}\n\
+             fallback = {{ mode = \"off\" }}\n"
+        ))
+        .expect("the zai config parses")
+    }
+
+    fn zai_store(material: &str) -> Arc<support::MapStore> {
+        Arc::new(support::MapStore::seeded(
+            StoreKind::Keychain,
+            &[(ZAI_REF, material)],
+        ))
+    }
+
+    fn try_build(
+        config: Config,
+        alias: &str,
+        store: Arc<support::MapStore>,
+    ) -> Result<ZaiProvider, ProviderError> {
+        let alias = alias.to_string();
+        std::thread::spawn(move || ZaiProvider::new(&config, &alias, store))
+            .join()
+            .expect("the provider thread joins")
+    }
+
+    fn send_with(
+        config: &Config,
+        alias: &str,
+        material: &str,
+        world: &str,
+    ) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
+        let store = zai_store(material);
+        let provider =
+            ZaiProvider::new(config, alias, store.clone()).expect("the zai adapter builds");
+        let (broker, manifest) = prepared_with((provider, store), config, world, "goal: zai");
+        dispatch(broker, world, manifest)
+    }
+
+    fn send_turns(
+        config: &Config,
+        world: &str,
+        prompts: &[&str],
+    ) -> (
+        Broker,
+        Vec<Result<rivect::providers::ProviderReply, ModelError>>,
+    ) {
+        let store = zai_store(ZAI_PROFILE);
+        let provider = ZaiProvider::new(config, "zai", store).expect("the adapter builds");
+        let mut broker = Broker::new(Box::new(provider));
+        let mut outcomes = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let manifest = broker
+                .prepare("main", config, world, prompt)
+                .expect("the zai pin prepares");
+            let (next, outcome) = dispatch(broker, world, manifest);
+            broker = next;
+            outcomes.push(outcome);
+        }
+        (broker, outcomes)
+    }
+
+    /// The same turns with the final prepare forced through the prefix
+    /// mutation the Broker records when the envelope changes; the
+    /// manifests are sent through the adapter directly so the post-prepare
+    /// mutation is admitted and the codec's accounting stays observable.
+    fn send_turns_with_mutation(
+        config: &Config,
+        world: &str,
+        prompts: &[&str],
+    ) -> (
+        ZaiProvider,
+        Vec<Result<rivect::providers::ProviderReply, ProviderError>>,
+    ) {
+        let store = zai_store(ZAI_PROFILE);
+        let provider = ZaiProvider::new(config, "zai", store).expect("the adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let mut manifests: Vec<RequestManifest> = prompts
+            .iter()
+            .map(|prompt| {
+                control
+                    .prepare("main", config, world, prompt)
+                    .expect("the zai pin prepares")
+            })
+            .collect();
+        if let Some(last) = manifests.last_mut() {
+            last.mutation_reason = Some("instructions".to_string());
+        }
+        std::thread::spawn(move || {
+            let mut provider = provider;
+            let mut outcomes = Vec::with_capacity(manifests.len());
+            for manifest in &manifests {
+                outcomes.push(provider.send(manifest));
+            }
+            (provider, outcomes)
+        })
+        .join()
+        .expect("the send thread joins")
+    }
+
+    /// Both literals are one backend: each alias resolves each recorded
+    /// transport, the canonical profile rides as the one bearer, and each
+    /// entered send returns one outcome and one physical usage.
+    #[test]
+    fn zai_aliases_send_the_canonical_profile_on_both_coding_plan_transports() {
+        let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
+            ("POST", "/v1/messages") => Reply::sse(messages_stream("messages answer")),
+            ("POST", "/chat/completions") => Reply::sse(chat_stream(
+                "chat answer",
+                json!({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}),
+            )),
+            _ => Reply::status(404),
+        });
+        let messages_usage = UsageDelta::Exact {
+            prompt_tokens: 5,
+            completion_tokens: 3,
+            total_tokens: 8,
+        };
+        let chat_usage = UsageDelta::Exact {
+            prompt_tokens: 11,
+            completion_tokens: 7,
+            total_tokens: 18,
+        };
+        for (alias, model, text, usage) in [
+            ("zai", ZAI_MESSAGES_MODEL, "messages answer", messages_usage),
+            (
+                "zai-coding-plan",
+                ZAI_MESSAGES_MODEL,
+                "messages answer",
+                messages_usage,
+            ),
+            ("zai", ZAI_CHAT_MODEL, "chat answer", chat_usage),
+            ("zai-coding-plan", ZAI_CHAT_MODEL, "chat answer", chat_usage),
+        ] {
+            let config = zai_config(alias, &peer.base, model);
+            let (broker, outcome) = send_with(&config, alias, ZAI_PROFILE, "/world/zai");
+            let reply = outcome.unwrap_or_else(|error| panic!("{alias}/{model}: {error:?}"));
+            assert_eq!(reply.text, text, "{alias}/{model}");
+            assert_eq!(reply.usage, usage, "{alias}/{model}");
+            assert!(reply.tool_calls.is_empty());
+            assert_eq!(broker.accounted_requests(), 1, "{alias}/{model}");
+            drop_blocking(broker);
+        }
+
+        let posts = peer.posts();
+        assert_eq!(posts.len(), 4, "one inference leg per entered send");
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|(_, path, _, _)| path == "/v1/messages")
+                .count(),
+            2,
+            "both aliases ride the Messages transport"
+        );
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|(_, path, _, _)| path == "/chat/completions")
+                .count(),
+            2,
+            "both aliases ride the Chat transport"
+        );
+        for (method, path, head, body) in &posts {
+            assert_eq!(method, "POST");
+            let head = head.to_ascii_lowercase();
+            assert!(
+                head.contains(&format!("authorization: bearer {ZAI_BEARER}")),
+                "the canonical ${{apiKey}}.${{secretKey}} bearer rides the wire: {head}"
+            );
+            let body: Value = serde_json::from_str(body).expect("the body is json");
+            assert!(
+                !body.to_string().contains("fixture-secret"),
+                "credential material rides the authorization header, never the body"
+            );
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .expect("messages is an array")
+                    .iter()
+                    .all(|message| message["role"] != json!("developer")),
+                "the coding-plan body constructs no developer role: {body}"
+            );
+            assert!(
+                body["reasoning_effort"].is_null(),
+                "an auto effort sends no unrecorded dial: {body}"
+            );
+            let messages = body["messages"].as_array().expect("messages is an array");
+            assert_eq!(
+                messages.last(),
+                Some(&json!({"role": "user", "content": "goal: zai"})),
+                "the frozen inputs ride the user turn verbatim: {body}"
+            );
+            if path == "/v1/messages" {
+                assert_eq!(body["model"], ZAI_MESSAGES_MODEL);
+                assert_eq!(body["stream"], json!(true));
+                assert!(body["max_tokens"].as_u64().is_some());
+                assert!(
+                    body["system"].is_string(),
+                    "the Messages dialect keeps its top-level system: {body}"
+                );
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "the Messages body carries exactly the user turn: {body}"
+                );
+                assert!(
+                    head.contains("anthropic-version: 2023-06-01"),
+                    "the recorded Messages version header rides: {head}"
+                );
+            } else {
+                assert_eq!(body["model"], ZAI_CHAT_MODEL);
+                assert_eq!(body["stream"], json!(true));
+                assert_eq!(
+                    body["stream_options"],
+                    json!({"include_usage": true}),
+                    "the recorded usage request rides the Chat stream"
+                );
+            }
+        }
+    }
+
+    /// The production factory installs both literals into the one
+    /// configured set and serves each entry it was built from.
+    #[test]
+    fn zai_configured_provider_installs_both_literals() {
+        let store: Arc<dyn CredentialStore> = zai_store(ZAI_PROFILE);
+        let mut refusals = Vec::new();
+        for alias in ["zai", "zai-coding-plan"] {
+            let config = zai_config(alias, "https://api.z.ai", ZAI_MESSAGES_MODEL);
+            let build = rivect::providers::configured_provider(&config, &store)
+                .expect("the configured set builds");
+            assert!(build.refusals.is_empty(), "{:?}", build.refusals);
+            assert!(
+                build.provider.serves(
+                    alias,
+                    config
+                        .connections
+                        .get(alias)
+                        .expect("the declared connection"),
+                ),
+                "{alias} is installed from its own entry"
+            );
+            refusals.push((alias, build.provider.name()));
+            drop_blocking(build);
+        }
+        assert_eq!(refusals.len(), 2);
+    }
+
+    /// The endpoint, region, declaration kind and profile binding are the
+    /// adapter's gates: a PAYG or foreign origin, a configured region, a
+    /// non-canonical scope and an unsupported declaration kind deny typed
+    /// before any wire leg, while the recorded origin and the matching
+    /// recorded base build.
+    #[test]
+    fn zai_endpoint_region_and_profile_bind_before_any_request() {
+        let peer = ZaiPeer::start(|_method, _path, _body| Reply::status(404));
+        let store = zai_store(ZAI_PROFILE);
+
+        let payg = zai_config("zai", "https://api.z.ai/api/paas/v4", ZAI_MESSAGES_MODEL);
+        assert!(
+            matches!(
+                try_build(payg, "zai", Arc::clone(&store)),
+                Err(ProviderError::UnsendableRequest { .. })
+            ),
+            "the PAYG base is never admitted as the coding-plan endpoint"
+        );
+        let foreign = zai_config(
+            "zai",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            ZAI_MESSAGES_MODEL,
+        );
+        assert!(matches!(
+            try_build(foreign, "zai", Arc::clone(&store)),
+            Err(ProviderError::UnsendableRequest { .. })
+        ));
+
+        let mismatched_binding = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.zai]\nkind = \"api_key\"\nendpoint = \"https://api.z.ai\"\ncredential_ref = \"{ZAI_REF}\"\nprofile = \"zai\"\n\
+             [profiles.zai]\ncredential_ref = \"keyring:rivect-test/other\"\n\
+             [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"zai\", model_id = \"{ZAI_MESSAGES_MODEL}\" }}\n\
+             effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+        ))
+        .expect("the profile-bound row parses");
+        assert!(matches!(
+            try_build(mismatched_binding, "zai", Arc::clone(&store)),
+            Err(ProviderError::CredentialProfileMismatch { .. })
+        ));
+
+        let region = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.zai]\nkind = \"api_key\"\nendpoint = \"https://api.z.ai\"\nregion = \"us\"\ncredential_ref = \"{ZAI_REF}\"\n\
+             [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"zai\", model_id = \"{ZAI_MESSAGES_MODEL}\" }}\n\
+             effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+        ))
+        .expect("the region row parses");
+        assert!(matches!(
+            try_build(region, "zai", Arc::clone(&store)),
+            Err(ProviderError::RegionMismatch { .. })
+        ));
+
+        let subscription = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.zai]\nkind = \"subscription\"\nendpoint = \"https://api.z.ai\"\ncredential_ref = \"{ZAI_REF}\"\n\
+             [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"zai\", model_id = \"{ZAI_MESSAGES_MODEL}\" }}\n\
+             effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+        ))
+        .expect("the subscription row parses");
+        assert!(matches!(
+            try_build(subscription, "zai", Arc::clone(&store)),
+            Err(ProviderError::LiveGrantRequired { .. })
+        ));
+
+        let local = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.zai]\nkind = \"local\"\nendpoint = \"https://api.z.ai\"\nprofile = \"zai\"\n\
+             [profiles.zai]\ncredential_ref = \"{ZAI_REF}\"\n\
+             [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"zai\", model_id = \"{ZAI_MESSAGES_MODEL}\" }}\n\
+             effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+        ))
+        .expect("the local row parses");
+        assert!(matches!(
+            try_build(local, "zai", Arc::clone(&store)),
+            Err(ProviderError::LocalProfileDeclared { .. })
+        ));
+
+        // The recorded origin and each matching recorded base build; a
+        // configured base bound to the other transport denies on send with
+        // zero requests.
+        assert!(
+            try_build(
+                zai_config("zai", "https://api.z.ai", ZAI_MESSAGES_MODEL),
+                "zai",
+                Arc::clone(&store),
+            )
+            .is_ok()
+        );
+        assert!(
+            try_build(
+                zai_config("zai-coding-plan", zai::MESSAGES_BASE, ZAI_MESSAGES_MODEL),
+                "zai-coding-plan",
+                Arc::clone(&store),
+            )
+            .is_ok()
+        );
+        assert!(
+            try_build(
+                zai_config("zai-coding-plan", zai::CHAT_BASE, ZAI_CHAT_MODEL),
+                "zai-coding-plan",
+                Arc::clone(&store),
+            )
+            .is_ok()
+        );
+        let bound = zai_config("zai", zai::MESSAGES_BASE, ZAI_CHAT_MODEL);
+        let (broker, outcome) = send_with(&bound, "zai", ZAI_PROFILE, "/world/zai-bound");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(
+                    ProviderError::UnsendableRequest { .. }
+                ))
+            ),
+            "a Messages-bound endpoint cannot carry the Chat transport: {outcome:?}"
+        );
+        assert_eq!(broker.accounted_requests(), 0);
+        drop_blocking(broker);
+        assert!(
+            peer.requests().is_empty(),
+            "no refused build or binding crossed the wire"
+        );
+        let _ = peer;
+    }
+
+    /// The canonical profile is the only credential this adapter sends: a
+    /// PAYG key form, a non-canonical JSON document and a non-canonical
+    /// scope deny typed with zero requests, and an unrecorded model is not
+    /// admitted by a public listing or an HTTP 200.
+    #[test]
+    fn zai_wrong_credential_and_public_model_are_not_entitlement() {
+        let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
+            ("GET", "/models") => Reply::sse("{\"data\": [{\"id\": \"glm-9-payg\"}]}"),
+            ("POST", "/v1/messages") => Reply::sse(messages_stream("unexpected")),
+            _ => Reply::status(404),
+        });
+
+        for material in [
+            "sk-payg-fixture-not-the-plan",
+            "{\"api_key\":\"fixture-id\"}",
+            "{\"api_key\":\"fixture-id\",\"secret_key\":\"fixture-secret\",\"extra\":true}",
+            "{\"api_key\":\"fixture-id\",\"secret_key\":\"\"}",
+        ] {
+            let config = zai_config("zai", &peer.base, ZAI_MESSAGES_MODEL);
+            let (broker, outcome) = send_with(&config, "zai", material, "/world/zai-credential");
+            assert!(
+                matches!(
+                    outcome,
+                    Err(ModelError::Provider(
+                        ProviderError::CredentialMalformed { .. }
+                    ))
+                ),
+                "{material}: {outcome:?}"
+            );
+            assert_eq!(broker.accounted_requests(), 0);
+            drop_blocking(broker);
+        }
+
+        let wrong_scope = Config::parse_validated(&format!(
+            "config_version = 1\n\
+             [connections.zai]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/kimi-code\"\n\
+             [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"zai\", model_id = \"{ZAI_MESSAGES_MODEL}\" }}\n\
+             effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n",
+            peer.base
+        ))
+        .expect("the foreign-scope row parses");
+        assert!(
+            matches!(
+                try_build(wrong_scope, "zai", zai_store(ZAI_PROFILE)),
+                Err(ProviderError::CredentialMalformed { .. })
+            ),
+            "a scope naming another profile never reaches the adapter"
+        );
+
+        let unrecorded = zai_config("zai", &peer.base, "glm-9-payg");
+        let (broker, outcome) = send_with(&unrecorded, "zai", ZAI_PROFILE, "/world/zai-model");
+        assert!(
+            matches!(
+                outcome,
+                Err(ModelError::Provider(ProviderError::UnsupportedParameter {
+                    parameter: "model",
+                    ..
+                }))
+            ),
+            "a public model or HTTP 200 is not entitlement: {outcome:?}"
+        );
+        assert_eq!(broker.accounted_requests(), 0);
+        drop_blocking(broker);
+        assert!(
+            peer.requests().is_empty(),
+            "the credential denials and the unrecorded model crossed no wire"
+        );
+    }
+
+    /// A partial tool call and an unknown terminal are never success on
+    /// either transport; a recorded failure reason stays the peer's typed
+    /// verdict, and a refused stream settles no usage.
+    #[test]
+    fn zai_partial_and_unknown_terminals_are_not_success() {
+        let cases: Vec<(&str, &str, String, &str)> = vec![
+            (
+                "messages truncated tool",
+                ZAI_MESSAGES_MODEL,
+                tool_messages_stream(false),
+                "stream",
+            ),
+            (
+                "messages unknown stop",
+                ZAI_MESSAGES_MODEL,
+                messages_with_stop("partial", Some("mystery")),
+                "unknown",
+            ),
+            (
+                "messages absent stop",
+                ZAI_MESSAGES_MODEL,
+                messages_with_stop("partial", None),
+                "unknown",
+            ),
+            (
+                "chat truncated tool",
+                ZAI_CHAT_MODEL,
+                chat_tool_stream(false),
+                "unknown",
+            ),
+            (
+                "chat terminal truncated tool",
+                ZAI_CHAT_MODEL,
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"read_file\", \"arguments\": \"{\\\"path\\\":\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                "stream",
+            ),
+            (
+                "chat unknown finish",
+                ZAI_CHAT_MODEL,
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"partial\"}, \"finish_reason\": \"mystery\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                "unknown",
+            ),
+            (
+                "chat failure finish",
+                ZAI_CHAT_MODEL,
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"partial\"}, \"finish_reason\": \"content_filter\"}]}\n\ndata: [DONE]\n\n".to_string(),
+                "failed",
+            ),
+        ];
+        for (name, model, body, expected) in cases {
+            let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+                ("POST", "/v1/messages") => Reply::sse(body.clone()),
+                ("POST", "/chat/completions") => Reply::sse(body.clone()),
+                _ => Reply::status(404),
+            });
+            let config = zai_config("zai", &peer.base, model);
+            let (broker, outcome) = send_with(&config, "zai", ZAI_PROFILE, "/world/zai-partial");
+            match expected {
+                "stream" => assert!(
+                    matches!(
+                        outcome,
+                        Err(ModelError::Provider(ProviderError::StreamViolation { .. }))
+                    ),
+                    "{name}: {outcome:?}"
+                ),
+                "unknown" => assert!(
+                    matches!(
+                        outcome,
+                        Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+                    ),
+                    "{name}: {outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        outcome,
+                        Err(ModelError::Provider(ProviderError::ProviderFailed { .. }))
+                    ),
+                    "{name}: {outcome:?}"
+                ),
+            }
+            assert_eq!(broker.accounted_requests(), 0, "{name}");
+            drop_blocking(broker);
+            assert_eq!(peer.posts().len(), 1, "{name}: one inference leg");
+        }
+    }
+
+    /// The one physical usage is the last confirmed Chat report, even when
+    /// the stream is split inside every code point and repeats its usage;
+    /// a complete split tool call yields exactly one call.
+    #[test]
+    fn zai_split_chat_stream_settles_once_and_executes_the_complete_call() {
+        let stream = format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "h\u{e9}llo "}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"pa"}}]}, "finish_reason": null}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "th\":\"a/b\"}"}}]}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}}),
+        );
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/chat/completions") => Reply::split(stream.clone()),
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_CHAT_MODEL);
+        let (broker, outcome) = send_with(&config, "zai", ZAI_PROFILE, "/world/zai-split");
+        let reply = outcome.expect("the split stream completes one call");
+        assert_eq!(reply.text, "h\u{e9}llo ");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].tool, "read_file");
+        assert_eq!(reply.tool_calls[0].path.as_deref(), Some("a/b"));
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Exact {
+                prompt_tokens: 5,
+                completion_tokens: 3,
+                total_tokens: 8,
+            },
+            "the last confirmed report is the one charge"
+        );
+        assert_eq!(broker.accounted_requests(), 1, "one physical usage");
+        drop_blocking(broker);
+        assert_eq!(peer.posts().len(), 1);
+    }
+
+    /// The shared Messages codec carries the reasoning lineage: a thinking
+    /// block replays byte-identical inside its epoch, a prefix mutation
+    /// drops it and requests the recorded policy, and a `400` naming an
+    /// invalid signature strips exactly once, counts the retry and clears
+    /// the epoch.
+    #[test]
+    fn zai_messages_reasoning_replay_and_one_strip_retry_hold() {
+        let captures = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply::sse(messages_stream("replayed"))
+                }
+            }
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_MESSAGES_MODEL);
+        let (broker, outcomes) = send_turns(&config, "/world/zai", &["goal: one", "goal: two"]);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].as_ref().expect("capture turn").text, "captured");
+        assert_eq!(outcomes[1].as_ref().expect("replay turn").text, "replayed");
+        assert_eq!(broker.accounted_requests(), 2);
+        drop_blocking(broker);
+
+        let posts = peer.posts();
+        assert_eq!(posts.len(), 2, "one inference leg per turn");
+        let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        assert_eq!(
+            replay["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "plan", "signature": "sig-fixture"}],
+                },
+                {"role": "user", "content": "goal: two"},
+            ]),
+            "the captured thinking block replays byte-identical in its epoch"
+        );
+        assert!(replay["thinking"].is_null());
+        assert!(!posts[1].2.to_ascii_lowercase().contains("anthropic-beta"));
+
+        // The prefix mutation drops the replay and requests the policy.
+        let captures = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply::sse(mutated_messages_stream())
+                }
+            }
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_MESSAGES_MODEL);
+        let (provider, outcomes) =
+            send_turns_with_mutation(&config, "/world/zai-mutated", &["goal: one", "goal: two"]);
+        outcomes[0].as_ref().expect("the capture turn answers");
+        outcomes[1].as_ref().expect("the mutated turn answers");
+        assert_eq!(provider.dropped_reasoning(), 1);
+        let posts = peer.posts();
+        let mutated: Value = serde_json::from_str(&posts[1].3).expect("the mutated body is json");
+        assert!(
+            mutated["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a mutated prefix replays no block: {mutated}"
+        );
+        assert_eq!(
+            mutated["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            json!("drop_block")
+        );
+        assert!(
+            posts[1]
+                .2
+                .to_ascii_lowercase()
+                .contains("anthropic-beta: thinking-binding-controls-2026-08-01"),
+            "{}",
+            posts[1].2
+        );
+        drop_blocking(provider);
+
+        // The one-strip retry: the refused replayed leg strips its thinking
+        // block exactly once, the retry count settles, and the cleared
+        // lineage never replays or retries again.
+        let captures = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/v1/messages") => {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Reply::sse(thinking_messages_stream("captured", "plan", "sig-fixture"))
+                } else {
+                    Reply {
+                        status: 400,
+                        body: "Invalid signature: thinking block bound to a different conversation"
+                            .to_string(),
+                        chunk: 4096,
+                    }
+                }
+            }
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_MESSAGES_MODEL);
+        let store = zai_store(ZAI_PROFILE);
+        let provider = ZaiProvider::new(&config, "zai", store).expect("the adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let manifests: Vec<RequestManifest> = ["goal: one", "goal: two", "goal: three"]
+            .iter()
+            .map(|prompt| {
+                control
+                    .prepare("main", &config, "/world/zai-retry", prompt)
+                    .expect("the zai pin prepares")
+            })
+            .collect();
+        let (provider, outcomes) = std::thread::spawn(move || {
+            let mut provider = provider;
+            let mut outcomes = Vec::with_capacity(manifests.len());
+            for manifest in &manifests {
+                outcomes.push(provider.send(manifest));
+            }
+            (provider, outcomes)
+        })
+        .join()
+        .expect("the send thread joins");
+        assert_eq!(outcomes[0].as_ref().expect("capture").text, "captured");
+        match &outcomes[1] {
+            Err(ProviderError::Retried {
+                wire_retries,
+                source,
+            }) => {
+                assert_eq!(*wire_retries, 1, "the corrected retry is counted");
+                assert!(matches!(
+                    source.as_ref(),
+                    ProviderError::Transport {
+                        cause: TransportCause::Status { .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("the permanent signature error keeps its class: {other:?}"),
+        }
+        assert!(
+            matches!(
+                &outcomes[2],
+                Err(ProviderError::Transport {
+                    cause: TransportCause::Status { .. },
+                    ..
+                })
+            ),
+            "the cleared lineage denies without a retry: {:?}",
+            outcomes[2]
+        );
+        drop_blocking(provider);
+
+        let posts = peer.posts();
+        assert_eq!(
+            posts.len(),
+            4,
+            "capture, replay, exactly one stripped retry, then one clean attempt"
+        );
+        let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        assert_eq!(replay["messages"][0]["role"], json!("assistant"));
+        let retry: Value = serde_json::from_str(&posts[2].3).expect("the retry body is json");
+        assert!(
+            retry["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "the retry strips the replayed thinking blocks"
+        );
+        assert!(retry["thinking"].is_null());
+        let next: Value = serde_json::from_str(&posts[3].3).expect("the next body is json");
+        assert!(
+            next["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "the cleared lineage is never replayed by a later same-epoch send"
+        );
+    }
+
+    /// The Chat leg carries the recorded `reasoning_content` through the
+    /// stream and replays it as-is in the next turn of the same epoch; a
+    /// prefix mutation replays nothing even though the prior turn carried
+    /// reasoning.
+    #[test]
+    fn zai_chat_reasoning_replays_as_is_in_an_unchanged_epoch() {
+        let captures = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&captures);
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/chat/completions") => {
+                let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                Reply::sse(reasoning_chat_stream(
+                    &format!("answer-{turn}"),
+                    &format!("think-{turn}"),
+                ))
+            }
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_CHAT_MODEL);
+        let (provider, outcomes) = send_turns_with_mutation(
+            &config,
+            "/world/zai-chat",
+            &["goal: one", "goal: two", "goal: mutated"],
+        );
+        assert_eq!(outcomes[0].as_ref().expect("capture turn").text, "answer-1");
+        assert_eq!(outcomes[1].as_ref().expect("replay turn").text, "answer-2");
+        assert_eq!(outcomes[2].as_ref().expect("mutated turn").text, "answer-3");
+
+        let posts = peer.posts();
+        assert_eq!(posts.len(), 3, "one inference leg per turn");
+        let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
+        let messages = replay["messages"].as_array().expect("messages is an array");
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == json!("assistant"))
+            .expect("the replay carries the prior assistant turn");
+        assert_eq!(
+            assistant,
+            &json!({
+                "role": "assistant",
+                "content": "answer-1",
+                "reasoning_content": "think-1",
+            }),
+            "the recorded reasoning member returns as-is in the next turn: {replay}"
+        );
+        assert_eq!(
+            messages.last(),
+            Some(&json!({"role": "user", "content": "goal: two"}))
+        );
+        let mutated: Value = serde_json::from_str(&posts[2].3).expect("the mutated body is json");
+        assert!(
+            mutated["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a mutated prefix replays nothing even with a reasoning lineage: {mutated}"
+        );
+        drop_blocking(provider);
+    }
+}
