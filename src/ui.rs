@@ -6602,17 +6602,20 @@ mod card_pty {
                     .map_err(|error| error.to_string())
             }
             "publish" => {
-                let revision: u64 = words
-                    .next()
-                    .ok_or("publish needs an intent revision")?
-                    .parse()
-                    .map_err(|error: std::num::ParseIntError| error.to_string())?;
                 let session = SessionId(
                     words
                         .next()
                         .ok_or("publish needs a session id")?
                         .to_string(),
                 );
+                // The fixture fork rides the task's live intent: the steer
+                // that retires the create's start fork also moves it.
+                let revision = dispatch
+                    .runtime
+                    .store()
+                    .snapshot(task)
+                    .map_err(|error| error.to_string())?
+                    .intent_revision;
                 let question = Question::fixture(task, revision);
                 dispatch
                     .runtime
@@ -6980,11 +6983,8 @@ fallback = { mode = \"off\" }\n";
             Ok(())
         }
 
-        fn publish(&mut self, intent_revision: u64) -> Question {
-            let reply = must(
-                self.command(&format!("publish {intent_revision} decision-pty")),
-                "the fork publishes",
-            );
+        fn publish(&mut self) -> Question {
+            let reply = must(self.command("publish decision-pty"), "the fork publishes");
             must(
                 serde_json::from_value(reply),
                 "the publish reply is the question",
@@ -7124,6 +7124,49 @@ fallback = { mode = \"off\" }\n";
         screen: String,
     }
 
+    /// Submits `goal` through the composer and retires the task-start fork
+    /// the create publishes (TD-11), so the leg's own fixture question is the
+    /// task's next pending one. The start card's post-drain barrier is
+    /// consumed here, before the fixture opens: otherwise the leg would read
+    /// the start card's barrier as its own. The steer supersedes the start
+    /// fork without journaling an answer, leaving every answer-journal
+    /// assertion about the legs' own forks.
+    fn submit_task(driver: &mut CardDriver, rows: u16, cols: u16, goal: &str) {
+        press(&mut driver.pty, format!("{goal}\r").as_bytes());
+        let start = screen(
+            &driver.pty,
+            rows as usize,
+            cols as usize,
+            "focus 1/2",
+            secs(10),
+        );
+        assert!(
+            start.contains("focus 1/2"),
+            "the create's start fork opens its card: {start}"
+        );
+        assert!(
+            await_paint_barrier(driver, secs(10)),
+            "the start card reports its post-drain barrier"
+        );
+        must(driver.command("steer"), "the start fork is superseded");
+        // The card clears on the loop's next poll; until then its overlay
+        // covers the receipt the legs read.
+        let closed = must(
+            wait_for_frame(
+                &mut driver.pty,
+                rows as usize,
+                cols as usize,
+                secs(10),
+                |flat| flat.contains(DECISION_MOVED_NOTE) && !flat.contains("focus 1/2"),
+            ),
+            "pty screen",
+        );
+        assert!(
+            closed.contains(DECISION_MOVED_NOTE),
+            "the start card closes once its fork moves: {closed}"
+        );
+    }
+
     /// Spawns the TUI at `(rows, cols)`, submits one task, publishes the
     /// fixture fork through the child's own runtime, and returns once the
     /// card is on screen. The screen reconstruction is ASCII-only —
@@ -7134,7 +7177,7 @@ fallback = { mode = \"off\" }\n";
             seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
             "alternate screen must be entered on start"
         );
-        press(&mut driver.pty, b"pick a rollout lane\r");
+        submit_task(&mut driver, rows, cols, "pick a rollout lane");
         let visible = screen(
             &driver.pty,
             rows as usize,
@@ -7146,7 +7189,7 @@ fallback = { mode = \"off\" }\n";
             visible.contains("Submitted task:"),
             "the task receipt renders: {visible}"
         );
-        let question = driver.publish(1);
+        let question = driver.publish();
         // `focus 1/6` sits in the pinned footer — the LAST text a card
         // frame emits. Waiting on it proves the whole frame landed.
         let screen_text = screen(
@@ -7384,7 +7427,12 @@ fallback = { mode = \"off\" }\n";
             "alternate screen must be entered on start"
         );
 
-        press(&mut driver.pty, b"pick a rollout lane\r");
+        submit_task(
+            &mut driver,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "pick a rollout lane",
+        );
         let visible = screen(
             &driver.pty,
             DECISION_PTY_ROWS,
@@ -7402,7 +7450,7 @@ fallback = { mode = \"off\" }\n";
 
         // The material fork arrives through the child's own runtime; the
         // card picks it up on its next poll.
-        let question = driver.publish(1);
+        let question = driver.publish();
         assert_eq!(question.task_id.0, task_id, "the fork pins the dock's task");
 
         // The footer needle waits out the whole frame: `decision` paints in
@@ -7719,7 +7767,12 @@ fallback = { mode = \"off\" }\n";
             seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
             "alternate screen"
         );
-        press(&mut driver.pty, b"lane pick\r");
+        submit_task(
+            &mut driver,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "lane pick",
+        );
         let visible = screen(
             &driver.pty,
             DECISION_PTY_ROWS,
@@ -7733,7 +7786,7 @@ fallback = { mode = \"off\" }\n";
         );
         let task_id = dock_task_id(&visible);
 
-        let question = driver.publish(1);
+        let question = driver.publish();
         assert_eq!(question.task_id.0, task_id, "the fork pins the dock's task");
         let visible = screen(
             &driver.pty,
@@ -8801,7 +8854,12 @@ fallback = { mode = \"off\" }\n";
             "alternate screen must be entered on start"
         );
         // Patience only: the property is ordering (pre-paint input never commits), not the latency bound; a loaded suite may delay the paint.
-        press(&mut driver.pty, b"pick a rollout lane\r");
+        submit_task(
+            &mut driver,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "pick a rollout lane",
+        );
         let visible = screen(
             &driver.pty,
             DECISION_PTY_ROWS,
@@ -8822,7 +8880,7 @@ fallback = { mode = \"off\" }\n";
         // had not seen, a blind Enter would commit an unseen question.
         must(driver.command("hold"), "the child holds its pass");
         press(&mut driver.pty, b"\r\r\x1b[B\r");
-        let question = driver.publish(1);
+        let question = driver.publish();
 
         let screen_text = screen(
             &driver.pty,
@@ -8981,7 +9039,11 @@ fallback = { mode = \"off\" }\n";
         // question's id on screen proves the stale card closed for real —
         // the view carries one card, so a painted second card means the
         // first one let go.
-        let replacement = driver.publish(intent_revision);
+        let replacement = driver.publish();
+        assert_eq!(
+            replacement.intent_revision, intent_revision,
+            "the replacement fork publishes on the steered intent"
+        );
         let reopened = screen(
             &driver.pty,
             24,
@@ -8999,18 +9061,21 @@ fallback = { mode = \"off\" }\n";
         // keeping live controls that could only journal a denial.
         must(driver.command("answer"), "the wire answer lands");
         // With no card covering it, the transcript shows the close note
-        // twice — once per moved fork.
+        // once per moved fork: the create's start fork was retired before
+        // the fixture, and each of this leg's two forks moves once here.
+        // Three can only be reached after the answered fork closed — only
+        // two notes exist while its card is still open.
         let deadline = Instant::now() + secs(10);
         let mut visible = String::new();
         while Instant::now() < deadline {
             visible = reconstruct_screen(&stream(&driver.pty), 24, 80);
-            if visible.matches(DECISION_MOVED_NOTE).count() >= 2 {
+            if visible.matches(DECISION_MOVED_NOTE).count() >= 3 {
                 break;
             }
             pause(&mut driver.pty, Duration::from_millis(25));
         }
         assert!(
-            visible.matches(DECISION_MOVED_NOTE).count() >= 2,
+            visible.matches(DECISION_MOVED_NOTE).count() >= 3,
             "each moved fork closes its card with the move named: {visible}"
         );
 
@@ -9097,7 +9162,11 @@ fallback = { mode = \"off\" }\n";
             driver.command("resolve"),
             "the answer settles the dismissed fork",
         );
-        let replacement = driver.publish(dismissed.intent_revision);
+        let replacement = driver.publish();
+        assert_eq!(
+            replacement.intent_revision, dismissed.intent_revision,
+            "the replacement fork publishes on the live intent"
+        );
         let reopened = must(
             wait_for_reopened_card(
                 &mut driver.pty,
@@ -9146,7 +9215,12 @@ fallback = { mode = \"off\" }\n";
             seen(&mut driver.pty, b"\x1b[?1049h", secs(10)),
             "alternate screen must be entered on start"
         );
-        press(&mut driver.pty, format!("{goal}\r").as_bytes());
+        submit_task(
+            &mut driver,
+            DOCK_PTY_ROWS as u16,
+            DOCK_PTY_COLS as u16,
+            goal,
+        );
         let visible = screen(
             &driver.pty,
             DOCK_PTY_ROWS,
@@ -9915,7 +9989,12 @@ fallback = { mode = \"off\" }\n";
         // page's last row, opened and filled by the child — is one this view
         // never submitted and still nearly full, so a projection that measured
         // the last row would warn about that one instead.
-        press(&mut driver.pty, b"ledger\r");
+        submit_task(
+            &mut driver,
+            DOCK_PTY_ROWS as u16,
+            WIDE_PTY_COLS as u16,
+            "ledger",
+        );
         let receipt = screen(
             &driver.pty,
             DOCK_PTY_ROWS,

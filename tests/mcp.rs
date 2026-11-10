@@ -2603,7 +2603,12 @@ fn hostile_returned_content_grants_no_effects_ac079() {
         .chain(std::iter::once(("Cargo.toml".to_string(), manifest)))
         .collect::<Vec<_>>();
     for (label, source) in &scanned {
-        if !label.ends_with("Cargo.toml") {
+        // The `--ui-review` entry renders the awaiting-permission fixture
+        // through the production renderer without a store or a routed approval
+        // key; `installed_ui_review_keys_stay_passive_and_ctrl_c_restores`
+        // pins that passivity. Every other production file keeps the ban.
+        let review_fixture = Path::new(label).ends_with("src/ui/review.rs");
+        if !label.ends_with("Cargo.toml") && !review_fixture {
             for (line_no, line) in source.lines().enumerate() {
                 assert!(
                     !line.contains("PermissionPanel::new("),
