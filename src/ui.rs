@@ -17,6 +17,8 @@ use crate::policy::{
 #[cfg(test)]
 use crate::providers::LoopbackProvider;
 
+pub mod review;
+
 /// The TUI's one runtime is opened through the same configured factory the
 /// headless entry uses (TD-01). Production binds the provider set the
 /// admitted config describes; the test twin below is the seam the card
@@ -92,20 +94,21 @@ use crate::resources::{OutputStatus, OutputStream, sanitize_status_cause};
 use crate::state::StoreWriter;
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, poll, read,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::CellWidth as _;
 use ratatui::layout::Constraint;
 use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget as _;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -113,6 +116,7 @@ use std::fmt;
 use std::io::{self, Stdout, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 fn report_cleanup_error(error: &io::Error) {
@@ -123,65 +127,124 @@ fn report_cleanup_error(error: &io::Error) {
     }
 }
 
-/// Terminal lifecycle guard. Mouse capture is deliberately never enabled
-/// (D-005 default off so copy-on-select and tmux copy-mode keep working).
+/// Which surface the TUI owns: the alternate screen, or the terminal's own
+/// scrollback with a pinned bottom region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    #[default]
+    Fullscreen,
+    Inline,
+}
+
+impl RenderMode {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::Inline => "inline",
+        }
+    }
+}
+
+/// Rows the inline surface pins below the scrollback: status, the status
+/// band, the output status line, the dock's three task rows, the economy
+/// row and the composer.
+const INLINE_VIEWPORT_ROWS: u16 = 9;
+
+const SCREEN_NONE: u8 = 0;
+const SCREEN_FULLSCREEN: u8 = 1;
+/// The surface the panic hook must undo. The hook cannot borrow the guard,
+/// so the guard publishes the active surface here and the hook restores
+/// exactly that one.
+static ACTIVE_SCREEN: AtomicU8 = AtomicU8::new(SCREEN_NONE);
+static MOUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Restores the process-owned terminal state after a panic or a surface
+/// switch: the alternate screen only when this process entered it, mouse
+/// capture only when this process enabled it, then paste, cursor and raw
+/// mode. Errors are reported on the best-effort cleanup channel.
+fn restore_process_terminal() {
+    let screen = ACTIVE_SCREEN.swap(SCREEN_NONE, Ordering::SeqCst);
+    let mouse = MOUSE_ACTIVE.swap(false, Ordering::SeqCst);
+    let mut out = io::stdout();
+    if screen == SCREEN_FULLSCREEN
+        && let Err(error) = execute!(out, LeaveAlternateScreen)
+    {
+        report_cleanup_error(&error);
+    }
+    if mouse && let Err(error) = execute!(out, DisableMouseCapture) {
+        report_cleanup_error(&error);
+    }
+    if let Err(error) = execute!(out, DisableBracketedPaste, Show) {
+        report_cleanup_error(&error);
+    }
+    if let Err(error) = disable_raw_mode() {
+        report_cleanup_error(&error);
+    }
+}
+
+/// Terminal lifecycle guard. Mouse capture is off by default (D-005: copy-
+/// on-select and tmux copy-mode keep working) and the guard restores the
+/// active surface on every exit path, including a panic.
 pub struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     previous_hook: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>,
+    mode: RenderMode,
+    mouse: bool,
     restored: bool,
 }
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
+        Self::enter_mode(RenderMode::Fullscreen)
+    }
+
+    pub fn enter_mode(mode: RenderMode) -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
-            // execute! applies the sequence left to right: the screen
-            // may already be entered when the paste enable fails —
-            // undo whichever prefixes landed, then drop raw mode.
-            let mut out = io::stdout();
-            if let Err(cleanup_error) =
-                execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show)
-            {
-                report_cleanup_error(&cleanup_error);
+        let prepared = match mode {
+            RenderMode::Fullscreen => {
+                if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
+                    if let Err(cleanup_error) = disable_raw_mode() {
+                        report_cleanup_error(&cleanup_error);
+                    }
+                    return Err(error);
+                }
+                ACTIVE_SCREEN.store(SCREEN_FULLSCREEN, Ordering::SeqCst);
+                Terminal::new(CrosstermBackend::new(io::stdout()))
             }
-            if let Err(cleanup_error) = disable_raw_mode() {
-                report_cleanup_error(&cleanup_error);
-            }
-            return Err(error);
-        }
-        let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+            RenderMode::Inline => Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_ROWS),
+                },
+            ),
+        };
+        let terminal = match prepared {
             Ok(terminal) => terminal,
             Err(error) => {
-                let mut out = io::stdout();
-                if let Err(cleanup_error) =
-                    execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show)
-                {
-                    report_cleanup_error(&cleanup_error);
-                }
-                if let Err(cleanup_error) = disable_raw_mode() {
-                    report_cleanup_error(&cleanup_error);
-                }
+                restore_process_terminal();
                 return Err(error);
             }
         };
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            drop(terminal);
+            restore_process_terminal();
+            return Err(error);
+        }
         let original: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> =
             Arc::new(std::panic::take_hook());
         let chained = original.clone();
         // The hook cannot borrow the terminal, so it restores the shared tty
         // state directly; the guard's own restore stays idempotent.
         std::panic::set_hook(Box::new(move |info| {
-            let mut out = io::stdout();
-            if let Err(error) = execute!(out, DisableBracketedPaste, LeaveAlternateScreen, Show) {
-                report_cleanup_error(&error);
-            }
-            if let Err(error) = disable_raw_mode() {
-                report_cleanup_error(&error);
-            }
+            restore_process_terminal();
             chained(info);
         }));
         Ok(Self {
             terminal,
             previous_hook: original,
+            mode,
+            mouse: false,
             restored: false,
         })
     }
@@ -190,33 +253,137 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
+    #[must_use]
+    pub fn mode(&self) -> RenderMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn mouse(&self) -> bool {
+        self.mouse
+    }
+
+    /// Switches the surface by restoring the current one completely, then
+    /// entering the other; the caller repaints the whole view afterwards.
+    pub fn switch_mode(&mut self, mode: RenderMode) -> io::Result<()> {
+        if self.mode == mode {
+            return Ok(());
+        }
+        let clear = self.terminal.clear();
+        let mut primary = match clear {
+            Ok(()) => None,
+            Err(error) => {
+                report_cleanup_error(&error);
+                Some(error)
+            }
+        };
+        if self.mode == RenderMode::Fullscreen {
+            let leave = execute!(io::stdout(), LeaveAlternateScreen);
+            ACTIVE_SCREEN.store(SCREEN_NONE, Ordering::SeqCst);
+            if let Err(error) = leave {
+                if primary.is_none() {
+                    primary = Some(error);
+                } else {
+                    report_cleanup_error(&error);
+                }
+            }
+        }
+        let entered = match mode {
+            RenderMode::Fullscreen => execute!(io::stdout(), EnterAlternateScreen)
+                .map(|()| {
+                    ACTIVE_SCREEN.store(SCREEN_FULLSCREEN, Ordering::SeqCst);
+                })
+                .and_then(|()| {
+                    Terminal::new(CrosstermBackend::new(io::stdout())).map_err(io::Error::other)
+                }),
+            RenderMode::Inline => Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(INLINE_VIEWPORT_ROWS),
+                },
+            )
+            .map_err(io::Error::other),
+        };
+        match entered {
+            Ok(terminal) => {
+                self.terminal = terminal;
+                self.mode = mode;
+            }
+            Err(error) => {
+                restore_process_terminal();
+                if primary.is_none() {
+                    primary = Some(error);
+                } else {
+                    report_cleanup_error(&error);
+                }
+            }
+        }
+        primary.map_or(Ok(()), Err)
+    }
+
+    /// Enables or disables mouse capture; the pair is restored on every exit
+    /// path, and the default stays off.
+    pub fn set_mouse(&mut self, on: bool) -> io::Result<()> {
+        if self.mouse == on {
+            return Ok(());
+        }
+        if on {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)?;
+        }
+        self.mouse = on;
+        MOUSE_ACTIVE.store(on, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn restore_terminal(&mut self) -> io::Result<()> {
         if self.restored {
             return Ok(());
         }
-        let clear_succeeded = match self.terminal.clear() {
-            Ok(()) => true,
-            Err(error) => {
-                report_cleanup_error(&error);
-                false
+        // The fullscreen surface is erased before leaving the alternate
+        // screen; the inline surface keeps its final frame on the main screen
+        // so the transcript above the pinned region stays readable after the
+        // loop returns.
+        let clear_succeeded = if self.mode == RenderMode::Fullscreen {
+            match self.terminal.clear() {
+                Ok(()) => true,
+                Err(error) => {
+                    report_cleanup_error(&error);
+                    false
+                }
             }
+        } else {
+            true
         };
-        let screen = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            Show
-        );
+        let screen = if self.mode == RenderMode::Fullscreen {
+            let result = execute!(io::stdout(), LeaveAlternateScreen);
+            ACTIVE_SCREEN.store(SCREEN_NONE, Ordering::SeqCst);
+            result
+        } else {
+            Ok(())
+        };
+        let mouse = if self.mouse {
+            let result = execute!(io::stdout(), DisableMouseCapture);
+            self.mouse = false;
+            MOUSE_ACTIVE.store(false, Ordering::SeqCst);
+            result
+        } else {
+            Ok(())
+        };
+        let paste = execute!(io::stdout(), DisableBracketedPaste, Show);
         let raw_mode = disable_raw_mode();
-        let result = match (screen, raw_mode) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(screen_error), Ok(())) => Err(screen_error),
-            (Ok(()), Err(raw_mode_error)) => Err(raw_mode_error),
-            (Err(screen_error), Err(raw_mode_error)) => {
-                report_cleanup_error(&raw_mode_error);
-                Err(screen_error)
+        let mut primary = None;
+        for result in [screen, mouse, paste, raw_mode] {
+            if let Err(error) = result {
+                if primary.is_none() {
+                    primary = Some(error);
+                } else {
+                    report_cleanup_error(&error);
+                }
             }
-        };
+        }
+        let result = primary.map_or(Ok(()), Err);
         if result.is_ok() && clear_succeeded {
             if !std::thread::panicking() {
                 let original = std::mem::replace(&mut self.previous_hook, Arc::new(|_| {}));
@@ -850,6 +1017,9 @@ pub const HELP_TEXT: &str = concat!(
     "/help lists; /new (alias /clear) starts a conversation.\n",
     "/settings (alias /config) shows the served settings.\n",
     "/compact folds context.\n",
+    "/tui: fullscreen|inline|mouse on|off.\n",
+    "/resume [session]: attach; /rewind previews a checkpoint.\n",
+    "/permissions: modes, boundaries and grant.\n",
     "/login: URL, \"device\", \"complete\", \"cancel\".",
 );
 
@@ -992,9 +1162,8 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         }
         frame.render_widget(
             Paragraph::new(
-                view.dock
+                dock_window(&view.dock)
                     .iter()
-                    .take(view.dock.len().saturating_sub(1))
                     .map(|line| sanitize_status_cause(line))
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -1106,6 +1275,100 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         card.note_first_paint(inner);
     }
     Ok(())
+}
+
+/// Paints the inline surface: new transcript rows are inserted above the
+/// pinned region so they land in the terminal's own scrollback, then the
+/// pinned status/dock/composer region is drawn at the cursor row. The
+/// `flushed` counter is the number of transcript rows already inserted.
+fn render_inline(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    view: &LocalView,
+    flushed: &mut usize,
+) -> io::Result<()> {
+    let width = terminal.size()?.width.max(1);
+    let flushed_from = (*flushed).min(view.transcript.len());
+    let pending = view.transcript.get(flushed_from..).unwrap_or_default();
+    if !pending.is_empty() {
+        let text = sanitize_status_cause(&pending.join("\n"));
+        let rows = wrapped_row_count(&text, width);
+        terminal.insert_before(u16::try_from(rows).unwrap_or(u16::MAX), |buf| {
+            Paragraph::new(text.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .render(buf.area, buf);
+        })?;
+        *flushed = view.transcript.len();
+    }
+    terminal.draw(|frame| render_pinned(frame, view))?;
+    Ok(())
+}
+
+/// The inline surface's pinned bottom region: status, status band, output
+/// status, the dock's task rows, the economy row and the composer.
+fn render_pinned(frame: &mut ratatui::Frame<'_>, view: &LocalView) {
+    let area = frame.area();
+    let chunks = ratatui::layout::Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(sanitize_status_cause(&view.status)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(status_band(view, usize::from(area.width)))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        chunks[1],
+    );
+    if view.output.is_active() {
+        frame.render_widget(
+            Paragraph::new(output_status_line(
+                &view.output,
+                view.panel.is_some() || view.decision.is_some(),
+            )),
+            chunks[2],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(
+            dock_window(&view.dock)
+                .iter()
+                .map(|line| sanitize_status_cause(line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        chunks[3],
+    );
+    if let Some(economy) = view.dock.last() {
+        let text = fit_economy_row(&sanitize_status_cause(economy), area.width, 3);
+        frame.render_widget(
+            Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[4],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(format!("> {}", sanitize_status_cause(&view.composer))),
+        chunks[5],
+    );
+}
+
+/// Paints whichever surface is active; the caller owns the transcript flush
+/// counter for the inline surface.
+fn paint(
+    guard: &mut TerminalGuard,
+    view: &LocalView,
+    mode: RenderMode,
+    flushed: &mut usize,
+) -> io::Result<()> {
+    match mode {
+        RenderMode::Fullscreen => render(guard.terminal_mut(), view),
+        RenderMode::Inline => render_inline(guard.terminal_mut(), view, flushed),
+    }
 }
 
 /// One status line for the streaming output region: the fixed scroll
@@ -1547,6 +1810,16 @@ impl TuiDispatch {
                 boot_diagnostics,
             }
         })?;
+        // The shipped TUI binds the same process-cwd scope the headless entry
+        // does (TD-13): instruction discovery, the declared read grant and the
+        // resolved first-task target all follow the directory the operator
+        // started in.
+        runtime.set_instructions_root(std::env::current_dir().ok());
+        if let Ok(cwd) = std::env::current_dir() {
+            runtime.set_instructions_root(Some(cwd.clone()));
+            runtime.bind_read_scope(cwd.clone());
+            runtime.bind_first_task_scope(cwd);
+        }
         let result = match dispatch_tui_request(
             &mut runtime,
             json!({
@@ -1608,6 +1881,7 @@ impl TuiDispatch {
                     "kind": "create",
                     "goal": goal,
                     "contract": { "criteria": [], "constraints": [] },
+                    "first_question": true,
                 }
             }),
         )?;
@@ -1689,6 +1963,185 @@ impl TuiDispatch {
             .ok_or_else(|| io::Error::other("tui session.new omitted session_id"))?;
         self.session_id = session_id.to_string();
         Ok(previous)
+    }
+
+    /// `session.attach` or `session.list`: the operator's own conversation
+    /// switch. Attaching reads each todo row's pending question so the loop's
+    /// card poll can open it on the next pass; it never answers it.
+    fn resume(&mut self, session: Option<&str>) -> io::Result<(Vec<String>, Option<TaskId>)> {
+        let Some(session) = session else {
+            let result = dispatch_tui_request(
+                &mut self.runtime,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "command.execute",
+                    "params": {
+                        "schema_version": 1,
+                        "session_id": self.session_id,
+                        "command": { "kind": "session.list" },
+                    }
+                }),
+            )?;
+            let items = result
+                .get("sessions")
+                .and_then(|sessions| sessions.get("items"))
+                .and_then(Value::as_array)
+                .ok_or_else(|| io::Error::other("tui session.list omitted sessions"))?;
+            let mut lines = Vec::with_capacity(items.len() + 1);
+            lines.push("Sessions:".to_string());
+            for item in items {
+                let id = item
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let created = item
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                lines.push(format!("{id} ({created})"));
+            }
+            return Ok((lines, None));
+        };
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "session.attach",
+                "params": {
+                    "schema_version": 1,
+                    "bootstrap_id": format!("tui-{}", CommandId::generate()),
+                    "session_id": session,
+                }
+            }),
+        )?;
+        let session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("tui session.attach omitted session_id"))?;
+        self.session_id = session_id.to_string();
+        let status = self.status()?;
+        let mut pending = None;
+        if let Some(items) = status
+            .get("todo")
+            .and_then(|todo| todo.get("items"))
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                let Some(task) = item.get("task_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let task = TaskId(task.to_string());
+                if self
+                    .runtime
+                    .owner
+                    .store
+                    .current_question(&task)
+                    .map_err(|source| io::Error::other(source.to_string()))?
+                    .is_some()
+                {
+                    pending = Some(task);
+                    break;
+                }
+            }
+        }
+        let mut lines = vec![format!("Resumed session: {session_id}")];
+        if let Some(task) = &pending {
+            lines.push(format!("Pending decision for task: {}", task.0));
+        }
+        Ok((lines, pending))
+    }
+
+    /// `checkpoint.preview`: read-only coverage of the fold a rewind would
+    /// replace. The apply path is a separate typed command, so previewing
+    /// never rolls anything back.
+    fn rewind_preview(&mut self, task: &TaskId) -> io::Result<Vec<String>> {
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "command": { "kind": "checkpoint.preview", "task_id": task.0 },
+                }
+            }),
+        )?;
+        let bytes = result
+            .get("assembled_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let checkpoint = result.get("checkpoint").cloned().unwrap_or(Value::Null);
+        let mut lines = vec![format!(
+            "Rewind preview: task {}, {} assembled bytes; no rollback applied",
+            task.0, bytes
+        )];
+        if checkpoint.is_null() {
+            lines.push("Checkpoint: none recorded".to_string());
+        } else {
+            let id = checkpoint
+                .get("checkpoint_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let folded = checkpoint
+                .get("folded_records")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            lines.push(format!(
+                "Checkpoint: {id} folded {folded} records; apply is a separate action"
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// `permissions.view`: the read-only mode, boundary and grant projection.
+    fn permissions(&mut self) -> io::Result<Vec<String>> {
+        let result = dispatch_tui_request(
+            &mut self.runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "command.execute",
+                "params": {
+                    "schema_version": 1,
+                    "session_id": self.session_id,
+                    "command": { "kind": "permissions.view" },
+                }
+            }),
+        )?;
+        let decisions = result
+            .get("decisions")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut lines = vec![format!("Permissions: decisions {decisions}")];
+        if let Some(boundaries) = result.get("boundaries").and_then(Value::as_array) {
+            for boundary in boundaries {
+                let name = boundary
+                    .get("boundary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mode = boundary
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                lines.push(format!("{name}: {mode}"));
+            }
+        }
+        if let Some(grant) = result.get("grant").filter(|grant| !grant.is_null()) {
+            let id = grant
+                .get("grant_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scope = grant
+                .get("scope_root")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("grant: {id} at {scope}"));
+        }
+        Ok(lines)
     }
 
     /// The dock's projection for one pass: the rows `runtime.status` carries
@@ -1836,6 +2289,26 @@ impl TuiDispatch {
             }),
         )
     }
+}
+
+/// The dock's painted task window: three rows at most. Beyond three tasks
+/// the window keeps the first two and spends the last row on the hidden
+/// count plus the newest task's row, so a narrow frame still names the
+/// work it cannot fit. The economy row is not part of this window.
+fn dock_window(dock: &[String]) -> Vec<String> {
+    let tasks = dock.len().saturating_sub(1);
+    if tasks <= 3 {
+        return dock.iter().take(tasks).cloned().collect();
+    }
+    let last = dock
+        .get(tasks.saturating_sub(1))
+        .cloned()
+        .unwrap_or_default();
+    vec![
+        dock.first().cloned().unwrap_or_default(),
+        dock.get(1).cloned().unwrap_or_default(),
+        format!("+{} more · {last}", tasks.saturating_sub(2)),
+    ]
 }
 
 /// The dock rows a `runtime.status` result renders: one line per todo
@@ -2115,6 +2588,16 @@ pub fn handle_panel_key(
             let backward = matches!(code, KeyCode::Left | KeyCode::BackTab | KeyCode::Up);
             if let Some(panel) = view.panel.as_mut() {
                 panel.shift_focus(backward);
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Char('k') if modifiers.is_empty() => {
+            if let Some(panel) = view.panel.as_mut() {
+                panel.shift_focus(true);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Char('j') if modifiers.is_empty() => {
+            if let Some(panel) = view.panel.as_mut() {
+                panel.shift_focus(false);
             }
         }
         KeyCode::PageUp | KeyCode::PageDown => {
@@ -2398,12 +2881,36 @@ fn paint_answer(view: &mut LocalView, result: AnswerResult) {
 fn decision_navigation(card: &mut DecisionPanel, event: &TermEvent) -> bool {
     let TermEvent::Key(KeyEvent {
         code,
+        modifiers,
         kind: KeyEventKind::Press,
         ..
     }) = event
     else {
         return false;
     };
+    // Vim keys are navigation only outside the custom draft, where they are
+    // text like every other printable key.
+    if !card.custom_editing() && modifiers.is_empty() {
+        match code {
+            KeyCode::Char('j') => {
+                card.shift_focus(false);
+                return true;
+            }
+            KeyCode::Char('k') => {
+                card.shift_focus(true);
+                return true;
+            }
+            KeyCode::Char('h') => {
+                card.shift_focus(true);
+                return true;
+            }
+            KeyCode::Char('l') => {
+                card.shift_focus(false);
+                return true;
+            }
+            _ => {}
+        }
+    }
     match code {
         KeyCode::Left
         | KeyCode::BackTab
@@ -2798,6 +3305,15 @@ pub fn run_tui(data_root: &Path) -> io::Result<i32> {
     drive_tui(data_root, |_, _| Ok(()))
 }
 
+/// Runs the loop on the requested surface: fullscreen by default, inline when
+/// the entry names it. The guard restores whichever surface is active.
+///
+/// # Errors
+/// See [`run_tui`].
+pub fn run_tui_with_mode(data_root: &Path, mode: RenderMode) -> io::Result<i32> {
+    drive_tui_with_mode(data_root, mode, |_, _| Ok(()))
+}
+
 /// The loop behind [`run_tui`], settled: after the loop's guard and
 /// runtime dropped, [`settle_released`] delivers the release failures
 /// once. `between_passes` runs at the top of every pass while a dispatch
@@ -2807,12 +3323,83 @@ fn drive_tui<F>(data_root: &Path, between_passes: F) -> io::Result<i32>
 where
     F: FnMut(&mut TuiDispatch, Option<&TaskId>) -> io::Result<()>,
 {
-    settle_released(tui_loop(data_root, between_passes))
+    drive_tui_with_mode(data_root, RenderMode::Fullscreen, between_passes)
+}
+
+fn drive_tui_with_mode<F>(data_root: &Path, mode: RenderMode, between_passes: F) -> io::Result<i32>
+where
+    F: FnMut(&mut TuiDispatch, Option<&TaskId>) -> io::Result<()>,
+{
+    settle_released(tui_loop(data_root, mode, between_passes))
 }
 
 /// Painted for a leading-slash input the vocabulary does not serve: the
 /// operator gets the way back to the vocabulary, not a model call.
 const COMPOSER_USAGE: &str = "Unknown command. /help lists the available commands.";
+
+/// Painted for a `/tui` shape the surface command does not serve.
+const TUI_USAGE: &str = "tui: /tui [fullscreen|inline|mouse on|off]";
+
+/// Serves `/tui`: the surface and mouse capture are process-owned, so this
+/// command needs the guard rather than the dispatcher. The transcript and
+/// draft stay in `view` across a switch; the inline surface re-flushes the
+/// whole transcript into the terminal's own scrollback.
+fn run_tui_command(
+    input: &str,
+    guard: &mut TerminalGuard,
+    view: &mut LocalView,
+    render_mode: &mut RenderMode,
+    inline_flushed: &mut usize,
+) -> io::Result<bool> {
+    let mut words = input.split_whitespace();
+    if words.next() != Some("/tui") {
+        return Ok(false);
+    }
+    view.composer.clear();
+    let first = words.next();
+    let second = words.next();
+    if words.next().is_some() {
+        view.transcript.push(TUI_USAGE.to_string());
+        return Ok(true);
+    }
+    match (first, second) {
+        (None, None) => view.transcript.push(format!(
+            "tui: {}, mouse {}",
+            guard.mode().label(),
+            if guard.mouse() { "on" } else { "off" }
+        )),
+        (Some("fullscreen"), None) | (Some("inline"), None) => {
+            let mode = if first == Some("inline") {
+                RenderMode::Inline
+            } else {
+                RenderMode::Fullscreen
+            };
+            if guard.mode() == mode {
+                view.transcript
+                    .push(format!("tui: already {}", mode.label()));
+            } else {
+                guard.switch_mode(mode)?;
+                *render_mode = mode;
+                if mode == RenderMode::Inline {
+                    // The whole transcript moves to native scrollback: the
+                    // next inline paint inserts every row above the pinned
+                    // region instead of only the rows added since last time.
+                    *inline_flushed = 0;
+                }
+                view.transcript
+                    .push(format!("tui: switched to {}", mode.label()));
+            }
+        }
+        (Some("mouse"), Some("on")) | (Some("mouse"), Some("off")) => {
+            let on = second == Some("on");
+            guard.set_mouse(on)?;
+            view.transcript
+                .push(format!("tui: mouse {}", if on { "on" } else { "off" }));
+        }
+        _ => view.transcript.push(TUI_USAGE.to_string()),
+    }
+    Ok(true)
+}
 
 /// Painted when a `context.compact` is accepted: what the fold replaced and
 /// what it left, so the operator sees the context actually shrank.
@@ -2821,6 +3408,9 @@ const CONTEXT_COMPACTED: &str = "Context compacted";
 /// Painted when `/compact` runs with no conversation to fold: a plain line,
 /// never the wire's own field name.
 const NOTHING_TO_COMPACT: &str = "No conversation to compact yet; submit a task first.";
+
+/// Painted when `/rewind` runs with no task to preview.
+const NOTHING_TO_REWIND: &str = "No task to preview yet; submit a task first.";
 
 /// Drops what the operator was reading — transcript rows and streamed
 /// output — and keeps the session and the stored conversation: `/clear` is
@@ -2904,6 +3494,7 @@ fn run_composer_command(
     tui_dispatch: &mut Option<TuiDispatch>,
     data_root: &Path,
     pending_task: &mut Option<TaskId>,
+    inline_flushed: &mut usize,
 ) -> io::Result<()> {
     view.composer.clear();
     match input {
@@ -2919,6 +3510,7 @@ fn run_composer_command(
             match dispatch.new_session() {
                 Ok(previous) => {
                     reset_view_rows(view);
+                    *inline_flushed = 0;
                     // The card poll follows the conversation the operator
                     // is reading: a question the previous session left
                     // pending is not this conversation's to answer.
@@ -2973,6 +3565,59 @@ fn run_composer_command(
                     view.transcript.push(format!(
                         "{CONTEXT_COMPACTED}: {before} → {after} bytes, {folded} records folded."
                     ));
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        _ if input == "/resume" || input.starts_with("/resume ") => {
+            let argument = input
+                .strip_prefix("/resume ")
+                .map(str::trim)
+                .filter(|argument| !argument.is_empty());
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match dispatch.resume(argument) {
+                Ok((lines, pending)) => {
+                    *pending_task = pending;
+                    view.transcript.extend(lines);
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        "/rewind" => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            let task = match pending_task.clone() {
+                Some(task) => Some(task),
+                None => {
+                    let status = dispatch.status()?;
+                    status
+                        .get("todo")
+                        .and_then(|todo| todo.get("items"))
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("task_id"))
+                        .and_then(Value::as_str)
+                        .map(|id| TaskId(id.to_string()))
+                }
+            };
+            let Some(task) = task else {
+                view.transcript.push(NOTHING_TO_REWIND.to_string());
+                return Ok(());
+            };
+            match dispatch.rewind_preview(&task) {
+                Ok(lines) => {
+                    view.transcript.extend(lines);
+                    Ok(())
+                }
+                Err(error) => refusal_or_fault(view, input, error),
+            }
+        }
+        "/permissions" => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            match dispatch.permissions() {
+                Ok(lines) => {
+                    view.transcript.extend(lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -3054,7 +3699,7 @@ fn refresh_dock(
 
 /// The loop body: its terminal guard and runtime are dropped when it
 /// returns, on every path.
-fn tui_loop<F>(data_root: &Path, mut between_passes: F) -> io::Result<i32>
+fn tui_loop<F>(data_root: &Path, mode: RenderMode, mut between_passes: F) -> io::Result<i32>
 where
     F: FnMut(&mut TuiDispatch, Option<&TaskId>) -> io::Result<()>,
 {
@@ -3073,7 +3718,7 @@ where
             None
         }
     };
-    let mut guard = match TerminalGuard::enter() {
+    let mut guard = match TerminalGuard::enter_mode(mode) {
         Ok(guard) => guard,
         // The alternate screen never took the terminal, so stderr is
         // still the live channel here: a successfully opened runtime's
@@ -3087,6 +3732,9 @@ where
         }
     };
     let mut exit = 0;
+    let mut render_mode = mode;
+    // Transcript rows already inserted into the inline surface's scrollback.
+    let mut inline_flushed = 0usize;
     // The last submitted task — the one a material fork can still open a
     // decision card for while its question stays pending.
     let mut pending_task: Option<TaskId> = None;
@@ -3169,7 +3817,7 @@ where
                 card_opened = true;
             }
         }
-        if let Err(error) = render(guard.terminal_mut(), &view) {
+        if let Err(error) = paint(&mut guard, &view, render_mode, &mut inline_flushed) {
             // A paint failure leaves through the loop's error path, but the
             // in-flight window must still be joined and its runtime released
             // here, on the loop's thread.
@@ -3358,6 +4006,27 @@ where
                         exit = 130;
                         break;
                     }
+                    // The surface toggle outside the composer: a draft in
+                    // progress survives the switch because this key never
+                    // consumes it.
+                    (KeyCode::Char('t'), m)
+                        if m.contains(KeyModifiers::CONTROL)
+                            && view.panel.is_none()
+                            && view.decision.is_none() =>
+                    {
+                        let mode = if render_mode == RenderMode::Fullscreen {
+                            RenderMode::Inline
+                        } else {
+                            RenderMode::Fullscreen
+                        };
+                        guard.switch_mode(mode)?;
+                        render_mode = mode;
+                        if mode == RenderMode::Inline {
+                            inline_flushed = 0;
+                        }
+                        view.transcript
+                            .push(format!("tui: switched to {}", mode.label()));
+                    }
                     _ if view.panel.is_some() => {
                         // The modal owns the keys through the shared production
                         // handler; the limited-grant action records on the same
@@ -3390,13 +4059,22 @@ where
                     }
                     (KeyCode::Enter, _) if !view.composer.is_empty() => {
                         let input = view.composer.clone();
-                        run_composer_command(
+                        if !run_tui_command(
                             &input,
+                            &mut guard,
                             &mut view,
-                            &mut tui_dispatch,
-                            data_root,
-                            &mut pending_task,
-                        )?;
+                            &mut render_mode,
+                            &mut inline_flushed,
+                        )? {
+                            run_composer_command(
+                                &input,
+                                &mut view,
+                                &mut tui_dispatch,
+                                data_root,
+                                &mut pending_task,
+                                &mut inline_flushed,
+                            )?;
+                        }
                     }
                     (KeyCode::Enter, _) => {}
                     (KeyCode::Char(ch), m) if types_text(m) => append_composer_char(&mut view, ch),
@@ -3436,7 +4114,7 @@ where
                     // The completion is a state change of its own; paint it
                     // once before the cancel takes effect so the operator
                     // sees the settled state, not the stale in-flight line.
-                    render(guard.terminal_mut(), &view)?;
+                    paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
                     break;
                 }
             }
@@ -3453,7 +4131,7 @@ where
                 view.status = TUI_SEND_WINDOW_FAILED.to_string();
                 view.transcript.push(TUI_SEND_WINDOW_FAILED.to_string());
                 exit = 1;
-                render(guard.terminal_mut(), &view)?;
+                paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
                 break;
             }
             None => {}
@@ -3463,6 +4141,11 @@ where
     // runtime comes back and releases on this thread; the ledger already
     // settled it, so the wait changes no spend.
     close_window(&mut send_owner, &mut tui_dispatch);
+    if render_mode == RenderMode::Inline {
+        // Insert whatever the last state change left unflushed before the
+        // pinned region is cleared, so the transcript stays in scrollback.
+        paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
+    }
     guard.restore()?;
     Ok(exit)
 }
@@ -4862,8 +5545,16 @@ mod tests {
         root: &std::path::Path,
     ) {
         let mut pending_task = None;
-        run_composer_command(input, view, dispatch, root, &mut pending_task)
-            .expect("the composer command runs");
+        let mut inline_flushed = 0;
+        run_composer_command(
+            input,
+            view,
+            dispatch,
+            root,
+            &mut pending_task,
+            &mut inline_flushed,
+        )
+        .expect("the composer command runs");
     }
 
     #[test]

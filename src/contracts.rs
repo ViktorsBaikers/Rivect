@@ -20,6 +20,10 @@ pub const MODEL_WIRE_MAX_BYTES: usize = 1 << 20;
 pub const PAGE_DEFAULT: u32 = 20;
 pub const PAGE_MAX: u32 = 200;
 pub const KNOWN_READY_OPTION: &str = "brief";
+/// The reserved option id of the production task-start question (TD-12): the
+/// ordinary first step is one configured-model send plus the declared read,
+/// and neither a fork position nor a fallback candidate may reuse the name.
+pub const TASK_START_OPTION: &str = "begin";
 
 /// Runtime error codes of the public contract, with JSON-RPC exit semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -489,6 +493,49 @@ pub struct Question {
     pub recommendation_basis: String,
 }
 
+const TASK_START_PROMPT: &str = "Begin the first step";
+const TASK_START_LABEL: &str = "Begin";
+const TASK_START_CONSEQUENCES: &str = "one configured-model send plus the declared read";
+const TASK_START_RECOMMENDATION: &str =
+    "the ordinary first step dispatches once and reads the declared target";
+
+impl Question {
+    /// The production task-start fork (TD-11/TD-12): exactly one enabled
+    /// recommended position plus the card's always-available custom row. Its
+    /// deterministic id is the durable marker `resolve_read_target` uses to
+    /// recognize the reserved answer; no other question can carry it.
+    #[must_use]
+    pub fn task_start(task_id: &TaskId, intent_revision: u64) -> Self {
+        Self {
+            question_id: Self::task_start_question_id(task_id),
+            question_revision: 1,
+            task_id: task_id.clone(),
+            intent_revision,
+            prompt: TASK_START_PROMPT.to_string(),
+            options: vec![QuestionOption {
+                option_id: OptionId(TASK_START_OPTION.to_string()),
+                label: TASK_START_LABEL.to_string(),
+                consequences: TASK_START_CONSEQUENCES.to_string(),
+                availability: Availability::Enabled,
+            }],
+            recommended_option_id: OptionId(TASK_START_OPTION.to_string()),
+            recommendation_basis: TASK_START_RECOMMENDATION.to_string(),
+        }
+    }
+
+    /// The deterministic identity of one task's start question.
+    #[must_use]
+    pub fn task_start_question_id(task_id: &TaskId) -> QuestionId {
+        QuestionId(format!("task-start:{}", task_id.0))
+    }
+
+    /// Whether `question_id` is the recorded start question of `task_id`.
+    #[must_use]
+    pub fn is_task_start_question(question_id: &QuestionId, task_id: &TaskId) -> bool {
+        question_id == &Self::task_start_question_id(task_id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuestionOption {
     pub option_id: OptionId,
@@ -709,6 +756,57 @@ pub struct DeliveryReceipt {
     /// projection of an intent whose outcome is [`DeliveryOutcome::Unknown`].
     pub applied: bool,
     pub outcome: DeliveryOutcome,
+}
+
+// ----- installed release bundle (TD-03, AC-001/AC-028/AC-080) -----
+
+/// The manifest's own schema: the bundle format the activation check reads.
+/// It is versioned separately from the runtime [`SCHEMA_VERSION`] so a wire
+/// addition cannot silently re-mean an installed artifact.
+pub const RELEASE_MANIFEST_SCHEMA: u32 = 1;
+/// The exact installed inventory: the executable, the confined helper beside
+/// it, and this manifest. No data-resource artifact is shipped.
+pub const RELEASE_EXECUTABLE_NAME: &str = "rivect";
+pub const RELEASE_HELPER_NAME: &str = "rivect-sandbox-helper";
+pub const RELEASE_MANIFEST_NAME: &str = "rivect.manifest.json";
+/// The manifest is a small identity document, never a payload carrier.
+pub const RELEASE_MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+
+/// One artifact named by [`ReleaseManifest`]: the exact file name and the
+/// SHA-256 of its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseArtifact {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// The release receipt one authentic bundle carries: the build it was cut
+/// from and the two shipped artifacts' digests. The manifest's own byte
+/// digest, not a field here, is the activation identity installed producers
+/// bind to — a manifest cannot name itself without an unverifiable fixed
+/// point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseManifest {
+    pub schema_version: u32,
+    /// `rivect --version`, exactly as the packaged executable prints it.
+    pub build: String,
+    pub executable: ReleaseArtifact,
+    pub helper: ReleaseArtifact,
+}
+
+/// What one authentic bundle activates: the manifest digest that binds
+/// installed producers to this exact artifact set, the build it names, and
+/// the two verified artifact digests. It carries no path: the caller already
+/// owns the bundle root, and a copy of it is the same activation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseActivation {
+    pub manifest_sha256: String,
+    pub build: String,
+    pub executable_sha256: String,
+    pub helper_sha256: String,
 }
 
 /// JSON-RPC envelope for the corpus-driven ingress tests.

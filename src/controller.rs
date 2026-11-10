@@ -415,6 +415,18 @@ fn work_send_bound_scope(error: &ModelError) -> Option<String> {
     }
 }
 
+/// One confirmed scoped read handed to the evidence and completion guard:
+/// the dispatch identity and the resolved target travel together.
+struct ConfirmedRead<'a> {
+    session_id: &'a SessionId,
+    task_id: &'a TaskId,
+    target: &'a std::path::Path,
+    bytes: &'a [u8],
+    digest: &'a str,
+    retained_attempt_id: Option<String>,
+    effect_attempt: String,
+}
+
 impl Runtime {
     pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
         for _ in 0..SCHEDULER_DRAIN_LIMIT {
@@ -465,7 +477,7 @@ impl Runtime {
             };
         let request = EffectRequest::Read {
             grant_id: grant_id.to_string(),
-            path: target,
+            path: target.clone(),
         };
         let admitted = {
             let mut executor = self.executor();
@@ -490,14 +502,17 @@ impl Runtime {
             });
         }
         match executor.execute(&admitted) {
-            Ok(EffectOutcome::Read { bytes, digest }) => self.complete_read_with_evidence(
-                session_id,
-                task_id,
-                &bytes,
-                &digest,
-                retained_attempt_id,
-                effect_attempt,
-            ),
+            Ok(EffectOutcome::Read { bytes, digest }) => {
+                self.complete_read_with_evidence(ConfirmedRead {
+                    session_id,
+                    task_id,
+                    target: &target,
+                    bytes: &bytes,
+                    digest: &digest,
+                    retained_attempt_id,
+                    effect_attempt,
+                })
+            }
             Ok(EffectOutcome::Denied { reason }) => {
                 let snapshot = self.owner.store.snapshot(task_id)?;
                 Ok(StepOutcome::EffectDenied { reason, snapshot })
@@ -792,27 +807,36 @@ impl Runtime {
         // latest applied row names the fork this answer resolves, and an
         // option id colliding with a stale pause's candidate on a
         // different fork can never spend its frozen manifest.
+        let answered = self.owner.store.latest_applied_answer_question(task_id)?;
+        // The reserved `begin` position is the ordinary first step only when
+        // the applied answer named this task's recorded start question. A
+        // fallback candidate that happens to be named `begin` keeps its own
+        // frozen manifest path below.
+        let start_answer = matches!(
+            answer,
+            AnswerSelection::Option { option_id }
+                if option_id.0 == crate::contracts::TASK_START_OPTION
+        ) && answered
+            .as_ref()
+            .is_some_and(|question_id| Question::is_task_start_question(question_id, task_id));
         let chosen = match answer {
-            AnswerSelection::Option { option_id } => {
-                let answered = self.owner.store.latest_applied_answer_question(task_id)?;
-                self.paused_attempts
-                    .get(&task_id.0)
-                    .filter(|paused| {
-                        answered.is_some()
-                            && paused.served_question_id == answered
-                            && paused
-                                .choice
-                                .as_ref()
-                                .is_some_and(|choice| choice.candidates.contains(&option_id.0))
-                    })
-                    .map(|paused| {
-                        (
-                            paused.manifest.attempt_id.clone(),
-                            option_id.0.clone(),
-                            paused.manifest.clone(),
-                        )
-                    })
-            }
+            AnswerSelection::Option { option_id } => self
+                .paused_attempts
+                .get(&task_id.0)
+                .filter(|paused| {
+                    answered.as_ref() == paused.served_question_id.as_ref()
+                        && paused
+                            .choice
+                            .as_ref()
+                            .is_some_and(|choice| choice.candidates.contains(&option_id.0))
+                })
+                .map(|paused| {
+                    (
+                        paused.manifest.attempt_id.clone(),
+                        option_id.0.clone(),
+                        paused.manifest.clone(),
+                    )
+                }),
             AnswerSelection::Custom { .. } => None,
         };
         if let Some((attempt_id, connection, paused_manifest)) = chosen {
@@ -852,7 +876,7 @@ impl Runtime {
             self.paused_attempts.remove(&task_id.0);
             return self.read_target_from_reply(task_id, reply, Some(attempt_id));
         }
-        if matches!(answer, AnswerSelection::Option { .. }) {
+        if matches!(answer, AnswerSelection::Option { .. }) && !start_answer {
             // The served question's options are exactly the pause's
             // candidates and the store denies unknown option ids, so an
             // option answer that missed `chosen` was never aimed at the
@@ -863,11 +887,20 @@ impl Runtime {
             return Ok(Ok((self.scoped_file.clone(), None)));
         }
         let purpose = self.purpose.clone();
+        let target_declared = self.scoped_file.display().to_string();
+        // A real under-scope file is named as the read target; a bound scope
+        // root is named as a scope hint instead, so the model never reads the
+        // directory as a file.
+        let target_line = if self.scoped_file.is_file() {
+            format!("read {target_declared}")
+        } else {
+            format!("scope {target_declared}")
+        };
         let inputs = format!(
-            "goal: {}\nanswer: {}\nread {}",
+            "goal: {}\nanswer: {}\n{}",
             String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
             answer_text(answer),
-            self.scoped_file.display()
+            target_line
         );
         // The authorship of the bytes this dispatch carries (AC-009): a
         // tool output, an observation or a model-authored answer freezes
@@ -1159,22 +1192,26 @@ impl Runtime {
         )))
     }
 
-    /// Evidence and the completion guard for a confirmed scoped read.
-    /// The observation names `scoped_file`, the dispatch's permitted
-    /// action, not the worker target the grant already bound.
+    /// Evidence and the completion guard for a confirmed scoped read. The
+    /// observation names the resolved target, not the declared `scoped_file`:
+    /// a relative provider path is joined under the bound scope root.
     fn complete_read_with_evidence(
         &mut self,
-        session_id: &SessionId,
-        task_id: &TaskId,
-        bytes: &[u8],
-        digest: &str,
-        retained_attempt_id: Option<String>,
-        effect_attempt: String,
+        read: ConfirmedRead<'_>,
     ) -> Result<StepOutcome, ControllerError> {
+        let ConfirmedRead {
+            session_id,
+            task_id,
+            target,
+            bytes,
+            digest,
+            retained_attempt_id,
+            effect_attempt,
+        } = read;
         let observation = format!(
             "read {} bytes from {}; sha256={}",
             bytes.len(),
-            self.scoped_file.display(),
+            target.display(),
             digest
         );
         self.owner.store.insert_evidence_for_task(

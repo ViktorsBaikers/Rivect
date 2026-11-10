@@ -8,14 +8,16 @@
 
 use rivect::contracts::{CommandDescriptor, Page};
 use rivect::tools::{self, Shell};
+use rivect::ui::RenderMode;
 use std::path::PathBuf;
 
 /// The grammar, one line per invocation shape. It names the subcommands and
 /// the flags exactly as [`parse`] accepts them.
-pub const USAGE: &str = "rivect [--tui fullscreen] [--no-mouse] [--headless] [--data-root PATH]\n\
+pub const USAGE: &str = "rivect [--tui fullscreen|inline] [--no-mouse] [--headless] [--data-root PATH]\n\
        rivect <command> [--data-root PATH]\n\
        rivect doctor [--project PATH] [--data-root PATH]\n\
        rivect completions <bash|zsh|fish>\n\
+       rivect --ui-review <state>\n\
        rivect --help | --version";
 
 /// What one command line asks for.
@@ -35,7 +37,13 @@ pub enum Invocation {
     /// Run one catalog word once through the dispatcher.
     Command { kind: String, data_root: PathBuf },
     /// Run the TUI on a terminal, the JSON-RPC loop otherwise.
-    Run { headless: bool, data_root: PathBuf },
+    Run {
+        headless: bool,
+        render: RenderMode,
+        data_root: PathBuf,
+    },
+    /// Render one seeded review state on a terminal and exit.
+    UiReview { state: String },
 }
 
 /// Every way one command line is refused. Each variant carries the exact word
@@ -52,6 +60,10 @@ pub enum CliError {
     UnknownCommand { command: String },
     #[error("completions needs exactly one shell: bash, zsh or fish")]
     MissingShell,
+    #[error("missing value for --ui-review")]
+    MissingReviewState,
+    #[error("unknown ui review state {state}")]
+    UnknownReviewState { state: String },
     #[error("unknown shell {shell}; known shells: bash, zsh, fish")]
     UnknownShell { shell: String },
 }
@@ -100,20 +112,36 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
     }
     let mut data_root = default_data_root;
     let mut headless = false;
+    let mut render = RenderMode::Fullscreen;
     let mut project = None;
+    let mut review = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
             "--help" | "-h" => return Ok(Invocation::Help),
             "--version" if subcommand.is_none() => return Ok(Invocation::Version),
+            "--ui-review" if subcommand.is_none() => {
+                index += 1;
+                let Some(state) = rest.get(index) else {
+                    return Err(CliError::MissingReviewState);
+                };
+                if !rivect::ui::review::STATES.contains(&state.as_str()) {
+                    return Err(CliError::UnknownReviewState {
+                        state: state.clone(),
+                    });
+                }
+                review = Some(state.clone());
+            }
             "--tui" if subcommand.is_none() => {
                 index += 1;
                 let Some(mode) = rest.get(index) else {
                     return Err(CliError::MissingValue { flag: "--tui" });
                 };
-                if mode != "fullscreen" {
-                    return Err(CliError::UnsupportedRenderMode { mode: mode.clone() });
-                }
+                render = match mode.as_str() {
+                    "fullscreen" => RenderMode::Fullscreen,
+                    "inline" => RenderMode::Inline,
+                    _ => return Err(CliError::UnsupportedRenderMode { mode: mode.clone() }),
+                };
             }
             "--no-mouse" if subcommand.is_none() => {}
             "--headless" if subcommand.is_none() => headless = true,
@@ -147,8 +175,12 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
     if subcommand == Some(Subcommand::Doctor) {
         return Ok(Invocation::Doctor { project, data_root });
     }
+    if let Some(state) = review {
+        return Ok(Invocation::UiReview { state });
+    }
     Ok(Invocation::Run {
         headless,
+        render,
         data_root,
     })
 }

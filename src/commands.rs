@@ -7,8 +7,8 @@ use crate::context::{ContextError, IsolatedCause};
 use crate::contracts::{
     AnswerSelection, AttachmentId, CommandId, CommandResult, EffectClass, ErrorCode, Lifecycle,
     LocalCommand, LocalCommandResult, OptionId, PAGE_DEFAULT, PAGE_MAX, Page, ProjectInitResult,
-    QuestionId, QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION, SessionId,
-    TaskId, WireError,
+    Question, QuestionId, QuestionResult, RetryClass, RpcErrorBody, RpcResponse, SCHEMA_VERSION,
+    SessionId, TaskId, WireError,
 };
 use crate::index::{
     CarryPolicy, Completeness, GenerationState, IndexWatcher, PartialReason, ProjectGraph,
@@ -19,10 +19,12 @@ use crate::lsp::MAX_INDEX_PARSE_TIME;
 use crate::model::{Broker, PendingFallback, RequestManifest};
 use crate::owner::{Owner, OwnerError};
 use crate::policy::Policy;
-use crate::providers::{Provider, ProviderError};
+use crate::providers::{Dialect, Provider, ProviderError};
 use crate::resources::NotificationQueue;
 use crate::scheduler::{DEFAULT_MAX_SLOTS, DEFAULT_RESOURCE_CAP, Scheduler};
-use crate::state::{CacheCohort, CacheRate, ConflictCause, StoreError, TaskStore, denial_class};
+use crate::state::{
+    CacheCohort, CacheRate, ConflictCause, StoreError, TaskCreateRequest, TaskStore, denial_class,
+};
 use crate::supervisor::{Supervisor, SupervisorPolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1634,6 +1636,66 @@ impl Runtime {
         self.broker.set_instructions_root(root);
     }
 
+    /// Binds the first-task read target from the process cwd (TD-13): the
+    /// most specific discovered instruction file inside the granted scope
+    /// root, else the root itself. A discovery failure is a boot diagnostic;
+    /// the read grant stays bound and the target falls back to the canonical
+    /// scope root, so only an unbound root clears the pair.
+    pub fn bind_first_task_scope(&mut self, cwd: PathBuf) {
+        let mut scopes: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
+        scopes.reverse();
+        let root = self
+            .scope_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.scope_root.clone());
+        let discovered = match crate::instructions::InstructionSet::discover(&scopes) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                self.boot_diagnostics
+                    .push(format!("instruction discovery failed: {error}"));
+                if root.as_os_str().is_empty() {
+                    self.scoped_file.clear();
+                    self.scoped_grant.clear();
+                } else {
+                    self.scoped_file = root;
+                }
+                return;
+            }
+        };
+        self.scoped_file = discovered
+            .entries
+            .iter()
+            .find_map(|entry| {
+                let path = entry.path.canonicalize().ok()?;
+                path.starts_with(&root).then_some(path)
+            })
+            .unwrap_or(root);
+    }
+
+    /// The production task start (TD-11): composes the start question and
+    /// lands the task rows, the create receipt and that question in one store
+    /// transaction.
+    fn start_task(
+        &mut self,
+        session_id: &SessionId,
+        command_id: &str,
+        principal: &str,
+        goal: &str,
+        contract: (&[String], &[String]),
+    ) -> Result<CommandResult, StoreError> {
+        let task_id = TaskId::generate();
+        let question = Question::task_start(&task_id, 1);
+        self.owner.store.create_task_and_publish(TaskCreateRequest {
+            session_id,
+            command_id,
+            principal,
+            goal,
+            contract,
+            task_id,
+            question: Some(&question),
+        })
+    }
+
     pub fn config_for_broker(&self) -> config::Config {
         self.effective.composed()
     }
@@ -2224,6 +2286,10 @@ const METHODS: &[&str] = &[
     "sharing.grant.open",
     "sharing.attach",
     "sharing.grant.revoke",
+    "provider.row",
+    "support.preview",
+    "support.export",
+    "support.replay",
 ];
 
 /// Every JSON-RPC method this build serves, as the dispatcher's own table.
@@ -2362,6 +2428,8 @@ enum RequestError {
     LoginStateMismatch,
     #[error("parameter {name} has the wrong type")]
     InvalidParameter { name: &'static str },
+    #[error("support bundle exceeds {limit} bytes")]
+    SupportBundleTooLarge { limit: usize },
     #[error(transparent)]
     ProjectIndex(#[from] ProjectIndexError),
 }
@@ -4073,6 +4141,189 @@ fn session_export(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
     }
 }
 
+/// The fixed reason codes a support bundle carries instead of provider-bound
+/// reasoning material (AC-080): a closed vocabulary, so an opaque artifact
+/// never leaves the machine and a code never echoes its input.
+const SUPPORT_REASON_REASONING: &str = "reasoning_local_only";
+const SUPPORT_REASON_SIGNATURE: &str = "signature_local_only";
+const SUPPORT_REASON_ENCRYPTED: &str = "encrypted_reasoning_local_only";
+const SUPPORT_REASON_SECRET: &str = "secret_local_only";
+
+/// One support bundle is local replay state: bounded like one page, never a
+/// whole session store.
+const SUPPORT_BUNDLE_MAX_BYTES: usize = 65_536;
+
+/// The fixed reason code one provider-bound or credential-bearing field is
+/// replaced with; the key set is closed, so unrelated data rides unchanged.
+fn support_reason_code(key: &str) -> Option<&'static str> {
+    let normalized = key.to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "thinking" | "reasoning_content" | "thought_signature" | "thoughtsignature" => {
+            Some(SUPPORT_REASON_REASONING)
+        }
+        "signature" => Some(SUPPORT_REASON_SIGNATURE),
+        "encrypted_content" => Some(SUPPORT_REASON_ENCRYPTED),
+        "api_key"
+        | "x_api_key"
+        | "cf_aig_authorization"
+        | "x_amz_security_token"
+        | "authorization"
+        | "access_token"
+        | "refresh_token"
+        | "client_secret"
+        | "secret"
+        | "password"
+        | "token" => Some(SUPPORT_REASON_SECRET),
+        _ => None,
+    }
+}
+
+/// Replaces every provider-bound reasoning artifact and credential value in
+/// `value` with its fixed reason code, counting each replacement. A matching
+/// key replaces its whole value whatever the JSON type — an array of header
+/// values is still header material — and header keys match case-insensitively
+/// across `-`/`_` spellings. A `redacted_thinking` block is reasoning material
+/// as a whole, so the entire block is replaced rather than one member.
+fn redact_support_value(value: &mut Value, replacements: &mut BTreeMap<&'static str, u64>) {
+    if let Value::Object(fields) = value
+        && fields.get("type").and_then(Value::as_str) == Some("redacted_thinking")
+    {
+        *value = Value::String(SUPPORT_REASON_REASONING.to_string());
+        *replacements.entry(SUPPORT_REASON_REASONING).or_insert(0) += 1;
+        return;
+    }
+    match value {
+        Value::Object(fields) => {
+            for (key, entry) in fields.iter_mut() {
+                if let Some(code) = support_reason_code(key) {
+                    *entry = Value::String(code.to_string());
+                    *replacements.entry(code).or_insert(0) += 1;
+                } else {
+                    redact_support_value(entry, replacements);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_support_value(item, replacements);
+            }
+        }
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// One bounded support bundle from the request params, before redaction.
+fn support_bundle(params: &Value) -> Result<Value, RequestError> {
+    let Some(bundle) = params.get("bundle") else {
+        return Err(RequestError::Required { field: "bundle" });
+    };
+    let bytes = serde_json::to_vec(bundle).map_err(|_error| RequestError::Serialization)?;
+    if bytes.len() > SUPPORT_BUNDLE_MAX_BYTES {
+        return Err(RequestError::SupportBundleTooLarge {
+            limit: SUPPORT_BUNDLE_MAX_BYTES,
+        });
+    }
+    Ok(bundle.clone())
+}
+
+fn support_digest(value: &Value) -> Result<String, RequestError> {
+    use sha2::Digest as _;
+    let bytes = serde_json::to_vec(value).map_err(|_error| RequestError::Serialization)?;
+    Ok(config::hex(&sha2::Sha256::digest(&bytes)))
+}
+
+/// `support.preview`: the replacements a support export would make, with none
+/// of the bundle's bytes in the answer and no store access.
+fn support_preview(id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let mut bundle = match support_bundle(params) {
+        Ok(bundle) => bundle,
+        Err(err) => return request_error(id, err),
+    };
+    let mut replacements = BTreeMap::new();
+    redact_support_value(&mut bundle, &mut replacements);
+    let digest = match support_digest(&bundle) {
+        Ok(digest) => digest,
+        Err(err) => return request_error(id, err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "support.preview",
+            "redacted": !replacements.is_empty(),
+            "replacements": replacements,
+            "digest": digest,
+        }),
+    )
+}
+
+/// `support.export`: the redacted bundle a support handoff carries. The
+/// provider-bound reasoning bytes and credential values become fixed reason
+/// codes; nothing is published and no effect is repeated.
+fn support_export(id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let mut bundle = match support_bundle(params) {
+        Ok(bundle) => bundle,
+        Err(err) => return request_error(id, err),
+    };
+    let mut replacements = BTreeMap::new();
+    redact_support_value(&mut bundle, &mut replacements);
+    let digest = match support_digest(&bundle) {
+        Ok(digest) => digest,
+        Err(err) => return request_error(id, err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "support.export",
+            "replacements": replacements,
+            "digest": digest,
+            "bundle": bundle,
+        }),
+    )
+}
+
+/// `support.replay`: replays one exported bundle read-only. A bundle already
+/// carrying the fixed codes verifies; one still holding provider bytes is
+/// named unverified and redacted in the answer, with no store access.
+fn support_replay(id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let bundle = match support_bundle(params) {
+        Ok(bundle) => bundle,
+        Err(err) => return request_error(id, err),
+    };
+    let mut redacted = bundle.clone();
+    let mut replacements = BTreeMap::new();
+    redact_support_value(&mut redacted, &mut replacements);
+    let supplied = match support_digest(&bundle) {
+        Ok(digest) => digest,
+        Err(err) => return request_error(id, err),
+    };
+    let replay = match support_digest(&redacted) {
+        Ok(digest) => digest,
+        Err(err) => return request_error(id, err),
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "support.replay",
+            "verified": supplied == replay,
+            "replacements": replacements,
+            "digest": replay,
+            "bundle": redacted,
+        }),
+    )
+}
+
 /// `session.recap`: the durable shape of one session — a bounded task page with
 /// its lifecycle counts and the lifetime spend the settlement ledger recorded.
 /// The page honours `page.cursor` like every other bounded page, so a caller
@@ -4318,6 +4569,42 @@ fn effort_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
     )
 }
 
+/// `provider.row`: the installed build's recorded answer for one literal
+/// provider id — its dialect, whether this build serves it, and its login
+/// alias binding. An unrecorded, externally blocked or unserved id stays
+/// explicit instead of dropping out of the roster.
+fn provider_row(id: Value, params: &Value) -> RpcResponse {
+    let Some(connection) = params.get("id").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "id" });
+    };
+    let dialect = crate::providers::dialect_for(connection);
+    let (state, reason_code) = match (dialect, crate::providers::externally_blocked(connection)) {
+        (Some(Dialect::CursorAgent | Dialect::DevinAgent), _) => {
+            ("unserved", Some("dialect_unserved"))
+        }
+        (Some(_), _) => ("installed", None),
+        (None, Some(_)) => ("externally_blocked", Some("externally_blocked")),
+        (None, None) => ("unrecorded", Some("not_recorded")),
+    };
+    let alias_of = match connection {
+        "openai-codex-device" => Some("openai-codex"),
+        "zai-coding-plan" => Some("zai"),
+        _ => None,
+    };
+    RpcResponse::ok(
+        id,
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "kind": "provider.row",
+            "id": connection,
+            "dialect": dialect.map(|dialect| dialect.to_string()),
+            "state": state,
+            "reason_code": reason_code,
+            "alias_of": alias_of,
+        }),
+    )
+}
+
 /// `context.view`: what the assembled context is made of, by component size.
 fn context_view(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
     let Some(_session) = session_param(params) else {
@@ -4492,6 +4779,16 @@ fn harness_control(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
             "workflow": rt.effective.workflow_entry,
         }),
     )
+}
+
+/// `docs.status`: the documentation owner's declared source, version policy,
+/// cache bounds and honest account facts. A pure read — no external refresh,
+/// and a quota this build cannot observe stays `unknown` instead of zero.
+fn docs_status(id: Value, params: &Value) -> RpcResponse {
+    let Some(_session) = session_param(params) else {
+        return missing_session(id);
+    };
+    RpcResponse::ok(id, json!(crate::docs::status()))
 }
 
 /// `read_file`: the catalog's `read` alias resolving to the admitted tool. The
@@ -5163,6 +5460,10 @@ fn handle_method(
         "sharing.grant.open" => sharing_grant_open(rt, ingress, &params, id),
         "sharing.attach" => sharing_attach(rt, &params, id),
         "sharing.grant.revoke" => sharing_grant_revoke(rt, ingress, &params, id),
+        "provider.row" => provider_row(id, &params),
+        "support.preview" => support_preview(id, &params),
+        "support.export" => support_export(id, &params),
+        "support.replay" => support_replay(id, &params),
         "task.snapshot" => {
             let Some(_session) = session_param(&params) else {
                 return missing_session(id);
@@ -5354,6 +5655,7 @@ fn handle_method(
                 crate::tools::LocalKind::CheckpointApply => checkpoint_apply(rt, id, &params),
                 crate::tools::LocalKind::WorkflowControl => workflow_control(rt, id, &params),
                 crate::tools::LocalKind::HarnessControl => harness_control(rt, id, &params),
+                crate::tools::LocalKind::DocsStatus => docs_status(id, &params),
                 crate::tools::LocalKind::ReadFile => read_file_command(rt, id, &params),
                 crate::tools::LocalKind::ProjectInit => project_init(rt, id, &params),
                 crate::tools::LocalKind::SessionNew => session_new(rt, id, &params, connection_id),
@@ -6497,6 +6799,18 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 Ok(constraints) => constraints,
                 Err(err) => return request_error(id, err),
             };
+            let first_question = match params.get("first_question") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return request_error(
+                        id,
+                        RequestError::InvalidParameter {
+                            name: "first_question",
+                        },
+                    );
+                }
+            };
             let parent_task = params
                 .get("parent_task_id")
                 .and_then(Value::as_str)
@@ -6508,13 +6822,24 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     return store_error(id, &err);
                 }
             }
-            match rt.owner.store.create_task(
-                &session,
-                &command_id,
-                principal,
-                goal,
-                (&criteria, &constraints),
-            ) {
+            let created = if first_question {
+                rt.start_task(
+                    &session,
+                    &command_id,
+                    principal,
+                    goal,
+                    (&criteria, &constraints),
+                )
+            } else {
+                rt.owner.store.create_task(
+                    &session,
+                    &command_id,
+                    principal,
+                    goal,
+                    (&criteria, &constraints),
+                )
+            };
+            match created {
                 Ok(result) => {
                     // The scheduler owns the tree shape (INV-020):
                     // parentage recorded at creation links the child's

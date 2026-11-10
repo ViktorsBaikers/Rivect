@@ -1473,6 +1473,8 @@ pub enum ActionError {
     DuplicateOptionId { option_id: String },
     #[error("option id {option_id} must be non-empty ASCII within 64 bytes ([A-Za-z0-9._-])")]
     InvalidOptionId { option_id: String },
+    #[error("option id {option_id} is reserved")]
+    ReservedOptionId { option_id: String },
     #[error("disabled option {option_id} must carry a reason")]
     DisabledWithoutReason { option_id: String },
     #[error("recommended option {option_id} is not an enabled position")]
@@ -1600,6 +1602,7 @@ impl ActionError {
             | Self::OptionSlots { .. }
             | Self::DuplicateOptionId { .. }
             | Self::InvalidOptionId { .. }
+            | Self::ReservedOptionId { .. }
             | Self::DisabledWithoutReason { .. }
             | Self::RecommendationNotSelectable { .. }
             | Self::EmptyBasis
@@ -5137,6 +5140,11 @@ fn validate_fork(input: &ResolveDecisionInput) -> Result<(), ActionError> {
     let mut recommended_enabled = false;
     for option in &input.options {
         let raw = &option.option_id.0;
+        if raw == crate::contracts::TASK_START_OPTION {
+            return Err(ActionError::ReservedOptionId {
+                option_id: raw.clone(),
+            });
+        }
         if !legal_id(raw) {
             return Err(ActionError::InvalidOptionId {
                 option_id: raw.clone(),

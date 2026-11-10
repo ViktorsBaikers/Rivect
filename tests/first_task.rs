@@ -17,11 +17,13 @@
 mod support;
 
 use rivect::commands::Ingress;
-use rivect::contracts::{AnswerSelection, Lifecycle, OptionId, ProjectInitResult};
+use rivect::contracts::{
+    AnswerSelection, Lifecycle, OptionId, ProjectInitResult, TASK_START_OPTION,
+};
 use rivect::executor::EffectRequest;
 use rivect::index::SnapshotId;
 use rivect::model::RequestManifest;
-use rivect::providers::{Provider, ProviderError, ProviderReply};
+use rivect::providers::{Provider, ProviderError, ProviderReply, StoreKind, ToolCall};
 use rivect::resources::{Delivery, NotificationQueue, UsageDelta};
 use rivect::ui::{ApplyVerdict, Projection};
 use serde_json::{Value, json};
@@ -1716,10 +1718,9 @@ fn consumer_public_ingress() {
             .iter()
             .any(|d| d["canonical_id"] == "read_file" && d["available"] == true)
     );
-    // The catalog half of the same invariant: the promoted kind reports
+    // The catalog half of the same invariant: every promoted kind reports
     // itself available with a real description and no unavailability
-    // reason, while the one tolerated unbuilt row keeps `available: false`
-    // and names its exact reason.
+    // reason — the docs owner promoted the last row.
     let project_init = items
         .iter()
         .find(|d| d["canonical_id"] == "project.init")
@@ -1737,17 +1738,18 @@ fn consumer_public_ingress() {
         .iter()
         .filter(|d| d["available"] == false)
         .collect::<Vec<_>>();
-    assert_eq!(
-        unavailable_rows
-            .iter()
-            .map(|d| d["canonical_id"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>(),
-        vec!["docs.status"],
-        "exactly one catalog row is tolerated as unbuilt: {unavailable_rows:?}"
+    assert!(
+        unavailable_rows.is_empty(),
+        "every catalog row is served: {unavailable_rows:?}"
     );
-    assert_eq!(
-        unavailable_rows[0]["unavailability_reason"], "docs owner not installed",
-        "the one unbuilt row names its exact reason: {unavailable_rows:?}"
+    let docs_status = items
+        .iter()
+        .find(|d| d["canonical_id"] == "docs.status")
+        .expect("the docs row stays in the catalog");
+    assert_eq!(docs_status["available"], true, "{docs_status}");
+    assert!(
+        docs_status["unavailability_reason"].is_null(),
+        "the docs owner serves its own row: {docs_status}"
     );
 
     let _ = question;
@@ -3040,6 +3042,17 @@ fn wait_for_visible_tui_text(
     support::wait_for_screen_text(pty, TUI_ROWS, TUI_COLS, needle, timeout)
 }
 
+/// The composer create opens the production start card; a case that only
+/// submits work dismisses it before asserting the transcript or exiting.
+fn dismiss_start_card(pty: &mut support::PtySession) {
+    if wait_for_visible_tui_text(pty, "awaiting decision", Duration::from_secs(5)).is_ok() {
+        std::thread::sleep(Duration::from_millis(300));
+        pty.send(b"\x1b").expect("pty send dismiss");
+        let _left =
+            wait_for_visible_tui_text(pty, "decision left unanswered", Duration::from_secs(5));
+    }
+}
+
 #[test]
 fn tui_enter_dispatches_tasks_and_help() {
     let mut pty = spawn_pty(&rivect_binary(), TUI_ROWS as u16, TUI_COLS as u16);
@@ -3065,6 +3078,7 @@ fn tui_enter_dispatches_tasks_and_help() {
     );
 
     pty.send(b"task from q\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: task from q (accepted: ",
@@ -3076,8 +3090,8 @@ fn tui_enter_dispatches_tasks_and_help() {
         "non-empty Enter must show the accepted task receipt: {visible:?}"
     );
     assert!(
-        visible.contains(": running"),
-        "task dock must show accepted work: {visible:?}"
+        visible.contains(": waiting"),
+        "task dock must show the work waiting on its start question: {visible:?}"
     );
     pty.send(b"\x1b").expect("pty send");
     assert_eq!(
@@ -3105,6 +3119,7 @@ fn tui_lowercase_q_starts_composer_and_dispatches_exact_goal() {
     );
 
     pty.send(b"uery the root\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: query the root (accepted: ",
@@ -3169,6 +3184,7 @@ fn tui_bracketed_paste_fills_the_composer_without_submitting() {
     // Only a real Enter submits — and it submits the joined draft
     // verbatim.
     pty.send(b"\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: multi line paste goal (accepted: ",
@@ -3217,6 +3233,7 @@ fn tui_char_chords_never_type_their_letter_into_the_composer() {
 
     // The draft is exactly the bare char — Enter submits it verbatim.
     pty.send(b"\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(&pty, "Submitted task: x (", Duration::from_secs(10))
         .expect("pty screen");
     assert!(
@@ -3270,6 +3287,27 @@ fn accepted_task_id(screen: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_owned()
+}
+
+/// Settles the guard fixture's own run state directly: a submitted task waits
+/// on its start question, and these cases prove the session-switch guard over
+/// running work rather than over the start card.
+fn mark_task_running(pty: &support::PtySession) -> String {
+    let db_path = pty.data_root().join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
+    conn.busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    conn.execute(
+        "UPDATE tasks SET lifecycle = 'running' WHERE task_id = (SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1)",
+        [],
+    )
+    .expect("mark the fixture task running");
+    conn.query_row(
+        "SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("read the marked task")
 }
 
 /// The reconstructed frame once `needle` appears at least `count` times:
@@ -3475,23 +3513,25 @@ fn new_and_clear_create_an_independent_conversation_p4() {
     // on a session switch in this build, so the composer names the task and
     // the conversation the operator is reading stays addressable.
     pty.send(b"stored conversation\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(
+    dismiss_start_card(&mut pty);
+    let _visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: stored conversation (accepted: ",
         Duration::from_secs(10),
     )
     .expect("pty screen");
+    let stored_task = mark_task_running(&pty);
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        &format!("task {stored_task}: running"),
+        Duration::from_secs(10),
+    )
+    .expect("running dock");
     assert!(
-        visible.contains(": running"),
+        visible.contains(&format!("task {stored_task}: running")),
         "the stored conversation has live work: {visible:?}"
     );
-    let running = visible
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("task ")
-                .and_then(|rest| rest.strip_suffix(": running"))
-        })
-        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
+    let running = stored_task;
 
     pty.send(b"/clear\r").expect("pty send");
     let visible =
@@ -3587,6 +3627,7 @@ fn new_and_clear_create_an_independent_conversation_p5() {
     // Enter submits the draft as a task: the document's /clear line stays
     // part of the goal.
     pty.send(b"\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: notes /clear end (accepted: ",
@@ -3598,13 +3639,18 @@ fn new_and_clear_create_an_independent_conversation_p5() {
         1,
         "the pasted document became one task: {visible:?}"
     );
-    let running = visible
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("task ")
-                .and_then(|rest| rest.strip_suffix(": running"))
-        })
-        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
+    let stored_task = mark_task_running(&pty);
+    let visible = wait_for_visible_tui_text(
+        &pty,
+        &format!("task {stored_task}: running"),
+        Duration::from_secs(10),
+    )
+    .expect("running dock");
+    let running = stored_task;
+    assert!(
+        visible.contains(&format!("task {running}: running")),
+        "the dock names the running task: {visible:?}"
+    );
 
     // Only an exactly typed command reaches the dispatcher, and a running
     // task refuses the switch with its own typed cause instead of faking it.
@@ -3760,6 +3806,7 @@ fn new_requires_an_idle_session_p8() {
     );
 
     pty.send(b"probe\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: probe (accepted: ",
@@ -3771,6 +3818,13 @@ fn new_requires_an_idle_session_p8() {
         !running.is_empty(),
         "the accepted receipt names its task: {visible:?}"
     );
+    let running = mark_task_running(&pty);
+    let _ = wait_for_visible_tui_text(
+        &pty,
+        &format!("task {running}: running"),
+        Duration::from_secs(10),
+    )
+    .expect("running dock");
 
     // With that task running the switch is refused, and the refusal
     // names the task it would have left behind.
@@ -3857,19 +3911,20 @@ fn new_requires_an_idle_session_p8() {
     // A running task still refuses, in the conversation the switch left:
     // the rule is about the run, not a blanket admission.
     pty.send(b"second probe\r").expect("pty send");
-    let visible = wait_for_visible_tui_text(
+    dismiss_start_card(&mut pty);
+    let _visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: second probe (accepted: ",
         Duration::from_secs(10),
     )
     .expect("pty screen");
-    let live = visible
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("task ")
-                .and_then(|rest| rest.strip_suffix(": running"))
-        })
-        .unwrap_or_else(|| panic!("the dock names the running task: {visible:?}"));
+    let live = mark_task_running(&pty);
+    let _ = wait_for_visible_tui_text(
+        &pty,
+        &format!("task {live}: running"),
+        Duration::from_secs(10),
+    )
+    .expect("running dock");
     pty.send(b"/new\r").expect("pty send");
     let visible = wait_for_visible_tui_text(
         &pty,
@@ -3912,6 +3967,7 @@ fn new_requires_an_idle_session_p9() {
     // One real task names the session the guard reads; the seed below
     // fills the page the guard used to scan.
     pty.send(b"probe\r").expect("pty send");
+    dismiss_start_card(&mut pty);
     let visible = wait_for_visible_tui_text(
         &pty,
         "Submitted task: probe (accepted: ",
@@ -4027,6 +4083,7 @@ fn tui_data_root_flag_overrides_environment() {
     );
     pty.send(b"p\r").expect("pty send");
     pty.pump_for(Duration::from_secs(2)).expect("pty pump");
+    dismiss_start_card(&mut pty);
     pty.send(b"\x1b").expect("pty send");
     let exit = pty.wait_exit(Duration::from_secs(10)).expect("pty wait");
     assert_eq!(exit, Some(0), "TUI must exit cleanly");
@@ -4060,6 +4117,7 @@ fn tui_data_root_flag_overrides_environment() {
     );
     env_only.send(b"p\r").expect("pty send");
     env_only.pump_for(Duration::from_secs(2)).expect("pty pump");
+    dismiss_start_card(&mut env_only);
     env_only.send(b"\x1b").expect("pty send");
     assert_eq!(
         env_only
@@ -5610,4 +5668,1125 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p10() {
         !summary.contains("nothing further is needed"),
         "an empty step is not a verdict that nothing further is needed: {summary}"
     );
+}
+
+// ----- production task start (TD-11..TD-13) -----
+
+/// A provider that answers every send with one relative read target: the
+/// controller joins it under the bound scope, so the evidence names the
+/// resolved path rather than the declared one.
+struct StartTargetProvider {
+    target: String,
+    sends: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    last_manifest: std::sync::Arc<std::sync::Mutex<Option<RequestManifest>>>,
+}
+
+impl Provider for StartTargetProvider {
+    fn name(&self) -> &'static str {
+        "start-target"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &rivect::config::Connection) -> bool {
+        true
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last_manifest.lock().expect("manifest lock") = Some(manifest.clone());
+        Ok(ProviderReply {
+            text: "performing the admitted read".to_string(),
+            tool_calls: vec![ToolCall {
+                tool: "read_file".to_string(),
+                path: Some(self.target.clone()),
+            }],
+            usage: UsageDelta::Unknown,
+            wire_retries: 0,
+        })
+    }
+}
+
+/// The first send is a definitive pre-send denial, so a manual fallback
+/// pauses; every later send delegates to the offline loopback.
+struct FallbackBeginProvider {
+    inner: rivect::providers::LoopbackProvider,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<RequestManifest>>>,
+}
+
+impl Provider for FallbackBeginProvider {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn serves(&self, connection: &str, entry: &rivect::config::Connection) -> bool {
+        self.inner.serves(connection, entry)
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        let first = {
+            let mut sent = self.sent.lock().expect("wire log lock");
+            sent.push(manifest.clone());
+            sent.len() == 1
+        };
+        if first {
+            Err(ProviderError::StoreUnavailable {
+                store: StoreKind::Keychain,
+                reason: "fixture store unavailable".to_string(),
+            })
+        } else {
+            self.inner.send(manifest)
+        }
+    }
+}
+
+fn task_start_create(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    command_id: &str,
+) -> Value {
+    task_start_create_with(world, session, command_id, &[])
+}
+
+fn task_start_create_with(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    command_id: &str,
+    criteria: &[&str],
+) -> Value {
+    let response = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 400, "method": "task.submit",
+        "params": {
+            "schema_version": 1,
+            "command_id": command_id,
+            "session_id": session.0,
+            "kind": "create",
+            "goal": "start the ordinary first task",
+            "contract": { "criteria": criteria, "constraints": [] },
+            "first_question": true,
+        }
+    }));
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"].clone()
+}
+
+fn task_start_question(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    task: &rivect::contracts::TaskId,
+) -> rivect::contracts::Question {
+    let current = world.dispatch(&corpus_question_current(session, task, json!(401)));
+    assert!(current["error"].is_null(), "{current}");
+    serde_json::from_value(current["result"]["question"].clone()).expect("a pending start question")
+}
+
+fn answer_start(
+    world: &mut World,
+    session: &rivect::contracts::SessionId,
+    task: &rivect::contracts::TaskId,
+    question: &rivect::contracts::Question,
+    selection: AnswerSelection,
+    command_id: &str,
+) -> Value {
+    world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 402, "method": "task.submit",
+        "params": {
+            "schema_version": 1,
+            "command_id": command_id,
+            "session_id": session.0,
+            "kind": "answer",
+            "task_id": task.0,
+            "expected_intent_revision": question.intent_revision,
+            "question_id": question.question_id.0,
+            "question_revision": question.question_revision,
+            "selection": selection,
+        }
+    }))
+}
+
+fn store_row_count(world: &World, sql: &str) -> i64 {
+    let path = world.root.join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(path).expect("open the fixture store");
+    conn.query_row(sql, [], |row| row.get(0))
+        .expect("count the fixture rows")
+}
+
+const COUNT_TASKS: &str = "SELECT COUNT(*) FROM tasks";
+const COUNT_QUESTIONS: &str = "SELECT COUNT(*) FROM questions";
+const COUNT_RECEIPTS: &str = "SELECT COUNT(*) FROM command_receipts";
+
+#[test]
+fn task_start_create_publishes_one_question_in_one_transaction() {
+    let (mut world, _scope, _file, _grant) =
+        scoped_world("task-start-atomic", Some(&support::config_distinct_pools()));
+    let session = world.open_session("bootstrap-task-start-atomic");
+
+    let created = task_start_create(&mut world, &session, "cmd-start-atomic");
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    assert_eq!(created["status"], "accepted");
+    assert_eq!(created["intent_revision"], 1);
+    assert_eq!(created["task_revision"], 2, "the post-insert revision");
+    assert_eq!(created["snapshot"]["revision"], 2);
+    assert_eq!(created["snapshot"]["lifecycle"], "waiting");
+    assert_eq!(created["snapshot"]["event_cursor"], 2);
+    let blockers = created["snapshot"]["blockers"]
+        .as_array()
+        .expect("the waiting blockers");
+    assert_eq!(blockers[0]["condition"]["kind"], "decision");
+
+    let question = task_start_question(&mut world, &session, &task);
+    assert_eq!(
+        question.question_id,
+        rivect::contracts::Question::task_start_question_id(&task)
+    );
+    assert_eq!(question.options.len(), 1);
+    assert_eq!(question.options[0].option_id.0, TASK_START_OPTION);
+    assert_eq!(question.recommended_option_id.0, TASK_START_OPTION);
+    assert!(matches!(
+        question.options[0].availability,
+        rivect::contracts::Availability::Enabled
+    ));
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 1);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 1);
+    assert_eq!(store_row_count(&world, COUNT_RECEIPTS), 1);
+
+    // A replay returns the recorded receipt and publishes no second question.
+    let replay = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 403, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "cmd-start-atomic",
+            "session_id": session.0, "kind": "create",
+            "goal": "start the ordinary first task",
+            "contract": { "criteria": [], "constraints": [] },
+            "first_question": true,
+        }
+    }));
+    assert_eq!(replay["result"]["task_id"], created["task_id"]);
+    assert_eq!(
+        replay["result"], created,
+        "the recorded receipt replays unchanged"
+    );
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 1);
+
+    // The flag is part of the digest: a changed replay is a conflict with
+    // zero new rows and zero new questions.
+    let changed = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 404, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "cmd-start-atomic",
+            "session_id": session.0, "kind": "create",
+            "goal": "start the ordinary first task",
+            "contract": { "criteria": [], "constraints": [] },
+        }
+    }));
+    assert_eq!(changed["error"]["data"]["code"], "conflict", "{changed}");
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 1);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 1);
+
+    // A non-boolean flag is refused typed, never coerced.
+    let non_boolean = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 405, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "cmd-start-non-bool",
+            "session_id": session.0, "kind": "create",
+            "goal": "never written",
+            "contract": { "criteria": [], "constraints": [] },
+            "first_question": "yes",
+        }
+    }));
+    assert_eq!(
+        non_boolean["error"]["data"]["code"], "invalid_input",
+        "{non_boolean}"
+    );
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 1);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 1);
+    assert_eq!(store_row_count(&world, COUNT_RECEIPTS), 1);
+
+    // A create whose question cannot be published rolls the task rows and
+    // the receipt back: the transaction is all-or-nothing.
+    let bad_task = rivect::contracts::TaskId::generate();
+    let bad_question = rivect::contracts::Question::task_start(&bad_task, 99);
+    let no_strings: &[String] = &[];
+    let failed = world
+        .runtime
+        .store_writer()
+        .create_task_and_publish(rivect::state::TaskCreateRequest {
+            session_id: &session,
+            command_id: "cmd-start-unpublished",
+            principal: "human",
+            goal: "never written",
+            contract: (no_strings, no_strings),
+            task_id: bad_task.clone(),
+            question: Some(&bad_question),
+        })
+        .expect_err("a stale question pin rolls the create back");
+    assert!(
+        matches!(failed, rivect::state::StoreError::StaleIntent { .. }),
+        "{failed:?}"
+    );
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 1);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 1);
+    assert!(
+        world
+            .runtime
+            .store()
+            .receipt("cmd-start-unpublished")
+            .expect("receipt read")
+            .is_none(),
+        "a rolled-back create records no receipt"
+    );
+}
+
+#[test]
+fn task_start_legacy_receipt_digest_replays_unchanged() {
+    let mut world = open_world("task-start-legacy", Some(&support::config_distinct_pools()));
+    let session = world.open_session("bootstrap-task-start-legacy");
+    let legacy = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 420, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "cmd-start-legacy",
+            "session_id": session.0, "kind": "create", "goal": "legacy goal",
+            "contract": { "criteria": [], "constraints": [] },
+        }
+    }));
+    assert!(legacy.get("error").is_none(), "{legacy}");
+    let (digest, _) = world
+        .runtime
+        .store()
+        .receipt("cmd-start-legacy")
+        .expect("receipt read")
+        .expect("legacy receipt");
+    let criteria: Vec<String> = Vec::new();
+    let expected = serde_json::to_string(&(
+        &session.0,
+        "local_user",
+        "legacy goal",
+        &criteria,
+        &criteria,
+    ))
+    .expect("legacy digest");
+    assert_eq!(
+        digest, expected,
+        "a no-flag create keeps the legacy 5-tuple"
+    );
+    let replay = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 421, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "cmd-start-legacy",
+            "session_id": session.0, "kind": "create", "goal": "legacy goal",
+            "contract": { "criteria": [], "constraints": [] },
+        }
+    }));
+    assert_eq!(replay["result"], legacy["result"]);
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 1);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 0);
+
+    let started = task_start_create(&mut world, &session, "cmd-start-digest");
+    let (digest, _) = world
+        .runtime
+        .store()
+        .receipt("cmd-start-digest")
+        .expect("receipt read")
+        .expect("start receipt");
+    let expected = serde_json::to_string(&(
+        &session.0,
+        "local_user",
+        "start the ordinary first task",
+        &criteria,
+        &criteria,
+        true,
+    ))
+    .expect("start digest");
+    assert_eq!(digest, expected, "a start create hashes the 6-tuple");
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 2);
+    assert!(started["task_id"].is_string());
+}
+
+#[test]
+fn create_task_and_publish_refuses_a_question_for_another_task() {
+    let mut world = open_world(
+        "task-start-mismatch",
+        Some(&support::config_distinct_pools()),
+    );
+    let session = world.open_session("bootstrap-task-start-mismatch");
+    let first = rivect::contracts::TaskId::generate();
+    let second = rivect::contracts::TaskId::generate();
+    let question = rivect::contracts::Question::task_start(&first, 1);
+    let no_strings: &[String] = &[];
+    let error = world
+        .runtime
+        .store_writer()
+        .create_task_and_publish(rivect::state::TaskCreateRequest {
+            session_id: &session,
+            command_id: "cmd-start-mismatch",
+            principal: "human",
+            goal: "never written",
+            contract: (no_strings, no_strings),
+            task_id: second,
+            question: Some(&question),
+        })
+        .expect_err("a question for another task is refused before the transaction");
+    assert!(
+        matches!(
+            error,
+            rivect::state::StoreError::InvalidInput(
+                rivect::state::InvalidCause::StartQuestionMismatch
+            )
+        ),
+        "{error:?}"
+    );
+    assert_eq!(store_row_count(&world, COUNT_TASKS), 0);
+    assert_eq!(store_row_count(&world, COUNT_QUESTIONS), 0);
+    assert_eq!(store_row_count(&world, COUNT_RECEIPTS), 0);
+}
+
+#[test]
+fn task_start_begin_dispatches_once_to_one_settlement() {
+    let (mut world, scope, _file, _grant) =
+        scoped_world("task-start-begin", Some(&support::config_distinct_pools()));
+    std::fs::write(scope.join("AGENTS.md"), "project instructions\n").expect("instruction file");
+    world.runtime.bind_first_task_scope(scope.clone());
+    let session = world.open_session("bootstrap-task-start-begin");
+
+    let created = task_start_create(&mut world, &session, "cmd-start-begin");
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    let question = task_start_question(&mut world, &session, &task);
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Option {
+            option_id: OptionId(TASK_START_OPTION.to_string()),
+        },
+        "cmd-start-begin-answer",
+    );
+    assert!(answered.get("error").is_none(), "{answered}");
+    assert_eq!(answered["result"]["status"], "applied");
+    assert_eq!(answered["result"]["snapshot"]["lifecycle"], "completed");
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "begin is the ordinary send, exactly once"
+    );
+    assert_eq!(world.worker_reads(), 1, "the declared read lands once");
+    let totals = world
+        .runtime
+        .store()
+        .settlement_totals()
+        .expect("settlement totals");
+    assert_eq!(totals.settled_count, 1);
+
+    // A replayed answer never sends a second time.
+    let replay = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Option {
+            option_id: OptionId(TASK_START_OPTION.to_string()),
+        },
+        "cmd-start-begin-answer",
+    );
+    assert_eq!(
+        replay["error"]["data"]["code"], "already_terminal",
+        "{replay}"
+    );
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let replay_question = world
+        .runtime
+        .store()
+        .current_question(&task)
+        .expect("question read")
+        .map_or(0, |_| 1);
+    assert_eq!(replay_question, 0, "a completed task serves no question");
+    println!(
+        "task-start: create=1 question=1 replay_question={replay_question} begin_sends=1 begin_reads=1 begin_settlements=1"
+    );
+}
+
+#[test]
+fn task_start_discovery_error_keeps_grant_and_uses_scope_root() {
+    let mut world = open_world(
+        "task-start-discovery-error",
+        Some(&support::config_distinct_pools()),
+    );
+    let scope = world.root.join("granted");
+    std::fs::create_dir_all(scope.join("AGENTS.md")).expect("directory candidate");
+    std::fs::write(scope.join("allowed.txt"), "under-scope bytes\n").expect("target");
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_manifest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    world
+        .runtime
+        .broker
+        .set_provider(Box::new(StartTargetProvider {
+            target: "allowed.txt".to_string(),
+            sends: sends.clone(),
+            last_manifest: last_manifest.clone(),
+        }));
+    world.runtime.set_read_scope(scope.clone(), scope.clone());
+    world.runtime.bind_first_task_scope(scope.clone());
+    let root = scope.canonicalize().expect("scope canonical");
+    assert!(
+        world
+            .runtime
+            .boot_diagnostics
+            .iter()
+            .any(|line| line.contains("instruction discovery failed")
+                && line.contains("not a regular file")),
+        "the discovery failure is a boot diagnostic: {:?}",
+        world.runtime.boot_diagnostics
+    );
+    assert_eq!(world.runtime.scoped_file, root);
+    assert!(!world.runtime.scoped_grant.is_empty());
+
+    let session = world.open_session("bootstrap-task-start-discovery-error");
+    let created = task_start_create(&mut world, &session, "cmd-start-discovery-error");
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    let question = task_start_question(&mut world, &session, &task);
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Option {
+            option_id: OptionId(TASK_START_OPTION.to_string()),
+        },
+        "cmd-start-discovery-error-answer",
+    );
+    assert!(answered.get("error").is_none(), "{answered}");
+    let manifest = last_manifest
+        .lock()
+        .expect("manifest lock")
+        .clone()
+        .expect("the dispatch manifest");
+    assert!(
+        manifest
+            .inputs
+            .contains(&format!("scope {}", root.display())),
+        "a root target is named as a scope hint: {}",
+        manifest.inputs
+    );
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn task_start_custom_answer_dispatches_once() {
+    let (mut world, scope, _file, _grant) =
+        scoped_world("task-start-custom", Some(&support::config_distinct_pools()));
+    std::fs::write(scope.join("AGENTS.md"), "project instructions\n").expect("instruction file");
+    world.runtime.bind_first_task_scope(scope.clone());
+    let session = world.open_session("bootstrap-task-start-custom");
+
+    let created = task_start_create(&mut world, &session, "cmd-start-custom");
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    let question = task_start_question(&mut world, &session, &task);
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Custom {
+            text: "explain the first result".to_string(),
+        },
+        "cmd-start-custom-answer",
+    );
+    assert!(answered.get("error").is_none(), "{answered}");
+    assert_eq!(answered["result"]["snapshot"]["lifecycle"], "completed");
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(world.worker_reads(), 1);
+    let manifest = world.last_manifest().expect("the custom manifest");
+    assert!(
+        manifest.inputs.contains("answer: explain the first result"),
+        "the custom text reaches the same dispatch: {}",
+        manifest.inputs
+    );
+    assert!(
+        manifest.inputs.contains("read "),
+        "an under-scope file is named for the read: {}",
+        manifest.inputs
+    );
+    let totals = world
+        .runtime
+        .store()
+        .settlement_totals()
+        .expect("settlement totals");
+    assert_eq!(totals.settled_count, 1);
+    let replay = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Custom {
+            text: "explain the first result".to_string(),
+        },
+        "cmd-start-custom-answer",
+    );
+    assert!(replay.get("error").is_some(), "{replay}");
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a replayed custom answer never sends again"
+    );
+    assert_eq!(world.worker_reads(), 1);
+    println!("task-start custom: create=1 question=1 sends=1 reads=1 settlements=1");
+}
+
+#[test]
+fn task_start_scope_binding_falls_back_to_the_granted_root() {
+    let mut world = open_world(
+        "task-start-fallback",
+        Some(&support::config_distinct_pools()),
+    );
+    let granted = world.root.join("granted");
+    let parent = world.root.join("parent");
+    std::fs::create_dir_all(&granted).expect("granted root");
+    std::fs::create_dir_all(&parent).expect("parent root");
+    std::fs::write(granted.join("allowed.txt"), "under-scope bytes\n").expect("target file");
+    std::fs::write(parent.join("AGENTS.md"), "above the grant\n").expect("parent instruction");
+    let sends = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_manifest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    world
+        .runtime
+        .broker
+        .set_provider(Box::new(StartTargetProvider {
+            target: "allowed.txt".to_string(),
+            sends: sends.clone(),
+            last_manifest: last_manifest.clone(),
+        }));
+    world
+        .runtime
+        .set_read_scope(granted.clone(), granted.clone());
+    world.runtime.bind_first_task_scope(parent.clone());
+    let session = world.open_session("bootstrap-task-start-fallback");
+
+    let created = task_start_create_with(
+        &mut world,
+        &session,
+        "cmd-start-fallback",
+        &["observe the resolved target"],
+    );
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    let question = task_start_question(&mut world, &session, &task);
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Option {
+            option_id: OptionId(TASK_START_OPTION.to_string()),
+        },
+        "cmd-start-fallback-answer",
+    );
+    assert!(answered.get("error").is_none(), "{answered}");
+    assert_eq!(answered["result"]["snapshot"]["lifecycle"], "completed");
+    let manifest = last_manifest
+        .lock()
+        .expect("manifest lock")
+        .clone()
+        .expect("the dispatch manifest");
+    assert!(
+        manifest.inputs.contains("scope "),
+        "a root target is a scope hint, not a read path: {}",
+        manifest.inputs
+    );
+    assert!(
+        !manifest.inputs.contains("\nread "),
+        "a root target never reads the directory as a file: {}",
+        manifest.inputs
+    );
+    let evidence = world
+        .runtime
+        .store()
+        .evidence_for_task(&task)
+        .expect("recorded evidence");
+    assert_eq!(
+        evidence.len(),
+        1,
+        "one resolved read records one evidence row"
+    );
+    let resolved = granted
+        .canonicalize()
+        .expect("granted root canonical")
+        .join("allowed.txt");
+    assert!(
+        evidence[0]
+            .observation
+            .contains(&resolved.display().to_string()),
+        "the observation names the resolved absolute target: {evidence:?}"
+    );
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn task_start_unbound_scope_denies_typed() {
+    let mut world = open_world(
+        "task-start-unbound",
+        Some(&support::config_distinct_pools()),
+    );
+    let session = world.open_session("bootstrap-task-start-unbound");
+    let created = task_start_create(&mut world, &session, "cmd-start-unbound");
+    let task = rivect::contracts::TaskId(created["task_id"].as_str().expect("task id").to_string());
+    let question = task_start_question(&mut world, &session, &task);
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &question,
+        AnswerSelection::Option {
+            option_id: OptionId(TASK_START_OPTION.to_string()),
+        },
+        "cmd-start-unbound-answer",
+    );
+    assert!(answered["error"].is_object(), "{answered}");
+    assert_eq!(
+        answered["error"]["data"]["code"], "denied",
+        "an unbound read scope denies with its typed class: {answered}"
+    );
+    assert_eq!(
+        world
+            .provider_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an unbound scope never sends"
+    );
+}
+
+#[test]
+fn task_start_reserved_begin_is_refused_by_fork_validation() {
+    let mut world = open_world("task-start-fork", None);
+    let session = world.open_session("bootstrap-task-start-fork");
+    let task = world.create_task(&session, "cmd-start-fork");
+    let config = rivect::config::Config::parse_validated(&support::base_config())
+        .expect("the decision config parses");
+    let mut input = support::decision_input(&task);
+    input.options[0].option_id = OptionId(TASK_START_OPTION.to_string());
+    input.recommended_option_id = OptionId(TASK_START_OPTION.to_string());
+    let error = rivect::actions::ActionRegistry::new()
+        .resolve_decision(input, &mut world.runtime.action_context(&session, &config))
+        .expect_err("the reserved start id never becomes a fork position");
+    assert!(
+        matches!(
+            error,
+            rivect::actions::ActionError::ReservedOptionId { ref option_id }
+                if option_id == TASK_START_OPTION
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn task_start_fallback_candidate_named_begin_keeps_its_frozen_manifest() {
+    let config = "config_version = 1\n\
+         [connections.primary]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11434\"\n\
+         [connections.begin]\nkind = \"local\"\nendpoint = \"http://127.0.0.1:11435\"\n\
+         [models.defaults]\n\
+         model = { mode = \"fixed\", connection = \"primary\", model_id = \"fixture-model\" }\n\
+         effort = { mode = \"fixed\", value = \"medium\" }\n\
+         fallback = { mode = \"manual\" }\n";
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = FallbackBeginProvider {
+        inner: rivect::providers::LoopbackProvider::new(),
+        sent: sent.clone(),
+    };
+    let mut world = support::open_world_with(
+        "task-start-fallback-begin",
+        Some(config),
+        Box::new(provider),
+        Box::new(support::PlatformWorker::default()),
+    );
+    let scope = world.root.join("scope");
+    std::fs::create_dir_all(&scope).expect("scope dir");
+    let file = scope.join("allowed.txt");
+    std::fs::write(&file, "fallback target\n").expect("target file");
+    world.runtime.purpose = "main".to_string();
+    world.runtime.set_read_scope(scope, file);
+    let session = world.open_session("bootstrap-task-start-fallback-begin");
+    let task = world.create_task(&session, "cmd-start-fallback-begin");
+    let first = world.publish(&session, &task);
+    let first_answer = world.dispatch(&corpus_answer_custom(
+        &session,
+        "cmd-start-fallback-begin-answer",
+        &task,
+        &first,
+        "steps",
+        json!(410),
+    ));
+    assert!(first_answer["error"].is_null(), "{first_answer}");
+    let served = task_start_question(&mut world, &session, &task);
+    assert!(
+        served
+            .options
+            .iter()
+            .any(|option| option.option_id.0 == "begin"),
+        "the fallback serves a candidate genuinely named begin: {served:?}"
+    );
+    let answered = answer_start(
+        &mut world,
+        &session,
+        &task,
+        &served,
+        AnswerSelection::Option {
+            option_id: OptionId("begin".to_string()),
+        },
+        "cmd-start-fallback-begin-pick",
+    );
+    assert!(answered.get("error").is_none(), "{answered}");
+    let manifests = sent.lock().expect("wire log lock");
+    assert_eq!(manifests.len(), 2, "the primary and the substitute sent");
+    assert_eq!(
+        manifests[0].inputs, manifests[1].inputs,
+        "a fallback candidate named begin dispatches the frozen manifest unchanged"
+    );
+}
+
+// ----- packaged entry binding: headless process and TUI PTY -----
+
+/// One loopback Chat Completions peer: counts POSTs, captures their bodies,
+/// and answers with one streamed `read_file` tool call for `read_path`.
+struct ChatPeer {
+    base: String,
+    address: std::net::SocketAddr,
+    requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChatPeer {
+    fn start(read_path: &'static str) -> Self {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the chat peer");
+        let address = listener.local_addr().expect("peer address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_requests = requests.clone();
+        let thread_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let Some((method, target, _body)) = read_chat_request(&mut stream) else {
+                    continue;
+                };
+                if method == "POST" && target.starts_with("/v1/chat/completions") {
+                    thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = chat_stream(read_path);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    let written = stream
+                        .write_all(head.as_bytes())
+                        .and_then(|()| stream.write_all(response.as_bytes()))
+                        .and_then(|()| stream.flush());
+                    drop(written);
+                } else {
+                    let body = json!({"object": "list", "data": []}).to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let written = stream
+                        .write_all(head.as_bytes())
+                        .and_then(|()| stream.write_all(body.as_bytes()))
+                        .and_then(|()| stream.flush());
+                    drop(written);
+                }
+            }
+        });
+        Self {
+            base: format!("http://{address}"),
+            address,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}/v1", self.base)
+    }
+
+    fn requests(&self) -> u64 {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ChatPeer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(stream) = std::net::TcpStream::connect(self.address) {
+            drop(stream);
+        }
+        if let Some(handle) = self.handle.take() {
+            let joined = handle.join();
+            drop(joined);
+        }
+    }
+}
+
+fn read_chat_request(stream: &mut std::net::TcpStream) -> Option<(String, String, Vec<u8>)> {
+    use std::io::{BufRead, BufReader, Read};
+    let reader = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let target = parts.next()?.to_string();
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).ok()?;
+        if header.trim_end().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().ok()?;
+        }
+    }
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body).ok()?;
+    Some((method, target, body))
+}
+
+fn chat_stream(read_path: &str) -> String {
+    let arguments = serde_json::to_string(&json!({"path": read_path})).expect("tool arguments");
+    let call = json!({
+        "index": 0,
+        "id": "call-start",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": arguments},
+    });
+    let delta = json!({
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}, "finish_reason": null}],
+    });
+    let finish = json!({
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+    });
+    let usage = json!({
+        "id": "c1",
+        "choices": [],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+    });
+    format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+}
+
+fn local_chat_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.vllm]\nkind = \"local\"\nendpoint = \"{endpoint}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"vllm\", model_id = \"fixture-chat-model\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+#[test]
+fn headless_entry_creates_the_start_question_and_denies_a_machine_answer() {
+    use std::io::{BufRead, BufReader, Read as _, Write as _};
+    let peer = ChatPeer::start("notes.txt");
+    let root = tempfile::TempDir::with_prefix("rivect-headless-start-").expect("fixture root");
+    let data = root.path().join("data root");
+    let cwd = root.path().join("nested project юникод");
+    std::fs::create_dir_all(&data).expect("data root");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    std::fs::write(cwd.join("AGENTS.md"), "headless instructions\n").expect("instruction");
+    std::fs::write(cwd.join("notes.txt"), "headless target\n").expect("target");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("config write");
+
+    let mut command = std::process::Command::new(rivect_binary());
+    command
+        .args(["--headless", "--data-root"])
+        .arg(&data)
+        .current_dir(&cwd)
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for name in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command.spawn().expect("spawn the headless entry");
+    let mut stdin = child.stdin.take().expect("headless stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("headless stdout"));
+    let mut stderr = child.stderr.take().expect("headless stderr");
+    let mut frame = |value: Value| -> Value {
+        writeln!(stdin, "{value}").expect("write frame");
+        stdin.flush().expect("flush frame");
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read answer");
+        serde_json::from_str(&line).expect("answer frame")
+    };
+    let attach = frame(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session.attach",
+        "params": {"schema_version": 1, "bootstrap_id": "headless-start"},
+    }));
+    let session = attach["result"]["session_id"].clone();
+    let create = frame(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "headless-start-create",
+            "session_id": session, "kind": "create",
+            "goal": "start from the headless entry",
+            "contract": {"criteria": [], "constraints": []},
+            "first_question": true,
+        }
+    }));
+    let task = create["result"]["task_id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let question_id = format!("task-start:{task}");
+    let answered = frame(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "task.submit",
+        "params": {
+            "schema_version": 1, "command_id": "headless-start-answer",
+            "session_id": session, "kind": "answer", "task_id": task,
+            "expected_intent_revision": 1,
+            "question_id": question_id, "question_revision": 1,
+            "selection": {"kind": "option", "option_id": TASK_START_OPTION},
+        }
+    }));
+    let usage = frame(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "command.execute",
+        "params": {
+            "schema_version": 1, "session_id": session,
+            "command": {"kind": "usage.view"},
+        }
+    }));
+    let permissions = frame(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "command.execute",
+        "params": {
+            "schema_version": 1, "session_id": session,
+            "command": {"kind": "permissions.view"},
+        }
+    }));
+    assert_eq!(
+        permissions["result"]["grant"]["scope_root"],
+        json!(cwd.canonicalize().expect("cwd canonical").to_string_lossy()),
+        "run_headless binds the declared read grant to the process cwd"
+    );
+    drop(stdin);
+    let status = child.wait().expect("headless exit");
+    let mut error_text = String::new();
+    stderr
+        .read_to_string(&mut error_text)
+        .expect("read headless stderr");
+    // The headless channel is the machine ingress: it creates the production
+    // start question, but a machine frame never proves human consent, so the
+    // answer is refused typed and the pending question is preserved.
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "headless run exit {status:?}: {error_text}"
+    );
+    assert_eq!(create["result"]["snapshot"]["lifecycle"], "waiting");
+    assert_eq!(answered["error"]["data"]["code"], "denied", "{answered}");
+    assert_eq!(usage["result"]["totals"]["settled_count"], 0);
+    assert_eq!(peer.requests(), 0, "a denied answer never sends");
+    let conn = rusqlite::Connection::open(data.join("runtime").join("rivect.db"))
+        .expect("open the headless store");
+    let questions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM questions", [], |row| row.get(0))
+        .expect("count questions");
+    assert_eq!(
+        questions, 1,
+        "the denied machine answer preserves the pending question"
+    );
+    println!("task-start headless: create=1 question=1 machine_answer=denied");
+}
+
+#[test]
+fn tui_composer_start_question_completes_with_one_settlement() {
+    let peer = ChatPeer::start("AGENTS.md");
+    let root = tempfile::TempDir::with_prefix("rivect-tui-start-").expect("fixture root");
+    let data = root.path().join("data");
+    let cwd = root.path().join("tui project");
+    std::fs::create_dir_all(&data).expect("data root");
+    std::fs::create_dir_all(&cwd).expect("project cwd");
+    std::fs::write(cwd.join("AGENTS.md"), "tui instructions\n").expect("instruction");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("config write");
+
+    let mut command = support::pty_command(rivect_binary());
+    command.arg("--data-root");
+    command.arg(&data);
+    command.cwd(&cwd);
+    let mut pty =
+        support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("spawn the TUI");
+    assert!(
+        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
+            .expect("pty read"),
+        "the TUI enters the alternate screen"
+    );
+    pty.send("do the first task\r".as_bytes())
+        .expect("pty send");
+    let card = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
+        .expect("start card");
+    assert!(card.contains("Begin"), "the start card names begin: {card}");
+    std::thread::sleep(Duration::from_millis(300));
+    pty.send(b"\r").expect("pty send enter");
+    let answered = wait_for_visible_tui_text(
+        &pty,
+        "decision answer recorded; task resumed",
+        Duration::from_secs(10),
+    )
+    .expect("answer note");
+    assert!(
+        answered.contains("decision answer recorded; task resumed"),
+        "{answered}"
+    );
+    let completed = wait_for_visible_tui_text(&pty, "completed", Duration::from_secs(10))
+        .expect("completed dock");
+    assert!(completed.contains("completed"), "{completed}");
+    pty.send(b"\x1b").expect("pty send exit");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+
+    let db = data.join("runtime").join("rivect.db");
+    let conn = rusqlite::Connection::open(&db).expect("open the TUI store");
+    let settlements: i64 = conn
+        .query_row("SELECT COUNT(*) FROM usage_settlements", [], |row| {
+            row.get(0)
+        })
+        .expect("count settlements");
+    assert_eq!(settlements, 1);
+    assert_eq!(peer.requests(), 1, "the card's begin sends once");
+    pty.finish().expect("pty teardown");
+    println!("task-start: tui card opened; begin_sends=1 begin_settlements=1");
 }

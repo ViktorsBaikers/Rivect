@@ -116,6 +116,91 @@ pub struct SentCostExplain {
     pub confirmed: Option<u64>,
 }
 
+/// The four matched strategies a keep-model/effort-only/handoff/escalation
+/// evaluation compares on one frozen task (AC-048).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedStrategy {
+    KeepModel,
+    EffortOnly,
+    Handoff,
+    Escalation,
+}
+
+impl MatchedStrategy {
+    /// The matched report's spelling of the strategy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepModel => "keep-model",
+            Self::EffortOnly => "effort-only",
+            Self::Handoff => "handoff",
+            Self::Escalation => "escalation",
+        }
+    }
+}
+
+/// One matched trial's accounted token legs. The main attempt's total already
+/// contains its own context prompt and provider cache legs, so those are the
+/// attempt's breakdown and are never added a second time; the repair and proof
+/// attempts are separate settled sends and are added once each. A leg the
+/// provider never reported stays `None`, so an incomplete account is
+/// uncertain — never a fabricated zero and never the cheapest trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchedTrial {
+    pub strategy: MatchedStrategy,
+    /// The main attempt's provider-reported total.
+    pub attempt_tokens: Option<u64>,
+    /// Prompt tokens inside [`Self::attempt_tokens`].
+    pub context_tokens: Option<u64>,
+    /// Provider cache legs inside [`Self::attempt_tokens`].
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    /// Settled totals of the repair attempts the strategy needed.
+    pub repair_tokens: Option<u64>,
+    /// Settled totals of the proof attempts the strategy needed.
+    pub proof_tokens: Option<u64>,
+}
+
+impl MatchedTrial {
+    /// Whether every leg was reported, so the trial has a full account.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.attempt_tokens.is_some()
+            && self.context_tokens.is_some()
+            && self.cache_read_tokens.is_some()
+            && self.cache_write_tokens.is_some()
+            && self.repair_tokens.is_some()
+            && self.proof_tokens.is_some()
+    }
+
+    /// The full account: the main attempt plus its repair and proof attempts,
+    /// each counted once. `None` while any leg is unknown — an incomplete
+    /// account is uncertain, never a number a tariff comparison can use.
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u64> {
+        if !self.complete() {
+            return None;
+        }
+        self.attempt_tokens?
+            .checked_add(self.repair_tokens?)?
+            .checked_add(self.proof_tokens?)
+    }
+}
+
+/// Orders the four strategies by the full account, not by tariff alone. An
+/// incomplete trial sorts after every complete one: its uncertainty is never
+/// read as cheaper. Ties keep the caller's order.
+#[must_use]
+pub fn matched_ranking(trials: &[MatchedTrial]) -> Vec<MatchedStrategy> {
+    let mut ordered: Vec<&MatchedTrial> = trials.iter().collect();
+    ordered.sort_by_key(|trial| {
+        trial
+            .total_tokens()
+            .map_or((true, u64::MAX), |total| (false, total))
+    });
+    ordered.into_iter().map(|trial| trial.strategy).collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
     #[error("model configuration: {0}")]

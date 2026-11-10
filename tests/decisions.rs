@@ -23,7 +23,8 @@ use rivect::actions::{
 use rivect::config::Config;
 use rivect::contracts::{
     AnswerAttemptOutcome, AnswerSelection, Availability, EffectClass, EvidenceValidity,
-    KNOWN_READY_OPTION, OptionId, Question, QuestionOption, SessionId, TEXT_MAX_BYTES, TaskId,
+    KNOWN_READY_OPTION, OptionId, Question, QuestionOption, SessionId, TASK_START_OPTION,
+    TEXT_MAX_BYTES, TaskId,
 };
 use rivect::policy::ModeDecision;
 use rivect::state::{ConflictCause, InvalidCause, Missing, StoreError};
@@ -2085,6 +2086,14 @@ fn fork_validation_rejects_dishonest_shapes() {
     assert!(matches!(
         reject(dead_pick, "recommended position disabled"),
         ActionError::RecommendationNotSelectable { .. }
+    ));
+
+    let mut reserved = decision_input(&task);
+    reserved.options[0].option_id = OptionId(TASK_START_OPTION.to_string());
+    reserved.recommended_option_id = OptionId(TASK_START_OPTION.to_string());
+    assert!(matches!(
+        reject(reserved, "reserved start option"),
+        ActionError::ReservedOptionId { ref option_id } if option_id == TASK_START_OPTION
     ));
 
     let mut basisless = decision_input(&task);

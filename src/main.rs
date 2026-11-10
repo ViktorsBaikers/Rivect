@@ -81,13 +81,30 @@ fn main() {
             let code = run_command(&data_root, &kind);
             std::process::exit(code);
         }
+        cli::Invocation::UiReview { state } => {
+            // The review entry is terminal-only and opens nothing else: an
+            // unknown state was refused by the grammar, and a non-TTY refuses
+            // before the guard so no data root, store or provider is touched.
+            if !(io::stdout().is_tty() && io::stdin().is_tty()) {
+                eprintln!("ui review requires a terminal: {state}");
+                std::process::exit(2);
+            }
+            match rivect::ui::review::ReviewState::run(&state) {
+                Ok(code) => std::process::exit(code),
+                Err(source) => {
+                    eprintln!("ui review failed: {source}");
+                    std::process::exit(2);
+                }
+            }
+        }
         cli::Invocation::Run {
             headless,
+            render,
             data_root,
         } => {
             let is_tty = io::stdout().is_tty() && io::stdin().is_tty();
             if !headless && is_tty {
-                match rivect::ui::run_tui(&data_root) {
+                match rivect::ui::run_tui_with_mode(&data_root, render) {
                     Ok(code) => std::process::exit(code),
                     Err(source) => {
                         report_cli_error(&CliError::Tui(source));
@@ -303,11 +320,17 @@ fn run_headless(data_root: &Path) -> i32 {
     // files reach the assembled request. A working directory that cannot be
     // read hands no root and discovers nothing — never a failed boot.
     runtime.set_instructions_root(std::env::current_dir().ok());
-    // The same directory is the declared read scope a shipped `read_file`
-    // addresses: the entry binds it here, so a real binary's read is admitted
-    // under a real grant instead of `UnknownGrant`.
-    if let Ok(scope) = std::env::current_dir() {
-        runtime.bind_read_scope(scope);
+    if let Ok(cwd) = std::env::current_dir() {
+        runtime.set_instructions_root(Some(cwd.clone()));
+        // The same directory is the declared read scope a shipped `read_file`
+        // addresses: the entry binds it here, so a real binary's read is
+        // admitted under a real grant instead of `UnknownGrant`.
+        runtime.bind_read_scope(cwd.clone());
+        // The first-task target is the most specific instruction file inside
+        // that grant, else the scope root itself (TD-13).
+        runtime.bind_first_task_scope(cwd);
+    } else {
+        runtime.set_instructions_root(None);
     }
     // Boot recovery verdicts a human must resolve report on stderr —
     // machine stdout stays pure JSON.
@@ -767,8 +790,17 @@ mod tests {
             Step::Continue
         );
         assert_eq!(exit.status(), 2, "the usage refusal is the run's class");
-        // error (3): a served row this build cannot serve.
-        let error = command_frame(&session, "docs.status", 2);
+        // error (3): a served row whose store lookup names no such task.
+        let error = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "command.execute",
+            "params": {
+                "schema_version": 1,
+                "session_id": session,
+                "command": { "kind": "context.view" },
+                "task_id": "missing-task",
+            }
+        })
+        .to_string();
         assert_eq!(
             handle_event(
                 LoopEvent::Frame(error),

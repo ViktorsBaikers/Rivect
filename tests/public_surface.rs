@@ -1,9 +1,8 @@
-//! The canonical public surface (AC-077): one 36-row catalog with 35 rows
-//! served and one named typed-unavailable row, both alias pairs resolving in
-//! the dispatcher, help and completions rendered from that page, a machine
-//! channel that keeps stdout pure and its exit status distinguishing success,
-//! error and pending, and the sessionless doctor answering before any runtime
-//! open without touching the root.
+//! The canonical public surface (AC-077): one 36-row catalog with every row
+//! served, both alias pairs resolving in the dispatcher, help and completions
+//! rendered from that page, a machine channel that keeps stdout pure and its
+//! exit status distinguishing success, error and pending, and the sessionless
+//! doctor answering before any runtime open without touching the root.
 
 #![allow(
     clippy::expect_used,
@@ -76,6 +75,12 @@ fn execute(world: &mut support::World, session: &SessionId, kind: &str, extra: V
 /// Runs the built executable with a clean environment: only the variables a
 /// process needs to find its own runtime and temporary directory are passed.
 fn run_cli(args: &[&str], stdin: Option<&str>) -> Output {
+    run_cli_env(args, stdin, &[])
+}
+
+/// Runs the built executable with the caller's extra environment on top of
+/// the process allowlist.
+fn run_cli_env(args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
     use std::io::Write as _;
     let mut command = std::process::Command::new(support::rivect_binary());
     command
@@ -88,6 +93,9 @@ fn run_cli(args: &[&str], stdin: Option<&str>) -> Output {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
+    }
+    for (name, value) in env {
+        command.env(name, value);
     }
     let mut child = command.spawn().expect("spawn rivect");
     if let Some(text) = stdin {
@@ -194,7 +202,7 @@ fn catalog_is_the_enumerated_thirty_six_rows_in_order() {
 }
 
 #[test]
-fn thirty_five_rows_are_available_and_docs_status_carries_its_exact_reason() {
+fn every_catalog_row_is_available_through_its_own_carrier() {
     let page = tools::describe();
     let command_rows = &page.items[..ROWS.len()];
     let available = command_rows
@@ -202,17 +210,8 @@ fn thirty_five_rows_are_available_and_docs_status_carries_its_exact_reason() {
         .filter(|item| item.available)
         .map(|item| item.canonical_id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(available.len(), 35, "35 of the 36 rows are served");
+    assert_eq!(available.len(), 36, "all 36 rows are served");
     for item in command_rows {
-        if item.canonical_id == "docs.status" {
-            assert!(!item.available, "{item:?}");
-            assert_eq!(
-                item.unavailability_reason.as_deref(),
-                Some("docs owner not installed"),
-                "the one tolerated row names its exact reason"
-            );
-            continue;
-        }
         assert!(item.available, "{} is served: {item:?}", item.canonical_id);
         assert!(
             item.unavailability_reason.is_none(),
@@ -222,6 +221,10 @@ fn thirty_five_rows_are_available_and_docs_status_carries_its_exact_reason() {
         assert!(!item.description.is_empty(), "{}", item.canonical_id);
         assert!(!item.busy_policy.is_empty(), "{}", item.canonical_id);
     }
+    assert!(
+        tools::unavailable_rows().is_empty(),
+        "no catalog row remains unbuilt"
+    );
 }
 
 #[test]
@@ -260,19 +263,26 @@ fn every_available_row_is_reachable_through_its_declared_carrier() {
         }
     }
 
-    // The one unbuilt row answers typed with its own reason, never a blanket
-    // refusal and never a fabricated result.
-    let mut world = support::open_world("public-surface-unavailable", None);
-    let session = world.open_session("public-surface-unavailable");
-    let response = execute(&mut world, &session, "docs.status", json!({}));
+    // The docs owner answers its own real result: the declared direct source,
+    // version-aware policy, bounded cache and an honest unknown quota — no
+    // external refresh and no fabricated balance.
+    let mut world = support::open_world("public-surface-carriers", None);
+    let session = world.open_session("public-surface-carriers");
+    let docs = execute(&mut world, &session, "docs.status", json!({}));
+    assert!(docs.get("error").is_none(), "{docs}");
+    assert_eq!(docs["result"]["kind"], "docs.status", "{docs}");
+    assert_eq!(docs["result"]["owner"], "src/docs.rs", "{docs}");
+    assert_eq!(docs["result"]["version_aware"], true, "{docs}");
     assert_eq!(
-        response["error"]["data"]["code"], "capability_unavailable",
-        "{response}"
+        docs["result"]["source_classes"],
+        json!(["direct_local"]),
+        "{docs}"
     );
+    assert_eq!(docs["result"]["quota"], "unknown", "{docs}");
     assert_eq!(
-        response["error"]["data"]["message"],
-        "docs.status is unavailable: docs owner not installed",
-        "{response}"
+        docs["result"]["cache"]["max_entries"],
+        rivect::docs::CACHE_MAX_ENTRIES,
+        "{docs}"
     );
 
     // Every served row answers through its own handler with a discriminating
@@ -306,6 +316,7 @@ fn every_available_row_is_reachable_through_its_declared_carrier() {
         ("config.validate", json!({})),
         ("view.clear", json!({})),
         ("decisions.control", json!({ "op": "status" })),
+        ("docs.status", json!({})),
     ];
     for (kind, extra) in served {
         let response = execute(&mut world, &session, kind, extra.clone());
@@ -388,6 +399,11 @@ fn every_available_row_is_reachable_through_its_declared_carrier() {
             "workflow.control" => {
                 assert_eq!(result["op"], "status", "{result}");
                 assert_eq!(result["entry"]["key"], "workflow.enabled", "{result}");
+            }
+            "docs.status" => {
+                assert_eq!(result["owner"], "src/docs.rs", "{result}");
+                assert_eq!(result["quota"], "unknown", "{result}");
+                assert_eq!(result["cache"]["cached_entries"], 0, "{result}");
             }
             "config.list" | "config.export" => assert_eq!(
                 result["entries"].as_array().map(Vec::len),
@@ -732,8 +748,8 @@ fn every_declared_alias_dispatches_and_the_catalog_is_the_source() {
             );
             if row.canonical_id == "docs.status" {
                 assert_eq!(
-                    response["error"]["data"]["code"], "capability_unavailable",
-                    "the unbuilt row's alias keeps its typed refusal: {response}"
+                    response["result"]["kind"], "docs.status",
+                    "the alias reaches the docs owner's result, not a refusal: {response}"
                 );
             }
         }
@@ -1216,6 +1232,14 @@ fn help_and_completions_are_rendered_from_the_page() {
         "{text}"
     );
     assert!(text.contains("rivect doctor [--project PATH]"), "{text}");
+    assert!(text.contains("rivect [--tui fullscreen|inline]"), "{text}");
+    // Both surfaces parse; an unbuilt mode is a grammar refusal, not a
+    // silently ignored word.
+    assert_eq!(
+        run_cli(&["--tui", "inline", "--help"], None).status.code(),
+        Some(0)
+    );
+    assert_eq!(run_cli(&["--tui", "sideways"], None).status.code(), Some(2));
 
     for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
         let output = run_cli(&["completions", shell.id()], None);
@@ -1250,6 +1274,35 @@ fn help_and_completions_are_rendered_from_the_page() {
 }
 
 #[test]
+fn ui_review_refuses_unknown_state_and_non_tty_without_opening_a_root() {
+    let root = tempfile::TempDir::with_prefix("rivect-ui-review-refusal-").expect("temp");
+    let data_root = root.path().join("never opened");
+    let env = [("RIVECT_DATA_ROOT", data_root.to_str().expect("utf-8 root"))];
+
+    let unknown = run_cli_env(&["--ui-review", "not-a-state"], None, &env);
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    assert!(
+        stderr_of(&unknown).contains("unknown ui review state not-a-state"),
+        "{unknown:?}"
+    );
+    assert!(
+        !data_root.exists(),
+        "an unknown state opens no runtime, store or data root"
+    );
+
+    let non_tty = run_cli_env(&["--ui-review", "start-no-connection"], None, &env);
+    assert_eq!(non_tty.status.code(), Some(2), "{non_tty:?}");
+    assert!(
+        stderr_of(&non_tty).contains("ui review requires a terminal"),
+        "{non_tty:?}"
+    );
+    assert!(
+        !data_root.exists(),
+        "a non-TTY refusal opens no runtime, store or data root"
+    );
+}
+
+#[test]
 fn every_completion_word_is_a_dispatcher_request_and_help_agrees() {
     // Every emitted word parses through the grammar into a dispatcher request:
     // stdout carries a JSON answer and stderr never carries the usage banner.
@@ -1268,7 +1321,7 @@ fn every_completion_word_is_a_dispatcher_request_and_help_agrees() {
             "{word} must answer through the dispatcher: stdout={stdout:?} stderr={stderr:?}"
         );
         assert!(
-            !stderr.contains("rivect [--tui fullscreen]"),
+            !stderr.contains("rivect [--tui fullscreen|inline]"),
             "{word} must not print the grammar's usage banner: {stderr:?}"
         );
         assert!(help.contains(&word), "help must agree with the word {word}");

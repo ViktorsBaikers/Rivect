@@ -179,6 +179,8 @@ pub enum ConflictCause {
 pub enum InvalidCause {
     #[error("goal must be non-empty bounded text")]
     EmptyGoal,
+    #[error("start question must belong to the created task and carry its reserved id")]
+    StartQuestionMismatch,
     #[error("unknown option {option_id} for question {question_id}")]
     UnknownOption {
         option_id: String,
@@ -1195,6 +1197,19 @@ fn require_known_generation(generation: u64) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// The one owner-local create transaction's inputs: the task identity and the
+/// optional start question travel together, so the command helper has one
+/// carrier instead of a positional argument list.
+pub struct TaskCreateRequest<'a> {
+    pub session_id: &'a SessionId,
+    pub command_id: &'a str,
+    pub principal: &'a str,
+    pub goal: &'a str,
+    pub contract: (&'a [String], &'a [String]),
+    pub task_id: TaskId,
+    pub question: Option<&'a Question>,
 }
 
 impl TaskStore {
@@ -3036,13 +3051,62 @@ impl TaskStore {
         goal: &str,
         contract: (&[String], &[String]),
     ) -> Result<CommandResult> {
+        self.create_task_command(TaskCreateRequest {
+            session_id,
+            command_id,
+            principal,
+            goal,
+            contract,
+            task_id: TaskId::generate(),
+            question: None,
+        })
+    }
+
+    /// One transaction writes the task rows, the create receipt and exactly
+    /// one pending task-start question (TD-11). The returned snapshot is read
+    /// after the question insert, so it names the committed `waiting`
+    /// revision; a receipt replay returns before the insert, and a failed
+    /// insert rolls every row back.
+    pub fn create_task_and_publish(
+        &mut self,
+        request: TaskCreateRequest<'_>,
+    ) -> Result<CommandResult> {
+        let Some(question) = request.question else {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::StartQuestionMismatch,
+            ));
+        };
+        if question.task_id != request.task_id
+            || question.question_id != Question::task_start_question_id(&request.task_id)
+        {
+            return Err(StoreError::InvalidInput(
+                InvalidCause::StartQuestionMismatch,
+            ));
+        }
+        self.create_task_command(request)
+    }
+
+    fn create_task_command(&mut self, request: TaskCreateRequest<'_>) -> Result<CommandResult> {
+        let TaskCreateRequest {
+            session_id,
+            command_id,
+            principal,
+            goal,
+            contract,
+            task_id,
+            question,
+        } = request;
         let (criteria, constraints) = contract;
+        let first_question = question.is_some();
         if goal.is_empty() || goal.len() > crate::contracts::TEXT_MAX_BYTES {
             return Err(StoreError::InvalidInput(InvalidCause::EmptyGoal));
         }
-        let params_digest =
+        let params_digest = if first_question {
+            serde_json::to_string(&(&session_id.0, principal, goal, criteria, constraints, true))
+        } else {
             serde_json::to_string(&(&session_id.0, principal, goal, criteria, constraints))
-                .map_err(storage)?;
+        }
+        .map_err(storage)?;
         if let Some((digest, result_json)) = self.receipt(command_id)? {
             if digest != params_digest {
                 return Err(StoreError::Conflict(ConflictCause::DuplicateCommand {
@@ -3052,10 +3116,12 @@ impl TaskStore {
             let result: CommandResult = serde_json::from_str(&result_json).map_err(storage)?;
             return Ok(result);
         }
-        let task_id = TaskId::generate();
         let goal_bytes = goal.as_bytes().to_vec();
         let digest = crate::config::hex(&sha2::Sha256::digest(&goal_bytes));
-        let tx = self.conn_mut()?.transaction().map_err(storage)?;
+        let tx = self
+            .conn_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
         tx.execute(
             sql::INSERT_TASK,
             params![
@@ -3093,13 +3159,16 @@ impl TaskStore {
             json!({ "task_id": task_id.0, "goal_digest": digest }),
             "human",
         )?;
+        if let Some(question) = question {
+            Self::insert_question(&tx, session_id, question)?;
+        }
         let snapshot = Self::snapshot_in_tx(&tx, &task_id)?;
         let result = CommandResult {
             status: "accepted".to_string(),
             task_id,
             task_revision: snapshot.revision,
             intent_revision: snapshot.intent_revision,
-            event_cursor: 1,
+            event_cursor: snapshot.event_cursor,
             snapshot,
             contract_revision: Some(1),
         };
@@ -8772,6 +8841,15 @@ impl StoreWriter<'_> {
         question: &Question,
     ) -> Result<TaskSnapshot> {
         self.store.publish_question(session_id, question)
+    }
+
+    /// # Errors
+    /// See [`TaskStore::create_task_and_publish`].
+    pub fn create_task_and_publish(
+        &mut self,
+        request: TaskCreateRequest<'_>,
+    ) -> Result<CommandResult> {
+        self.store.create_task_and_publish(request)
     }
 
     /// # Errors
