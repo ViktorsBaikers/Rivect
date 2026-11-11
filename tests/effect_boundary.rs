@@ -2341,6 +2341,17 @@ fn out_of_range_panel_body_scroll_still_renders_the_scope() {
 }
 
 #[test]
+fn fullscreen_transcript_wraps_instead_of_clipping_its_tail() {
+    let mut view = initial_view();
+    view.transcript = vec![format!("{}tail-marker", "wrap ".repeat(30))];
+    let screen = rendered_text(&view);
+    assert!(
+        screen.contains("tail-marker"),
+        "the transcript wraps its long row instead of clipping the tail: {screen}"
+    );
+}
+
+#[test]
 fn stored_output_scroll_clamps_back_to_the_rendered_bound() {
     let mut view = initial_view();
     for index in 0..60 {
@@ -2359,6 +2370,29 @@ fn stored_output_scroll_clamps_back_to_the_rendered_bound() {
         view.output_scroll.get()
     );
     view.output_scroll.update(|offset| offset.saturating_sub(1));
+    let raised = rendered_text(&view);
+    assert_ne!(
+        bottom, raised,
+        "one PageUp after an overshoot visibly moves"
+    );
+}
+
+#[test]
+fn stored_transcript_scroll_clamps_back_to_the_rendered_bound() {
+    let mut view = initial_view();
+    view.transcript = (0..60).map(|index| format!("row {index:02}")).collect();
+    // A PageDown run past the content bottom leaves the stored offset
+    // out of range; the render clamps it to the wrapped bound, so one
+    // PageUp visibly moves instead of first walking off the overshoot.
+    view.transcript_scroll.set(u16::MAX);
+    let bottom = rendered_text(&view);
+    assert!(
+        view.transcript_scroll.get() < u16::MAX && view.transcript_scroll.get() > 0,
+        "the render clamps the stored transcript offset to the real bound: {}",
+        view.transcript_scroll.get()
+    );
+    view.transcript_scroll
+        .update(|offset| offset.saturating_sub(1));
     let raised = rendered_text(&view);
     assert_ne!(
         bottom, raised,

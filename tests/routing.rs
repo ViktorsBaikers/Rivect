@@ -5031,12 +5031,14 @@ fn accounting_record_reflects_provider_reply_usage_exactly_unknown_never_zero() 
                 tool_calls: Vec::new(),
                 usage: reported,
                 wire_retries: 0,
+                dropped_reasoning: 0,
             }),
             Respond::Reply(ProviderReply {
                 text: "two".to_string(),
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
                 wire_retries: 0,
+                dropped_reasoning: 0,
             }),
         ],
         0,
@@ -8221,6 +8223,7 @@ impl Provider for ChallengeProvider {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

@@ -21113,7 +21113,7 @@ async fn chat_completion_detail_legs_are_carried() {
     assert_eq!(
         record.usage,
         UsageDelta::Legs {
-            prompt_tokens: Some(5),
+            prompt_tokens: Some(2),
             completion_tokens: Some(7),
             reasoning_tokens: Some(2),
             cache_read_tokens: Some(3),
@@ -23247,8 +23247,14 @@ mod kimi_contract {
             body["thinking"].is_null(),
             "an unchanged epoch asks no drop policy"
         );
-        let head = posts[1].2.to_ascii_lowercase();
-        assert!(!head.contains("anthropic-beta"), "{head}");
+        for post in &posts {
+            let head = post.2.to_ascii_lowercase();
+            assert!(
+                head.contains("anthropic-version: 2023-06-01"),
+                "the Messages wire carries the mandatory version header: {head}"
+            );
+            assert!(!head.contains("anthropic-beta"), "{head}");
+        }
     }
 
     /// A prefix mutation drops the epoch's replay and requests the recorded
@@ -23276,8 +23282,22 @@ mod kimi_contract {
         let config = kimi_config(&peer.base, "kimi-k3");
         let (provider, outcomes) =
             send_turns_with_mutation(&config, &["goal: one", "goal: mutated"]);
-        outcomes[0].as_ref().expect("the capture turn answers");
-        outcomes[1].as_ref().expect("the mutated turn answers");
+        assert_eq!(
+            outcomes[0]
+                .as_ref()
+                .expect("the capture turn answers")
+                .dropped_reasoning,
+            0,
+            "a send that replayed nothing carries no drop on its reply"
+        );
+        assert_eq!(
+            outcomes[1]
+                .as_ref()
+                .expect("the mutated turn answers")
+                .dropped_reasoning,
+            1,
+            "the Messages reply carries the peer's input_transformations count"
+        );
         assert_eq!(
             provider.dropped_reasoning(),
             1,
@@ -23308,6 +23328,18 @@ mod kimi_contract {
             head.contains("anthropic-beta: thinking-binding-controls-2026-08-01"),
             "{head}"
         );
+        for (index, post) in posts.iter().enumerate() {
+            let head = post.2.to_ascii_lowercase();
+            assert!(
+                head.contains("anthropic-version: 2023-06-01"),
+                "every Messages leg carries the version header: {head}"
+            );
+            assert_eq!(
+                head.contains("anthropic-beta"),
+                index != 0,
+                "the thinking beta rides only the mutated leg: {head}"
+            );
+        }
         drop_blocking(provider);
     }
 
@@ -23393,6 +23425,15 @@ mod kimi_contract {
             4,
             "capture, replay, exactly one stripped retry, then one clean attempt"
         );
+        for post in &posts {
+            assert!(
+                post.2
+                    .to_ascii_lowercase()
+                    .contains("anthropic-version: 2023-06-01"),
+                "every Messages leg including the retry carries the version header: {}",
+                post.2
+            );
+        }
         let replay: Value = serde_json::from_str(&posts[1].3).expect("the replay body is json");
         assert_eq!(
             replay["messages"][0]["role"],
@@ -23622,6 +23663,147 @@ mod kimi_contract {
             "a mutated prefix replays nothing even with a reasoning lineage: {mutated}"
         );
         drop_blocking(provider);
+    }
+
+    /// Chat Completions reports the cached prompt share inside
+    /// `prompt_tokens`; the adapter normalizes to uncached input, so the
+    /// cache rate reads 400/1000 rather than 400/1400.
+    #[test]
+    fn kimi_chat_cached_prompt_is_counted_once() {
+        let stream = format!(
+            "data: {}\n\n\
+             data: {}\n\n\
+             data: {}\n\n\
+             data: [DONE]\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "cached"}, "finish_reason": null}]}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "total_tokens": 1010,
+                "prompt_tokens_details": {"cached_tokens": 400},
+            }}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        );
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => Reply::sse(stream.clone()),
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let (broker, outcome) = send(&config, "kimi-k2.7-code");
+        let reply = outcome.expect("the cached send answers");
+        drop_blocking(broker);
+        let UsageDelta::Legs {
+            prompt_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            ..
+        } = reply.usage
+        else {
+            panic!("a cached Chat row carries its legs: {:?}", reply.usage);
+        };
+        assert_eq!(prompt_tokens, Some(600), "cached input is not prompt input");
+        assert_eq!(cache_read_tokens, Some(400));
+        assert_eq!(cache_write_tokens, None);
+        let uncached = prompt_tokens.unwrap_or(0);
+        let read = cache_read_tokens.unwrap_or(0);
+        assert_eq!(
+            (read, uncached + read + cache_write_tokens.unwrap_or(0)),
+            (400, 1000),
+            "H = 400/1000, never 400/1400"
+        );
+    }
+
+    /// A committed epoch displaces the conversation's prior epoch: the live
+    /// epoch replays its reasoning byte-for-byte, while a displaced or
+    /// unknown epoch replays nothing.
+    #[test]
+    fn kimi_chat_displaced_epoch_retires_its_replay_state() {
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&turn);
+        let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/v1/models") => Reply::json(models_listing()),
+            ("POST", "/v1/chat/completions") => {
+                let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if turn <= 2 {
+                    Reply::sse(reasoning_chat_stream(
+                        &format!("answer-{turn}"),
+                        &format!("think-{turn}"),
+                    ))
+                } else {
+                    Reply::sse(chat_stream(&format!("answer-{turn}")))
+                }
+            }
+            _ => Reply {
+                status: 404,
+                body: "{}".to_string(),
+                chunk: 4096,
+            },
+        });
+        let config = kimi_config(&peer.base, "kimi-k2.7-code");
+        let provider =
+            KimiProvider::new(&config, "kimi-code", kimi_store()).expect("the adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let mut displaced = control
+            .prepare("main", &config, "/world/kimi", "goal: displaced")
+            .expect("the kimi pin prepares");
+        displaced.epoch_id = "epoch-displaced".to_string();
+        let mut live = control
+            .prepare("main", &config, "/world/kimi", "goal: live")
+            .expect("the kimi pin prepares");
+        live.epoch_id = "epoch-live".to_string();
+        let replay = live.clone();
+        let stale = displaced.clone();
+        let mut unknown = displaced.clone();
+        unknown.epoch_id = "epoch-unknown".to_string();
+        let (provider, first) = send_on_thread(provider, displaced);
+        let (provider, second) = send_on_thread(provider, live);
+        let (provider, third) = send_on_thread(provider, replay);
+        let (provider, fourth) = send_on_thread(provider, stale);
+        let (provider, fifth) = send_on_thread(provider, unknown);
+        first.expect("the displaced epoch answers");
+        second.expect("the live epoch answers");
+        third.expect("the live replay answers");
+        fourth.expect("the displaced retry answers");
+        fifth.expect("the unknown epoch answers");
+        drop_blocking(provider);
+
+        let requests = peer.requests();
+        let posts: Vec<&(String, String, String, String)> = requests
+            .iter()
+            .filter(|(method, _, _, _)| method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 5, "one inference leg per send");
+        let replayed: Value = serde_json::from_str(&posts[2].3).expect("the replay body is json");
+        let assistant = replayed["messages"]
+            .as_array()
+            .expect("messages is an array")
+            .iter()
+            .find(|message| message["role"] == json!("assistant"));
+        assert_eq!(
+            assistant,
+            Some(&json!({
+                "role": "assistant",
+                "content": "answer-2",
+                "reasoning_content": "think-2",
+            })),
+            "the live epoch replays its turn byte-for-byte"
+        );
+        for post in &posts[3..] {
+            let body: Value = serde_json::from_str(&post.3).expect("the body is json");
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .expect("messages is an array")
+                    .iter()
+                    .all(|message| message["role"] != json!("assistant")),
+                "a displaced or unknown epoch fails closed: {body}"
+            );
+        }
     }
 }
 
@@ -24256,6 +24438,122 @@ mod zai_contract {
         }
     }
 
+    /// Chat Completions reports the cached prompt share inside
+    /// `prompt_tokens`; the adapter normalizes to uncached input, so the
+    /// cache rate counts the cached input once.
+    #[test]
+    fn zai_chat_cached_prompt_is_counted_once() {
+        let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
+            ("POST", "/chat/completions") => Reply::sse(chat_stream(
+                "cached",
+                json!({
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 10,
+                    "total_tokens": 1010,
+                    "prompt_tokens_details": {"cached_tokens": 400},
+                }),
+            )),
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_CHAT_MODEL);
+        let (broker, outcome) = send_with(&config, "zai", ZAI_PROFILE, "/world/zai");
+        let reply = outcome.expect("the cached send answers");
+        drop_blocking(broker);
+        assert_eq!(
+            reply.usage,
+            UsageDelta::Legs {
+                prompt_tokens: Some(600),
+                completion_tokens: Some(10),
+                reasoning_tokens: None,
+                cache_read_tokens: Some(400),
+                cache_write_tokens: None,
+                total_tokens: Some(1010),
+            }
+        );
+    }
+
+    /// A committed epoch displaces the conversation's prior epoch: the live
+    /// epoch replays its reasoning byte-for-byte, while a displaced or
+    /// unknown epoch replays nothing.
+    #[test]
+    fn zai_chat_displaced_epoch_retires_its_replay_state() {
+        let turn = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&turn);
+        let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {
+            ("POST", "/chat/completions") => {
+                let turn = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if turn <= 2 {
+                    Reply::sse(reasoning_chat_stream(
+                        &format!("answer-{turn}"),
+                        &format!("think-{turn}"),
+                    ))
+                } else {
+                    Reply::sse(chat_stream(
+                        &format!("answer-{turn}"),
+                        json!({"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}),
+                    ))
+                }
+            }
+            _ => Reply::status(404),
+        });
+        let config = zai_config("zai", &peer.base, ZAI_CHAT_MODEL);
+        let provider = ZaiProvider::new(&config, "zai", zai_store(ZAI_PROFILE))
+            .expect("the zai adapter builds");
+        let mut control = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+        let mut displaced = control
+            .prepare("main", &config, "/world/zai", "goal: displaced")
+            .expect("the zai pin prepares");
+        displaced.epoch_id = "epoch-displaced".to_string();
+        let mut live = control
+            .prepare("main", &config, "/world/zai", "goal: live")
+            .expect("the zai pin prepares");
+        live.epoch_id = "epoch-live".to_string();
+        let replay = live.clone();
+        let stale = displaced.clone();
+        let mut unknown = displaced.clone();
+        unknown.epoch_id = "epoch-unknown".to_string();
+        let (provider, first) = send_on_thread(provider, displaced);
+        let (provider, second) = send_on_thread(provider, live);
+        let (provider, third) = send_on_thread(provider, replay);
+        let (provider, fourth) = send_on_thread(provider, stale);
+        let (provider, fifth) = send_on_thread(provider, unknown);
+        first.expect("the displaced epoch answers");
+        second.expect("the live epoch answers");
+        third.expect("the live replay answers");
+        fourth.expect("the displaced retry answers");
+        fifth.expect("the unknown epoch answers");
+        drop_blocking(provider);
+
+        let posts = peer.posts();
+        assert_eq!(posts.len(), 5, "one inference leg per send");
+        let replayed: Value = serde_json::from_str(&posts[2].3).expect("the replay body is json");
+        let assistant = replayed["messages"]
+            .as_array()
+            .expect("messages is an array")
+            .iter()
+            .find(|message| message["role"] == json!("assistant"));
+        assert_eq!(
+            assistant,
+            Some(&json!({
+                "role": "assistant",
+                "content": "answer-2",
+                "reasoning_content": "think-2",
+            })),
+            "the live epoch replays its turn byte-for-byte"
+        );
+        for post in &posts[3..] {
+            let body: Value = serde_json::from_str(&post.3).expect("the body is json");
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .expect("messages is an array")
+                    .iter()
+                    .all(|message| message["role"] != json!("assistant")),
+                "a displaced or unknown epoch fails closed: {body}"
+            );
+        }
+    }
+
     /// The production factory installs both literals into the one
     /// configured set and serves each entry it was built from.
     #[test]
@@ -24668,8 +24966,22 @@ mod zai_contract {
         let config = zai_config("zai", &peer.base, ZAI_MESSAGES_MODEL);
         let (provider, outcomes) =
             send_turns_with_mutation(&config, "/world/zai-mutated", &["goal: one", "goal: two"]);
-        outcomes[0].as_ref().expect("the capture turn answers");
-        outcomes[1].as_ref().expect("the mutated turn answers");
+        assert_eq!(
+            outcomes[0]
+                .as_ref()
+                .expect("the capture turn answers")
+                .dropped_reasoning,
+            0,
+            "a send that replayed nothing carries no drop on its reply"
+        );
+        assert_eq!(
+            outcomes[1]
+                .as_ref()
+                .expect("the mutated turn answers")
+                .dropped_reasoning,
+            1,
+            "the Messages reply carries the peer's input_transformations count"
+        );
         assert_eq!(provider.dropped_reasoning(), 1);
         let posts = peer.posts();
         let mutated: Value = serde_json::from_str(&posts[1].3).expect("the mutated body is json");

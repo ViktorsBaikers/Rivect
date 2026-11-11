@@ -1001,6 +1001,7 @@ impl GeminiCodec {
             tool_calls: state.tool_calls,
             usage,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 
@@ -1041,8 +1042,12 @@ impl GeminiCodec {
             // — and a usage object that withholds it is a wire
             // violation, not an estimate the peer never charged.
             (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
+                // `promptTokenCount` includes the cached prefix, so the
+                // prompt leg is uncached input only.
+                // shortcut: dialect semantics normalized at the adapter; revisit if a provider changes the inclusion rule
+                let uncached = prompt_tokens.saturating_sub(cache_read.unwrap_or(0));
                 Ok(UsageDelta::from_reported(
-                    prompt_tokens,
+                    uncached,
                     completion_tokens,
                     total_tokens,
                     thoughts,

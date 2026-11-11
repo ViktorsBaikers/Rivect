@@ -38,6 +38,16 @@ enum CliError {
     IndexWorker(#[source] io::Error),
 }
 
+/// The stream pair a refusal names: a surface needs a terminal on both
+/// streams, so the one that is not a terminal is the caller's next action.
+fn non_terminal_streams(stdin_tty: bool, stdout_tty: bool) -> &'static str {
+    match (stdin_tty, stdout_tty) {
+        (true, false) => "stdout is not a terminal",
+        (false, true) => "stdin is not a terminal",
+        _ => "stdin and stdout are not terminals",
+    }
+}
+
 fn main() {
     // The worker mode is exactly this one argument: combined with any
     // other flag it is unknown, and it never opens a runtime, a store or
@@ -85,8 +95,13 @@ fn main() {
             // The review entry is terminal-only and opens nothing else: an
             // unknown state was refused by the grammar, and a non-TTY refuses
             // before the guard so no data root, store or provider is touched.
-            if !(io::stdout().is_tty() && io::stdin().is_tty()) {
-                eprintln!("ui review requires a terminal: {state}");
+            let stdin_tty = io::stdin().is_tty();
+            let stdout_tty = io::stdout().is_tty();
+            if !(stdin_tty && stdout_tty) {
+                eprintln!(
+                    "ui review requires a terminal: {state} ({}); run it in an interactive terminal or allocate a PTY",
+                    non_terminal_streams(stdin_tty, stdout_tty)
+                );
                 std::process::exit(2);
             }
             match rivect::ui::review::ReviewState::run(&state) {
@@ -102,8 +117,21 @@ fn main() {
             render,
             data_root,
         } => {
-            let is_tty = io::stdout().is_tty() && io::stdin().is_tty();
-            if !headless && is_tty {
+            let stdin_tty = io::stdin().is_tty();
+            let stdout_tty = io::stdout().is_tty();
+            // The TUI needs a terminal on both streams and the machine loop
+            // needs neither; a mix has no surface. Answering the usage here
+            // is what keeps `rivect > log` from waiting on a live stdin that
+            // will never supply a frame.
+            if stdin_tty != stdout_tty {
+                eprintln!(
+                    "the run needs a terminal on both stdin and stdout: {}; run it in an interactive terminal or pipe both streams\n{}",
+                    non_terminal_streams(stdin_tty, stdout_tty),
+                    cli::help(&rivect::tools::describe())
+                );
+                std::process::exit(2);
+            }
+            if !headless && stdin_tty {
                 match rivect::ui::run_tui_with_mode(&data_root, render) {
                     Ok(code) => std::process::exit(code),
                     Err(source) => {
@@ -676,6 +704,14 @@ mod tests {
             _outcome: &rivect::model::SendOutcome,
         ) -> Result<(), rivect::model::LedgerError> {
             self.finished += 1;
+            Ok(())
+        }
+
+        fn record_reasoning_drop(
+            &mut self,
+            _ticket: &rivect::model::SendTicket,
+            _count: u64,
+        ) -> Result<(), rivect::model::LedgerError> {
             Ok(())
         }
     }

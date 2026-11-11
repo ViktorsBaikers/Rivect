@@ -26,7 +26,8 @@ use super::sse::{MAX_STREAM_BYTES, SseEvent, SseParser};
 use super::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES, ToolCall,
     WireAuth, bounded_reason, check_deadline, loopback_base, read_chunk,
-    resolve_admitted_credential_in, sse, transport, transport_status, violation, wire_body,
+    resolve_admitted_credential_in, retain_lineage_epoch, retire_displaced_epochs, sse, transport,
+    transport_status, violation, wire_body,
 };
 use crate::config::{Config, ConnKind, Connection, EffortAssign, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
@@ -377,9 +378,14 @@ impl ZaiProvider {
 
     /// The frozen manifest as the Chat Completions wire body. The prior
     /// assistant turn of this epoch replays its reasoning beside the answer
-    /// it accompanied; a prefix mutation replays nothing, and no developer
+    /// it accompanied; a prefix mutation replays nothing and retires the
+    /// conversation's displaced epochs before the wire leg, and no developer
     /// role is ever constructed.
-    fn chat_body(&self, manifest: &RequestManifest, model: &str) -> Result<Value, ProviderError> {
+    fn chat_body(
+        &mut self,
+        manifest: &RequestManifest,
+        model: &str,
+    ) -> Result<Value, ProviderError> {
         if let EffortAssign::Fixed { .. } = &manifest.effort {
             // The recorded Chat row names an effort ladder this build's
             // vocabulary cannot transmit without inventing a wire value.
@@ -388,6 +394,9 @@ impl ZaiProvider {
                 parameter: "reasoning_effort",
                 model: model.to_string(),
             });
+        }
+        if manifest.mutation_reason.is_some() {
+            retire_displaced_epochs(&mut self.chat_lineages, &chat_lineage_key(manifest));
         }
         let mut messages = Vec::with_capacity(3);
         if !manifest.instructions.is_empty() {
@@ -624,16 +633,18 @@ impl ZaiProvider {
             tool_calls,
             usage,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 
     /// Commits the assistant turn one Chat epoch replays — the answer and
-    /// every reasoning member the peer named, byte-identical. A mutation
-    /// or a reasoning-less turn clears the epoch's set instead.
+    /// every reasoning member the peer named, byte-identical. A mutation or
+    /// a reasoning-less turn clears the conversation's replay state instead,
+    /// so a displaced epoch never answers a later send.
     fn commit_chat(&mut self, manifest: &RequestManifest, model: &str, state: &ChatStream) {
         let key = chat_lineage_key(manifest);
         if manifest.mutation_reason.is_some() || state.reasoning.iter().all(String::is_empty) {
-            self.chat_lineages.remove(&key);
+            retire_displaced_epochs(&mut self.chat_lineages, &key);
             return;
         }
         let mut message = serde_json::Map::new();
@@ -644,7 +655,8 @@ impl ZaiProvider {
                 message.insert((*name).to_string(), json!(piece));
             }
         }
-        self.chat_lineages.insert(
+        retain_lineage_epoch(
+            &mut self.chat_lineages,
             key,
             ChatLineage {
                 model: model.to_string(),
@@ -1089,8 +1101,12 @@ fn chat_usage(connection: &str, usage: Option<&Value>) -> Result<UsageDelta, Pro
         .and_then(Value::as_u64);
     match (prompt, completion, total) {
         (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
+            // Cached prompt tokens are a subset of `prompt_tokens` in this
+            // dialect, so the prompt leg is uncached input only.
+            // shortcut: dialect semantics normalized at the adapter; revisit if a provider changes the inclusion rule
+            let uncached = prompt_tokens.saturating_sub(cache_read.unwrap_or(0));
             Ok(UsageDelta::from_reported(
-                prompt_tokens,
+                uncached,
                 completion_tokens,
                 total_tokens,
                 reasoning,

@@ -97,8 +97,10 @@ pub fn copy_bundle(source: &Path, destination: &Path) {
     }
 }
 
-/// Every path under `root` with its length, sorted: the zero-write oracle.
-pub fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
+/// Every path under `root` with its length and content digest, sorted: the
+/// zero-write oracle. The digest is what makes a same-length in-place rewrite
+/// visible; a directory records the fixed `dir` marker.
+pub fn snapshot(root: &Path) -> Vec<(PathBuf, u64, String)> {
     let mut entries = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -110,7 +112,17 @@ pub fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            entries.push((path.clone(), metadata.len()));
+            let digest = if metadata.is_dir() {
+                "dir".to_string()
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => super::sha256_hex(&bytes),
+                    // An unreadable entry is a distinct state, never the
+                    // digest of an empty file.
+                    Err(_) => "unreadable".to_string(),
+                }
+            };
+            entries.push((path.clone(), metadata.len(), digest));
             if metadata.is_dir() {
                 pending.push(path);
             }

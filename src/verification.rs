@@ -7,6 +7,7 @@ use crate::contracts::{ErrorCode, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +492,55 @@ impl ConformanceError {
     }
 }
 
+/// Reads one oracle file through its byte bound: a non-regular target is
+/// refused before the open (a FIFO with no writer never blocks), and the
+/// length and take bounds refuse an oversized file.
+fn read_bounded_oracle(path: &Path) -> Result<Vec<u8>, ConformanceError> {
+    let length = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            return Err(ConformanceError::OracleRead {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "oracle is not a regular file",
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(ConformanceError::OracleRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let file = std::fs::File::open(path).map_err(|source| ConformanceError::OracleRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if length > ORACLE_MAX_BYTES as u64 {
+        return Err(ConformanceError::OracleTooLarge {
+            path: path.to_path_buf(),
+            limit: ORACLE_MAX_BYTES,
+        });
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    let mut bounded = file.take(ORACLE_MAX_BYTES as u64 + 1);
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConformanceError::OracleRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > ORACLE_MAX_BYTES {
+        return Err(ConformanceError::OracleTooLarge {
+            path: path.to_path_buf(),
+            limit: ORACLE_MAX_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
 /// One oracle bound from its external path and materialized outside the
 /// candidate; the temp directory is the only holder of the bytes the
 /// evaluator reads.
@@ -521,16 +571,7 @@ impl ProtectedOracle {
         if resolved.starts_with(&candidate) {
             return Err(ConformanceError::OracleInsideCandidate { path: resolved });
         }
-        let bytes = std::fs::read(&resolved).map_err(|source| ConformanceError::OracleRead {
-            path: resolved.clone(),
-            source,
-        })?;
-        if bytes.len() > ORACLE_MAX_BYTES {
-            return Err(ConformanceError::OracleTooLarge {
-                path: resolved,
-                limit: ORACLE_MAX_BYTES,
-            });
-        }
+        let bytes = read_bounded_oracle(&resolved)?;
         let oracle = Oracle::load(&bytes)?;
         let directory = tempfile::Builder::new()
             .prefix("rivect-conformance-oracle-")
@@ -671,8 +712,9 @@ pub fn evaluate(oracle: &ProtectedOracle, run: &CandidateRun) -> ConformanceRepo
                 if evidence_present(observation) {
                     counts.record(case.mode, TrialOutcome::Pass);
                 } else {
+                    // A pass without evidence is recorded as no pass, so the
+                    // counts never report one the report itself rejected.
                     accepted = false;
-                    counts.record(case.mode, TrialOutcome::Pass);
                     reject(
                         &mut rejection,
                         Rejection::FakePass {

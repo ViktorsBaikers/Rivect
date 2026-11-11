@@ -1146,6 +1146,164 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     rivect::config::hex(&sha2::Sha256::digest(bytes))
 }
 
+/// Retained leg-status evidence (AC-003/AC-040/AC-078): one append-only JSONL
+/// file per host-conditional leg under `target/rivect-not-run`. A leg resets
+/// its own file before it runs; a leg that could not run records the exact
+/// prerequisite there. `tests/final_acceptance.rs` reads these rows and
+/// surfaces them as NOT_RUN, so a green test binary never stands in for a
+/// proof that did not execute.
+pub mod not_run {
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use std::io::{Read as _, Write as _};
+
+    pub const DIR: &str = "target/rivect-not-run";
+    /// The closed literal leg set: only these legs are surfaced. A file for
+    /// any other name is not this run's evidence and is never read, so a
+    /// stale or forged row cannot invent a `LEG_NOT_RUN` verdict.
+    pub const LEGS: [&str; 6] = [
+        "auth.keychain",
+        "auth.secret_service",
+        "ingress.exec",
+        "ingress.vision",
+        "ingress.pty",
+        "measurement.offline_corpus",
+    ];
+    const MAX_LINES: usize = 8;
+    /// A leg's file is a handful of short lines; anything larger is not
+    /// this run's evidence and is never loaded.
+    const MAX_FILE_BYTES: u64 = 8 * 1024;
+    const MAX_PREREQUISITE_CHARS: usize = 512;
+
+    fn directory() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DIR)
+    }
+
+    fn file(leg: &str) -> std::path::PathBuf {
+        directory().join(format!("{leg}.jsonl"))
+    }
+
+    /// Removes a previous run's record for `leg`, so a leg that runs now
+    /// cannot inherit an older host's NOT_RUN.
+    pub fn reset(leg: &str) {
+        match std::fs::remove_file(file(leg)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("reset retained leg {leg}: {error}"),
+        }
+    }
+
+    /// Appends one bounded `not_run` row naming why the leg could not run.
+    pub fn record(leg: &str, prerequisite: &str) {
+        let directory = directory();
+        std::fs::create_dir_all(&directory).expect("retained leg directory");
+        let path = file(leg);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().count() >= MAX_LINES {
+            return;
+        }
+        let bounded: String = prerequisite.chars().take(MAX_PREREQUISITE_CHARS).collect();
+        let line = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "leg": leg,
+            "status": "not_run",
+            "prerequisite": bounded,
+        }))
+        .expect("retained leg row encodes")
+            + "\n";
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("retained leg opens");
+        file.write_all(line.as_bytes())
+            .expect("retained leg writes");
+        file.flush().expect("retained leg flushes");
+    }
+
+    /// Parses the rows in one leg's file that may belong to this run: the
+    /// schema, the leg and the status must all name the same leg the file
+    /// names, and the prerequisite is bounded and stripped of control
+    /// characters before it can reach a printed verdict line. Anything else
+    /// is ignored, never surfaced.
+    #[must_use]
+    pub fn parse_rows(leg: &str, text: &str) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for line in text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(MAX_LINES)
+        {
+            let Ok(mut row) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if row["schema_version"] != json!(1)
+                || row["leg"] != json!(leg)
+                || row["status"] != json!("not_run")
+            {
+                continue;
+            }
+            let Some(prerequisite) = row["prerequisite"].as_str() else {
+                continue;
+            };
+            row["prerequisite"] = json!(
+                prerequisite
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(MAX_PREREQUISITE_CHARS)
+                    .collect::<String>()
+            );
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Every retained leg this run recorded, one row per unique leg, sorted
+    /// by leg. Only the closed literal set is read and each file is bounded,
+    /// so a stale conflict or an oversized file can neither fail the run nor
+    /// forge a verdict line.
+    pub fn records() -> Vec<Value> {
+        records_in(&directory())
+    }
+
+    /// [`records`] over a caller-supplied directory: the file walk itself,
+    /// so a test can prove the closed set, the caps and the dedupe without
+    /// writing under `target/`.
+    #[must_use]
+    pub fn records_in(root: &std::path::Path) -> Vec<Value> {
+        let mut rows: Vec<Value> = Vec::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for leg in LEGS {
+            let path = root.join(format!("{leg}.jsonl"));
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            // Dedupe by leg: the append-only file may hold rows from an
+            // earlier run, and one leg is one NOT_RUN whatever it says.
+            if let Some(row) = parse_rows(leg, &text).into_iter().next()
+                && seen.insert(leg)
+            {
+                rows.push(row);
+            }
+        }
+        rows.sort_by(|left, right| left["leg"].as_str().cmp(&right["leg"].as_str()));
+        rows
+    }
+}
+
 pub fn path_str(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -1250,12 +1408,15 @@ pub fn send_on_thread<P: Provider + 'static>(
 
 /// A ledger that counts the settlement rows a dispatch opened and closed.
 /// `NullLedger` records nothing, so a failed send's single row is only
-/// observable through this double.
+/// observable through this double. It also keeps the dropped-reasoning
+/// count the broker recorded, so a dispatch proof can assert the evidence
+/// reached the ledger seam.
 #[derive(Debug, Default)]
 pub struct CountingLedger {
     pub begun: usize,
     pub finished: usize,
     pub failed: usize,
+    pub dropped_reasoning: u64,
 }
 
 impl CountingLedger {
@@ -1288,6 +1449,15 @@ impl Ledger for CountingLedger {
         if matches!(outcome, SendOutcome::Failed { .. }) {
             self.failed += 1;
         }
+        Ok(())
+    }
+
+    fn record_reasoning_drop(
+        &mut self,
+        _ticket: &SendTicket,
+        count: u64,
+    ) -> Result<(), LedgerError> {
+        self.dropped_reasoning = self.dropped_reasoning.saturating_add(count);
         Ok(())
     }
 }

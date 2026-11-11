@@ -214,6 +214,10 @@ fn defect_fake_pass_zero_selection_and_missing_cells_are_rejected() {
         ),
         "{report:?}"
     );
+    assert_eq!(
+        report.counts.deterministic.passed, 0,
+        "a pass without evidence is never counted as a pass: {report:?}"
+    );
 
     // A fake PASS: the negative control passes instead of failing.
     let report = evaluate(
@@ -558,4 +562,57 @@ fn an_unreadable_or_invalid_oracle_is_a_typed_failure() {
         ProtectedOracle::bind(&candidate_root(), &bad_expectation).is_err(),
         "an undeclared expectation is refused"
     );
+}
+
+/// The oracle holdout is external input, so a non-regular target is refused
+/// before the open that would block forever, and a regular file past the byte
+/// bound is still refused.
+#[cfg(unix)]
+#[test]
+fn an_oracle_target_must_be_regular_and_byte_bounded() {
+    use rivect::verification::ORACLE_MAX_BYTES;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::TempDir::with_prefix("rivect-oracle-bound-").expect("tempdir");
+    let path = directory.path().join("oracle.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+
+    // No writer ever opens the FIFO: only a pre-open regular-file refusal
+    // returns here, because `File::open` on a reader FIFO blocks forever.
+    let (answer, answered) = mpsc::channel();
+    let root = candidate_root();
+    let reader_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        answer
+            .send(ProtectedOracle::bind(&root, &reader_path))
+            .expect("send the fifo binding");
+    });
+    let observed = answered
+        .recv_timeout(Duration::from_secs(15))
+        .expect("a non-regular target is refused before the blocking open");
+    reader.join().expect("the reader finishes");
+    match observed {
+        Err(ConformanceError::OracleRead { source, .. }) => {
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the refusal is typed at the open boundary"
+            );
+        }
+        Ok(_) => panic!("a non-regular oracle never binds"),
+        Err(other) => panic!("a non-regular oracle is refused: {other:?}"),
+    }
+
+    std::fs::remove_file(&path).expect("replace the fifo");
+    std::fs::write(&path, vec![b' '; ORACLE_MAX_BYTES + 1]).expect("over-bound oracle");
+    match ProtectedOracle::bind(&candidate_root(), &path) {
+        Err(ConformanceError::OracleTooLarge { limit, .. }) => assert_eq!(limit, ORACLE_MAX_BYTES),
+        Ok(_) => panic!("an over-bound oracle never binds"),
+        Err(other) => panic!("an over-bound oracle is refused at the bound: {other:?}"),
+    }
 }

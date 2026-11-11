@@ -9605,6 +9605,7 @@ mod plan_selection {
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
                 wire_retries: 0,
+                dropped_reasoning: 0,
             }
         }
 
@@ -10231,6 +10232,7 @@ mod plan_selection {
                         }],
                         usage: UsageDelta::Unknown,
                         wire_retries: 0,
+                        dropped_reasoning: 0,
                     },
                     SemanticRefusal::ToolCall,
                 ),

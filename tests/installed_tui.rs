@@ -1,8 +1,10 @@
 //! AC-001 (TD-03): the exact packaged artifact from the release slice runs the
 //! inherited 19 design-brief states across the four acceptance geometries plus
 //! a live resize and the fourteen input modes. Each cell is exercised with a
-//! binary pass/fail: the state's own rendered observables at that geometry
-//! must appear, and the input mode must reach the same artifact. Terminal
+//! pass/fail verdict — except the three theme inputs, whose distinct palettes
+//! are declared NOT_RUN and whose cells carry that claim as their reason. The
+//! state's own rendered observables at that geometry must appear, and the
+//! input mode must reach the same artifact. Terminal
 //! restore is checked after exit, cancel and panic; inline keeps the
 //! transcript in the terminal's own scrollback with mouse capture off; and
 //! focusing or inspecting a decision card or permission panel records no
@@ -47,6 +49,22 @@ const INPUTS: usize = 14;
 const CELLS: usize = STATES * GEOMETRIES * INPUTS;
 
 const WAIT: Duration = Duration::from_secs(10);
+
+/// Env gate for the cursor-query trace: the harness prints when it sees
+/// `ESC [ 6 n`, when it answers, and what the child reported on timeout.
+/// Diagnostic only — unset, the trace is silent and no behaviour changes.
+const CURSOR_TRACE_ENV: &str = "RIVECT_PTY_CURSOR_TRACE";
+
+fn trace_enabled() -> bool {
+    std::env::var_os(CURSOR_TRACE_ENV).is_some()
+}
+
+/// Microseconds since the harness's first traced call, so query, answer and
+/// timeout orderings are readable in one run.
+fn trace_at() -> Duration {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Geometry {
@@ -191,6 +209,11 @@ fn status_with_tasks(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Va
 
 fn state_fixture(state: usize) -> StateFixture {
     match state {
+        // The two start states are the same production frame: the runtime
+        // projects no project or index fact, so the seeded views and their
+        // status/dock/transcript are identical. They stay distinct cells
+        // because the design brief names both states, not because the
+        // packaged artifact paints them differently.
         0 => StateFixture::new(
             "start-no-connection",
             initial_view(),
@@ -384,18 +407,15 @@ fn state_fixture(state: usize) -> StateFixture {
             )
         }
         11 => {
+            // Completion has no transcript line in production: it shows as
+            // the dock lifecycle row the projection builds, so the seeded
+            // frame carries that row and nothing it invented.
             let mut view = initial_view();
-            view.transcript
-                .push("Success: 3 criteria verified; 1 limitation remains".to_string());
             view.dock = task_dock(&status_with_tasks(
                 &[("task-1", "completed", None)],
                 Value::Null,
             ));
-            StateFixture::new(
-                "success",
-                view,
-                &["Success: 3 criteria verified", "task task-1: completed"],
-            )
+            StateFixture::new("success", view, &["task task-1: completed"])
         }
         12 => {
             let mut view = initial_view();
@@ -692,9 +712,17 @@ impl TuiPty {
         std::fs::create_dir_all(&data).map_err(|error| format!("data root: {error}"))?;
         let (cols, rows) = geometry.size();
         let mut command = support::pty_command(bundle.join("rivect"));
-        if let Some(mode) = mode {
-            command.arg("--tui");
-            command.arg(mode.label());
+        match mode {
+            Some(RenderMode::Linear) => {
+                // The accessibility surface has its own flag; `--tui`
+                // accepts only the two viewport modes.
+                command.arg("--linear");
+            }
+            Some(mode) => {
+                command.arg("--tui");
+                command.arg(mode.label());
+            }
+            None => {}
         }
         command.arg("--data-root");
         command.arg(&data);
@@ -755,9 +783,20 @@ impl TuiPty {
     fn answer_cursor_query(&mut self) -> Result<(), String> {
         let bytes = self.bytes()?;
         if let Some(found) = support::find_subsequence(&bytes[self.cursor_at..], b"\x1b[6n") {
+            if trace_enabled() {
+                eprintln!(
+                    "[cursor-trace {:?}] saw ESC[6n at byte {} (cursor_at {})",
+                    trace_at(),
+                    found,
+                    self.cursor_at
+                );
+            }
             self.pty
                 .send(b"\x1b[1;1R")
                 .map_err(|error| format!("pty send: {error}"))?;
+            if trace_enabled() {
+                eprintln!("[cursor-trace {:?}] answered ESC[1;1R", trace_at());
+            }
             self.cursor_at += found + 4;
         }
         Ok(())
@@ -773,6 +812,17 @@ impl TuiPty {
                 return Ok(screen);
             }
             if Instant::now() >= deadline {
+                if trace_enabled() {
+                    let text = String::from_utf8_lossy(&bytes);
+                    eprintln!(
+                        "[cursor-trace {:?}] timeout for {needle:?}; cleanup-report={} alt-in={} alt-out={} cursor_at={}",
+                        trace_at(),
+                        text.contains("terminal cleanup failed"),
+                        text.contains("\u{1b}[?1049h"),
+                        text.contains("\u{1b}[?1049l"),
+                        self.cursor_at
+                    );
+                }
                 return Err(format!(
                     "timeout waiting for {needle:?}; last screen:\n{screen}"
                 ));
@@ -784,6 +834,13 @@ impl TuiPty {
     }
 
     fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if trace_enabled() {
+            eprintln!(
+                "[cursor-trace {:?}] send {:?}",
+                trace_at(),
+                String::from_utf8_lossy(bytes)
+            );
+        }
         self.pty
             .send(bytes)
             .map_err(|error| format!("pty send: {error}"))
@@ -1040,6 +1097,8 @@ fn inline_probe(geometry: Geometry) -> Result<(), String> {
     tui.wait("> draft text", WAIT)?;
     // The draft survives a surface switch: the key is outside the composer.
     tui.send(b"\x14")?;
+    // The fullscreen transcript follows its tail, so the switch's own row
+    // is visible without a paging keypress.
     tui.wait("tui: switched to fullscreen", WAIT)?;
     tui.wait("> draft text", WAIT)?;
     tui.send(b"\x14")?;
@@ -1255,6 +1314,61 @@ const THEME_DARK_CLAIM: &str = "theme-agnostic rendering; distinct dark palette 
 const THEME_HIGH_CONTRAST_CLAIM: &str =
     "theme-agnostic rendering; distinct high-contrast palette NOT_RUN";
 
+/// Cells whose distinct theme palette stays unproven: the three theme inputs
+/// on every state and geometry. They are counted NOT_RUN with the claim as
+/// the reason, never PASS.
+const NOT_RUN_CELLS: usize = 3 * STATES * GEOMETRIES;
+
+/// The theme inputs a cell cannot pass: their probes assert theme-agnostic
+/// rendering only, so a passing probe earns the claim, not a cell verdict.
+fn not_run_claim(input: InputMode) -> Option<&'static str> {
+    match input {
+        InputMode::Light => Some(THEME_LIGHT_CLAIM),
+        InputMode::Dark => Some(THEME_DARK_CLAIM),
+        InputMode::HighContrast => Some(THEME_HIGH_CONTRAST_CLAIM),
+        _ => None,
+    }
+}
+
+/// The permission panel's renderer-only claim: the frame proves the renderer
+/// paints the seeded state, never an approval/decision path opening a panel.
+const RENDERER_ONLY_CLAIM: &str = "renderer-only: no production approval/decision path opens the permission panel; the Ask verdict carries no class or target and the sole constructor is the passive `--ui-review` renderer in src/ui/review.rs (DEC-017)";
+
+/// The streaming and failed-output fixtures' renderer-only claim: the step
+/// driver that would feed `LocalView::output` in production is deferred, so
+/// the frame proves the renderer paints the seeded stream, nothing more.
+const RENDERER_ONLY_OUTPUT_CLAIM: &str = "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream";
+
+/// The non-TTY state is not a TUI frame at all: a non-TTY entry routes to
+/// the structured headless loop, so this cell proves the TUI renderer can
+/// paint the seeded text, never that a terminal produces it.
+const RENDERER_ONLY_NON_TTY_CLAIM: &str = "renderer-only: the non-TTY entry routes to the structured headless loop; the TUI cannot paint this state in production";
+
+/// The states whose frame is a renderer fixture with no production producer.
+fn renderer_only_claim(state: &str) -> Option<&'static str> {
+    match state {
+        "awaiting-permission" => Some(RENDERER_ONLY_CLAIM),
+        "streaming-long-output" | "error-offline-partial" => Some(RENDERER_ONLY_OUTPUT_CLAIM),
+        "non-tty" => Some(RENDERER_ONLY_NON_TTY_CLAIM),
+        _ => None,
+    }
+}
+
+/// What each seeded state can honestly claim: the two start states are one
+/// production frame, completion has no transcript line, and the permission,
+/// streaming, failed-output and non-TTY states are the renderer's alone.
+fn state_claims() -> Value {
+    json!({
+        "start-no-connection": "production start frame; identical to no-project-index because the runtime projects no project or index fact",
+        "no-project-index": "same production start frame as start-no-connection; no project or index projection exists",
+        "awaiting-permission": RENDERER_ONLY_CLAIM,
+        "streaming-long-output": RENDERER_ONLY_OUTPUT_CLAIM,
+        "error-offline-partial": RENDERER_ONLY_OUTPUT_CLAIM,
+        "non-tty": RENDERER_ONLY_NON_TTY_CLAIM,
+        "success": "completion is the dock lifecycle row only; production has no completion transcript line",
+    })
+}
+
 fn write_report(
     bundle: &Path,
     pass: usize,
@@ -1282,6 +1396,7 @@ fn write_report(
             "inline_scrollback": INLINE_SCROLLBACK_CLAIM,
         },
         "zero_send_approval": ZERO_SEND_CLAIM,
+        "state_claims": state_claims(),
         "input_mode_claims": {
             "no-color": "no SGR color emitted (asserted)",
             "light": THEME_LIGHT_CLAIM,
@@ -1291,20 +1406,58 @@ fn write_report(
         },
         "platform_terminals": "NOT_RUN (no platform terminal is available on this host)",
     });
-    assert_eq!(report["restore"]["exit"], RESTORE_EXIT_CLAIM);
-    assert_eq!(report["restore"]["cancel"], RESTORE_CANCEL_CLAIM);
-    assert_eq!(report["restore"]["panic"], RESTORE_PANIC_CLAIM);
-    assert_eq!(
-        report["restore"]["inline_scrollback"],
-        INLINE_SCROLLBACK_CLAIM
-    );
-    assert_eq!(report["zero_send_approval"], ZERO_SEND_CLAIM);
-    assert_eq!(report["input_mode_claims"]["light"], THEME_LIGHT_CLAIM);
-    assert_eq!(report["input_mode_claims"]["dark"], THEME_DARK_CLAIM);
-    assert_eq!(
-        report["input_mode_claims"]["high-contrast"],
-        THEME_HIGH_CONTRAST_CLAIM
-    );
+    // The restore and zero-send fields are declarations, not executed
+    // probes: this test owns neither leg. Assert their evidence class.
+    for (label, claim) in [
+        ("restore.exit", RESTORE_EXIT_CLAIM),
+        ("restore.cancel", RESTORE_CANCEL_CLAIM),
+        ("restore.panic", RESTORE_PANIC_CLAIM),
+        ("restore.inline_scrollback", INLINE_SCROLLBACK_CLAIM),
+        ("zero_send_approval", ZERO_SEND_CLAIM),
+    ] {
+        assert!(
+            claim.starts_with("NOT_RUN"),
+            "{label} declares its NOT_RUN owner instead of claiming execution: {claim}"
+        );
+    }
+    for claim in [
+        THEME_LIGHT_CLAIM,
+        THEME_DARK_CLAIM,
+        THEME_HIGH_CONTRAST_CLAIM,
+    ] {
+        assert!(
+            claim.starts_with("theme-agnostic rendering"),
+            "a theme cell declaration names the unproven palette: {claim}"
+        );
+    }
+    // The renderer-only states must name their evidence class in the report,
+    // and every passing cell of such a state must carry that same claim: a
+    // reader can never take a seeded frame for production evidence.
+    let claims = state_claims();
+    for state in [
+        "awaiting-permission",
+        "streaming-long-output",
+        "error-offline-partial",
+        "non-tty",
+    ] {
+        assert!(
+            claims[state]
+                .as_str()
+                .is_some_and(|claim| claim.starts_with("renderer-only: ")),
+            "the renderer-only state {state} names its evidence class"
+        );
+    }
+    for cell in cells {
+        let state = cell["state"].as_str().unwrap_or_default();
+        if cell["verdict"] == "PASS"
+            && let Some(claim) = renderer_only_claim(state)
+        {
+            assert_eq!(
+                cell["reason"], claim,
+                "a passing renderer-only cell names its claim: {cell}"
+            );
+        }
+    }
     let path = matrix_report_path();
     std::fs::write(
         &path,
@@ -1340,6 +1493,7 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
 
     let mut pass = 0usize;
     let mut fail = 0usize;
+    let mut not_run = 0usize;
     let mut cells = Vec::with_capacity(CELLS);
     for state in 0..STATES {
         let fixture = state_fixture(state);
@@ -1350,22 +1504,37 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
                     .get(&(geometry, input))
                     .cloned()
                     .unwrap_or_else(|| Err("input probe missing".to_string()));
-                let (verdict, reason) = match (state_verdict.clone(), input_verdict) {
-                    (Ok(()), Ok(())) => {
-                        pass += 1;
-                        ("PASS", String::new())
-                    }
-                    (state, input) => {
-                        fail += 1;
-                        let mut reasons = Vec::new();
-                        if let Err(reason) = state {
-                            reasons.push(format!("state: {reason}"));
+                let (verdict, reason) =
+                    match (not_run_claim(input), state_verdict.clone(), input_verdict) {
+                        // The probe asserts theme-agnostic rendering only: the
+                        // distinct palette stays NOT_RUN with its claim as the
+                        // reason, never a PASS. A probe that fails is still a
+                        // failure — the theme run broke, it did not go unproven.
+                        (Some(claim), Ok(()), Ok(())) => {
+                            not_run += 1;
+                            ("NOT_RUN", claim.to_string())
                         }
-                        if let Err(reason) = input {
-                            reasons.push(format!("input: {reason}"));
+                        (None, Ok(()), Ok(())) => {
+                            pass += 1;
+                            ("PASS", String::new())
                         }
-                        ("FAIL", reasons.join("; "))
-                    }
+                        (_, state, input) => {
+                            fail += 1;
+                            let mut reasons = Vec::new();
+                            if let Err(reason) = state {
+                                reasons.push(format!("state: {reason}"));
+                            }
+                            if let Err(reason) = input {
+                                reasons.push(format!("input: {reason}"));
+                            }
+                            ("FAIL", reasons.join("; "))
+                        }
+                    };
+                // A passing renderer-only frame names that fact, so no reader
+                // takes it for a production one.
+                let reason = match renderer_only_claim(fixture.name) {
+                    Some(claim) if verdict == "PASS" => claim.to_string(),
+                    _ => reason,
                 };
                 if verdict == "FAIL" {
                     println!(
@@ -1386,14 +1555,21 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
         }
     }
 
-    let not_run = 0usize;
     let path = write_report(bundle, pass, fail, not_run, &cells).expect("matrix report");
     println!(
         "UI-CELLS total={CELLS} pass={pass} fail={fail} not_run={not_run} report={}",
         path.display()
     );
     assert_eq!(pass + fail + not_run, CELLS, "every cell is accounted");
-    assert_eq!(fail, 0, "every installed UI cell passes");
+    assert_eq!(
+        not_run, NOT_RUN_CELLS,
+        "the three theme inputs are NOT_RUN on every state and geometry"
+    );
+    assert_eq!(pass, CELLS - NOT_RUN_CELLS, "every other cell passes");
+    assert_eq!(
+        fail, 0,
+        "every installed UI cell passes or is a declared NOT_RUN"
+    );
 }
 
 #[test]
@@ -1474,6 +1650,121 @@ fn installed_inline_clear_after_long_transcript_keeps_later_rows() {
     require_inline_restore(&bytes).expect("inline restore");
 }
 
+/// The inline surface paints the decision card in its reserved region with
+/// the question line and the focused row visible: the floor projection pins
+/// both instead of scrolling the question away for a distant option. The
+/// leg proves a key sent inside the consent floor is refused and the same
+/// key after the floor dismisses the card.
+#[test]
+fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
+    let mut tui =
+        TuiPty::spawn(Geometry::W80H24, Some(RenderMode::Inline), &[]).expect("inline pty");
+    tui.wait("Rivect · not connected", WAIT)
+        .expect("inline screen");
+    tui.send(b"inline card probe\r").expect("submit task");
+    // The production first-question card: its prompt and focus counter are
+    // both painted in the nine-row inline region, above the two-row footer.
+    // The footer is the last row a card frame paints, so waiting on it
+    // proves the whole frame — question line, focused row and footer —
+    // landed, not just the first chunk of the diff.
+    let opened = tui
+        .wait("focus 1/2", WAIT)
+        .expect("the inline pinned region paints the card footer");
+    let screen = support::squashed(&opened);
+    assert!(
+        screen.contains("Begin the first step"),
+        "the inline card paints the question prompt: {screen}"
+    );
+    assert!(
+        screen.contains("> 1."),
+        "the inline card paints the focused row: {screen}"
+    );
+    // The consent window runs from the first paint: a key sent inside it
+    // cannot have been aimed at the card. The absent-needle wait outlasts
+    // the floor, so a dismissal would have painted by the assertion.
+    tui.send(b"\x1b").expect("pre-floor dismiss");
+    tui.pump(Duration::from_millis(400))
+        .expect("pump past the floor");
+    let bytes = tui.bytes().expect("inline bytes");
+    let refused = support::squashed(&tui.screen(&bytes));
+    assert!(
+        refused.contains("focus 1/2") && !refused.contains("decision left unanswered"),
+        "an unaimed Esc inside the floor never dismisses the card: {refused}"
+    );
+    // The waits above already outlasted the floor, so this Esc is admitted
+    // and the card leaves the question pending for the wire surface.
+    tui.send(b"\x1b").expect("dismiss card");
+    tui.wait("decision left unanswered", WAIT)
+        .expect("the admitted Esc dismisses the card");
+    tui.send(b"\x1b").expect("exit");
+    let (bytes, code) = tui.finish().expect("teardown");
+    assert_eq!(code, Some(0), "the inline card session exits 0");
+    require_inline_restore(&bytes).expect("inline restore");
+}
+
+/// Every CSI sequence the linear surface emits must be a bracketed-paste
+/// toggle; any other is cursor addressing or an alternate-screen entry and
+/// breaks the append-only contract.
+fn has_cursor_addressing(bytes: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while let Some(found) = support::find_subsequence(&bytes[offset..], b"\x1b[") {
+        let rest = &bytes[offset + found..];
+        if !(rest.starts_with(b"\x1b[?2004h") || rest.starts_with(b"\x1b[?2004l")) {
+            return true;
+        }
+        offset += found + 2;
+    }
+    false
+}
+
+/// One linear-surface selector under test: a label, the entry mode, and the
+/// environment the child receives.
+type LinearCase<'a> = (&'a str, Option<RenderMode>, &'a [(&'a str, &'a str)]);
+
+/// The screen-reader surface is a linear append-only stream: no alternate
+/// screen, no cursor addressing, and consecutive transcript rows arrive
+/// intact. Both selectors — the flag and the environment — reach it on the
+/// packaged artifact.
+#[test]
+fn installed_linear_mode_is_append_only_plain_text() {
+    let cases: [LinearCase<'_>; 2] = [
+        ("flag", Some(RenderMode::Linear), &[]),
+        ("env", None, &[("RIVECT_LINEAR", "1")]),
+    ];
+    for (label, mode, env) in cases {
+        let mut tui = TuiPty::spawn(Geometry::W80H24, mode, env)
+            .unwrap_or_else(|error| panic!("{label} linear pty: {error}"));
+        tui.wait("Input is available. Enter a task or a clarification.", WAIT)
+            .unwrap_or_else(|error| panic!("{label} linear screen: {error}"));
+        tui.send(b"/help\r").expect("help");
+        tui.wait("Commands: Enter submits", WAIT)
+            .unwrap_or_else(|error| panic!("{label} linear help: {error}"));
+        tui.send(b"\x1b").expect("exit");
+        let (bytes, code) = tui.finish().expect("teardown");
+        assert_eq!(code, Some(0), "{label}: the linear session exits 0");
+        assert!(
+            support::find_subsequence(&bytes, b"\x1b[?1049").is_none(),
+            "{label}: linear never enters the alternate screen"
+        );
+        assert!(
+            !has_cursor_addressing(&bytes),
+            "{label}: linear emitted cursor addressing: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let start = b"Input is available. Enter a task or a clarification.\r\n\
+No project or index is selected; ordinary replies are not blocked.";
+        assert!(
+            support::find_subsequence(&bytes, start).is_some(),
+            "{label}: consecutive transcript rows arrive intact: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            support::find_subsequence(&bytes, b"Commands: Enter submits").is_some(),
+            "{label}: the help row arrives in the stream"
+        );
+    }
+}
+
 #[test]
 fn installed_terminal_restores_after_exit_cancel_and_panic() {
     // Exit and cancel run on the packaged artifact.
@@ -1546,6 +1837,64 @@ fn installed_focus_and_inspection_never_send_or_approve_unit_level() {
 #[test]
 fn installed_non_tty_channels_stay_structured() {
     headless_pipe_probe(Geometry::W80H24, InputMode::Keyboard).expect("non-TTY channels");
+}
+
+/// A terminal stdin with a redirected stdout must answer the usage/help and
+/// exit 2: with only one stream a terminal the run has no surface, and the
+/// JSON-RPC loop would wait on the live terminal forever instead of printing.
+#[test]
+fn installed_mixed_streams_print_help_and_exit_instead_of_waiting() {
+    let bundle = support::release::baseline_bundle();
+    let root = tempfile::TempDir::with_prefix("rivect-installed-mixed-").expect("mixed root");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).expect("mixed data");
+    let log = root.path().join("stream.log");
+    let status = root.path().join("status");
+    // The shell script is a fixed literal; the only substituted values are
+    // this test's own paths, passed as environment entries rather than built
+    // into the command string (standards §10). The brace group writes the
+    // child's own exit class while `cat` keeps its stdout a real pipe.
+    let mut command = support::pty_command("sh");
+    command.arg("-c");
+    command
+        .arg("{ \"$RIVECT_BIN\" 2>&1; echo \"$?\" > \"$RIVECT_STATUS\"; } | cat > \"$RIVECT_LOG\"");
+    command.env("RIVECT_BIN", bundle.join("rivect"));
+    command.env("RIVECT_LOG", &log);
+    command.env("RIVECT_STATUS", &status);
+    command.env("RIVECT_DATA_ROOT", &data);
+    let mut pty = support::PtySession::spawn(command, 24, 80, root, data).expect("mixed pty");
+    let code = pty.wait_exit(WAIT).expect("mixed wait");
+    let bytes = pty.collected().expect("mixed read");
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    let status_text = std::fs::read_to_string(&status).unwrap_or_default();
+    pty.finish().expect("mixed teardown");
+    assert_eq!(
+        code,
+        Some(0),
+        "the wrapper must finish after the child; a deadline kill here is the pre-fix hang: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        status_text.trim(),
+        "2",
+        "a mixed-stream run is a usage error, not a wait: {log_text}"
+    );
+    assert!(
+        log_text.contains("usage:"),
+        "the refusal prints the usage/help: {log_text}"
+    );
+    assert!(
+        log_text.contains("stdout is not a terminal"),
+        "the refusal names the non-terminal stream: {log_text}"
+    );
+    assert!(
+        log_text.contains("--headless"),
+        "the help names the machine entry: {log_text}"
+    );
+    assert!(
+        !log_text.contains('\u{1b}'),
+        "the refusal is plain text: {log_text}"
+    );
 }
 
 #[test]

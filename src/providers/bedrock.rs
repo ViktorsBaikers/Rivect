@@ -860,6 +860,7 @@ impl StreamState {
             tool_calls: self.tool_calls,
             usage: self.usage.unwrap_or(UsageDelta::Unknown),
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

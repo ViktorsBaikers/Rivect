@@ -1394,6 +1394,129 @@ async fn anthropic_epoch_replay_bytewise() {
 }
 
 #[tokio::test]
+async fn anthropic_displaced_epoch_retires_its_replay_state() {
+    let server = MockServer::start().await;
+    mount_messages_once(
+        &server,
+        thinking_stream_with("displaced", "think-displaced", "sig-displaced"),
+    )
+    .await;
+    mount_messages_once(
+        &server,
+        thinking_stream_with("live", "think-live", "sig-live"),
+    )
+    .await;
+    mount_messages(&server, text_stream("after", 1, 1)).await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = anthropic_provider(&config);
+
+    let mut displaced = prepared_manifest(&config);
+    displaced.epoch_id = "epoch-displaced".to_string();
+    let (provider, outcome) = send_on_thread(provider, displaced);
+    outcome.expect("the displaced epoch captures its block");
+
+    // The next epoch of the same conversation is opened by a prefix
+    // mutation and displaces the set its predecessor captured.
+    let mut live = prepared_manifest(&config);
+    live.epoch_id = "epoch-live".to_string();
+    live.mutation_reason = Some("instructions".to_string());
+    let (provider, outcome) = send_on_thread(provider, live);
+    outcome.expect("the live epoch captures its block");
+
+    // The live epoch still replays its own block byte-for-byte.
+    let mut replay = prepared_manifest(&config);
+    replay.epoch_id = "epoch-live".to_string();
+    let inputs = replay.inputs.clone();
+    let (provider, outcome) = send_on_thread(provider, replay);
+    assert_eq!(provider.dropped_reasoning(), 0);
+    outcome.expect("the live epoch replays");
+
+    // A stale send of the displaced epoch and an unknown epoch both fail
+    // closed: neither replays bytes the conversation has moved past.
+    let mut stale = prepared_manifest(&config);
+    stale.epoch_id = "epoch-displaced".to_string();
+    let (provider, outcome) = send_on_thread(provider, stale);
+    outcome.expect("the displaced epoch still answers without a replay");
+    let mut unknown = prepared_manifest(&config);
+    unknown.epoch_id = "epoch-unknown".to_string();
+    let (provider, outcome) = send_on_thread(provider, unknown);
+    outcome.expect("the unknown epoch still answers without a replay");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 5);
+    for request in &requests[..2] {
+        assert!(
+            body_of(request)["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a fresh or mutated epoch replays nothing"
+        );
+    }
+    assert_eq!(
+        body_of(&requests[2])["messages"],
+        json!([
+            {
+                "role": "assistant",
+                "content": [thinking_block_with("think-live", "sig-live")],
+            },
+            {"role": "user", "content": inputs},
+        ]),
+        "the live epoch replays byte-for-byte"
+    );
+    for request in &requests[3..] {
+        assert!(
+            body_of(request)["messages"]
+                .as_array()
+                .expect("messages is an array")
+                .iter()
+                .all(|message| message["role"] != json!("assistant")),
+            "a displaced or unknown epoch fails closed instead of replaying"
+        );
+    }
+}
+
+/// The replay retainer is bounded: one send per distinct conversation past
+/// the cap evicts the first conversation, so its epoch fails closed while
+/// the conversations still inside the bound replay.
+#[tokio::test]
+async fn anthropic_lineage_retainer_is_bounded() {
+    // One past the adapter's 16-conversation cap.
+    const SENDS: usize = 17;
+    let server = MockServer::start().await;
+    mount_messages(&server, thinking_stream("captured")).await;
+    let config =
+        Config::parse_validated(&anthropic_config(&server_uri_v1(&server))).expect("valid");
+    let (mut provider, _store) = anthropic_provider(&config);
+    for index in 0..SENDS {
+        let mut manifest = prepared_manifest_at(&config, &format!("/world/{index:02}"));
+        manifest.epoch_id = "epoch-bounded".to_string();
+        let (next, outcome) = send_on_thread(provider, manifest);
+        provider = next;
+        outcome.expect("a captured conversation answers");
+    }
+    let mut evicted = prepared_manifest_at(&config, "/world/00");
+    evicted.epoch_id = "epoch-bounded".to_string();
+    let (provider, outcome) = send_on_thread(provider, evicted);
+    outcome.expect("the evicted conversation answers without a replay");
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), SENDS + 1);
+    assert!(
+        body_of(&requests[SENDS])["messages"]
+            .as_array()
+            .expect("messages is an array")
+            .iter()
+            .all(|message| message["role"] != json!("assistant")),
+        "a conversation past the retainer bound replays nothing"
+    );
+}
+
+#[tokio::test]
 async fn anthropic_lineage_key_binds_world_and_purpose() {
     let server = MockServer::start().await;
     mount_messages_once(&server, thinking_stream("captured")).await;
@@ -1469,7 +1592,11 @@ async fn anthropic_mutated_epoch_drop_block() {
     mutated.epoch_id = "epoch-two".to_string();
     mutated.mutation_reason = Some("instructions".to_string());
     let (provider, outcome) = send_on_thread(provider, mutated);
-    outcome.expect("the mutated send succeeds");
+    let mutated_reply = outcome.expect("the mutated send succeeds");
+    assert_eq!(
+        mutated_reply.dropped_reasoning, 1,
+        "the reply carries the peer's input_transformations count for this send"
+    );
     assert_eq!(
         provider.dropped_reasoning(),
         1,
@@ -1478,7 +1605,11 @@ async fn anthropic_mutated_epoch_drop_block() {
     let mut after = prepared_manifest(&config);
     after.epoch_id = "epoch-two".to_string();
     let (provider, outcome) = send_on_thread(provider, after);
-    outcome.expect("the post-mutation send succeeds");
+    let after_reply = outcome.expect("the post-mutation send succeeds");
+    assert_eq!(
+        after_reply.dropped_reasoning, 0,
+        "the reply carries this send's delta, never the cumulative counter"
+    );
     drop_blocking(provider);
 
     let requests = server

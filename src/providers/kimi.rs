@@ -22,13 +22,14 @@
 //! never reaches the peer. Token material — the device code, the access and
 //! refresh tokens — never enters `Debug`, `Display` or a diagnostic.
 
-use super::anthropic::{MessagesCodec, RefusedMessages, THINKING_BINDING_BETA};
+use super::anthropic::{ANTHROPIC_VERSION, MessagesCodec, RefusedMessages, THINKING_BINDING_BETA};
 use super::login_common::{self, BindingError, CommonError};
 use super::sse::{MAX_STREAM_BYTES, SseEvent, SseParser};
 use super::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
     SecretRef, ToolCall, WireAuth, bounded_reason, check_deadline, read_chunk,
-    resolve_admitted_credential_in, sse, transport, transport_status, violation, wire_body,
+    resolve_admitted_credential_in, retain_lineage_epoch, retire_displaced_epochs, sse, transport,
+    transport_status, violation, wire_body,
 };
 use crate::config::{Config, ConnKind, Connection, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
@@ -1185,8 +1186,16 @@ impl KimiProvider {
 
     /// The frozen manifest as the Chat Completions wire body. The prior
     /// assistant turn of this epoch replays its reasoning beside the answer
-    /// it accompanied; a prefix mutation replays nothing.
-    fn chat_body(&self, manifest: &RequestManifest, model: &str) -> Result<Value, ProviderError> {
+    /// it accompanied; a prefix mutation replays nothing and retires the
+    /// conversation's displaced epochs before the wire leg.
+    fn chat_body(
+        &mut self,
+        manifest: &RequestManifest,
+        model: &str,
+    ) -> Result<Value, ProviderError> {
+        if manifest.mutation_reason.is_some() {
+            retire_displaced_epochs(&mut self.chat_lineages, &chat_lineage_key(manifest));
+        }
         let mut messages = Vec::with_capacity(3);
         if !manifest.instructions.is_empty() {
             messages.push(json!({ "role": "system", "content": manifest.instructions }));
@@ -1326,6 +1335,7 @@ impl Provider for KimiProvider {
                             .post(format!("{endpoint}/messages"))
                             .header(reqwest::header::CONTENT_TYPE, "application/json")
                             .header(reqwest::header::ACCEPT, "text/event-stream")
+                            .header("anthropic-version", ANTHROPIC_VERSION)
                             .bearer_auth(&bearer)
                             .body(bytes),
                     );
@@ -1459,16 +1469,18 @@ impl KimiProvider {
             tool_calls,
             usage,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 
     /// Commits the assistant turn one Chat epoch replays — the answer and
-    /// every reasoning member the peer named, byte-identical. A mutation
-    /// or a reasoning-less turn clears the epoch's set instead.
+    /// every reasoning member the peer named, byte-identical. A mutation or
+    /// a reasoning-less turn clears the conversation's replay state instead,
+    /// so a displaced epoch never answers a later send.
     fn commit_chat(&mut self, manifest: &RequestManifest, model: &str, state: &ChatStream) {
         let key = chat_lineage_key(manifest);
         if manifest.mutation_reason.is_some() || state.reasoning.iter().all(String::is_empty) {
-            self.chat_lineages.remove(&key);
+            retire_displaced_epochs(&mut self.chat_lineages, &key);
             return;
         }
         let mut message = serde_json::Map::new();
@@ -1479,7 +1491,8 @@ impl KimiProvider {
                 message.insert((*name).to_string(), json!(piece));
             }
         }
-        self.chat_lineages.insert(
+        retain_lineage_epoch(
+            &mut self.chat_lineages,
             key,
             ChatLineage {
                 model: model.to_string(),
@@ -1871,8 +1884,12 @@ fn chat_usage(usage: Option<&Value>) -> Result<UsageDelta, ProviderError> {
         .and_then(Value::as_u64);
     match (prompt, completion, total) {
         (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
+            // Cached prompt tokens are a subset of `prompt_tokens` in this
+            // dialect, so the prompt leg is uncached input only.
+            // shortcut: dialect semantics normalized at the adapter; revisit if a provider changes the inclusion rule
+            let uncached = prompt_tokens.saturating_sub(cache_read.unwrap_or(0));
             Ok(UsageDelta::from_reported(
-                prompt_tokens,
+                uncached,
                 completion_tokens,
                 total_tokens,
                 reasoning,

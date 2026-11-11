@@ -2130,6 +2130,7 @@ impl Provider for NoReadProvider {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }
@@ -2160,6 +2161,7 @@ impl Provider for OutsideScopeProvider {
             }],
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }
@@ -4003,6 +4005,7 @@ fn primary_fallback_and_substitute_each_settle_once() {
                     total_tokens: 3,
                 },
                 wire_retries: 0,
+                dropped_reasoning: 0,
             })
         }
     }
@@ -4143,6 +4146,7 @@ fn substitute_settlement_records_its_parent_and_its_own_bins() {
                     total_tokens: 3,
                 },
                 wire_retries: 0,
+                dropped_reasoning: 0,
             })
         }
     }

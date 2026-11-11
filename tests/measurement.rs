@@ -785,6 +785,7 @@ fn frozen_release_budgets_match_the_pinned_digest() {
 
 #[test]
 fn offline_corpus_measures_the_installed_candidate_against_the_frozen_limits() {
+    support::not_run::reset("measurement.offline_corpus");
     let frozen = Frozen::load();
     assert_eq!(frozen.digest, FROZEN_BUDGET_DIGEST);
     let doc = frozen.document();
@@ -812,6 +813,10 @@ fn offline_corpus_measures_the_installed_candidate_against_the_frozen_limits() {
     // earns no PASS; nothing here invents one.
     let platform = platform();
     if let Platform::Unavailable { reason } = &platform {
+        support::not_run::record(
+            "measurement.offline_corpus",
+            &format!("platform unavailable: {reason}"),
+        );
         println!("corpus NOT_RUN on this platform: {reason}");
         return;
     }
@@ -1007,6 +1012,72 @@ fn ineligible_p99_is_not_pass() {
                 ))
         ),
         "an under-populated p99 is not PASS: {verdict:?}"
+    );
+    assert!(!verdict.is_pass());
+}
+
+/// An unmeasured kit or owned RSS is a named gap, never a PASS: all-zero
+/// figures were never observed, while a measured under-limit report passes.
+#[test]
+fn unmeasured_kit_or_owned_rss_is_not_pass() {
+    let frozen = Frozen::load();
+    let limits = frozen_limits(&frozen.document());
+    let mut report = complete_report(&limits);
+    assert!(
+        matches!(report.verdict(&limits), ReleaseVerdict::Pass),
+        "a measured under-limit report passes"
+    );
+
+    report.kit = KitMeasurement::default();
+    let verdict = report.verdict(&limits);
+    assert!(
+        matches!(
+            &verdict,
+            ReleaseVerdict::NotPass(gaps)
+                if gaps
+                    .iter()
+                    .any(|gap| matches!(gap, MeasurementGap::KitUnmeasured { .. }))
+        ),
+        "an unmeasured kit earns no PASS: {verdict:?}"
+    );
+    assert!(!verdict.is_pass());
+
+    // A partially measured kit is unmeasured too: one zero figure was never
+    // observed, so no limit arm can read it as under budget.
+    let mut report = complete_report(&limits);
+    report.kit = KitMeasurement {
+        disk_bytes: 1,
+        package_bytes: 1,
+        package_files: 1,
+        install_nanos: 0,
+    };
+    let verdict = report.verdict(&limits);
+    assert!(
+        matches!(
+            &verdict,
+            ReleaseVerdict::NotPass(gaps)
+                if gaps
+                    .iter()
+                    .any(|gap| matches!(gap, MeasurementGap::KitUnmeasured { .. }))
+        ),
+        "a partially measured kit earns no PASS: {verdict:?}"
+    );
+    assert!(!verdict.is_pass());
+
+    // A counted owned group whose resident set was never observed is
+    // unmeasured too, never taken as under budget.
+    let mut report = complete_report(&limits);
+    report.owned.rss_bytes = 0;
+    let verdict = report.verdict(&limits);
+    assert!(
+        matches!(
+            &verdict,
+            ReleaseVerdict::NotPass(gaps)
+                if gaps
+                    .iter()
+                    .any(|gap| matches!(gap, MeasurementGap::OwnedUnmeasured { .. }))
+        ),
+        "an unmeasured owned RSS earns no PASS: {verdict:?}"
     );
     assert!(!verdict.is_pass());
 }

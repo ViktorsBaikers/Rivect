@@ -17,19 +17,30 @@ use rivect::docs::{
     Redirect, Request, Response, SourceClass, Unknown, classify, plan, redirect, status,
     status_for,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// One versioned docs snapshot tree: a direct source that needs no key.
 fn snapshot(tag: &str) -> tempfile::TempDir {
+    snapshot_with(tag, "rivect", "1.2.0", "installed-1.2.0 API")
+}
+
+/// One snapshot file at the installed version's path, with a header the case
+/// chooses: a same-package latest version or another package's claim.
+fn snapshot_with(
+    tag: &str,
+    header_package: &str,
+    header_version: &str,
+    body: &str,
+) -> tempfile::TempDir {
     let directory = tempfile::TempDir::with_prefix(format!("rivect-docs-{tag}-")).expect("tempdir");
     std::fs::create_dir_all(directory.path().join("rivect")).expect("package dir");
     std::fs::write(
         directory.path().join("rivect").join("1.2.0.json"),
         serde_json::to_vec(&json!({
-            "package": "rivect",
-            "version": "1.2.0",
-            "body": "installed-1.2.0 API",
+            "package": header_package,
+            "version": header_version,
+            "body": body,
         }))
         .expect("body encodes"),
     )
@@ -54,6 +65,29 @@ fn response(status: u16, body: &str) -> Response {
         etag: None,
         location: None,
     }
+}
+
+/// `docs.status` with its declared `question` object: the public entry that
+/// serves the direct source. The entry never carries a transport response, so
+/// the stale/304/redirect legs stay library cases over `classify`/`redirect`;
+/// this drives the half of AC-037/AC-038 the product surface actually owns.
+fn status_question(
+    world: &mut support::World,
+    session: &rivect::contracts::SessionId,
+    installed: &str,
+    root: &Path,
+) -> Value {
+    world.dispatch(&support::command_execute(
+        session,
+        "docs.status",
+        json!({
+            "question": {
+                "package": "rivect",
+                "installed": installed,
+                "root": root.to_str().expect("utf-8 snapshot root"),
+            }
+        }),
+    ))
 }
 
 #[test]
@@ -305,6 +339,211 @@ fn accept_and_authorization_are_scoped_to_the_request_origin() {
 }
 
 #[test]
+fn protocol_relative_redirects_name_their_own_authority() {
+    // A protocol-relative location carries its own authority under the
+    // request's scheme: a foreign one is refused with the scoped credential
+    // withheld rather than read as a same-origin path.
+    assert_eq!(
+        redirect(
+            "https://docs.example.test",
+            "//evil.example.test/steal",
+            Some("https://docs.example.test")
+        ),
+        Redirect::Refused {
+            origin: "https://evil.example.test".to_string(),
+            authorization: Authorization::Withheld,
+        }
+    );
+    // The same authority may follow with the scoped credential.
+    assert_eq!(
+        redirect(
+            "https://docs.example.test",
+            "//docs.example.test/api/rivect/1.2.0",
+            Some("https://docs.example.test")
+        ),
+        Redirect::Follow {
+            url: "//docs.example.test/api/rivect/1.2.0".to_string(),
+            authorization: Authorization::Scoped,
+        }
+    );
+    // With no credential bound, neither location attaches an authorization.
+    assert_eq!(
+        redirect(
+            "https://docs.example.test",
+            "//evil.example.test/steal",
+            None
+        ),
+        Redirect::Refused {
+            origin: "https://evil.example.test".to_string(),
+            authorization: Authorization::None,
+        }
+    );
+    assert_eq!(
+        redirect(
+            "https://docs.example.test",
+            "//docs.example.test/api/rivect/1.2.0",
+            None
+        ),
+        Redirect::Follow {
+            url: "//docs.example.test/api/rivect/1.2.0".to_string(),
+            authorization: Authorization::None,
+        }
+    );
+
+    // The classifier reads the same authority: a protocol-relative
+    // cross-origin redirect is an explicit unknown, never a same-origin
+    // re-plan.
+    let mut moved = response(302, "");
+    moved.location = Some("//evil.example.test/steal".to_string());
+    assert_eq!(
+        classify(&request("1.2.0", None), &moved, None, 100).unknown(),
+        Some(&Unknown::CrossOriginRedirect {
+            origin: "https://evil.example.test".to_string()
+        })
+    );
+    // A same-authority protocol-relative redirect is re-planned, not served.
+    let mut inside = response(307, "");
+    inside.location = Some("//docs.example.test/api/rivect/1.2.0/full".to_string());
+    assert_eq!(
+        classify(&request("1.2.0", None), &inside, None, 100).unknown(),
+        Some(&Unknown::Redirect {
+            url: "//docs.example.test/api/rivect/1.2.0/full".to_string()
+        })
+    );
+}
+
+#[test]
+fn ambiguous_redirect_spellings_resolve_to_their_foreign_authority() {
+    // WHATWG resolution treats backslashes as slashes and collapses repeated
+    // slashes, so each spelling names the foreign authority rather than a
+    // same-origin path; the scoped credential is withheld and the hop refused.
+    for location in ["/\\evil.example.test/steal", "\\\\evil.example.test\\steal"] {
+        assert_eq!(
+            redirect(
+                "https://docs.example.test",
+                location,
+                Some("https://docs.example.test")
+            ),
+            Redirect::Refused {
+                origin: "https://evil.example.test".to_string(),
+                authorization: Authorization::Withheld,
+            },
+            "{location}"
+        );
+
+        let mut moved = response(302, "");
+        moved.location = Some(location.to_string());
+        assert_eq!(
+            classify(&request("1.2.0", None), &moved, None, 100).unknown(),
+            Some(&Unknown::CrossOriginRedirect {
+                origin: "https://evil.example.test".to_string()
+            }),
+            "{location}"
+        );
+    }
+
+    // An empty authority (`///evil`) is refused by the parser itself; the hop
+    // is still refused and the credential withheld.
+    assert!(
+        matches!(
+            redirect(
+                "https://docs.example.test",
+                "///evil.example.test/steal",
+                Some("https://docs.example.test")
+            ),
+            Redirect::Refused {
+                authorization: Authorization::Withheld,
+                ..
+            }
+        ),
+        "an unresolvable authority is refused"
+    );
+    let mut moved = response(302, "");
+    moved.location = Some("///evil.example.test/steal".to_string());
+    assert!(matches!(
+        classify(&request("1.2.0", None), &moved, None, 100).unknown(),
+        Some(&Unknown::CrossOriginRedirect { .. })
+    ));
+
+    // A same-scheme location with one slash is a path under WHATWG resolution
+    // (a browser's `new URL("https:/x", base)` stays on base), so it follows
+    // with the scoped credential instead of being misread as an authority.
+    assert_eq!(
+        redirect(
+            "https://docs.example.test",
+            "https:/evil.example.test/steal",
+            Some("https://docs.example.test")
+        ),
+        Redirect::Follow {
+            url: "https:/evil.example.test/steal".to_string(),
+            authorization: Authorization::Scoped,
+        }
+    );
+    let mut inside = response(302, "");
+    inside.location = Some("https:/evil.example.test/steal".to_string());
+    assert_eq!(
+        classify(&request("1.2.0", None), &inside, None, 100).unknown(),
+        Some(&Unknown::Redirect {
+            url: "https:/evil.example.test/steal".to_string()
+        })
+    );
+}
+
+/// A caller-named snapshot must be a regular file: a FIFO with no writer is
+/// refused before the open that would block forever, and a regular file past
+/// the body bound is still refused by the byte bound.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_target_must_be_regular_and_byte_bounded() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::TempDir::with_prefix("rivect-docs-bound-").expect("tempdir");
+    std::fs::create_dir_all(directory.path().join("rivect")).expect("package dir");
+    let path = directory.path().join("rivect").join("1.2.0.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+
+    // No writer ever opens the FIFO: only a pre-open regular-file refusal
+    // returns here, because `File::open` on a reader FIFO blocks forever.
+    let (answer, answered) = mpsc::channel();
+    let source_root = directory.path().to_path_buf();
+    let reader = std::thread::spawn(move || {
+        let source = DirectSource::new(&source_root);
+        answer
+            .send(source.retrieve("rivect", "1.2.0"))
+            .expect("send the fifo answer");
+    });
+    let observed = answered
+        .recv_timeout(Duration::from_secs(15))
+        .expect("a non-regular target is refused before the blocking open");
+    reader.join().expect("the reader finishes");
+    match observed {
+        Err(DocsError::Read { source, .. }) => {
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the refusal is typed at the open boundary"
+            );
+        }
+        other => panic!("a non-regular snapshot is refused: {other:?}"),
+    }
+
+    std::fs::remove_file(&path).expect("replace the fifo");
+    std::fs::write(&path, vec![b' '; rivect::docs::DOC_BODY_MAX_BYTES + 1])
+        .expect("over-bound snapshot");
+    match DirectSource::new(directory.path()).retrieve("rivect", "1.2.0") {
+        Err(DocsError::TooLarge { limit, .. }) => {
+            assert_eq!(limit, rivect::docs::DOC_BODY_MAX_BYTES);
+        }
+        other => panic!("an over-bound snapshot is refused: {other:?}"),
+    }
+}
+
+#[test]
 fn malformed_and_oversized_documents_are_unknown_never_evidence() {
     let no_key = request("1.2.0", None);
     // A 200 whose body is not the declared header is malformed.
@@ -358,6 +597,116 @@ fn malformed_and_oversized_documents_are_unknown_never_evidence() {
 }
 
 #[test]
+fn docs_status_question_serves_only_an_applicable_source() {
+    // AC-037 at the declared product entry: the on-disk direct source is the
+    // applicable one, and an incompatible latest/API answer is an explicit
+    // unknown rather than evidence.
+    let compatible = snapshot("entry-compatible");
+    let mut world = support::open_world("docs-entry-version", None);
+    let session = world.open_session("docs-entry-version");
+    let served = status_question(&mut world, &session, "1.2.0", compatible.path());
+    assert!(served.get("error").is_none(), "{served}");
+    let answer = &served["result"]["answer"];
+    assert_eq!(answer["status"], "source", "{served}");
+    assert_eq!(answer["version"], "1.2.0", "{served}");
+    assert_eq!(answer["body"], "installed-1.2.0 API", "{served}");
+    assert_eq!(answer["freshness"]["fetched"]["as_of"], 0, "{served}");
+
+    // The installed 1.2.0 caller asking for a 2.0.0 snapshot is the
+    // old-version/latest trap: the body's own header refuses it as evidence,
+    // and the incompatible example never reaches the answer.
+    let latest = snapshot_with(
+        "entry-latest",
+        "rivect",
+        "2.0.0",
+        "latest-only API; citation: https://docs.example.test/latest",
+    );
+    let trapped = status_question(&mut world, &session, "1.2.0", latest.path());
+    assert!(trapped.get("error").is_none(), "{trapped}");
+    let answer = &trapped["result"]["answer"];
+    assert_eq!(answer["status"], "unknown", "{trapped}");
+    assert_eq!(answer["reason"], "version_mismatch", "{trapped}");
+    assert_eq!(answer["installed"], "1.2.0", "{trapped}");
+    assert_eq!(answer["offered"], "2.0.0", "{trapped}");
+    assert!(
+        !trapped.to_string().contains("latest-only API"),
+        "an incompatible example is never served as evidence: {trapped}"
+    );
+    assert!(
+        !trapped.to_string().contains("docs.example.test/latest"),
+        "an unsupported citation is never served as evidence: {trapped}"
+    );
+
+    // A snapshot whose own header names another package is poisoned.
+    let poisoned = snapshot_with("entry-poisoned", "other", "1.2.0", "impostor");
+    let poisoned = status_question(&mut world, &session, "1.2.0", poisoned.path());
+    assert_eq!(
+        poisoned["result"]["answer"]["reason"], "poisoned_source",
+        "{poisoned}"
+    );
+    assert!(
+        !poisoned.to_string().contains("impostor"),
+        "a poisoned body is never evidence: {poisoned}"
+    );
+
+    // A version the source does not hold stays unknown; the latest one is
+    // never substituted.
+    let missing = status_question(&mut world, &session, "2.0.0", compatible.path());
+    assert_eq!(
+        missing["result"]["answer"]["reason"], "version_unavailable",
+        "{missing}"
+    );
+    assert_eq!(
+        missing["result"]["answer"]["requested"], "2.0.0",
+        "{missing}"
+    );
+    assert_eq!(
+        missing["result"]["quota"], "unknown",
+        "the account fact stays unknown"
+    );
+}
+
+#[test]
+fn docs_status_question_uses_the_direct_baseline_without_a_key_or_overage() {
+    // AC-038 at the product entry: no key and no SaaS account, the direct
+    // source still answers, the quota stays an honest unknown, and no
+    // credential/authorization field is carried by the answer.
+    let direct = snapshot("entry-no-key");
+    let mut world = support::open_world("docs-entry-no-key", None);
+    let session = world.open_session("docs-entry-no-key");
+    let served = status_question(&mut world, &session, "1.2.0", direct.path());
+    assert!(served.get("error").is_none(), "{served}");
+    let result = &served["result"];
+    assert_eq!(result["answer"]["status"], "source", "{served}");
+    assert_eq!(result["answer"]["version"], "1.2.0", "{served}");
+    assert_eq!(result["quota"], "unknown", "{served}");
+    assert_eq!(
+        result["source_classes"],
+        json!(["direct_local"]),
+        "{served}"
+    );
+    assert_eq!(
+        result["version_aware"], true,
+        "the row pins the installed version"
+    );
+    let rendered = served.to_string().to_ascii_lowercase();
+    for forbidden in ["authorization", "bearer", "credential", "api_key"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "the direct baseline carries no {forbidden}: {served}"
+        );
+    }
+
+    // Stale/304/redirect freshness and Authorization scoping are classifier
+    // properties this entry cannot carry: no transport response reaches it.
+    // The library cases above remain their owner; the product half proves the
+    // baseline answers without a key and never invents a paid account.
+    let status = status();
+    assert_eq!(status.quota, Quota::Unknown);
+    assert_eq!(status.source_classes, vec!["direct_local"]);
+}
+
+#[test]
 fn docs_status_is_available_and_reports_a_real_result() {
     // The catalog row is served, not merely advertised.
     let page = rivect::tools::describe();
@@ -408,6 +757,11 @@ fn docs_status_is_available_and_reports_a_real_result() {
     ));
     assert!(response.get("error").is_none(), "{response}");
     let result = &response["result"];
+    assert_eq!(
+        result,
+        &json!(rivect::docs::status()),
+        "no-argument docs.status is the status projection byte-for-byte"
+    );
     assert_eq!(result["kind"], "docs.status", "{response}");
     assert_eq!(result["owner"], "src/docs.rs", "{response}");
     assert_eq!(

@@ -4763,7 +4763,7 @@ async fn usage_metadata_cache_and_thought_legs_are_carried() {
     assert_eq!(
         record.usage,
         UsageDelta::Legs {
-            prompt_tokens: Some(5),
+            prompt_tokens: Some(2),
             completion_tokens: Some(7),
             reasoning_tokens: Some(2),
             cache_read_tokens: Some(3),

@@ -283,6 +283,7 @@ impl Provider for Scripted {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

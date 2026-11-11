@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 /// The grammar, one line per invocation shape. It names the subcommands and
 /// the flags exactly as [`parse`] accepts them.
-pub const USAGE: &str = "rivect [--tui fullscreen|inline] [--no-mouse] [--headless] [--data-root PATH]\n\
+pub const USAGE: &str = "rivect [--tui fullscreen|inline] [--linear] [--no-mouse] [--headless] [--data-root PATH]\n\
        rivect <command> [--data-root PATH]\n\
        rivect doctor [--project PATH] [--data-root PATH]\n\
        rivect completions <bash|zsh|fish>\n\
@@ -50,19 +50,26 @@ pub enum Invocation {
 /// that was wrong, and `main` prints it with the usage block.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("unsupported render mode in this build: {mode}")]
-    UnsupportedRenderMode { mode: String },
+    #[error(
+        "unknown --tui mode {mode}; --tui accepts fullscreen or inline (linear is selected by --linear)"
+    )]
+    UnknownRenderMode { mode: String },
     #[error("missing value for {flag}")]
     MissingValue { flag: &'static str },
     #[error("unknown flag {flag}")]
     UnknownFlag { flag: String },
+    #[error("unknown flag {flag} for doctor; doctor accepts --project and --data-root")]
+    DoctorFlag { flag: String },
     #[error("unknown command {command}")]
     UnknownCommand { command: String },
     #[error("completions needs exactly one shell: bash, zsh or fish")]
     MissingShell,
     #[error("missing value for --ui-review")]
     MissingReviewState,
-    #[error("unknown ui review state {state}")]
+    #[error(
+        "unknown ui review state {state}; known states: {}",
+        rivect::ui::review::STATES.join(", ")
+    )]
     UnknownReviewState { state: String },
     #[error("unknown shell {shell}; known shells: bash, zsh, fish")]
     UnknownShell { shell: String },
@@ -72,6 +79,13 @@ pub enum CliError {
 enum Subcommand {
     Completions,
     Doctor,
+}
+
+/// The accessibility environment switch for the append-only surface
+/// (engineering-standards §7.3 names flag + env). Exactly `1` requests it;
+/// any other value leaves the default surface untouched.
+fn linear_requested() -> bool {
+    std::env::var_os("RIVECT_LINEAR").is_some_and(|value| value == "1")
 }
 
 /// Parses one command line. `default_data_root` is read only when the flags
@@ -112,7 +126,13 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
     }
     let mut data_root = default_data_root;
     let mut headless = false;
-    let mut render = RenderMode::Fullscreen;
+    // The screen-reader surface is selected by flag or by the standard's
+    // environment variable; an explicit `--tui` still overrides the default.
+    let mut render = if linear_requested() {
+        RenderMode::Linear
+    } else {
+        RenderMode::Fullscreen
+    };
     let mut project = None;
     let mut review = None;
     let mut index = 0;
@@ -125,6 +145,12 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
                 let Some(state) = rest.get(index) else {
                     return Err(CliError::MissingReviewState);
                 };
+                // The state list is the surface's own vocabulary, so `--help`
+                // after the flag asks for the banner instead of becoming a
+                // state named `--help`.
+                if state == "--help" || state == "-h" {
+                    return Ok(Invocation::Help);
+                }
                 if !rivect::ui::review::STATES.contains(&state.as_str()) {
                     return Err(CliError::UnknownReviewState {
                         state: state.clone(),
@@ -140,9 +166,10 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
                 render = match mode.as_str() {
                     "fullscreen" => RenderMode::Fullscreen,
                     "inline" => RenderMode::Inline,
-                    _ => return Err(CliError::UnsupportedRenderMode { mode: mode.clone() }),
+                    _ => return Err(CliError::UnknownRenderMode { mode: mode.clone() }),
                 };
             }
+            "--linear" if subcommand.is_none() => render = RenderMode::Linear,
             "--no-mouse" if subcommand.is_none() => {}
             "--headless" if subcommand.is_none() => headless = true,
             "--data-root" => {
@@ -163,7 +190,13 @@ pub fn parse(args: &[String], default_data_root: PathBuf) -> Result<Invocation, 
             }
             // A flag this subcommand does not own is refused, never silently
             // ignored: `doctor --headless` is a caller error, not a doctor
-            // that quietly drops the word.
+            // that quietly drops the word. Doctor's refusal names the flags it
+            // does own so the caller has a next action.
+            flag if subcommand == Some(Subcommand::Doctor) => {
+                return Err(CliError::DoctorFlag {
+                    flag: flag.to_string(),
+                });
+            }
             flag => {
                 return Err(CliError::UnknownFlag {
                     flag: flag.to_string(),
@@ -227,9 +260,9 @@ fn parse_command(
     })
 }
 
-/// The help banner: the grammar's usage lines, then one line per catalog row.
-/// The row lines are [`tools::help_lines`], so the banner cannot advertise a
-/// row the page does not carry.
+/// The help banner: the grammar's usage lines, then the flags section and one
+/// line per page entry. [`tools::help_lines`] owns both blocks, so the banner
+/// cannot advertise a row the page does not carry.
 #[must_use]
 pub fn help(page: &Page<CommandDescriptor>) -> String {
     let mut text = String::from("usage:\n");
@@ -238,7 +271,7 @@ pub fn help(page: &Page<CommandDescriptor>) -> String {
         text.push_str(line.trim_start());
         text.push('\n');
     }
-    text.push_str("\ncommands:\n");
+    text.push('\n');
     for line in tools::help_lines(page) {
         text.push_str(&line);
         text.push('\n');
@@ -259,6 +292,23 @@ pub fn version() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accessibility surface has its own flag; it is a run mode, not a
+    /// catalog word, and the grammar accepts it without a value.
+    #[test]
+    fn linear_flag_selects_the_append_only_surface() {
+        let run = parse(&["--linear".to_string()], PathBuf::from("/data"));
+        assert!(
+            matches!(
+                run,
+                Ok(Invocation::Run {
+                    render: RenderMode::Linear,
+                    ..
+                })
+            ),
+            "{run:?}"
+        );
+    }
 
     /// Every word a completion script offers is one this grammar resolves:
     /// a catalog word parses into a one-shot command, never a usage error.
@@ -288,7 +338,7 @@ mod tests {
             PathBuf::from("/data"),
         );
         assert!(
-            matches!(doctor, Err(CliError::UnknownFlag { .. })),
+            matches!(doctor, Err(CliError::DoctorFlag { .. })),
             "{doctor:?}"
         );
         let completions = parse(

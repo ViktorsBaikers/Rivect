@@ -389,6 +389,27 @@ fn installed_artifact_answers_76_provider_and_alias_rows() {
     );
 }
 
+#[test]
+fn the_release_zero_effect_oracle_sees_a_same_length_rewrite() {
+    // The release zero-write proof records the bytes under its roots, not
+    // just their sizes: a same-length in-place rewrite must move it.
+    let root = tempfile::TempDir::with_prefix("rivect-release-oracle-digest-").expect("temp root");
+    let target = root.path().join("candidate.bin");
+    std::fs::write(&target, b"aaaa").expect("first bytes");
+    let before = support::release::snapshot(root.path());
+    std::fs::write(&target, b"bbbb").expect("same-length rewrite");
+    assert_eq!(
+        std::fs::metadata(&target).expect("metadata").len(),
+        before[0].1,
+        "the control keeps the recorded length"
+    );
+    assert_ne!(
+        support::release::snapshot(root.path()),
+        before,
+        "a same-length in-place rewrite must move the release zero-write oracle"
+    );
+}
+
 /// Support preview/export and read-only replay publish nothing, repeat no
 /// effect, and replace provider-bound reasoning bytes and credential values
 /// with fixed reason codes.
@@ -399,7 +420,15 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
     const ENCRYPTED_SENTINEL: &str = "ENCRYPTED-SENTINEL-bytes";
     const THOUGHT_SIGNATURE_SENTINEL: &str = "THOUGHT-SIGNATURE-SENTINEL-bytes";
     const REDACTED_SENTINEL: &str = "REDACTED-THINKING-SENTINEL-bytes";
+    const REASONING_SENTINEL: &str = "REASONING-SENTINEL-bytes";
+    const REASONING_TEXT_SENTINEL: &str = "REASONING-TEXT-SENTINEL-bytes";
+    const REASONING_DETAILS_SENTINEL: &str = "REASONING-DETAILS-SENTINEL-bytes";
+    const SUMMARY_SENTINEL: &str = "SUMMARY-TEXT-SENTINEL-bytes";
     const SECRET_SENTINEL: &str = "SECRET-SENTINEL-bytes";
+    const GEMINI_THOUGHT_SENTINEL: &str = "GEMINI-THOUGHT-SENTINEL-bytes";
+    const GITLAB_REASONING_SENTINEL: &str = "GITLAB-REASONING-SENTINEL-bytes";
+    const ID_TOKEN_SENTINEL: &str = "ID-TOKEN-SENTINEL-bytes";
+    const PRIVATE_KEY_SENTINEL: &str = "PRIVATE-KEY-SENTINEL-bytes";
 
     let root = tempfile::TempDir::with_prefix("rivect-installed-support-").expect("fixture root");
     let bundle = support::release::baseline_bundle();
@@ -415,9 +444,19 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
             {"role": "assistant", "content": [
                 {"type": "thinking", "thinking": THINKING_SENTINEL, "signature": SIGNATURE_SENTINEL}
             ]},
-            {"type": "reasoning", "id": "rs_1", "encrypted_content": [ENCRYPTED_SENTINEL]},
+            {"type": "reasoning", "id": "rs_1",
+             "summary": [{"type": "summary_text", "text": SUMMARY_SENTINEL}],
+             "encrypted_content": [ENCRYPTED_SENTINEL]},
             {"type": "redacted_thinking", "data": REDACTED_SENTINEL},
+            {"type": "reasoning_text", "text": REASONING_TEXT_SENTINEL},
             {"parts": [{"thought_signature": THOUGHT_SIGNATURE_SENTINEL}]},
+            {"signature": SIGNATURE_SENTINEL},
+            {"encrypted_content": ENCRYPTED_SENTINEL},
+            {"reasoning": REASONING_SENTINEL},
+            {"reasoning_text": REASONING_TEXT_SENTINEL},
+            {"reasoning_details": REASONING_DETAILS_SENTINEL},
+            {"parts": [{"thought": true, "text": GEMINI_THOUGHT_SENTINEL}]},
+            {"message_sub_type": "reasoning", "content": GITLAB_REASONING_SENTINEL},
             {"headers": {
                 "authorization": SECRET_SENTINEL,
                 "Authorization": SECRET_SENTINEL,
@@ -425,16 +464,41 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
                 "x-api-key": SECRET_SENTINEL,
                 "cf-aig-authorization": SECRET_SENTINEL,
                 "x-amz-security-token": SECRET_SENTINEL,
-                "token": SECRET_SENTINEL
+                "token": SECRET_SENTINEL,
+                "apiKey": SECRET_SENTINEL,
+                "x-goog-api-key": SECRET_SENTINEL,
+                "bearer_token": SECRET_SENTINEL,
+                "accessKeyId": SECRET_SENTINEL,
+                "SecretAccessKey": SECRET_SENTINEL,
+                "SessionToken": SECRET_SENTINEL,
+                "secretKey": SECRET_SENTINEL,
+                "id_token": ID_TOKEN_SENTINEL,
+                "privateKey": PRIVATE_KEY_SENTINEL
             }}
         ]
     });
     let expected_replacements = json!({
-        "reasoning_local_only": 3,
+        "reasoning_local_only": 10,
         "signature_local_only": 1,
         "encrypted_reasoning_local_only": 1,
-        "secret_local_only": 7,
+        "secret_local_only": 16,
     });
+    let provider_bytes = [
+        THINKING_SENTINEL,
+        SIGNATURE_SENTINEL,
+        ENCRYPTED_SENTINEL,
+        THOUGHT_SIGNATURE_SENTINEL,
+        REDACTED_SENTINEL,
+        REASONING_SENTINEL,
+        REASONING_TEXT_SENTINEL,
+        REASONING_DETAILS_SENTINEL,
+        SUMMARY_SENTINEL,
+        SECRET_SENTINEL,
+        GEMINI_THOUGHT_SENTINEL,
+        GITLAB_REASONING_SENTINEL,
+        ID_TOKEN_SENTINEL,
+        PRIVATE_KEY_SENTINEL,
+    ];
 
     let first = run_packaged_frames(
         bundle,
@@ -500,14 +564,7 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
         "{exported}"
     );
     let export_text = exported["bundle"].to_string();
-    for sentinel in [
-        THINKING_SENTINEL,
-        SIGNATURE_SENTINEL,
-        ENCRYPTED_SENTINEL,
-        THOUGHT_SIGNATURE_SENTINEL,
-        REDACTED_SENTINEL,
-        SECRET_SENTINEL,
-    ] {
+    for sentinel in provider_bytes {
         assert!(
             !support::release::stdout_of(&export_run).contains(sentinel),
             "support output never carries the sentinel {sentinel}"
@@ -574,6 +631,12 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
         raw_replay["replacements"], expected_replacements,
         "{raw_replay}"
     );
+    for sentinel in provider_bytes {
+        assert!(
+            !support::release::stdout_of(&replay_run).contains(sentinel),
+            "support replay never carries the sentinel {sentinel}"
+        );
+    }
 
     // Zero effect: no event landed and no settlement moved across preview,
     // export and both replays.

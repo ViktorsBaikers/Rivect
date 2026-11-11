@@ -117,9 +117,10 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Every path under `root` with its length, sorted: the zero-effect oracle for
-/// the doctor runs.
-fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
+/// Every path under `root` with its length and content digest, sorted: the
+/// zero-effect oracle for the doctor runs. The digest makes a same-length
+/// in-place rewrite visible where a length-only record read identical.
+fn snapshot(root: &Path) -> Vec<(PathBuf, u64, String)> {
     let mut entries = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -131,7 +132,17 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            entries.push((path.clone(), metadata.len()));
+            let digest = if metadata.is_dir() {
+                "dir".to_string()
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => support::sha256_hex(&bytes),
+                    // An unreadable entry is a distinct state, never the
+                    // digest of an empty file.
+                    Err(_) => "unreadable".to_string(),
+                }
+            };
+            entries.push((path.clone(), metadata.len(), digest));
             if metadata.is_dir() {
                 pending.push(path);
             }
@@ -139,6 +150,27 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
     }
     entries.sort();
     entries
+}
+
+#[test]
+fn the_zero_effect_oracle_sees_a_same_length_rewrite() {
+    // The doctor control records what is on disk, not just how much: a
+    // same-length in-place rewrite is a write, and the oracle must see it.
+    let root = tempfile::TempDir::with_prefix("rivect-zero-effect-digest-").expect("temp root");
+    let target = root.path().join("state.bin");
+    std::fs::write(&target, b"aaaa").expect("first bytes");
+    let before = snapshot(root.path());
+    std::fs::write(&target, b"bbbb").expect("same-length rewrite");
+    assert_eq!(
+        std::fs::metadata(&target).expect("metadata").len(),
+        before[0].1,
+        "the control keeps the recorded length"
+    );
+    assert_ne!(
+        snapshot(root.path()),
+        before,
+        "a same-length in-place rewrite must move the zero-effect oracle"
+    );
 }
 
 /// Splits a completion script into its words, so a row is matched whole
@@ -1281,25 +1313,107 @@ fn ui_review_refuses_unknown_state_and_non_tty_without_opening_a_root() {
 
     let unknown = run_cli_env(&["--ui-review", "not-a-state"], None, &env);
     assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    let refused = stderr_of(&unknown);
     assert!(
-        stderr_of(&unknown).contains("unknown ui review state not-a-state"),
+        refused.contains("unknown ui review state not-a-state"),
         "{unknown:?}"
     );
+    for state in rivect::ui::review::STATES {
+        assert!(
+            refused.contains(state),
+            "the refusal names the known state {state}: {refused}"
+        );
+    }
     assert!(
         !data_root.exists(),
         "an unknown state opens no runtime, store or data root"
     );
 
+    // `--help`/`-h` after the flag ask for help, not for a state with that
+    // name.
+    for help_flag in ["--help", "-h"] {
+        let review_help = run_cli_env(&["--ui-review", help_flag], None, &env);
+        assert_eq!(
+            review_help.status.code(),
+            Some(0),
+            "{help_flag}: {review_help:?}"
+        );
+        assert!(
+            stdout_of(&review_help).contains("usage:"),
+            "{help_flag}: the help banner answers the flag: {review_help:?}"
+        );
+    }
+    assert!(
+        !data_root.exists(),
+        "help opens no runtime, store or data root"
+    );
+
     let non_tty = run_cli_env(&["--ui-review", "start-no-connection"], None, &env);
     assert_eq!(non_tty.status.code(), Some(2), "{non_tty:?}");
+    let refused = stderr_of(&non_tty);
     assert!(
-        stderr_of(&non_tty).contains("ui review requires a terminal"),
+        refused.contains("ui review requires a terminal"),
         "{non_tty:?}"
+    );
+    assert!(
+        refused.contains("stdin and stdout are not terminals"),
+        "the refusal names the streams that are not terminals: {refused}"
+    );
+    assert!(
+        refused.contains("allocate a PTY"),
+        "the refusal names the recovery: {refused}"
     );
     assert!(
         !data_root.exists(),
         "a non-TTY refusal opens no runtime, store or data root"
     );
+}
+
+#[test]
+fn help_names_every_run_flag_and_the_surface_precedence() {
+    let help = run_cli(&["--help"], None);
+    assert_eq!(help.status.code(), Some(0), "{help:?}");
+    let text = stdout_of(&help);
+    for needle in [
+        "flags:",
+        "--tui fullscreen|inline",
+        "fullscreen is the default",
+        "--linear",
+        "capture is off by default",
+        "--headless",
+        "--data-root PATH",
+        "--ui-review <state>",
+        "last of --tui/--linear wins",
+        "RIVECT_LINEAR=1 sets the default surface only when no --tui or --linear flag is given",
+    ] {
+        assert!(text.contains(needle), "help omits {needle:?}: {text}");
+    }
+}
+
+#[test]
+fn flag_refusals_name_the_accepted_values_and_their_owner() {
+    // `--tui linear` is a near miss for the supported `--linear`, so the
+    // refusal names the values `--tui` accepts and the flag that owns linear.
+    let linear = run_cli(&["--tui", "linear"], None);
+    assert_eq!(linear.status.code(), Some(2), "{linear:?}");
+    let refused = stderr_of(&linear);
+    assert!(refused.contains("unknown --tui mode linear"), "{refused}");
+    assert!(
+        refused.contains("--tui accepts fullscreen or inline"),
+        "{refused}"
+    );
+    assert!(refused.contains("--linear"), "{refused}");
+
+    // `doctor` lists `--headless` in the banner but owns only its own flags.
+    let doctor = run_cli(&["doctor", "--headless"], None);
+    assert_eq!(doctor.status.code(), Some(2), "{doctor:?}");
+    let refused = stderr_of(&doctor);
+    assert!(
+        refused.contains("unknown flag --headless for doctor"),
+        "{refused}"
+    );
+    assert!(refused.contains("--project"), "{refused}");
+    assert!(refused.contains("--data-root"), "{refused}");
 }
 
 #[test]

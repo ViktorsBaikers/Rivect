@@ -346,3 +346,13 @@ CREATE TABLE IF NOT EXISTS sharing_grants (
     expires_at INTEGER NOT NULL,
     state TEXT NOT NULL
 ) STRICT;
+-- Dropped replayed reasoning (AC-046): one row per physical send whose peer
+-- reported discarding replayed thinking blocks. `reason_code` is the fixed
+-- class this build records, never provider bytes, and the row is local-only
+-- evidence that never leaves this machine. Additive and ignored by a build
+-- without it: no generation bump.
+CREATE TABLE IF NOT EXISTS reasoning_drops (
+    attempt_id TEXT PRIMARY KEY,
+    reason_code TEXT NOT NULL,
+    count INTEGER NOT NULL
+) STRICT;

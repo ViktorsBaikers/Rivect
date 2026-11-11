@@ -559,6 +559,18 @@ pub fn settlement_cohort_rows(count: usize) -> String {
     )
 }
 
+// ----- dropped reasoning (AC-046) -----
+
+/// One send's peer-reported dropped-reasoning count as durable local
+/// evidence (AC-046). The attempt is the identity, so a repeated report of
+/// the same send replaces the count instead of growing the ledger.
+pub const INSERT_REASONING_DROP: &str = "INSERT OR REPLACE INTO reasoning_drops
+                 (attempt_id, reason_code, count) VALUES (?1, ?2, ?3)";
+/// One attempt's dropped-reasoning record: absent means the peer dropped
+/// nothing on that send.
+pub const REASONING_DROP_ROW: &str =
+    "SELECT attempt_id, reason_code, count FROM reasoning_drops WHERE attempt_id = ?1";
+
 // ----- bounded work (AC-083a) -----
 
 /// One worker's recorded bounds. The scope and the work row open in one

@@ -206,6 +206,8 @@ pub enum InvalidCause {
     EventCursorOutOfRange,
     #[error("budget units {0} exceed the storable range")]
     BudgetUnitsOutOfRange(u64),
+    #[error("dropped reasoning count {0} exceeds the storable range")]
+    ReasoningDropOutOfRange(u64),
     #[error("work budget {field} {value} exceeds the storable range")]
     WorkBudgetBoundOutOfRange { field: &'static str, value: u64 },
     #[error("sharing grant expiry {0} exceeds the storable range")]
@@ -7489,6 +7491,25 @@ impl TaskStore {
         })
     }
 
+    /// Records one send's peer-reported dropped-reasoning count as local
+    /// evidence (AC-046). The row is keyed by the physical attempt, so a
+    /// repeated report of the same attempt replaces the count instead of
+    /// growing the ledger.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidInput`] when the count is past the storable
+    /// range, and the storage failure of the write.
+    pub fn record_reasoning_drop(&mut self, attempt_id: &str, count: u64) -> Result<()> {
+        let count = reasoning_drop_count_i64(count)?;
+        self.conn_write()?
+            .execute(
+                sql::INSERT_REASONING_DROP,
+                params![attempt_id, REASONING_DROP_REASON_CODE, count],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Closes one dispatched attempt (AC-057, DEC-012): the row settles
     /// with the provider's bins, exactness, unknown reason, wire retries
     /// and the units actually charged, and the reservation resolves —
@@ -7730,6 +7751,31 @@ impl TaskStore {
             .map_err(storage)?;
         row.ok_or_else(|| StoreError::NotFound(Missing::Settlement(attempt_id.to_string())))?
             .into_record()
+    }
+
+    /// One send's durable dropped-reasoning record: the fixed reason class
+    /// and the peer-reported count (AC-046). `None` when this store recorded
+    /// no drop for the attempt.
+    ///
+    /// # Errors
+    /// The storage failure of the read, and corrupt storage for a negative
+    /// count.
+    pub fn reasoning_drop(&self, attempt_id: &str) -> Result<Option<ReasoningDrop>> {
+        let row = self
+            .conn()?
+            .query_row(sql::REASONING_DROP_ROW, params![attempt_id], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
+            .optional()
+            .map_err(storage)?;
+        row.map(|(reason_code, count)| {
+            Ok(ReasoningDrop {
+                attempt_id: attempt_id.to_string(),
+                reason_code,
+                count: unsigned(count)?,
+            })
+        })
+        .transpose()
     }
 
     /// The lifetime settled totals of the status projection (AC-062): one
@@ -9123,6 +9169,20 @@ impl SharingGrantState {
     }
 }
 
+/// One durable dropped-reasoning record (AC-046): the physical attempt, the
+/// fixed reason class and the peer-reported count. Local evidence only; it
+/// never leaves this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningDrop {
+    pub attempt_id: String,
+    pub reason_code: String,
+    pub count: u64,
+}
+
+/// The one reason class a dropped-reasoning record carries: the peer
+/// discarded replayed thinking blocks. Fixed bytes, never provider text.
+const REASONING_DROP_REASON_CODE: &str = "dropped_reasoning";
+
 /// One settlement row as the status projection and the proofs read it
 /// (AC-057): the physical child attempt, the attempt it fell back from,
 /// the frozen bound, the provider bins and exactness, the wire retries,
@@ -9457,6 +9517,16 @@ impl Ledger for StoreLedger<'_> {
             .finish_send(ticket, outcome)
             .map_err(LedgerError::Store)
     }
+
+    fn record_reasoning_drop(
+        &mut self,
+        ticket: &SendTicket,
+        count: u64,
+    ) -> std::result::Result<(), LedgerError> {
+        self.store
+            .record_reasoning_drop(&ticket.attempt_id, count)
+            .map_err(LedgerError::Store)
+    }
 }
 
 /// Budget units are u64 in the API and i64 in SQLite; a value past the
@@ -9468,6 +9538,13 @@ fn budget_units_i64(units: u64) -> Result<i64> {
             InvalidCause::BudgetUnitsOutOfRange(units),
         )),
     }
+}
+
+/// A dropped-reasoning count is u64 in the API and i64 in SQLite; a value
+/// past the storable range is a typed rejection, never a truncating cast.
+fn reasoning_drop_count_i64(count: u64) -> Result<i64> {
+    i64::try_from(count)
+        .map_err(|_overflow| StoreError::InvalidInput(InvalidCause::ReasoningDropOutOfRange(count)))
 }
 
 /// One worker bound is u64 in the API and i64 in SQLite; the field name

@@ -1314,6 +1314,11 @@ pub enum MeasurementGap {
     OwnedUnmeasured {
         reason: String,
     },
+    /// No installed kit figure was observed: an unmeasured kit is never
+    /// taken as under budget.
+    KitUnmeasured {
+        reason: String,
+    },
     NotRunWithoutPrerequisite {
         name: String,
     },
@@ -1399,6 +1404,23 @@ impl ReleaseReport {
         if self.owned.counted == 0 {
             gaps.push(MeasurementGap::OwnedUnmeasured {
                 reason: "no owned process was observed; an unmeasured group is never taken as under budget"
+                    .to_string(),
+            });
+        } else if self.owned.rss_bytes == 0 {
+            gaps.push(MeasurementGap::OwnedUnmeasured {
+                reason: "no owned resident set was observed; an unmeasured group is never taken as under budget"
+                    .to_string(),
+            });
+        }
+        // Every kit figure must be observed: one zero figure was never read
+        // from the installed kit, so no limit arm may take it as under budget.
+        if self.kit.disk_bytes == 0
+            || self.kit.package_bytes == 0
+            || self.kit.package_files == 0
+            || self.kit.install_nanos == 0
+        {
+            gaps.push(MeasurementGap::KitUnmeasured {
+                reason: "an installed kit figure was never observed; an unmeasured figure is never taken as under budget"
                     .to_string(),
             });
         }

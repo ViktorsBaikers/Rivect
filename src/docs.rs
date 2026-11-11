@@ -9,6 +9,7 @@
 use crate::contracts::ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -239,18 +240,25 @@ impl DocsError {
     }
 }
 
-/// The origin of one absolute URL, lowercased for comparison; `None` for a
+/// The origin of one hierarchical URL in WHATWG serialization; `None` for a
 /// string that names no origin.
 fn origin_of(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme.is_empty() {
-        return None;
-    }
-    let authority = rest.split('/').next()?;
-    if authority.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+    let parsed = reqwest::Url::parse(url).ok()?;
+    parsed.host_str()?;
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// The origin one redirect location resolves to against the request origin,
+/// by the WHATWG rules a client applies: backslashes read as slashes and
+/// repeated slashes collapse, so `/\evil` and `\\evil` name their own
+/// authority instead of a same-origin path. `None` when the location or the
+/// request origin does not parse, so an unresolvable location is refused
+/// rather than followed as if it were a path.
+fn location_origin(request_origin: &str, location: &str) -> Option<String> {
+    let base = reqwest::Url::parse(request_origin).ok()?;
+    let resolved = base.join(location).ok()?;
+    resolved.host_str()?;
+    Some(resolved.origin().ascii_serialization())
 }
 
 /// Whether one value can be a single URL path segment or file name.
@@ -310,25 +318,32 @@ pub enum Redirect {
 /// Follow one redirect from `request_origin` to `location`, scoped to the
 /// credential's own origin.
 pub fn redirect(request_origin: &str, location: &str, credential_origin: Option<&str>) -> Redirect {
-    let target = match origin_of(location) {
-        Some(origin) => origin,
-        // A relative location stays on the request origin.
-        None => request_origin.to_string(),
-    };
+    let target = location_origin(request_origin, location);
     let authorization = match credential_origin {
         None => Authorization::None,
-        Some(origin) if origin.eq_ignore_ascii_case(&target) => Authorization::Scoped,
-        Some(_) => Authorization::Withheld,
+        Some(origin) => match &target {
+            Some(target) if origin.eq_ignore_ascii_case(target) => Authorization::Scoped,
+            Some(_) | None => Authorization::Withheld,
+        },
     };
-    if !target.eq_ignore_ascii_case(request_origin) {
-        return Redirect::Refused {
-            origin: target,
-            authorization: Authorization::Withheld,
-        };
-    }
-    Redirect::Follow {
-        url: location.to_string(),
-        authorization,
+    match target {
+        Some(target) if target.eq_ignore_ascii_case(request_origin) => Redirect::Follow {
+            url: location.to_string(),
+            authorization,
+        },
+        Some(origin) => Redirect::Refused {
+            origin,
+            authorization,
+        },
+        // Neither side resolves to an origin, so the hop cannot be proven
+        // same-origin: it is refused and no credential follows it.
+        None => Redirect::Refused {
+            origin: location.to_string(),
+            authorization: match credential_origin {
+                Some(_) => Authorization::Withheld,
+                None => Authorization::None,
+            },
+        },
     }
 }
 
@@ -346,7 +361,8 @@ impl<'a> DirectSource<'a> {
     }
 
     /// Read the snapshot for exactly `version`. A snapshot whose own header
-    /// names another package or version is poisoned and never served.
+    /// names another package is poisoned; a same-package snapshot declaring
+    /// another version is the installed/latest trap and is never served.
     pub fn retrieve(&self, package: &str, version: &str) -> Result<Answer, DocsError> {
         if !bounded_identifier(package) {
             return Err(DocsError::InvalidRequest { field: "package" });
@@ -355,8 +371,17 @@ impl<'a> DirectSource<'a> {
             return Err(DocsError::InvalidRequest { field: "version" });
         }
         let path = self.root.join(package).join(format!("{version}.json"));
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+        let length = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            Ok(_) => {
+                return Err(DocsError::Read {
+                    path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "snapshot is not a regular file",
+                    ),
+                });
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Answer::Unknown(Unknown::VersionUnavailable {
                     requested: version.to_string(),
@@ -364,6 +389,29 @@ impl<'a> DirectSource<'a> {
             }
             Err(source) => return Err(DocsError::Read { path, source }),
         };
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Answer::Unknown(Unknown::VersionUnavailable {
+                    requested: version.to_string(),
+                }));
+            }
+            Err(source) => return Err(DocsError::Read { path, source }),
+        };
+        if length > DOC_BODY_MAX_BYTES as u64 {
+            return Err(DocsError::TooLarge {
+                path,
+                limit: DOC_BODY_MAX_BYTES,
+            });
+        }
+        // The take bound holds even when the file grows after the length
+        // check, and a stream that never reaches EOF is refused at the bound
+        // instead of read forever.
+        let mut bytes = Vec::with_capacity(length as usize);
+        let mut bounded = file.take(DOC_BODY_MAX_BYTES as u64 + 1);
+        if let Err(source) = bounded.read_to_end(&mut bytes) {
+            return Err(DocsError::Read { path, source });
+        }
         if bytes.len() > DOC_BODY_MAX_BYTES {
             return Err(DocsError::TooLarge {
                 path,
@@ -374,10 +422,16 @@ impl<'a> DirectSource<'a> {
             Ok(header) => header,
             Err(_) => return Ok(Answer::Unknown(Unknown::Malformed)),
         };
-        if header.package != package || header.version != version {
+        if header.package != package {
             return Ok(Answer::Unknown(Unknown::PoisonedSource {
                 package: header.package,
                 version: header.version,
+            }));
+        }
+        if header.version != version {
+            return Ok(Answer::Unknown(Unknown::VersionMismatch {
+                installed: version.to_string(),
+                offered: header.version,
             }));
         }
         Ok(Answer::Source(Box::new(SourceDoc {
@@ -435,15 +489,17 @@ pub fn classify(
             }))
         }
         301 | 302 | 303 | 307 | 308 => match response.location.as_deref() {
-            Some(location) => match origin_of(location) {
+            Some(location) => match location_origin(&request_origin, location) {
                 Some(origin) if origin.eq_ignore_ascii_case(&request_origin) => {
                     Answer::Unknown(Unknown::Redirect {
                         url: location.to_string(),
                     })
                 }
                 Some(origin) => Answer::Unknown(Unknown::CrossOriginRedirect { origin }),
-                None => Answer::Unknown(Unknown::Redirect {
-                    url: location.to_string(),
+                // A location that names no resolvable origin is never read as
+                // a same-origin re-plan; it is refused as a foreign hop.
+                None => Answer::Unknown(Unknown::CrossOriginRedirect {
+                    origin: location.to_string(),
                 }),
             },
             None => Answer::Unknown(Unknown::Malformed),

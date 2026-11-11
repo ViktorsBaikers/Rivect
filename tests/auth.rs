@@ -334,9 +334,17 @@ fn probe_store(kind: StoreKind) -> Probe {
 /// legs; otherwise journal + report the honest status and skip the store
 /// legs (the store itself is absent, not the proof).
 fn keychain_or_report(case: &str, journal: &mut AuthJournal) -> Option<FlightedStore> {
+    // One reset per process: every keychain case appends its own row, and a
+    // leg that answers now must not inherit an older host's NOT_RUN.
+    static RESET: Once = Once::new();
+    RESET.call_once(|| support::not_run::reset("auth.keychain"));
     match probe_store(StoreKind::Keychain) {
         Probe::Available(store) => Some(store),
         Probe::Unavailable(err) => {
+            support::not_run::record(
+                "auth.keychain",
+                &format!("keychain unavailable: {}", error_variant(&err)),
+            );
             eprintln!(
                 "{case}: keychain probe unavailable: {}",
                 error_variant(&err)
@@ -351,6 +359,7 @@ fn keychain_or_report(case: &str, journal: &mut AuthJournal) -> Option<FlightedS
             None
         }
         Probe::Blocked => {
+            support::not_run::record("auth.keychain", "keychain probe timed out");
             eprintln!("{case}: keychain probe timed out");
             journal.record("probe", case, TEST_NAMESPACE, "blocked: probe timeout");
             journal.record("status", case, TEST_NAMESPACE, "blocked");
@@ -981,6 +990,7 @@ fn keychain_store_absent_or_locked_records_honest_status_without_hanging() {
 #[test]
 fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
     let case = "secret-service";
+    support::not_run::reset("auth.secret_service");
     let _store_cases = STORE_CASES.lock().unwrap_or_else(|e| e.into_inner());
     let journal = AuthJournal::open(case);
     let (tx, rx) = mpsc::channel();
@@ -994,6 +1004,10 @@ fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
                 journal.record("lifecycle", credential.raw(), TEST_NAMESPACE, "pass");
             }
             Err(err @ ProviderError::StoreUnavailable { .. }) => {
+                support::not_run::record(
+                    "auth.secret_service",
+                    &format!("secret-service unavailable: {}", error_variant(&err)),
+                );
                 eprintln!(
                     "{case}: secret-service leg not run: {}",
                     error_variant(&err)
@@ -1014,6 +1028,7 @@ fn secret_service_leg_records_not_run_when_the_headless_store_is_absent() {
     match rx.recv_timeout(PROBE_TIMEOUT) {
         Ok(()) => {}
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            support::not_run::record("auth.secret_service", "secret-service leg timed out");
             eprintln!("{case}: secret-service leg timed out");
             // The wedged leg keeps the moved journal; a fresh instance
             // records the honest verdict on the same bounded file.

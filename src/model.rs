@@ -729,6 +729,16 @@ pub trait Ledger {
         ticket: &SendTicket,
         outcome: &SendOutcome,
     ) -> Result<(), LedgerError>;
+
+    /// Records how many replayed thinking blocks the peer reported dropping
+    /// for the send this ticket opened (AC-046). The count is local evidence,
+    /// never a failure of the task.
+    ///
+    /// # Errors
+    /// [`LedgerError::Store`] when the record cannot be written; the
+    /// settlement row stays open.
+    fn record_reasoning_drop(&mut self, ticket: &SendTicket, count: u64)
+    -> Result<(), LedgerError>;
 }
 
 /// A ledger that records nothing: the seam's no-op for a caller that reads
@@ -755,6 +765,14 @@ impl Ledger for NullLedger {
         &mut self,
         _ticket: &SendTicket,
         _outcome: &SendOutcome,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+
+    fn record_reasoning_drop(
+        &mut self,
+        _ticket: &SendTicket,
+        _count: u64,
     ) -> Result<(), LedgerError> {
         Ok(())
     }
@@ -1653,6 +1671,15 @@ impl Broker {
                 return Err(SendFailure::Provider(source));
             }
         };
+        // AC-046: a peer-reported drop is local evidence, not a task error.
+        // Writing it before the close means a refused record leaves the
+        // dispatched row open exactly like a refused settlement — fail
+        // closed, never a silent loss.
+        if reply.dropped_reasoning > 0 {
+            ledger
+                .record_reasoning_drop(&ticket, reply.dropped_reasoning)
+                .map_err(SendFailure::Ledger)?;
+        }
         ledger
             .finish_send(
                 &ticket,

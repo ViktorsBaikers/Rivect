@@ -2437,16 +2437,19 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn allow_once_note_states_only_what_is_true() {
-    // The allow-once note names the chosen action and the next observable
-    // state: the request is consumed by the choice, nothing is granted —
-    // and it never claims permission applies anywhere.
+    // The allow-once note names the chosen action and the absence of a
+    // grant: no consent carrier consumes the request yet, so the note must
+    // not claim it does — and it never claims permission applies anywhere.
     assert!(
         !PANEL_ALLOWED_NOTE.contains("permission applies"),
         "overclaiming note: {PANEL_ALLOWED_NOTE}"
     );
+    assert!(
+        !PANEL_ALLOWED_NOTE.contains("request consumed"),
+        "the note claims a consume seam that does not exist yet: {PANEL_ALLOWED_NOTE}"
+    );
     assert!(PANEL_ALLOWED_NOTE.contains("allowed once"));
     assert!(PANEL_ALLOWED_NOTE.contains("no grant recorded"));
-    assert!(PANEL_ALLOWED_NOTE.contains("request consumed"));
 }
 
 /// PTY child role: renders the production panel through the real terminal

@@ -714,6 +714,11 @@ pub fn landlock_rules(confinement: &Confinement) -> Vec<String> {
                 .collect();
             rules.extend(loader_rules("read-file"));
             rules.extend(loader_rules("execute"));
+            // Every native git builtin opens /dev/null for reading and
+            // writing before its main (the check phase's captured children do
+            // the same), so the exec leg grants exactly that device and
+            // nothing else under /dev.
+            rules.push("path-beneath:read-file,write-file:/dev/null".to_string());
             // execve requires Landlock read-file as well as execute on
             // the program; execute-only on the scope cannot load a
             // binary that lives outside /usr (SYSTEM_READ_RULES).
@@ -1341,12 +1346,16 @@ fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
 mod tests {
     use super::{
         CLONE_NEW_NAMESPACE_FLAGS, CLONE_NEWIPC, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
-        Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES, landlock_rules, native_net_syscalls,
-        net_deny_filter, sys_clone,
+        Confinement, SYS_CLONE3, SYSTEM_EXECUTE_RULES, SandboxLauncher, egress_once,
+        exec_confinement, landlock_rules, native_net_syscalls, net_deny_filter, run_confined,
+        sys_clone,
     };
-    use crate::executor::{STDERR_RETAIN_BYTES, drain_retaining_cap, same_regular_file};
+    use crate::executor::{
+        STDERR_RETAIN_BYTES, WorkerError, drain_retaining_cap, same_regular_file,
+    };
     use std::io::Read as _;
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn target_identity_requires_same_regular_file() -> Result<(), Box<dyn std::error::Error>> {
@@ -1568,6 +1577,59 @@ mod tests {
     }
 
     #[test]
+    fn exec_confinement_admits_dev_null_and_denies_other_devices_and_outside_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scope = tempfile::TempDir::with_prefix("rivect-exec-device-")?;
+        let launcher = SandboxLauncher::default();
+        let confinement = exec_confinement(scope.path())?;
+        let copy = |source: &str, name: &str| -> Result<PathBuf, Box<dyn std::error::Error>> {
+            let target = scope.path().join(name);
+            std::fs::copy(source, &target)?;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+            Ok(target)
+        };
+        let tee = copy("/usr/bin/tee", "tee")?;
+        let approved = run_confined(
+            &launcher,
+            &confinement,
+            &tee,
+            &[std::ffi::OsStr::new("/dev/null")],
+        )?;
+        assert!(
+            approved.exit_ok,
+            "the admitted /dev/null write succeeds: {}",
+            approved.stderr
+        );
+        let denied_device = run_confined(
+            &launcher,
+            &confinement,
+            &tee,
+            &[std::ffi::OsStr::new("/dev/zero")],
+        )?;
+        assert!(
+            !denied_device.exit_ok,
+            "a write to another device is denied"
+        );
+        let cat = copy("/usr/bin/cat", "cat")?;
+        let outside = tempfile::TempDir::with_prefix("rivect-exec-outside-")?;
+        let foreign = outside.path().join("secret.txt");
+        std::fs::write(&foreign, b"outside")?;
+        let denied_file = run_confined(&launcher, &confinement, &cat, &[foreign.as_os_str()])?;
+        assert!(
+            !denied_file.exit_ok,
+            "a read outside the granted scope is denied"
+        );
+        assert!(
+            matches!(
+                egress_once("http://127.0.0.1:9/"),
+                Err(WorkerError::SandboxDenied { .. })
+            ),
+            "the egress boundary still denies"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn confinement_rules_grant_exactly_the_admitted_operation() {
         let read = landlock_rules(&Confinement::Read {
             scope: Path::new("/scope").to_path_buf(),
@@ -1595,6 +1657,14 @@ mod tests {
         assert!(!exec.iter().any(|rule| {
             SYSTEM_EXECUTE_RULES.contains(&rule.as_str()) || rule.contains("execute:/usr/bin")
         }));
+        // Exactly one device rule: git and captured children need /dev/null
+        // read and write; no other path under /dev is granted.
+        let devices: Vec<&str> = exec
+            .iter()
+            .map(String::as_str)
+            .filter(|rule| rule.contains("/dev/"))
+            .collect();
+        assert_eq!(devices, vec!["path-beneath:read-file,write-file:/dev/null"]);
         assert!(landlock_rules(&Confinement::Egress).is_empty());
     }
 }

@@ -23,6 +23,7 @@ use rivect::executor::{EffectOutcome, EffectRequest};
 use rivect::policy::{ModeDecision, PermissionMode};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::Ordering;
@@ -108,6 +109,167 @@ fn read_answer(stdout: &mut BufReader<ChildStdout>) -> Value {
     let mut line = String::new();
     stdout.read_line(&mut line).expect("read answer");
     serde_json::from_str(&line).unwrap_or_else(|error| panic!("answer is JSON: {error}: {line}"))
+}
+
+/// The local MCP fixture: one newline-delimited JSON-RPC subset
+/// (`initialize`, `tools/call`), declared by the operator's document exactly
+/// as `tests/mcp.rs` declares its server. The mode selects the one answer a
+/// case needs; the fixture records the frames it received and the calls it
+/// served, so the assertions read the peer rather than our own buffer.
+const MCP_FIXTURE_SERVER: &str = r#"
+import json, os, sys
+
+def flag(name, default=None):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+
+MODE = flag("--mode", "success")
+ROOT = flag("--root", ".")
+FRAMES = os.path.join(ROOT, "frames.log")
+CALLS = os.path.join(ROOT, "call.count")
+
+def append(path, text):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+def counter(path):
+    value = 0
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+        value = int(raw) if raw else 0
+    value += 1
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(str(value))
+    return value
+
+def reply(payload):
+    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    append(FRAMES, line)
+    try:
+        request = json.loads(line)
+    except ValueError:
+        continue
+    method = request.get("method")
+    identity = request.get("id")
+    if method == "initialize":
+        served = request.get("params", {}).get("protocolVersion")
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"protocolVersion": served, "capabilities": {},
+                          "serverInfo": {"name": "rivect-ingress-fixture"}}})
+        continue
+    if method != "tools/call":
+        reply({"jsonrpc": "2.0", "id": identity,
+               "error": {"code": -32601, "message": "unsupported method"}})
+        continue
+    counter(CALLS)
+    if MODE == "input_required":
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"resultType": "input_required", "requestState": "state-1"}})
+        continue
+    if MODE == "oversize":
+        # One line past the client's 64 KiB frame bound: the call must stay
+        # an unknown outcome, never a 70 KiB payload in the answer.
+        reply({"jsonrpc": "2.0", "id": identity,
+               "result": {"resultType": "complete",
+                          "content": [{"type": "text", "text": "x" * 70000}]}})
+        continue
+    reply({"jsonrpc": "2.0", "id": identity,
+           "result": {"resultType": "complete",
+                      "content": [{"type": "text", "text": "done"}]}})
+"#;
+
+struct McpFixture {
+    directory: tempfile::TempDir,
+}
+
+impl McpFixture {
+    fn new(tag: &str) -> Self {
+        let directory = tempfile::TempDir::with_prefix(format!("rivect-ingress-mcp-{tag}-"))
+            .expect("create the mcp fixture root");
+        let script = directory.path().join("server.py");
+        let program = directory.path().join("server.sh");
+        std::fs::write(&script, MCP_FIXTURE_SERVER).expect("write the mcp fixture server");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nexec python3 {} \"$@\"\n", script.display()),
+        )
+        .expect("write the mcp fixture launcher");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the mcp fixture launcher executable");
+        Self { directory }
+    }
+
+    fn root(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn frames(&self) -> String {
+        std::fs::read_to_string(self.root().join("frames.log")).unwrap_or_default()
+    }
+
+    fn calls(&self) -> u64 {
+        std::fs::read_to_string(self.root().join("call.count"))
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+/// The operator's document: three declared servers over the same local
+/// program, each with its own origin and mode. The request names a server and
+/// never supplies a program, an environment or an origin.
+fn mcp_fixture_config(fixture: &McpFixture) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.local]\n\
+         kind = \"local\"\n\
+         endpoint = \"http://127.0.0.1:11434\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"auto\" }}\n\
+         effort = {{ mode = \"auto\" }}\n\
+         fallback = {{ mode = \"auto\" }}\n\
+         [mcp.servers.inbound]\n\
+         origin = \"mcp+stdio://ingress-inbound\"\n\
+         program = \"{program}\"\n\
+         args = [\"--mode\", \"success\", \"--root\", \"{root}\"]\n\
+         [mcp.servers.holding]\n\
+         origin = \"mcp+stdio://ingress-holding\"\n\
+         program = \"{program}\"\n\
+         args = [\"--mode\", \"input_required\", \"--root\", \"{root}\"]\n\
+         [mcp.servers.large]\n\
+         origin = \"mcp+stdio://ingress-large\"\n\
+         program = \"{program}\"\n\
+         args = [\"--mode\", \"oversize\", \"--root\", \"{root}\"]\n",
+        program = fixture.root().join("server.sh").display(),
+        root = fixture.root().display(),
+    )
+}
+
+/// The first executable named `git` on this host, if any: the positive exec
+/// leg runs the real program inside the granted scope.
+fn system_git() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .and_then(|paths| paths.to_str().map(str::to_string))
+        .and_then(|paths| {
+            paths
+                .split(':')
+                .map(|directory| Path::new(directory).join("git"))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
+/// The harmless control program: proves the host's confined exec works before
+/// the git leg distinguishes a host gap from the git boundary.
+fn system_true() -> Option<PathBuf> {
+    ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.is_file())
 }
 
 #[test]
@@ -203,8 +365,19 @@ fn read_file_ingress_through_the_real_entry_reads_in_scope_and_bounds_its_previe
 #[test]
 fn exec_ingress_runs_a_confined_program() {
     // The exec positive is the only host-conditional leg in this target: it
-    // owns its own test so its `NOT_RUN` return can never skip a proof that
+    // owns its own test so its `NOT_RUN` record can never skip a proof that
     // could have run elsewhere.
+    support::not_run::reset("ingress.exec");
+    let Some(git) = system_git() else {
+        support::not_run::record("ingress.exec", "no git program on PATH");
+        eprintln!("NOT_RUN: no git program on PATH; the exec positive leg is skipped");
+        return;
+    };
+    let Some(true_source) = system_true() else {
+        support::not_run::record("ingress.exec", "no host true program for the exec control");
+        eprintln!("NOT_RUN: no host true program; the exec positive leg is skipped");
+        return;
+    };
     let (provider, calls, _manifest) = support::CountingProvider::new();
     let mut world = support::open_world_with(
         "ingress-exec",
@@ -220,51 +393,176 @@ fn exec_ingress_runs_a_confined_program() {
         .materialize_obligations(&task)
         .expect("obligations");
 
-    // A real program inside the granted scope, run through admission.
-    std::fs::copy("/usr/bin/true", world.root.join("true")).expect("copy true into scope");
-    let program = world.root.join("true");
+    // The proof entry is the production executor admission/execute pair
+    // (`EffectRequest::Exec`), not a higher shell or PTY entry this build does
+    // not expose. The harmless control first distinguishes a host gap from a
+    // program the boundary denies; the positive is the real git binary copied
+    // into the granted scope, whose argv[0] `git-version` dispatches git's own
+    // `version` builtin and exits 0 without arguments.
+    let control_program = world.root.join("control-true");
+    std::fs::copy(&true_source, &control_program).expect("copy true into scope");
+    std::fs::set_permissions(&control_program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the control executable");
+    let program = world.root.join("git-version");
+    std::fs::copy(&git, &program).expect("copy git into scope");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the scoped git executable");
+    assert!(
+        control_program.starts_with(&world.root) && program.starts_with(&world.root),
+        "both programs are inside the declared scope"
+    );
     let grant = world
         .runtime
         .policy_writer()
         .grant_classes(world.root.clone(), vec![EffectClass::Exec]);
-    let admitted = {
-        let mut executor = world.runtime.executor();
-        executor
-            .admit(
-                &task,
+    let run = |world: &mut support::World,
+               task: &rivect::contracts::TaskId,
+               program: &Path|
+     -> Result<EffectOutcome, rivect::executor::ExecutorError> {
+        let admitted = {
+            let mut executor = world.runtime.executor();
+            executor.admit(
+                task,
                 EffectRequest::Exec {
-                    grant_id: grant,
-                    program,
+                    grant_id: grant.clone(),
+                    program: program.to_path_buf(),
                 },
                 PermissionMode::Yolo,
-            )
-            .expect("the exec cell is admitted")
-    };
-    let outcome = {
+            )?
+        };
         let mut executor = world.runtime.executor();
         executor.execute(&admitted)
     };
-    match outcome {
-        Ok(EffectOutcome::Executed { .. }) => {}
-        Err(
+    let host_unavailable = |error: &rivect::executor::ExecutorError| {
+        matches!(
+            error,
             rivect::executor::ExecutorError::Worker(
                 rivect::executor::WorkerError::SandboxUnavailable { .. }
-                | rivect::executor::WorkerError::SandboxSpawnFailed { .. }
-                | rivect::executor::WorkerError::ExecUnavailable,
-            )
-            | rivect::executor::ExecutorError::Worker(
+                    | rivect::executor::WorkerError::SandboxSpawnFailed { .. }
+                    | rivect::executor::WorkerError::ExecUnavailable,
+            ) | rivect::executor::ExecutorError::Worker(
                 rivect::executor::WorkerError::OwnedLaunch { .. }
-                | rivect::executor::WorkerError::OwnedPreparation { .. },
-            ),
-        ) => {
-            // The host cannot run the confined leg: report the gap instead of
-            // claiming the positive.
+                    | rivect::executor::WorkerError::OwnedPreparation { .. },
+            )
+        )
+    };
+    match run(&mut world, &task, &control_program) {
+        Ok(EffectOutcome::Executed { detail }) => {
+            // The worker never captures the child's stdout, caps stderr at
+            // 64 KiB, and the effect carries one fixed observation: the
+            // execution's output cannot grow the answer.
+            assert_eq!(detail, "exec-performed exit=ok", "{detail}");
+            assert!(
+                detail.len() <= 64,
+                "the captured detail is bounded: {detail}"
+            );
+        }
+        Err(error) if host_unavailable(&error) => {
+            support::not_run::record(
+                "ingress.exec",
+                "confined exec unavailable on this host (sandbox namespaces/landlock)",
+            );
             eprintln!(
                 "NOT_RUN: confined exec is unavailable on this host; only the exec positive leg is skipped"
             );
             return;
         }
-        other => panic!("unexpected exec outcome: {other:?}"),
+        other => panic!("the control program must execute: {other:?}"),
+    }
+
+    // DEC-033's exec rule carries `read-file` beside `write-file` on the
+    // literal /dev/null; a confined `cat` of that device discriminates the
+    // read half alone, so dropping it turns this leg red.
+    #[cfg(target_os = "linux")]
+    {
+        support::ensure_helper();
+        let cat_source = ["/usr/bin/cat", "/bin/cat"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .expect("a host cat program");
+        let cat = world.root.join("cat-dev-null");
+        std::fs::copy(&cat_source, &cat).expect("copy cat into the scope");
+        std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o755))
+            .expect("make the scoped cat executable");
+        let cat = cat.canonicalize().expect("canonical cat");
+        let confinement =
+            rivect::executor::linux::exec_confinement(&world.root).expect("exec confinement");
+        let launcher = rivect::executor::linux::SandboxLauncher::default();
+        let admitted = rivect::executor::linux::run_confined(
+            &launcher,
+            &confinement,
+            &cat,
+            &[std::ffi::OsStr::new("/dev/null")],
+        )
+        .expect("confined read of /dev/null");
+        assert!(
+            admitted.exit_ok,
+            "the admitted /dev/null read succeeds: {}",
+            admitted.stderr
+        );
+        let denied = rivect::executor::linux::run_confined(
+            &launcher,
+            &confinement,
+            &cat,
+            &[std::ffi::OsStr::new("/dev/zero")],
+        )
+        .expect("confined read of /dev/zero");
+        assert!(
+            !denied.exit_ok,
+            "a read of another device is denied: {}",
+            denied.stderr
+        );
+    }
+
+    // Cancellation outranks a new effect: a cancelled task's admitted exec
+    // never reaches the worker, so nothing was spawned.
+    let cancelled = world.create_task(&session, "ingress-exec-cancelled");
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&cancelled)
+        .expect("obligations");
+    let snapshot = world
+        .runtime
+        .store()
+        .snapshot(&cancelled)
+        .expect("snapshot");
+    let cancel = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 9, "method": "task.submit",
+        "params": { "schema_version": 1, "session_id": session.0, "task_id": cancelled.0,
+                    "kind": "cancel", "command_id": "ingress-exec-cancel",
+                    "expected_intent_revision": snapshot.intent_revision,
+                    "reason": "ingress cancellation" }
+    }));
+    assert_eq!(cancel["result"]["status"], "applied", "{cancel}");
+    match run(&mut world, &cancelled, &control_program) {
+        Err(rivect::executor::ExecutorError::Cancelled) => {}
+        other => panic!("a cancelled exec is refused: {other:?}"),
+    }
+
+    // The positive: the real git program executes inside the declared scope.
+    match run(&mut world, &task, &program) {
+        Ok(EffectOutcome::Executed { detail }) => {
+            assert_eq!(detail, "exec-performed exit=ok", "{detail}");
+            assert!(
+                detail.len() <= 64,
+                "the captured detail is bounded: {detail}"
+            );
+        }
+        Err(rivect::executor::ExecutorError::Worker(
+            rivect::executor::WorkerError::SandboxDenied { .. },
+        )) => {
+            // The boundary executed the harmless control but denied git: the
+            // git positive is not proven, and a retained NOT_RUN would let a
+            // removed /dev/null rule read green. Fail instead.
+            panic!("the exec boundary denied the real git program after the control executed");
+        }
+        // The control program already executed, so this host's sandbox is
+        // available: every later failure is the git leg's own and a hard
+        // failure, never a retained NOT_RUN. Only the control match above
+        // may classify an unavailable sandbox.
+        other => panic!("the git positive must execute once the control did: {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
 }
@@ -433,6 +731,173 @@ fn egress_ingress_refuses_a_destination_it_was_never_granted() {
 }
 
 #[test]
+fn egress_ingress_runs_a_declared_mcp_call_with_a_bound_and_cancellation() {
+    // The declared public web/egress entry is `command.execute` kind
+    // `mcp.call`: the server, program and origin are operator data, and the
+    // executor's egress admission is the gate before the first byte.
+    let fixture = McpFixture::new("positive");
+    let (provider, provider_calls, _manifest) = support::CountingProvider::new();
+    let mut world = support::open_world_with(
+        "ingress-mcp-positive",
+        Some(&mcp_fixture_config(&fixture)),
+        Box::new(provider),
+        Box::new(PlatformWorker),
+    );
+    let session = world.open_session("ingress-mcp-positive");
+    let task = world.create_task(&session, "ingress-mcp-positive-task");
+    let grant = world
+        .runtime
+        .policy_writer()
+        .grant_classes(world.root.clone(), vec![EffectClass::Egress]);
+
+    // Before the operator's destination consent, the declared server is
+    // refused at the executor's own admission: no frame reaches the peer.
+    let unapproved = world.dispatch(&support::command_execute(
+        &session,
+        "mcp.call",
+        json!({ "task_id": task.0, "grant_id": grant,
+                "server": "inbound", "tool": "fixture.echo", "arguments": {} }),
+    ));
+    assert_eq!(
+        unapproved["error"]["data"]["code"], "denied",
+        "an unapproved declared origin is refused: {unapproved}"
+    );
+    assert_eq!(
+        fixture.frames(),
+        "",
+        "an unapproved destination sends no byte"
+    );
+
+    for origin in [
+        "mcp+stdio://ingress-inbound",
+        "mcp+stdio://ingress-holding",
+        "mcp+stdio://ingress-large",
+    ] {
+        let scope = rivect::policy::preapproval_scope(EffectClass::Egress, &grant, origin)
+            .expect("the egress preapproval key");
+        world
+            .runtime
+            .store_writer()
+            .record_preapproval(&scope, "operator", 600)
+            .expect("record the destination consent");
+    }
+
+    // Positive: the declared-scope call succeeds and answers the peer's own
+    // content; the fixture served exactly one handshake and one call frame.
+    let call = world.dispatch(&support::command_execute(
+        &session,
+        "mcp.call",
+        json!({ "task_id": task.0, "grant_id": grant,
+                "server": "inbound", "tool": "fixture.echo",
+                "arguments": { "text": "hello" } }),
+    ));
+    assert!(call.get("error").is_none(), "the call is admitted: {call}");
+    let result = &call["result"];
+    assert_eq!(result["kind"], "mcp.call", "{call}");
+    assert_eq!(result["state"], "succeeded", "{call}");
+    assert_eq!(result["result"][0]["text"], "done", "{call}");
+    assert!(
+        result["bytes_sent"].as_u64().unwrap_or(0) > 0,
+        "the call crossed the peer: {call}"
+    );
+    assert_eq!(fixture.calls(), 1, "the peer served one tools/call");
+    assert_eq!(
+        fixture.frames().lines().count(),
+        2,
+        "one handshake and one call frame"
+    );
+
+    // Output bound: a peer answer past the bounded frame never becomes the
+    // result; the outcome stays unknown and its retained artifact is bounded.
+    let large = world.dispatch(&support::command_execute(
+        &session,
+        "mcp.call",
+        json!({ "task_id": task.0, "grant_id": grant,
+                "server": "large", "tool": "fixture.echo", "arguments": {} }),
+    ));
+    assert!(
+        large.get("error").is_none(),
+        "the refused bound is an outcome: {large}"
+    );
+    let result = &large["result"];
+    assert_eq!(result["state"], "outcome_unknown", "{large}");
+    assert_eq!(result["reason_code"], "frame_over_bound", "{large}");
+    assert!(result["result"].is_null(), "{large}");
+    assert!(
+        !large.to_string().contains(&"x".repeat(69_000)),
+        "the oversized peer line is never copied into the answer"
+    );
+    let artifact = world.root.join(
+        result["artifact"]
+            .as_str()
+            .expect("the call names its retained artifact"),
+    );
+    let lines: Vec<String> = std::fs::read_to_string(&artifact)
+        .expect("the retained artifact reads")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(!lines.is_empty(), "the terminal outcome is retained");
+    assert!(
+        lines.len() <= rivect::mcp::MCP_RETAINED_MAX_LINES,
+        "the retained line count is bounded"
+    );
+    for line in &lines {
+        assert!(
+            line.len() <= rivect::mcp::MCP_RETAINED_MAX_LINE_BYTES,
+            "a retained line is bounded: {} bytes",
+            line.len()
+        );
+    }
+
+    // Cancellable: a pending call is one logical operation; cancelling its
+    // task settles it as an unknown remote outcome without a second byte.
+    let cancelled = world.create_task(&session, "ingress-mcp-cancel");
+    let pending = world.dispatch(&support::command_execute(
+        &session,
+        "mcp.call",
+        json!({ "task_id": cancelled.0, "grant_id": grant,
+                "server": "holding", "tool": "fixture.echo", "arguments": {} }),
+    ));
+    assert!(pending.get("error").is_none(), "{pending}");
+    assert_eq!(pending["result"]["state"], "input_required", "{pending}");
+    let operation = pending["result"]["logical_operation_id"]
+        .as_str()
+        .expect("the pending call names its operation")
+        .to_string();
+    let frames = fixture.frames();
+    let snapshot = world
+        .runtime
+        .store()
+        .snapshot(&cancelled)
+        .expect("snapshot");
+    let cancel = world.dispatch(&json!({
+        "jsonrpc": "2.0", "id": 11, "method": "task.submit",
+        "params": { "schema_version": 1, "session_id": session.0, "task_id": cancelled.0,
+                    "kind": "cancel", "command_id": "ingress-mcp-cancel",
+                    "expected_intent_revision": snapshot.intent_revision,
+                    "reason": "ingress cancellation" }
+    }));
+    assert_eq!(cancel["result"]["status"], "applied", "{cancel}");
+    let resumed = world.dispatch(&support::command_execute(
+        &session,
+        "mcp.call",
+        json!({ "task_id": cancelled.0, "grant_id": grant,
+                "server": "holding", "tool": "fixture.echo",
+                "arguments": {}, "operation": operation }),
+    ));
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    assert_eq!(resumed["result"]["state"], "outcome_unknown", "{resumed}");
+    assert_eq!(resumed["result"]["reason_code"], "cancelled", "{resumed}");
+    assert_eq!(
+        fixture.frames(),
+        frames,
+        "a cancelled operation sends no further byte"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0, "no provider wire");
+}
+
+#[test]
 fn git_ingress_refuses_an_unscoped_program_before_any_spawn() {
     let (provider, calls, _manifest) = support::CountingProvider::new();
     let mut world = support::open_world_with(
@@ -478,6 +943,7 @@ fn git_ingress_refuses_an_unscoped_program_before_any_spawn() {
 
 #[test]
 fn vision_purpose_is_refused_before_any_send() {
+    support::not_run::reset("ingress.vision");
     let (provider, calls, _manifest) = support::CountingProvider::new();
     let mut world = support::open_world_with(
         "ingress-vision",
@@ -494,9 +960,27 @@ fn vision_purpose_is_refused_before_any_send() {
         "/world/ingress-vision",
         "describe the image",
     );
+    match prepared {
+        Err(rivect::model::ModelError::NoEligibleCandidate { purpose, rejected }) => {
+            assert_eq!(purpose, "vision", "the refusal names the requested purpose");
+            assert!(
+                rejected.is_empty(),
+                "an undeclared purpose enumerates no declared candidate: {rejected:?}"
+            );
+        }
+        other => panic!("an undeclared vision purpose is refused typed: {other:?}"),
+    }
     assert!(
-        prepared.is_err(),
-        "an undeclared vision purpose is refused: {prepared:?}"
+        !config.models.purposes.contains_key("vision"),
+        "the shipped purpose set declares no vision entry"
+    );
+    // No production entry carries an image/vision input today: the manifest
+    // carries text inputs only, and no shipped purpose names `vision`. The
+    // refusal above is therefore the only vision proof this build can run;
+    // the gap is retained instead of being reported as a native positive.
+    support::not_run::record(
+        "ingress.vision",
+        "no production vision entry: Broker::prepare/RequestManifest carry text inputs only and no shipped purpose declares `vision`",
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
 }
@@ -603,6 +1087,7 @@ fn read_file_maps_executor_failures_to_their_own_class() {
 
 #[test]
 fn the_pty_tui_paints_and_restores_the_terminal() {
+    support::not_run::reset("ingress.pty");
     let root = tempfile::TempDir::with_prefix("rivect-ingress-pty-").expect("pty root");
     let data_root = root.path().to_path_buf();
     let mut command = support::pty_command(support::rivect_binary());
@@ -615,6 +1100,7 @@ fn the_pty_tui_paints_and_restores_the_terminal() {
         Ok(session) => session,
         // A host that cannot allocate a pty is an honest NOT_RUN, never a pass.
         Err(error) => {
+            support::not_run::record("ingress.pty", &format!("pty unavailable: {error}"));
             eprintln!("NOT_RUN: pty unavailable: {error}");
             return;
         }

@@ -60,6 +60,7 @@ impl Provider for QuietProvider {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }
@@ -152,6 +153,7 @@ impl Provider for FailFirstProvider {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

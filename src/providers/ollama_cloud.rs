@@ -899,6 +899,7 @@ impl OllamaCloudProvider {
             tool_calls: state.tool_calls,
             usage: state.usage,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

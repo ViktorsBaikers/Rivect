@@ -5,11 +5,14 @@
 //! 19×G×I installed UI matrix. A row bound to another candidate is stale; a
 //! missing, stale, failed, censored or unattributed row prevents a full pass.
 //!
-//! The two installed-release legs are passed on the repaired candidate: the
-//! packaged artifact publishes and settles an ordinary first task, and the 19
-//! states render through the packaged `--ui-review` entry. The run prints the
-//! stable verdict line; the full-pass claim stays SLICE-010/Seal, while real
-//! provider, publication and platform legs stay NOT_RUN.
+//! The ordinary installed-release leg is passed on the repaired candidate:
+//! the packaged artifact publishes and settles an ordinary first task. The
+//! installed UI matrix renders all 19 states through the packaged
+//! `--ui-review` entry, but the 285 theme cells declare distinct
+//! light/dark/high-contrast palettes NOT_RUN, so that row is censored rather
+//! than passed. The run prints the stable verdict line; the full-pass claim
+//! stays SLICE-010/Seal, while real provider, publication and platform legs
+//! stay NOT_RUN.
 
 #![allow(
     clippy::expect_used,
@@ -42,6 +45,29 @@ use std::process::{Command, Output, Stdio};
 
 const INSTALLED_ORDINARY_EVIDENCE_MARKER: &str = "#installed-ordinary";
 const INSTALLED_UI_EVIDENCE_MARKER: &str = "#installed-ui";
+
+/// The three input modes whose distinct palettes the matrix declares NOT_RUN:
+/// each theme cell must carry exactly its mode's claim as the reason, and no
+/// other cell may be NOT_RUN.
+const THEME_NOT_RUN_CLAIMS: [(&str, &str); 3] = [
+    (
+        "light",
+        "theme-agnostic rendering; distinct light palette NOT_RUN",
+    ),
+    (
+        "dark",
+        "theme-agnostic rendering; distinct dark palette NOT_RUN",
+    ),
+    (
+        "high-contrast",
+        "theme-agnostic rendering; distinct high-contrast palette NOT_RUN",
+    ),
+];
+
+/// 19 states × 5 geometries × the three theme inputs.
+const UI_NOT_RUN_CELLS: usize = UI_STATES.len() * UI_GEOMETRIES.len() * THEME_NOT_RUN_CLAIMS.len();
+/// The cells a complete matrix passes: every cell that is not a theme cell.
+const UI_PASS_CELLS: usize = FINAL_UI_CELLS - UI_NOT_RUN_CELLS;
 
 fn passed(case_id: String, candidate: &str, evidence: String) -> FinalRow {
     FinalRow {
@@ -475,6 +501,37 @@ fn matrix_identity(report: &Value) -> Result<BTreeMap<(String, String, String), 
         ) else {
             return Err("matrix cell is missing a coordinate or verdict".to_string());
         };
+        let reason = cell["reason"].as_str().unwrap_or_default();
+        // The declared NOT_RUN family is exactly the theme inputs, each with
+        // its own claim as the reason: a theme cell that says PASS is the
+        // overclaim this matrix must never carry.
+        match (
+            THEME_NOT_RUN_CLAIMS.iter().find(|(mode, _)| *mode == input),
+            verdict,
+        ) {
+            (Some((_, claim)), "NOT_RUN") if reason == *claim => {}
+            (Some((_, claim)), "NOT_RUN") => {
+                return Err(format!(
+                    "theme cell {state}/{geometry}/{input} carries {reason:?}, not its claim {claim:?}"
+                ));
+            }
+            (Some(_), _) => {
+                return Err(format!(
+                    "theme cell {state}/{geometry}/{input} is {verdict}, not NOT_RUN"
+                ));
+            }
+            (None, "NOT_RUN") => {
+                return Err(format!(
+                    "cell {state}/{geometry}/{input} is NOT_RUN outside the declared theme family"
+                ));
+            }
+            (None, "PASS" | "FAIL") => {}
+            (None, _) => {
+                return Err(format!(
+                    "cell {state}/{geometry}/{input} carries unknown verdict {verdict}"
+                ));
+            }
+        }
         let key = (state.to_string(), geometry.to_string(), input.to_string());
         if !expected.contains(&key) {
             return Err(format!("matrix carries an unknown cell {key:?}"));
@@ -511,18 +568,30 @@ fn installed_ui_evidence(path: &Path, candidate: &str) -> Result<String, String>
     if report["schema_version"] != json!(1) {
         return Err("matrix schema_version is not 1".to_string());
     }
-    if report["cells"] != json!(FINAL_UI_CELLS)
-        || report["pass"] != json!(FINAL_UI_CELLS)
-        || report["fail"] != json!(0)
-        || report["not_run"] != json!(0)
-    {
-        return Err("matrix summary is not a complete pass".to_string());
-    }
+    // The identity pass requires the exact NOT_RUN family (reason text
+    // included) and the summary that matches it.
     let cells = matrix_identity(&report)?;
-    if cells.values().any(|verdict| verdict != "PASS") {
-        return Err("matrix carries a non-PASS cell".to_string());
+    let pass = cells.values().filter(|verdict| *verdict == "PASS").count();
+    let not_run = cells
+        .values()
+        .filter(|verdict| *verdict == "NOT_RUN")
+        .count();
+    if report["cells"] != json!(FINAL_UI_CELLS)
+        || report["fail"] != json!(0)
+        || report["pass"] != json!(UI_PASS_CELLS)
+        || report["not_run"] != json!(UI_NOT_RUN_CELLS)
+        || pass != UI_PASS_CELLS
+        || not_run != UI_NOT_RUN_CELLS
+    {
+        return Err("matrix summary is not the declared pass/NOT_RUN split".to_string());
     }
-    Ok(format!("{}#installed-ui", path.display()))
+    // The matrix is honest, and that honesty is why the row cannot pass: the
+    // theme palettes it declares NOT_RUN are not rendered evidence.
+    Err(format!(
+        "not run: {not_run} theme cells declare distinct light/dark/high-contrast palettes NOT_RUN ({pass} of {} cells pass, 0 fail) ({}#installed-ui)",
+        cells.len(),
+        path.display()
+    ))
 }
 
 fn acceptance_rows(candidate: &str) -> Vec<FinalRow> {
@@ -678,60 +747,98 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
     .expect("stale matrix");
     assert!(installed_ui_evidence(&ui, candidate).is_err());
 
-    let cells: Vec<Value> = UI_STATES
+    // The honest cell set: the three theme inputs are NOT_RUN with their own
+    // claim as the reason, every other cell passes.
+    let honest: Vec<Value> = UI_STATES
         .iter()
         .flat_map(|state| {
             UI_GEOMETRIES.iter().flat_map(move |geometry| {
                 UI_INPUTS.iter().map(move |input| {
-                    json!({
-                        "state": state,
-                        "geometry": geometry,
-                        "input": input,
-                        "verdict": "PASS",
-                    })
+                    let claim = THEME_NOT_RUN_CLAIMS
+                        .iter()
+                        .find(|(mode, _)| mode == input)
+                        .map(|(_, claim)| *claim);
+                    match claim {
+                        Some(claim) => json!({
+                            "state": state,
+                            "geometry": geometry,
+                            "input": input,
+                            "verdict": "NOT_RUN",
+                            "reason": claim,
+                        }),
+                        None => json!({
+                            "state": state,
+                            "geometry": geometry,
+                            "input": input,
+                            "verdict": "PASS",
+                        }),
+                    }
                 })
             })
         })
         .collect();
-    std::fs::write(
-        &ui,
+    let honest_summary = |cells: &[Value]| {
         json!({
             "schema_version": 1,
             "candidate_manifest_sha256": candidate,
             "states": 19,
             "geometries": 5,
             "inputs": 14,
-            "cells": 1330,
-            "pass": 1330,
+            "cells": FINAL_UI_CELLS,
+            "pass": UI_PASS_CELLS,
             "fail": 0,
-            "not_run": 0,
+            "not_run": UI_NOT_RUN_CELLS,
             "cell_verdicts": cells,
         })
-        .to_string(),
-    )
-    .expect("current matrix");
-    assert!(installed_ui_evidence(&ui, candidate).is_ok());
+    };
 
-    let mut duplicate = cells.clone();
-    duplicate.pop();
-    duplicate.push(cells[0].clone());
-    std::fs::write(
-        &ui,
-        json!({
-            "schema_version": 1,
-            "candidate_manifest_sha256": candidate,
-            "states": 19,
-            "geometries": 5,
-            "inputs": 14,
-            "cells": 1330,
-            "pass": 1330,
-            "fail": 0,
-            "not_run": 0,
-            "cell_verdicts": duplicate,
+    // The overclaim the matrix must never carry: every cell PASS while the
+    // theme claims are declared NOT_RUN. The consumer refuses it for the
+    // theme cells themselves, not merely for a summary mismatch.
+    let all_pass: Vec<Value> = honest
+        .iter()
+        .map(|cell| {
+            let mut cell = cell.clone();
+            cell["verdict"] = json!("PASS");
+            cell["reason"] = json!("");
+            cell
         })
-        .to_string(),
-    )
-    .expect("duplicate matrix");
+        .collect();
+    std::fs::write(&ui, honest_summary(&all_pass).to_string()).expect("all-pass matrix");
+    let refused = installed_ui_evidence(&ui, candidate).expect_err("an all-PASS matrix is refused");
+    assert!(
+        refused.contains("not NOT_RUN"),
+        "the all-PASS matrix is refused for its overclaim: {refused}"
+    );
+    assert!(matrix_identity(&read_receipt(&ui).expect("all-pass report")).is_err());
+
+    // The honest matrix validates and still censors the row: the theme
+    // palettes it declares NOT_RUN are not rendered evidence.
+    std::fs::write(&ui, honest_summary(&honest).to_string()).expect("honest matrix");
+    let censored = installed_ui_evidence(&ui, candidate)
+        .expect_err("the declared NOT_RUN family censors the row");
+    assert!(
+        censored.contains("NOT_RUN") && censored.contains(INSTALLED_UI_EVIDENCE_MARKER),
+        "the censoring cause names the NOT_RUN family and the report: {censored}"
+    );
+    let ui_rows = matrix_rows(&ui);
+    assert_eq!(ui_rows.len(), FINAL_UI_CELLS, "every cell is counted");
+    assert_eq!(
+        ui_rows
+            .iter()
+            .filter(|row| row.outcome == TrialOutcome::Pass)
+            .count(),
+        UI_PASS_CELLS,
+        "the passing cells are exactly the non-theme cells"
+    );
+    let honest_report = counted(candidate, &ui_rows);
+    assert_eq!(
+        honest_report.blockers.not_run.len(),
+        UI_NOT_RUN_CELLS,
+        "the theme cells are counted NOT_RUN, never PASS"
+    );
+    assert!(!honest_report.full_pass, "{honest_report:?}");
+
     let assert_refused = |path: &Path| {
         assert!(installed_ui_evidence(path, candidate).is_err());
         let mut rows: Vec<FinalRow> = complete_rows(candidate)
@@ -750,27 +857,16 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
             "a malformed matrix contributes no cells"
         );
     };
+
+    let mut duplicate = honest.clone();
+    duplicate.pop();
+    duplicate.push(honest[0].clone());
+    std::fs::write(&ui, honest_summary(&duplicate).to_string()).expect("duplicate matrix");
     assert_refused(&ui);
 
-    let mut unknown = cells.clone();
+    let mut unknown = honest.clone();
     unknown[0]["state"] = json!("state-unlisted");
-    std::fs::write(
-        &ui,
-        json!({
-            "schema_version": 1,
-            "candidate_manifest_sha256": candidate,
-            "states": 19,
-            "geometries": 5,
-            "inputs": 14,
-            "cells": 1330,
-            "pass": 1330,
-            "fail": 0,
-            "not_run": 0,
-            "cell_verdicts": unknown,
-        })
-        .to_string(),
-    )
-    .expect("unknown-coordinate matrix");
+    std::fs::write(&ui, honest_summary(&unknown).to_string()).expect("unknown-coordinate matrix");
     assert_refused(&ui);
 
     std::fs::write(
@@ -785,12 +881,196 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
             "pass": 0,
             "fail": 0,
             "not_run": 0,
-            "cell_verdicts": cells,
+            "cell_verdicts": honest,
         })
         .to_string(),
     )
     .expect("short-summary matrix");
     assert_refused(&ui);
+}
+
+/// The verdict's full-pass claim: the counted report must pass and no
+/// retained leg may exist. One retained row means one proof did not execute.
+fn full_pass_with_retained(
+    report: &rivect::verification::FinalAcceptance,
+    retained: usize,
+) -> bool {
+    report.full_pass && retained == 0
+}
+
+/// Surfaces each retained leg row as a NOT_RUN line and returns the number
+/// of unique legs. Retained legs are their own blocker family: they never
+/// enter `blockers.not_run`, whose membership is the declared-vs-observed
+/// comparison, but a real retained row still forbids a full pass.
+fn surface_retained_not_run(retained_not_run: &[Value]) -> usize {
+    let mut retained_legs: BTreeSet<&str> = BTreeSet::new();
+    for row in retained_not_run {
+        assert_eq!(
+            row["status"], "not_run",
+            "a retained leg row is a NOT_RUN: {row}"
+        );
+        let leg = row["leg"].as_str().expect("retained leg names its leg");
+        assert!(!leg.is_empty(), "a retained leg row names its leg: {row}");
+        let prerequisite = row["prerequisite"].as_str().unwrap_or("<no prerequisite>");
+        // The reader strips control characters; a row that still carries one
+        // could forge a terminal line and is refused here as well.
+        assert!(
+            !leg.chars().any(char::is_control) && !prerequisite.chars().any(char::is_control),
+            "a retained row carries no control character: {row}"
+        );
+        if retained_legs.insert(leg) {
+            println!("LEG_NOT_RUN {leg}: {prerequisite}");
+        }
+    }
+    println!("LEGS_NOT_RUN retained={}", retained_legs.len());
+    retained_legs.len()
+}
+
+/// The retained leg files this run can read, walked independently of
+/// [`support::not_run::records`]: the closed leg set, the byte cap, UTF-8,
+/// and a first row naming its own leg. The conjunction compares the reader
+/// against this set, so a reader that returns no rows cannot hide a file.
+fn retained_legs_on_disk() -> BTreeSet<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(support::not_run::DIR);
+    support::not_run::LEGS
+        .into_iter()
+        .filter(|leg| {
+            let Ok(bytes) = std::fs::read(root.join(format!("{leg}.jsonl"))) else {
+                return false;
+            };
+            if bytes.len() > 8 * 1024 {
+                return false;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return false;
+            };
+            !support::not_run::parse_rows(leg, &text).is_empty()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_retained_leg_not_run_is_surfaced_and_forbids_a_full_pass() {
+    let candidate = "candidate";
+    let report = counted(candidate, &complete_rows(candidate));
+    assert!(report.full_pass, "the fixture set is complete: {report:?}");
+    assert!(
+        full_pass_with_retained(&report, 0),
+        "a complete report with no retained leg keeps the full pass"
+    );
+    let retained = vec![json!({
+        "schema_version": 1,
+        "leg": "auth.keychain",
+        "status": "not_run",
+        "prerequisite": "fixture prerequisite",
+    })];
+    let retained_legs = surface_retained_not_run(&retained);
+    assert_eq!(retained_legs, 1, "the retained NOT_RUN leg is surfaced");
+    assert!(
+        !full_pass_with_retained(&report, retained_legs),
+        "a complete report plus one retained row is not a full pass"
+    );
+}
+
+#[test]
+fn retained_rows_dedupe_by_leg_and_never_forge_a_verdict() {
+    let duplicate = json!({
+        "schema_version": 1,
+        "leg": "ingress.exec",
+        "status": "not_run",
+        "prerequisite": "no git",
+    });
+    let other = json!({
+        "schema_version": 1,
+        "leg": "ingress.pty",
+        "status": "not_run",
+        "prerequisite": "no pty",
+    });
+    let retained = vec![duplicate.clone(), duplicate, other];
+    assert_eq!(
+        surface_retained_not_run(&retained),
+        2,
+        "the counted total is the unique-leg count"
+    );
+}
+
+/// The retained reader's file walk: only a closed-set leg file that fits the
+/// cap, decodes as UTF-8 and names its own leg is evidence, and its duplicate
+/// rows still count one leg.
+#[test]
+fn retained_reader_reads_only_a_bounded_regular_leg_file() {
+    let root = tempfile::TempDir::with_prefix("rivect-retained-reader-").expect("temp root");
+    std::fs::write(
+        root.path().join("auth.keychain.jsonl"),
+        concat!(
+            r#"{"schema_version":1,"leg":"auth.keychain","status":"not_run","prerequisite":"first"}"#,
+            "\n",
+            r#"{"schema_version":1,"leg":"auth.keychain","status":"not_run","prerequisite":"second"}"#,
+            "\n",
+        ),
+    )
+    .expect("duplicate rows");
+    std::fs::write(
+        root.path().join("auth.secret_service.jsonl"),
+        [0xff, 0xfe, 0xfd],
+    )
+    .expect("invalid utf-8");
+    std::fs::write(
+        root.path().join("ingress.exec.jsonl"),
+        vec![b'x'; 8 * 1024 + 1],
+    )
+    .expect("over cap");
+    std::fs::write(
+        root.path().join("ingress.vision.jsonl"),
+        r#"{"schema_version":1,"leg":"ingress.exec","status":"not_run","prerequisite":"forged"}"#,
+    )
+    .expect("forged leg");
+
+    let rows = support::not_run::records_in(root.path());
+    assert_eq!(rows.len(), 1, "one deduped leg survives: {rows:?}");
+    assert_eq!(rows[0]["leg"], "auth.keychain");
+    assert_eq!(
+        rows[0]["prerequisite"], "first",
+        "the first row of a leg names it once"
+    );
+}
+
+#[test]
+fn retained_reader_ignores_conflicting_and_control_bearing_rows() {
+    let good =
+        r#"{"schema_version":1,"leg":"ingress.exec","status":"not_run","prerequisite":"no git"}"#;
+    let conflicting =
+        r#"{"schema_version":1,"leg":"auth.keychain","status":"not_run","prerequisite":"forged"}"#;
+    let control = r#"{"schema_version":1,"leg":"ingress.exec","status":"not_run","prerequisite":"evil\u001b[2Jforged\nLEG_NOT_RUN"}"#;
+    let wrong_status =
+        r#"{"schema_version":1,"leg":"ingress.exec","status":"pass","prerequisite":"forged"}"#;
+    let wrong_schema =
+        r#"{"schema_version":2,"leg":"ingress.exec","status":"not_run","prerequisite":"forged"}"#;
+    let rows = support::not_run::parse_rows(
+        "ingress.exec",
+        &format!("{good}\n{conflicting}\n{control}\n{wrong_status}\n{wrong_schema}"),
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "only rows naming this leg and status parse: {rows:?}"
+    );
+    assert_eq!(rows[0]["leg"], "ingress.exec");
+    assert_eq!(
+        rows[1]["prerequisite"], "evil[2JforgedLEG_NOT_RUN",
+        "control characters are stripped before printing"
+    );
+    assert!(
+        rows.iter().all(|row| {
+            !row["prerequisite"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .any(char::is_control)
+        }),
+        "no parsed prerequisite can forge a terminal line: {rows:?}"
+    );
 }
 
 #[test]
@@ -847,6 +1127,15 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             expected_not_run.insert(case_id);
         }
     }
+    // The matrix's declared NOT_RUN family: the theme cells carry their own
+    // claim as the reason, and no other UI cell may be NOT_RUN.
+    for state in UI_STATES {
+        for geometry in UI_GEOMETRIES {
+            for (input, _claim) in THEME_NOT_RUN_CLAIMS {
+                expected_not_run.insert(ui_case(state, geometry, input));
+            }
+        }
+    }
 
     let ui = matrix_rows(&ui_report_path());
     let ui_count = ui.len();
@@ -895,7 +1184,6 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         report.installed_rows, FINAL_INSTALLED_ROWS,
         "74 provider INSTALLED rows plus 2 alias INSTALLED rows = 76"
     );
-    assert_eq!(report.ui_cells, ui_count);
     assert!(report.blockers.failed.is_empty(), "{report:?}");
     assert!(report.blockers.unattributed.is_empty(), "{report:?}");
 
@@ -919,52 +1207,102 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             "an absent matrix is not a smaller denominator"
         );
     } else {
-        assert_eq!(ui_missing, 0, "every 19xGxI cell is counted");
-        assert!(
-            ui_stale == 0 || ui_stale == FINAL_UI_CELLS,
-            "the matrix binds one candidate for every cell"
+        assert_eq!(
+            report.ui_cells, FINAL_UI_CELLS,
+            "every 19xGxI cell is counted in the report"
         );
-        if ui_stale == 0 {
-            assert_eq!(
-                report.passed,
-                expected_required_rows() - declared_not_run.len(),
-                "every current row and cell passes"
-            );
-        }
+        assert_eq!(ui_missing, 0, "every 19xGxI cell is counted");
+        assert_eq!(
+            ui_stale, 0,
+            "the matrix binds the acting candidate on every cell"
+        );
+        assert_eq!(
+            report.passed,
+            expected_required_rows() - declared_not_run.len(),
+            "every current row and cell passes"
+        );
     }
 
-    for (case_id, marker) in [
-        (INSTALLED_ORDINARY_CASE, INSTALLED_ORDINARY_EVIDENCE_MARKER),
-        (INSTALLED_UI_CASE, INSTALLED_UI_EVIDENCE_MARKER),
-    ] {
-        let row = rows
-            .iter()
-            .find(|row| row.case_id == case_id)
-            .expect("release row");
-        assert_eq!(row.outcome, TrialOutcome::Pass);
-        let evidence = row.evidence.as_deref().expect("retained receipt pointer");
-        assert!(
-            evidence.ends_with(marker),
-            "the row points at its retained receipt: {evidence}"
-        );
-        assert!(!report.blockers.not_run.contains(&case_id.to_string()));
-        if case_id == INSTALLED_UI_CASE {
-            assert_eq!(
-                ui_count, FINAL_UI_CELLS,
-                "the passing UI row counts every one of the 1330 cells"
-            );
-        }
-        println!("PASSED {case_id}: {evidence}");
-    }
+    let ordinary = rows
+        .iter()
+        .find(|row| row.case_id == INSTALLED_ORDINARY_CASE)
+        .expect("release row");
+    assert_eq!(ordinary.outcome, TrialOutcome::Pass);
+    let evidence = ordinary
+        .evidence
+        .as_deref()
+        .expect("retained receipt pointer");
+    assert!(
+        evidence.ends_with(INSTALLED_ORDINARY_EVIDENCE_MARKER),
+        "the row points at its retained receipt: {evidence}"
+    );
+    assert!(
+        !report
+            .blockers
+            .not_run
+            .contains(&INSTALLED_ORDINARY_CASE.to_string())
+    );
+    println!("PASSED {INSTALLED_ORDINARY_CASE}: {evidence}");
+
+    // The UI row is censored, never passed: the matrix declares the theme
+    // palettes NOT_RUN, and the cause names that declaration and the report.
+    let ui_row = rows
+        .iter()
+        .find(|row| row.case_id == INSTALLED_UI_CASE)
+        .expect("release row");
+    assert_eq!(ui_row.outcome, TrialOutcome::Censored);
+    let cause = ui_row.cause.as_deref().expect("the censoring cause");
+    assert!(
+        cause.contains(INSTALLED_UI_EVIDENCE_MARKER) && cause.contains("NOT_RUN"),
+        "the censored row points at its retained matrix and its NOT_RUN family: {cause}"
+    );
+    assert!(
+        report
+            .blockers
+            .not_run
+            .contains(&INSTALLED_UI_CASE.to_string())
+    );
+    assert_eq!(
+        ui_count, FINAL_UI_CELLS,
+        "the matrix still counts every one of the 1330 cells"
+    );
+    println!("CENSORED {INSTALLED_UI_CASE}: {cause}");
+
+    // Host-conditional legs retain a machine-readable NOT_RUN row instead of
+    // returning green. The conjunction surfaces every retained row as NOT_RUN
+    // and cannot claim a full pass while one exists.
+    let retained_not_run = support::not_run::records();
+    let retained_legs_not_run = surface_retained_not_run(&retained_not_run);
+    let surfaced: BTreeSet<String> = retained_not_run
+        .iter()
+        .map(|row| {
+            row["leg"]
+                .as_str()
+                .expect("a surfaced row names its leg")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        surfaced,
+        retained_legs_on_disk(),
+        "the retained reader surfaces every leg file on disk exactly once"
+    );
+    assert_eq!(
+        retained_legs_not_run,
+        surfaced.len(),
+        "the counted total is the deduped unique-leg count it prints"
+    );
 
     let blocker_count = report.blockers.missing.len()
         + report.blockers.stale.len()
         + report.blockers.failed.len()
         + report.blockers.not_run.len()
-        + report.blockers.unattributed.len();
+        + report.blockers.unattributed.len()
+        + retained_legs_not_run;
+    let full_pass = full_pass_with_retained(&report, retained_legs_not_run);
     println!(
         "FINAL_ACCEPTANCE verdict={} blockers={blocker_count}",
-        if report.full_pass {
+        if full_pass {
             "full-pass"
         } else {
             "not-full-pass"

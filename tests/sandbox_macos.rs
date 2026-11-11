@@ -1764,6 +1764,27 @@ fn macos_exec_profile_does_not_allow_dev_read() {
 }
 
 #[test]
+fn macos_exec_profile_admits_only_the_null_device() {
+    // Native git opens /dev/null for reading and writing before its main, so
+    // the exec profile carries exactly that literal, matching the Linux
+    // `read-file,write-file:/dev/null` rule and no other device.
+    let fixture = TempTree::new("sandbox-macos", "exec-dev-null");
+    let profile = macos::exec_profile(&fixture.path).expect("exec profile");
+    let device_lines: Vec<&str> = profile
+        .lines()
+        .filter(|line| line.contains("\"/dev"))
+        .collect();
+    assert_eq!(
+        device_lines,
+        [
+            "    (allow file-read* (literal \"/dev/null\"))",
+            "    (allow file-write* (literal \"/dev/null\"))",
+        ],
+        "exactly the /dev/null read/write literal and no other /dev literal: {profile}"
+    );
+}
+
+#[test]
 fn live_admission_context_allow_cells_reach_the_seatbelt_worker_when_granting_signals_are_present()
 {
     ensure_helper();

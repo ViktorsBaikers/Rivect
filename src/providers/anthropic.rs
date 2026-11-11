@@ -51,8 +51,8 @@ use super::{
     CatalogModel, CredentialStore, Dialect, Provider, ProviderError, ProviderReply, ToolCall,
     WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
     open_proxy_connection, payload_reason, positive_count, read_catalog_body, read_chunk,
-    resolve_admitted_credential_in, route_for, routes_for, sse, transport, transport_status,
-    violation, wire_body, wire_effort,
+    resolve_admitted_credential_in, retain_lineage_epoch, retire_displaced_epochs, route_for,
+    routes_for, sse, transport, transport_status, violation, wire_body, wire_effort,
 };
 use crate::config::{Config, ConnKind, EffortAssign, FixedModel, ModelAssign};
 use crate::model::RequestManifest;
@@ -958,7 +958,7 @@ impl MessagesCodec {
     pub(crate) fn binding(&mut self, manifest: &RequestManifest, model: &str) -> RequestBinding {
         let key = lineage_key(manifest);
         if manifest.mutation_reason.is_some() {
-            self.lineages.remove(&key);
+            retire_displaced_epochs(&mut self.lineages, &key);
             return RequestBinding {
                 replay: Vec::new(),
                 drop_block: true,
@@ -1413,6 +1413,7 @@ impl MessagesCodec {
             tool_calls: state.tool_calls,
             usage,
             wire_retries: 0,
+            dropped_reasoning: state.transformations,
         })
     }
 
@@ -1761,13 +1762,15 @@ impl MessagesCodec {
     }
 
     /// Commits this reply's assistant thinking set under its own lineage:
-    /// a set is replayed only by the same world, purpose, epoch and model.
+    /// a set is replayed only by the same world, purpose, epoch and model,
+    /// and a committed epoch displaces the conversation's older epochs.
     fn commit(&mut self, manifest: &RequestManifest, model: &str, blocks: Vec<Value>) {
         let key = lineage_key(manifest);
         if blocks.is_empty() {
             self.lineages.remove(&key);
         } else {
-            self.lineages.insert(
+            retain_lineage_epoch(
+                &mut self.lineages,
                 key,
                 ThinkingLineage {
                     model: model.to_string(),

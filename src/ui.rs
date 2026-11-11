@@ -95,7 +95,7 @@ use crate::state::StoreWriter;
 use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind, poll, read,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -110,7 +110,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget as _;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::{Value, json};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Stdout, Write};
@@ -127,13 +127,15 @@ fn report_cleanup_error(error: &io::Error) {
     }
 }
 
-/// Which surface the TUI owns: the alternate screen, or the terminal's own
-/// scrollback with a pinned bottom region.
+/// Which surface the TUI owns: the alternate screen, the terminal's own
+/// scrollback with a pinned bottom region, or the append-only linear stream a
+/// screen reader consumes (no alternate screen, no cursor addressing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderMode {
     #[default]
     Fullscreen,
     Inline,
+    Linear,
 }
 
 impl RenderMode {
@@ -142,6 +144,7 @@ impl RenderMode {
         match self {
             Self::Fullscreen => "fullscreen",
             Self::Inline => "inline",
+            Self::Linear => "linear",
         }
     }
 }
@@ -158,6 +161,9 @@ const SCREEN_FULLSCREEN: u8 = 1;
 /// exactly that one.
 static ACTIVE_SCREEN: AtomicU8 = AtomicU8::new(SCREEN_NONE);
 static MOUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The linear surface never hides the cursor or addresses it, so the panic
+/// restore must not emit the cursor-show sequence either.
+static LINEAR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Restores the process-owned terminal state after a panic or a surface
 /// switch: the alternate screen only when this process entered it, mouse
@@ -175,7 +181,13 @@ fn restore_process_terminal() {
     if mouse && let Err(error) = execute!(out, DisableMouseCapture) {
         report_cleanup_error(&error);
     }
-    if let Err(error) = execute!(out, DisableBracketedPaste, Show) {
+    let linear = LINEAR_ACTIVE.swap(false, Ordering::SeqCst);
+    let cursor = if linear {
+        execute!(out, DisableBracketedPaste)
+    } else {
+        execute!(out, DisableBracketedPaste, Show)
+    };
+    if let Err(error) = cursor {
         report_cleanup_error(&error);
     }
     if let Err(error) = disable_raw_mode() {
@@ -218,6 +230,13 @@ impl TerminalGuard {
                     viewport: Viewport::Inline(INLINE_VIEWPORT_ROWS),
                 },
             ),
+            // The linear surface owns no viewport: its renderer writes plain
+            // lines, so the terminal only needs constructing for the guard's
+            // lifetime. Nothing is entered on the screen.
+            RenderMode::Linear => {
+                LINEAR_ACTIVE.store(true, Ordering::SeqCst);
+                Terminal::new(CrosstermBackend::new(io::stdout()))
+            }
         };
         let terminal = match prepared {
             Ok(terminal) => terminal,
@@ -303,6 +322,10 @@ impl TerminalGuard {
                 },
             )
             .map_err(io::Error::other),
+            RenderMode::Linear => {
+                LINEAR_ACTIVE.store(true, Ordering::SeqCst);
+                Terminal::new(CrosstermBackend::new(io::stdout())).map_err(io::Error::other)
+            }
         };
         match entered {
             Ok(terminal) => {
@@ -371,7 +394,14 @@ impl TerminalGuard {
         } else {
             Ok(())
         };
-        let paste = execute!(io::stdout(), DisableBracketedPaste, Show);
+        let paste = if self.mode == RenderMode::Linear {
+            // Linear never hides or addresses the cursor, so it must not
+            // emit the show sequence on the way out either.
+            execute!(io::stdout(), DisableBracketedPaste)
+        } else {
+            execute!(io::stdout(), DisableBracketedPaste, Show)
+        };
+        LINEAR_ACTIVE.store(false, Ordering::SeqCst);
         let raw_mode = disable_raw_mode();
         let mut primary = None;
         for result in [screen, mouse, paste, raw_mode] {
@@ -452,6 +482,18 @@ impl ContextMeasurement {
     }
 }
 
+/// One cached transcript projection: the sanitized joined text and the
+/// wrapped row count at `width`, keyed by the append revision and row count.
+/// A new row, a reset or a width change rebuilds the entry once.
+#[derive(Debug, Clone, PartialEq)]
+struct TranscriptCache {
+    revision: u64,
+    rows: usize,
+    width: u16,
+    text: Arc<String>,
+    wrapped: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalView {
     pub status: String,
@@ -477,6 +519,32 @@ pub struct LocalView {
     /// shared borrow of the view, so the write-back goes through `Cell`
     /// — and a PageDown overshoot can never swallow the next PageUp.
     pub output_scroll: Cell<u16>,
+    /// Vertical scroll offset of the transcript body; `/clear` resets it
+    /// with the rows it described. `render` clamps the stored offset to the
+    /// wrapped bound each frame — through `Cell` like
+    /// [`LocalView::output_scroll`] — so a PageDown overshoot can never
+    /// swallow the next PageUp.
+    pub transcript_scroll: Cell<u16>,
+    /// Tail-follow: while set, the render pins the transcript to its bottom
+    /// so a new row lands on screen with no keypress. `PageUp` clears it, a
+    /// `PageDown` at the bottom restores it, and `/clear` or a surface
+    /// switch resets it.
+    pub transcript_follow: Cell<bool>,
+    /// The bottom offset the last following render stored; a stored offset
+    /// that no longer matches it is a manual move and ends the follow.
+    transcript_follow_bottom: Cell<u16>,
+    /// The fullscreen transcript body height the last render painted:
+    /// the step a PageUp/PageDown moves by.
+    transcript_page: Cell<u16>,
+    /// The streaming-output body height the last render painted.
+    output_page: Cell<u16>,
+    /// Append revision of [`LocalView::transcript`], bumped by every
+    /// in-module append; the render caches key on it.
+    transcript_revision: Cell<u64>,
+    /// The sanitized joined transcript and its wrapped row count, kept
+    /// between frames: a still view must not re-sanitize and re-wrap the
+    /// whole transcript on every loop pass.
+    transcript_cache: RefCell<Option<TranscriptCache>>,
     /// Open permission panel (modal). The Ask-verdict producer arrives with
     /// the mode-selection carrier; while open, keys route to the panel.
     pub panel: Option<PermissionPanel>,
@@ -496,6 +564,99 @@ impl LocalView {
     pub fn replace_output(&mut self, output: OutputStream) {
         self.output = output;
         self.output_scroll.set(0);
+    }
+
+    /// Appends one transcript row and invalidates the render cache.
+    pub fn push_transcript(&mut self, line: String) {
+        self.transcript.push(line);
+        self.bump_transcript_revision();
+    }
+
+    /// Appends a batch of transcript rows and invalidates the render cache.
+    pub fn extend_transcript(&mut self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        self.transcript.extend_from_slice(lines);
+        self.bump_transcript_revision();
+    }
+
+    fn bump_transcript_revision(&self) {
+        self.transcript_revision
+            .set(self.transcript_revision.get().wrapping_add(1));
+    }
+
+    /// The sanitized joined transcript and its wrapped row count at `width`.
+    /// Both the text and the count are cached against the append revision,
+    /// so a still transcript costs one borrow per frame; the cache is
+    /// rebuilt exactly once after a new row or a reset.
+    fn transcript_projection(&self, width: u16) -> (Arc<String>, usize) {
+        let width = width.max(1);
+        let cached = self.transcript_cache.borrow().as_ref().map(|cache| {
+            (
+                cache.revision,
+                cache.rows,
+                cache.width,
+                Arc::clone(&cache.text),
+                cache.wrapped,
+            )
+        });
+        if let Some((revision, rows, cached_width, text, wrapped)) = cached
+            && revision == self.transcript_revision.get()
+            && rows == self.transcript.len()
+        {
+            if cached_width == width {
+                return (text, wrapped);
+            }
+            let wrapped = wrapped_row_count(&text, width);
+            *self.transcript_cache.borrow_mut() = Some(TranscriptCache {
+                revision,
+                rows,
+                width,
+                text: Arc::clone(&text),
+                wrapped,
+            });
+            return (text, wrapped);
+        }
+        let mut joined = String::new();
+        for (index, line) in self.transcript.iter().enumerate() {
+            if index > 0 {
+                joined.push('\n');
+            }
+            joined.push_str(&sanitize_status_cause(line));
+        }
+        let text = Arc::new(joined);
+        let wrapped = wrapped_row_count(&text, width);
+        *self.transcript_cache.borrow_mut() = Some(TranscriptCache {
+            revision: self.transcript_revision.get(),
+            rows: self.transcript.len(),
+            width,
+            text: Arc::clone(&text),
+            wrapped,
+        });
+        (text, wrapped)
+    }
+
+    /// The transcript offset this frame paints. While following, the
+    /// offset tracks the bottom the wrapped rows allow, so an appended
+    /// row is visible without a key. A stored offset that no longer
+    /// matches the last followed bottom is a manual move (a key handler
+    /// disables follow too; this arm covers direct writes) and ends the
+    /// follow rather than dragging the reader back down.
+    fn transcript_offset(&self, height: u16, rows: usize) -> u16 {
+        let max = u16::try_from(rows.saturating_sub(usize::from(height))).unwrap_or(u16::MAX);
+        let stored = self.transcript_scroll.get();
+        if self.transcript_follow.get() {
+            if stored == self.transcript_follow_bottom.get() {
+                self.transcript_scroll.set(max);
+                self.transcript_follow_bottom.set(max);
+                return max;
+            }
+            self.transcript_follow.set(false);
+        }
+        let clamped = stored.min(max);
+        self.transcript_scroll.set(clamped);
+        clamped
     }
 }
 
@@ -535,11 +696,11 @@ impl PanelAction {
 pub const PANEL_TITLE: &str = "awaiting permission";
 /// Transcript note when the panel resolves without a grant.
 pub const PANEL_DENIED_NOTE: &str = "permission denied; no grant recorded";
-/// Transcript note when the one-shot allow is chosen: it names the chosen
-/// action and the next observable state — the request is consumed by the
-/// choice and no grant outlives it (no consent carrier exists yet; the
-/// consume seam arrives with the mode-selection carrier).
-pub const PANEL_ALLOWED_NOTE: &str = "allowed once; no grant recorded; request consumed";
+/// Transcript note when the one-shot allow is chosen. It names only the
+/// chosen action and the absence of a grant: no consent carrier consumes
+/// the request yet (the consume seam arrives with the mode-selection
+/// carrier), so the note never claims it.
+pub const PANEL_ALLOWED_NOTE: &str = "allowed once; no grant recorded";
 /// Transcript note when the limited grant is recorded in the store.
 pub const PANEL_LIMITED_NOTE: &str = "limited grant recorded";
 /// One pinned footer line naming the panel's key affordances, sized to
@@ -724,6 +885,15 @@ pub const DECISION_ANSWER_AUTHOR: &str = "human";
 /// the draft is not open: the write is refused and named — the same
 /// honesty every other refused append gets — never a silent drop.
 pub const DECISION_PASTE_REFUSED_NOTE: &str = "paste refused while the decision card owns input";
+/// The composer row while the decision card owns the keys: Enter and
+/// Backspace never reach the composer, so the row says the input is paused
+/// instead of inviting a draft that cannot be sent.
+pub const DECISION_COMPOSER_PAUSED: &str = "[input paused: answer the decision card]";
+/// The composer row while the permission panel owns the keys.
+pub const PANEL_COMPOSER_PAUSED: &str = "[input paused: answer the permission panel]";
+/// Transcript note when a paste arrives while the permission panel owns
+/// input: the write is refused and named, never a silent drop.
+pub const PANEL_PASTE_REFUSED_NOTE: &str = "paste refused while the permission panel owns input";
 /// Transcript note when the pinned question moves under an open card —
 /// superseded or answered through another ingress: the card closes
 /// honestly instead of keeping live affordances on a question that no
@@ -862,22 +1032,9 @@ impl DecisionPanel {
     }
 
     /// Removes the draft's last extended grapheme cluster — a Backspace
-    /// that dies mid-cluster would leave a combining mark orphaned. The
-    /// segmentation is the render path's own (`styled_graphemes`), which
-    /// drops clusters that contain a control char, so a trailing control
-    /// (the pasted `\n` the draft deliberately keeps) peels off by its
-    /// own bytes; a `\r\n` tail is one cluster and dies together.
+    /// that dies mid-cluster would leave a combining mark orphaned.
     fn pop_grapheme(&mut self) {
-        let remove = match self.custom_draft.chars().next_back() {
-            None => 0,
-            Some('\n') if self.custom_draft.chars().nth_back(1) == Some('\r') => 2,
-            Some(ch) if ch.is_control() => ch.len_utf8(),
-            Some(_) => Line::raw(self.custom_draft.as_str())
-                .styled_graphemes(Style::default())
-                .last()
-                .map_or(0, |grapheme| grapheme.symbol.len()),
-        };
-        self.custom_draft.truncate(self.custom_draft.len() - remove);
+        pop_last_grapheme(&mut self.custom_draft);
     }
 
     /// Pinned header: title, task, and the pair the card's answer pins —
@@ -1051,9 +1208,57 @@ pub fn initial_view() -> LocalView {
         composer: String::new(),
         output: OutputStream::new(),
         output_scroll: Cell::new(0),
+        transcript_scroll: Cell::new(0),
+        transcript_follow: Cell::new(true),
+        transcript_follow_bottom: Cell::new(0),
+        transcript_page: Cell::new(1),
+        output_page: Cell::new(1),
+        transcript_revision: Cell::new(0),
+        transcript_cache: RefCell::new(None),
         panel: None,
         decision: None,
         decision_dismissed: None,
+    }
+}
+
+/// The status the surface carries once a send window closes: the bound
+/// connection and credential profile the runtime now projects, when the send
+/// bound one, else the status the in-flight label replaced. A send that bound
+/// no connection leaves the pre-send text — at open that is the disconnected
+/// line, which is then still the true projection.
+fn status_after_send(
+    bound: Option<crate::model::ProfileBinding>,
+    before: Option<String>,
+) -> String {
+    let Some(bound) = bound else {
+        return before.unwrap_or_else(|| STATUS_DISCONNECTED.to_string());
+    };
+    match bound.profile {
+        Some(profile) => format!("Rivect · connected · profile {profile}"),
+        None => format!("Rivect · connected · {}", bound.connection),
+    }
+}
+
+/// The transcript body a surface paints: every row sanitized and joined as
+/// one paragraph. Fullscreen wraps this text and inline counts the rows it
+/// inserts from the same builder, so both surfaces agree on its height.
+fn transcript_text(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|line| sanitize_status_cause(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The composer row a surface paints: the draft while the composer owns
+/// the keys, or the honest paused marker while a modal does.
+fn composer_line(view: &LocalView) -> String {
+    if view.decision.is_some() {
+        format!("> {DECISION_COMPOSER_PAUSED}")
+    } else if view.panel.is_some() {
+        format!("> {PANEL_COMPOSER_PAUSED}")
+    } else {
+        format!("> {}", sanitize_status_cause(&view.composer))
     }
 }
 
@@ -1111,14 +1316,17 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             Paragraph::new(sanitize_status_cause(&view.status)),
             chunks[0],
         );
+        // The transcript wraps at the region's width, so a long row
+        // continues on the next line instead of clipping its tail. The
+        // sanitized text and its wrapped height are cached by revision;
+        // the offset follows the tail until the operator pages away.
+        let (transcript, transcript_rows) = view.transcript_projection(chunks[1].width);
+        let transcript_scroll = view.transcript_offset(chunks[1].height, transcript_rows);
+        view.transcript_page.set(chunks[1].height.max(1));
         frame.render_widget(
-            Paragraph::new(
-                view.transcript
-                    .iter()
-                    .map(|line| sanitize_status_cause(line))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            Paragraph::new(transcript.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((transcript_scroll, 0)),
             chunks[1],
         );
         frame.render_widget(
@@ -1135,25 +1343,26 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
                 chunks[next],
             );
             next += 1;
-            // The measured text is the rendered text: clamping the raw
-            // stream would count control characters the projection
-            // escapes or drops, so the estimate disagrees with the
-            // widget's own rows.
-            let output_text = sanitize_status_cause(view.output.text());
+            // `OutputStream::text` is already the sanitized projection:
+            // sanitizing it again each frame re-escaped bytes the boundary
+            // already neutralized. The stream keeps its own bounded text,
+            // so the render paints it verbatim.
+            let output_text = view.output.text();
             // The render owns the region's width and height, so it owns
             // the bound: the stored offset is clamped back each frame
             // and can never run past the content (the overshoot a
             // PageDown run would otherwise leave swallows the next
-            // PageUp whole).
+            // PageUp whole). `clamp_scroll` skips the wrap pass at zero.
             let scroll = clamp_scroll(
-                &output_text,
+                output_text,
                 chunks[next].width,
                 chunks[next].height,
                 view.output_scroll.get(),
             );
             view.output_scroll.set(scroll);
+            view.output_page.set(chunks[next].height.max(1));
             frame.render_widget(
-                Paragraph::new(output_text.as_str())
+                Paragraph::new(output_text)
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .scroll((scroll, 0)),
                 chunks[next],
@@ -1179,107 +1388,205 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
                 chunks[next + 1],
             );
         }
-        frame.render_widget(
-            Paragraph::new(format!("> {}", sanitize_status_cause(&view.composer))),
-            chunks[next + 2],
-        );
-        if let Some(panel) = &view.panel {
-            // Modal overlay: capped at the 60-column acceptance geometry,
-            // clamped to the buffer, three regions — pinned header,
-            // scrollable scope body (wrapping, never truncating),
-            // pinned actions footer (design-brief §4).
-            let width = area.width.min(60);
-            let height = area.height.saturating_sub(4).max(6);
-            let panel_area = ratatui::layout::Rect {
-                x: area.width.saturating_sub(width) / 2,
-                y: area.height.saturating_sub(height) / 2,
-                width,
-                height,
-            };
-            frame.render_widget(ratatui::widgets::Clear, panel_area);
-            let block = ratatui::widgets::Block::bordered();
-            let inner = block.inner(panel_area);
-            frame.render_widget(block, panel_area);
-            let regions = ratatui::layout::Layout::vertical([
-                Constraint::Length(PANEL_HEADER_ROWS),
-                Constraint::Min(1),
-                Constraint::Length(PANEL_FOOTER_ROWS),
-            ])
-            .split(inner);
-            frame.render_widget(Paragraph::new(panel.header_text()), regions[0]);
-            let body = panel.body_text();
-            let body_scroll = clamp_scroll(
-                &body,
-                regions[1].width,
-                regions[1].height,
-                panel.body_scroll.get(),
-            );
-            panel.body_scroll.set(body_scroll);
-            frame.render_widget(
-                Paragraph::new(body.as_str())
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((body_scroll, 0)),
-                regions[1],
-            );
-            frame.render_widget(Paragraph::new(panel.footer_text()), regions[2]);
-        }
-        if let Some(card) = &view.decision {
-            // Modal overlay, same geometry and three-region discipline as
-            // the permission panel: pinned header, scrollable position
-            // body, pinned focus/hint footer.
-            let width = area.width.min(60);
-            let height = area.height.saturating_sub(4).max(6);
-            let card_area = ratatui::layout::Rect {
-                x: area.width.saturating_sub(width) / 2,
-                y: area.height.saturating_sub(height) / 2,
-                width,
-                height,
-            };
-            frame.render_widget(ratatui::widgets::Clear, card_area);
-            let block = ratatui::widgets::Block::bordered();
-            let inner = block.inner(card_area);
-            // The widgets clip to the buffer; the stamp does too. The
-            // question content lives in `inner`, so its viewport
-            // intersection is the part of this paint the operator could
-            // actually see — empty means the frame showed nothing.
-            card_inner = Some(inner.intersection(area));
-            frame.render_widget(block, card_area);
-            let regions = ratatui::layout::Layout::vertical([
-                Constraint::Length(DECISION_HEADER_ROWS),
-                Constraint::Min(1),
-                Constraint::Length(DECISION_FOOTER_ROWS),
-            ])
-            .split(inner);
-            frame.render_widget(Paragraph::new(card.header_text()), regions[0]);
-            let (body, scroll, hidden) = decision_body(
-                card,
-                regions[1].width,
-                regions[1].height,
-                card.body_scroll.get(),
-            );
-            card.body_scroll.set(scroll);
-            frame.render_widget(
-                Paragraph::new(body.as_str())
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((scroll, 0)),
-                regions[1],
-            );
-            frame.render_widget(Paragraph::new(card.footer_text(hidden)), regions[2]);
-        }
+        frame.render_widget(Paragraph::new(composer_line(view)), chunks[next + 2]);
+        card_inner = paint_modals(frame, view);
     })?;
     // The frame just flushed: a card that painted for the first time
     // records the instant its consent window runs from — the earliest
     // moment input could have been aimed at it — but only when the
     // paint left a visible interior cell to aim at.
+    note_card_paint(view, card_inner);
+    Ok(())
+}
+
+/// Rows a modal always keeps scrollable: the subject/question line and the
+/// focused card row (or the scope body on the panel).
+const MODAL_MIN_BODY_ROWS: u16 = 2;
+
+/// One modal's painted regions. `compact` marks the ≤10-row viewport where
+/// the status row is reserved, the footer is pinned before the header, and
+/// the header collapses to the one line that names the subject.
+struct ModalFrame {
+    header: ratatui::layout::Rect,
+    body: ratatui::layout::Rect,
+    footer: ratatui::layout::Rect,
+    compact: bool,
+}
+
+/// Paints the shared modal frame — geometry, clear, border and the three
+/// pinned/scrollable regions — and returns them. On a viewport of ten rows
+/// or less, the modal starts below the reserved status row and uses the rest
+/// of the screen; any other viewport keeps the capped centered overlay. The
+/// footer is allocated before the header: the actions/focus line and the
+/// hint are what make the modal answerable, so a short inner rect collapses
+/// the header to its naming line instead of clipping the footer away.
+fn modal_frame(frame: &mut ratatui::Frame<'_>, header_rows: u16, footer_rows: u16) -> ModalFrame {
+    let area = frame.area();
+    let compact = area.height <= 10;
+    let width = area.width.min(60);
+    let height = if compact {
+        area.height.saturating_sub(1)
+    } else {
+        area.height.saturating_sub(4).max(6)
+    };
+    let rect = ratatui::layout::Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: if compact {
+            area.height.saturating_sub(height)
+        } else {
+            area.height.saturating_sub(height) / 2
+        },
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let block = ratatui::widgets::Block::bordered();
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let footer_rows = footer_rows.min(inner.height.saturating_sub(1 + MODAL_MIN_BODY_ROWS));
+    let header_rows = if inner.height >= header_rows + footer_rows + MODAL_MIN_BODY_ROWS {
+        header_rows
+    } else {
+        1.min(inner.height.saturating_sub(footer_rows))
+    };
+    let regions = ratatui::layout::Layout::vertical([
+        Constraint::Length(header_rows),
+        Constraint::Min(1),
+        Constraint::Length(footer_rows),
+    ])
+    .split(inner);
+    ModalFrame {
+        header: regions[0],
+        body: regions[1],
+        footer: regions[2],
+        compact,
+    }
+}
+
+/// A pinned header clipped to the rows the frame kept: each line is elided
+/// at the inner width (grapheme-whole, with a visible marker), and a header
+/// with more lines than rows ends its last visible line with the same
+/// marker — a scarce viewport never clips a consent fact silently.
+fn modal_header(text: &str, width: u16, rows: u16) -> String {
+    let mut lines: Vec<String> = text.lines().map(|line| elide_cells(line, width)).collect();
+    if lines.len() > usize::from(rows) {
+        lines.truncate(usize::from(rows));
+        if let Some(last) = lines.last_mut() {
+            last.push_str(" …");
+            *last = elide_cells(last, width);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Elides one line to `max` terminal cells, keeping a visible marker on the
+/// row. Grapheme clusters are kept whole, so a wide glyph never splits.
+fn elide_cells(text: &str, max: u16) -> String {
+    if text.cell_width() <= max {
+        return text.to_string();
+    }
+    let budget = max.saturating_sub(1);
+    let mut kept = String::new();
+    let mut width = 0u16;
+    for grapheme in Line::raw(text).styled_graphemes(Style::default()) {
+        let cells = grapheme.symbol.cell_width();
+        if width + cells > budget {
+            break;
+        }
+        kept.push_str(grapheme.symbol);
+        width += cells;
+    }
+    kept.push('…');
+    kept
+}
+
+/// Paints the modal layer — the permission panel and the decision card — over
+/// whatever the base surface drew, and returns the painted body clipped to
+/// the viewport when its first line (the question) is actually visible: the
+/// part of the frame the operator could aim an answer at. Both surfaces run
+/// this same layer, so a card opens on either.
+fn paint_modals(frame: &mut ratatui::Frame<'_>, view: &LocalView) -> Option<ratatui::layout::Rect> {
+    let area = frame.area();
+    if let Some(panel) = &view.panel {
+        // Three regions: pinned header, scrollable scope body (wrapping,
+        // never truncating), pinned actions footer (design-brief §4).
+        let modal = modal_frame(frame, PANEL_HEADER_ROWS, PANEL_FOOTER_ROWS);
+        frame.render_widget(
+            Paragraph::new(modal_header(
+                &panel.header_text(),
+                modal.header.width,
+                modal.header.height,
+            )),
+            modal.header,
+        );
+        let body = panel.body_text();
+        let body_scroll = clamp_scroll(
+            &body,
+            modal.body.width,
+            modal.body.height,
+            panel.body_scroll.get(),
+        );
+        panel.body_scroll.set(body_scroll);
+        frame.render_widget(
+            Paragraph::new(body.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((body_scroll, 0)),
+            modal.body,
+        );
+        frame.render_widget(Paragraph::new(panel.footer_text()), modal.footer);
+    }
+    let card = view.decision.as_ref()?;
+    // Modal overlay, same geometry and three-region discipline as the
+    // permission panel: pinned header, scrollable position body, pinned
+    // focus/hint footer.
+    let modal = modal_frame(frame, DECISION_HEADER_ROWS, DECISION_FOOTER_ROWS);
+    frame.render_widget(
+        Paragraph::new(modal_header(
+            &card.header_text(),
+            modal.header.width,
+            modal.header.height,
+        )),
+        modal.header,
+    );
+    let (body, scroll, hidden) = decision_body(
+        card,
+        modal.body.width,
+        modal.body.height,
+        card.body_scroll.get(),
+        modal.compact,
+    );
+    card.body_scroll.set(scroll);
+    frame.render_widget(
+        Paragraph::new(body.as_str())
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll, 0)),
+        modal.body,
+    );
+    frame.render_widget(Paragraph::new(card.footer_text(hidden)), modal.footer);
+    // The stamp follows the question line: the body's first row. A clipped
+    // body or a body scrolled past that row showed no question, so the
+    // frame starts no consent window.
+    let body_visible = modal.body.intersection(area);
+    if body_visible.is_empty() || scroll != 0 {
+        None
+    } else {
+        Some(body_visible)
+    }
+}
+
+/// Stamps a decision card's first paint once its frame flushed. Both surfaces
+/// run this same stamp: the consent window runs from the first frame the
+/// operator could aim at, never from the card's creation.
+fn note_card_paint(view: &LocalView, card_inner: Option<ratatui::layout::Rect>) {
     if let (Some(card), Some(inner)) = (&view.decision, card_inner) {
         card.note_first_paint(inner);
     }
-    Ok(())
 }
 
 /// Paints the inline surface: new transcript rows are inserted above the
 /// pinned region so they land in the terminal's own scrollback, then the
-/// pinned status/dock/composer region is drawn at the cursor row. The
+/// pinned status/dock/composer region — with any open modal over it — is
+/// drawn at the cursor row, and the card's first paint is stamped. The
 /// `flushed` counter is the number of transcript rows already inserted.
 fn render_inline(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -1290,7 +1597,7 @@ fn render_inline(
     let flushed_from = (*flushed).min(view.transcript.len());
     let pending = view.transcript.get(flushed_from..).unwrap_or_default();
     if !pending.is_empty() {
-        let text = sanitize_status_cause(&pending.join("\n"));
+        let text = transcript_text(pending);
         let rows = wrapped_row_count(&text, width);
         terminal.insert_before(u16::try_from(rows).unwrap_or(u16::MAX), |buf| {
             Paragraph::new(text.as_str())
@@ -1299,13 +1606,20 @@ fn render_inline(
         })?;
         *flushed = view.transcript.len();
     }
-    terminal.draw(|frame| render_pinned(frame, view))?;
+    let mut card_inner = None;
+    terminal.draw(|frame| card_inner = render_pinned(frame, view))?;
+    note_card_paint(view, card_inner);
     Ok(())
 }
 
 /// The inline surface's pinned bottom region: status, status band, output
-/// status, the dock's task rows, the economy row and the composer.
-fn render_pinned(frame: &mut ratatui::Frame<'_>, view: &LocalView) {
+/// status, the dock's task rows, the economy row and the composer, with the
+/// modal layer over it. Returns the card's painted interior for the stamp the
+/// caller runs after the draw.
+fn render_pinned(
+    frame: &mut ratatui::Frame<'_>,
+    view: &LocalView,
+) -> Option<ratatui::layout::Rect> {
     let area = frame.area();
     let chunks = ratatui::layout::Layout::vertical([
         Constraint::Length(1),
@@ -1351,23 +1665,78 @@ fn render_pinned(frame: &mut ratatui::Frame<'_>, view: &LocalView) {
             chunks[4],
         );
     }
-    frame.render_widget(
-        Paragraph::new(format!("> {}", sanitize_status_cause(&view.composer))),
-        chunks[5],
-    );
+    frame.render_widget(Paragraph::new(composer_line(view)), chunks[5]);
+    paint_modals(frame, view)
+}
+
+/// One changed-line marker set for the append-only surface: what has been
+/// written already, so a repaint emits only the new rows and the lines whose
+/// text actually moved.
+#[derive(Debug, Default)]
+struct LinearPaint {
+    flushed: usize,
+    status: String,
+    dock: String,
+    composer: String,
+}
+
+/// Writes one plain line. Raw mode disables output post-processing, so the
+/// carriage return is explicit; no cursor is addressed.
+fn write_plain_line(out: &mut impl Write, line: &str) -> io::Result<()> {
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\r\n")?;
+    Ok(())
+}
+
+/// The append-only surface: every new transcript row and every changed
+/// status/dock/composer line is written exactly once, newline-terminated.
+/// No alternate screen is entered and no cursor is addressed, so a screen
+/// reader receives a linear stream instead of an in-place redraw.
+fn render_linear(view: &LocalView, paint: &mut LinearPaint) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    let flushed = paint.flushed.min(view.transcript.len());
+    for line in &view.transcript[flushed..] {
+        write_plain_line(&mut out, &sanitize_status_cause(line))?;
+    }
+    paint.flushed = view.transcript.len();
+    let status = sanitize_status_cause(&view.status);
+    if status != paint.status {
+        write_plain_line(&mut out, &status)?;
+        paint.status = status;
+    }
+    let mut dock_lines = dock_window(&view.dock);
+    if let Some(economy) = view.dock.last() {
+        dock_lines.push(sanitize_status_cause(economy));
+    }
+    let dock = dock_lines.join("\n");
+    if dock != paint.dock {
+        for line in &dock_lines {
+            write_plain_line(&mut out, line)?;
+        }
+        paint.dock = dock;
+    }
+    let composer = composer_line(view);
+    if composer != paint.composer {
+        write_plain_line(&mut out, &composer)?;
+        paint.composer = composer;
+    }
+    out.flush()
 }
 
 /// Paints whichever surface is active; the caller owns the transcript flush
-/// counter for the inline surface.
+/// counter for the inline surface and the append-only marker set for the
+/// linear one.
 fn paint(
     guard: &mut TerminalGuard,
     view: &LocalView,
     mode: RenderMode,
     flushed: &mut usize,
+    linear: &mut LinearPaint,
 ) -> io::Result<()> {
     match mode {
         RenderMode::Fullscreen => render(guard.terminal_mut(), view),
         RenderMode::Inline => render_inline(guard.terminal_mut(), view, flushed),
+        RenderMode::Linear => render_linear(view, linear),
     }
 }
 
@@ -1399,6 +1768,27 @@ fn output_status_line(output: &OutputStream, modal_open: bool) -> String {
         line.push_str(&format!(" · {OUTPUT_TRUNCATED_NOTE}"));
     }
     line
+}
+
+/// Whether the streaming output owns PageUp/PageDown: only while it is
+/// still producing. A settled stream keeps its text, but the keys fall
+/// through to the transcript so the reader can reach the rest of session.
+fn stream_owns_page_keys(output: &OutputStream) -> bool {
+    matches!(output.status(), OutputStatus::Streaming)
+}
+
+/// Advances a scroll cell by `rows` cells in either direction, saturating at
+/// both ends. One helper serves the streaming-output and transcript bodies,
+/// and the step is the region height the last render painted.
+fn scroll_by(cell: &Cell<u16>, down: bool, rows: u16) {
+    let rows = rows.max(1);
+    cell.update(|offset| {
+        if down {
+            offset.saturating_add(rows)
+        } else {
+            offset.saturating_sub(rows)
+        }
+    });
 }
 
 /// Largest offset that can still render rows of `text` inside a
@@ -2609,7 +2999,7 @@ pub fn handle_panel_key(
         // Esc cancels the prompt: stopped work stays visible, nothing is
         // granted (design-brief Pause/cancel state).
         KeyCode::Esc if view.panel.take().is_some() => {
-            view.transcript.push(PANEL_DENIED_NOTE.to_string());
+            view.push_transcript(PANEL_DENIED_NOTE.to_string());
         }
         _ => {}
     }
@@ -2625,10 +3015,10 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut StoreWriter<'_>) {
     if let Some(mut panel) = view.panel.take() {
         match panel.confirm() {
             PanelAction::Deny => {
-                view.transcript.push(PANEL_DENIED_NOTE.to_string());
+                view.push_transcript(PANEL_DENIED_NOTE.to_string());
             }
             PanelAction::AllowOnce => {
-                view.transcript.push(PANEL_ALLOWED_NOTE.to_string());
+                view.push_transcript(PANEL_ALLOWED_NOTE.to_string());
             }
             PanelAction::LimitedGrant => {
                 if !grant_id_is_key_safe(&panel.grant_id) {
@@ -2642,19 +3032,19 @@ fn confirm_panel_action(view: &mut LocalView, store: &mut StoreWriter<'_>) {
                 else {
                     panel.focus_deny();
                     view.panel = Some(panel);
-                    view.transcript.push(
+                    view.push_transcript(
                         "limited grant recording failed: scope is not valid unicode".to_string(),
                     );
                     return;
                 };
                 match store.record_preapproval(&scope, PANEL_GRANTOR, LIMIT_GRANT_TTL_SECONDS) {
                     Ok(()) => {
-                        view.transcript.push(PANEL_LIMITED_NOTE.to_string());
+                        view.push_transcript(PANEL_LIMITED_NOTE.to_string());
                     }
                     Err(source) => {
                         panel.focus_deny();
                         view.panel = Some(panel);
-                        view.transcript.push(format!(
+                        view.push_transcript(format!(
                             "limited grant recording failed: {}",
                             sanitize_status_cause(&source.to_string())
                         ));
@@ -2701,7 +3091,7 @@ pub fn handle_decision_event(
             if let Some(card) = view.decision.as_mut() {
                 if card.custom_editing {
                     if !card.push_draft(text) {
-                        view.transcript.push(DECISION_DRAFT_LIMIT_NOTE.to_string());
+                        view.push_transcript(DECISION_DRAFT_LIMIT_NOTE.to_string());
                     }
                 } else {
                     // A composer-aimed paste while the card owns input is
@@ -2728,11 +3118,11 @@ pub fn handle_decision_event(
             // silent truncate — lands the limit note instead.
             KeyCode::Enter if card.push_draft("\n") => {}
             KeyCode::Enter => {
-                view.transcript.push(DECISION_DRAFT_LIMIT_NOTE.to_string());
+                view.push_transcript(DECISION_DRAFT_LIMIT_NOTE.to_string());
             }
             KeyCode::Backspace => card.pop_grapheme(),
             KeyCode::Char(ch) if types_text(modifiers) && !card.push_draft(&ch.to_string()) => {
-                view.transcript.push(DECISION_DRAFT_LIMIT_NOTE.to_string());
+                view.push_transcript(DECISION_DRAFT_LIMIT_NOTE.to_string());
             }
             _ => {}
         }
@@ -2749,7 +3139,7 @@ pub fn handle_decision_event(
         KeyCode::Esc => {
             if let Some(card) = view.decision.take() {
                 view.decision_dismissed = Some(card.question.question_id);
-                view.transcript.push(DECISION_LEFT_NOTE.to_string());
+                view.push_transcript(DECISION_LEFT_NOTE.to_string());
             }
         }
         _ => {}
@@ -2771,7 +3161,7 @@ fn apply_decision_choice(view: &mut LocalView, rt: &mut Runtime, session_id: &Se
             let result = commit_answer(rt, session_id, &card, selection);
             paint_answer(view, result);
         }
-        DecisionCommit::Refused(line) => view.transcript.push(line),
+        DecisionCommit::Refused(line) => view.push_transcript(line),
         DecisionCommit::EditDraft => {
             if let Some(card) = view.decision.as_mut() {
                 card.set_custom_editing(true);
@@ -2862,13 +3252,13 @@ fn commit_answer(
 /// Paints one committed answer, on whichever thread holds the view.
 fn paint_answer(view: &mut LocalView, result: AnswerResult) {
     match result {
-        AnswerResult::Applied => view.transcript.push(DECISION_ANSWERED_NOTE.to_string()),
-        AnswerResult::Settled => view.transcript.push(DECISION_SETTLED_NOTE.to_string()),
-        AnswerResult::ResumeFailed(reason) => view.transcript.push(format!(
+        AnswerResult::Applied => view.push_transcript(DECISION_ANSWERED_NOTE.to_string()),
+        AnswerResult::Settled => view.push_transcript(DECISION_SETTLED_NOTE.to_string()),
+        AnswerResult::ResumeFailed(reason) => view.push_transcript(format!(
             "decision answer recorded; resume failed: {}",
             sanitize_status_cause(&reason)
         )),
-        AnswerResult::Denied(reason) => view.transcript.push(format!(
+        AnswerResult::Denied(reason) => view.push_transcript(format!(
             "decision answer denied: {}",
             sanitize_status_cause(&reason)
         )),
@@ -2942,8 +3332,21 @@ fn decision_body(
     width: u16,
     height: u16,
     offset: u16,
+    compact: bool,
 ) -> (String, u16, usize) {
     let (preamble, items) = card.body_parts();
+    if compact {
+        // The floor projection: the question line and the focused row are
+        // the two rows an answer needs, so a nine-row viewport shows them
+        // instead of scrolling the question out for a distant option. The
+        // hidden count still names the rows the window keeps out of sight.
+        let question = preamble.lines().next().unwrap_or_default();
+        let focused = items
+            .get(card.focus().min(items.len().saturating_sub(1)))
+            .map_or("", String::as_str);
+        let hidden = items.len().saturating_sub(1);
+        return (format!("{question}\n{focused}"), 0, hidden);
+    }
     let body_text = format!("{preamble}{}", items.join("\n"));
     let width = width.max(1);
     let mut spans = Vec::with_capacity(items.len());
@@ -3013,13 +3416,33 @@ fn types_text_altgr(modifiers: KeyModifiers) -> bool {
         || modifiers == (KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+/// Removes the last extended grapheme cluster from a draft, so a Backspace
+/// that dies mid-cluster cannot orphan a combining mark. The segmentation is
+/// the render path's own (`styled_graphemes`), which drops clusters that
+/// contain a control char, so a trailing control (the pasted `\n` a draft
+/// deliberately keeps) peels off by its own bytes; a `\r\n` tail is one
+/// cluster and dies together. Both the decision draft and the composer use
+/// this — one editor behavior, not two.
+fn pop_last_grapheme(text: &mut String) {
+    let remove = match text.chars().next_back() {
+        None => 0,
+        Some('\n') if text.chars().nth_back(1) == Some('\r') => 2,
+        Some(ch) if ch.is_control() => ch.len_utf8(),
+        Some(_) => Line::raw(text.as_str())
+            .styled_graphemes(Style::default())
+            .last()
+            .map_or(0, |grapheme| grapheme.symbol.len()),
+    };
+    text.truncate(text.len() - remove);
+}
+
 fn append_composer_char(view: &mut LocalView, ch: char) {
     // The typed goal must never exceed what create_task accepts; the wire
     // frame cap (REQUEST_MAX_BYTES) is far above this, so TEXT_MAX_BYTES is
     // the binding limit for composed goals.
     if view.composer.len().saturating_add(ch.len_utf8()) > TEXT_MAX_BYTES {
         if view.transcript.last().map(String::as_str) != Some(COMPOSER_LIMIT_MESSAGE) {
-            view.transcript.push(COMPOSER_LIMIT_MESSAGE.to_string());
+            view.push_transcript(COMPOSER_LIMIT_MESSAGE.to_string());
         }
         return;
     }
@@ -3053,15 +3476,15 @@ fn append_composer_paste(view: &mut LocalView, text: &str) {
 /// them — a verdict that must be resolved cannot ride stderr inside the
 /// alternate screen.
 fn surface_boot_diagnostics(view: &mut LocalView, runtime: &Runtime) {
-    view.transcript.extend_from_slice(&runtime.boot_diagnostics);
+    view.extend_transcript(&runtime.boot_diagnostics);
 }
 
 /// A failed open's carried verdicts join the transcript ahead of the
 /// error line itself: the operator reads what must be resolved on the
 /// same surface the TUI keeps painting.
 fn note_open_failure(view: &mut LocalView, failure: &TuiOpenError) {
-    view.transcript.extend_from_slice(&failure.boot_diagnostics);
-    view.transcript.push(format!(
+    view.extend_transcript(&failure.boot_diagnostics);
+    view.push_transcript(format!(
         "session open failed: {}",
         sanitize_status_cause(&failure_report(&failure.error).to_string())
     ));
@@ -3154,8 +3577,9 @@ fn status_band(view: &LocalView, width: usize) -> String {
 pub const TUI_CANCEL_PENDING: &str = "cancel requested; waiting for the in-flight send to settle";
 
 /// Painted while the send window is open: the answer is committed and the
-/// provider is still working, and input stays live.
-pub const TUI_SEND_PENDING: &str = "send in flight; input stays live";
+/// provider is still working. The card's navigation keys stay live; the
+/// composer row says its own input is paused.
+pub const TUI_SEND_PENDING: &str = "send in flight; card navigation stays live";
 
 /// Painted when the send worker died before handing the runtime back: the
 /// failure rides the status line, not a transcript row the decision card's
@@ -3359,24 +3783,29 @@ fn run_tui_command(
     let first = words.next();
     let second = words.next();
     if words.next().is_some() {
-        view.transcript.push(TUI_USAGE.to_string());
+        view.push_transcript(TUI_USAGE.to_string());
         return Ok(true);
     }
     match (first, second) {
-        (None, None) => view.transcript.push(format!(
+        (None, None) => view.push_transcript(format!(
             "tui: {}, mouse {}",
             guard.mode().label(),
             if guard.mouse() { "on" } else { "off" }
         )),
         (Some("fullscreen"), None) | (Some("inline"), None) => {
+            if guard.mode() == RenderMode::Linear {
+                // A screen reader gets one linear surface: switching to an
+                // in-place redraw would break the append-only contract.
+                view.push_transcript("tui: linear mode is fixed".to_string());
+                return Ok(true);
+            }
             let mode = if first == Some("inline") {
                 RenderMode::Inline
             } else {
                 RenderMode::Fullscreen
             };
             if guard.mode() == mode {
-                view.transcript
-                    .push(format!("tui: already {}", mode.label()));
+                view.push_transcript(format!("tui: already {}", mode.label()));
             } else {
                 guard.switch_mode(mode)?;
                 *render_mode = mode;
@@ -3386,17 +3815,20 @@ fn run_tui_command(
                     // region instead of only the rows added since last time.
                     *inline_flushed = 0;
                 }
-                view.transcript
-                    .push(format!("tui: switched to {}", mode.label()));
+                // A new surface starts at the tail: the offset described a
+                // body the previous surface painted, not this one.
+                view.transcript_scroll.set(0);
+                view.transcript_follow.set(true);
+                view.transcript_follow_bottom.set(0);
+                view.push_transcript(format!("tui: switched to {}", mode.label()));
             }
         }
         (Some("mouse"), Some("on")) | (Some("mouse"), Some("off")) => {
             let on = second == Some("on");
             guard.set_mouse(on)?;
-            view.transcript
-                .push(format!("tui: mouse {}", if on { "on" } else { "off" }));
+            view.push_transcript(format!("tui: mouse {}", if on { "on" } else { "off" }));
         }
-        _ => view.transcript.push(TUI_USAGE.to_string()),
+        _ => view.push_transcript(TUI_USAGE.to_string()),
     }
     Ok(true)
 }
@@ -3418,10 +3850,18 @@ const NOTHING_TO_REWIND: &str = "No task to preview yet; submit a task first.";
 fn reset_view_rows(view: &mut LocalView) {
     let fresh = initial_view();
     view.transcript = fresh.transcript;
+    // The cache describes rows that no longer exist; the revision bump
+    // rebuilds it on the next frame instead of painting the old text.
+    view.transcript_revision
+        .set(view.transcript_revision.get().wrapping_add(1));
     // The dock is a projection of `runtime.status`, refreshed by the loop,
     // so `/clear` does not blank it: live task state is not reading surface.
     view.output = fresh.output;
     view.output_scroll = fresh.output_scroll;
+    view.transcript_scroll = fresh.transcript_scroll;
+    view.transcript_follow = fresh.transcript_follow;
+    view.transcript_follow_bottom = fresh.transcript_follow_bottom;
+    view.transcript_page = fresh.transcript_page;
 }
 
 /// The runtime's own refusal message, when a dispatch fault is a rejected
@@ -3440,7 +3880,7 @@ fn rejection_message(error: &io::Error) -> Option<&str> {
 fn refusal_or_fault(view: &mut LocalView, command: &str, error: io::Error) -> io::Result<()> {
     match rejection_message(&error) {
         Some(cause) => {
-            view.transcript.push(format!("{command} refused: {cause}"));
+            view.push_transcript(format!("{command} refused: {cause}"));
             Ok(())
         }
         None => Err(error),
@@ -3449,9 +3889,9 @@ fn refusal_or_fault(view: &mut LocalView, command: &str, error: io::Error) -> io
 
 /// The loop's dispatch, handed the directory the TUI was started in: that
 /// root is the instruction scope discovery walks (AC-076), the same hand the
-/// headless entry makes, so both entries discover the same files. A working
-/// directory that cannot be read hands no root and discovers nothing — never
-/// a failed open.
+/// headless entry makes, so both entries discover the same files. DRIFT-003
+/// pins the literal hand per entry; `TuiDispatch::open` binds the same root
+/// for its own callers.
 fn open_dispatch(data_root: &Path) -> Result<TuiDispatch, TuiOpenError> {
     let mut dispatch = TuiDispatch::open(data_root)?;
     dispatch
@@ -3499,7 +3939,7 @@ fn run_composer_command(
     view.composer.clear();
     match input {
         "/help" => {
-            view.transcript.push(HELP_TEXT.to_string());
+            view.push_transcript(HELP_TEXT.to_string());
             Ok(())
         }
         // `/clear` is `/new`'s alias: both resolve to `session.new` in the
@@ -3523,7 +3963,7 @@ fn run_composer_command(
                     // The dock is a projection: the next beat paints it
                     // from the new session, so no read here can exit the
                     // TUI for a frame it is about to draw anyway.
-                    view.transcript.push(format!(
+                    view.push_transcript(format!(
                         "New conversation: {} (previous: {previous})",
                         dispatch.session_id
                     ));
@@ -3537,8 +3977,8 @@ fn run_composer_command(
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
             match dispatch.open_settings() {
                 Ok(lines) => {
-                    view.transcript.push("Settings:".to_string());
-                    view.transcript.extend(lines);
+                    view.push_transcript("Settings:".to_string());
+                    view.extend_transcript(&lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -3556,13 +3996,13 @@ fn run_composer_command(
                 .map(|warning| warning.task_id.clone())
                 .or_else(|| pending_task.clone());
             let Some(task) = task else {
-                view.transcript.push(NOTHING_TO_COMPACT.to_string());
+                view.push_transcript(NOTHING_TO_COMPACT.to_string());
                 return Ok(());
             };
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
             match dispatch.compact_context(&task) {
                 Ok((before, after, folded)) => {
-                    view.transcript.push(format!(
+                    view.push_transcript(format!(
                         "{CONTEXT_COMPACTED}: {before} → {after} bytes, {folded} records folded."
                     ));
                     Ok(())
@@ -3579,7 +4019,7 @@ fn run_composer_command(
             match dispatch.resume(argument) {
                 Ok((lines, pending)) => {
                     *pending_task = pending;
-                    view.transcript.extend(lines);
+                    view.extend_transcript(&lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -3602,12 +4042,12 @@ fn run_composer_command(
                 }
             };
             let Some(task) = task else {
-                view.transcript.push(NOTHING_TO_REWIND.to_string());
+                view.push_transcript(NOTHING_TO_REWIND.to_string());
                 return Ok(());
             };
             match dispatch.rewind_preview(&task) {
                 Ok(lines) => {
-                    view.transcript.extend(lines);
+                    view.extend_transcript(&lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -3617,7 +4057,7 @@ fn run_composer_command(
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
             match dispatch.permissions() {
                 Ok(lines) => {
-                    view.transcript.extend(lines);
+                    view.extend_transcript(&lines);
                     Ok(())
                 }
                 Err(error) => refusal_or_fault(view, input, error),
@@ -3631,7 +4071,7 @@ fn run_composer_command(
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
             match login_command(&mut dispatch.runtime, argument) {
                 Ok(lines) => {
-                    view.transcript.extend(lines);
+                    view.extend_transcript(&lines);
                     Ok(())
                 }
                 // A login refusal never echoes the composer input: the
@@ -3641,7 +4081,7 @@ fn run_composer_command(
             }
         }
         _ if input.starts_with('/') => {
-            view.transcript.push(COMPOSER_USAGE.to_string());
+            view.push_transcript(COMPOSER_USAGE.to_string());
             Ok(())
         }
         _ => {
@@ -3735,6 +4175,8 @@ where
     let mut render_mode = mode;
     // Transcript rows already inserted into the inline surface's scrollback.
     let mut inline_flushed = 0usize;
+    // The linear surface's append-only markers: rows and lines written.
+    let mut linear_paint = LinearPaint::default();
     // The last submitted task — the one a material fork can still open a
     // decision card for while its question stays pending.
     let mut pending_task: Option<TaskId> = None;
@@ -3798,7 +4240,7 @@ where
             };
             if moved {
                 view.decision = None;
-                view.transcript.push(DECISION_MOVED_NOTE.to_string());
+                view.push_transcript(DECISION_MOVED_NOTE.to_string());
             }
         } else if let Some(task_id) = pending_task.clone()
             && let Some(dispatch) = tui_dispatch.as_mut()
@@ -3817,7 +4259,13 @@ where
                 card_opened = true;
             }
         }
-        if let Err(error) = paint(&mut guard, &view, render_mode, &mut inline_flushed) {
+        if let Err(error) = paint(
+            &mut guard,
+            &view,
+            render_mode,
+            &mut inline_flushed,
+            &mut linear_paint,
+        ) {
             // A paint failure leaves through the loop's error path, but the
             // in-flight window must still be joined and its runtime released
             // here, on the loop's thread.
@@ -3830,17 +4278,19 @@ where
             // input that cannot have been aimed at the card must never
             // answer it (a blind Enter on focus 0) or dismiss it (a
             // blind Esc). Only input produced after the paint reaches
-            // the card. The drain is blind to event kind: a Paste the
-            // operator aimed at the composer dies here too — its text
-            // is lost with the rest of the pre-paint queue. The bound
-            // keeps a sustained byte flood from starving the loop; the
-            // consent floor below, not this drain, is the invariant
-            // that refuses unaimed Enter/Esc.
+            // the card. The drain refuses keys, but a Paste is draft text:
+            // it cannot commit or dismiss the card, so it is retained in the
+            // composer instead of being dropped with the rest of the
+            // pre-paint queue. The bound keeps a sustained byte flood from
+            // starving the loop; the consent floor below, not this drain, is
+            // the invariant that refuses unaimed Enter/Esc.
             for _ in 0..PRE_PAINT_DRAIN_CAP {
                 if !poll(Duration::ZERO)? {
                     break;
                 }
-                read()?;
+                if let TermEvent::Paste(text) = read()? {
+                    append_composer_paste(&mut view, &text);
+                }
             }
             // Test observation seam: the first frame is stamped and its
             // pre-paint queue is drained, so the order token this file
@@ -3970,7 +4420,7 @@ where
                             continue;
                         }
                         DecisionCommit::Refused(line) => {
-                            view.transcript.push(line);
+                            view.push_transcript(line);
                             continue;
                         }
                         DecisionCommit::EditDraft | DecisionCommit::Open => {}
@@ -4008,11 +4458,13 @@ where
                     }
                     // The surface toggle outside the composer: a draft in
                     // progress survives the switch because this key never
-                    // consumes it.
+                    // consumes it. The linear surface has no peer to toggle
+                    // to — an in-place redraw would break its contract.
                     (KeyCode::Char('t'), m)
                         if m.contains(KeyModifiers::CONTROL)
                             && view.panel.is_none()
-                            && view.decision.is_none() =>
+                            && view.decision.is_none()
+                            && render_mode != RenderMode::Linear =>
                     {
                         let mode = if render_mode == RenderMode::Fullscreen {
                             RenderMode::Inline
@@ -4024,8 +4476,10 @@ where
                         if mode == RenderMode::Inline {
                             inline_flushed = 0;
                         }
-                        view.transcript
-                            .push(format!("tui: switched to {}", mode.label()));
+                        view.transcript_scroll.set(0);
+                        view.transcript_follow.set(true);
+                        view.transcript_follow_bottom.set(0);
+                        view.push_transcript(format!("tui: switched to {}", mode.label()));
                     }
                     _ if view.panel.is_some() => {
                         // The modal owns the keys through the shared production
@@ -4047,15 +4501,39 @@ where
                         }
                     }
                     // Streaming output scroll: the reader keeps their place
-                    // while output updates in place (design-brief §3).
-                    (KeyCode::PageUp | KeyCode::PageDown, _) if view.output.is_active() => {
-                        view.output_scroll.update(|offset| {
-                            if code == KeyCode::PageDown {
-                                offset.saturating_add(1)
-                            } else {
-                                offset.saturating_sub(1)
-                            }
-                        });
+                    // while output updates in place (design-brief §3). A
+                    // settled stream keeps its text but no longer owns the
+                    // keys — otherwise its complete state would starve the
+                    // transcript paging for the rest of the session.
+                    (KeyCode::PageUp | KeyCode::PageDown, _)
+                        if stream_owns_page_keys(&view.output) =>
+                    {
+                        scroll_by(
+                            &view.output_scroll,
+                            code == KeyCode::PageDown,
+                            view.output_page.get(),
+                        );
+                    }
+                    // The transcript is the other scrollable body: with no
+                    // live stream the same keys page it by the painted
+                    // region height. Only the fullscreen surface paints a
+                    // transcript offset; the inline transcript lives in the
+                    // terminal's own scrollback.
+                    (KeyCode::PageUp | KeyCode::PageDown, _)
+                        if render_mode == RenderMode::Fullscreen =>
+                    {
+                        if code == KeyCode::PageUp {
+                            view.transcript_follow.set(false);
+                            scroll_by(&view.transcript_scroll, false, view.transcript_page.get());
+                        } else if view.transcript_scroll.get()
+                            >= view.transcript_follow_bottom.get()
+                        {
+                            // At the bottom, PageDown resumes tail-follow: the
+                            // next appended row arrives visible.
+                            view.transcript_follow.set(true);
+                        } else {
+                            scroll_by(&view.transcript_scroll, true, view.transcript_page.get());
+                        }
                     }
                     (KeyCode::Enter, _) if !view.composer.is_empty() => {
                         let input = view.composer.clone();
@@ -4079,15 +4557,36 @@ where
                     (KeyCode::Enter, _) => {}
                     (KeyCode::Char(ch), m) if types_text(m) => append_composer_char(&mut view, ch),
                     (KeyCode::Backspace, _) => {
-                        view.composer.pop();
+                        pop_last_grapheme(&mut view.composer);
                     }
                     _ => {}
                 },
                 // Bracketed paste is one atomic event: its text joins
-                // the composer draft. While a modal owns input it drops
-                // like the keys the modal swallows.
+                // the composer draft. While the permission panel owns
+                // input the write is refused and named, like every other
+                // refused append.
                 TermEvent::Paste(text) if view.panel.is_none() => {
                     append_composer_paste(&mut view, &text);
+                }
+                TermEvent::Paste(_) => {
+                    view.push_transcript(PANEL_PASTE_REFUSED_NOTE.to_string());
+                }
+                // Mouse capture is off by default; when the operator turns
+                // it on, the wheel scrolls the same region the page keys
+                // do. No click is advertised, so none is claimed.
+                TermEvent::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let down = mouse.kind == MouseEventKind::ScrollDown;
+                    if stream_owns_page_keys(&view.output) {
+                        scroll_by(&view.output_scroll, down, 1);
+                    } else if render_mode == RenderMode::Fullscreen {
+                        view.transcript_follow.set(false);
+                        scroll_by(&view.transcript_scroll, down, view.transcript_page.get());
+                    }
                 }
                 _ => {}
             }
@@ -4106,15 +4605,24 @@ where
                 view.decision = None;
                 paint_answer(&mut view, result);
                 // The in-flight label is a window fact, not a session one:
-                // the surface goes back to the status it carried before.
-                view.status = status_before_send
-                    .take()
-                    .unwrap_or_else(|| STATUS_DISCONNECTED.to_string());
+                // the surface returns to what the runtime now projects — a
+                // connection the send bound, else the status it carried
+                // before the label replaced it.
+                let bound = tui_dispatch
+                    .as_ref()
+                    .and_then(|dispatch| dispatch.runtime.broker.bound_profile());
+                view.status = status_after_send(bound, status_before_send.take());
                 if cancel_requested {
                     // The completion is a state change of its own; paint it
                     // once before the cancel takes effect so the operator
                     // sees the settled state, not the stale in-flight line.
-                    paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
+                    paint(
+                        &mut guard,
+                        &view,
+                        render_mode,
+                        &mut inline_flushed,
+                        &mut linear_paint,
+                    )?;
                     break;
                 }
             }
@@ -4129,9 +4637,15 @@ where
                 // hidden behind its `Clear` overlay for the exiting frame.
                 view.decision = None;
                 view.status = TUI_SEND_WINDOW_FAILED.to_string();
-                view.transcript.push(TUI_SEND_WINDOW_FAILED.to_string());
+                view.push_transcript(TUI_SEND_WINDOW_FAILED.to_string());
                 exit = 1;
-                paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
+                paint(
+                    &mut guard,
+                    &view,
+                    render_mode,
+                    &mut inline_flushed,
+                    &mut linear_paint,
+                )?;
                 break;
             }
             None => {}
@@ -4141,10 +4655,18 @@ where
     // runtime comes back and releases on this thread; the ledger already
     // settled it, so the wait changes no spend.
     close_window(&mut send_owner, &mut tui_dispatch);
-    if render_mode == RenderMode::Inline {
+    if matches!(render_mode, RenderMode::Inline | RenderMode::Linear) {
         // Insert whatever the last state change left unflushed before the
-        // pinned region is cleared, so the transcript stays in scrollback.
-        paint(&mut guard, &view, render_mode, &mut inline_flushed)?;
+        // pinned region is cleared, so the transcript stays in scrollback;
+        // the linear surface owns no pinned region and flushes the same rows
+        // as plain lines.
+        paint(
+            &mut guard,
+            &view,
+            render_mode,
+            &mut inline_flushed,
+            &mut linear_paint,
+        )?;
     }
     guard.restore()?;
     Ok(exit)
@@ -4205,17 +4727,20 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_CONSENT_DELAY,
-        DOCK_EMPTY, DecisionPanel, ECONOMY_PATH_MAX, ECONOMY_UNKNOWN_ROW, HELP_TEXT, LocalView,
-        LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream, TuiDispatch, TuiOpenError,
-        append_composer_char, append_composer_paste, dispatch_tui_request, elide_label, elide_path,
-        initial_view, note_open_failure, output_status_line, render, run_composer_command,
-        surface_boot_diagnostics, task_dock, types_text, types_text_altgr, wrapped_row_count,
+        CONTEXT_MEASURE_INTERVAL, ContextMeasureKey, ContextMeasurement, DECISION_COMPOSER_PAUSED,
+        DECISION_CONSENT_DELAY, DOCK_EMPTY, DecisionPanel, ECONOMY_PATH_MAX, ECONOMY_UNKNOWN_ROW,
+        HELP_TEXT, LocalView, LoopbackProvider, OUTPUT_SCROLL_HINT, OutputStream,
+        PANEL_COMPOSER_PAUSED, PermissionPanel, TuiDispatch, TuiOpenError, append_composer_char,
+        append_composer_paste, composer_line, dispatch_tui_request, elide_cells, elide_label,
+        elide_path, initial_view, note_open_failure, output_status_line, pop_last_grapheme, render,
+        run_composer_command, status_after_send, stream_owns_page_keys, surface_boot_diagnostics,
+        task_dock, types_text, types_text_altgr, wrapped_row_count,
     };
     use crate::contracts::{PAGE_MAX, Question, TEXT_MAX_BYTES, TaskId};
     use crate::providers::openai_login::DeviceEndpoints;
     use crate::providers::{CredentialStore, ProviderError, SecretRef, StoreKind};
     use crossterm::event::KeyModifiers;
+    use ratatui::buffer::CellWidth as _;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -4268,6 +4793,32 @@ mod tests {
         assert!(!measurement.answers(&key("task-1", None, false), taken));
         assert!(!measurement.answers(&key("task-1", Some(3), true), taken));
         assert!(!measurement.answers(&key("task-2", Some(3), false), taken));
+    }
+
+    /// The status after a send window names what the runtime now projects: a
+    /// bound connection, else the pre-send status; only a send that bound
+    /// nothing leaves the disconnected line.
+    #[test]
+    fn status_after_send_projects_the_bound_connection_and_profile() {
+        let bound = |connection: &str, profile: Option<&str>| {
+            Some(crate::model::ProfileBinding {
+                connection: connection.to_string(),
+                profile: profile.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            status_after_send(bound("local", None), None),
+            "Rivect · connected · local"
+        );
+        assert_eq!(
+            status_after_send(bound("local", Some("work")), None),
+            "Rivect · connected · profile work"
+        );
+        assert_eq!(
+            status_after_send(None, Some("pre-send status".to_string())),
+            "pre-send status"
+        );
+        assert_eq!(status_after_send(None, None), super::STATUS_DISCONNECTED);
     }
 
     /// Each expectation names the renderer's own break decisions, not a
@@ -4828,6 +5379,295 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The terminal's painted rows, joined as the screen a reader sees.
+    fn frame_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn transcript_follow_keeps_the_newest_row_visible() -> Result<(), Box<dyn std::error::Error>> {
+        let mut view = initial_view();
+        view.transcript = (0..60).map(|index| format!("row {index:02}")).collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        render(&mut terminal, &view)?;
+        let screen = frame_text(&terminal);
+        assert!(
+            screen.contains("row 59"),
+            "the tail is visible without a key: {screen}"
+        );
+        assert!(
+            !screen.contains("row 00"),
+            "a full transcript scrolls the head off, not the tail: {screen}"
+        );
+        // The pinned offset is the bottom the region height leaves, and the
+        // recorded page step is that same height — not a single row.
+        let page = view.transcript_page.get();
+        assert!(page > 1, "paging moves by the painted region: {page}");
+        assert_eq!(
+            view.transcript_scroll.get(),
+            60 - page,
+            "the followed offset is the wrapped bottom"
+        );
+        // An appended row lands on screen while the follow is held.
+        view.push_transcript("row new".to_string());
+        render(&mut terminal, &view)?;
+        let screen = frame_text(&terminal);
+        assert!(
+            screen.contains("row new"),
+            "an appended row arrives visible: {screen}"
+        );
+        // Paging holds the reader's window: a later append must not drag
+        // them back to the tail.
+        view.transcript_follow.set(false);
+        view.transcript_scroll.set(0);
+        render(&mut terminal, &view)?;
+        let paged = frame_text(&terminal);
+        assert!(
+            paged.contains("row 00"),
+            "the paged view is the head: {paged}"
+        );
+        view.push_transcript("row later".to_string());
+        render(&mut terminal, &view)?;
+        let held = frame_text(&terminal);
+        assert!(
+            held.contains("row 00") && !held.contains("row later"),
+            "a held offset keeps its window: {held}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transcript_projection_cache_rebuilds_only_on_a_new_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut view = initial_view();
+        view.transcript = (0..30).map(|index| format!("row {index:02}")).collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        render(&mut terminal, &view)?;
+        let painted = frame_text(&terminal);
+        // The second frame reuses the cached projection and paints the same
+        // bytes; the cache is a cost, never a change in output.
+        render(&mut terminal, &view)?;
+        assert_eq!(
+            painted,
+            frame_text(&terminal),
+            "the cached frame renders identical bytes"
+        );
+        let (first_text, first_rows) = view.transcript_projection(80);
+        let (again_text, again_rows) = view.transcript_projection(80);
+        assert_eq!(first_text, again_text, "the cached text is identical");
+        assert_eq!(first_rows, again_rows, "the cached wrap is identical");
+        view.push_transcript("cache tail marker".to_string());
+        let (text, rows) = view.transcript_projection(80);
+        assert!(
+            text.contains("cache tail marker"),
+            "a new row invalidates the cache: {text}"
+        );
+        assert!(rows > first_rows, "the wrapped bound grew with the row");
+        render(&mut terminal, &view)?;
+        assert!(
+            frame_text(&terminal).contains("cache tail marker"),
+            "the next frame paints the new row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_render_paints_the_streams_own_sanitized_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut view = initial_view();
+        view.output.push_chunk(b"ok\x1b]52;c;evil\x07tail\n");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        render(&mut terminal, &view)?;
+        let screen = frame_text(&terminal);
+        assert!(
+            screen.contains("ok^[]52;c;evil^Gtail"),
+            "the stream's own sanitized text is painted verbatim: {screen}"
+        );
+        assert!(
+            !screen.contains('\u{1b}'),
+            "no control introducer reaches the frame: {screen:?}"
+        );
+        render(&mut terminal, &view)?;
+        assert_eq!(
+            screen,
+            frame_text(&terminal),
+            "re-rendering a settled stream paints identical bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_streaming_output_owns_the_page_keys() {
+        let mut output = OutputStream::new();
+        assert!(stream_owns_page_keys(&output), "a new stream owns the keys");
+        output.push_chunk(b"row\n");
+        assert!(
+            stream_owns_page_keys(&output),
+            "a live stream owns the keys"
+        );
+        output.settle(crate::resources::OutputSettlement::Complete);
+        assert!(
+            !stream_owns_page_keys(&output),
+            "a settled stream must not starve transcript paging"
+        );
+        let mut failed = OutputStream::new();
+        failed.push_chunk(b"row\n");
+        failed.settle(crate::resources::OutputSettlement::Failed {
+            cause: "connection lost".to_string(),
+        });
+        assert!(!stream_owns_page_keys(&failed));
+    }
+
+    #[test]
+    fn inline_card_floor_paints_the_question_and_the_focused_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut view = initial_view();
+        view.decision = Some(DecisionPanel::new(Question::fixture(
+            &TaskId("task-1".to_string()),
+            1,
+        )));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 9))?;
+        render(&mut terminal, &view)?;
+        let screen = frame_text(&terminal);
+        assert!(
+            screen.contains("awaiting decision"),
+            "the collapsed header names the state: {screen}"
+        );
+        assert!(
+            screen.contains("question: "),
+            "the body pins the question line: {screen}"
+        );
+        assert!(
+            screen.contains("> 1."),
+            "the body pins the focused row: {screen}"
+        );
+        assert!(
+            screen.contains("focus 1/6"),
+            "the footer keeps its focus counter: {screen}"
+        );
+        let card = view.decision.as_ref().ok_or("the card is open")?;
+        assert!(
+            card.first_painted_at.get().is_some(),
+            "a visible question line starts the consent window"
+        );
+        Ok(())
+    }
+
+    /// The awaiting-permission seed the review entry owns: the only exempt
+    /// way a test may hold a panel (DEC-017 bans the constructor outside
+    /// `src/ui/review.rs`, tests included).
+    fn seeded_panel() -> Result<PermissionPanel, Box<dyn std::error::Error>> {
+        crate::ui::review::ReviewState::view("awaiting-permission")
+            .and_then(|view| view.panel)
+            .ok_or_else(|| "the review seed carries a permission panel".into())
+    }
+
+    #[test]
+    fn inline_panel_pins_actions_and_marks_the_collapsed_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut panel = seeded_panel()?;
+        panel.scope = "/inline/floor/scope".to_string();
+        let mut view = initial_view();
+        view.panel = Some(panel);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 9))?;
+        render(&mut terminal, &view)?;
+        let screen = frame_text(&terminal);
+        assert!(
+            screen.contains("awaiting permission"),
+            "the mandatory naming line survives: {screen}"
+        );
+        assert!(
+            screen.contains('…'),
+            "a collapsed header carries a visible truncation marker: {screen}"
+        );
+        assert!(
+            screen.contains("[deny]"),
+            "the actions line is pinned above the header: {screen}"
+        );
+        assert!(
+            screen.contains("Enter confirms"),
+            "the hint footer is pinned: {screen}"
+        );
+        assert!(
+            screen.contains("scope: /inline/floor/scope"),
+            "the body keeps its scrollable scope: {screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn panel_header_elides_a_long_value_with_a_marker() -> Result<(), Box<dyn std::error::Error>> {
+        let mut panel = seeded_panel()?;
+        panel.initiator = "task-".to_string() + &"long-initiator-".repeat(8);
+        let header = panel.header_text();
+        let line = header
+            .lines()
+            .find(|line| line.starts_with("initiator: "))
+            .ok_or("the initiator line exists")?;
+        let elided = elide_cells(line, 58);
+        assert!(
+            elided.ends_with('…') && elided.cell_width() <= 58,
+            "the elided line keeps the marker inside the width: {elided}"
+        );
+        assert!(
+            elided.starts_with("initiator: "),
+            "the field name survives elision: {elided}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composer_row_pauses_while_a_modal_owns_input() -> Result<(), Box<dyn std::error::Error>> {
+        let mut view = initial_view();
+        view.composer = "typed draft".to_string();
+        assert!(
+            composer_line(&view).contains("typed draft"),
+            "the idle composer paints its draft"
+        );
+        view.decision = Some(DecisionPanel::new(Question::fixture(
+            &TaskId("task-1".to_string()),
+            1,
+        )));
+        assert!(
+            composer_line(&view).contains(DECISION_COMPOSER_PAUSED),
+            "the card's composer row states the pause"
+        );
+        view.decision = None;
+        view.panel = Some(seeded_panel()?);
+        assert!(
+            composer_line(&view).contains(PANEL_COMPOSER_PAUSED),
+            "the panel's composer row states the pause"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composer_backspace_peels_one_grapheme_cluster() {
+        let mut combining = "a\u{0301}e\u{0301}".to_string();
+        pop_last_grapheme(&mut combining);
+        assert_eq!(combining, "a\u{0301}", "a combining cluster dies whole");
+        let mut family = "👩\u{200d}👩\u{200d}👧".to_string();
+        pop_last_grapheme(&mut family);
+        assert_eq!(
+            family, "",
+            "a ZWJ family is one grapheme cluster and dies whole"
+        );
+        let mut trailing = "ok👩\u{200d}👩\u{200d}👧".to_string();
+        pop_last_grapheme(&mut trailing);
+        assert_eq!(trailing, "ok", "the cluster before it stays intact");
     }
 
     #[test]
@@ -7396,6 +8236,19 @@ fallback = { mode = \"off\" }\n";
             !squashed(&settled).contains("send in flight"),
             "the in-flight label is cleared once the window closes: {settled}"
         );
+        // The send bound a connection, so the settled frame projects it on
+        // the status line instead of falling back to the disconnected text.
+        // The reconstructed screen blanks non-ASCII glyphs, so the `·`
+        // separators read as gaps: the assertion names the words, not the
+        // exact spacing.
+        let status_row = squashed(settled.lines().next().unwrap_or_default());
+        assert!(
+            status_row.contains("Rivect")
+                && status_row.contains("connected")
+                && !status_row.contains("not connected")
+                && status_row.contains("local"),
+            "the settled frame projects the bound connection: {settled}"
+        );
 
         // The window closes, the cancel takes effect, and the ledger settled
         // the cancelled send exactly once.
@@ -7576,6 +8429,13 @@ fallback = { mode = \"off\" }\n";
         assert!(
             visible.contains("decision answer recorded"),
             "Enter commits through the shared answer seam: {visible}"
+        );
+        // The send bound no connection (this leg never prepares a context),
+        // so the window restores the pre-send status instead of naming one.
+        let status_row = squashed(visible.lines().next().unwrap_or_default());
+        assert!(
+            status_row.starts_with("Rivect not connected"),
+            "a send that bound nothing keeps the pre-send status: {visible}"
         );
 
         press(&mut driver.pty, b"\x1b");
@@ -8932,6 +9792,92 @@ fallback = { mode = \"off\" }\n";
             "unanswered",
             secs(30),
         ));
+        press(&mut driver.pty, b"\x1b");
+        expect_exit(&mut driver, secs(30));
+        let (outcome, store) = driver.exited();
+        assert_eq!(outcome, json!({ "exit": 0 }));
+        assert!(
+            must(store.current_question(&question.task_id), "current").is_some(),
+            "the question is still pending after Esc"
+        );
+        drop(store);
+        teardown(driver);
+    }
+
+    #[test]
+    fn pty_paste_queued_before_the_card_paint_is_retained_in_the_composer() {
+        let mut driver = must(
+            CardDriver::spawn(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &[]),
+            "card spawn",
+        );
+        assert!(
+            seen(&mut driver.pty, b"\x1b[?1049h", secs(30)),
+            "alternate screen must be entered on start"
+        );
+        submit_task(
+            &mut driver,
+            DECISION_PTY_ROWS as u16,
+            DECISION_PTY_COLS as u16,
+            "pick a rollout lane",
+        );
+        let visible = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "Submitted task:",
+            secs(30),
+        );
+        assert!(
+            visible.contains("Submitted task:"),
+            "the task receipt renders: {visible}"
+        );
+
+        // The child holds its pass until the paste is queued, so the paste
+        // lands before the card's first paint and the opening drain sees it.
+        must(driver.command("hold"), "the child holds its pass");
+        press(&mut driver.pty, b"\x1b[200~queued before paint\x1b[201~");
+        let question = driver.publish();
+        let opened = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "focus 1/6",
+            secs(30),
+        );
+        assert!(
+            opened.contains("focus 1/6"),
+            "the card paints over the queued paste: {opened}"
+        );
+        let report = driver.report();
+        assert!(
+            report.current.is_some(),
+            "a pre-paint paste never answers the unseen question"
+        );
+        assert!(
+            report.attempts.is_empty(),
+            "a pre-paint paste journals nothing"
+        );
+
+        // Past the barrier and the consent floor, Esc dismisses the card and
+        // the retained draft appears on the composer row: the drain kept the
+        // text instead of dropping it with the unaimed keys.
+        assert!(
+            await_paint_barrier(&mut driver, secs(10)),
+            "the opening card reports its post-drain barrier"
+        );
+        pause(&mut driver.pty, DECISION_CONSENT_DELAY);
+        press(&mut driver.pty, b"\x1b");
+        let after = screen(
+            &driver.pty,
+            DECISION_PTY_ROWS,
+            DECISION_PTY_COLS,
+            "queued before paint",
+            secs(30),
+        );
+        assert!(
+            squashed(&after).contains("queued before paint"),
+            "the pre-paint paste is retained in the composer: {after}"
+        );
         press(&mut driver.pty, b"\x1b");
         expect_exit(&mut driver, secs(30));
         let (outcome, store) = driver.exited();

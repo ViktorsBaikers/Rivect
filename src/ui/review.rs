@@ -46,6 +46,9 @@ impl ReviewState {
     #[must_use]
     pub fn view(state: &str) -> Option<LocalView> {
         Some(match state {
+            // Both start ids name the same production frame: the runtime
+            // projects no project or index fact, so the design brief's two
+            // states share one seeded view.
             "start-no-connection" => initial_view(),
             "no-project-index" => initial_view(),
             "ready-for-input" => {
@@ -85,6 +88,11 @@ impl ReviewState {
                 view
             }
             "awaiting-permission" => {
+                // Renderer-only: no production approval/decision path opens
+                // the panel (the Ask verdict carries no class or target); the
+                // sole constructor is the passive `--ui-review` renderer,
+                // here — DEC-017. The frame proves the renderer paints the
+                // state, never a production open.
                 let mut view = initial_view();
                 let scope = format!(
                     "{}/workflow-scope/deep/nested/directory-tree/permission-grant-boundary-with-a-deliberately-long-tail-suffix",
@@ -166,9 +174,9 @@ impl ReviewState {
                 view
             }
             "success" => {
+                // Completion shows as the dock lifecycle row only: the
+                // production renderer has no completion transcript line.
                 let mut view = initial_view();
-                view.transcript
-                    .push("Success: 3 criteria verified; 1 limitation remains".to_string());
                 view.dock = task_dock(&status_with_tasks(
                     &[("task-1", "completed", None)],
                     Value::Null,

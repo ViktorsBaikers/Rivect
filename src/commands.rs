@@ -2428,6 +2428,10 @@ enum RequestError {
     LoginStateMismatch,
     #[error("parameter {name} has the wrong type")]
     InvalidParameter { name: &'static str },
+    #[error("docs.status question must be an object with package, installed and root")]
+    InvalidQuestion,
+    #[error("docs.status question.{field} must be a non-empty string")]
+    InvalidQuestionField { field: &'static str },
     #[error("support bundle exceeds {limit} bytes")]
     SupportBundleTooLarge { limit: usize },
     #[error(transparent)]
@@ -4153,41 +4157,84 @@ const SUPPORT_REASON_SECRET: &str = "secret_local_only";
 /// whole session store.
 const SUPPORT_BUNDLE_MAX_BYTES: usize = 65_536;
 
+/// The snake_case spelling of one JSON key: `apiKey`, `api-key` and
+/// `api_key` name the same field, so the closed reason list matches every
+/// wire spelling a dialect uses.
+fn support_key_spelling(key: &str) -> String {
+    let mut normalized = String::with_capacity(key.len() + 4);
+    let mut after_lowercase = false;
+    for character in key.chars() {
+        if character == '-' {
+            normalized.push('_');
+            after_lowercase = false;
+        } else if character.is_ascii_uppercase() {
+            if after_lowercase {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            after_lowercase = false;
+        } else {
+            normalized.push(character.to_ascii_lowercase());
+            after_lowercase = character.is_ascii_lowercase() || character.is_ascii_digit();
+        }
+    }
+    normalized
+}
+
 /// The fixed reason code one provider-bound or credential-bearing field is
 /// replaced with; the key set is closed, so unrelated data rides unchanged.
 fn support_reason_code(key: &str) -> Option<&'static str> {
-    let normalized = key.to_ascii_lowercase().replace('-', "_");
-    match normalized.as_str() {
-        "thinking" | "reasoning_content" | "thought_signature" | "thoughtsignature" => {
-            Some(SUPPORT_REASON_REASONING)
-        }
+    match support_key_spelling(key).as_str() {
+        "thinking" | "reasoning" | "reasoning_content" | "reasoning_text" | "reasoning_details"
+        | "thought_signature" | "thoughtsignature" => Some(SUPPORT_REASON_REASONING),
         "signature" => Some(SUPPORT_REASON_SIGNATURE),
         "encrypted_content" => Some(SUPPORT_REASON_ENCRYPTED),
         "api_key"
+        | "apikey"
         | "x_api_key"
+        | "x_goog_api_key"
         | "cf_aig_authorization"
         | "x_amz_security_token"
         | "authorization"
         | "access_token"
         | "refresh_token"
+        | "id_token"
+        | "bearer_token"
+        | "access_key_id"
+        | "secret_access_key"
+        | "session_token"
+        | "private_key"
         | "client_secret"
         | "secret"
+        | "secret_key"
         | "password"
         | "token" => Some(SUPPORT_REASON_SECRET),
         _ => None,
     }
 }
 
+/// Whether one object is provider-bound reasoning material as a whole: each
+/// dialect's block type names reasoning, so the whole block is replaced and
+/// no member of it (summary, signature, encrypted payload) survives. Gemini
+/// marks a thought part with `thought: true` and GitLab names its reasoning
+/// entries by `message_sub_type`, so both are read as whole blocks too.
+fn support_reasoning_block(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("reasoning" | "thinking" | "redacted_thinking" | "reasoning_text" | "summary_text")
+    ) || value.get("thought").and_then(Value::as_bool) == Some(true)
+        || value.get("message_sub_type").and_then(Value::as_str) == Some("reasoning")
+}
+
 /// Replaces every provider-bound reasoning artifact and credential value in
 /// `value` with its fixed reason code, counting each replacement. A matching
 /// key replaces its whole value whatever the JSON type — an array of header
-/// values is still header material — and header keys match case-insensitively
-/// across `-`/`_` spellings. A `redacted_thinking` block is reasoning material
-/// as a whole, so the entire block is replaced rather than one member.
+/// values is still header material — and keys match case-insensitively
+/// across `-`, `_` and camelCase spellings. A typed reasoning block is
+/// reasoning material as a whole, so the entire block is replaced rather
+/// than one member.
 fn redact_support_value(value: &mut Value, replacements: &mut BTreeMap<&'static str, u64>) {
-    if let Value::Object(fields) = value
-        && fields.get("type").and_then(Value::as_str) == Some("redacted_thinking")
-    {
+    if support_reasoning_block(value) {
         *value = Value::String(SUPPORT_REASON_REASONING.to_string());
         *replacements.entry(SUPPORT_REASON_REASONING).or_insert(0) += 1;
         return;
@@ -4781,14 +4828,67 @@ fn harness_control(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
     )
 }
 
+/// One field of a docs question: only a non-empty string names a snapshot
+/// coordinate, so a blank or mistyped field is the caller's typed refusal.
+fn docs_question_field<'a>(
+    question: &'a Value,
+    field: &'static str,
+) -> Result<&'a str, RequestError> {
+    question
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(RequestError::InvalidQuestionField { field })
+}
+
 /// `docs.status`: the documentation owner's declared source, version policy,
 /// cache bounds and honest account facts. A pure read — no external refresh,
 /// and a quota this build cannot observe stays `unknown` instead of zero.
+/// A caller may add a `question` naming an on-disk direct-source snapshot; the
+/// typed answer rides beside the unchanged status fields and never mutates the
+/// cache, reads a credential or reaches the wire.
 fn docs_status(id: Value, params: &Value) -> RpcResponse {
     let Some(_session) = session_param(params) else {
         return missing_session(id);
     };
-    RpcResponse::ok(id, json!(crate::docs::status()))
+    let Some(question) = params.get("question") else {
+        return RpcResponse::ok(id, json!(crate::docs::status()));
+    };
+    if !question.is_object() {
+        return request_error(id, RequestError::InvalidQuestion);
+    }
+    let package = match docs_question_field(question, "package") {
+        Ok(package) => package,
+        Err(error) => return request_error(id, error),
+    };
+    let installed = match docs_question_field(question, "installed") {
+        Ok(installed) => installed,
+        Err(error) => return request_error(id, error),
+    };
+    let root = match docs_question_field(question, "root") {
+        Ok(root) => root,
+        Err(error) => return request_error(id, error),
+    };
+    let answer = match crate::docs::DirectSource::new(Path::new(root)).retrieve(package, installed)
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let class = error.code();
+            let rpc = match class {
+                ErrorCode::InvalidInput => -32602,
+                _ => -32000,
+            };
+            return envelope_error(id, class, rpc, &error.to_string());
+        }
+    };
+    let Ok(mut result) = serde_json::to_value(crate::docs::status()) else {
+        return request_error(id, RequestError::Serialization);
+    };
+    let Some(object) = result.as_object_mut() else {
+        return request_error(id, RequestError::Serialization);
+    };
+    object.insert("answer".to_string(), json!(answer));
+    RpcResponse::ok(id, result)
 }
 
 /// `read_file`: the catalog's `read` alias resolving to the admitted tool. The

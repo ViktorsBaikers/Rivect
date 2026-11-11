@@ -4621,6 +4621,7 @@ impl ChatCompletionsProvider {
             tool_calls,
             usage,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 
@@ -4651,8 +4652,12 @@ impl ChatCompletionsProvider {
             // — and a usage object that withholds a counter is a wire
             // violation, not an estimate the peer never charged.
             (Some(prompt_tokens), Some(completion_tokens), Some(total_tokens)) => {
+                // Cached prompt tokens are a subset of `prompt_tokens` in
+                // this dialect, so the prompt leg is uncached input only.
+                // shortcut: dialect semantics normalized at the adapter; revisit if a provider changes the inclusion rule
+                let uncached = prompt_tokens.saturating_sub(cache_read.unwrap_or(0));
                 Ok(UsageDelta::from_reported(
-                    prompt_tokens,
+                    uncached,
                     completion_tokens,
                     total_tokens,
                     reasoning,

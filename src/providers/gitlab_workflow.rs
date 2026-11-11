@@ -1038,6 +1038,7 @@ impl Provider for GitlabWorkflowProvider {
                         tool_calls: Vec::new(),
                         usage: UsageDelta::Unknown,
                         wire_retries: sockets.saturating_sub(1),
+                        dropped_reasoning: 0,
                     });
                 }
                 SocketEnd::Action(tool) => {
@@ -1046,6 +1047,7 @@ impl Provider for GitlabWorkflowProvider {
                         tool_calls: vec![tool],
                         usage: UsageDelta::Unknown,
                         wire_retries: sockets.saturating_sub(1),
+                        dropped_reasoning: 0,
                     });
                 }
                 SocketEnd::Idle => {

@@ -374,7 +374,7 @@ pub const CATALOG: &[CatalogRow] = &[
         aliases: &[],
         description: "paint the terminal surface in fullscreen or inline mode",
         busy_policy: BUSY_READ,
-        carrier: Carrier::Cli("rivect --tui fullscreen|inline"),
+        carrier: Carrier::Cli("rivect --tui <fullscreen|inline> or rivect --linear"),
         unavailable: None,
     },
 ];
@@ -551,26 +551,41 @@ pub fn describe() -> Page<CommandDescriptor> {
     Page::new(items, 0)
 }
 
-/// The page as help lines. Every word is the page's own, so a row the page
-/// does not carry cannot appear in the text.
+/// The help body: the run flags with their precedence, then the page as help
+/// lines. Every command word is the page's own, so a row the page does not
+/// carry cannot appear in the text.
 #[must_use]
 pub fn help_lines(page: &Page<CommandDescriptor>) -> Vec<String> {
-    page.items
-        .iter()
-        .map(|item| {
-            let aliases = item.aliases.join(", ");
-            match &item.unavailability_reason {
-                Some(reason) => format!(
-                    "  {:<20} {:<16} {} (unavailable: {reason})",
-                    item.canonical_id, aliases, item.description
-                ),
-                None => format!(
-                    "  {:<20} {:<16} {}",
-                    item.canonical_id, aliases, item.description
-                ),
-            }
-        })
-        .collect()
+    let mut lines = vec![
+        "flags:".to_string(),
+        "  --tui fullscreen|inline  terminal surface: fullscreen is the default, inline keeps scrollback"
+            .to_string(),
+        "  --linear                 append-only screen-reader surface; the last of --tui/--linear wins"
+            .to_string(),
+        "  --no-mouse               mouse capture is off by default; this flag states that explicitly"
+            .to_string(),
+        "  --headless               run the JSON-RPC loop even on a terminal".to_string(),
+        "  --data-root PATH         private data root (default $RIVECT_DATA_ROOT, else $HOME/.rivect)"
+            .to_string(),
+        "  --ui-review <state>      render one seeded review state on a terminal".to_string(),
+        "RIVECT_LINEAR=1 sets the default surface only when no --tui or --linear flag is given"
+            .to_string(),
+        "commands:".to_string(),
+    ];
+    lines.extend(page.items.iter().map(|item| {
+        let aliases = item.aliases.join(", ");
+        match &item.unavailability_reason {
+            Some(reason) => format!(
+                "  {:<20} {:<16} {} (unavailable: {reason})",
+                item.canonical_id, aliases, item.description
+            ),
+            None => format!(
+                "  {:<20} {:<16} {}",
+                item.canonical_id, aliases, item.description
+            ),
+        }
+    }));
+    lines
 }
 
 /// The words a completion script offers: every row's canonical id and every

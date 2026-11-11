@@ -268,6 +268,11 @@ pub struct ProviderReply {
     /// its first leg's usage is unknown, never zero — so the settlement
     /// carries the count instead of opening a second attempt.
     pub wire_retries: u32,
+    /// How many replayed thinking blocks this physical send's peer reported
+    /// dropping (AC-046): the Messages codec's per-send delta, never the
+    /// cumulative counter and never provider text. The broker records it as
+    /// durable evidence; the send itself succeeded.
+    pub dropped_reasoning: u64,
 }
 
 /// A transport failure's programmatic class, independent of diagnostic text.
@@ -2115,12 +2120,14 @@ impl Provider for LoopbackProvider {
                 }],
                 usage: UsageDelta::Unknown,
                 wire_retries: 0,
+                dropped_reasoning: 0,
             }),
             None => Ok(ProviderReply {
                 text: WAITING_FOR_DECISION.to_string(),
                 tool_calls: Vec::new(),
                 usage: UsageDelta::Unknown,
                 wire_retries: 0,
+                dropped_reasoning: 0,
             }),
         }
     }
@@ -2719,6 +2726,34 @@ pub(crate) fn wire_body(connection: &str, body: &Value) -> Result<Vec<u8>, Provi
         });
     }
     Ok(body_bytes)
+}
+
+/// How many conversation lineages one adapter retains across distinct
+/// worlds and purposes: replay state is disposable, so a long-lived process
+/// never accumulates every displaced epoch it ever saw.
+pub(crate) const LINEAGE_EPOCH_LIMIT: usize = 16;
+
+/// Retires every epoch of one conversation except `key`: a conversation
+/// replays only the state its current epoch committed, so a displaced epoch
+/// must not answer a later send.
+pub(crate) fn retire_displaced_epochs<V>(
+    epochs: &mut BTreeMap<(String, String, String), V>,
+    key: &(String, String, String),
+) {
+    epochs.retain(|held, _| held.0 != key.0 || held.1 != key.1);
+}
+
+/// Records one committed epoch's replay state: the conversation's older
+/// epochs are displaced and the lowest-keyed conversation is dropped past
+/// the cap. An evicted epoch replays nothing — a miss, never stale bytes.
+pub(crate) fn retain_lineage_epoch<V>(
+    epochs: &mut BTreeMap<(String, String, String), V>,
+    key: (String, String, String),
+    value: V,
+) {
+    retire_displaced_epochs(epochs, &key);
+    epochs.insert(key, value);
+    while epochs.len() > LINEAGE_EPOCH_LIMIT && epochs.pop_first().is_some() {}
 }
 
 pub(crate) fn transport(connection: &str, err: reqwest::Error) -> ProviderError {

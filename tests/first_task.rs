@@ -97,6 +97,7 @@ impl Provider for NoToolProvider {
             tool_calls: Vec::new(),
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }
@@ -3885,16 +3886,27 @@ fn new_requires_an_idle_session_p8() {
         .expect("read the conversation /new leaves");
     drop(conn);
 
-    // The painted line is wider than the panel, so the switch is named by
-    // the conversation it left: the head of that id fits on the row.
+    // The painted line wraps after `(previous:`, so the switch is named by
+    // the conversation it left on the row below: the head of that id must
+    // still be visible there. The first served `/new` already painted one
+    // wrapped marker, so the wait needs the second one.
     let left_behind = previous.get(..8).unwrap_or(previous.as_str());
-    let served = format!("(previous: {left_behind}");
     pty.send(b"/new\r").expect("pty send");
-    let visible =
-        wait_for_visible_tui_text(&pty, &served, Duration::from_secs(10)).expect("pty screen");
+    let visible = wait_for_repeated_tui_text(&pty, "(previous:", 2, Duration::from_secs(10))
+        .expect("pty screen");
+    let rows: Vec<&str> = visible.lines().collect();
+    let marker = rows
+        .iter()
+        .rposition(|row| row.contains("(previous:"))
+        .expect("the switch names the conversation it left");
     assert!(
-        visible.contains(&served),
-        "a blocked task does not hold the session: {visible:?}"
+        rows.get(marker + 1)
+            .is_some_and(|row| row.contains(left_behind)),
+        "the previous conversation's head is visible below the wrapped marker: {visible:?}"
+    );
+    assert!(
+        !visible.contains(&format!("(previous: {left_behind}")),
+        "the pinned projection is the wrapped two-line form: {visible:?}"
     );
 
     let conn = rusqlite::Connection::open(&db_path).expect("open TUI runtime database");
@@ -5701,6 +5713,7 @@ impl Provider for StartTargetProvider {
             }],
             usage: UsageDelta::Unknown,
             wire_retries: 0,
+            dropped_reasoning: 0,
         })
     }
 }

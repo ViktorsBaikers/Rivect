@@ -495,7 +495,9 @@ pub fn write_profile(scope_root: &Path) -> Result<String, WorkerError> {
 }
 
 /// Seatbelt profile that admits process execution only inside the granted
-/// scope; everything outside is denied by the kernel.
+/// scope plus the literal `/dev/null` read/write a native program opens
+/// before its main; every other path outside the scope is denied by the
+/// kernel.
 ///
 /// # Errors
 /// Returns [`WorkerError::ScopeRootUnavailable`] when the scope root cannot
@@ -503,7 +505,7 @@ pub fn write_profile(scope_root: &Path) -> Result<String, WorkerError> {
 pub fn exec_profile(scope_root: &Path) -> Result<String, WorkerError> {
     let scope = scheme_literal(&canonical_scope(scope_root)?)?;
     Ok(format!(
-        "(version 1)\n{EXEC_SYSTEM_READ_RULES}    (allow process-exec (subpath {scope}))\n"
+        "(version 1)\n{EXEC_SYSTEM_READ_RULES}    (allow file-read* (literal \"/dev/null\"))\n    (allow file-write* (literal \"/dev/null\"))\n    (allow process-exec (subpath {scope}))\n"
     ))
 }
 

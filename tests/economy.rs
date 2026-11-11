@@ -31,8 +31,8 @@ use rivect::learning::{
     VersionEvidence,
 };
 use rivect::model::{
-    Broker, MatchedStrategy, MatchedTrial, ModelError, RequestManifest, SendContext, SendOutcome,
-    SendTicket, matched_ranking,
+    Broker, LedgerError, MatchedStrategy, MatchedTrial, ModelError, RequestManifest, SendContext,
+    SendOutcome, SendTicket, matched_ranking,
 };
 use rivect::providers::{LoopbackProvider, Provider, ProviderError, ProviderReply};
 use rivect::resources::{Exactness, UsageDelta};
@@ -119,9 +119,11 @@ fn assert_same_pairing(before: &Value, after: &Value, label: &str) {
 
 /// A provider that answers with exactly the usage it was handed, so the
 /// settlement carries the provider's own bins and nothing inferred. The
-/// counter lets a replay proof assert the provider was never called.
+/// counter lets a replay proof assert the provider was never called, and
+/// `dropped` is the peer-reported reasoning drop the reply carries.
 struct UsageProvider {
     usage: UsageDelta,
+    dropped: u64,
     fail: bool,
     calls: Arc<AtomicU64>,
 }
@@ -136,8 +138,18 @@ impl UsageProvider {
     fn counting(usage: UsageDelta, calls: Arc<AtomicU64>) -> Self {
         Self {
             usage,
+            dropped: 0,
             fail: false,
             calls,
+        }
+    }
+
+    /// The same provider reporting `dropped` replayed thinking blocks the
+    /// peer discarded on this send (AC-046).
+    fn dropping(usage: UsageDelta, dropped: u64) -> Self {
+        Self {
+            dropped,
+            ..Self::settled(usage)
         }
     }
 }
@@ -164,6 +176,7 @@ impl Provider for UsageProvider {
             tool_calls: Vec::new(),
             usage: self.usage,
             wire_retries: 0,
+            dropped_reasoning: self.dropped,
         })
     }
 }
@@ -1555,6 +1568,118 @@ fn estimate_settles_with_the_retained_bound_and_keeps_its_bins() {
     assert_eq!(
         store.settlement_totals().expect("totals").dispatched_count,
         0
+    );
+}
+
+/// A peer-reported reasoning drop lands as durable local evidence beside the
+/// settled row: one dispatch, one settlement, one fixed reason class (AC-046).
+#[test]
+fn dropped_reasoning_records_a_durable_row_once() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-drop-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::dropping(
+        UsageDelta::Exact {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+        },
+        2,
+    )));
+    let manifest = prepared_with(&mut broker, "goal: dropped reasoning");
+    {
+        let mut ledger = StoreLedger::new(&mut store, vec![SCOPE_A.to_string()]);
+        broker
+            .dispatch(&mut ledger, WORLD, &manifest)
+            .expect("the send settles");
+    }
+    let drop = store
+        .reasoning_drop(&manifest.attempt_id)
+        .expect("the drop read succeeds")
+        .expect("the peer's drop is durable");
+    assert_eq!(drop.attempt_id, manifest.attempt_id);
+    assert_eq!(drop.reason_code, "dropped_reasoning");
+    assert_eq!(drop.count, 2);
+    let record = store.settlement(&manifest.attempt_id).expect("row settles");
+    assert_eq!(record.state, SettlementState::Settled);
+    let totals = store.settlement_totals().expect("totals");
+    assert_eq!(totals.settled_count, 1, "the dispatch settles exactly once");
+    assert_eq!(totals.dispatched_count, 0);
+}
+
+/// A send that dropped nothing writes no reasoning row: the evidence table
+/// records drops, never every send (AC-046).
+#[test]
+fn zero_dropped_reasoning_records_no_row() {
+    let root = tempfile::TempDir::with_prefix("rivect-economy-drop-zero-").expect("fixture root");
+    let mut store = TaskStore::open(&root.path().join("state.db")).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    let mut broker = Broker::new(Box::new(UsageProvider::settled(UsageDelta::Unknown)));
+    let manifest = prepared_with(&mut broker, "goal: no dropped reasoning");
+    {
+        let mut ledger = StoreLedger::new(&mut store, vec![SCOPE_A.to_string()]);
+        broker
+            .dispatch(&mut ledger, WORLD, &manifest)
+            .expect("the send settles");
+    }
+    assert_eq!(
+        store
+            .reasoning_drop(&manifest.attempt_id)
+            .expect("the drop read succeeds"),
+        None
+    );
+    let record = store.settlement(&manifest.attempt_id).expect("row settles");
+    assert_eq!(record.state, SettlementState::Settled);
+}
+
+/// A store refusal on the drop record is typed and fails the send closed: no
+/// drop row appears, the settlement row stays open and nothing reports a
+/// success the evidence never recorded (AC-046).
+#[test]
+fn dropped_reasoning_store_refusal_is_typed_and_keeps_the_row_open() {
+    let root =
+        tempfile::TempDir::with_prefix("rivect-economy-drop-refused-").expect("fixture root");
+    let path = root.path().join("state.db");
+    let mut store = TaskStore::open(&path).expect("store opens");
+    store.open_budget(SCOPE_A, 10).expect("budget opens");
+    drop(store);
+    {
+        let raw = rusqlite::Connection::open(&path).expect("raw connection");
+        raw.execute_batch(
+            "CREATE TRIGGER reasoning_drops_fault BEFORE INSERT ON reasoning_drops
+             BEGIN SELECT RAISE(ABORT, 'injected reasoning drop failure'); END;",
+        )
+        .expect("the drop insert fault is planted");
+    }
+    let mut store = TaskStore::open(&path).expect("store reopens");
+    let mut broker = Broker::new(Box::new(UsageProvider::dropping(UsageDelta::Unknown, 1)));
+    let manifest = prepared_with(&mut broker, "goal: refused drop");
+    let sent = {
+        let mut ledger = StoreLedger::new(&mut store, vec![SCOPE_A.to_string()]);
+        broker.dispatch(&mut ledger, WORLD, &manifest)
+    };
+    assert!(
+        matches!(
+            sent,
+            Err(ModelError::Ledger(LedgerError::Store(StoreError::Storage(
+                _
+            ))))
+        ),
+        "the refused drop is the typed ledger failure: {sent:?}"
+    );
+    assert_eq!(
+        store
+            .reasoning_drop(&manifest.attempt_id)
+            .expect("the drop read succeeds"),
+        None
+    );
+    let record = store
+        .settlement(&manifest.attempt_id)
+        .expect("the dispatched row stays open");
+    assert_eq!(record.state, SettlementState::Dispatched);
+    assert_eq!(
+        store.settlement_totals().expect("totals").dispatched_count,
+        1
     );
 }
 
