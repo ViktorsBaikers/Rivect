@@ -267,13 +267,15 @@ pub enum ExpectedOutcome {
 }
 
 /// What a candidate trial reported. `Censored` is retained as NOT_RUN, never
-/// promoted to a pass.
+/// promoted to a pass; `Unserved` is the recorded terminal denial for a
+/// provider with no installed adapter, also never a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrialOutcome {
     Pass,
     Fail,
     Censored,
+    Unserved,
 }
 
 /// One source-declared case: its stable id, its expectation and the trial
@@ -378,6 +380,8 @@ pub struct ModeCounts {
     pub passed: u32,
     pub failed: u32,
     pub censored: u32,
+    #[serde(default)]
+    pub unserved: u32,
 }
 
 /// The counts a matched report carries, split by trial class.
@@ -399,15 +403,20 @@ impl TrialCounts {
             TrialOutcome::Pass => counts.passed = counts.passed.saturating_add(1),
             TrialOutcome::Fail => counts.failed = counts.failed.saturating_add(1),
             TrialOutcome::Censored => counts.censored = counts.censored.saturating_add(1),
+            TrialOutcome::Unserved => counts.unserved = counts.unserved.saturating_add(1),
         }
     }
 
-    /// Every trial that did not run, across classes.
+    /// Every trial that did not run, across classes. A recorded terminal
+    /// denial is not a run either.
     pub fn not_run(self) -> u32 {
         self.deterministic
             .censored
+            .saturating_add(self.deterministic.unserved)
             .saturating_add(self.replay.censored)
+            .saturating_add(self.replay.unserved)
             .saturating_add(self.live.censored)
+            .saturating_add(self.live.unserved)
     }
 }
 
@@ -428,9 +437,12 @@ pub struct ConformanceReport {
 impl ConformanceReport {
     /// The failed and censored rows a report must keep visible.
     pub fn retained(&self) -> impl Iterator<Item = &ConformanceRow> {
-        self.rows
-            .iter()
-            .filter(|row| matches!(row.observed, TrialOutcome::Fail | TrialOutcome::Censored))
+        self.rows.iter().filter(|row| {
+            matches!(
+                row.observed,
+                TrialOutcome::Fail | TrialOutcome::Censored | TrialOutcome::Unserved
+            )
+        })
     }
 }
 
@@ -734,9 +746,9 @@ pub fn evaluate(oracle: &ProtectedOracle, run: &CandidateRun) -> ConformanceRepo
                     },
                 );
             }
-            (ExpectedOutcome::Pass, TrialOutcome::Censored) => {
+            (ExpectedOutcome::Pass, TrialOutcome::Censored | TrialOutcome::Unserved) => {
                 accepted = false;
-                counts.record(case.mode, TrialOutcome::Censored);
+                counts.record(case.mode, observation.outcome);
                 reject(
                     &mut rejection,
                     Rejection::NotRun {
@@ -769,9 +781,9 @@ pub fn evaluate(oracle: &ProtectedOracle, run: &CandidateRun) -> ConformanceRepo
                     },
                 );
             }
-            (ExpectedOutcome::Fail, TrialOutcome::Censored) => {
+            (ExpectedOutcome::Fail, TrialOutcome::Censored | TrialOutcome::Unserved) => {
                 accepted = false;
-                counts.record(case.mode, TrialOutcome::Censored);
+                counts.record(case.mode, observation.outcome);
                 reject(
                     &mut rejection,
                     Rejection::NotRun {
@@ -779,8 +791,8 @@ pub fn evaluate(oracle: &ProtectedOracle, run: &CandidateRun) -> ConformanceRepo
                     },
                 );
             }
-            (ExpectedOutcome::NotRun, TrialOutcome::Censored) => {
-                counts.record(case.mode, TrialOutcome::Censored);
+            (ExpectedOutcome::NotRun, TrialOutcome::Censored | TrialOutcome::Unserved) => {
+                counts.record(case.mode, observation.outcome);
             }
             (ExpectedOutcome::NotRun, TrialOutcome::Pass | TrialOutcome::Fail) => {
                 accepted = false;
@@ -1088,6 +1100,37 @@ pub fn provider_case(trial: &str, provider: &str) -> String {
     format!("TP-PROVIDER-{trial}::{provider}")
 }
 
+/// The three trial classes the offline provider receipt carries.
+pub const OFFLINE_PROVIDER_TRIALS: [&str; 3] = ["AUTH", "WIRE", "RECOVERY"];
+
+/// The 74 providers × three offline trial classes the provider receipt binds.
+pub const OFFLINE_PROVIDER_ROWS: usize = PROVIDER_ROWS.len() * OFFLINE_PROVIDER_TRIALS.len();
+
+/// The two recorded providers with no installed adapter. Their six
+/// AUTH/WIRE/RECOVERY rows are terminal `Unserved`, never `passed`.
+pub const UNSERVED_PROVIDERS: [&str; 2] = ["cursor", "devin"];
+
+/// Every case id the recorded unserved class excludes from `passed`.
+pub fn unserved_cases() -> Vec<String> {
+    let mut cases = Vec::with_capacity(UNSERVED_PROVIDERS.len() * OFFLINE_PROVIDER_TRIALS.len());
+    for provider in UNSERVED_PROVIDERS {
+        for trial in OFFLINE_PROVIDER_TRIALS {
+            cases.push(provider_case(trial, provider));
+        }
+    }
+    cases
+}
+
+/// Whether `case_id` is one of the six recorded terminal denials.
+#[must_use]
+pub fn is_unserved_case(case_id: &str) -> bool {
+    UNSERVED_PROVIDERS.iter().any(|provider| {
+        OFFLINE_PROVIDER_TRIALS
+            .iter()
+            .any(|trial| provider_case(trial, provider) == case_id)
+    })
+}
+
 /// One alias installed-row case.
 pub fn alias_case(alias: &str) -> String {
     format!("TP-ALIAS-INSTALLED::{alias}")
@@ -1133,6 +1176,457 @@ pub fn final_required_cases() -> Vec<String> {
     cases.into_iter().collect()
 }
 
+/// The offline evidence receipt schema this build writes and reads.
+pub const OFFLINE_EVIDENCE_SCHEMA: u32 = 1;
+
+/// The producer version this build accepts.
+pub const OFFLINE_EVIDENCE_PRODUCER_VERSION: &str = "1";
+
+/// The receipt and manifest byte bounds; an oversized document is refused
+/// before it is parsed.
+pub const OFFLINE_EVIDENCE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The three offline evidence families and their fixed denominators.
+pub const OFFLINE_FAMILIES: [(&str, usize); 3] = [
+    ("provider", OFFLINE_PROVIDER_ROWS),
+    ("acceptance", 40),
+    ("search", 20),
+];
+
+/// The family denominator the receipt must carry, or `None` for an unknown
+/// family.
+#[must_use]
+pub fn offline_family_denominator(family: &str) -> Option<usize> {
+    OFFLINE_FAMILIES
+        .iter()
+        .find(|(name, _count)| *name == family)
+        .map(|(_name, count)| *count)
+}
+
+/// What one checked-in manifest row expects from its oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrialExpectation {
+    Pass,
+    Unserved,
+}
+
+/// One checked-in offline-evidence manifest row: the case, its provider,
+/// the exact integration oracles and the marker their output must carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineEvidenceManifestRow {
+    pub case_id: String,
+    pub provider: String,
+    pub oracle: Vec<String>,
+    pub marker: String,
+    pub expected: TrialExpectation,
+    pub observation: String,
+}
+
+/// The checked-in manifest a receipt is bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineEvidenceManifest {
+    pub schema_version: u32,
+    pub family: String,
+    pub rows: Vec<OfflineEvidenceManifestRow>,
+}
+
+impl OfflineEvidenceManifest {
+    /// Parse one manifest under the document byte bound.
+    ///
+    /// # Errors
+    /// Returns [`OfflineEvidenceError`] when the document is oversized,
+    /// malformed, or fails [`Self::validate`].
+    pub fn load(bytes: &[u8]) -> Result<Self, OfflineEvidenceError> {
+        if bytes.len() > OFFLINE_EVIDENCE_MAX_BYTES {
+            return Err(OfflineEvidenceError::TooLarge {
+                limit: OFFLINE_EVIDENCE_MAX_BYTES,
+            });
+        }
+        let manifest: Self = serde_json::from_slice(bytes)
+            .map_err(|source| OfflineEvidenceError::Malformed { source })?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validate the manifest's own shape and its fixed denominator.
+    ///
+    /// # Errors
+    /// Returns [`OfflineEvidenceError`] naming the first rejected row.
+    pub fn validate(&self) -> Result<(), OfflineEvidenceError> {
+        if self.schema_version != OFFLINE_EVIDENCE_SCHEMA {
+            return Err(OfflineEvidenceError::Schema {
+                found: self.schema_version,
+                expected: OFFLINE_EVIDENCE_SCHEMA,
+            });
+        }
+        let Some(denominator) = offline_family_denominator(&self.family) else {
+            return Err(OfflineEvidenceError::UnknownFamily {
+                family: self.family.clone(),
+            });
+        };
+        if self.rows.len() != denominator {
+            return Err(OfflineEvidenceError::Denominator {
+                declared: self.rows.len(),
+                expected: denominator,
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for row in &self.rows {
+            if !seen.insert(row.case_id.as_str()) {
+                return Err(OfflineEvidenceError::DuplicateCase {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.provider.trim().is_empty() {
+                return Err(OfflineEvidenceError::Omission {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.oracle.is_empty()
+                || row.oracle.iter().any(|oracle| {
+                    let Some((target, test)) = oracle.split_once("::") else {
+                        return true;
+                    };
+                    target.trim().is_empty()
+                        || test.trim().is_empty()
+                        || matches!(target, "lib" | "bin")
+                })
+            {
+                return Err(OfflineEvidenceError::Evidence {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.marker.trim().is_empty() {
+                return Err(OfflineEvidenceError::Marker {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.observation.trim().is_empty() || row.observation.contains('\n') {
+                return Err(OfflineEvidenceError::Observation {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            match row.expected {
+                TrialExpectation::Pass if is_unserved_case(&row.case_id) => {
+                    return Err(OfflineEvidenceError::OutcomeMismatch {
+                        case_id: row.case_id.clone(),
+                    });
+                }
+                TrialExpectation::Unserved if !is_unserved_case(&row.case_id) => {
+                    return Err(OfflineEvidenceError::UnservedOutsideRecordedSet {
+                        case_id: row.case_id.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One executed integration target in the receipt: its exact command, exit,
+/// retained output digest and the oracle cases it served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineEvidenceTarget {
+    pub target: String,
+    pub command: String,
+    pub exit: i32,
+    pub output_sha256: String,
+    pub cases: u32,
+}
+
+/// One receipt row: the case, the exact oracle it ran as, the marker that
+/// oracle printed and the terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRow {
+    pub case_id: String,
+    pub evidence: String,
+    pub marker: String,
+    pub outcome: TrialOutcome,
+}
+
+/// The receipt's counted split: every row is terminal, never all passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineEvidenceCounts {
+    pub rows: usize,
+    pub pass: usize,
+    pub unserved: usize,
+}
+
+/// The candidate-bound offline evidence receipt the final conjunction
+/// consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineEvidenceReceipt {
+    pub schema_version: u32,
+    pub producer_version: String,
+    pub family: String,
+    pub candidate_manifest_sha256: String,
+    pub manifest_sha256: String,
+    pub targets: Vec<OfflineEvidenceTarget>,
+    pub rows: Vec<EvidenceRow>,
+    pub counts: OfflineEvidenceCounts,
+}
+
+impl OfflineEvidenceReceipt {
+    /// Parse one receipt under the document byte bound.
+    ///
+    /// # Errors
+    /// Returns [`OfflineEvidenceError`] when the document is oversized or
+    /// malformed.
+    pub fn load(bytes: &[u8]) -> Result<Self, OfflineEvidenceError> {
+        if bytes.len() > OFFLINE_EVIDENCE_MAX_BYTES {
+            return Err(OfflineEvidenceError::TooLarge {
+                limit: OFFLINE_EVIDENCE_MAX_BYTES,
+            });
+        }
+        serde_json::from_slice(bytes).map_err(|source| OfflineEvidenceError::Malformed { source })
+    }
+
+    /// Validate this receipt against the exact checked-in manifest bytes.
+    /// Every accepted row is candidate-bound, oracle-named and terminal.
+    ///
+    /// # Errors
+    /// Returns [`OfflineEvidenceError`] naming the first rejected cell.
+    pub fn validate(
+        &self,
+        manifest_bytes: &[u8],
+        manifest: &OfflineEvidenceManifest,
+    ) -> Result<(), OfflineEvidenceError> {
+        if self.schema_version != OFFLINE_EVIDENCE_SCHEMA {
+            return Err(OfflineEvidenceError::Schema {
+                found: self.schema_version,
+                expected: OFFLINE_EVIDENCE_SCHEMA,
+            });
+        }
+        if self.producer_version != OFFLINE_EVIDENCE_PRODUCER_VERSION {
+            return Err(OfflineEvidenceError::ProducerVersion {
+                found: self.producer_version.clone(),
+                expected: OFFLINE_EVIDENCE_PRODUCER_VERSION,
+            });
+        }
+        if manifest.schema_version != OFFLINE_EVIDENCE_SCHEMA || manifest.family != self.family {
+            return Err(OfflineEvidenceError::UnknownFamily {
+                family: self.family.clone(),
+            });
+        }
+        let Some(denominator) = offline_family_denominator(&self.family) else {
+            return Err(OfflineEvidenceError::UnknownFamily {
+                family: self.family.clone(),
+            });
+        };
+        if manifest.rows.len() != denominator || self.rows.len() != denominator {
+            return Err(OfflineEvidenceError::Denominator {
+                declared: self.rows.len(),
+                expected: denominator,
+            });
+        }
+        if !is_hex_64(&self.candidate_manifest_sha256) {
+            return Err(OfflineEvidenceError::CandidateDigest);
+        }
+        let expected_manifest = crate::config::hex(&Sha256::digest(manifest_bytes));
+        if self.manifest_sha256 != expected_manifest {
+            return Err(OfflineEvidenceError::ManifestDigest {
+                declared: self.manifest_sha256.clone(),
+                expected: expected_manifest,
+            });
+        }
+        let expected_counts = OfflineEvidenceCounts {
+            rows: self.rows.len(),
+            pass: self
+                .rows
+                .iter()
+                .filter(|row| row.outcome == TrialOutcome::Pass)
+                .count(),
+            unserved: self
+                .rows
+                .iter()
+                .filter(|row| row.outcome == TrialOutcome::Unserved)
+                .count(),
+        };
+        if self.counts != expected_counts
+            || expected_counts.pass + expected_counts.unserved != denominator
+        {
+            return Err(OfflineEvidenceError::Counts {
+                declared: self.counts,
+                expected: expected_counts,
+            });
+        }
+
+        let mut targets = BTreeSet::new();
+        for target in &self.targets {
+            if target.target.trim().is_empty()
+                || matches!(target.target.as_str(), "lib" | "bin")
+                || target.exit != 0
+                || !is_hex_64(&target.output_sha256)
+                || target.cases == 0
+                || !target
+                    .command
+                    .contains(&format!("--test {}", target.target))
+                || !target.command.contains("--locked")
+            {
+                return Err(OfflineEvidenceError::Target {
+                    target: target.target.clone(),
+                });
+            }
+            if !targets.insert(target.target.as_str()) {
+                return Err(OfflineEvidenceError::DuplicateTarget {
+                    target: target.target.clone(),
+                });
+            }
+        }
+
+        let mut manifest_rows: BTreeMap<&str, &OfflineEvidenceManifestRow> = BTreeMap::new();
+        for row in &manifest.rows {
+            manifest_rows.insert(row.case_id.as_str(), row);
+        }
+        let required_cases = final_required_cases();
+        let required: BTreeSet<&str> = required_cases.iter().map(String::as_str).collect();
+        let mut seen = BTreeSet::new();
+        for row in &self.rows {
+            if !seen.insert(row.case_id.as_str()) {
+                return Err(OfflineEvidenceError::DuplicateCase {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            let Some(manifest_row) = manifest_rows.get(row.case_id.as_str()) else {
+                return Err(OfflineEvidenceError::Omission {
+                    case_id: row.case_id.clone(),
+                });
+            };
+            if !required.contains(row.case_id.as_str()) {
+                return Err(OfflineEvidenceError::UnexpectedCase {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            let Some((target, test)) = row.evidence.split_once("::") else {
+                return Err(OfflineEvidenceError::Evidence {
+                    case_id: row.case_id.clone(),
+                });
+            };
+            if row.evidence.trim().is_empty()
+                || target.trim().is_empty()
+                || test.trim().is_empty()
+                || matches!(target, "lib" | "bin")
+                || !targets.contains(target)
+            {
+                return Err(OfflineEvidenceError::Evidence {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.marker.trim().is_empty() || row.marker != manifest_row.marker {
+                return Err(OfflineEvidenceError::Marker {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            let expected_outcome = match manifest_row.expected {
+                TrialExpectation::Pass => TrialOutcome::Pass,
+                TrialExpectation::Unserved => TrialOutcome::Unserved,
+            };
+            if row.outcome != expected_outcome {
+                return Err(OfflineEvidenceError::OutcomeMismatch {
+                    case_id: row.case_id.clone(),
+                });
+            }
+            if row.outcome == TrialOutcome::Unserved && !is_unserved_case(&row.case_id) {
+                return Err(OfflineEvidenceError::UnservedOutsideRecordedSet {
+                    case_id: row.case_id.clone(),
+                });
+            }
+        }
+        if seen.len() != denominator {
+            return Err(OfflineEvidenceError::Denominator {
+                declared: seen.len(),
+                expected: denominator,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_hex_64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Why an offline evidence document is refused.
+#[derive(Debug, thiserror::Error)]
+pub enum OfflineEvidenceError {
+    #[error("the offline evidence document is larger than {limit} bytes")]
+    TooLarge { limit: usize },
+    #[error("the offline evidence document is not valid: {source}")]
+    Malformed {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("the offline evidence speaks schema {found}, not {expected}")]
+    Schema { found: u32, expected: u32 },
+    #[error("the offline evidence producer {found} is not {expected}")]
+    ProducerVersion {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("the offline evidence family {family} is not recorded")]
+    UnknownFamily { family: String },
+    #[error("the offline evidence declares {declared} rows, not {expected}")]
+    Denominator { declared: usize, expected: usize },
+    #[error("the offline evidence repeats case {case_id}")]
+    DuplicateCase { case_id: String },
+    #[error("the offline evidence repeats target {target}")]
+    DuplicateTarget { target: String },
+    #[error("the offline evidence omits or invents case {case_id}")]
+    Omission { case_id: String },
+    #[error("the offline evidence names a case outside the required roster: {case_id}")]
+    UnexpectedCase { case_id: String },
+    #[error("case {case_id} carries no integration oracle")]
+    Evidence { case_id: String },
+    #[error("case {case_id} carries no row marker")]
+    Marker { case_id: String },
+    #[error("case {case_id} carries no one-line observation")]
+    Observation { case_id: String },
+    #[error("case {case_id} declares the wrong terminal outcome")]
+    OutcomeMismatch { case_id: String },
+    #[error("case {case_id} claims unserved outside the recorded six")]
+    UnservedOutsideRecordedSet { case_id: String },
+    #[error("the offline evidence candidate digest is not 64 hex characters")]
+    CandidateDigest,
+    #[error("the offline evidence manifest digest {declared} is not {expected}")]
+    ManifestDigest { declared: String, expected: String },
+    #[error("the offline evidence counts {declared:?} are not {expected:?}")]
+    Counts {
+        declared: OfflineEvidenceCounts,
+        expected: OfflineEvidenceCounts,
+    },
+    #[error("target {target} is not an executed integration target")]
+    Target { target: String },
+}
+
+impl OfflineEvidenceError {
+    /// The wire code this failure reports: all of these are malformed or
+    /// stale declared evidence, never a case verdict.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::TooLarge { .. } | Self::Malformed { .. } => ErrorCode::InvalidInput,
+            Self::Schema { .. } | Self::ProducerVersion { .. } => ErrorCode::UnsupportedVersion,
+            Self::UnknownFamily { .. }
+            | Self::Denominator { .. }
+            | Self::DuplicateCase { .. }
+            | Self::DuplicateTarget { .. }
+            | Self::Omission { .. }
+            | Self::UnexpectedCase { .. }
+            | Self::Evidence { .. }
+            | Self::Marker { .. }
+            | Self::Observation { .. }
+            | Self::OutcomeMismatch { .. }
+            | Self::UnservedOutsideRecordedSet { .. }
+            | Self::CandidateDigest
+            | Self::ManifestDigest { .. }
+            | Self::Counts { .. }
+            | Self::Target { .. } => ErrorCode::InvalidInput,
+        }
+    }
+}
+
 /// One final-conjunction row: the exact case, the candidate whose bytes it
 /// was observed on, and the retained pointer or cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1175,6 +1669,7 @@ pub struct FinalAcceptance {
     pub present: usize,
     pub current: usize,
     pub passed: usize,
+    pub unserved: usize,
     pub provider_rows: usize,
     pub alias_rows: usize,
     pub installed_rows: usize,
@@ -1214,6 +1709,8 @@ pub enum FinalAcceptanceError {
     RowCollision { case_id: String },
     #[error("the final conjunction row {case_id} is not a required case")]
     UnexpectedRow { case_id: String },
+    #[error("the final conjunction row {case_id} declares unserved outside the recorded six")]
+    UnservedOutsideRecordedSet { case_id: String },
     #[error("the final conjunction declares {declared} provider rows, not {expected}")]
     ProviderDenominator { declared: usize, expected: usize },
     #[error("the final conjunction declares {declared} installed rows, not {expected}")]
@@ -1289,6 +1786,7 @@ pub fn evaluate_final(
     let mut blockers = FinalBlockers::default();
     let mut current = 0usize;
     let mut passed = 0usize;
+    let mut unserved = 0usize;
     for case_id in &required {
         let Some(row) = supplied.get(case_id.as_str()) else {
             blockers.missing.push(case_id.clone());
@@ -1306,6 +1804,14 @@ pub fn evaluate_final(
                 } else {
                     blockers.unattributed.push(case_id.clone());
                 }
+            }
+            TrialOutcome::Unserved => {
+                if !is_unserved_case(case_id) {
+                    return Err(FinalAcceptanceError::UnservedOutsideRecordedSet {
+                        case_id: case_id.clone(),
+                    });
+                }
+                unserved = unserved.saturating_add(1);
             }
             TrialOutcome::Fail => blockers.failed.push(case_id.clone()),
             TrialOutcome::Censored => {
@@ -1346,6 +1852,7 @@ pub fn evaluate_final(
         present,
         current,
         passed,
+        unserved,
         provider_rows,
         alias_rows,
         installed_rows,

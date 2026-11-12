@@ -2087,6 +2087,7 @@ async fn ollama_cloud_send_deadline_expiry_is_a_typed_denial() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn ollama_cloud_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("ollama-cloud");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -2938,6 +2939,7 @@ fn qianfan_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn qianfan_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("qianfan");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3746,6 +3748,7 @@ fn qwen_portal_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn qwen_portal_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("qwen-portal");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4526,6 +4529,7 @@ fn siliconflow_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn siliconflow_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("siliconflow");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5452,6 +5456,7 @@ fn siliconflow_cn_dialect_is_keyed_on_the_literal_connection_id() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn siliconflow_cn_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("siliconflow-cn");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -6457,6 +6462,7 @@ fn synthetic_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn synthetic_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("synthetic");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -7268,6 +7274,7 @@ fn together_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn together_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("together");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 

@@ -623,6 +623,7 @@ async fn llama_cpp_typed_denial_recovers_through_the_same_credential_seam() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn llama_cpp_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("llama.cpp");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": LLAMA_CPP_LISTED})]).await;
@@ -1696,6 +1697,7 @@ async fn lm_studio_typed_denial_recovers_through_the_same_credential_seam() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn lm_studio_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("lm-studio");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": LM_STUDIO_LISTED})]).await;
@@ -2393,6 +2395,7 @@ async fn minimax_code_typed_denial_recovers_through_the_same_credential_seam() {
 /// leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn minimax_code_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("minimax-code");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_chat(
@@ -3116,6 +3119,7 @@ async fn minimax_code_cn_typed_denial_recovers_through_the_same_credential_seam(
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn minimax_code_cn_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("minimax-code-cn");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_chat(
@@ -4054,6 +4058,7 @@ async fn mistral_typed_denial_recovers_through_the_same_credential_seam() {
 /// suite rather than silently absenting.
 #[tokio::test]
 async fn mistral_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("mistral");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": MISTRAL_MODEL})]).await;
@@ -5012,6 +5017,7 @@ async fn moonshot_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn moonshot_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("moonshot");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": MOONSHOT_MODEL})]).await;
@@ -5832,6 +5838,7 @@ async fn nanogpt_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn nanogpt_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("nanogpt");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": NANOGPT_MODEL})]).await;
@@ -6815,6 +6822,7 @@ async fn novita_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn novita_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("novita");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![novita_row(NOVITA_MODEL)]).await;
@@ -7631,6 +7639,7 @@ async fn nvidia_typed_denial_recovers_through_the_same_credential_seam() {
 /// suite rather than silently absenting.
 #[tokio::test]
 async fn nvidia_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("nvidia");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": NVIDIA_MODEL})]).await;

@@ -852,6 +852,7 @@ async fn band5_zhipu_coding_plan_short_deadline_denies_without_a_second_request(
 /// and report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band5_zhipu_coding_plan_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("zhipu-coding-plan");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -2090,6 +2091,7 @@ async fn band5_opencode_go_short_deadline_denies_without_a_second_request() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band5_opencode_go_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("opencode-go");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 

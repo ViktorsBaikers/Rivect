@@ -16,6 +16,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -43,6 +44,21 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
+
+/// Print the three offline provider trial markers a legs matrix proves.
+fn emit_provider_rows(provider: &str) {
+    for trial in rivect::verification::OFFLINE_PROVIDER_TRIALS {
+        emit_provider_row(trial, provider);
+    }
+}
 
 use support::{MapStore, SlowStore, drop_blocking, prepared_with, send_on_thread, sse_block};
 
@@ -2342,6 +2358,7 @@ async fn foreign_reasoning_blob_rejected() {
 
 #[tokio::test]
 async fn anthropic_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("anthropic");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3130,6 +3147,7 @@ async fn umans_short_deadline_denies_without_a_second_request() {
 
 #[tokio::test]
 async fn umans_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("umans");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3723,6 +3741,7 @@ async fn minimax_short_deadline_denies_without_a_second_request() {
 
 #[tokio::test]
 async fn minimax_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("minimax");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4323,6 +4342,7 @@ async fn cloudflare_ai_gateway_short_deadline_denies_without_a_second_request() 
 
 #[tokio::test]
 async fn cloudflare_ai_gateway_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("cloudflare-ai-gateway");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4446,6 +4466,7 @@ fn count_path(requests: &[Request], path: &str) -> usize {
 /// marker read is the only other physical request.
 #[tokio::test]
 async fn vercel_ai_gateway_valid_control_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "vercel-ai-gateway");
     let server = MockServer::start().await;
     mount_keyed_models(
         &server,
@@ -4654,6 +4675,7 @@ async fn vercel_ai_gateway_auto_pin_reads_one_listing_and_one_messages_request()
 
 #[tokio::test]
 async fn vercel_ai_gateway_wrong_credential_profile_region_or_origin_denies_without_secrets() {
+    emit_provider_row("AUTH", "vercel-ai-gateway");
     // a configured region names no recorded contract — typed denial at build
     let region_config = Config::parse_validated(&format!(
         "config_version = 1\n\
@@ -5091,6 +5113,7 @@ async fn vercel_ai_gateway_stream_fragmentation_and_repeated_usage_never_duplica
 /// request runs.
 #[tokio::test]
 async fn vercel_ai_gateway_unknown_outcome_is_not_retried() {
+    emit_provider_row("RECOVERY", "vercel-ai-gateway");
     let server = MockServer::start().await;
     mount_keyed_models(&server, &[vercel_row(VERCEL_MODEL, &["tool-use"])]).await;
     Mock::given(method("POST"))
@@ -5140,6 +5163,7 @@ fn provider_installed_vercel_ai_gateway() {}
 /// because the manual pin needs none.
 #[tokio::test]
 async fn custom_messages_valid_control_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "custom-messages");
     assert_eq!(dialect_for(CUSTOM_MESSAGES), Some(Dialect::Messages));
     assert!(
         routes_for(CUSTOM_MESSAGES).is_empty(),
@@ -5248,6 +5272,7 @@ async fn custom_messages_requires_a_configured_endpoint() {
 /// sends exactly one inference request.
 #[tokio::test]
 async fn custom_messages_manual_model_sends_when_the_listing_fails() {
+    emit_provider_row("RECOVERY", "custom-messages");
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(CUSTOM_MESSAGES_MODELS_PATH))
@@ -5721,6 +5746,7 @@ async fn custom_messages_stream_fragmentation_and_repeated_usage_never_duplicate
 /// in diagnostics.
 #[tokio::test]
 async fn custom_messages_auth_failure_and_rate_limit_are_not_retried() {
+    emit_provider_row("AUTH", "custom-messages");
     for code in [401u16, 429] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -6930,6 +6956,7 @@ fn routed_proxy_origin_rejects_a_non_loopback_host() {
 
 #[tokio::test]
 async fn gitlab_duo_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("gitlab-duo");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -8009,6 +8036,7 @@ async fn opencode_zen_auto_pin_shares_one_clock_across_catalogue_and_wire() {
 
 #[tokio::test]
 async fn opencode_zen_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("opencode-zen");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -8233,6 +8261,7 @@ async fn mount_zenmux_messages(server: &MockServer, body: String) {
 /// Completions request for the same pin.
 #[tokio::test]
 async fn zenmux_anthropic_class_model_takes_the_messages_route() {
+    emit_provider_row("WIRE", "zenmux");
     assert_eq!(dialect_for(ZENMUX), Some(Dialect::ChatCompletions));
     assert_eq!(
         routes_for(ZENMUX),
@@ -8398,6 +8427,7 @@ async fn zenmux_unrecorded_class_never_enters_the_messages_route() {
 /// denial renders the material or body.
 #[tokio::test]
 async fn zenmux_wrong_credential_region_or_origin_denies_without_secrets() {
+    emit_provider_row("AUTH", "zenmux");
     let server = MockServer::start().await;
 
     // a configured region names no recorded contract
@@ -8551,6 +8581,7 @@ async fn zenmux_catalog_is_the_authoritative_metadata_on_the_messages_arm() {
 /// rejection accounts nothing.
 #[tokio::test]
 async fn zenmux_rejects_partial_tool_block_unknown_terminal_and_repeated_usage() {
+    emit_provider_row("RECOVERY", "zenmux");
     // partial tool JSON at the block stop
     let server = MockServer::start().await;
     mount_zenmux_messages(

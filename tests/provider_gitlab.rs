@@ -8,6 +8,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -30,6 +31,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
 
 use support::ws_peer::{
     PROFILE_TOKEN, PROJECT_ID, PeerRequest, PeerScript, SocketScript, WORKFLOW_TOKEN, WsPeer,
@@ -221,6 +230,7 @@ fn body(request: &PeerRequest) -> Value {
 
 #[test]
 fn dispatch_returns_one_validated_outcome_and_one_accounting_record() {
+    emit_provider_row("WIRE", "gitlab-duo-agent");
     let fixture = peer_fixture(PeerScript {
         sockets: vec![SocketScript {
             frames: vec![
@@ -518,6 +528,7 @@ fn silent_handshake_is_a_typed_timeout_with_one_settlement_row() {
 
 #[test]
 fn idle_death_reconnects_once_on_the_same_workflow_id() {
+    emit_provider_row("RECOVERY", "gitlab-duo-agent");
     let fixture = peer_fixture(PeerScript {
         sockets: vec![
             SocketScript::default(),
@@ -1312,6 +1323,7 @@ fn an_action_hands_back_the_recorded_tool_call() {
 
 #[test]
 fn a_wrong_profile_denies_typed_with_zero_requests() {
+    emit_provider_row("AUTH", "gitlab-duo-agent");
     let fixture = peer_fixture(PeerScript::default());
     let store = Arc::new(MapStore::seeded(
         StoreKind::Keychain,

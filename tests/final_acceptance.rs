@@ -32,13 +32,16 @@ use rivect::contracts::RELEASE_MANIFEST_NAME;
 use rivect::executor::verify_release_bundle;
 use rivect::providers::{Dialect, dialect_for};
 use rivect::verification::{
-    ALIAS_ROWS, FINAL_INSTALLED_ROWS, FINAL_PROVIDER_ROWS, FINAL_UI_CELLS, FinalAcceptanceError,
-    FinalDeclaration, FinalRow, INSTALLED_ORDINARY_CASE, INSTALLED_UI_CASE, PROVIDER_ROWS,
-    PROVIDER_TRIALS, RELEASE_CASE_IDS, RELEASE_SECTIONS, SEARCH_SERVICES, SEARCH_TRIALS,
-    SOURCE_SCENARIOS, TrialOutcome, UI_GEOMETRIES, UI_INPUTS, UI_STATES, UPGRADE_CASE, alias_case,
-    conjunction_cells, evaluate_final, final_required_cases, provider_case, ui_case,
+    ALIAS_ROWS, EvidenceRow, FINAL_INSTALLED_ROWS, FINAL_PROVIDER_ROWS, FINAL_UI_CELLS,
+    FinalAcceptanceError, FinalDeclaration, FinalRow, INSTALLED_ORDINARY_CASE, INSTALLED_UI_CASE,
+    OfflineEvidenceCounts, OfflineEvidenceManifest, OfflineEvidenceReceipt, OfflineEvidenceTarget,
+    PROVIDER_ROWS, PROVIDER_TRIALS, RELEASE_CASE_IDS, RELEASE_SECTIONS, SEARCH_SERVICES,
+    SEARCH_TRIALS, SOURCE_SCENARIOS, TrialExpectation, TrialOutcome, UI_GEOMETRIES, UI_INPUTS,
+    UI_STATES, UPGRADE_CASE, alias_case, conjunction_cells, evaluate_final, final_required_cases,
+    is_unserved_case, provider_case, ui_case,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -419,20 +422,303 @@ fn catalog_rows(candidate: &str) -> Vec<FinalRow> {
         .collect()
 }
 
-fn provider_trial_rows(candidate: &str) -> Vec<FinalRow> {
+const PROVIDER_PRODUCER: &str = "sh scripts/offline-evidence.sh --manifest tests/fixtures/provider-trials.json --receipt target/provider-trials.json --bundle <dir>";
+
+fn provider_manifest_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("provider-trials.json")
+}
+
+fn provider_receipt_path() -> PathBuf {
+    std::env::var_os("RIVECT_PROVIDER_TRIALS_RECEIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("provider-trials.json")
+        })
+}
+
+fn censored_provider_rows(candidate: &str, cause: String) -> Vec<FinalRow> {
     let mut rows = Vec::with_capacity(PROVIDER_ROWS.len() * 3);
     for (id, _dialect) in PROVIDER_ROWS {
         for trial in ["AUTH", "WIRE", "RECOVERY"] {
-            rows.push(censored(
-                provider_case(trial, id),
-                candidate,
-                format!(
-                    "not run: the {trial} leg is owned by its own target and is not consumed by this conjunction"
-                ),
-            ));
+            rows.push(censored(provider_case(trial, id), candidate, cause.clone()));
         }
     }
     rows
+}
+
+/// Consume the candidate-current provider receipt. A missing, stale,
+/// malformed or unmarked receipt contributes censored rows only; an
+/// `unserved` row stays a terminal denial carried in its own count.
+fn provider_trial_rows_from(
+    manifest_path: &Path,
+    receipt_path: &Path,
+    candidate: &str,
+) -> Vec<FinalRow> {
+    let manifest_bytes = match std::fs::read(manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!(
+                "OFFLINE_ACCEPTANCE pending family=provider producer=\"{PROVIDER_PRODUCER}\" cause=\"{error}\""
+            );
+            return censored_provider_rows(
+                candidate,
+                format!("missing receipt: run {PROVIDER_PRODUCER}"),
+            );
+        }
+    };
+    let manifest = match OfflineEvidenceManifest::load(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return censored_provider_rows(candidate, format!("malformed manifest: {error}"));
+        }
+    };
+    let receipt_bytes = match std::fs::read(receipt_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!(
+                "OFFLINE_ACCEPTANCE pending family=provider producer=\"{PROVIDER_PRODUCER}\" cause=\"{error}\""
+            );
+            return censored_provider_rows(
+                candidate,
+                format!("missing receipt: run {PROVIDER_PRODUCER}"),
+            );
+        }
+    };
+    let receipt = match OfflineEvidenceReceipt::load(&receipt_bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return censored_provider_rows(candidate, format!("malformed receipt: {error}"));
+        }
+    };
+    if let Err(error) = receipt.validate(&manifest_bytes, &manifest) {
+        return censored_provider_rows(candidate, format!("invalid receipt: {error}"));
+    }
+    if receipt.candidate_manifest_sha256 != candidate {
+        return censored_provider_rows(
+            candidate,
+            format!(
+                "stale receipt: {} is not {candidate}",
+                receipt.candidate_manifest_sha256
+            ),
+        );
+    }
+    receipt
+        .rows
+        .into_iter()
+        .map(|row| {
+            let evidence = format!("{}#{}", receipt_path.display(), row.evidence);
+            match row.outcome {
+                TrialOutcome::Pass => passed(row.case_id, candidate, evidence),
+                TrialOutcome::Unserved => FinalRow {
+                    case_id: row.case_id,
+                    candidate: candidate.to_string(),
+                    outcome: TrialOutcome::Unserved,
+                    evidence: Some(evidence),
+                    cause: Some("unserved: no installed adapter".to_string()),
+                },
+                TrialOutcome::Fail => failed(row.case_id, candidate, evidence),
+                TrialOutcome::Censored => censored(
+                    row.case_id,
+                    candidate,
+                    format!("receipt censored: {evidence}"),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn provider_trial_rows(candidate: &str) -> Vec<FinalRow> {
+    provider_trial_rows_from(
+        &provider_manifest_path(),
+        &provider_receipt_path(),
+        candidate,
+    )
+}
+
+fn provider_receipt(
+    manifest_bytes: &[u8],
+    manifest: &OfflineEvidenceManifest,
+    candidate: &str,
+) -> OfflineEvidenceReceipt {
+    let rows: Vec<EvidenceRow> = manifest
+        .rows
+        .iter()
+        .map(|row| EvidenceRow {
+            case_id: row.case_id.clone(),
+            evidence: row.oracle.first().expect("one oracle").clone(),
+            marker: row.marker.clone(),
+            outcome: match row.expected {
+                TrialExpectation::Pass => TrialOutcome::Pass,
+                TrialExpectation::Unserved => TrialOutcome::Unserved,
+            },
+        })
+        .collect();
+    let mut cases: BTreeMap<String, u32> = BTreeMap::new();
+    for row in &rows {
+        let target = row
+            .evidence
+            .split_once("::")
+            .expect("target::test")
+            .0
+            .to_string();
+        *cases.entry(target).or_default() += 1;
+    }
+    let targets = cases
+        .into_iter()
+        .map(|(target, cases)| OfflineEvidenceTarget {
+            command: format!("cargo test --locked --test {target} -- --nocapture"),
+            target,
+            exit: 0,
+            output_sha256: "a".repeat(64),
+            cases,
+        })
+        .collect();
+    OfflineEvidenceReceipt {
+        schema_version: 1,
+        producer_version: "1".to_string(),
+        family: "provider".to_string(),
+        candidate_manifest_sha256: candidate.to_string(),
+        manifest_sha256: rivect::config::hex(&Sha256::digest(manifest_bytes)),
+        targets,
+        rows,
+        counts: OfflineEvidenceCounts {
+            rows: 222,
+            pass: 216,
+            unserved: 6,
+        },
+    }
+}
+
+#[test]
+fn provider_receipt_missing_stale_or_unmarked_is_never_pass() {
+    let candidate = "b".repeat(64);
+    let manifest_bytes = std::fs::read(provider_manifest_path()).expect("the manifest is readable");
+    let manifest = OfflineEvidenceManifest::load(&manifest_bytes).expect("the manifest validates");
+    let root = tempfile::TempDir::with_prefix("rivect-provider-receipt-").expect("temp");
+    let receipt_path = root.path().join("provider-trials.json");
+    let manifest_path = provider_manifest_path();
+
+    let current = provider_receipt(&manifest_bytes, &manifest, &candidate);
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&current).expect("serialize the receipt"),
+    )
+    .expect("write the current receipt");
+    let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert_eq!(rows.len(), 222);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.outcome == TrialOutcome::Pass)
+            .count(),
+        216
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.outcome == TrialOutcome::Unserved)
+            .count(),
+        6
+    );
+    assert!(
+        rows.iter()
+            .all(|row| matches!(row.outcome, TrialOutcome::Pass | TrialOutcome::Unserved))
+    );
+
+    std::fs::remove_file(&receipt_path).expect("remove the receipt");
+    let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert_eq!(rows.len(), 222);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "a missing receipt is censored, never pass"
+    );
+
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&provider_receipt(
+            &manifest_bytes,
+            &manifest,
+            &"c".repeat(64),
+        ))
+        .expect("serialize the stale receipt"),
+    )
+    .expect("write the stale receipt");
+    let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "a stale receipt is censored, never pass"
+    );
+
+    let mut unmarked = provider_receipt(&manifest_bytes, &manifest, &candidate);
+    unmarked.rows[0].marker.clear();
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&unmarked).expect("serialize the unmarked receipt"),
+    )
+    .expect("write the unmarked receipt");
+    let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "an unmarked receipt is censored, never pass"
+    );
+
+    let mut shrunken = provider_receipt(&manifest_bytes, &manifest, &candidate);
+    shrunken.rows.pop();
+    shrunken.counts.rows = shrunken.rows.len();
+    shrunken.counts.pass = shrunken
+        .rows
+        .iter()
+        .filter(|row| row.outcome == TrialOutcome::Pass)
+        .count();
+    shrunken.counts.unserved = shrunken
+        .rows
+        .iter()
+        .filter(|row| row.outcome == TrialOutcome::Unserved)
+        .count();
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&shrunken).expect("serialize the shrunken receipt"),
+    )
+    .expect("write the shrunken receipt");
+    let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "a shrunken receipt is censored, never pass"
+    );
+}
+
+#[test]
+fn unserved_rows_are_terminal_and_never_passed() {
+    let candidate = "candidate-current";
+    let mut rows = complete_rows(candidate);
+    let unserved: BTreeSet<String> = rivect::verification::unserved_cases().into_iter().collect();
+    for row in &mut rows {
+        if unserved.contains(&row.case_id) {
+            row.outcome = TrialOutcome::Unserved;
+            row.evidence = Some(format!("receipt#{}", row.case_id));
+            row.cause = Some("unserved: no installed adapter".to_string());
+        }
+    }
+    let report = counted(candidate, &rows);
+    assert!(report.full_pass, "{report:?}");
+    assert_eq!(report.unserved, 6);
+    assert_eq!(report.passed, report.required - 6);
+    assert!(report.blockers.is_empty(), "{report:?}");
+
+    let mut promoted = rows.clone();
+    let victim = promoted
+        .iter_mut()
+        .find(|row| row.case_id == "TP-PROVIDER-AUTH::openai")
+        .expect("the openai auth row");
+    victim.outcome = TrialOutcome::Unserved;
+    assert!(matches!(
+        evaluate_final(candidate, FinalDeclaration::release(), &promoted),
+        Err(FinalAcceptanceError::UnservedOutsideRecordedSet { .. })
+    ));
+    assert!(!is_unserved_case("TP-PROVIDER-AUTH::openai"));
 }
 
 fn search_rows(candidate: &str) -> Vec<FinalRow> {
@@ -1427,9 +1713,9 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             }
         }
     }
-    for (id, _dialect) in PROVIDER_ROWS {
-        for trial in ["AUTH", "WIRE", "RECOVERY"] {
-            expected_not_run.insert(provider_case(trial, id));
+    for row in &rows {
+        if row.case_id.starts_with("TP-PROVIDER-") && row.outcome == TrialOutcome::Censored {
+            expected_not_run.insert(row.case_id.clone());
         }
     }
     for (case_id, _mode) in conjunction_cells() {
@@ -1487,6 +1773,13 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     );
     assert!(report.blockers.failed.is_empty(), "{report:?}");
     assert!(report.blockers.unattributed.is_empty(), "{report:?}");
+    assert_eq!(
+        report.unserved,
+        rows.iter()
+            .filter(|row| row.outcome == TrialOutcome::Unserved)
+            .count(),
+        "unserved is counted outside passed"
+    );
 
     let observed_not_run: BTreeSet<&str> =
         report.blockers.not_run.iter().map(String::as_str).collect();
@@ -1519,8 +1812,8 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         );
         assert_eq!(
             report.passed,
-            expected_required_rows() - declared_not_run.len(),
-            "every current row and cell passes"
+            expected_required_rows() - declared_not_run.len() - report.unserved,
+            "every current row and cell passes; unserved stays outside passed"
         );
     }
 

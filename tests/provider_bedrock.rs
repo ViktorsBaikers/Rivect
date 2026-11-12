@@ -8,6 +8,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -34,6 +35,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
 
 use support::{MapStore, prepared_with, responses_completed_stream};
 
@@ -633,6 +642,7 @@ fn tool_stream(name: &str, input: &str, stop_reason: &str) -> Vec<u8> {
 
 #[test]
 fn bedrock_valid_control_bearer_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "amazon-bedrock");
     let peer = scripted_peer(valid_stream("verified outcome text", 11, 7));
     let config = standard_config(MODEL);
     let store = fixture_store(BEARER);
@@ -1043,6 +1053,7 @@ fn bedrock_pinned_effort_denies() {
 
 #[test]
 fn bedrock_wrong_credential_or_region_denies_without_secrets() {
+    emit_provider_row("AUTH", "amazon-bedrock");
     let material = r#"{"sso_start_url":"https://example.invalid/start"}"#;
     let silent = SilentPeer::new();
     let config = standard_config(MODEL);
@@ -1219,6 +1230,7 @@ fn bedrock_absent_material_denies_with_no_request() {
 
 #[test]
 fn bedrock_partial_tool_block_and_unknown_terminal_deny() {
+    emit_provider_row("RECOVERY", "amazon-bedrock");
     let peer = scripted_peer(tool_stream("read_file", r#"{"path":"#, "tool_use"));
     let config = standard_config(MODEL);
     let mut provider = fixture_provider(&config, fixture_store(BEARER), &peer.base);
@@ -1540,6 +1552,7 @@ fn bedrock_exception_message_escapes_control_characters() {
 
 #[test]
 fn mantle_valid_control_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "bedrock-mantle");
     let stream = responses_completed_stream(
         "mantle outcome",
         Vec::new(),
@@ -1900,6 +1913,7 @@ fn mantle_listed_offer_gates_send() {
 
 #[test]
 fn mantle_failed_discovery_keeps_the_seed() {
+    emit_provider_row("RECOVERY", "bedrock-mantle");
     let cases: [(&str, &[u8]); 3] = [
         ("500 Internal Server Error", b"{\"error\":\"down\"}"),
         ("200 OK", b"not json"),
@@ -2054,6 +2068,7 @@ fn mantle_base_override_denies_non_loopback_and_ambiguous_urls() {
 
 #[test]
 fn mantle_wrong_region_denies_without_secrets() {
+    emit_provider_row("AUTH", "bedrock-mantle");
     let silent = SilentPeer::new();
     // A geo-prefixed pin under a configured region outside its geo takes
     // the shared resolver's region gate before the offer gate.

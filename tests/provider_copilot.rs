@@ -8,6 +8,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -36,6 +37,14 @@ use wiremock::matchers::{method, path as path_matcher};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
 
 use support::{MapStore, drop_blocking, prepared_with, responses_completed_stream, sse_block};
 
@@ -423,6 +432,7 @@ fn records_path(requests: &[Request], route: &str) {
 
 #[tokio::test]
 async fn copilot_messages_path_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "github-copilot");
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -841,6 +851,7 @@ async fn copilot_model_outside_the_closed_table_denies() {
 
 #[tokio::test]
 async fn copilot_wrong_credential_or_origin_denies_without_secrets() {
+    emit_provider_row("AUTH", "github-copilot");
     let server = MockServer::start().await;
     let config = copilot_config(CHAT_MODEL);
 
@@ -988,6 +999,7 @@ async fn copilot_permanent_auth_denial_is_not_retried() {
 
 #[tokio::test]
 async fn copilot_rate_limit_is_bounded_without_cross_id_fallback() {
+    emit_provider_row("RECOVERY", "github-copilot");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path_matcher(CHAT_PATH))

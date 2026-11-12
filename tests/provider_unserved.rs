@@ -13,7 +13,8 @@
 #![allow(
     clippy::expect_used,
     clippy::panic,
-    reason = "test code keeps expect/panic conveniences; src/ stays strict (standards §14)"
+    clippy::print_stdout,
+    reason = "test code keeps expect/panic conveniences and prints the offline receipt row markers; src/ stays strict (standards §14)"
 )]
 
 use rivect::config::{Config, Connection};
@@ -26,6 +27,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod support;
+
+/// Print the three offline receipt markers a terminal unserved row set
+/// proves: the send gate denied typed with zero requests and accounting.
+fn emit_unserved_rows(provider: &str) {
+    for trial in rivect::verification::OFFLINE_PROVIDER_TRIALS {
+        println!(
+            "ROW {} ok",
+            rivect::verification::provider_case(trial, provider)
+        );
+    }
+}
 
 use support::{CountingLedger, CountingProvider};
 
@@ -77,6 +89,7 @@ fn unserved_denial(
 
 #[test]
 fn cursor_send_denies_unserved_with_zero_requests() {
+    emit_unserved_rows("cursor");
     let (error, requests, broker) = unserved_denial("cursor", CREDENTIAL_REF, WORLD, MODEL);
     assert!(
         matches!(
@@ -100,6 +113,7 @@ fn cursor_send_denies_unserved_with_zero_requests() {
 
 #[test]
 fn devin_send_denies_unserved_with_zero_requests() {
+    emit_unserved_rows("devin");
     let (error, requests, broker) =
         unserved_denial("devin", DEVIN_CREDENTIAL_REF, DEVIN_WORLD, DEVIN_MODEL);
     let ModelError::Provider(source) = &error else {

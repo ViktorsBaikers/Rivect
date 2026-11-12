@@ -23,6 +23,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -43,6 +44,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
 
 use support::{
     CountingLedger, MapStore, drop_blocking, prepared_with, received_bodies, send_on_thread,
@@ -299,6 +308,7 @@ fn messages_path(project: &str, location: &str, model: &str) -> String {
 /// surfaces — each leg returns one verified outcome from one request.
 #[tokio::test]
 async fn class_dispatch_uses_the_recorded_class_per_credential_form() {
+    emit_provider_row("WIRE", "google-vertex");
     assert_eq!(dialect_for(VERTEX), Some(Dialect::Vertex));
     assert_eq!(Dialect::Vertex.to_string(), "vertex");
 
@@ -764,6 +774,7 @@ async fn auto_assignment_denies_typed_before_the_post() {
 /// denies typed before the post: the key form never guesses a credential.
 #[tokio::test]
 async fn malformed_api_key_denies_before_the_post() {
+    emit_provider_row("AUTH", "google-vertex");
     let server = MockServer::start().await;
     let config = Config::parse_validated(&vertex_config(&server.uri(), GEMINI_MODEL, AUTO_EFFORT))
         .expect("valid");
@@ -993,6 +1004,7 @@ async fn betas_ride_the_messages_body_never_the_header() {
 /// `message_stop`.
 #[tokio::test]
 async fn truncated_streams_are_never_success() {
+    emit_provider_row("RECOVERY", "google-vertex");
     let server = MockServer::start().await;
     let partial_gemini = format!(
         "data: {}\n\n",

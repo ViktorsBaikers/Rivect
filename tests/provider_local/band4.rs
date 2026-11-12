@@ -725,6 +725,7 @@ fn band4_vllm_default_base_is_its_own_recorded_host() {
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_vllm_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("vllm");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -1504,6 +1505,7 @@ fn band4_venice_discriminates_the_recorded_default_base() {
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_venice_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("venice");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -2311,6 +2313,7 @@ fn band4_xai_oauth_discriminates_the_recorded_default_base() {
 /// the `grok.com` accounting origin are never claimed.
 #[tokio::test]
 async fn band4_xai_oauth_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xai-oauth");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3127,6 +3130,7 @@ fn band4_xai_discriminates_the_recorded_default_base() {
 /// INSTALLED reports NOT_RUN — no live xAI call is ever claimed.
 #[tokio::test]
 async fn band4_xai_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xai");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -3918,6 +3922,7 @@ fn band4_wafer_serverless_discriminates_the_recorded_default_base() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_wafer_serverless_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("wafer-serverless");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -4588,6 +4593,7 @@ fn band4_xiaomi_default_base_is_the_payg_literal() {
 /// INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_xiaomi_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xiaomi");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5260,6 +5266,7 @@ fn band4_xiaomi_token_plan_ams_default_base_is_the_ams_literal() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_xiaomi_token_plan_ams_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xiaomi-token-plan-ams");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5928,6 +5935,7 @@ fn band4_xiaomi_token_plan_cn_default_base_is_the_cn_literal() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_xiaomi_token_plan_cn_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xiaomi-token-plan-cn");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -6601,6 +6609,7 @@ fn band4_xiaomi_token_plan_sgp_default_base_is_the_sgp_literal() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_xiaomi_token_plan_sgp_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("xiaomi-token-plan-sgp");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -7433,6 +7442,7 @@ fn band4_yolo_auto_discriminates_the_recorded_default_base() {
 /// and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn band4_yolo_auto_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("yolo-auto");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 

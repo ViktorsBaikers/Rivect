@@ -13,6 +13,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -34,6 +35,16 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print the three offline provider trial markers a legs matrix proves.
+fn emit_provider_rows(provider: &str) {
+    for trial in rivect::verification::OFFLINE_PROVIDER_TRIALS {
+        println!(
+            "ROW {} ok",
+            rivect::verification::provider_case(trial, provider)
+        );
+    }
+}
 
 use support::{SlowStore, drop_blocking, received_bodies, send_on_thread};
 
@@ -4616,6 +4627,7 @@ async fn replay_body_is_bounded_by_the_wire_limit() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("google");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 

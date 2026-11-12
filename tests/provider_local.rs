@@ -23,10 +23,11 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
-    reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
+    reason = "test code keeps unwrap/expect/panic/discard conveniences and prints the offline receipt row markers; src/ stays strict (standards §14)"
 )]
 
 use rivect::config::{Config, ConfigIssue, EffortLevel};
@@ -45,6 +46,22 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial. The producer
+/// requires the exact line and the test proves the leg before it prints.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
+
+/// Print the three offline provider trial markers a legs matrix proves.
+fn emit_provider_rows(provider: &str) {
+    for trial in rivect::verification::OFFLINE_PROVIDER_TRIALS {
+        emit_provider_row(trial, provider);
+    }
+}
 
 use support::{
     SlowStore, drop_blocking, mount_responses, prepared_with, responses_completed_stream,
@@ -4544,6 +4561,7 @@ async fn reasoning_and_refusal_deltas_never_join_the_answer() {
 /// an omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("custom-chat-completions");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5703,6 +5721,7 @@ async fn abliteration_stream_rejections_stay_typed_and_charge_nothing() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn abliteration_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("abliteration");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -6651,6 +6670,7 @@ async fn aiand_auto_pick_resolves_through_the_merged_catalog() {
 /// suite rather than silently absenting.
 #[tokio::test]
 async fn aiand_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("aiand");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -7473,6 +7493,7 @@ async fn aimlapi_auto_pick_resolves_through_the_filtered_catalog() {
 /// suite rather than silently absenting.
 #[tokio::test]
 async fn aimlapi_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("aimlapi");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -8615,6 +8636,7 @@ async fn alibaba_coding_plan_typed_denial_recovers_through_the_same_credential_s
 /// absenting.
 #[tokio::test]
 async fn alibaba_coding_plan_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("alibaba-coding-plan");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -9972,6 +9994,7 @@ async fn alibaba_token_plan_typed_denial_recovers_through_the_same_credential_se
 /// absenting.
 #[tokio::test]
 async fn alibaba_token_plan_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("alibaba-token-plan");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -10946,6 +10969,7 @@ async fn coreweave_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn coreweave_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("coreweave");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": "matrix"})]).await;
@@ -11824,6 +11848,7 @@ async fn deepinfra_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn deepinfra_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("deepinfra");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": "matrix"})]).await;
@@ -12975,6 +13000,7 @@ async fn deepseek_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn deepseek_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("deepseek");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": "matrix"})]).await;
@@ -14168,6 +14194,7 @@ async fn fireworks_typed_denial_recovers_through_the_same_credential_seam() {
 /// omitted leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn fireworks_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("fireworks");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": "deepseek-v4-flash"})]).await;
@@ -14963,6 +14990,7 @@ async fn firepass_typed_denial_recovers_through_the_same_credential_seam() {
 /// suite rather than silently absenting.
 #[tokio::test]
 async fn firepass_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("firepass");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_chat(
@@ -15750,6 +15778,7 @@ async fn gmi_cloud_typed_denial_recovers_through_the_same_credential_seam() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn gmi_cloud_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("gmi-cloud");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": GMI_MODEL})]).await;
@@ -16917,6 +16946,7 @@ async fn groq_typed_denial_recovers_through_the_same_credential_seam() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn groq_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("groq");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(
@@ -18360,6 +18390,7 @@ async fn huggingface_typed_denial_recovers_through_the_same_credential_seam() {
 /// leg fails the suite rather than silently absenting.
 #[tokio::test]
 async fn huggingface_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("huggingface");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(
@@ -19324,6 +19355,7 @@ async fn kilo_typed_denial_recovers_through_the_same_credential_seam() {
 /// caught by the gate's exact-name chain, not by this row.
 #[tokio::test]
 async fn kilo_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("kilo");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": KILO_FREE_MODEL})]).await;
@@ -20935,6 +20967,7 @@ async fn litellm_open_proxy_empty_material_denies_before_any_leg() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn litellm_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("litellm");
     use std::collections::BTreeMap;
     let server = MockServer::start().await;
     mount_models(&server, vec![json!({"id": LITELLM_LISTED})]).await;
@@ -23021,6 +23054,7 @@ mod kimi_contract {
     /// denies before the adapter exists and crosses no wire at all.
     #[test]
     fn kimi_wrong_model_and_profile_deny_before_any_inference_request() {
+        emit_provider_row("AUTH", "kimi-code");
         let peer = KimiPeer::start(|method, path, _body| match (method, path) {
             ("GET", "/v1/models") => Reply::json(models_listing()),
             _ => Reply {
@@ -23095,6 +23129,7 @@ mod kimi_contract {
     /// through it; the adapter serves only its own id.
     #[test]
     fn kimi_configured_provider_serves_the_literal_row() {
+        emit_provider_row("WIRE", "kimi-code");
         let peer = KimiPeer::start(|method, path, _body| match (method, path) {
             ("GET", "/v1/models") => Reply::json(models_listing()),
             ("POST", "/v1/messages") => Reply::sse(messages_stream("factory answer")),
@@ -23348,6 +23383,7 @@ mod kimi_contract {
     /// lineage so the same epoch never replays or retries again.
     #[test]
     fn kimi_messages_signature_400_strips_once_and_clears_the_epoch() {
+        emit_provider_row("RECOVERY", "kimi-code");
         let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&captures);
         let peer = KimiPeer::start(move |method, path, _body| match (method, path) {
@@ -24322,6 +24358,8 @@ mod zai_contract {
     /// entered send returns one outcome and one physical usage.
     #[test]
     fn zai_aliases_send_the_canonical_profile_on_both_coding_plan_transports() {
+        emit_provider_row("WIRE", "zai");
+        emit_provider_row("WIRE", "zai-coding-plan");
         let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
             ("POST", "/v1/messages") => Reply::sse(messages_stream("messages answer")),
             ("POST", "/chat/completions") => Reply::sse(chat_stream(
@@ -24712,6 +24750,8 @@ mod zai_contract {
     /// admitted by a public listing or an HTTP 200.
     #[test]
     fn zai_wrong_credential_and_public_model_are_not_entitlement() {
+        emit_provider_row("AUTH", "zai");
+        emit_provider_row("AUTH", "zai-coding-plan");
         let peer = ZaiPeer::start(|method, path, _body| match (method, path) {
             ("GET", "/models") => Reply::sse("{\"data\": [{\"id\": \"glm-9-payg\"}]}"),
             ("POST", "/v1/messages") => Reply::sse(messages_stream("unexpected")),
@@ -24913,6 +24953,8 @@ mod zai_contract {
     /// the epoch.
     #[test]
     fn zai_messages_reasoning_replay_and_one_strip_retry_hold() {
+        emit_provider_row("RECOVERY", "zai");
+        emit_provider_row("RECOVERY", "zai-coding-plan");
         let captures = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&captures);
         let peer = ZaiPeer::start(move |method, path, _body| match (method, path) {

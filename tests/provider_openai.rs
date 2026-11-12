@@ -19,10 +19,11 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
-    reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
+    reason = "test code keeps unwrap/expect/panic/discard conveniences and prints the offline receipt row markers; src/ stays strict (standards §14)"
 )]
 
 use rivect::config::{Config, ConnKind, EffortLevel};
@@ -45,6 +46,21 @@ use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
+
+/// Print the three offline provider trial markers a legs matrix proves.
+fn emit_provider_rows(provider: &str) {
+    for trial in rivect::verification::OFFLINE_PROVIDER_TRIALS {
+        emit_provider_row(trial, provider);
+    }
+}
 
 use support::{
     SlowStore, drop_blocking, mount_responses, prepared_with, received_bodies,
@@ -4411,6 +4427,7 @@ async fn replay_body_is_bounded_by_the_wire_limit() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("openai");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -5350,6 +5367,7 @@ async fn meta_adverse_wire_input_never_reports_success() {
 /// rather than silently absenting.
 #[tokio::test]
 async fn meta_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("meta");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -6690,6 +6708,7 @@ fn ollama_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn ollama_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("ollama");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -7702,6 +7721,7 @@ fn openrouter_dialect_is_keyed_on_the_literal_connection_id() {
 /// run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn openrouter_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("openrouter");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -8454,6 +8474,7 @@ fn sakana_dialect_is_keyed_on_the_literal_connection_id() {
 /// this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn sakana_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("sakana");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -9450,6 +9471,7 @@ async fn custom_responses_short_deadline_denies_without_a_second_request() {
 /// report inside this run, and INSTALLED reports NOT_RUN.
 #[tokio::test]
 async fn custom_responses_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("custom-responses");
     use std::collections::BTreeMap;
     let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
 
@@ -9801,6 +9823,7 @@ fn codex_uri_at(address: std::net::SocketAddr) -> String {
 /// the request, and a replay of the spent attempt sends nothing.
 #[tokio::test]
 async fn openai_codex_valid_control_yields_one_outcome_and_one_physical_usage() {
+    emit_provider_row("WIRE", "openai-codex");
     let server = MockServer::start().await;
     mount_codex_responses(
         &server,
@@ -9943,6 +9966,8 @@ async fn openai_codex_catalog_is_the_account_workspace_discovery() {
 /// canonical id's apart from its literal connection.
 #[tokio::test]
 async fn openai_codex_device_alias_selects_the_same_contract() {
+    emit_provider_row("AUTH", "openai-codex-device");
+    emit_provider_row("WIRE", "openai-codex-device");
     assert_eq!(
         rivect::providers::dialect_for("openai-codex-device"),
         Some(Dialect::Responses),
@@ -10015,6 +10040,7 @@ async fn openai_codex_device_alias_selects_the_same_contract() {
 /// typed before a false success, and the denial never renders the secret.
 #[tokio::test]
 async fn openai_codex_wrong_credential_profile_or_region_denies_without_secrets() {
+    emit_provider_row("AUTH", "openai-codex");
     let endpoint = "http://127.0.0.1:1/backend-api/codex";
 
     // A configured region has no recorded Codex contract.
@@ -10437,6 +10463,8 @@ async fn openai_codex_chain_refuses_every_sibling_after_an_attempted_failure() {
 /// the walk continues past the refusal instead of ending the chain.
 #[tokio::test]
 async fn openai_codex_chain_continues_past_a_same_contract_refusal() {
+    emit_provider_row("RECOVERY", "openai-codex");
+    emit_provider_row("RECOVERY", "openai-codex-device");
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/backend-api/codex/responses"))

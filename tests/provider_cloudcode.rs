@@ -35,6 +35,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stdout,
     clippy::let_underscore_must_use,
     let_underscore_drop,
     clippy::redundant_clone,
@@ -67,6 +68,14 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
+
+/// Print one offline receipt marker for a provider trial.
+fn emit_provider_row(trial: &str, provider: &str) {
+    println!(
+        "ROW {} ok",
+        rivect::verification::provider_case(trial, provider)
+    );
+}
 
 use support::{CountingLedger, MapStore, SlowStore, prepared_with, received_bodies};
 
@@ -481,6 +490,7 @@ const REQUEST_KEYS: &[&str] = &[
 /// verified outcome with one accounting record.
 #[tokio::test]
 async fn antigravity_envelope_is_recorded() {
+    emit_provider_row("WIRE", "google-antigravity");
     assert_eq!(dialect_for(ANTIGRAVITY), Some(Dialect::CloudCode));
     assert_eq!(Dialect::CloudCode.to_string(), "cloudcode");
 
@@ -980,6 +990,7 @@ async fn recorded_daily_and_sandbox_origins_are_admitted() {
 /// exactly one accounting row for the connection.
 #[tokio::test]
 async fn a_transient_first_failure_falls_back_to_the_sandbox_origin_once() {
+    emit_provider_row("RECOVERY", "google-antigravity");
     let daily = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(STREAM_PATH))
@@ -2070,6 +2081,7 @@ async fn a_retried_stream_failure_keeps_the_crossed_leg_count() {
 /// accounting row.
 #[tokio::test]
 async fn wrong_origin_and_profile_deny_without_a_request() {
+    emit_provider_row("AUTH", "google-antigravity");
     // The foreign origin is config-valid https but outside the recorded
     // set. The zero budget makes a guard regression stop at the deadline
     // instead of reaching the foreign host.
@@ -2853,6 +2865,7 @@ fn antigravity_adapter_consumes_the_producer_artifact() {
 /// members, and one verified outcome with one accounting record.
 #[tokio::test]
 async fn gemini_cli_envelope_is_recorded() {
+    emit_provider_row("WIRE", "google-gemini-cli");
     assert_eq!(dialect_for(GEMINI_CLI), Some(Dialect::CloudCode));
 
     let server = MockServer::start().await;
@@ -3007,6 +3020,7 @@ async fn gemini_cli_envelope_is_recorded() {
 /// past it by the resolve delay.
 #[tokio::test]
 async fn a_slow_resolve_cannot_push_the_gemini_cli_send_past_the_deadline() {
+    emit_provider_row("RECOVERY", "google-gemini-cli");
     let deadline = Duration::from_millis(1600);
     let (origin, peer) = never_answer();
     let config =
@@ -3212,6 +3226,7 @@ async fn gemini_cli_recorded_tier_states_send_with_a_bound_project() {
 /// with zero requests and no accounting row.
 #[tokio::test]
 async fn gemini_cli_tier_and_project_gate_denies_before_the_post() {
+    emit_provider_row("AUTH", "google-gemini-cli");
     let server = MockServer::start().await;
     let config = Config::parse_validated(&gemini_cli_config(&server.uri(), GEMINI_CLI_MODEL))
         .expect("valid");
