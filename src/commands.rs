@@ -173,6 +173,11 @@ pub struct Runtime {
     /// injects its own store; a complete call that finds none opens the
     /// platform backend the bound scope's class names.
     pub login_credentials: Option<Arc<dyn crate::providers::CredentialStore>>,
+    /// The credential seam `docs.search` resolves its scoped
+    /// `search.<service>` binding through (TD-19). A proof injects its own
+    /// store; while none is bound the platform backend opens on the first
+    /// lookup, so opening a runtime still touches no keyring.
+    pub search_credentials: Option<Arc<dyn crate::providers::CredentialStore>>,
     /// Test-only contract-peer endpoints: the in-crate TUI proof needs the
     /// loopback peer the production surface never selects.
     #[cfg(test)]
@@ -1548,6 +1553,7 @@ impl Runtime {
             provider_credentials,
             mcp_credentials: None,
             login_credentials: None,
+            search_credentials: None,
             #[cfg(test)]
             login_endpoints: None,
             pending_login: None,
@@ -2379,6 +2385,7 @@ const METHODS: &[&str] = &[
     "sharing.attach",
     "sharing.grant.revoke",
     "provider.row",
+    "docs.search",
     "support.preview",
     "support.export",
     "support.replay",
@@ -2530,6 +2537,8 @@ enum RequestError {
     InvalidQuestion,
     #[error("docs.status question.{field} must be a non-empty string")]
     InvalidQuestionField { field: &'static str },
+    #[error("limit must be an integer from 1 to 20")]
+    InvalidSearchLimit,
     #[error("support bundle exceeds {limit} bytes")]
     SupportBundleTooLarge { limit: usize },
     #[error(transparent)]
@@ -4942,8 +4951,9 @@ fn docs_question_field<'a>(
 }
 
 /// `docs.status`: the documentation owner's declared source, version policy,
-/// cache bounds and honest account facts. A pure read — no external refresh,
-/// and a quota this build cannot observe stays `unknown` instead of zero.
+/// cache bounds and honest account facts. A pure read with zero transports and
+/// zero credential reads — no external refresh, and a quota this build cannot
+/// observe stays `unknown` instead of zero.
 /// A caller may add a `question` naming an on-disk direct-source snapshot; the
 /// typed answer rides beside the unchanged status fields and never mutates the
 /// cache, reads a credential or reaches the wire.
@@ -4989,6 +4999,57 @@ fn docs_status(id: Value, params: &Value) -> RpcResponse {
     };
     object.insert("answer".to_string(), json!(answer));
     RpcResponse::ok(id, result)
+}
+
+/// `docs.search`: one bounded request to exactly one recorded service
+/// profile. The selector is validated before the credential seam is touched,
+/// the scoped `search.<service>` binding resolves through the runtime's store,
+/// and every failure is the owner's typed `SearchError` — never a package
+/// document and never a direct-source substitute. `docs.status` stays a pure
+/// read; this method is its only transport-bearing sibling.
+fn docs_search(rt: &mut Runtime, id: Value, params: &Value) -> RpcResponse {
+    let Some(session) = session_param(params) else {
+        return missing_session(id);
+    };
+    let Some(service) = params.get("service").and_then(Value::as_str) else {
+        return request_error(id, RequestError::Required { field: "service" });
+    };
+    let Ok(query) = required_str(params, "query") else {
+        return request_error(id, RequestError::Required { field: "query" });
+    };
+    let limit = match params.get("limit") {
+        None => crate::docs::SEARCH_DEFAULT_LIMIT,
+        Some(value) => match value.as_u64().and_then(|limit| usize::try_from(limit).ok()) {
+            Some(limit) => limit,
+            None => return request_error(id, RequestError::InvalidSearchLimit),
+        },
+    };
+    let request = crate::docs::SearchRequest {
+        schema_version: SCHEMA_VERSION,
+        session_id: session.0,
+        service: service.to_string(),
+        query: query.to_string(),
+        limit,
+    };
+    let config = rt.effective().composed();
+    let store = rt
+        .search_credentials
+        .clone()
+        .unwrap_or_else(crate::providers::platform_credential_store);
+    match crate::docs::search(&request, &config, store.as_ref()) {
+        Ok(result) => match serde_json::to_value(result) {
+            Ok(result) => RpcResponse::ok(id, result),
+            Err(_) => request_error(id, RequestError::Serialization),
+        },
+        Err(error) => {
+            let rpc = match error {
+                crate::docs::SearchError::UnknownService { .. }
+                | crate::docs::SearchError::InvalidRequest { .. } => -32602,
+                _ => -32000,
+            };
+            envelope_error(id, error.code(), rpc, &error.to_string())
+        }
+    }
 }
 
 /// `read_file`: the catalog's `read` alias resolving to the admitted tool. The
@@ -5661,6 +5722,7 @@ fn handle_method(
         "sharing.attach" => sharing_attach(rt, &params, id),
         "sharing.grant.revoke" => sharing_grant_revoke(rt, ingress, &params, id),
         "provider.row" => provider_row(id, &params),
+        "docs.search" => docs_search(rt, id, &params),
         "support.preview" => support_preview(id, &params),
         "support.export" => support_export(id, &params),
         "support.replay" => support_replay(id, &params),

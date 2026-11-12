@@ -907,18 +907,220 @@ fn unserved_rows_are_terminal_and_never_passed() {
     assert!(!is_unserved_case("TP-PROVIDER-AUTH::openai"));
 }
 
-fn search_rows(candidate: &str) -> Vec<FinalRow> {
+const SEARCH_PRODUCER: &str = "sh scripts/offline-evidence.sh --manifest tests/fixtures/search-trials.json --receipt target/search-trials.json --bundle <dir>";
+
+fn search_manifest_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("search-trials.json")
+}
+
+fn search_receipt_path() -> PathBuf {
+    std::env::var_os("RIVECT_SEARCH_TRIALS_RECEIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("search-trials.json")
+        })
+}
+
+fn censored_search_rows(candidate: &str, cause: String) -> Vec<FinalRow> {
     conjunction_cells()
         .into_iter()
         .filter(|(case_id, _mode)| case_id.starts_with("TP-SEARCH-"))
-        .map(|(case_id, _mode)| {
-            censored(
-                case_id,
+        .map(|(case_id, _mode)| censored(case_id, candidate, cause.clone()))
+        .collect()
+}
+
+/// Consume the candidate-current search receipt. A missing, stale, malformed
+/// or unmarked receipt contributes the 20 censored cells only; a current one
+/// maps every executed row to its terminal outcome.
+fn search_rows_from(manifest_path: &Path, receipt_path: &Path, candidate: &str) -> Vec<FinalRow> {
+    let manifest_bytes = match std::fs::read(manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!(
+                "OFFLINE_ACCEPTANCE pending family=search producer=\"{SEARCH_PRODUCER}\" cause=\"{error}\""
+            );
+            return censored_search_rows(
                 candidate,
-                "not run: the search target is not consumed by this conjunction".to_string(),
-            )
+                format!("missing manifest: run {SEARCH_PRODUCER}"),
+            );
+        }
+    };
+    let manifest = match OfflineEvidenceManifest::load(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return censored_search_rows(candidate, format!("malformed manifest: {error}"));
+        }
+    };
+    let receipt_bytes = match std::fs::read(receipt_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!(
+                "OFFLINE_ACCEPTANCE pending family=search producer=\"{SEARCH_PRODUCER}\" cause=\"{error}\""
+            );
+            return censored_search_rows(
+                candidate,
+                format!("missing receipt: run {SEARCH_PRODUCER}"),
+            );
+        }
+    };
+    let receipt = match OfflineEvidenceReceipt::load(&receipt_bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return censored_search_rows(candidate, format!("malformed receipt: {error}"));
+        }
+    };
+    if let Err(error) = receipt.validate(&manifest_bytes, &manifest) {
+        return censored_search_rows(candidate, format!("invalid receipt: {error}"));
+    }
+    if receipt.candidate_manifest_sha256 != candidate {
+        return censored_search_rows(
+            candidate,
+            format!(
+                "stale receipt: {} is not {candidate}",
+                receipt.candidate_manifest_sha256
+            ),
+        );
+    }
+    receipt
+        .rows
+        .into_iter()
+        .map(|row| {
+            let evidence = format!("{}#{}", receipt_path.display(), row.evidence);
+            match row.outcome {
+                TrialOutcome::Pass => passed(row.case_id, candidate, evidence),
+                TrialOutcome::Unserved => FinalRow {
+                    case_id: row.case_id,
+                    candidate: candidate.to_string(),
+                    outcome: TrialOutcome::Unserved,
+                    evidence: Some(evidence),
+                    cause: Some("unserved: no recorded search service".to_string()),
+                },
+                TrialOutcome::Fail => failed(row.case_id, candidate, evidence),
+                TrialOutcome::Censored => censored(
+                    row.case_id,
+                    candidate,
+                    format!("receipt censored: {evidence}"),
+                ),
+            }
         })
         .collect()
+}
+
+fn search_rows(candidate: &str) -> Vec<FinalRow> {
+    search_rows_from(&search_manifest_path(), &search_receipt_path(), candidate)
+}
+
+fn search_receipt(
+    manifest_bytes: &[u8],
+    manifest: &OfflineEvidenceManifest,
+    candidate: &str,
+) -> OfflineEvidenceReceipt {
+    let rows: Vec<EvidenceRow> = manifest
+        .rows
+        .iter()
+        .map(|row| EvidenceRow {
+            case_id: row.case_id.clone(),
+            evidence: row.oracle.first().expect("one oracle").clone(),
+            marker: row.marker.clone(),
+            outcome: TrialOutcome::Pass,
+        })
+        .collect();
+    let mut cases: BTreeMap<String, u32> = BTreeMap::new();
+    for row in &rows {
+        let target = row
+            .evidence
+            .split_once("::")
+            .expect("target::test")
+            .0
+            .to_string();
+        *cases.entry(target).or_default() += 1;
+    }
+    let targets = cases
+        .into_iter()
+        .map(|(target, cases)| OfflineEvidenceTarget {
+            command: format!("cargo test --locked --test {target} -- --nocapture"),
+            target,
+            exit: 0,
+            output_sha256: "a".repeat(64),
+            cases,
+        })
+        .collect();
+    OfflineEvidenceReceipt {
+        schema_version: 1,
+        producer_version: "1".to_string(),
+        family: "search".to_string(),
+        candidate_manifest_sha256: candidate.to_string(),
+        manifest_sha256: rivect::config::hex(&Sha256::digest(manifest_bytes)),
+        targets,
+        rows,
+        counts: OfflineEvidenceCounts {
+            rows: 20,
+            pass: 20,
+            unserved: 0,
+        },
+    }
+}
+
+#[test]
+fn search_receipt_missing_stale_or_unmarked_is_never_pass() {
+    let candidate = "d".repeat(64);
+    let manifest_bytes = std::fs::read(search_manifest_path()).expect("the search manifest reads");
+    let manifest =
+        OfflineEvidenceManifest::load(&manifest_bytes).expect("the search manifest validates");
+    let root = tempfile::TempDir::with_prefix("rivect-search-receipt-").expect("temp");
+    let receipt_path = root.path().join("search-trials.json");
+    let manifest_path = search_manifest_path();
+
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&search_receipt(&manifest_bytes, &manifest, &candidate))
+            .expect("serialize the receipt"),
+    )
+    .expect("write the current receipt");
+    let rows = search_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert_eq!(rows.len(), 20);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Pass),
+        "a current receipt maps all 20 cells: {rows:?}"
+    );
+
+    std::fs::remove_file(&receipt_path).expect("remove the receipt");
+    let rows = search_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert_eq!(rows.len(), 20);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "a missing receipt is censored, never pass"
+    );
+
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&search_receipt(&manifest_bytes, &manifest, &"e".repeat(64)))
+            .expect("serialize the stale receipt"),
+    )
+    .expect("write the stale receipt");
+    let rows = search_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "a stale receipt is censored, never pass"
+    );
+
+    let mut unmarked = search_receipt(&manifest_bytes, &manifest, &candidate);
+    unmarked.rows[0].marker.clear();
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec(&unmarked).expect("serialize the unmarked receipt"),
+    )
+    .expect("write the unmarked receipt");
+    let rows = search_rows_from(&manifest_path, &receipt_path, &candidate);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
+        "an unmarked receipt is censored, never pass"
+    );
 }
 
 fn installed_receipt_path() -> PathBuf {
@@ -2084,13 +2286,10 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         }
     }
     for row in &rows {
-        if row.case_id.starts_with("TP-PROVIDER-") && row.outcome == TrialOutcome::Censored {
+        if (row.case_id.starts_with("TP-PROVIDER-") || row.case_id.starts_with("TP-SEARCH-"))
+            && row.outcome == TrialOutcome::Censored
+        {
             expected_not_run.insert(row.case_id.clone());
-        }
-    }
-    for (case_id, _mode) in conjunction_cells() {
-        if case_id.starts_with("TP-SEARCH-") {
-            expected_not_run.insert(case_id);
         }
     }
 

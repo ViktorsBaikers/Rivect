@@ -29,6 +29,7 @@ mod support;
 
 use rivect::contracts::{RELEASE_MANIFEST_NAME, ReleaseManifest};
 use rivect::executor::verify_release_bundle;
+use rivect::verification::SEARCH_SERVICES;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -661,6 +662,120 @@ fn installed_support_and_replay_are_zero_effect_and_redacted() {
         "support replacements: {}; zero events, zero settlements, zero external effects",
         expected_replacements
     );
+}
+
+/// The packaged artifact serves all five recorded search profiles through the
+/// typed `docs.search` entry: with each `search.<service>` connection declared
+/// against a loopback endpoint and no credential material enrolled, every call
+/// answers `missing_credential` before any socket is opened, and `docs.status`
+/// remains the pure projection. The successful AUTH/RESULT/RECOVERY paths run
+/// offline in `tests/search_services.rs`; real keys stay NOT_RUN.
+#[test]
+fn packaged_docs_search_binds_five_profiles_and_keeps_docs_status_pure() {
+    let root =
+        tempfile::TempDir::with_prefix("rivect-installed-docs-search-").expect("fixture root");
+    let bundle = support::release::baseline_bundle();
+    assert!(
+        !bundle.starts_with(env!("CARGO_MANIFEST_DIR")),
+        "the bundle is outside the checkout: {}",
+        bundle.display()
+    );
+    let data = root.path().join("data root");
+    let cwd = root.path().join("nested working dir");
+    std::fs::create_dir_all(&data).expect("data root");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind docs peer");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("docs peer address")
+    );
+    let mut document = support::base_config();
+    for service in SEARCH_SERVICES {
+        document.push_str(&format!(
+            "[connections.\"search.{service}\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"keyring:search/{service}\"\n"
+        ));
+    }
+    std::fs::write(data.join("config.toml"), document).expect("packaged config");
+    let data_argument = data.to_str().expect("utf-8 data root");
+
+    let first = run_packaged_frames(
+        bundle,
+        &cwd,
+        &["--headless", "--data-root", data_argument],
+        &[command_frame(
+            1,
+            "session.attach",
+            json!({"schema_version": 1, "bootstrap_id": "installed-docs-search"}),
+        )],
+    );
+    assert!(
+        first.status.success(),
+        "the packaged artifact runs: {}",
+        support::release::stderr_of(&first)
+    );
+    let session = answer(&responses(&first), 1)["result"]["session_id"].clone();
+
+    let mut frames = Vec::with_capacity(7);
+    for (index, service) in SEARCH_SERVICES.iter().enumerate() {
+        frames.push(session_frame(
+            index as u64 + 2,
+            &session,
+            "docs.search",
+            json!({"service": service, "query": format!("installed {service}"), "limit": 1}),
+        ));
+    }
+    frames.push(local_command(7, &session, "docs.status", json!({})));
+    let output = run_packaged_frames(
+        bundle,
+        &cwd,
+        &["--headless", "--data-root", data_argument],
+        &frames,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the typed capability denial is the run's exit class: {}",
+        support::release::stderr_of(&output)
+    );
+    let answers = responses(&output);
+    assert_eq!(answers.len(), frames.len(), "one answer per frame");
+    for (index, service) in SEARCH_SERVICES.iter().enumerate() {
+        let response = answer(&answers, index as u64 + 2);
+        let error = response
+            .get("error")
+            .unwrap_or_else(|| panic!("{service} answered a result without a key: {response}"));
+        assert_eq!(
+            error["data"]["code"], "capability_unavailable",
+            "a missing search key is a typed capability denial: {response}"
+        );
+        assert!(
+            error["data"]["message"].as_str().is_some_and(
+                |message| message.contains(&format!("search credential for {service}"))
+            ),
+            "{response}"
+        );
+        assert!(response.get("result").is_none(), "{response}");
+        println!("ROW TP-SEARCH-{service}-INSTALLED ok");
+    }
+    let status = &answer(&answers, 7)["result"];
+    assert_eq!(status, &json!(rivect::docs::status()), "{status}");
+    assert_eq!(status["kind"], "docs.status", "{status}");
+    assert_eq!(
+        status["source_classes"],
+        json!(["direct_local"]),
+        "{status}"
+    );
+    assert_eq!(status["quota"], "unknown", "{status}");
+    assert!(status.get("answer").is_none(), "{status}");
+
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking packaged docs accept");
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("a missing credential still opened a transport"),
+        Err(error) => panic!("packaged docs accept failed: {error}"),
+    }
 }
 
 /// One loopback Chat Completions peer for the installed ordinary request:

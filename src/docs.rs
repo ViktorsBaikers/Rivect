@@ -7,11 +7,13 @@
 //! refresh another's.
 
 use crate::contracts::ErrorCode;
+use crate::providers::{CredentialStore, ProviderError, SecretRef};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The owner every docs projection names.
 pub const DOCS_OWNER: &str = "src/docs.rs";
@@ -613,8 +615,9 @@ pub struct StatusResult {
 }
 
 /// The docs owner's status. `docs.status` is a pure read: it reports the
-/// owner's declared policy and the live cache count, never an external
-/// refresh. Quota has no account in this build, so it stays `unknown`.
+/// owner's declared policy and the live cache count, with zero transports and
+/// zero credential reads, never an external refresh. Quota has no account in
+/// this build, so it stays `unknown`.
 pub fn status() -> StatusResult {
     status_for(&Cache::default())
 }
@@ -633,5 +636,582 @@ pub fn status_for(cache: &Cache) -> StatusResult {
             cached_entries: cache.len(),
         },
         quota: Quota::Unknown,
+    }
+}
+
+/// The auth shape a recorded search service expects. The shape is the whole
+/// public vocabulary: a service either carries a bearer token, an API-key
+/// header, or the key in the request query — never a second scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchAuth {
+    Bearer,
+    XApiKey,
+    QueryKey,
+}
+
+/// One recorded search service: the exact endpoint and method this build
+/// calls, the auth shape it attaches, and the response fields its citation
+/// parser reads. A service without a row is unknown, never a guessed endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchProfile {
+    pub id: &'static str,
+    pub endpoint: &'static str,
+    pub method: &'static str,
+    pub auth: SearchAuth,
+    /// The JSON array the service returns its hits under.
+    pub results_field: &'static str,
+    /// The JSON field one hit carries its snippet under.
+    pub snippet_field: &'static str,
+}
+
+/// The five source-admitted search services, in the recorded order.
+pub const SEARCH_PROFILES: [SearchProfile; 5] = [
+    SearchProfile {
+        id: "exa",
+        endpoint: "https://api.exa.ai/search",
+        method: "POST",
+        auth: SearchAuth::Bearer,
+        results_field: "results",
+        snippet_field: "text",
+    },
+    SearchProfile {
+        id: "kagi",
+        endpoint: "https://kagi.com/api/v0/search",
+        method: "GET",
+        auth: SearchAuth::QueryKey,
+        results_field: "data",
+        snippet_field: "snippet",
+    },
+    SearchProfile {
+        id: "parallel",
+        endpoint: "https://api.parallel.ai/v1/search",
+        method: "POST",
+        auth: SearchAuth::XApiKey,
+        results_field: "results",
+        snippet_field: "snippet",
+    },
+    SearchProfile {
+        id: "perplexity",
+        endpoint: "https://api.perplexity.ai/search",
+        method: "POST",
+        auth: SearchAuth::Bearer,
+        results_field: "results",
+        snippet_field: "snippet",
+    },
+    SearchProfile {
+        id: "tavily",
+        endpoint: "https://api.tavily.com/search",
+        method: "POST",
+        auth: SearchAuth::QueryKey,
+        results_field: "results",
+        snippet_field: "content",
+    },
+];
+
+/// The recorded profile for exactly one service id.
+#[must_use]
+pub fn search_profile(service: &str) -> Option<&'static SearchProfile> {
+    SEARCH_PROFILES.iter().find(|profile| profile.id == service)
+}
+
+/// The largest query one request may carry.
+pub const SEARCH_QUERY_MAX_BYTES: usize = 4096;
+
+/// The largest rendered request (URL plus body) one call may send.
+pub const SEARCH_REQUEST_MAX_BYTES: usize = 16 * 1024;
+
+/// The largest upstream body one call accepts; an external answer is
+/// untrusted input and is bounded like every other one.
+pub const SEARCH_RESPONSE_MAX_BYTES: usize = 256 * 1024;
+
+/// One request's whole deadline: connect, send, and read the bounded body.
+pub const SEARCH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The result count a request gets when it names none.
+pub const SEARCH_DEFAULT_LIMIT: usize = 10;
+
+/// The largest result count one request may ask for.
+pub const SEARCH_MAX_LIMIT: usize = 20;
+
+/// How a redacted query key is rendered in plans, errors, results and Debug.
+pub const SEARCH_REDACTED: &str = "<redacted>";
+
+/// One `docs.search` request. `service` must be exactly one recorded id; the
+/// selector is checked before any credential store or transport is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub service: String,
+    pub query: String,
+    pub limit: usize,
+}
+
+/// One cited search result: the page title, its URL and a bounded snippet.
+/// Nothing here is a `SourceDoc`; a search hit never becomes a package
+/// documentation citation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// One `docs.search` answer: cited web hits with their exact provenance. The
+/// `kind` names the search entry, so a consumer cannot read it as a package
+/// document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub schema_version: u32,
+    pub kind: String,
+    pub service: String,
+    pub query_sha256: String,
+    pub results: Vec<SearchHit>,
+    pub truncated: bool,
+    pub freshness: Freshness,
+    pub attempts: u32,
+}
+
+/// Why a `docs.search` call is not a result. Each cause is typed, bounded and
+/// non-success; none is a silent empty answer or a direct-source substitute.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SearchError {
+    #[error("unknown search service {service}")]
+    UnknownService { service: String },
+    #[error("search request field {field} is invalid")]
+    InvalidRequest { field: &'static str },
+    #[error("search credential for {service} is missing")]
+    MissingCredential { service: String },
+    #[error("search connection for {service} names another origin or profile")]
+    WrongOrigin { service: String },
+    #[error("search service {service} refused a redirect")]
+    RedirectRefused { service: String },
+    #[error("search service denied the request with status {status}")]
+    Denied { status: u16 },
+    #[error("search service exhausted its quota")]
+    QuotaExhausted,
+    #[error("search upstream answered status {status}")]
+    Upstream { status: u16 },
+    #[error("search response exceeds {limit} bytes")]
+    TooLarge { limit: usize },
+    #[error("search request timed out")]
+    Timeout,
+    #[error("search request was cancelled")]
+    Cancelled,
+    #[error("search response is malformed")]
+    Malformed,
+}
+
+impl SearchError {
+    /// The wire code this failure reports: a malformed selector is the
+    /// caller's, a missing credential is an unavailable capability, and a
+    /// peer or store failure is a blocked dependency.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            Self::UnknownService { .. } | Self::InvalidRequest { .. } => ErrorCode::InvalidInput,
+            Self::MissingCredential { .. } => ErrorCode::CapabilityUnavailable,
+            Self::WrongOrigin { .. } | Self::RedirectRefused { .. } | Self::Denied { .. } => {
+                ErrorCode::Denied
+            }
+            Self::QuotaExhausted => ErrorCode::BudgetExhausted,
+            Self::Upstream { .. } | Self::Timeout | Self::Malformed => ErrorCode::DependencyBlocked,
+            Self::TooLarge { .. } => ErrorCode::OutputLimit,
+            Self::Cancelled => ErrorCode::Cancelled,
+        }
+    }
+}
+
+/// One planned request: method, auth shape and the rendered query. The key is
+/// never a field — [`SearchPlan::url`] renders `api_key=<redacted>` and the
+/// key is attached only at the one send site.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SearchPlan {
+    method: &'static str,
+    endpoint: String,
+    query: String,
+    limit: usize,
+    auth: SearchAuth,
+}
+
+impl SearchPlan {
+    /// The method the planned request uses.
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        self.method
+    }
+
+    /// The auth shape the planned request attaches.
+    #[must_use]
+    pub fn auth(&self) -> SearchAuth {
+        self.auth
+    }
+
+    /// The redacted request URL: a query-key service's key is `api_key=<redacted>`.
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.render(None)
+    }
+
+    /// The JSON body a POST request carries; `None` for a GET.
+    #[must_use]
+    pub fn body(&self) -> Option<String> {
+        if self.method == "POST" {
+            Some(serde_json::json!({"query": self.query, "limit": self.limit}).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn request_url(&self, key: &str) -> String {
+        self.render(Some(key))
+    }
+
+    fn render(&self, key: Option<&str>) -> String {
+        let mut url = self.endpoint.trim_end_matches('/').to_string();
+        if self.method == "GET" {
+            url.push_str("?query=");
+            url.push_str(&encode_component(&self.query));
+            url.push_str("&limit=");
+            url.push_str(&self.limit.to_string());
+        }
+        if self.auth == SearchAuth::QueryKey {
+            url.push(if self.method == "GET" { '&' } else { '?' });
+            url.push_str("api_key=");
+            match key {
+                Some(key) => url.push_str(&encode_component(key)),
+                None => url.push_str(SEARCH_REDACTED),
+            }
+        }
+        url
+    }
+}
+
+impl std::fmt::Debug for SearchPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchPlan")
+            .field("method", &self.method)
+            .field("url", &self.url())
+            .field("auth", &self.auth)
+            .finish()
+    }
+}
+
+/// Plan one request against its recorded profile. The endpoint must be the
+/// profile's own origin or a loopback one, so a credential never rides to an
+/// unrecorded host; a request past the byte bound is refused before any send.
+///
+/// # Errors
+/// [`SearchError::TooLarge`] when the rendered URL plus body exceeds
+/// [`SEARCH_REQUEST_MAX_BYTES`].
+pub fn search_plan(
+    profile: &SearchProfile,
+    endpoint: &str,
+    request: &SearchRequest,
+) -> Result<SearchPlan, SearchError> {
+    let plan = SearchPlan {
+        method: profile.method,
+        endpoint: endpoint.to_string(),
+        query: request.query.clone(),
+        limit: request.limit,
+        auth: profile.auth,
+    };
+    let body_len = plan.body().map_or(0, |body| body.len());
+    if plan.url().len().saturating_add(body_len) > SEARCH_REQUEST_MAX_BYTES {
+        return Err(SearchError::TooLarge {
+            limit: SEARCH_REQUEST_MAX_BYTES,
+        });
+    }
+    Ok(plan)
+}
+
+/// Execute one `docs.search` call against its recorded service profile:
+/// validate the selector before any credential read, resolve the scoped
+/// `search.<service>` credential, refuse a wrong origin/profile with no
+/// attempt, and send one bounded request whose any-3xx answer is refused.
+///
+/// # Errors
+/// [`SearchError::UnknownService`] for an absent/unknown selector;
+/// [`SearchError::InvalidRequest`] for an invalid field; [`SearchError::TooLarge`]
+/// for a request/response past its bound; [`SearchError::MissingCredential`]
+/// for an undeclared connection or unresolvable key; [`SearchError::WrongOrigin`]
+/// for a credential bound to another origin/profile; [`SearchError::Denied`],
+/// [`SearchError::QuotaExhausted`], [`SearchError::Upstream`],
+/// [`SearchError::RedirectRefused`], [`SearchError::Timeout`] and
+/// [`SearchError::Malformed`] for the peer's typed non-success answers.
+pub fn search(
+    request: &SearchRequest,
+    config: &crate::config::Config,
+    store: &dyn CredentialStore,
+) -> Result<SearchResult, SearchError> {
+    validate_search_request(request)?;
+    let profile = search_profile(&request.service).ok_or_else(|| SearchError::UnknownService {
+        service: request.service.clone(),
+    })?;
+    let connection_id = format!("search.{}", profile.id);
+    let Some(connection) = config.connections.get(&connection_id) else {
+        return Err(SearchError::MissingCredential {
+            service: request.service.clone(),
+        });
+    };
+    // The endpoint origin is part of the recorded profile: a credential is
+    // sent only to the service's own origin, or to a loopback diagnostic peer.
+    if !endpoint_matches_profile(profile, &connection.endpoint) {
+        return Err(SearchError::WrongOrigin {
+            service: request.service.clone(),
+        });
+    }
+    let credential = crate::providers::resolve_credential(config, &connection_id)
+        .map_err(|error| credential_error(&request.service, &error))?;
+    if !credential_origin_matches(&credential, &connection.endpoint) {
+        return Err(SearchError::WrongOrigin {
+            service: request.service.clone(),
+        });
+    }
+    let material = store
+        .resolve(&credential)
+        .map_err(|error| credential_error(&request.service, &error))?;
+    let Ok(key) = String::from_utf8(material) else {
+        return Err(SearchError::MissingCredential {
+            service: request.service.clone(),
+        });
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(SearchError::MissingCredential {
+            service: request.service.clone(),
+        });
+    }
+    let plan = search_plan(profile, &connection.endpoint, request)?;
+    execute_search(profile, &plan, key, request)
+}
+
+fn validate_search_request(request: &SearchRequest) -> Result<(), SearchError> {
+    if request.schema_version != 1 {
+        return Err(SearchError::InvalidRequest {
+            field: "schema_version",
+        });
+    }
+    if request.session_id.trim().is_empty() {
+        return Err(SearchError::InvalidRequest {
+            field: "session_id",
+        });
+    }
+    if request.query.trim().is_empty() {
+        return Err(SearchError::InvalidRequest { field: "query" });
+    }
+    if request.query.len() > SEARCH_QUERY_MAX_BYTES {
+        return Err(SearchError::TooLarge {
+            limit: SEARCH_QUERY_MAX_BYTES,
+        });
+    }
+    if request.limit == 0 || request.limit > SEARCH_MAX_LIMIT {
+        return Err(SearchError::InvalidRequest { field: "limit" });
+    }
+    Ok(())
+}
+
+fn endpoint_matches_profile(profile: &SearchProfile, endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    if crate::providers::is_loopback_url(&url) {
+        return true;
+    }
+    match (origin_of(profile.endpoint), origin_of(endpoint)) {
+        (Some(recorded), Some(configured)) => recorded.eq_ignore_ascii_case(&configured),
+        _ => false,
+    }
+}
+
+/// A scoped ref may carry an origin leg (`account/origin/profile`); when it
+/// does, that origin must be the connection endpoint's host. A ref without
+/// the leg is scoped by the connection's own declaration.
+fn credential_origin_matches(credential: &SecretRef, endpoint: &str) -> bool {
+    let segments: Vec<&str> = credential.scope().split('/').collect();
+    if segments.len() != 3 {
+        return true;
+    }
+    match reqwest::Url::parse(endpoint) {
+        Ok(url) => url
+            .host_str()
+            .is_some_and(|host| segments[1].eq_ignore_ascii_case(host)),
+        Err(_) => false,
+    }
+}
+
+fn credential_error(service: &str, error: &ProviderError) -> SearchError {
+    match error {
+        ProviderError::CredentialProfileMismatch { .. } => SearchError::WrongOrigin {
+            service: service.to_string(),
+        },
+        _ => SearchError::MissingCredential {
+            service: service.to_string(),
+        },
+    }
+}
+
+fn execute_search(
+    profile: &SearchProfile,
+    plan: &SearchPlan,
+    key: &str,
+    request: &SearchRequest,
+) -> Result<SearchResult, SearchError> {
+    let Ok(method) = reqwest::Method::from_bytes(plan.method().as_bytes()) else {
+        return Err(SearchError::Malformed);
+    };
+    // No proxy and no redirect: a proxy could forward the key elsewhere and a
+    // followed 3xx could carry it to an origin the profile never recorded.
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(SEARCH_DEADLINE)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return Err(SearchError::Malformed);
+    };
+    let url = plan.request_url(key);
+    let body_len = plan.body().map_or(0, |body| body.len());
+    if url.len().saturating_add(body_len) > SEARCH_REQUEST_MAX_BYTES {
+        return Err(SearchError::TooLarge {
+            limit: SEARCH_REQUEST_MAX_BYTES,
+        });
+    }
+    let mut builder = client
+        .request(method, url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    builder = match plan.auth() {
+        SearchAuth::Bearer => builder.bearer_auth(key),
+        SearchAuth::XApiKey => builder.header("x-api-key", key),
+        SearchAuth::QueryKey => builder,
+    };
+    if let Some(body) = plan.body() {
+        builder = builder
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let response = builder.send().map_err(|error| {
+        if error.is_timeout() {
+            SearchError::Timeout
+        } else {
+            SearchError::Malformed
+        }
+    })?;
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(SearchError::RedirectRefused {
+            service: request.service.clone(),
+        });
+    }
+    match status {
+        200 => {}
+        401 | 403 => return Err(SearchError::Denied { status }),
+        429 => return Err(SearchError::QuotaExhausted),
+        _ => return Err(SearchError::Upstream { status }),
+    }
+    // The take bound holds even when the peer never reaches EOF or declares
+    // no length.
+    let mut bytes = Vec::with_capacity(SEARCH_RESPONSE_MAX_BYTES.min(64 * 1024));
+    let mut bounded = response.take(SEARCH_RESPONSE_MAX_BYTES as u64 + 1);
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut => SearchError::Timeout,
+            std::io::ErrorKind::Interrupted => SearchError::Cancelled,
+            _ => SearchError::Malformed,
+        })?;
+    if bytes.len() > SEARCH_RESPONSE_MAX_BYTES {
+        return Err(SearchError::TooLarge {
+            limit: SEARCH_RESPONSE_MAX_BYTES,
+        });
+    }
+    parse_search_results(profile, request, &bytes, key)
+}
+
+fn parse_search_results(
+    profile: &SearchProfile,
+    request: &SearchRequest,
+    bytes: &[u8],
+    key: &str,
+) -> Result<SearchResult, SearchError> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Err(SearchError::Malformed);
+    };
+    let hits = value
+        .get(profile.results_field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or(SearchError::Malformed)?;
+    let mut truncated = hits.len() > request.limit;
+    let mut results = Vec::with_capacity(hits.len().min(request.limit));
+    for hit in hits {
+        if results.len() == request.limit {
+            break;
+        }
+        let Some(url) = hit.get("url").and_then(serde_json::Value::as_str) else {
+            return Err(SearchError::Malformed);
+        };
+        if !is_citation_url(url) {
+            truncated = true;
+            continue;
+        }
+        let title = hit
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let snippet = hit
+            .get(profile.snippet_field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        results.push(SearchHit {
+            title: redact(title, key),
+            url: redact(url, key),
+            snippet: redact(snippet, key),
+        });
+    }
+    Ok(SearchResult {
+        schema_version: 1,
+        kind: "docs.search".to_string(),
+        service: profile.id.to_string(),
+        query_sha256: crate::config::hex(&sha2::Sha256::digest(request.query.as_bytes())),
+        results,
+        truncated,
+        freshness: Freshness::Fetched {
+            as_of: now_seconds(),
+        },
+        attempts: 1,
+    })
+}
+
+fn is_citation_url(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed.host_str().is_some() && matches!(parsed.scheme(), "http" | "https"),
+        Err(_) => false,
+    }
+}
+
+/// Replace the resolved key wherever an upstream answer echoes it; a search
+/// result never becomes a second copy of the credential.
+fn redact(value: &str, key: &str) -> String {
+    value.replace(key, SEARCH_REDACTED)
+}
+
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn now_seconds() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        // A clock before the epoch cannot name a fetch time; zero is the
+        // honest unknown a caller can distinguish from a real timestamp.
+        Err(_) => 0,
     }
 }

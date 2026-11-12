@@ -782,3 +782,115 @@ fn docs_status_is_available_and_reports_a_real_result() {
     // row answered from its own owner.
     assert_eq!(status.quota, Quota::Unknown);
 }
+
+/// A credential seam that fails the test on any read: `docs.status` must be a
+/// pure projection even when a search connection and store are configured.
+struct UntouchableStore;
+
+impl rivect::providers::CredentialStore for UntouchableStore {
+    fn kind(&self) -> rivect::providers::StoreKind {
+        rivect::providers::StoreKind::Keychain
+    }
+
+    fn occupied(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+    ) -> Result<bool, rivect::providers::ProviderError> {
+        panic!("docs.status read a credential")
+    }
+
+    fn entry_accounts(
+        &self,
+        _service: &str,
+    ) -> Result<Vec<String>, rivect::providers::ProviderError> {
+        panic!("docs.status read a credential")
+    }
+
+    fn login(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+        _secret: &[u8],
+    ) -> Result<(), rivect::providers::ProviderError> {
+        panic!("docs.status wrote a credential")
+    }
+
+    fn resolve(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+    ) -> Result<Vec<u8>, rivect::providers::ProviderError> {
+        panic!("docs.status read a credential")
+    }
+
+    fn refresh(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+        _secret: &[u8],
+    ) -> Result<(), rivect::providers::ProviderError> {
+        panic!("docs.status wrote a credential")
+    }
+
+    fn revoke(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+    ) -> Result<(), rivect::providers::ProviderError> {
+        panic!("docs.status revoked a credential")
+    }
+
+    fn logout(
+        &self,
+        _credential: &rivect::providers::SecretRef,
+    ) -> Result<(), rivect::providers::ProviderError> {
+        panic!("docs.status logged out a credential")
+    }
+}
+
+/// `docs.status` is a pure read: with a declared search connection, an
+/// injected credential store and a bound loopback endpoint, the row answers
+/// its own projection, reads no credential and opens no socket.
+#[test]
+fn docs_status_is_a_pure_read_with_zero_transports_or_credentials() {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the docs purity peer");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("docs purity peer address")
+    );
+    let document = format!(
+        "{}\n[connections.\"search.exa\"]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"keyring:search/exa\"\n",
+        support::base_config()
+    );
+    let mut world = support::open_world("docs-status-purity", Some(&document));
+    world.runtime.search_credentials = Some(std::sync::Arc::new(UntouchableStore));
+    let session = world.open_session("docs-status-purity");
+    let response = world.dispatch(&support::command_execute(
+        &session,
+        "docs.status",
+        json!({}),
+    ));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"],
+        json!(status()),
+        "the no-question row is exactly the owner's projection"
+    );
+    assert_eq!(response["result"]["owner"], "src/docs.rs", "{response}");
+    assert_eq!(
+        response["result"]["source_classes"],
+        json!(["direct_local"]),
+        "{response}"
+    );
+    assert_eq!(response["result"]["quota"], "unknown", "{response}");
+    assert_eq!(
+        response["result"]["cache"]["cached_entries"], 0,
+        "{response}"
+    );
+
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking docs purity accept");
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("docs.status opened a transport"),
+        Err(error) => panic!("docs purity accept failed: {error}"),
+    }
+}
