@@ -3,17 +3,17 @@
 //! geometries plus a live resize and the fourteen input modes. Every cell is
 //! exercised with a pass/fail verdict. Every one of the 19 states is also
 //! rendered under each of the three themes at every geometry (285
-//! state×theme observations); each observation asserts that state's
-//! status/dock/composer/modal SGR fingerprint — pairwise distinct across
-//! light/dark/high-contrast — with text identical to the unthemed control.
-//! Mono `NO_COLOR`/`TERM=dumb`/non-TTY emits no SGR color and every state's
-//! status token plus dock/composer labels appear verbatim. The state's own
-//! rendered observables at that geometry must appear, and the input mode must
-//! reach the same artifact. Terminal restore is checked after exit, cancel and
-//! panic; inline keeps the transcript in the terminal's own scrollback with
-//! mouse capture off; and focusing or inspecting a decision card or permission
-//! panel records no answer, no preapproval and no provider call. Screenshot or
-//! file presence is never used as interaction proof.
+//! state×theme observations); each observation compares that state's
+//! status/dock/composer/transcript/modal SGR fingerprint to the pinned palette
+//! for its theme, with text identical to the default mono control. Mono
+//! `NO_COLOR`/`TERM=dumb`/non-TTY emits no SGR color and every state's status
+//! token plus dock/composer labels appear verbatim. The state's own rendered
+//! observables at that geometry must appear, and the input mode must reach the
+//! same artifact. Terminal restore is checked after exit, cancel and panic;
+//! inline keeps the transcript in the terminal's own scrollback with mouse
+//! capture off; and focusing or inspecting a decision card or permission panel
+//! records no answer, no preapproval and no provider call. Screenshot or file
+//! presence is never used as interaction proof.
 //!
 //! The packaged artifact cannot be made to panic through any public input:
 //! the panic leg therefore runs the same production `TerminalGuard` in this
@@ -55,8 +55,14 @@ const CELLS: usize = STATES * GEOMETRIES * INPUTS;
 
 /// One observation per state, geometry and theme.
 const THEME_OBSERVATIONS: usize = STATES * GEOMETRIES * 3;
-/// One mono label/SGR probe per state and geometry.
-const MONO_PROBES: usize = STATES * GEOMETRIES;
+/// One mono label/SGR probe per state, geometry and selected theme.
+const MONO_PROBES: usize = STATES * GEOMETRIES * 3;
+/// One `TERM=dumb` label probe per state.
+const DUMB_PROBES: usize = STATES;
+/// The bounded worker set for independent packaged runs.
+const MATRIX_WORKERS: usize = 4;
+/// The recorded matrix gate: the run must stay below this wall time.
+const MATRIX_BUDGET_SECONDS: f64 = 900.0;
 
 /// The three inherited themes and the exact `RIVECT_THEME` value each names.
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
@@ -175,6 +181,7 @@ impl InputMode {
 
 struct StateFixture {
     name: &'static str,
+    view: LocalView,
     needles: Vec<&'static str>,
     /// The status line's visible token.
     status: String,
@@ -219,6 +226,7 @@ impl StateFixture {
         let modal = view.decision.is_some() || view.panel.is_some();
         Self {
             name,
+            view,
             needles: needles.to_vec(),
             status,
             dock_probe,
@@ -571,16 +579,52 @@ fn state_fixture(state: usize) -> StateFixture {
     }
 }
 
-/// The four palette carriers' SGR state, read from the final screen cells the
+/// The five palette carriers' SGR state, read from the final screen cells the
 /// packaged renderer painted.
 struct SurfaceFingerprints {
     status: String,
     dock: String,
     composer: String,
     modal: String,
+    transcript: String,
 }
 
-/// One finished review frame: the final screen text, its rows, the four
+impl SurfaceFingerprints {
+    fn surface(&self, surface: &str) -> &str {
+        match surface {
+            "status" => &self.status,
+            "dock" => &self.dock,
+            "composer" => &self.composer,
+            "modal" => &self.modal,
+            "transcript" => &self.transcript,
+            _ => panic!("unknown surface {surface}"),
+        }
+    }
+}
+
+/// The expected SGR fingerprint per theme and surface, pinned independently
+/// of the resolver. The indices are the xterm palette slots ratatui/crossterm
+/// emit for the tokens in `src/ui/theme.rs` (`38;5;n`): light status/modal
+/// Blue 4, light composer Magenta 5; dark status/modal Cyan 6, dark composer
+/// bright Magenta 13; high contrast LightYellow 11, LightCyan 14, White 15
+/// with bold. Body rows are `Reset`, which vt100 reports as `Default`.
+fn expected_fingerprint(theme: &str, surface: &str) -> &'static str {
+    match (theme, surface) {
+        ("light", "status" | "modal") => "fg=Idx(4);bg=Default;bold=false",
+        ("light", "composer") => "fg=Idx(5);bg=Default;bold=false",
+        ("light", "dock" | "transcript") => "fg=Default;bg=Default;bold=false",
+        ("dark", "status" | "modal") => "fg=Idx(6);bg=Default;bold=false",
+        ("dark", "composer") => "fg=Idx(13);bg=Default;bold=false",
+        ("dark", "dock" | "transcript") => "fg=Default;bg=Default;bold=false",
+        ("high-contrast", "status") => "fg=Idx(11);bg=Default;bold=true",
+        ("high-contrast", "composer") => "fg=Idx(14);bg=Default;bold=true",
+        ("high-contrast", "modal") => "fg=Idx(15);bg=Default;bold=true",
+        ("high-contrast", "dock" | "transcript") => "fg=Default;bg=Default;bold=true",
+        _ => panic!("no expected fingerprint for {theme}/{surface}"),
+    }
+}
+
+/// One finished review frame: the final screen text, its rows, the five
 /// fingerprints and the bytes the child actually emitted.
 struct ReviewFrame {
     text: String,
@@ -607,48 +651,9 @@ impl ThemeObservation {
             "dock": self.fingerprints.dock,
             "composer": self.fingerprints.composer,
             "modal": self.fingerprints.modal,
+            "transcript": self.fingerprints.transcript,
         })
     }
-}
-
-/// The three themes must paint pairwise-distinct carriers; a modal either is
-/// absent in all three or painted and distinct in all three.
-fn require_distinct_palettes(observations: &[ThemeObservation]) -> Result<(), String> {
-    for surface in ["status", "dock", "composer"] {
-        let values: std::collections::BTreeSet<&str> = observations
-            .iter()
-            .map(|observation| match surface {
-                "status" => observation.fingerprints.status.as_str(),
-                "dock" => observation.fingerprints.dock.as_str(),
-                _ => observation.fingerprints.composer.as_str(),
-            })
-            .collect();
-        if values.len() != THEMES.len() {
-            return Err(format!(
-                "{:?}/{} {surface} palettes are not pairwise distinct: {values:?}",
-                observations.first().map(|observation| observation.state),
-                observations
-                    .first()
-                    .map_or("", |observation| observation.geometry),
-            ));
-        }
-    }
-    let modals: std::collections::BTreeSet<&str> = observations
-        .iter()
-        .map(|observation| observation.fingerprints.modal.as_str())
-        .collect();
-    if modals != std::collections::BTreeSet::from(["none"])
-        && (modals.len() != THEMES.len() || modals.contains("none"))
-    {
-        return Err(format!(
-            "{:?}/{} modal palettes are not pairwise distinct: {modals:?}",
-            observations.first().map(|observation| observation.state),
-            observations
-                .first()
-                .map_or("", |observation| observation.geometry),
-        ));
-    }
-    Ok(())
 }
 
 /// Replaces the one volatile screen token: the decision card's question id is
@@ -678,6 +683,33 @@ fn normalized_review_text(text: &str) -> String {
         }
     }
     normalized
+}
+
+/// Runs independent jobs on a bounded worker set, preserving job order in the
+/// result vector. Each job owns its fixture, so no view crosses a thread.
+fn parallel_map<T: Copy + Send + Sync, R: Send>(
+    jobs: &[T],
+    workers: usize,
+    work: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let workers = workers.clamp(1, jobs.len());
+    let chunk_size = jobs.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let work = &work;
+                scope.spawn(move || chunk.iter().map(|job| work(*job)).collect::<Vec<R>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("palette worker"))
+            .collect()
+    })
 }
 
 fn await_review_screen(
@@ -728,86 +760,163 @@ fn review_frame(
     })
 }
 
-/// Renders one state unthemed and returns its squashed screen text; that text
-/// is the control every theme render must reproduce.
+/// Renders one state in the default environment and returns its squashed
+/// screen text; that text is the control every theme render must reproduce.
 fn render_state(fixture: &StateFixture, geometry: Geometry) -> Result<String, String> {
     review_frame(fixture, geometry, &[], "state").map(|frame| frame.text)
 }
 
-/// One themed render: it must paint the same text as the control, carry the
-/// palette's color on all four carriers, and bold only the high-contrast
-/// theme. Returns the fingerprints the matrix collects.
+/// One themed render: it must paint the same text as the default control and
+/// every carrier must match the pinned token for its theme and surface.
 fn observe_theme(
-    fixture: &StateFixture,
+    state_index: usize,
     geometry: Geometry,
     theme: &'static str,
-    control: &str,
+    control: &Result<String, String>,
 ) -> Result<ThemeObservation, String> {
+    let control = control
+        .as_ref()
+        .map_err(|error| format!("control failed: {error}"))?;
+    let fixture = state_fixture(state_index);
     let frame = review_frame(
-        fixture,
+        &fixture,
         geometry,
         &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
         theme,
     )?;
     if normalized_review_text(&frame.text) != normalized_review_text(control) {
         return Err(format!(
-            "{theme} text differs from the unthemed control: {:?} != {control:?}",
+            "{theme} text differs from the default control: {:?} != {control:?}",
             frame.text
         ));
     }
     if !has_color_sgr(&frame.bytes) {
         return Err(format!("{theme} emitted no SGR color"));
     }
-    let fingerprints = frame.fingerprints;
-    for (surface, value) in [
-        ("status", &fingerprints.status),
-        ("dock", &fingerprints.dock),
-        ("composer", &fingerprints.composer),
-        ("modal", &fingerprints.modal),
-    ] {
-        if value == "none" {
-            continue;
-        }
-        if !value.contains("fg=Idx(") {
+    for surface in ["status", "dock", "composer", "transcript"] {
+        let expected = expected_fingerprint(theme, surface);
+        let observed = frame.fingerprints.surface(surface);
+        if observed != expected {
             return Err(format!(
-                "{theme} {surface} carries no palette color: {value}"
+                "{theme} {surface} fingerprint {observed:?} != expected {expected:?}"
             ));
         }
-        let bold = value.contains("bold=true");
-        if (theme == "high-contrast") != bold {
-            return Err(format!("{theme} {surface} bold state is wrong: {value}"));
+    }
+    if fixture.modal {
+        let expected = expected_fingerprint(theme, "modal");
+        let observed = frame.fingerprints.modal.as_str();
+        if observed != expected {
+            return Err(format!(
+                "{theme} modal fingerprint {observed:?} != expected {expected:?}"
+            ));
         }
+    } else if frame.fingerprints.modal != "none" {
+        return Err(format!(
+            "{theme} paints a modal in a state with none: {:?}",
+            frame.fingerprints.modal
+        ));
     }
     Ok(ThemeObservation {
         state: fixture.name,
         geometry: geometry.label(),
         theme,
-        fingerprints,
+        fingerprints: frame.fingerprints,
     })
 }
 
-/// The mono label proof: `NO_COLOR` must strip every SGR color while the
-/// status token, the first dock row and the composer row stay verbatim.
-fn mono_probe(fixture: &StateFixture, geometry: Geometry) -> Result<(), String> {
+/// The mono proof for one state, geometry and selected theme: `NO_COLOR`
+/// strips every SGR color while the status token, dock row and composer row
+/// stay verbatim; high contrast keeps its bold modifier.
+fn mono_probe(
+    fixture: &StateFixture,
+    geometry: Geometry,
+    theme: &'static str,
+) -> Result<(), String> {
     let frame = review_frame(
         fixture,
         geometry,
-        &[("TERM", "xterm-256color"), ("NO_COLOR", "1")],
+        &[
+            ("TERM", "xterm-256color"),
+            ("NO_COLOR", "1"),
+            ("RIVECT_THEME", theme),
+        ],
         "mono",
     )?;
     if has_color_sgr(&frame.bytes) {
-        return Err("mono emitted an SGR color".to_string());
+        return Err(format!("{theme} mono emitted an SGR color"));
     }
     if !frame.text.contains(&support::squashed(&fixture.status)) {
-        return Err(format!("mono lost the status token {:?}", fixture.status));
+        return Err(format!(
+            "{theme} mono lost the status token {:?}",
+            fixture.status
+        ));
     }
     if !frame.text.contains(&support::squashed(&fixture.dock_probe)) {
-        return Err(format!("mono lost the dock row {:?}", fixture.dock_probe));
+        return Err(format!(
+            "{theme} mono lost the dock row {:?}",
+            fixture.dock_probe
+        ));
     }
     let composer_row = frame.rows.last().map_or("", String::as_str).trim_end();
     if composer_row != fixture.composer_label.trim_end() {
         return Err(format!(
-            "mono composer row {composer_row:?} != {:?}",
+            "{theme} mono composer row {composer_row:?} != {:?}",
+            fixture.composer_label.trim_end()
+        ));
+    }
+    let bold = theme == "high-contrast";
+    for surface in ["status", "dock", "composer", "transcript"] {
+        let expected = if bold {
+            "fg=Default;bg=Default;bold=true"
+        } else {
+            "fg=Default;bg=Default;bold=false"
+        };
+        if frame.fingerprints.surface(surface) != expected {
+            return Err(format!(
+                "{theme} mono {surface} fingerprint {:?} != {expected:?}",
+                frame.fingerprints.surface(surface)
+            ));
+        }
+    }
+    if fixture.modal {
+        let expected = if bold {
+            "fg=Default;bg=Default;bold=true"
+        } else {
+            "fg=Default;bg=Default;bold=false"
+        };
+        if frame.fingerprints.modal != expected {
+            return Err(format!(
+                "{theme} mono modal fingerprint {:?} != {expected:?}",
+                frame.fingerprints.modal
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The per-state `TERM=dumb` label proof: no color, and the status/dock/
+/// composer text still arrives verbatim.
+fn dumb_probe(fixture: &StateFixture) -> Result<(), String> {
+    let frame = review_frame(fixture, Geometry::W80H24, &[("TERM", "dumb")], "dumb")?;
+    if has_color_sgr(&frame.bytes) {
+        return Err("TERM=dumb emitted an SGR color".to_string());
+    }
+    if !frame.text.contains(&support::squashed(&fixture.status)) {
+        return Err(format!(
+            "TERM=dumb lost the status token {:?}",
+            fixture.status
+        ));
+    }
+    if !frame.text.contains(&support::squashed(&fixture.dock_probe)) {
+        return Err(format!(
+            "TERM=dumb lost the dock row {:?}",
+            fixture.dock_probe
+        ));
+    }
+    let composer_row = frame.rows.last().map_or("", String::as_str).trim_end();
+    if composer_row != fixture.composer_label.trim_end() {
+        return Err(format!(
+            "TERM=dumb composer row {composer_row:?} != {:?}",
             fixture.composer_label.trim_end()
         ));
     }
@@ -815,7 +924,7 @@ fn mono_probe(fixture: &StateFixture, geometry: Geometry) -> Result<(), String> 
 }
 
 /// The theme input probes run one representative state; the per-state
-/// observations above carry the full 19×G×3 matrix.
+/// observations carry the full 19×G×3 matrix.
 fn palette_probe(geometry: Geometry, theme: &'static str) -> Result<(), String> {
     let fixture = state_fixture(2);
     let frame = review_frame(
@@ -829,6 +938,12 @@ fn palette_probe(geometry: Geometry, theme: &'static str) -> Result<(), String> 
     }
     if !frame.text.contains(&support::squashed(&fixture.status)) {
         return Err(format!("{theme} lost the status token"));
+    }
+    if frame.fingerprints.surface("status") != expected_fingerprint(theme, "status") {
+        return Err(format!(
+            "{theme} status fingerprint {:?} != expected",
+            frame.fingerprints.status
+        ));
     }
     Ok(())
 }
@@ -848,6 +963,119 @@ fn no_color_probe(geometry: Geometry) -> Result<(), String> {
         return Err("NO_COLOR lost the status token".to_string());
     }
     Ok(())
+}
+
+/// Reads the fingerprint of the first non-space cell on one row.
+fn fingerprint_at_row(
+    rows: &[String],
+    screen: &vt100::Screen,
+    row: usize,
+) -> Result<String, String> {
+    let text = rows
+        .get(row)
+        .ok_or_else(|| format!("inline screen has no row {row}"))?;
+    let column = text.chars().position(|ch| !ch.is_whitespace()).unwrap_or(0);
+    let row = u16::try_from(row).map_err(|error| format!("inline row overflow: {error}"))?;
+    let column = u16::try_from(column).map_err(|error| format!("inline col overflow: {error}"))?;
+    let cell = screen
+        .cell(row, column)
+        .ok_or_else(|| format!("no inline cell at {row},{column}"))?;
+    Ok(format!(
+        "fg={:?};bg={:?};bold={}",
+        cell.fgcolor(),
+        cell.bgcolor(),
+        cell.bold()
+    ))
+}
+
+/// One themed inline render per theme: the pinned status/dock/composer region
+/// and the modal border carry the expected tokens and labels.
+fn inline_theme_probe(theme: &'static str) -> Result<(), String> {
+    let mut tui = TuiPty::spawn(
+        Geometry::W80H24,
+        Some(RenderMode::Inline),
+        &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
+    )?;
+    tui.wait("Rivect · not connected", WAIT)?;
+    let bytes = tui.bytes()?;
+    let rows = tui.row_texts(&bytes);
+    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 200);
+    parser.process(&bytes);
+    let screen = parser.screen();
+    for (surface, needle) in [
+        ("status", "Rivect · not connected"),
+        ("dock", rivect::ui::DOCK_EMPTY),
+        (
+            "transcript",
+            "Input is available. Enter a task or a clarification.",
+        ),
+    ] {
+        let row = rows
+            .iter()
+            .position(|text| support::squashed(text).contains(&support::squashed(needle)))
+            .ok_or_else(|| format!("inline screen carries no {needle:?}"))?;
+        let observed = fingerprint_at_row(&rows, screen, row)?;
+        let expected = expected_fingerprint(theme, surface);
+        if observed != expected {
+            return Err(format!(
+                "inline {theme} {surface} fingerprint {observed:?} != {expected:?}"
+            ));
+        }
+    }
+    let composer_row = rows
+        .iter()
+        .rposition(|text| text.trim_start().starts_with('>'))
+        .ok_or_else(|| "inline screen carries no composer row".to_string())?;
+    let observed = fingerprint_at_row(&rows, screen, composer_row)?;
+    let expected = expected_fingerprint(theme, "composer");
+    if observed != expected {
+        return Err(format!(
+            "inline {theme} composer fingerprint {observed:?} != {expected:?}"
+        ));
+    }
+    // Open the production decision card to paint a modal border inline.
+    tui.send(b"inline palette probe\r")?;
+    tui.wait("focus 1/2", WAIT)?;
+    let bytes = tui.bytes()?;
+    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 200);
+    parser.process(&bytes);
+    let screen = parser.screen();
+    let corner = (0..tui.rows).find_map(|row| {
+        (0..tui.cols)
+            .find(|col| {
+                screen
+                    .cell(row, *col)
+                    .is_some_and(|cell| cell.contents() == "┌")
+            })
+            .map(|col| (row, col))
+    });
+    let (row, col) = corner.ok_or_else(|| "inline decision card painted no border".to_string())?;
+    let cell = screen
+        .cell(row, col)
+        .ok_or_else(|| "inline modal corner cell missing".to_string())?;
+    let observed = format!(
+        "fg={:?};bg={:?};bold={}",
+        cell.fgcolor(),
+        cell.bgcolor(),
+        cell.bold()
+    );
+    let expected = expected_fingerprint(theme, "modal");
+    if observed != expected {
+        return Err(format!(
+            "inline {theme} modal fingerprint {observed:?} != {expected:?}"
+        ));
+    }
+    // The card refuses a key inside its consent floor (the first paint starts
+    // a short clock); wait it out before dismissing.
+    tui.pump(Duration::from_millis(400))?;
+    tui.send(b"\x1b")?;
+    tui.wait("decision left unanswered", WAIT)?;
+    tui.send(b"\x1b")?;
+    let (bytes, code) = tui.finish()?;
+    if code != Some(0) {
+        return Err(format!("inline {theme} exit {code:?}"));
+    }
+    require_inline_restore(&bytes)
 }
 
 fn has_color_sgr(bytes: &[u8]) -> bool {
@@ -1092,16 +1320,15 @@ impl TuiPty {
             .collect()
     }
 
-    /// Reads the four palette carriers' SGR attributes from the final screen:
-    /// the first status cell, the first dock row, the composer row and the
-    /// modal frame's top-left border corner. The state fixture says which
-    /// rows exist; a missing carrier is a probe failure, never a default.
+    /// Reads the five palette carriers' SGR attributes from the final screen:
+    /// the status cell, the transcript start, the dock row, the composer row
+    /// and the modal frame's top-left border corner. The rows come from the
+    /// renderer's own layout anchors, never from searching the screen text.
     fn surface_fingerprints(
         &self,
         bytes: &[u8],
         fixture: &StateFixture,
     ) -> Result<SurfaceFingerprints, String> {
-        let rows = self.row_texts(bytes);
         let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
         parser.process(bytes);
         let screen = parser.screen();
@@ -1116,22 +1343,12 @@ impl TuiPty {
                 cell.bold()
             ))
         };
+        let (transcript_row, dock_row, composer_row) =
+            rivect::ui::view_anchors(&fixture.view, self.cols, self.rows);
         let status = cell(0, 0)?;
-        let dock_row = rows
-            .iter()
-            .position(|row| {
-                support::squashed(row).contains(&support::squashed(&fixture.dock_probe))
-            })
-            .ok_or_else(|| {
-                format!(
-                    "no dock row carries {:?}; rows: {rows:?}",
-                    fixture.dock_probe
-                )
-            })?;
-        let dock_row = u16::try_from(dock_row)
-            .map_err(|error| format!("dock row index overflows u16: {error}"))?;
+        let transcript = cell(transcript_row, 0)?;
         let dock = cell(dock_row, 0)?;
-        let composer = cell(self.rows.saturating_sub(1), 0)?;
+        let composer = cell(composer_row, 0)?;
         let modal = if fixture.modal {
             let corner = (0..self.rows).find_map(|row| {
                 (0..self.cols)
@@ -1152,6 +1369,7 @@ impl TuiPty {
             dock,
             composer,
             modal,
+            transcript,
         })
     }
 
@@ -1683,15 +1901,24 @@ fn state_claims() -> Value {
     })
 }
 
-fn write_report(
-    bundle: &Path,
+/// Everything one matrix run produced, so the writer and the verifier share
+/// one carrier instead of a long argument list.
+struct MatrixRun {
+    cells: Vec<Value>,
+    observations: Vec<Value>,
     pass: usize,
     fail: usize,
-    not_run: usize,
-    cells: &[Value],
-    observations: &[Value],
+    theme_pass: usize,
     mono_pass: usize,
-) -> Result<PathBuf, String> {
+    dumb_pass: usize,
+    inline_pass: usize,
+    runtime_seconds: f64,
+}
+
+/// Writes the report first, with whatever the run actually produced. The
+/// success invariants are asserted afterwards ([`verify_report`]), so a failed
+/// run still leaves a FAIL/partial report instead of deleting the evidence.
+fn write_report(bundle: &Path, run: &MatrixRun) -> Result<PathBuf, String> {
     let manifest = bundle.join("rivect.manifest.json");
     let digest = support::release::sha256_file(&manifest);
     let report = json!({
@@ -1701,13 +1928,16 @@ fn write_report(
         "geometries": GEOMETRIES,
         "inputs": INPUTS,
         "cells": CELLS,
-        "pass": pass,
-        "fail": fail,
-        "not_run": not_run,
-        "cell_verdicts": cells,
-        "theme_observations": observations.len(),
-        "theme_fingerprints": observations,
-        "mono_probes": { "total": MONO_PROBES, "pass": mono_pass },
+        "pass": run.pass,
+        "fail": run.fail,
+        "not_run": 0,
+        "cell_verdicts": run.cells,
+        "theme_observations": run.observations.len(),
+        "theme_fingerprints": run.observations,
+        "mono_probes": { "total": MONO_PROBES, "pass": run.mono_pass },
+        "dumb_probes": { "total": DUMB_PROBES, "pass": run.dumb_pass },
+        "inline_probes": { "total": THEMES.len(), "pass": run.inline_pass },
+        "runtime_seconds": run.runtime_seconds,
         "restore": {
             "exit": RESTORE_EXIT_CLAIM,
             "cancel": RESTORE_CANCEL_CLAIM,
@@ -1725,50 +1955,65 @@ fn write_report(
         },
         "platform_terminals": "NOT_RUN (no platform terminal is available on this host)",
     });
-    // The restore and zero-send fields are declarations, not executed
-    // probes: this test owns neither leg. Assert their evidence class.
-    for (label, claim) in [
-        ("restore.exit", RESTORE_EXIT_CLAIM),
-        ("restore.cancel", RESTORE_CANCEL_CLAIM),
-        ("restore.panic", RESTORE_PANIC_CLAIM),
-        ("restore.inline_scrollback", INLINE_SCROLLBACK_CLAIM),
-        ("zero_send_approval", ZERO_SEND_CLAIM),
-    ] {
-        assert!(
-            claim.starts_with("NOT_RUN"),
-            "{label} declares its NOT_RUN owner instead of claiming execution: {claim}"
-        );
-    }
+    let path = matrix_report_path();
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| format!("matrix report encode: {error}"))?,
+    )
+    .map_err(|error| format!("matrix report write {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// The success invariants, asserted only after the report has been written.
+fn verify_report(run: &MatrixRun) {
+    assert_eq!(run.pass + run.fail, CELLS, "every cell is accounted");
+    assert_eq!(run.pass, CELLS, "every installed UI cell passes");
+    assert_eq!(run.fail, 0, "no installed UI cell failed");
     assert_eq!(
-        observations.len(),
-        THEME_OBSERVATIONS,
-        "one observation per state, geometry and theme"
+        run.theme_pass, THEME_OBSERVATIONS,
+        "every state×geometry×theme observation passes"
     );
-    assert_eq!(mono_pass, MONO_PROBES, "every mono label probe passes");
-    assert_eq!(pass, CELLS, "every installed UI cell passes");
-    assert_eq!(fail, 0, "no installed UI cell failed");
-    assert_eq!(not_run, 0, "no installed UI cell is unproven");
+    assert_eq!(run.mono_pass, MONO_PROBES, "every mono label probe passes");
+    assert_eq!(
+        run.dumb_pass, DUMB_PROBES,
+        "every TERM=dumb label probe passes"
+    );
+    assert_eq!(
+        run.inline_pass,
+        THEMES.len(),
+        "every themed inline probe passes"
+    );
+    assert!(
+        run.runtime_seconds < MATRIX_BUDGET_SECONDS,
+        "matrix runtime {:.1}s exceeded the {MATRIX_BUDGET_SECONDS:.0}s gate",
+        run.runtime_seconds
+    );
     let mut seen = std::collections::BTreeSet::new();
-    for observation in observations {
+    for observation in &run.observations {
         let state = observation["state"].as_str().expect("observation state");
         let geometry = observation["geometry"]
             .as_str()
             .expect("observation geometry");
         let theme = observation["theme"].as_str().expect("observation theme");
-        for surface in ["status", "dock", "composer"] {
-            let fingerprint = observation[surface]
-                .as_str()
-                .expect("observation fingerprint");
-            assert!(
-                !fingerprint.is_empty() && fingerprint != "none",
-                "{state}/{geometry}/{theme} carries a {surface} fingerprint"
+        for surface in ["status", "dock", "composer", "transcript"] {
+            assert_eq!(
+                observation[surface]
+                    .as_str()
+                    .expect("observation fingerprint"),
+                expected_fingerprint(theme, surface),
+                "{state}/{geometry}/{theme} {surface}"
             );
         }
-        assert!(
-            observation["modal"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty()),
-            "{state}/{geometry}/{theme} carries a modal fingerprint"
+        let modal_state = matches!(state, "awaiting-decision" | "awaiting-permission");
+        assert_eq!(
+            observation["modal"].as_str().expect("observation modal"),
+            if modal_state {
+                expected_fingerprint(theme, "modal")
+            } else {
+                "none"
+            },
+            "{state}/{geometry}/{theme} modal"
         );
         assert!(
             seen.insert((state.to_string(), geometry.to_string(), theme.to_string())),
@@ -1788,44 +2033,19 @@ fn write_report(
             );
         }
     }
-    // Per state and geometry the three themes must be pairwise distinct on
-    // each painted carrier; a modal absent in every theme stays `none`.
-    for observation in observations {
-        let siblings: Vec<&Value> = observations
-            .iter()
-            .filter(|other| {
-                other["state"] == observation["state"]
-                    && other["geometry"] == observation["geometry"]
-            })
-            .collect();
-        assert_eq!(siblings.len(), THEMES.len());
-        for surface in ["status", "dock", "composer"] {
-            let mut values: Vec<&str> = siblings
-                .iter()
-                .map(|sibling| sibling[surface].as_str().expect("sibling fingerprint"))
-                .collect();
-            values.sort_unstable();
-            values.dedup();
-            assert_eq!(
-                values.len(),
-                THEMES.len(),
-                "{} / {} / {surface} palettes are pairwise distinct",
-                observation["state"],
-                observation["geometry"]
-            );
-        }
-        let modals: std::collections::BTreeSet<&str> = siblings
-            .iter()
-            .map(|sibling| sibling["modal"].as_str().expect("sibling modal"))
-            .collect();
-        if modals != std::collections::BTreeSet::from(["none"]) {
-            assert_eq!(
-                modals.len(),
-                THEMES.len(),
-                "modal palettes are pairwise distinct"
-            );
-            assert!(!modals.contains("none"), "every theme paints the modal");
-        }
+    // The restore and zero-send fields are declarations, not executed
+    // probes: this test owns neither leg. Assert their evidence class.
+    for (label, claim) in [
+        ("restore.exit", RESTORE_EXIT_CLAIM),
+        ("restore.cancel", RESTORE_CANCEL_CLAIM),
+        ("restore.panic", RESTORE_PANIC_CLAIM),
+        ("restore.inline_scrollback", INLINE_SCROLLBACK_CLAIM),
+        ("zero_send_approval", ZERO_SEND_CLAIM),
+    ] {
+        assert!(
+            claim.starts_with("NOT_RUN"),
+            "{label} declares its NOT_RUN owner instead of claiming execution: {claim}"
+        );
     }
     // The renderer-only states must name their evidence class in the report,
     // and every passing cell of such a state must carry that same claim: a
@@ -1844,7 +2064,7 @@ fn write_report(
             "the renderer-only state {state} names its evidence class"
         );
     }
-    for cell in cells {
+    for cell in &run.cells {
         let state = cell["state"].as_str().unwrap_or_default();
         if cell["verdict"] == "PASS"
             && let Some(claim) = renderer_only_claim(state)
@@ -1855,18 +2075,11 @@ fn write_report(
             );
         }
     }
-    let path = matrix_report_path();
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&report)
-            .map_err(|error| format!("matrix report encode: {error}"))?,
-    )
-    .map_err(|error| format!("matrix report write {}: {error}", path.display()))?;
-    Ok(path)
 }
 
 #[test]
 fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
+    let started = Instant::now();
     let report_path = matrix_report_path();
     match std::fs::remove_file(&report_path) {
         Ok(()) => {}
@@ -1880,88 +2093,139 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
         bundle.display()
     );
 
-    let mut input_verdicts = std::collections::HashMap::new();
-    for geometry in Geometry::ALL {
-        for input in InputMode::ALL {
-            let verdict = input_probe(input, geometry);
-            input_verdicts.insert((geometry, input), verdict);
+    // Input probes are independent packaged runs; keep a bounded worker set.
+    let input_jobs: Vec<(Geometry, InputMode)> = Geometry::ALL
+        .iter()
+        .flat_map(|geometry| InputMode::ALL.iter().map(move |input| (*geometry, *input)))
+        .collect();
+    let input_verdicts: std::collections::HashMap<_, _> =
+        parallel_map(&input_jobs, MATRIX_WORKERS, |(geometry, input)| {
+            ((geometry, input), input_probe(input, geometry))
+        })
+        .into_iter()
+        .collect();
+
+    let state_geometries: Vec<(usize, Geometry)> = (0..STATES)
+        .flat_map(|state| Geometry::ALL.iter().map(move |geometry| (state, *geometry)))
+        .collect();
+    let controls: std::collections::HashMap<_, _> =
+        parallel_map(&state_geometries, MATRIX_WORKERS, |(state, geometry)| {
+            let fixture = state_fixture(state);
+            ((state, geometry), render_state(&fixture, geometry))
+        })
+        .into_iter()
+        .collect();
+
+    let theme_jobs: Vec<(usize, Geometry, &'static str)> = state_geometries
+        .iter()
+        .flat_map(|(state, geometry)| THEMES.map(|theme| (*state, *geometry, theme)))
+        .collect();
+    let theme_results = parallel_map(&theme_jobs, MATRIX_WORKERS, |(state, geometry, theme)| {
+        let control = controls
+            .get(&(state, geometry))
+            .cloned()
+            .unwrap_or_else(|| Err("control probe missing".to_string()));
+        let verdict = observe_theme(state, geometry, theme, &control)
+            .map(|observation| observation.to_json());
+        ((state, geometry, theme), verdict)
+    });
+    let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
+    let mut theme_verdicts = std::collections::HashMap::new();
+    let mut theme_pass = 0usize;
+    for (key, result) in theme_results {
+        if result.is_ok() {
+            theme_pass += 1;
+        }
+        theme_verdicts.insert(key, result.as_ref().map(|_| ()).map_err(Clone::clone));
+        if let Ok(observation) = result {
+            observations.push(observation);
+        }
+    }
+
+    let mono_results = parallel_map(&theme_jobs, MATRIX_WORKERS, |(state, geometry, theme)| {
+        let fixture = state_fixture(state);
+        (
+            (state, geometry, theme),
+            mono_probe(&fixture, geometry, theme),
+        )
+    });
+    let mut mono_verdicts = std::collections::HashMap::new();
+    let mut mono_pass = 0usize;
+    for (key, result) in mono_results {
+        if result.is_ok() {
+            mono_pass += 1;
+        }
+        mono_verdicts.insert(key, result);
+    }
+
+    let dumb_results = parallel_map(&(0..STATES).collect::<Vec<_>>(), MATRIX_WORKERS, |state| {
+        let fixture = state_fixture(state);
+        (state, dumb_probe(&fixture))
+    });
+    let mut dumb_verdicts = std::collections::HashMap::new();
+    let mut dumb_pass = 0usize;
+    for (state, result) in dumb_results {
+        if result.is_ok() {
+            dumb_pass += 1;
+        }
+        dumb_verdicts.insert(state, result);
+    }
+
+    let inline_results = parallel_map(&THEMES, THEMES.len(), |theme| {
+        (theme, inline_theme_probe(theme))
+    });
+    let inline_pass = inline_results
+        .iter()
+        .filter(|(_, result)| result.is_ok())
+        .count();
+    for (theme, result) in &inline_results {
+        if let Err(error) = result {
+            println!("INLINE-THEME theme={theme} verdict=FAIL reason={error}");
         }
     }
 
     let mut pass = 0usize;
     let mut fail = 0usize;
     let mut cells = Vec::with_capacity(CELLS);
-    let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
-    let mut mono_pass = 0usize;
-    let mut theme_pass = 0usize;
     for state in 0..STATES {
         let fixture = state_fixture(state);
         for geometry in Geometry::ALL {
-            let state_verdict = render_state(&fixture, geometry);
-            let mut theme_verdicts: std::collections::HashMap<&'static str, Result<(), String>> =
-                std::collections::HashMap::new();
-            let mut rendered = Vec::new();
-            match &state_verdict {
-                Ok(control) => {
-                    for theme in THEMES {
-                        match observe_theme(&fixture, geometry, theme, control) {
-                            Ok(observation) => rendered.push(observation),
-                            Err(error) => {
-                                theme_verdicts.insert(theme, Err(error));
-                            }
-                        }
-                    }
-                    if rendered.len() == THEMES.len() {
-                        match require_distinct_palettes(&rendered) {
-                            Ok(()) => {
-                                for theme in THEMES {
-                                    theme_verdicts.insert(theme, Ok(()));
-                                    theme_pass += 1;
-                                }
-                            }
-                            Err(error) => {
-                                for theme in THEMES {
-                                    theme_verdicts.insert(theme, Err(error.clone()));
-                                }
-                            }
-                        }
-                    } else {
-                        for theme in THEMES {
-                            theme_verdicts
-                                .entry(theme)
-                                .or_insert_with(|| Err("theme observation missing".to_string()));
-                        }
-                    }
-                }
-                Err(error) => {
-                    for theme in THEMES {
-                        theme_verdicts.insert(theme, Err(error.clone()));
-                    }
-                }
-            }
-            for observation in &rendered {
-                observations.push(observation.to_json());
-            }
-            let mono_verdict = mono_probe(&fixture, geometry);
-            if mono_verdict.is_ok() {
-                mono_pass += 1;
-            }
+            let state_verdict: Result<(), String> = controls
+                .get(&(state, geometry))
+                .map(|verdict| verdict.as_ref().map(|_| ()).map_err(Clone::clone))
+                .unwrap_or_else(|| Err("control probe missing".to_string()));
+            let mono_verdict = THEMES
+                .iter()
+                .find_map(|theme| {
+                    mono_verdicts
+                        .get(&(state, geometry, *theme))
+                        .and_then(|verdict| verdict.as_ref().err())
+                        .map(|error| format!("mono {theme}: {error}"))
+                })
+                .map_or(Ok(()), Err);
+            let dumb_verdict = dumb_verdicts
+                .get(&state)
+                .map(|verdict| verdict.as_ref().map(|_| ()).map_err(Clone::clone))
+                .unwrap_or_else(|| Err("dumb probe missing".to_string()));
             for input in InputMode::ALL {
                 let input_verdict = input_verdicts
                     .get(&(geometry, input))
                     .cloned()
                     .unwrap_or_else(|| Err("input probe missing".to_string()));
                 let theme_verdict = match input {
-                    InputMode::Light => theme_verdicts.get("light").cloned(),
-                    InputMode::Dark => theme_verdicts.get("dark").cloned(),
-                    InputMode::HighContrast => theme_verdicts.get("high-contrast").cloned(),
+                    InputMode::Light => theme_verdicts.get(&(state, geometry, "light")).cloned(),
+                    InputMode::Dark => theme_verdicts.get(&(state, geometry, "dark")).cloned(),
+                    InputMode::HighContrast => theme_verdicts
+                        .get(&(state, geometry, "high-contrast"))
+                        .cloned(),
                     InputMode::NoColor => Some(mono_verdict.clone()),
+                    InputMode::Plain => Some(state_verdict.clone().and(dumb_verdict.clone())),
                     _ => None,
                 }
                 .unwrap_or(Ok(()));
                 let (verdict, reason) = match (state_verdict.clone(), input_verdict, theme_verdict)
                 {
-                    (Ok(_), Ok(()), Ok(())) => {
+                    (Ok(()), Ok(()), Ok(())) => {
                         pass += 1;
                         ("PASS", String::new())
                     }
@@ -2005,29 +2269,52 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
         }
     }
 
-    println!("THEME-OBSERVATIONS total={THEME_OBSERVATIONS} pass={theme_pass}");
-    let path = write_report(bundle, pass, fail, 0, &cells, &observations, mono_pass)
-        .expect("matrix report");
+    let runtime = started.elapsed();
+    let run = MatrixRun {
+        cells,
+        observations,
+        pass,
+        fail,
+        theme_pass,
+        mono_pass,
+        dumb_pass,
+        inline_pass,
+        runtime_seconds: runtime.as_secs_f64(),
+    };
+    let path = write_report(bundle, &run).expect("matrix report written before success asserts");
     println!(
-        "UI-CELLS total={CELLS} pass={pass} fail={fail} not_run=0 report={}",
+        "THEME-OBSERVATIONS total={THEME_OBSERVATIONS} pass={}",
+        run.theme_pass
+    );
+    println!(
+        "MONO-PROBES total={MONO_PROBES} pass={} DUMB-PROBES total={DUMB_PROBES} pass={}",
+        run.mono_pass, run.dumb_pass
+    );
+    println!(
+        "INLINE-PROBES total={} pass={}",
+        THEMES.len(),
+        run.inline_pass
+    );
+    println!(
+        "UI-MATRIX runtime={:.1}s report={}",
+        run.runtime_seconds,
         path.display()
     );
-    assert_eq!(pass + fail, CELLS, "every cell is accounted");
-    assert_eq!(
-        theme_pass, THEME_OBSERVATIONS,
-        "every state×geometry×theme observation passes"
+    println!(
+        "UI-CELLS total={CELLS} pass={} fail={} not_run=0 report={}",
+        run.pass,
+        run.fail,
+        path.display()
     );
-    assert_eq!(mono_pass, MONO_PROBES, "every mono label probe passes");
-    assert_eq!(fail, 0, "every installed UI cell passes");
-    assert_eq!(pass, CELLS, "the matrix passes every cell");
+    verify_report(&run);
 }
 
-/// An unknown `RIVECT_THEME` falls back to the dark palette and earns exactly
-/// one stderr note naming the accepted values; a known theme earns none.
+/// An unknown `RIVECT_THEME` falls back to mono and earns exactly one stderr
+/// note naming the accepted values, emitted before the alternate screen; a
+/// known theme earns none.
 #[test]
-fn installed_unknown_theme_falls_back_to_dark_with_one_note() {
-    const NOTE: &str =
-        "rivect: unknown RIVECT_THEME; accepted values are light|dark|high-contrast; using dark";
+fn installed_unknown_theme_falls_back_to_mono_with_one_note() {
+    const NOTE: &str = "rivect: unknown RIVECT_THEME; accepted values are light|dark|high-contrast; no theme applied";
     let fixture = state_fixture(2);
     let control = render_state(&fixture, Geometry::W80H24).expect("control frame");
     let unknown = review_frame(
@@ -2047,10 +2334,22 @@ fn installed_unknown_theme_falls_back_to_dark_with_one_note() {
         !emitted.contains("sepia"),
         "the note never echoes the untrusted value"
     );
+    let note_at = emitted.find(NOTE).expect("the note reached the terminal");
+    let alt_at = emitted
+        .find("\u{1b}[?1049h")
+        .expect("the review entered the alternate screen");
+    assert!(
+        note_at < alt_at,
+        "the note is emitted before the alternate screen, so it survives restore"
+    );
     assert_eq!(
         normalized_review_text(&unknown.text),
         normalized_review_text(&control),
-        "the fallback changes no visible text"
+        "the mono fallback changes no visible text"
+    );
+    assert_eq!(
+        unknown.fingerprints.status, "fg=Default;bg=Default;bold=false",
+        "an unknown value resolves to the mono palette"
     );
     let dark = review_frame(
         &fixture,
@@ -2059,10 +2358,6 @@ fn installed_unknown_theme_falls_back_to_dark_with_one_note() {
         "dark-theme",
     )
     .expect("dark frame");
-    assert_eq!(
-        unknown.fingerprints.status, dark.fingerprints.status,
-        "an unknown value resolves to the dark palette"
-    );
     let dark_emitted = String::from_utf8_lossy(&dark.bytes);
     assert!(
         !dark_emitted.contains("unknown RIVECT_THEME"),

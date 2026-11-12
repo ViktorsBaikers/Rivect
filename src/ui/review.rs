@@ -274,6 +274,9 @@ impl ReviewState {
                 format!("unknown ui review state {state}"),
             ));
         };
+        // Resolve before the alternate screen so the unknown-theme note is
+        // visible in the terminal's own scrollback, not painted over.
+        let _palette = super::theme::Palette::resolve();
         let mut guard = TerminalGuard::enter_mode(RenderMode::Fullscreen)?;
         render(guard.terminal_mut(), &view)?;
         loop {
@@ -311,4 +314,49 @@ fn status_with_tasks(tasks: &[(&str, &str, Option<&str>)], economy: Value) -> Va
         })
         .collect();
     json!({ "todo": { "items": items }, "economy": economy })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::theme::{Capability, Palette};
+    use std::ffi::OsString;
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    /// The run's prologue resolves the palette before the alternate screen, so
+    /// an unknown-value note lands where restore leaves it visible.
+    #[test]
+    fn unknown_theme_note_precedes_the_alternate_screen() {
+        let mut out = Vec::new();
+        let palette = Palette::resolve_reporting(
+            &|name| (name == "RIVECT_THEME").then(|| OsString::from("sepia")),
+            true,
+            &mut out,
+        );
+        assert_eq!(palette.capability(), Capability::Mono);
+        out.extend_from_slice(b"\x1b[?1049h");
+        let note_at =
+            find(&out, b"rivect: unknown RIVECT_THEME").expect("the unknown value writes one note");
+        let alt_at = find(&out, b"\x1b[?1049h").expect("the alternate screen marker");
+        assert!(
+            note_at < alt_at,
+            "the note is on stderr before the alternate-screen escape"
+        );
+    }
+
+    #[test]
+    fn a_known_theme_writes_no_note_before_the_alternate_screen() {
+        let mut out = Vec::new();
+        let palette = Palette::resolve_reporting(
+            &|name| (name == "RIVECT_THEME").then(|| OsString::from("dark")),
+            true,
+            &mut out,
+        );
+        assert_eq!(palette.capability(), Capability::Indexed);
+        assert!(out.is_empty(), "a known theme writes no note: {out:?}");
+    }
 }

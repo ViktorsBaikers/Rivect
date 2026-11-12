@@ -51,6 +51,12 @@ const INSTALLED_UI_EVIDENCE_MARKER: &str = "#installed-ui";
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
 /// Every state carries one observation per geometry and theme.
 const THEME_OBSERVATIONS: usize = UI_STATES.len() * UI_GEOMETRIES.len() * THEMES.len();
+/// One mono probe per state, geometry and theme.
+const MONO_PROBES: usize = THEME_OBSERVATIONS;
+/// One `TERM=dumb` label probe per state.
+const DUMB_PROBES: usize = UI_STATES.len();
+/// The recorded matrix gate.
+const MATRIX_BUDGET_SECONDS: f64 = 900.0;
 
 /// The renderer-only claim each of these states' passing cells must carry,
 /// character for character. A missing or altered claim is a malformed report:
@@ -556,10 +562,96 @@ fn matrix_identity(report: &Value) -> Result<BTreeMap<(String, String, String), 
     Ok(observed)
 }
 
+/// One parsed surface fingerprint: `fg=Default|Idx(n);bg=Default;bold=bool`
+/// with exactly those three fields. The format is pinned, so a placeholder
+/// such as `a/b/c` or an RGB/truecolor claim is refused.
+#[derive(Debug, PartialEq, Eq)]
+struct Fingerprint {
+    fg: Option<u8>,
+    bold: bool,
+}
+
+fn parse_fingerprint(value: &str) -> Option<Fingerprint> {
+    let mut fg = None;
+    let mut background = false;
+    let mut bold = None;
+    let mut fields = 0usize;
+    for field in value.split(';') {
+        fields += 1;
+        if field == "fg=Default" {
+            fg = Some(None);
+        } else if let Some(index) = field
+            .strip_prefix("fg=Idx(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            fg = Some(Some(index.parse::<u8>().ok()?));
+        } else if field == "bg=Default" {
+            background = true;
+        } else if field == "bold=false" {
+            bold = Some(false);
+        } else if field == "bold=true" {
+            bold = Some(true);
+        } else {
+            return None;
+        }
+    }
+    if fields != 3 || !background {
+        return None;
+    }
+    Some(Fingerprint {
+        fg: fg?,
+        bold: bold?,
+    })
+}
+
+/// The expected fingerprint per theme and surface, pinned independently of
+/// the producer: light Blue/Magenta, dark Cyan/bright Magenta, high contrast
+/// LightYellow/LightCyan/White with bold; body rows are Reset.
+fn expected_fingerprint(theme: &str, surface: &str) -> &'static str {
+    match (theme, surface) {
+        ("light", "status" | "modal") => "fg=Idx(4);bg=Default;bold=false",
+        ("light", "composer") => "fg=Idx(5);bg=Default;bold=false",
+        ("light", "dock" | "transcript") => "fg=Default;bg=Default;bold=false",
+        ("dark", "status" | "modal") => "fg=Idx(6);bg=Default;bold=false",
+        ("dark", "composer") => "fg=Idx(13);bg=Default;bold=false",
+        ("dark", "dock" | "transcript") => "fg=Default;bg=Default;bold=false",
+        ("high-contrast", "status") => "fg=Idx(11);bg=Default;bold=true",
+        ("high-contrast", "composer") => "fg=Idx(14);bg=Default;bold=true",
+        ("high-contrast", "modal") => "fg=Idx(15);bg=Default;bold=true",
+        ("high-contrast", "dock" | "transcript") => "fg=Default;bg=Default;bold=true",
+        _ => panic!("no expected fingerprint for {theme}/{surface}"),
+    }
+}
+
+fn require_fingerprint(
+    state: &str,
+    geometry: &str,
+    theme: &str,
+    surface: &str,
+    value: &str,
+) -> Result<(), String> {
+    let Some(parsed) = parse_fingerprint(value) else {
+        return Err(format!(
+            "theme observation {state}/{geometry}/{theme} {surface} is not a fingerprint: {value:?}"
+        ));
+    };
+    let Some(expected) = parse_fingerprint(expected_fingerprint(theme, surface)) else {
+        return Err(format!(
+            "the expected {theme}/{surface} fingerprint is malformed"
+        ));
+    };
+    if parsed != expected {
+        return Err(format!(
+            "theme observation {state}/{geometry}/{theme} {surface} is {parsed:?}, not {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// The report's 285 state×theme observations: every state, geometry and theme
-/// appears once; each carries non-empty status/dock/composer fingerprints and
-/// a modal fingerprint; and the three themes are pairwise distinct on every
-/// painted carrier. A dropped or blank fingerprint is a malformed report.
+/// appears exactly once; each carrier matches the pinned expected palette;
+/// the two card states carry a painted modal and every other state `none`;
+/// and the mono/dumb probes cover their whole sets.
 fn theme_observations(report: &Value) -> Result<(), String> {
     if report["theme_observations"].as_u64() != Some(THEME_OBSERVATIONS as u64) {
         return Err("matrix carries no 285 state×theme observations".to_string());
@@ -590,29 +682,40 @@ fn theme_observations(report: &Value) -> Result<(), String> {
                 "theme observation names an unknown coordinate: {state}/{geometry}/{theme}"
             ));
         }
-        for surface in ["status", "dock", "composer"] {
-            match observation[surface].as_str() {
-                Some(value) if !value.is_empty() && value != "none" => {}
-                _ => {
-                    return Err(format!(
-                        "theme observation {state}/{geometry}/{theme} misses its {surface} fingerprint"
-                    ));
-                }
-            }
-        }
-        match observation["modal"].as_str() {
-            Some(value) if !value.is_empty() => {}
-            _ => {
-                return Err(format!(
-                    "theme observation {state}/{geometry}/{theme} misses its modal fingerprint"
-                ));
-            }
-        }
         if !seen.insert((state.to_string(), geometry.to_string(), theme.to_string())) {
             return Err(format!(
                 "theme observation repeats a coordinate: {state}/{geometry}/{theme}"
             ));
         }
+        for surface in ["status", "dock", "composer", "transcript"] {
+            let Some(value) = observation[surface].as_str() else {
+                return Err(format!(
+                    "theme observation {state}/{geometry}/{theme} misses its {surface} fingerprint"
+                ));
+            };
+            require_fingerprint(state, geometry, theme, surface, value)?;
+        }
+        let modal_state = matches!(state, "awaiting-decision" | "awaiting-permission");
+        let Some(modal) = observation["modal"].as_str() else {
+            return Err(format!(
+                "theme observation {state}/{geometry}/{theme} misses its modal fingerprint"
+            ));
+        };
+        if modal_state {
+            require_fingerprint(state, geometry, theme, "modal", modal)?;
+        } else if modal != "none" {
+            return Err(format!(
+                "theme observation {state}/{geometry}/{theme} paints a modal in a state with none"
+            ));
+        }
+        if modal_state && modal == "none" {
+            return Err(format!(
+                "theme observation {state}/{geometry}/{theme} misses its painted modal"
+            ));
+        }
+    }
+    if seen.len() != THEME_OBSERVATIONS {
+        return Err("theme observations do not cover every coordinate".to_string());
     }
     for state in UI_STATES {
         for theme in THEMES {
@@ -627,44 +730,37 @@ fn theme_observations(report: &Value) -> Result<(), String> {
             }
         }
     }
-    for state in UI_STATES {
-        for geometry in UI_GEOMETRIES {
-            let siblings: Vec<&Value> = observations
-                .iter()
-                .filter(|observation| {
-                    observation["state"] == json!(state)
-                        && observation["geometry"] == json!(geometry)
-                })
-                .collect();
-            if siblings.len() != THEMES.len() {
-                return Err(format!(
-                    "{state}/{geometry} carries {} themes",
-                    siblings.len()
-                ));
-            }
-            for surface in ["status", "dock", "composer"] {
-                let values: BTreeSet<&str> = siblings
-                    .iter()
-                    .filter_map(|sibling| sibling[surface].as_str())
-                    .collect();
-                if values.len() != THEMES.len() {
-                    return Err(format!(
-                        "{state}/{geometry} {surface} palettes are not pairwise distinct"
-                    ));
-                }
-            }
-            let modals: BTreeSet<&str> = siblings
-                .iter()
-                .filter_map(|sibling| sibling["modal"].as_str())
-                .collect();
-            if modals != BTreeSet::from(["none"])
-                && (modals.len() != THEMES.len() || modals.contains("none"))
-            {
-                return Err(format!(
-                    "{state}/{geometry} modal palettes are not pairwise distinct"
-                ));
-            }
-        }
+    let mono = &report["mono_probes"];
+    if mono["total"].as_u64() != Some(MONO_PROBES as u64)
+        || mono["pass"].as_u64() != Some(MONO_PROBES as u64)
+    {
+        return Err(format!(
+            "mono probes are not the full {MONO_PROBES}/{MONO_PROBES} set: {mono}"
+        ));
+    }
+    let dumb = &report["dumb_probes"];
+    if dumb["total"].as_u64() != Some(DUMB_PROBES as u64)
+        || dumb["pass"].as_u64() != Some(DUMB_PROBES as u64)
+    {
+        return Err(format!(
+            "dumb probes are not the full {DUMB_PROBES}/{DUMB_PROBES} set: {dumb}"
+        ));
+    }
+    let inline = &report["inline_probes"];
+    if inline["total"].as_u64() != Some(THEMES.len() as u64)
+        || inline["pass"].as_u64() != Some(THEMES.len() as u64)
+    {
+        return Err(format!(
+            "inline probes are not the full {}/{} set: {inline}",
+            THEMES.len(),
+            THEMES.len()
+        ));
+    }
+    let runtime = report["runtime_seconds"].as_f64().unwrap_or(f64::INFINITY);
+    if !(0.0..MATRIX_BUDGET_SECONDS).contains(&runtime) {
+        return Err(format!(
+            "matrix runtime {runtime:.1}s is outside the {MATRIX_BUDGET_SECONDS:.0}s gate"
+        ));
     }
     Ok(())
 }
@@ -811,24 +907,23 @@ fn honest_ui_cells() -> Vec<Value> {
 
 fn honest_theme_fingerprints() -> Vec<Value> {
     let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
-    for (state_index, state) in UI_STATES.iter().enumerate() {
-        for (geometry_index, geometry) in UI_GEOMETRIES.iter().enumerate() {
-            for (theme_index, theme) in THEMES.iter().enumerate() {
-                let base = 10 * state_index + 3 * geometry_index + theme_index;
-                let bold = *theme == "high-contrast";
-                let modal = if matches!(*state, "awaiting-decision" | "awaiting-permission") {
-                    format!("fg=Idx({});bg=Default;bold={bold}", 190 + base % 60)
-                } else {
-                    "none".to_string()
-                };
+    for state in UI_STATES {
+        for geometry in UI_GEOMETRIES {
+            for theme in THEMES {
+                let modal_state = matches!(state, "awaiting-decision" | "awaiting-permission");
                 observations.push(json!({
                     "state": state,
                     "geometry": geometry,
                     "theme": theme,
-                    "status": format!("fg=Idx({});bg=Default;bold={bold}", 30 + base % 60),
-                    "dock": format!("fg=Idx({});bg=Default;bold={bold}", 100 + base % 60),
-                    "composer": format!("fg=Idx({});bg=Default;bold={bold}", 150 + base % 60),
-                    "modal": modal,
+                    "status": expected_fingerprint(theme, "status"),
+                    "dock": expected_fingerprint(theme, "dock"),
+                    "composer": expected_fingerprint(theme, "composer"),
+                    "transcript": expected_fingerprint(theme, "transcript"),
+                    "modal": if modal_state {
+                        expected_fingerprint(theme, "modal")
+                    } else {
+                        "none"
+                    },
                 }));
             }
         }
@@ -850,6 +945,10 @@ fn honest_ui_report(cells: &[Value], observations: &[Value]) -> Value {
         "cell_verdicts": cells,
         "theme_observations": observations.len(),
         "theme_fingerprints": observations,
+        "mono_probes": { "total": MONO_PROBES, "pass": MONO_PROBES },
+        "dumb_probes": { "total": DUMB_PROBES, "pass": DUMB_PROBES },
+        "inline_probes": { "total": THEMES.len(), "pass": THEMES.len() },
+        "runtime_seconds": 300.0,
     })
 }
 
@@ -988,6 +1087,63 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
         .expect("NOT_RUN matrix");
     let refused = installed_ui_evidence(&ui, candidate).expect_err("a NOT_RUN cell is refused");
     assert!(refused.contains("NOT_RUN"), "{refused}");
+
+    // Placeholder fingerprints are not fingerprints.
+    let mut placeholder = observations.clone();
+    placeholder[0]["status"] = json!("a");
+    placeholder[0]["dock"] = json!("b");
+    placeholder[0]["composer"] = json!("c");
+    placeholder[0]["transcript"] = json!("d");
+    std::fs::write(&ui, honest_ui_report(&honest, &placeholder).to_string())
+        .expect("placeholder fingerprints");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("placeholder fingerprints are refused");
+    assert!(refused.contains("fingerprint"), "{refused}");
+
+    // 285 reported observations with only 284 entries is a short report.
+    let mut short_report = honest_ui_report(&honest, &dropped);
+    short_report["theme_observations"] = json!(THEME_OBSERVATIONS);
+    std::fs::write(&ui, short_report.to_string()).expect("short observation list");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("a short observation list is refused");
+    assert!(refused.contains("284"), "{refused}");
+
+    // The card states must paint a modal; all-`none` is refused.
+    let mut no_modal = observations.clone();
+    for observation in &mut no_modal {
+        if observation["state"] == json!("awaiting-decision") {
+            observation["modal"] = json!("none");
+        }
+    }
+    std::fs::write(&ui, honest_ui_report(&honest, &no_modal).to_string())
+        .expect("missing modal fingerprints");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("a missing painted modal is refused");
+    assert!(refused.contains("modal"), "{refused}");
+
+    // A swapped theme label no longer matches the pinned palette.
+    let mut swapped = observations.clone();
+    swapped[0]["theme"] = json!("dark");
+    std::fs::write(&ui, honest_ui_report(&honest, &swapped).to_string())
+        .expect("swapped theme label");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("a swapped theme label is refused");
+    assert!(refused.contains("theme observation"), "{refused}");
+
+    // The mono probe set must be the full 285.
+    let mut short_mono = honest_ui_report(&honest, &observations);
+    short_mono["mono_probes"]["pass"] = json!(MONO_PROBES - 1);
+    std::fs::write(&ui, short_mono.to_string()).expect("short mono probes");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("a short mono probe set is refused");
+    assert!(refused.contains("mono probes"), "{refused}");
+
+    // A runtime outside the recorded gate is refused.
+    let mut slow = honest_ui_report(&honest, &observations);
+    slow["runtime_seconds"] = json!(MATRIX_BUDGET_SECONDS + 1.0);
+    std::fs::write(&ui, slow.to_string()).expect("slow matrix");
+    let refused = installed_ui_evidence(&ui, candidate).expect_err("a slow matrix is refused");
+    assert!(refused.contains("runtime"), "{refused}");
 
     let assert_refused = |path: &Path| {
         assert!(installed_ui_evidence(path, candidate).is_err());

@@ -1263,55 +1263,92 @@ fn composer_line(view: &LocalView) -> String {
     }
 }
 
+/// The fixed-row facts a fullscreen frame derives from the view. The renderer
+/// builds its constraints from this, and the installed probes anchor their
+/// surface cells from the same arithmetic instead of searching text.
+pub struct ViewMetrics {
+    pub output_active: bool,
+    pub band: String,
+    pub band_rows: u16,
+    pub task_rows: u16,
+    pub economy_text: Option<String>,
+    pub economy_rows: u16,
+}
+
+/// The rows the fullscreen surface occupies up to the dock/economy/composer
+/// stack. The transcript starts below the status row; the bottom stack is
+/// composer, economy, dock, so a test can pin the dock row from the bottom
+/// without depending on the transcript's flexible height.
+#[must_use]
+pub fn view_anchors(view: &LocalView, width: u16, height: u16) -> (u16, u16, u16) {
+    let metrics = view_metrics(view, width);
+    let composer = height.saturating_sub(1);
+    let dock = composer
+        .saturating_sub(metrics.economy_rows)
+        .saturating_sub(metrics.task_rows);
+    (1.min(composer), dock, composer)
+}
+
+#[must_use]
+pub fn view_metrics(view: &LocalView, width: u16) -> ViewMetrics {
+    // The status band takes two rows while it has something to say: a
+    // message chained after the transcript is painted below the panel the
+    // moment the transcript outgrows it, and the long session AC-072
+    // targets is that shape. Its rows are one message each — the warning
+    // and the dock's fault mark — so a dead refresh never hides behind a
+    // warning. An idle band takes no row, so the panels keep the geometry
+    // they have without it.
+    let band = status_band(view, usize::from(width));
+    let band_rows = if band.is_empty() { 0 } else { 2 };
+    // The dock's task rows keep their three-row window; the economy row
+    // below them is its own slot, so it paints even when three tasks fill
+    // the dock and never clips off the panel. The slot is sized from the
+    // row's own wrapped height — the same wrap the widget performs — so a
+    // production-shaped projection is never clipped into a fixed two-row
+    // budget; the cap bounds how much of the transcript it may take, and a
+    // row still over the cap ends with an explicit cut marker.
+    let task_rows = view.dock.len().saturating_sub(1).clamp(0, 3);
+    // A modal covers the dock anyway, so the economy slot keeps a short
+    // tail there rather than pushing the base rows under the card's side
+    // margins.
+    let economy_cap = if view.decision.is_some() || view.panel.is_some() {
+        3
+    } else {
+        ECONOMY_MAX_ROWS
+    };
+    let economy_text = view
+        .dock
+        .last()
+        .map(|row| fit_economy_row(&sanitize_status_cause(row), width, economy_cap));
+    let economy_rows = economy_text
+        .as_deref()
+        .map_or(0, |text| wrapped_row_count(text, width.max(1)));
+    ViewMetrics {
+        output_active: view.output.is_active(),
+        band,
+        band_rows,
+        task_rows: u16::try_from(task_rows).unwrap_or(u16::MAX),
+        economy_text,
+        economy_rows: u16::try_from(economy_rows).unwrap_or(u16::MAX),
+    }
+}
+
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Result<(), B::Error> {
     let mut card_inner = None;
     let palette = theme::Palette::resolve();
     terminal.draw(|frame| {
         let area = frame.area();
-        let output_active = view.output.is_active();
+        let metrics = view_metrics(view, area.width);
         let mut rows = Vec::with_capacity(7);
         rows.push(Constraint::Length(1));
         rows.push(Constraint::Min(1));
-        // The status band takes two rows while it has something to say: a
-        // message chained after the transcript is painted below the panel the
-        // moment the transcript outgrows it, and the long session AC-072
-        // targets is that shape. Its rows are one message each — the warning
-        // and the dock's fault mark — so a dead refresh never hides behind a
-        // warning. An idle band takes no row, so the panels keep the geometry
-        // they have without it.
-        let band = status_band(view, usize::from(area.width));
-        rows.push(Constraint::Length(if band.is_empty() { 0 } else { 2 }));
-        if output_active {
+        rows.push(Constraint::Length(metrics.band_rows));
+        if metrics.output_active {
             rows.push(Constraint::Length(1));
             rows.push(Constraint::Min(1));
         }
-        // The dock's task rows keep their three-row window; the economy
-        // row below them is its own slot, so it paints even when three tasks
-        // fill the dock and never clips off the panel. The slot is sized from
-        // the row's own wrapped height — the same wrap the widget performs —
-        // so a production-shaped projection is never clipped into a fixed
-        // two-row budget; the cap bounds how much of the transcript it may
-        // take, and a row still over the cap ends with an explicit cut marker.
-        let task_rows = view.dock.len().saturating_sub(1).clamp(0, 3);
-        // A modal covers the dock anyway, so the economy slot keeps a short
-        // tail there rather than pushing the base rows under the card's
-        // side margins.
-        let economy_cap = if view.decision.is_some() || view.panel.is_some() {
-            3
-        } else {
-            ECONOMY_MAX_ROWS
-        };
-        let economy_text = view
-            .dock
-            .last()
-            .map(|row| fit_economy_row(&sanitize_status_cause(row), area.width, economy_cap));
-        let economy_rows = economy_text
-            .as_deref()
-            .map_or(0, |text| wrapped_row_count(text, area.width.max(1)));
-        rows.push(Constraint::Length(task_rows as u16));
-        rows.push(Constraint::Length(
-            u16::try_from(economy_rows).unwrap_or(u16::MAX),
-        ));
+        rows.push(Constraint::Length(metrics.task_rows));
+        rows.push(Constraint::Length(metrics.economy_rows));
         rows.push(Constraint::Length(1));
         let chunks = ratatui::layout::Layout::vertical(rows).split(area);
         frame.render_widget(
@@ -1333,11 +1370,11 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             chunks[1],
         );
         frame.render_widget(
-            Paragraph::new(band).wrap(ratatui::widgets::Wrap { trim: true }),
+            Paragraph::new(metrics.band.as_str()).wrap(ratatui::widgets::Wrap { trim: true }),
             chunks[2],
         );
         let mut next = 3;
-        if output_active {
+        if metrics.output_active {
             frame.render_widget(
                 Paragraph::new(output_status_line(
                     &view.output,
@@ -1383,7 +1420,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             .style(palette.dock()),
             chunks[next],
         );
-        if let Some(economy) = economy_text.as_deref() {
+        if let Some(economy) = metrics.economy_text.as_deref() {
             // The slot's height and the fit check count `trim: false` rows;
             // painting the same mode keeps the measured wrap and the painted
             // wrap in agreement.
@@ -4185,6 +4222,9 @@ where
             None
         }
     };
+    // Resolve before the alternate screen so the unknown-theme note is
+    // visible in the terminal's own scrollback, not painted over.
+    let _palette = theme::Palette::resolve();
     let mut guard = match TerminalGuard::enter_mode(mode) {
         Ok(guard) => guard,
         // The alternate screen never took the terminal, so stderr is
@@ -9246,10 +9286,10 @@ fallback = { mode = \"off\" }\n";
         best.max(run)
     }
 
-    /// The offset of the first SGR (`CSI … m`) sequence that is not a bare
-    /// reset — the UI is monochrome, so resets are the only attribute
-    /// escapes a NO_COLOR terminal should ever receive. Private-mode
-    /// sequences (`?` params) are not SGR and never count.
+    /// The offset of the first SGR (`CSI … m`) sequence that selects a color.
+    /// Mono palettes still allow bold/dim/underline and resets, so only color
+    /// parameters count; private-mode sequences (`?` params) are not SGR and
+    /// never count.
     fn first_color_sgr(bytes: &[u8]) -> Option<usize> {
         let mut index = 0usize;
         while let Some(pos) = find_subsequence(&bytes[index..], b"\x1b[").map(|p| p + index) {
@@ -9259,13 +9299,17 @@ fallback = { mode = \"off\" }\n";
             }
             if i < bytes.len() && bytes[i] == b'm' {
                 let params = &bytes[pos + 2..i];
-                // `ESC [ m` and `ESC [ 0 m` (and `0;0` chains) reset every
-                // attribute — they set no color. Anything else would.
-                let reset_only = params.is_empty()
-                    || params
-                        .split(|byte| *byte == b';')
-                        .all(|code| !code.is_empty() && code.iter().all(|b| *b == b'0'));
-                if params.first() != Some(&b'?') && !reset_only {
+                if params.first() != Some(&b'?')
+                    && String::from_utf8_lossy(params)
+                        .split(';')
+                        .filter_map(|code| code.parse::<u16>().ok())
+                        .any(|code| {
+                            matches!(
+                                code,
+                                30..=37 | 40..=47 | 90..=97 | 100..=107 | 38 | 48 | 58
+                            )
+                        })
+                {
                     return Some(pos);
                 }
             }
