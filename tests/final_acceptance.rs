@@ -7,12 +7,13 @@
 //!
 //! The ordinary installed-release leg is passed on the repaired candidate:
 //! the packaged artifact publishes and settles an ordinary first task. The
-//! installed UI matrix renders all 19 states through the packaged
-//! `--ui-review` entry, but the 285 theme cells declare distinct
-//! light/dark/high-contrast palettes NOT_RUN, so that row is censored rather
-//! than passed. The run prints the stable verdict line; the full-pass claim
-//! stays SLICE-010/Seal, while real provider, publication and platform legs
-//! stay NOT_RUN.
+//! installed UI matrix renders all 19 states under each theme through the
+//! packaged `--ui-review` entry: its report carries 285 state×theme
+//! observations with per-state status/dock/composer/modal SGR fingerprints,
+//! so the row is PASS evidence when the candidate, every cell and every
+//! renderer-only claim match. The run prints the stable verdict line; the
+//! full-pass claim stays SLICE-010/Seal, while real provider, publication
+//! and platform legs stay NOT_RUN.
 
 #![allow(
     clippy::expect_used,
@@ -46,28 +47,39 @@ use std::process::{Command, Output, Stdio};
 const INSTALLED_ORDINARY_EVIDENCE_MARKER: &str = "#installed-ordinary";
 const INSTALLED_UI_EVIDENCE_MARKER: &str = "#installed-ui";
 
-/// The three input modes whose distinct palettes the matrix declares NOT_RUN:
-/// each theme cell must carry exactly its mode's claim as the reason, and no
-/// other cell may be NOT_RUN.
-const THEME_NOT_RUN_CLAIMS: [(&str, &str); 3] = [
+/// The three rendered themes and the observation each state must carry.
+const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
+/// Every state carries one observation per geometry and theme.
+const THEME_OBSERVATIONS: usize = UI_STATES.len() * UI_GEOMETRIES.len() * THEMES.len();
+
+/// The renderer-only claim each of these states' passing cells must carry,
+/// character for character. A missing or altered claim is a malformed report:
+/// a seeded frame must never read as production evidence.
+const RENDERER_ONLY_CLAIMS: [(&str, &str); 4] = [
     (
-        "light",
-        "theme-agnostic rendering; distinct light palette NOT_RUN",
+        "awaiting-permission",
+        "renderer-only: no production approval/decision path opens the permission panel; the Ask verdict carries no class or target and the sole constructor is the passive `--ui-review` renderer in src/ui/review.rs (DEC-017)",
     ),
     (
-        "dark",
-        "theme-agnostic rendering; distinct dark palette NOT_RUN",
+        "streaming-long-output",
+        "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream",
     ),
     (
-        "high-contrast",
-        "theme-agnostic rendering; distinct high-contrast palette NOT_RUN",
+        "error-offline-partial",
+        "renderer-only: no production producer feeds view.output (the step-driver feed is deferred); the frame proves the renderer paints the seeded stream",
+    ),
+    (
+        "non-tty",
+        "renderer-only: the non-TTY entry routes to the structured headless loop; the TUI cannot paint this state in production",
     ),
 ];
 
-/// 19 states × 5 geometries × the three theme inputs.
-const UI_NOT_RUN_CELLS: usize = UI_STATES.len() * UI_GEOMETRIES.len() * THEME_NOT_RUN_CLAIMS.len();
-/// The cells a complete matrix passes: every cell that is not a theme cell.
-const UI_PASS_CELLS: usize = FINAL_UI_CELLS - UI_NOT_RUN_CELLS;
+fn renderer_only_claim(state: &str) -> Option<&'static str> {
+    RENDERER_ONLY_CLAIMS
+        .iter()
+        .find(|(claimed, _)| *claimed == state)
+        .map(|(_, claim)| *claim)
+}
 
 fn passed(case_id: String, candidate: &str, evidence: String) -> FinalRow {
     FinalRow {
@@ -501,32 +513,14 @@ fn matrix_identity(report: &Value) -> Result<BTreeMap<(String, String, String), 
         ) else {
             return Err("matrix cell is missing a coordinate or verdict".to_string());
         };
-        let reason = cell["reason"].as_str().unwrap_or_default();
-        // The declared NOT_RUN family is exactly the theme inputs, each with
-        // its own claim as the reason: a theme cell that says PASS is the
-        // overclaim this matrix must never carry.
-        match (
-            THEME_NOT_RUN_CLAIMS.iter().find(|(mode, _)| *mode == input),
-            verdict,
-        ) {
-            (Some((_, claim)), "NOT_RUN") if reason == *claim => {}
-            (Some((_, claim)), "NOT_RUN") => {
+        match verdict {
+            "PASS" | "FAIL" => {}
+            "NOT_RUN" => {
                 return Err(format!(
-                    "theme cell {state}/{geometry}/{input} carries {reason:?}, not its claim {claim:?}"
+                    "cell {state}/{geometry}/{input} is NOT_RUN; the theme cells are observations now, so no UI cell may stay unproven"
                 ));
             }
-            (Some(_), _) => {
-                return Err(format!(
-                    "theme cell {state}/{geometry}/{input} is {verdict}, not NOT_RUN"
-                ));
-            }
-            (None, "NOT_RUN") => {
-                return Err(format!(
-                    "cell {state}/{geometry}/{input} is NOT_RUN outside the declared theme family"
-                ));
-            }
-            (None, "PASS" | "FAIL") => {}
-            (None, _) => {
+            _ => {
                 return Err(format!(
                     "cell {state}/{geometry}/{input} carries unknown verdict {verdict}"
                 ));
@@ -562,36 +556,158 @@ fn matrix_identity(report: &Value) -> Result<BTreeMap<(String, String, String), 
     Ok(observed)
 }
 
+/// The report's 285 state×theme observations: every state, geometry and theme
+/// appears once; each carries non-empty status/dock/composer fingerprints and
+/// a modal fingerprint; and the three themes are pairwise distinct on every
+/// painted carrier. A dropped or blank fingerprint is a malformed report.
+fn theme_observations(report: &Value) -> Result<(), String> {
+    if report["theme_observations"].as_u64() != Some(THEME_OBSERVATIONS as u64) {
+        return Err("matrix carries no 285 state×theme observations".to_string());
+    }
+    let Some(observations) = report["theme_fingerprints"].as_array() else {
+        return Err("matrix carries no theme fingerprints".to_string());
+    };
+    if observations.len() != THEME_OBSERVATIONS {
+        return Err(format!(
+            "matrix carries {} theme fingerprints",
+            observations.len()
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for observation in observations {
+        let (Some(state), Some(geometry), Some(theme)) = (
+            observation["state"].as_str(),
+            observation["geometry"].as_str(),
+            observation["theme"].as_str(),
+        ) else {
+            return Err("theme observation is missing a coordinate".to_string());
+        };
+        if !UI_STATES.contains(&state)
+            || !UI_GEOMETRIES.contains(&geometry)
+            || !THEMES.contains(&theme)
+        {
+            return Err(format!(
+                "theme observation names an unknown coordinate: {state}/{geometry}/{theme}"
+            ));
+        }
+        for surface in ["status", "dock", "composer"] {
+            match observation[surface].as_str() {
+                Some(value) if !value.is_empty() && value != "none" => {}
+                _ => {
+                    return Err(format!(
+                        "theme observation {state}/{geometry}/{theme} misses its {surface} fingerprint"
+                    ));
+                }
+            }
+        }
+        match observation["modal"].as_str() {
+            Some(value) if !value.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "theme observation {state}/{geometry}/{theme} misses its modal fingerprint"
+                ));
+            }
+        }
+        if !seen.insert((state.to_string(), geometry.to_string(), theme.to_string())) {
+            return Err(format!(
+                "theme observation repeats a coordinate: {state}/{geometry}/{theme}"
+            ));
+        }
+    }
+    for state in UI_STATES {
+        for theme in THEMES {
+            let count = seen
+                .iter()
+                .filter(|(cell_state, _, cell_theme)| cell_state == state && cell_theme == theme)
+                .count();
+            if count != UI_GEOMETRIES.len() {
+                return Err(format!(
+                    "{state}/{theme} carries {count} observations, not one per geometry"
+                ));
+            }
+        }
+    }
+    for state in UI_STATES {
+        for geometry in UI_GEOMETRIES {
+            let siblings: Vec<&Value> = observations
+                .iter()
+                .filter(|observation| {
+                    observation["state"] == json!(state)
+                        && observation["geometry"] == json!(geometry)
+                })
+                .collect();
+            if siblings.len() != THEMES.len() {
+                return Err(format!(
+                    "{state}/{geometry} carries {} themes",
+                    siblings.len()
+                ));
+            }
+            for surface in ["status", "dock", "composer"] {
+                let values: BTreeSet<&str> = siblings
+                    .iter()
+                    .filter_map(|sibling| sibling[surface].as_str())
+                    .collect();
+                if values.len() != THEMES.len() {
+                    return Err(format!(
+                        "{state}/{geometry} {surface} palettes are not pairwise distinct"
+                    ));
+                }
+            }
+            let modals: BTreeSet<&str> = siblings
+                .iter()
+                .filter_map(|sibling| sibling["modal"].as_str())
+                .collect();
+            if modals != BTreeSet::from(["none"])
+                && (modals.len() != THEMES.len() || modals.contains("none"))
+            {
+                return Err(format!(
+                    "{state}/{geometry} modal palettes are not pairwise distinct"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn installed_ui_evidence(path: &Path, candidate: &str) -> Result<String, String> {
     let report = read_receipt(path)?;
     check_candidate(&report, candidate)?;
     if report["schema_version"] != json!(1) {
         return Err("matrix schema_version is not 1".to_string());
     }
-    // The identity pass requires the exact NOT_RUN family (reason text
-    // included) and the summary that matches it.
     let cells = matrix_identity(&report)?;
+    theme_observations(&report)?;
     let pass = cells.values().filter(|verdict| *verdict == "PASS").count();
-    let not_run = cells
-        .values()
-        .filter(|verdict| *verdict == "NOT_RUN")
-        .count();
+    let fail = cells.values().filter(|verdict| *verdict == "FAIL").count();
     if report["cells"] != json!(FINAL_UI_CELLS)
         || report["fail"] != json!(0)
-        || report["pass"] != json!(UI_PASS_CELLS)
-        || report["not_run"] != json!(UI_NOT_RUN_CELLS)
-        || pass != UI_PASS_CELLS
-        || not_run != UI_NOT_RUN_CELLS
+        || report["pass"] != json!(FINAL_UI_CELLS)
+        || report["not_run"] != json!(0)
+        || pass != FINAL_UI_CELLS
+        || fail != 0
     {
-        return Err("matrix summary is not the declared pass/NOT_RUN split".to_string());
+        return Err("matrix summary is not the declared all-PASS split".to_string());
     }
-    // The matrix is honest, and that honesty is why the row cannot pass: the
-    // theme palettes it declares NOT_RUN are not rendered evidence.
-    Err(format!(
-        "not run: {not_run} theme cells declare distinct light/dark/high-contrast palettes NOT_RUN ({pass} of {} cells pass, 0 fail) ({}#installed-ui)",
-        cells.len(),
-        path.display()
-    ))
+    // A passing renderer-only cell carries the exact claim that names its
+    // evidence class; the mutant that drops or alters it is refused here.
+    let Some(verdicts) = report["cell_verdicts"].as_array() else {
+        return Err("matrix carries no cell verdicts".to_string());
+    };
+    for cell in verdicts {
+        let state = cell["state"].as_str().unwrap_or_default();
+        let Some(claim) = renderer_only_claim(state) else {
+            continue;
+        };
+        if cell["verdict"] == "PASS" && cell["reason"].as_str() != Some(claim) {
+            return Err(format!(
+                "passing renderer-only cell {state}/{}/{} misses its claim: {}",
+                cell["geometry"].as_str().unwrap_or_default(),
+                cell["input"].as_str().unwrap_or_default(),
+                cell["reason"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    Ok(format!("{}#installed-ui", path.display()))
 }
 
 fn acceptance_rows(candidate: &str) -> Vec<FinalRow> {
@@ -675,6 +791,68 @@ fn matrix_rows(path: &Path) -> Vec<FinalRow> {
     rows
 }
 
+fn honest_ui_cells() -> Vec<Value> {
+    let mut cells = Vec::with_capacity(FINAL_UI_CELLS);
+    for state in UI_STATES {
+        for geometry in UI_GEOMETRIES {
+            for input in UI_INPUTS {
+                cells.push(json!({
+                    "state": state,
+                    "geometry": geometry,
+                    "input": input,
+                    "verdict": "PASS",
+                    "reason": renderer_only_claim(state).unwrap_or_default(),
+                }));
+            }
+        }
+    }
+    cells
+}
+
+fn honest_theme_fingerprints() -> Vec<Value> {
+    let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
+    for (state_index, state) in UI_STATES.iter().enumerate() {
+        for (geometry_index, geometry) in UI_GEOMETRIES.iter().enumerate() {
+            for (theme_index, theme) in THEMES.iter().enumerate() {
+                let base = 10 * state_index + 3 * geometry_index + theme_index;
+                let bold = *theme == "high-contrast";
+                let modal = if matches!(*state, "awaiting-decision" | "awaiting-permission") {
+                    format!("fg=Idx({});bg=Default;bold={bold}", 190 + base % 60)
+                } else {
+                    "none".to_string()
+                };
+                observations.push(json!({
+                    "state": state,
+                    "geometry": geometry,
+                    "theme": theme,
+                    "status": format!("fg=Idx({});bg=Default;bold={bold}", 30 + base % 60),
+                    "dock": format!("fg=Idx({});bg=Default;bold={bold}", 100 + base % 60),
+                    "composer": format!("fg=Idx({});bg=Default;bold={bold}", 150 + base % 60),
+                    "modal": modal,
+                }));
+            }
+        }
+    }
+    observations
+}
+
+fn honest_ui_report(cells: &[Value], observations: &[Value]) -> Value {
+    json!({
+        "schema_version": 1,
+        "candidate_manifest_sha256": "candidate-current",
+        "states": 19,
+        "geometries": 5,
+        "inputs": 14,
+        "cells": FINAL_UI_CELLS,
+        "pass": FINAL_UI_CELLS,
+        "fail": 0,
+        "not_run": 0,
+        "cell_verdicts": cells,
+        "theme_observations": observations.len(),
+        "theme_fingerprints": observations,
+    })
+}
+
 #[test]
 fn installed_receipts_absent_stale_or_failed_are_never_pass() {
     let root = tempfile::TempDir::with_prefix("rivect-receipt-negative-").expect("temp");
@@ -747,79 +925,16 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
     .expect("stale matrix");
     assert!(installed_ui_evidence(&ui, candidate).is_err());
 
-    // The honest cell set: the three theme inputs are NOT_RUN with their own
-    // claim as the reason, every other cell passes.
-    let honest: Vec<Value> = UI_STATES
-        .iter()
-        .flat_map(|state| {
-            UI_GEOMETRIES.iter().flat_map(move |geometry| {
-                UI_INPUTS.iter().map(move |input| {
-                    let claim = THEME_NOT_RUN_CLAIMS
-                        .iter()
-                        .find(|(mode, _)| mode == input)
-                        .map(|(_, claim)| *claim);
-                    match claim {
-                        Some(claim) => json!({
-                            "state": state,
-                            "geometry": geometry,
-                            "input": input,
-                            "verdict": "NOT_RUN",
-                            "reason": claim,
-                        }),
-                        None => json!({
-                            "state": state,
-                            "geometry": geometry,
-                            "input": input,
-                            "verdict": "PASS",
-                        }),
-                    }
-                })
-            })
-        })
-        .collect();
-    let honest_summary = |cells: &[Value]| {
-        json!({
-            "schema_version": 1,
-            "candidate_manifest_sha256": candidate,
-            "states": 19,
-            "geometries": 5,
-            "inputs": 14,
-            "cells": FINAL_UI_CELLS,
-            "pass": UI_PASS_CELLS,
-            "fail": 0,
-            "not_run": UI_NOT_RUN_CELLS,
-            "cell_verdicts": cells,
-        })
-    };
-
-    // The overclaim the matrix must never carry: every cell PASS while the
-    // theme claims are declared NOT_RUN. The consumer refuses it for the
-    // theme cells themselves, not merely for a summary mismatch.
-    let all_pass: Vec<Value> = honest
-        .iter()
-        .map(|cell| {
-            let mut cell = cell.clone();
-            cell["verdict"] = json!("PASS");
-            cell["reason"] = json!("");
-            cell
-        })
-        .collect();
-    std::fs::write(&ui, honest_summary(&all_pass).to_string()).expect("all-pass matrix");
-    let refused = installed_ui_evidence(&ui, candidate).expect_err("an all-PASS matrix is refused");
+    // The honest matrix: every cell PASS, the four renderer-only states carry
+    // their exact claims, and 285 state×theme fingerprints.
+    let honest = honest_ui_cells();
+    let observations = honest_theme_fingerprints();
+    std::fs::write(&ui, honest_ui_report(&honest, &observations).to_string())
+        .expect("honest matrix");
+    let evidence = installed_ui_evidence(&ui, candidate).expect("the honest matrix passes");
     assert!(
-        refused.contains("not NOT_RUN"),
-        "the all-PASS matrix is refused for its overclaim: {refused}"
-    );
-    assert!(matrix_identity(&read_receipt(&ui).expect("all-pass report")).is_err());
-
-    // The honest matrix validates and still censors the row: the theme
-    // palettes it declares NOT_RUN are not rendered evidence.
-    std::fs::write(&ui, honest_summary(&honest).to_string()).expect("honest matrix");
-    let censored = installed_ui_evidence(&ui, candidate)
-        .expect_err("the declared NOT_RUN family censors the row");
-    assert!(
-        censored.contains("NOT_RUN") && censored.contains(INSTALLED_UI_EVIDENCE_MARKER),
-        "the censoring cause names the NOT_RUN family and the report: {censored}"
+        evidence.ends_with(INSTALLED_UI_EVIDENCE_MARKER),
+        "the passing row points at its retained matrix: {evidence}"
     );
     let ui_rows = matrix_rows(&ui);
     assert_eq!(ui_rows.len(), FINAL_UI_CELLS, "every cell is counted");
@@ -828,16 +943,51 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
             .iter()
             .filter(|row| row.outcome == TrialOutcome::Pass)
             .count(),
-        UI_PASS_CELLS,
-        "the passing cells are exactly the non-theme cells"
+        FINAL_UI_CELLS,
+        "every cell passes"
     );
-    let honest_report = counted(candidate, &ui_rows);
-    assert_eq!(
-        honest_report.blockers.not_run.len(),
-        UI_NOT_RUN_CELLS,
-        "the theme cells are counted NOT_RUN, never PASS"
-    );
-    assert!(!honest_report.full_pass, "{honest_report:?}");
+    let mut complete: Vec<FinalRow> = complete_rows(candidate)
+        .into_iter()
+        .filter(|row| !row.case_id.starts_with("UI::"))
+        .collect();
+    complete.extend(ui_rows);
+    let honest_report = counted(candidate, &complete);
+    assert!(honest_report.full_pass, "{honest_report:?}");
+
+    // A passing renderer-only cell that drops its claim is refused.
+    let mut missing_claim = honest.clone();
+    let victim = missing_claim
+        .iter_mut()
+        .find(|cell| {
+            cell["state"] == json!("awaiting-permission") && cell["input"] == json!("keyboard-only")
+        })
+        .expect("the renderer-only cell exists");
+    victim["reason"] = json!("");
+    std::fs::write(
+        &ui,
+        honest_ui_report(&missing_claim, &observations).to_string(),
+    )
+    .expect("missing-claim mutant");
+    let refused = installed_ui_evidence(&ui, candidate)
+        .expect_err("a missing renderer-only claim is refused");
+    assert!(refused.contains("claim"), "{refused}");
+
+    // A dropped state×theme fingerprint is refused.
+    let mut dropped = observations.clone();
+    dropped.pop();
+    std::fs::write(&ui, honest_ui_report(&honest, &dropped).to_string())
+        .expect("dropped fingerprint");
+    let refused =
+        installed_ui_evidence(&ui, candidate).expect_err("a dropped fingerprint is refused");
+    assert!(refused.contains("285"), "{refused}");
+
+    // A cell that keeps the old NOT_RUN claim is refused.
+    let mut not_run = honest.clone();
+    not_run[0]["verdict"] = json!("NOT_RUN");
+    std::fs::write(&ui, honest_ui_report(&not_run, &observations).to_string())
+        .expect("NOT_RUN matrix");
+    let refused = installed_ui_evidence(&ui, candidate).expect_err("a NOT_RUN cell is refused");
+    assert!(refused.contains("NOT_RUN"), "{refused}");
 
     let assert_refused = |path: &Path| {
         assert!(installed_ui_evidence(path, candidate).is_err());
@@ -861,12 +1011,14 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
     let mut duplicate = honest.clone();
     duplicate.pop();
     duplicate.push(honest[0].clone());
-    std::fs::write(&ui, honest_summary(&duplicate).to_string()).expect("duplicate matrix");
+    std::fs::write(&ui, honest_ui_report(&duplicate, &observations).to_string())
+        .expect("duplicate matrix");
     assert_refused(&ui);
 
     let mut unknown = honest.clone();
     unknown[0]["state"] = json!("state-unlisted");
-    std::fs::write(&ui, honest_summary(&unknown).to_string()).expect("unknown-coordinate matrix");
+    std::fs::write(&ui, honest_ui_report(&unknown, &observations).to_string())
+        .expect("unknown-coordinate matrix");
     assert_refused(&ui);
 
     std::fs::write(
@@ -882,6 +1034,8 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
             "fail": 0,
             "not_run": 0,
             "cell_verdicts": honest,
+            "theme_observations": observations.len(),
+            "theme_fingerprints": observations,
         })
         .to_string(),
     )
@@ -1127,15 +1281,6 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             expected_not_run.insert(case_id);
         }
     }
-    // The matrix's declared NOT_RUN family: the theme cells carry their own
-    // claim as the reason, and no other UI cell may be NOT_RUN.
-    for state in UI_STATES {
-        for geometry in UI_GEOMETRIES {
-            for (input, _claim) in THEME_NOT_RUN_CLAIMS {
-                expected_not_run.insert(ui_case(state, geometry, input));
-            }
-        }
-    }
 
     let ui = matrix_rows(&ui_report_path());
     let ui_count = ui.len();
@@ -1244,29 +1389,33 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     );
     println!("PASSED {INSTALLED_ORDINARY_CASE}: {evidence}");
 
-    // The UI row is censored, never passed: the matrix declares the theme
-    // palettes NOT_RUN, and the cause names that declaration and the report.
+    // The UI row passes on its candidate-bound matrix: every cell PASS, the
+    // 285 state×theme observations present, and every renderer-only claim
+    // intact.
     let ui_row = rows
         .iter()
         .find(|row| row.case_id == INSTALLED_UI_CASE)
         .expect("release row");
-    assert_eq!(ui_row.outcome, TrialOutcome::Censored);
-    let cause = ui_row.cause.as_deref().expect("the censoring cause");
+    if let Some(cause) = ui_row.cause.as_deref() {
+        println!("UI-ROW cause: {cause}");
+    }
+    assert_eq!(ui_row.outcome, TrialOutcome::Pass);
+    let evidence = ui_row.evidence.as_deref().expect("retained matrix pointer");
     assert!(
-        cause.contains(INSTALLED_UI_EVIDENCE_MARKER) && cause.contains("NOT_RUN"),
-        "the censored row points at its retained matrix and its NOT_RUN family: {cause}"
+        evidence.ends_with(INSTALLED_UI_EVIDENCE_MARKER),
+        "the row points at its retained matrix: {evidence}"
     );
     assert!(
-        report
+        !report
             .blockers
             .not_run
             .contains(&INSTALLED_UI_CASE.to_string())
     );
     assert_eq!(
         ui_count, FINAL_UI_CELLS,
-        "the matrix still counts every one of the 1330 cells"
+        "the matrix counts every one of the 1330 cells"
     );
-    println!("CENSORED {INSTALLED_UI_CASE}: {cause}");
+    println!("PASSED {INSTALLED_UI_CASE}: {evidence}");
 
     // Host-conditional legs retain a machine-readable NOT_RUN row instead of
     // returning green. The conjunction surfaces every retained row as NOT_RUN

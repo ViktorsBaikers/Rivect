@@ -1,15 +1,19 @@
-//! AC-001 (TD-03): the exact packaged artifact from the release slice runs the
-//! inherited 19 design-brief states across the four acceptance geometries plus
-//! a live resize and the fourteen input modes. Each cell is exercised with a
-//! pass/fail verdict — except the three theme inputs, whose distinct palettes
-//! are declared NOT_RUN and whose cells carry that claim as their reason. The
-//! state's own rendered observables at that geometry must appear, and the
-//! input mode must reach the same artifact. Terminal
-//! restore is checked after exit, cancel and panic; inline keeps the
-//! transcript in the terminal's own scrollback with mouse capture off; and
-//! focusing or inspecting a decision card or permission panel records no
-//! answer, no preapproval and no provider call. Screenshot or file presence
-//! is never used as interaction proof.
+//! AC-001 (TD-03/TD-15): the exact packaged artifact from the release slice
+//! runs the inherited 19 design-brief states across the four acceptance
+//! geometries plus a live resize and the fourteen input modes. Every cell is
+//! exercised with a pass/fail verdict. Every one of the 19 states is also
+//! rendered under each of the three themes at every geometry (285
+//! state×theme observations); each observation asserts that state's
+//! status/dock/composer/modal SGR fingerprint — pairwise distinct across
+//! light/dark/high-contrast — with text identical to the unthemed control.
+//! Mono `NO_COLOR`/`TERM=dumb`/non-TTY emits no SGR color and every state's
+//! status token plus dock/composer labels appear verbatim. The state's own
+//! rendered observables at that geometry must appear, and the input mode must
+//! reach the same artifact. Terminal restore is checked after exit, cancel and
+//! panic; inline keeps the transcript in the terminal's own scrollback with
+//! mouse capture off; and focusing or inspecting a decision card or permission
+//! panel records no answer, no preapproval and no provider call. Screenshot or
+//! file presence is never used as interaction proof.
 //!
 //! The packaged artifact cannot be made to panic through any public input:
 //! the panic leg therefore runs the same production `TerminalGuard` in this
@@ -35,7 +39,8 @@ use rivect::contracts::{EffectClass, Question, TaskId};
 use rivect::policy::{ModeDecision, preapproval_scope};
 use rivect::resources::{OutputSettlement, OutputStream};
 use rivect::ui::{
-    DecisionPanel, LocalView, PermissionPanel, RenderMode, TerminalGuard, initial_view, task_dock,
+    DECISION_COMPOSER_PAUSED, DecisionPanel, LocalView, PANEL_COMPOSER_PAUSED, PermissionPanel,
+    RenderMode, TerminalGuard, initial_view, task_dock,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -47,6 +52,14 @@ const STATES: usize = 19;
 const GEOMETRIES: usize = 5;
 const INPUTS: usize = 14;
 const CELLS: usize = STATES * GEOMETRIES * INPUTS;
+
+/// One observation per state, geometry and theme.
+const THEME_OBSERVATIONS: usize = STATES * GEOMETRIES * 3;
+/// One mono label/SGR probe per state and geometry.
+const MONO_PROBES: usize = STATES * GEOMETRIES;
+
+/// The three inherited themes and the exact `RIVECT_THEME` value each names.
+const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -163,6 +176,14 @@ impl InputMode {
 struct StateFixture {
     name: &'static str,
     needles: Vec<&'static str>,
+    /// The status line's visible token.
+    status: String,
+    /// The first painted dock row (the economy row when no task rows exist).
+    dock_probe: String,
+    /// The composer row's full text, paused marker included.
+    composer_label: String,
+    /// Whether the state paints a modal border.
+    modal: bool,
 }
 
 impl StateFixture {
@@ -186,9 +207,23 @@ impl StateFixture {
             reviewed.panel.is_some(),
             "{name}: panel presence"
         );
+        let status = view.status.clone();
+        let dock_probe = view.dock.first().cloned().unwrap_or_default();
+        let composer_label = if view.decision.is_some() {
+            format!("> {DECISION_COMPOSER_PAUSED}")
+        } else if view.panel.is_some() {
+            format!("> {PANEL_COMPOSER_PAUSED}")
+        } else {
+            format!("> {}", view.composer)
+        };
+        let modal = view.decision.is_some() || view.panel.is_some();
         Self {
             name,
             needles: needles.to_vec(),
+            status,
+            dock_probe,
+            composer_label,
+            modal,
         }
     }
 }
@@ -536,8 +571,120 @@ fn state_fixture(state: usize) -> StateFixture {
     }
 }
 
-fn render_state(fixture: &StateFixture, geometry: Geometry) -> Result<(), String> {
-    let mut tui = TuiPty::spawn_review(geometry, fixture.name, &[])?;
+/// The four palette carriers' SGR state, read from the final screen cells the
+/// packaged renderer painted.
+struct SurfaceFingerprints {
+    status: String,
+    dock: String,
+    composer: String,
+    modal: String,
+}
+
+/// One finished review frame: the final screen text, its rows, the four
+/// fingerprints and the bytes the child actually emitted.
+struct ReviewFrame {
+    text: String,
+    rows: Vec<String>,
+    fingerprints: SurfaceFingerprints,
+    bytes: Vec<u8>,
+}
+
+/// One state×geometry×theme observation for the matrix report.
+struct ThemeObservation {
+    state: &'static str,
+    geometry: &'static str,
+    theme: &'static str,
+    fingerprints: SurfaceFingerprints,
+}
+
+impl ThemeObservation {
+    fn to_json(&self) -> Value {
+        json!({
+            "state": self.state,
+            "geometry": self.geometry,
+            "theme": self.theme,
+            "status": self.fingerprints.status,
+            "dock": self.fingerprints.dock,
+            "composer": self.fingerprints.composer,
+            "modal": self.fingerprints.modal,
+        })
+    }
+}
+
+/// The three themes must paint pairwise-distinct carriers; a modal either is
+/// absent in all three or painted and distinct in all three.
+fn require_distinct_palettes(observations: &[ThemeObservation]) -> Result<(), String> {
+    for surface in ["status", "dock", "composer"] {
+        let values: std::collections::BTreeSet<&str> = observations
+            .iter()
+            .map(|observation| match surface {
+                "status" => observation.fingerprints.status.as_str(),
+                "dock" => observation.fingerprints.dock.as_str(),
+                _ => observation.fingerprints.composer.as_str(),
+            })
+            .collect();
+        if values.len() != THEMES.len() {
+            return Err(format!(
+                "{:?}/{} {surface} palettes are not pairwise distinct: {values:?}",
+                observations.first().map(|observation| observation.state),
+                observations
+                    .first()
+                    .map_or("", |observation| observation.geometry),
+            ));
+        }
+    }
+    let modals: std::collections::BTreeSet<&str> = observations
+        .iter()
+        .map(|observation| observation.fingerprints.modal.as_str())
+        .collect();
+    if modals != std::collections::BTreeSet::from(["none"])
+        && (modals.len() != THEMES.len() || modals.contains("none"))
+    {
+        return Err(format!(
+            "{:?}/{} modal palettes are not pairwise distinct: {modals:?}",
+            observations.first().map(|observation| observation.state),
+            observations
+                .first()
+                .map_or("", |observation| observation.geometry),
+        ));
+    }
+    Ok(())
+}
+
+/// Replaces the one volatile screen token: the decision card's question id is
+/// generated per process, so two `--ui-review` runs of the same state differ
+/// only there. Everything else the renderer paints must be byte-identical.
+fn normalized_review_text(text: &str) -> String {
+    fn is_uuid(bytes: &[u8]) -> bool {
+        bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+    }
+    let bytes = text.as_bytes();
+    let mut normalized = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes.len() - index >= 36 && is_uuid(&bytes[index..index + 36]) {
+            normalized.push_str("<question>");
+            index += 36;
+        } else {
+            let ch = text[index..]
+                .chars()
+                .next()
+                .expect("a char boundary always yields a char");
+            normalized.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    normalized
+}
+
+fn await_review_screen(
+    tui: &mut TuiPty,
+    fixture: &StateFixture,
+    geometry: Geometry,
+) -> Result<(), String> {
     for needle in &fixture.needles {
         tui.wait(needle, WAIT)?;
     }
@@ -547,15 +694,160 @@ fn render_state(fixture: &StateFixture, geometry: Geometry) -> Result<(), String
         tui.resize(20, 60)?;
         tui.wait(fixture.needles[0], WAIT)?;
     }
+    Ok(())
+}
+
+/// One packaged `--ui-review` run: environment in, final screen plus
+/// fingerprints and emitted bytes out.
+fn review_frame(
+    fixture: &StateFixture,
+    geometry: Geometry,
+    env: &[(&str, &str)],
+    label: &str,
+) -> Result<ReviewFrame, String> {
+    let mut tui = TuiPty::spawn_review(geometry, fixture.name, env)?;
+    await_review_screen(&mut tui, fixture, geometry)?;
+    let screen_bytes = tui.bytes()?;
+    let rows = tui.row_texts(&screen_bytes);
+    let text = support::squashed(&rows.join("\n"));
+    let fingerprints = tui.surface_fingerprints(&screen_bytes, fixture)?;
     tui.send(b"\x1b")?;
     let (bytes, code, data_root_opened) = tui.finish_review()?;
     if code != Some(0) {
-        return Err(format!("review exit {code:?}"));
+        return Err(format!("{label} review exit {code:?}"));
     }
     if data_root_opened {
-        return Err("the review entry opened a data root".to_string());
+        return Err(format!("{label} review opened a data root"));
     }
-    require_fullscreen_restore(&bytes)
+    require_fullscreen_restore(&bytes)?;
+    Ok(ReviewFrame {
+        text,
+        rows,
+        fingerprints,
+        bytes,
+    })
+}
+
+/// Renders one state unthemed and returns its squashed screen text; that text
+/// is the control every theme render must reproduce.
+fn render_state(fixture: &StateFixture, geometry: Geometry) -> Result<String, String> {
+    review_frame(fixture, geometry, &[], "state").map(|frame| frame.text)
+}
+
+/// One themed render: it must paint the same text as the control, carry the
+/// palette's color on all four carriers, and bold only the high-contrast
+/// theme. Returns the fingerprints the matrix collects.
+fn observe_theme(
+    fixture: &StateFixture,
+    geometry: Geometry,
+    theme: &'static str,
+    control: &str,
+) -> Result<ThemeObservation, String> {
+    let frame = review_frame(
+        fixture,
+        geometry,
+        &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
+        theme,
+    )?;
+    if normalized_review_text(&frame.text) != normalized_review_text(control) {
+        return Err(format!(
+            "{theme} text differs from the unthemed control: {:?} != {control:?}",
+            frame.text
+        ));
+    }
+    if !has_color_sgr(&frame.bytes) {
+        return Err(format!("{theme} emitted no SGR color"));
+    }
+    let fingerprints = frame.fingerprints;
+    for (surface, value) in [
+        ("status", &fingerprints.status),
+        ("dock", &fingerprints.dock),
+        ("composer", &fingerprints.composer),
+        ("modal", &fingerprints.modal),
+    ] {
+        if value == "none" {
+            continue;
+        }
+        if !value.contains("fg=Idx(") {
+            return Err(format!(
+                "{theme} {surface} carries no palette color: {value}"
+            ));
+        }
+        let bold = value.contains("bold=true");
+        if (theme == "high-contrast") != bold {
+            return Err(format!("{theme} {surface} bold state is wrong: {value}"));
+        }
+    }
+    Ok(ThemeObservation {
+        state: fixture.name,
+        geometry: geometry.label(),
+        theme,
+        fingerprints,
+    })
+}
+
+/// The mono label proof: `NO_COLOR` must strip every SGR color while the
+/// status token, the first dock row and the composer row stay verbatim.
+fn mono_probe(fixture: &StateFixture, geometry: Geometry) -> Result<(), String> {
+    let frame = review_frame(
+        fixture,
+        geometry,
+        &[("TERM", "xterm-256color"), ("NO_COLOR", "1")],
+        "mono",
+    )?;
+    if has_color_sgr(&frame.bytes) {
+        return Err("mono emitted an SGR color".to_string());
+    }
+    if !frame.text.contains(&support::squashed(&fixture.status)) {
+        return Err(format!("mono lost the status token {:?}", fixture.status));
+    }
+    if !frame.text.contains(&support::squashed(&fixture.dock_probe)) {
+        return Err(format!("mono lost the dock row {:?}", fixture.dock_probe));
+    }
+    let composer_row = frame.rows.last().map_or("", String::as_str).trim_end();
+    if composer_row != fixture.composer_label.trim_end() {
+        return Err(format!(
+            "mono composer row {composer_row:?} != {:?}",
+            fixture.composer_label.trim_end()
+        ));
+    }
+    Ok(())
+}
+
+/// The theme input probes run one representative state; the per-state
+/// observations above carry the full 19×G×3 matrix.
+fn palette_probe(geometry: Geometry, theme: &'static str) -> Result<(), String> {
+    let fixture = state_fixture(2);
+    let frame = review_frame(
+        &fixture,
+        geometry,
+        &[("TERM", "xterm-256color"), ("RIVECT_THEME", theme)],
+        theme,
+    )?;
+    if !has_color_sgr(&frame.bytes) {
+        return Err(format!("{theme} emitted no SGR color"));
+    }
+    if !frame.text.contains(&support::squashed(&fixture.status)) {
+        return Err(format!("{theme} lost the status token"));
+    }
+    Ok(())
+}
+
+fn no_color_probe(geometry: Geometry) -> Result<(), String> {
+    let fixture = state_fixture(2);
+    let frame = review_frame(
+        &fixture,
+        geometry,
+        &[("TERM", "xterm-256color"), ("NO_COLOR", "1")],
+        "no-color",
+    )?;
+    if has_color_sgr(&frame.bytes) {
+        return Err("NO_COLOR emitted an SGR color".to_string());
+    }
+    if !frame.text.contains(&support::squashed(&fixture.status)) {
+        return Err("NO_COLOR lost the status token".to_string());
+    }
+    Ok(())
 }
 
 fn has_color_sgr(bytes: &[u8]) -> bool {
@@ -780,6 +1072,89 @@ impl TuiPty {
         parser.screen().contents()
     }
 
+    fn row_texts(&self, bytes: &[u8]) -> Vec<String> {
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
+        parser.process(bytes);
+        let screen = parser.screen();
+        (0..self.rows)
+            .map(|row| {
+                let mut text = String::new();
+                for col in 0..self.cols {
+                    match screen.cell(row, col) {
+                        Some(cell) if !cell.contents().is_empty() => {
+                            text.push_str(cell.contents());
+                        }
+                        _ => text.push(' '),
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
+    /// Reads the four palette carriers' SGR attributes from the final screen:
+    /// the first status cell, the first dock row, the composer row and the
+    /// modal frame's top-left border corner. The state fixture says which
+    /// rows exist; a missing carrier is a probe failure, never a default.
+    fn surface_fingerprints(
+        &self,
+        bytes: &[u8],
+        fixture: &StateFixture,
+    ) -> Result<SurfaceFingerprints, String> {
+        let rows = self.row_texts(bytes);
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 200);
+        parser.process(bytes);
+        let screen = parser.screen();
+        let cell = |row: u16, col: u16| -> Result<String, String> {
+            let cell = screen
+                .cell(row, col)
+                .ok_or_else(|| format!("screen has no cell {row},{col}"))?;
+            Ok(format!(
+                "fg={:?};bg={:?};bold={}",
+                cell.fgcolor(),
+                cell.bgcolor(),
+                cell.bold()
+            ))
+        };
+        let status = cell(0, 0)?;
+        let dock_row = rows
+            .iter()
+            .position(|row| {
+                support::squashed(row).contains(&support::squashed(&fixture.dock_probe))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no dock row carries {:?}; rows: {rows:?}",
+                    fixture.dock_probe
+                )
+            })?;
+        let dock_row = u16::try_from(dock_row)
+            .map_err(|error| format!("dock row index overflows u16: {error}"))?;
+        let dock = cell(dock_row, 0)?;
+        let composer = cell(self.rows.saturating_sub(1), 0)?;
+        let modal = if fixture.modal {
+            let corner = (0..self.rows).find_map(|row| {
+                (0..self.cols)
+                    .find(|col| {
+                        screen
+                            .cell(row, *col)
+                            .is_some_and(|cell| cell.contents() == "┌")
+                    })
+                    .map(|col| (row, col))
+            });
+            let (row, col) = corner.ok_or_else(|| "no modal border was painted".to_string())?;
+            cell(row, col)?
+        } else {
+            "none".to_string()
+        };
+        Ok(SurfaceFingerprints {
+            status,
+            dock,
+            composer,
+            modal,
+        })
+    }
+
     fn answer_cursor_query(&mut self) -> Result<(), String> {
         let bytes = self.bytes()?;
         if let Some(found) = support::find_subsequence(&bytes[self.cursor_at..], b"\x1b[6n") {
@@ -936,13 +1311,10 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
             }
             require_fullscreen_restore(&bytes)
         }
-        InputMode::NoColor => color_probe(geometry, &[("NO_COLOR", "1")]),
-        InputMode::Light => color_probe(geometry, &[("COLORFGBG", "15;0")]),
-        InputMode::Dark => color_probe(geometry, &[("COLORFGBG", "0;15")]),
-        InputMode::HighContrast => color_probe(
-            geometry,
-            &[("COLORFGBG", "0;15"), ("TERM", "xterm-256color")],
-        ),
+        InputMode::NoColor => no_color_probe(geometry),
+        InputMode::Light => palette_probe(geometry, "light"),
+        InputMode::Dark => palette_probe(geometry, "dark"),
+        InputMode::HighContrast => palette_probe(geometry, "high-contrast"),
         InputMode::ReducedMotion => {
             let mut tui = TuiPty::spawn(
                 geometry,
@@ -1044,47 +1416,6 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
             require_fullscreen_restore(&bytes)
         }
     }
-}
-
-fn color_probe(geometry: Geometry, env: &[(&str, &str)]) -> Result<(), String> {
-    let (screen, bytes) = theme_run(geometry, env, "mode")?;
-    let (control, control_bytes) = theme_run(geometry, &[], "control")?;
-    if screen != control {
-        return Err(format!(
-            "theme mode changed the rendered screen: {screen:?} != {control:?}"
-        ));
-    }
-    if has_color_sgr(&bytes) || has_color_sgr(&control_bytes) {
-        return Err("theme mode emitted an SGR color".to_string());
-    }
-    require_fullscreen_restore(&bytes)
-}
-
-/// One theme-mode run: the screen it renders and the bytes it emitted. The
-/// mode is only an environment input, so the differential against a control
-/// run is its observable.
-fn theme_run(
-    geometry: Geometry,
-    env: &[(&str, &str)],
-    label: &str,
-) -> Result<(String, Vec<u8>), String> {
-    let mut tui = TuiPty::spawn(geometry, Some(RenderMode::Fullscreen), env)?;
-    tui.wait("Rivect · not connected", WAIT)?;
-    exercise_resize(&mut tui, geometry)?;
-    tui.send(b"/help\r")?;
-    tui.wait("Commands: Enter submits", WAIT)?;
-    let screen = support::squashed(&tui.screen(&tui.bytes()?));
-    let screen = screen
-        .split("economy:")
-        .next()
-        .unwrap_or(screen.as_str())
-        .to_string();
-    tui.send(b"\x1b")?;
-    let (bytes, code) = tui.finish()?;
-    if code != Some(0) {
-        return Err(format!("{label} theme exit {code:?}"));
-    }
-    Ok((screen, bytes))
 }
 
 fn inline_probe(geometry: Geometry) -> Result<(), String> {
@@ -1309,26 +1640,9 @@ const RESTORE_PANIC_CLAIM: &str =
 const INLINE_SCROLLBACK_CLAIM: &str =
     "NOT_RUN (owned by installed_inline_clear_after_long_transcript_keeps_later_rows)";
 const ZERO_SEND_CLAIM: &str = "NOT_RUN (unit-level proof: installed_focus_and_inspection_never_send_or_approve_unit_level; no packaged interaction claim)";
-const THEME_LIGHT_CLAIM: &str = "theme-agnostic rendering; distinct light palette NOT_RUN";
-const THEME_DARK_CLAIM: &str = "theme-agnostic rendering; distinct dark palette NOT_RUN";
-const THEME_HIGH_CONTRAST_CLAIM: &str =
-    "theme-agnostic rendering; distinct high-contrast palette NOT_RUN";
-
-/// Cells whose distinct theme palette stays unproven: the three theme inputs
-/// on every state and geometry. They are counted NOT_RUN with the claim as
-/// the reason, never PASS.
-const NOT_RUN_CELLS: usize = 3 * STATES * GEOMETRIES;
-
-/// The theme inputs a cell cannot pass: their probes assert theme-agnostic
-/// rendering only, so a passing probe earns the claim, not a cell verdict.
-fn not_run_claim(input: InputMode) -> Option<&'static str> {
-    match input {
-        InputMode::Light => Some(THEME_LIGHT_CLAIM),
-        InputMode::Dark => Some(THEME_DARK_CLAIM),
-        InputMode::HighContrast => Some(THEME_HIGH_CONTRAST_CLAIM),
-        _ => None,
-    }
-}
+/// The theme inputs are rendered observations now: the report carries one
+/// fingerprint per state, geometry and theme instead of a NOT_RUN family.
+const THEME_CLAIM: &str = "rendered under every state and geometry; per-state status/dock/composer/modal fingerprint in theme_fingerprints";
 
 /// The permission panel's renderer-only claim: the frame proves the renderer
 /// paints the seeded state, never an approval/decision path opening a panel.
@@ -1375,6 +1689,8 @@ fn write_report(
     fail: usize,
     not_run: usize,
     cells: &[Value],
+    observations: &[Value],
+    mono_pass: usize,
 ) -> Result<PathBuf, String> {
     let manifest = bundle.join("rivect.manifest.json");
     let digest = support::release::sha256_file(&manifest);
@@ -1389,6 +1705,9 @@ fn write_report(
         "fail": fail,
         "not_run": not_run,
         "cell_verdicts": cells,
+        "theme_observations": observations.len(),
+        "theme_fingerprints": observations,
+        "mono_probes": { "total": MONO_PROBES, "pass": mono_pass },
         "restore": {
             "exit": RESTORE_EXIT_CLAIM,
             "cancel": RESTORE_CANCEL_CLAIM,
@@ -1398,10 +1717,10 @@ fn write_report(
         "zero_send_approval": ZERO_SEND_CLAIM,
         "state_claims": state_claims(),
         "input_mode_claims": {
-            "no-color": "no SGR color emitted (asserted)",
-            "light": THEME_LIGHT_CLAIM,
-            "dark": THEME_DARK_CLAIM,
-            "high-contrast": THEME_HIGH_CONTRAST_CLAIM,
+            "no-color": "no SGR color emitted; status token and dock/composer labels asserted",
+            "light": THEME_CLAIM,
+            "dark": THEME_CLAIM,
+            "high-contrast": THEME_CLAIM,
             "reduced-motion": "no spinner glyphs emitted (asserted)",
         },
         "platform_terminals": "NOT_RUN (no platform terminal is available on this host)",
@@ -1420,15 +1739,93 @@ fn write_report(
             "{label} declares its NOT_RUN owner instead of claiming execution: {claim}"
         );
     }
-    for claim in [
-        THEME_LIGHT_CLAIM,
-        THEME_DARK_CLAIM,
-        THEME_HIGH_CONTRAST_CLAIM,
-    ] {
+    assert_eq!(
+        observations.len(),
+        THEME_OBSERVATIONS,
+        "one observation per state, geometry and theme"
+    );
+    assert_eq!(mono_pass, MONO_PROBES, "every mono label probe passes");
+    assert_eq!(pass, CELLS, "every installed UI cell passes");
+    assert_eq!(fail, 0, "no installed UI cell failed");
+    assert_eq!(not_run, 0, "no installed UI cell is unproven");
+    let mut seen = std::collections::BTreeSet::new();
+    for observation in observations {
+        let state = observation["state"].as_str().expect("observation state");
+        let geometry = observation["geometry"]
+            .as_str()
+            .expect("observation geometry");
+        let theme = observation["theme"].as_str().expect("observation theme");
+        for surface in ["status", "dock", "composer"] {
+            let fingerprint = observation[surface]
+                .as_str()
+                .expect("observation fingerprint");
+            assert!(
+                !fingerprint.is_empty() && fingerprint != "none",
+                "{state}/{geometry}/{theme} carries a {surface} fingerprint"
+            );
+        }
         assert!(
-            claim.starts_with("theme-agnostic rendering"),
-            "a theme cell declaration names the unproven palette: {claim}"
+            observation["modal"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "{state}/{geometry}/{theme} carries a modal fingerprint"
         );
+        assert!(
+            seen.insert((state.to_string(), geometry.to_string(), theme.to_string())),
+            "observation repeats a coordinate: {state}/{geometry}/{theme}"
+        );
+    }
+    assert_eq!(seen.len(), THEME_OBSERVATIONS);
+    for state in rivect::ui::review::STATES {
+        for theme in THEMES {
+            assert_eq!(
+                seen.iter()
+                    .filter(|(cell_state, _, cell_theme)| cell_state == state
+                        && cell_theme == theme)
+                    .count(),
+                GEOMETRIES,
+                "{state}/{theme} has one observation per geometry"
+            );
+        }
+    }
+    // Per state and geometry the three themes must be pairwise distinct on
+    // each painted carrier; a modal absent in every theme stays `none`.
+    for observation in observations {
+        let siblings: Vec<&Value> = observations
+            .iter()
+            .filter(|other| {
+                other["state"] == observation["state"]
+                    && other["geometry"] == observation["geometry"]
+            })
+            .collect();
+        assert_eq!(siblings.len(), THEMES.len());
+        for surface in ["status", "dock", "composer"] {
+            let mut values: Vec<&str> = siblings
+                .iter()
+                .map(|sibling| sibling[surface].as_str().expect("sibling fingerprint"))
+                .collect();
+            values.sort_unstable();
+            values.dedup();
+            assert_eq!(
+                values.len(),
+                THEMES.len(),
+                "{} / {} / {surface} palettes are pairwise distinct",
+                observation["state"],
+                observation["geometry"]
+            );
+        }
+        let modals: std::collections::BTreeSet<&str> = siblings
+            .iter()
+            .map(|sibling| sibling["modal"].as_str().expect("sibling modal"))
+            .collect();
+        if modals != std::collections::BTreeSet::from(["none"]) {
+            assert_eq!(
+                modals.len(),
+                THEMES.len(),
+                "modal palettes are pairwise distinct"
+            );
+            assert!(!modals.contains("none"), "every theme paints the modal");
+        }
     }
     // The renderer-only states must name their evidence class in the report,
     // and every passing cell of such a state must carry that same claim: a
@@ -1493,43 +1890,96 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
 
     let mut pass = 0usize;
     let mut fail = 0usize;
-    let mut not_run = 0usize;
     let mut cells = Vec::with_capacity(CELLS);
+    let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
+    let mut mono_pass = 0usize;
+    let mut theme_pass = 0usize;
     for state in 0..STATES {
         let fixture = state_fixture(state);
         for geometry in Geometry::ALL {
             let state_verdict = render_state(&fixture, geometry);
+            let mut theme_verdicts: std::collections::HashMap<&'static str, Result<(), String>> =
+                std::collections::HashMap::new();
+            let mut rendered = Vec::new();
+            match &state_verdict {
+                Ok(control) => {
+                    for theme in THEMES {
+                        match observe_theme(&fixture, geometry, theme, control) {
+                            Ok(observation) => rendered.push(observation),
+                            Err(error) => {
+                                theme_verdicts.insert(theme, Err(error));
+                            }
+                        }
+                    }
+                    if rendered.len() == THEMES.len() {
+                        match require_distinct_palettes(&rendered) {
+                            Ok(()) => {
+                                for theme in THEMES {
+                                    theme_verdicts.insert(theme, Ok(()));
+                                    theme_pass += 1;
+                                }
+                            }
+                            Err(error) => {
+                                for theme in THEMES {
+                                    theme_verdicts.insert(theme, Err(error.clone()));
+                                }
+                            }
+                        }
+                    } else {
+                        for theme in THEMES {
+                            theme_verdicts
+                                .entry(theme)
+                                .or_insert_with(|| Err("theme observation missing".to_string()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    for theme in THEMES {
+                        theme_verdicts.insert(theme, Err(error.clone()));
+                    }
+                }
+            }
+            for observation in &rendered {
+                observations.push(observation.to_json());
+            }
+            let mono_verdict = mono_probe(&fixture, geometry);
+            if mono_verdict.is_ok() {
+                mono_pass += 1;
+            }
             for input in InputMode::ALL {
                 let input_verdict = input_verdicts
                     .get(&(geometry, input))
                     .cloned()
                     .unwrap_or_else(|| Err("input probe missing".to_string()));
-                let (verdict, reason) =
-                    match (not_run_claim(input), state_verdict.clone(), input_verdict) {
-                        // The probe asserts theme-agnostic rendering only: the
-                        // distinct palette stays NOT_RUN with its claim as the
-                        // reason, never a PASS. A probe that fails is still a
-                        // failure — the theme run broke, it did not go unproven.
-                        (Some(claim), Ok(()), Ok(())) => {
-                            not_run += 1;
-                            ("NOT_RUN", claim.to_string())
+                let theme_verdict = match input {
+                    InputMode::Light => theme_verdicts.get("light").cloned(),
+                    InputMode::Dark => theme_verdicts.get("dark").cloned(),
+                    InputMode::HighContrast => theme_verdicts.get("high-contrast").cloned(),
+                    InputMode::NoColor => Some(mono_verdict.clone()),
+                    _ => None,
+                }
+                .unwrap_or(Ok(()));
+                let (verdict, reason) = match (state_verdict.clone(), input_verdict, theme_verdict)
+                {
+                    (Ok(_), Ok(()), Ok(())) => {
+                        pass += 1;
+                        ("PASS", String::new())
+                    }
+                    (state, input, theme) => {
+                        fail += 1;
+                        let mut reasons = Vec::new();
+                        if let Err(reason) = state {
+                            reasons.push(format!("state: {reason}"));
                         }
-                        (None, Ok(()), Ok(())) => {
-                            pass += 1;
-                            ("PASS", String::new())
+                        if let Err(reason) = input {
+                            reasons.push(format!("input: {reason}"));
                         }
-                        (_, state, input) => {
-                            fail += 1;
-                            let mut reasons = Vec::new();
-                            if let Err(reason) = state {
-                                reasons.push(format!("state: {reason}"));
-                            }
-                            if let Err(reason) = input {
-                                reasons.push(format!("input: {reason}"));
-                            }
-                            ("FAIL", reasons.join("; "))
+                        if let Err(reason) = theme {
+                            reasons.push(format!("theme: {reason}"));
                         }
-                    };
+                        ("FAIL", reasons.join("; "))
+                    }
+                };
                 // A passing renderer-only frame names that fact, so no reader
                 // takes it for a production one.
                 let reason = match renderer_only_claim(fixture.name) {
@@ -1555,20 +2005,68 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
         }
     }
 
-    let path = write_report(bundle, pass, fail, not_run, &cells).expect("matrix report");
+    println!("THEME-OBSERVATIONS total={THEME_OBSERVATIONS} pass={theme_pass}");
+    let path = write_report(bundle, pass, fail, 0, &cells, &observations, mono_pass)
+        .expect("matrix report");
     println!(
-        "UI-CELLS total={CELLS} pass={pass} fail={fail} not_run={not_run} report={}",
+        "UI-CELLS total={CELLS} pass={pass} fail={fail} not_run=0 report={}",
         path.display()
     );
-    assert_eq!(pass + fail + not_run, CELLS, "every cell is accounted");
+    assert_eq!(pass + fail, CELLS, "every cell is accounted");
     assert_eq!(
-        not_run, NOT_RUN_CELLS,
-        "the three theme inputs are NOT_RUN on every state and geometry"
+        theme_pass, THEME_OBSERVATIONS,
+        "every state×geometry×theme observation passes"
     );
-    assert_eq!(pass, CELLS - NOT_RUN_CELLS, "every other cell passes");
+    assert_eq!(mono_pass, MONO_PROBES, "every mono label probe passes");
+    assert_eq!(fail, 0, "every installed UI cell passes");
+    assert_eq!(pass, CELLS, "the matrix passes every cell");
+}
+
+/// An unknown `RIVECT_THEME` falls back to the dark palette and earns exactly
+/// one stderr note naming the accepted values; a known theme earns none.
+#[test]
+fn installed_unknown_theme_falls_back_to_dark_with_one_note() {
+    const NOTE: &str =
+        "rivect: unknown RIVECT_THEME; accepted values are light|dark|high-contrast; using dark";
+    let fixture = state_fixture(2);
+    let control = render_state(&fixture, Geometry::W80H24).expect("control frame");
+    let unknown = review_frame(
+        &fixture,
+        Geometry::W80H24,
+        &[("TERM", "xterm-256color"), ("RIVECT_THEME", "sepia")],
+        "unknown-theme",
+    )
+    .expect("unknown theme falls back");
+    let emitted = String::from_utf8_lossy(&unknown.bytes);
     assert_eq!(
-        fail, 0,
-        "every installed UI cell passes or is a declared NOT_RUN"
+        emitted.matches(NOTE).count(),
+        1,
+        "the unknown value earns exactly one note: {emitted:?}"
+    );
+    assert!(
+        !emitted.contains("sepia"),
+        "the note never echoes the untrusted value"
+    );
+    assert_eq!(
+        normalized_review_text(&unknown.text),
+        normalized_review_text(&control),
+        "the fallback changes no visible text"
+    );
+    let dark = review_frame(
+        &fixture,
+        Geometry::W80H24,
+        &[("TERM", "xterm-256color"), ("RIVECT_THEME", "dark")],
+        "dark-theme",
+    )
+    .expect("dark frame");
+    assert_eq!(
+        unknown.fingerprints.status, dark.fingerprints.status,
+        "an unknown value resolves to the dark palette"
+    );
+    let dark_emitted = String::from_utf8_lossy(&dark.bytes);
+    assert!(
+        !dark_emitted.contains("unknown RIVECT_THEME"),
+        "a known theme earns no unknown-value note"
     );
 }
 

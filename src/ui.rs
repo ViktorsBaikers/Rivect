@@ -18,6 +18,7 @@ use crate::policy::{
 use crate::providers::LoopbackProvider;
 
 pub mod review;
+pub mod theme;
 
 /// The TUI's one runtime is opened through the same configured factory the
 /// headless entry uses (TD-01). Production binds the provider set the
@@ -1264,6 +1265,7 @@ fn composer_line(view: &LocalView) -> String {
 
 pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Result<(), B::Error> {
     let mut card_inner = None;
+    let palette = theme::Palette::resolve();
     terminal.draw(|frame| {
         let area = frame.area();
         let output_active = view.output.is_active();
@@ -1313,7 +1315,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         rows.push(Constraint::Length(1));
         let chunks = ratatui::layout::Layout::vertical(rows).split(area);
         frame.render_widget(
-            Paragraph::new(sanitize_status_cause(&view.status)),
+            Paragraph::new(sanitize_status_cause(&view.status)).style(palette.status()),
             chunks[0],
         );
         // The transcript wraps at the region's width, so a long row
@@ -1325,6 +1327,7 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
         view.transcript_page.set(chunks[1].height.max(1));
         frame.render_widget(
             Paragraph::new(transcript.as_str())
+                .style(palette.transcript())
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((transcript_scroll, 0)),
             chunks[1],
@@ -1376,7 +1379,8 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
                     .map(|line| sanitize_status_cause(line))
                     .collect::<Vec<_>>()
                     .join("\n"),
-            ),
+            )
+            .style(palette.dock()),
             chunks[next],
         );
         if let Some(economy) = economy_text.as_deref() {
@@ -1384,12 +1388,17 @@ pub fn render<B: Backend>(terminal: &mut Terminal<B>, view: &LocalView) -> Resul
             // painting the same mode keeps the measured wrap and the painted
             // wrap in agreement.
             frame.render_widget(
-                Paragraph::new(economy).wrap(ratatui::widgets::Wrap { trim: false }),
+                Paragraph::new(economy)
+                    .style(palette.dock())
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
                 chunks[next + 1],
             );
         }
-        frame.render_widget(Paragraph::new(composer_line(view)), chunks[next + 2]);
-        card_inner = paint_modals(frame, view);
+        frame.render_widget(
+            Paragraph::new(composer_line(view)).style(palette.composer()),
+            chunks[next + 2],
+        );
+        card_inner = paint_modals(frame, view, palette);
     })?;
     // The frame just flushed: a card that painted for the first time
     // records the instant its consent window runs from — the earliest
@@ -1420,7 +1429,12 @@ struct ModalFrame {
 /// footer is allocated before the header: the actions/focus line and the
 /// hint are what make the modal answerable, so a short inner rect collapses
 /// the header to its naming line instead of clipping the footer away.
-fn modal_frame(frame: &mut ratatui::Frame<'_>, header_rows: u16, footer_rows: u16) -> ModalFrame {
+fn modal_frame(
+    frame: &mut ratatui::Frame<'_>,
+    header_rows: u16,
+    footer_rows: u16,
+    palette: theme::Palette,
+) -> ModalFrame {
     let area = frame.area();
     let compact = area.height <= 10;
     let width = area.width.min(60);
@@ -1440,7 +1454,7 @@ fn modal_frame(frame: &mut ratatui::Frame<'_>, header_rows: u16, footer_rows: u1
         height,
     };
     frame.render_widget(ratatui::widgets::Clear, rect);
-    let block = ratatui::widgets::Block::bordered();
+    let block = ratatui::widgets::Block::bordered().border_style(palette.modal());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let footer_rows = footer_rows.min(inner.height.saturating_sub(1 + MODAL_MIN_BODY_ROWS));
@@ -1505,12 +1519,16 @@ fn elide_cells(text: &str, max: u16) -> String {
 /// the viewport when its first line (the question) is actually visible: the
 /// part of the frame the operator could aim an answer at. Both surfaces run
 /// this same layer, so a card opens on either.
-fn paint_modals(frame: &mut ratatui::Frame<'_>, view: &LocalView) -> Option<ratatui::layout::Rect> {
+fn paint_modals(
+    frame: &mut ratatui::Frame<'_>,
+    view: &LocalView,
+    palette: theme::Palette,
+) -> Option<ratatui::layout::Rect> {
     let area = frame.area();
     if let Some(panel) = &view.panel {
         // Three regions: pinned header, scrollable scope body (wrapping,
         // never truncating), pinned actions footer (design-brief §4).
-        let modal = modal_frame(frame, PANEL_HEADER_ROWS, PANEL_FOOTER_ROWS);
+        let modal = modal_frame(frame, PANEL_HEADER_ROWS, PANEL_FOOTER_ROWS, palette);
         frame.render_widget(
             Paragraph::new(modal_header(
                 &panel.header_text(),
@@ -1539,7 +1557,7 @@ fn paint_modals(frame: &mut ratatui::Frame<'_>, view: &LocalView) -> Option<rata
     // Modal overlay, same geometry and three-region discipline as the
     // permission panel: pinned header, scrollable position body, pinned
     // focus/hint footer.
-    let modal = modal_frame(frame, DECISION_HEADER_ROWS, DECISION_FOOTER_ROWS);
+    let modal = modal_frame(frame, DECISION_HEADER_ROWS, DECISION_FOOTER_ROWS, palette);
     frame.render_widget(
         Paragraph::new(modal_header(
             &card.header_text(),
@@ -1594,6 +1612,7 @@ fn render_inline(
     flushed: &mut usize,
 ) -> io::Result<()> {
     let width = terminal.size()?.width.max(1);
+    let palette = theme::Palette::resolve();
     let flushed_from = (*flushed).min(view.transcript.len());
     let pending = view.transcript.get(flushed_from..).unwrap_or_default();
     if !pending.is_empty() {
@@ -1601,13 +1620,14 @@ fn render_inline(
         let rows = wrapped_row_count(&text, width);
         terminal.insert_before(u16::try_from(rows).unwrap_or(u16::MAX), |buf| {
             Paragraph::new(text.as_str())
+                .style(palette.transcript())
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .render(buf.area, buf);
         })?;
         *flushed = view.transcript.len();
     }
     let mut card_inner = None;
-    terminal.draw(|frame| card_inner = render_pinned(frame, view))?;
+    terminal.draw(|frame| card_inner = render_pinned(frame, view, palette))?;
     note_card_paint(view, card_inner);
     Ok(())
 }
@@ -1619,6 +1639,7 @@ fn render_inline(
 fn render_pinned(
     frame: &mut ratatui::Frame<'_>,
     view: &LocalView,
+    palette: theme::Palette,
 ) -> Option<ratatui::layout::Rect> {
     let area = frame.area();
     let chunks = ratatui::layout::Layout::vertical([
@@ -1631,7 +1652,7 @@ fn render_pinned(
     ])
     .split(area);
     frame.render_widget(
-        Paragraph::new(sanitize_status_cause(&view.status)),
+        Paragraph::new(sanitize_status_cause(&view.status)).style(palette.status()),
         chunks[0],
     );
     frame.render_widget(
@@ -1655,18 +1676,24 @@ fn render_pinned(
                 .map(|line| sanitize_status_cause(line))
                 .collect::<Vec<_>>()
                 .join("\n"),
-        ),
+        )
+        .style(palette.dock()),
         chunks[3],
     );
     if let Some(economy) = view.dock.last() {
         let text = fit_economy_row(&sanitize_status_cause(economy), area.width, 3);
         frame.render_widget(
-            Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+            Paragraph::new(text)
+                .style(palette.dock())
+                .wrap(ratatui::widgets::Wrap { trim: false }),
             chunks[4],
         );
     }
-    frame.render_widget(Paragraph::new(composer_line(view)), chunks[5]);
-    paint_modals(frame, view)
+    frame.render_widget(
+        Paragraph::new(composer_line(view)).style(palette.composer()),
+        chunks[5],
+    );
+    paint_modals(frame, view, palette)
 }
 
 /// One changed-line marker set for the append-only surface: what has been
