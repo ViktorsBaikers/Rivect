@@ -2405,6 +2405,25 @@ impl Provider for ConfiguredProvider {
                 connection: connection.to_string(),
             });
         };
+        // A typed image rides only the adapter that records its mark
+        // (TD-21): a substitute minted from a failed attempt keeps the
+        // image, so a retry whose dialect cannot honour it denies typed
+        // here instead of letting that codec drop the image.
+        if manifest.image.is_some() {
+            let ModelAssign::Fixed(fixed) = &manifest.model else {
+                return Err(ProviderError::UnsendableRequest {
+                    connection: connection.to_string(),
+                    reason: "an image request names no single model".to_string(),
+                });
+            };
+            if !adapter.image_input(connection, &fixed.model_id) {
+                return Err(ProviderError::UnsupportedParameter {
+                    connection: connection.to_string(),
+                    parameter: "image",
+                    model: fixed.model_id.clone(),
+                });
+            }
+        }
         adapter.send(manifest)
     }
 }

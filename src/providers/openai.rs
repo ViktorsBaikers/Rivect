@@ -42,7 +42,7 @@
 use crate::config::{
     Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
 };
-use crate::model::RequestManifest;
+use crate::model::{ImageInput, RequestManifest};
 use crate::providers::aws;
 use crate::providers::openai_login::{CodexCredential, LoginError as CodexLoginError};
 use crate::providers::sse::{SseEvent, SseParser};
@@ -464,6 +464,19 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             blind_retry: BlindRetry::Allowed,
         }),
         _ => None,
+    }
+}
+
+/// Whether one pinned Responses id carries the recorded image-input mark
+/// (TD-21): the captured descriptor rows state `input: ["text", "image"]`
+/// for the `bedrock-mantle` frontier seeds — the one Responses seed table
+/// this build records with the mark — so a pin outside that table answers
+/// `false` and the vision path denies typed instead of sending an image
+/// the record never admitted.
+fn recorded_image_input(connection: &str, model: &str) -> bool {
+    match connection {
+        "bedrock-mantle" => MANTLE_MODELS.contains(&model),
+        _ => false,
     }
 }
 
@@ -1478,15 +1491,52 @@ impl OpenAiProvider {
         }
     }
 
+    /// The RFC 4648 §4 base64 alphabet the Responses `data:` URL uses.
+    const BASE64_ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// Encodes `bytes` as padded base64: every three bytes become four
+    /// symbols and a trailing one or two bytes are `=`-padded. The one
+    /// alphabet the wire contract names is in-repo — a dependency would
+    /// add a format surface this adapter never sends.
+    fn base64_encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let mut block = [0u8; 3];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let bits = u32::from(block[0]) << 16 | u32::from(block[1]) << 8 | u32::from(block[2]);
+            let symbol =
+                |shift: u32| Self::BASE64_ALPHABET[((bits >> shift) & 0x3f) as usize] as char;
+            out.push(symbol(18));
+            out.push(symbol(12));
+            out.push(if chunk.len() > 1 { symbol(6) } else { '=' });
+            out.push(if chunk.len() > 2 { symbol(0) } else { '=' });
+        }
+        out
+    }
+
+    /// The `data:` URL one typed image occupies on the Responses wire
+    /// (TD-21): the sniffed media type, the base64 alphabet and the raw
+    /// bytes' padded encoding — the exact bytes the frozen manifest
+    /// accounted as [`ImageInput::encoded_len`].
+    fn image_data_url(image: &ImageInput) -> String {
+        format!(
+            "data:{};base64,{}",
+            image.media().wire_media(),
+            Self::base64_encode(image.bytes())
+        )
+    }
+
     /// The frozen manifest as the Responses wire request (AC-013):
     /// model pin, instructions and the declared tool surface verbatim,
     /// `store: false` and `stream: true` always,
     /// `include = ["reasoning.encrypted_content"]` where the recorded
     /// peer returns the reasoning artifact the replay contract carries
     /// (SRC-019/D-006), the pinned effort on the reasoning surface,
-    /// and the epoch's recorded output items replayed ahead of the new
-    /// input — the stateless replay the `store: false` contract
-    /// requires.
+    /// the frozen image as one `input_image` part in the same user
+    /// message as its text, and the epoch's recorded output items
+    /// replayed ahead of the new input — the stateless replay the
+    /// `store: false` contract requires.
     ///
     /// The replay set is bound by `MODEL_WIRE_MAX_BYTES`: once a
     /// lineage's committed items serialize past it, every send under
@@ -1505,10 +1555,14 @@ impl OpenAiProvider {
             .get(&key)
             .map_or_else(Vec::new, |items| items.clone());
         let mut input = prior;
-        input.push(json!({
-            "role": "user",
-            "content": [{ "type": "input_text", "text": manifest.inputs }],
-        }));
+        let mut content = vec![json!({ "type": "input_text", "text": manifest.inputs })];
+        if let Some(image) = &manifest.image {
+            content.push(json!({
+                "type": "input_image",
+                "image_url": Self::image_data_url(image),
+            }));
+        }
+        input.push(json!({ "role": "user", "content": content }));
         let mut body = json!({
             "model": fixed.model_id,
             "instructions": manifest.instructions,
@@ -2186,6 +2240,26 @@ impl Provider for OpenAiProvider {
         connection == self.connection
     }
 
+    /// The recorded image mark for one pinned model (TD-21): the recorded
+    /// descriptor rows answer from the table alone, while the local
+    /// endpoint class states its capability only in the served native
+    /// descriptor, so the same bounded discovery the catalogue leg reads
+    /// answers here. A failed or unreadable discovery is no capability —
+    /// the request then denies typed instead of sending an image the peer
+    /// never admitted.
+    fn image_input(&self, connection: &str, model: &str) -> bool {
+        if connection != self.connection {
+            return false;
+        }
+        if recorded_image_input(connection, model) {
+            return true;
+        }
+        self.connection == "ollama"
+            && self
+                .catalog_models()
+                .is_ok_and(|rows| rows.iter().any(|row| row.id == model && row.vision))
+    }
+
     /// Sends the frozen manifest as one physical Responses request.
     ///
     /// # Errors
@@ -2466,5 +2540,58 @@ mod tests {
         assert_eq!(probed[31].id, "model-31");
         let mut short = models[..7].to_vec();
         assert_eq!(probe_targets_mut(&mut short).len(), 7);
+    }
+
+    /// The in-repo encoder against RFC 4648 §10's vectors plus the
+    /// padding and full-alphabet edges the `data:` URL depends on.
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("f\u{6f}", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(
+                OpenAiProvider::base64_encode(raw.as_bytes()),
+                encoded,
+                "{raw:?} encodes as the RFC vector"
+            );
+        }
+        assert_eq!(OpenAiProvider::base64_encode(&[0x00]), "AA==");
+        assert_eq!(OpenAiProvider::base64_encode(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(
+            OpenAiProvider::base64_encode(&[0xfb, 0xff, 0xbf]),
+            "+/+/",
+            "the last two alphabet symbols are `+` and `/`"
+        );
+    }
+
+    /// The recorded image mark is the mantle seed alone: the same id on
+    /// another connection, or another id on the mantle connection, is
+    /// text-only — the pin then denies typed rather than sending an
+    /// image the record never admitted.
+    #[test]
+    fn recorded_image_input_is_the_mantle_seed_only() {
+        for id in MANTLE_MODELS {
+            assert!(
+                recorded_image_input("bedrock-mantle", id),
+                "{id} carries the recorded image mark"
+            );
+            assert!(
+                !recorded_image_input("openai", id),
+                "{id} is not recorded on openai"
+            );
+        }
+        for id in RESPONSES_MODELS {
+            assert!(
+                !recorded_image_input("openai", id),
+                "{id} records no image mark"
+            );
+            assert!(!recorded_image_input("bedrock-mantle", id));
+        }
     }
 }

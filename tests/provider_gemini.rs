@@ -20,12 +20,17 @@
     reason = "test code keeps unwrap/expect/panic/discard conveniences; src/ stays strict (standards §14)"
 )]
 
-use rivect::config::Config;
-use rivect::model::{Broker, ModelError, RequestManifest};
+use rivect::config::{Config, Connection};
+use rivect::model::{
+    Broker, ImageMedia, InputOrigin, ModelError, PendingImage, RankingFacts, RequestManifest,
+};
 use rivect::providers::gemini::{
     GOOGLE_PROJECT_BILLED_KEY_TYPE, GOOGLE_STANDARD_KEY_SUNSET, GeminiProvider,
 };
-use rivect::providers::{Provider, ProviderError, StoreKind, TransportCause, TransportClass};
+use rivect::providers::{
+    CredentialStore, Provider, ProviderError, ProviderReply, StoreKind, TransportCause,
+    TransportClass, configured_provider,
+};
 use rivect::resources::UsageDelta;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -67,6 +72,15 @@ const STORE_KIND: StoreKind = StoreKind::Keychain;
 
 /// The pinned model id the fixed-pin legs carry.
 const MODEL: &str = "gemini-3.1-pro-preview";
+
+/// A deterministic 1×1 PNG: the typed-image negative carries a real
+/// payload so the denial is the capability gate, never a media sniff.
+const PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+];
 
 /// One configured `google` connection pointing at the fixture peer:
 /// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
@@ -208,7 +222,7 @@ fn dispatch(
     mut broker: Broker,
     world: &str,
     manifest: RequestManifest,
-) -> (Broker, Result<rivect::providers::ProviderReply, ModelError>) {
+) -> (Broker, Result<ProviderReply, ModelError>) {
     let world = world.to_string();
     std::thread::spawn(move || {
         let outcome = broker.dispatch(&mut rivect::model::NullLedger, &world, &manifest);
@@ -1848,7 +1862,7 @@ async fn dribbling_peer_cannot_park_the_send_past_the_deadline() {
             (Predicate::Connect, error.is_connect()),
         ])
     }
-    fn primary(outcome: Result<rivect::providers::ProviderReply, ProviderError>) -> Primary {
+    fn primary(outcome: Result<ProviderReply, ProviderError>) -> Primary {
         let mut observed = Primary {
             variant: Variant::Other,
             ..Primary::default()
@@ -4790,3 +4804,134 @@ async fn usage_metadata_cache_and_thought_legs_are_carried() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::google = NOT_RUN"]
 fn provider_installed_google() {}
+
+/// The Gemini dialect records no image-input mark: a typed image denies
+/// `ImageUnsupported` at prepare, before the broker accounts and before
+/// any request reaches the peer — never a dropped image.
+#[tokio::test]
+async fn typed_image_is_denied_unsupported_before_any_wire_request() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let (provider, _store) = google_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let denial = broker
+        .prepare_vision(
+            "main",
+            &config,
+            "/world/google-image",
+            "goal: describe the image",
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes: PNG.to_vec(),
+            },
+        )
+        .expect_err("the gemini dialect records no image mark");
+    match denial {
+        ModelError::ImageUnsupported { connection, model } => {
+            assert_eq!(connection, "google");
+            assert_eq!(model, MODEL);
+        }
+        other => panic!("wrong denial: {other:?}"),
+    }
+    assert_eq!(broker.accounted_requests(), 0);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock answers")
+            .is_empty(),
+        "the denial issues no wire request"
+    );
+}
+
+/// A local double that admits every image, so the hub's own retry guard
+/// can be exercised with the manifest the broker mints.
+struct ImageCapableDouble;
+
+impl Provider for ImageCapableDouble {
+    fn name(&self) -> &'static str {
+        "image-capable-double"
+    }
+
+    fn serves(&self, _connection: &str, _entry: &Connection) -> bool {
+        true
+    }
+
+    fn image_input(&self, _connection: &str, _model: &str) -> bool {
+        true
+    }
+
+    fn send(&mut self, _manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        panic!("the fixture double never sends")
+    }
+}
+
+/// A retried image request keeps its typed image; the production hub
+/// denies it typed on a dialect that cannot encode it rather than
+/// letting that codec drop the image from the retry body.
+#[tokio::test]
+async fn hub_denies_a_retried_image_for_a_dialect_that_cannot_encode_it() {
+    let server = MockServer::start().await;
+    let config =
+        Config::parse_validated(&gemini_config(&server_uri_v1beta(&server))).expect("valid");
+    let mut broker = Broker::new(Box::new(ImageCapableDouble));
+    let manifest = broker
+        .prepare_vision(
+            "main",
+            &config,
+            "/world/google-retry",
+            "goal: describe the image",
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes: PNG.to_vec(),
+            },
+        )
+        .expect("the capability double admits the image");
+    assert!(
+        manifest.image.is_some(),
+        "the retried manifest keeps the image"
+    );
+
+    let store: Arc<dyn CredentialStore> = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CREDENTIAL_REF, SECRET)],
+    ));
+    let build_config = config.clone();
+    let build_store = Arc::clone(&store);
+    let mut hub = std::thread::spawn(move || {
+        configured_provider(&build_config, &build_store)
+            .expect("the google adapter set builds")
+            .provider
+    })
+    .join()
+    .expect("the hub build thread joins");
+    let denial = hub
+        .send(&manifest)
+        .expect_err("the google dialect records no image mark");
+    match denial {
+        ProviderError::UnsupportedParameter {
+            connection,
+            parameter,
+            model,
+        } => {
+            assert_eq!(connection, "google");
+            assert_eq!(parameter, "image");
+            assert_eq!(model, MODEL);
+        }
+        other => panic!("wrong denial: {other:?}"),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock answers")
+            .is_empty(),
+        "the hub denial issues no wire request"
+    );
+    drop_blocking(hub);
+}

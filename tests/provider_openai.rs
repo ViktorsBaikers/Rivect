@@ -27,7 +27,11 @@
 )]
 
 use rivect::config::{Config, ConnKind, EffortLevel};
-use rivect::model::{Broker, ModelError, RejectionCause, RequestManifest};
+use rivect::contracts::{IMAGE_MAX_BYTES, MODEL_WIRE_MAX_BYTES};
+use rivect::model::{
+    Broker, ImageMedia, InputOrigin, ModelError, PendingImage, RankingFacts, RejectionCause,
+    RequestManifest,
+};
 use rivect::providers::local::ChatCompletionsProvider;
 use rivect::providers::openai::OpenAiProvider;
 use rivect::providers::sse::{SseError, SseParser};
@@ -10993,5 +10997,489 @@ async fn response_usage_detail_legs_are_carried() {
             cache_write_tokens: None,
             total_tokens: Some(12),
         }
+    );
+}
+
+// ----- typed image wire (TD-21) -------------------------------------
+
+/// The mantle connection's scoped credential ref — the fixture store
+/// serves it by scope alone.
+const MANTLE_IMAGE_REF: &str = "keyring:rivect-test/bedrock-mantle";
+
+/// The recorded `bedrock-mantle` seed whose descriptor row marks image
+/// input; the adapter's recorded offer set names it.
+const MANTLE_IMAGE_MODEL: &str = "openai.gpt-5.4";
+
+/// The deterministic 1×1 PNG every image leg carries.
+const PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+];
+
+/// The recorded image-capable seed pinned on the mantle connection: the
+/// endpoint is supplied by the loopback base override, so the empty
+/// configured value is the recorded sentinel.
+fn mantle_image_config() -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.bedrock-mantle]\nkind = \"api_key\"\nendpoint = \"\"\ncredential_ref = \"{MANTLE_IMAGE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"bedrock-mantle\", model_id = \"{MANTLE_IMAGE_MODEL}\" }}\n\
+         effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The mantle adapter under a loopback base override; construction runs
+/// on a plain OS thread because reqwest's blocking client cannot be
+/// built inside a tokio context.
+fn mantle_image_provider(config: &Config, base: &str) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(MANTLE_IMAGE_REF, SECRET)],
+    ));
+    let handle = Arc::clone(&store);
+    let config = config.clone();
+    let base = format!("{base}/openai/v1");
+    let provider = std::thread::spawn(move || {
+        OpenAiProvider::with_mantle_base_override(
+            &config,
+            "bedrock-mantle",
+            handle,
+            Duration::from_secs(5),
+            Some(base),
+        )
+    })
+    .join()
+    .expect("the provider thread joins")
+    .expect("the mantle image adapter builds");
+    (provider, store)
+}
+
+async fn mount_mantle_image_response(server: &MockServer, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/openai/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(server)
+        .await;
+}
+
+/// One prepared image request through the real admission path.
+fn prepared_vision(
+    config: &Config,
+    provider: OpenAiProvider,
+    world: &str,
+    inputs: &str,
+    bytes: Vec<u8>,
+) -> (Broker, RequestManifest) {
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare_vision(
+            "main",
+            config,
+            world,
+            inputs,
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes,
+            },
+        )
+        .expect("the recorded image model admits the request");
+    (broker, manifest)
+}
+
+/// Decodes padded base64 in the test, independently of the encoder, so
+/// the wire part is checked against the fixture bytes rather than trusted
+/// because the adapter produced it.
+fn decode_base64(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut bits = 0u32;
+    let mut symbols = 0u32;
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a') + 26,
+            b'0'..=b'9' => u32::from(byte - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => panic!("the data URL carries a symbol outside the base64 alphabet"),
+        };
+        bits = (bits << 6) | value;
+        symbols += 1;
+        if symbols == 4 {
+            out.push((bits >> 16) as u8);
+            out.push((bits >> 8) as u8);
+            out.push(bits as u8);
+            bits = 0;
+            symbols = 0;
+        }
+    }
+    match symbols {
+        2 => out.push((bits >> 4) as u8),
+        3 => {
+            out.push((bits >> 10) as u8);
+            out.push((bits >> 2) as u8);
+        }
+        1 => panic!("the data URL ends on one base64 symbol"),
+        _ => {}
+    }
+    out
+}
+
+/// The frozen image rides the same user message as its text: one
+/// `input_image` part whose `data:` URL decodes to exactly the frozen
+/// bytes and digests equal to the manifest's.
+#[tokio::test]
+async fn image_manifest_emits_exactly_one_exact_input_image_part() {
+    let server = MockServer::start().await;
+    mount_mantle_image_response(
+        &server,
+        responses_completed_stream(
+            "image outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 21, "output_tokens": 7, "total_tokens": 28})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&mantle_image_config()).expect("valid");
+    let (provider, _store) = mantle_image_provider(&config, &server.uri());
+    let (broker, manifest) = prepared_vision(
+        &config,
+        provider,
+        "/world/image-wire",
+        "goal: describe the image",
+        PNG.to_vec(),
+    );
+    let image = manifest
+        .image
+        .as_ref()
+        .expect("the manifest carries the image");
+    assert_eq!(image.byte_len(), PNG.len());
+    assert_eq!(image.digest(), support::sha256_hex(PNG));
+
+    let (broker, outcome) = dispatch(broker, "/world/image-wire", manifest.clone());
+    let reply = outcome.expect("the image send completes");
+    assert_eq!(reply.text, "image outcome");
+    assert_eq!(broker.accounted_requests(), 1);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(body["model"], MANTLE_IMAGE_MODEL);
+    let content = body["input"][0]["content"]
+        .as_array()
+        .expect("the user message carries a content array");
+    assert_eq!(content.len(), 2, "one text part and one image part");
+    assert_eq!(
+        content[0],
+        json!({ "type": "input_text", "text": manifest.inputs })
+    );
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(
+        content[1]["detail"],
+        Value::Null,
+        "no detail member is invented"
+    );
+    let url = content[1]["image_url"].as_str().expect("the data URL");
+    let payload = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("the exact media prefix");
+    assert_eq!(
+        decode_base64(payload),
+        PNG,
+        "the wire part is the frozen bytes"
+    );
+    assert_eq!(
+        support::sha256_hex(&decode_base64(payload)),
+        image.digest(),
+        "the decoded wire bytes digest equal to the manifest's"
+    );
+    assert!(
+        !manifest.wire_bytes().contains("data:image/"),
+        "wire_bytes stays the text composition"
+    );
+}
+
+/// A manifest without an image leaves the exact text-only user message:
+/// no `input_image` part exists anywhere in the request body.
+#[tokio::test]
+async fn text_only_request_carries_no_input_image_part() {
+    let server = MockServer::start().await;
+    mount_mantle_image_response(
+        &server,
+        responses_completed_stream("text outcome", Vec::new(), None),
+    )
+    .await;
+    let config = Config::parse_validated(&mantle_image_config()).expect("valid");
+    let (provider, _store) = mantle_image_provider(&config, &server.uri());
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare(
+            "main",
+            &config,
+            "/world/image-text",
+            "goal: describe the image",
+        )
+        .expect("the text path prepares");
+    assert!(manifest.image.is_none(), "the text path freezes no image");
+
+    let (broker, outcome) = dispatch(broker, "/world/image-text", manifest.clone());
+    outcome.expect("the text send completes");
+    assert_eq!(broker.accounted_requests(), 1);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["input"],
+        json!([{
+            "role": "user",
+            "content": [{ "type": "input_text", "text": manifest.inputs }],
+        }])
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains("input_image"),
+        "no image part rides a request that froze none"
+    );
+}
+
+/// The capability table is the recorded image seed alone: another id on
+/// the same connection, or the same id on another connection, answers
+/// `false`.
+#[test]
+fn image_capability_is_the_recorded_mantle_seed() {
+    let mantle_config = Config::parse_validated(&mantle_image_config()).expect("valid");
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(MANTLE_IMAGE_REF, SECRET)],
+    ));
+    let config = mantle_config.clone();
+    let mantle = std::thread::spawn(move || OpenAiProvider::new(&config, "bedrock-mantle", store))
+        .join()
+        .expect("the provider thread joins")
+        .expect("the mantle adapter builds");
+    assert!(mantle.image_input("bedrock-mantle", MANTLE_IMAGE_MODEL));
+    assert!(
+        !mantle.image_input("bedrock-mantle", "openai.gpt-5.2"),
+        "an unrecorded mantle id answers text-only"
+    );
+    assert!(
+        !mantle.image_input("openai", MANTLE_IMAGE_MODEL),
+        "another connection never borrows the mark"
+    );
+
+    let openai_config =
+        Config::parse_validated(&openai_config("http://127.0.0.1:9/v1")).expect("valid");
+    let (openai, _store) = openai_provider(&openai_config);
+    assert!(
+        !openai.image_input("openai", "gpt-5.2"),
+        "the openai sample records no image mark"
+    );
+}
+
+/// A capability-false pin denies typed before the broker accounts or the
+/// adapter posts: no wire request is issued.
+#[tokio::test]
+async fn capability_false_denies_the_image_before_any_wire_request() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = openai_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let denial = broker
+        .prepare_vision(
+            "main",
+            &config,
+            "/world/image-denied",
+            "goal: describe the image",
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes: PNG.to_vec(),
+            },
+        )
+        .expect_err("the openai sample records no image mark");
+    match denial {
+        ModelError::ImageUnsupported { connection, model } => {
+            assert_eq!(connection, "openai");
+            assert_eq!(model, "gpt-5.2");
+        }
+        other => panic!("wrong denial: {other:?}"),
+    }
+    assert_eq!(broker.accounted_requests(), 0);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock answers")
+            .is_empty(),
+        "the denial issues no wire request"
+    );
+}
+
+/// The raw bound admits exactly 512 KiB and the accounted encoded length
+/// is the data URL the wire carries; one byte past the raw bound denies
+/// typed with the named bounds and no send.
+#[tokio::test]
+async fn image_bounds_account_the_raw_and_encoded_wire_bytes() {
+    let server = MockServer::start().await;
+    mount_mantle_image_response(
+        &server,
+        responses_completed_stream("bounded outcome", Vec::new(), None),
+    )
+    .await;
+    let config = Config::parse_validated(&mantle_image_config()).expect("valid");
+
+    let mut raw = vec![0u8; IMAGE_MAX_BYTES];
+    raw[..PNG.len().min(8)].copy_from_slice(&PNG[..PNG.len().min(8)]);
+    let (provider, _store) = mantle_image_provider(&config, &server.uri());
+    let (broker, manifest) = prepared_vision(
+        &config,
+        provider,
+        "/world/image-bound",
+        "goal: describe the image",
+        raw.clone(),
+    );
+    let image = manifest
+        .image
+        .as_ref()
+        .expect("the raw bound admits the image");
+    assert_eq!(image.byte_len(), IMAGE_MAX_BYTES);
+    let encoded = image.encoded_len();
+    assert_eq!(encoded, ImageMedia::Png.data_url_len(IMAGE_MAX_BYTES));
+    assert_eq!(
+        encoded,
+        "data:image/png;base64,".len() + IMAGE_MAX_BYTES.div_ceil(3) * 4,
+        "the accounted bytes are the padded encoded payload plus its prefix"
+    );
+    let text_accounted = manifest.wire_bytes().len() + manifest.output_reserve;
+    assert!(text_accounted + encoded <= MODEL_WIRE_MAX_BYTES);
+
+    let (_, outcome) = dispatch(broker, "/world/image-bound", manifest.clone());
+    outcome.expect("the bounded image sends");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    let url = body["input"][0]["content"][1]["image_url"]
+        .as_str()
+        .expect("the data URL");
+    assert_eq!(url.len(), encoded, "the wire carries the accounted length");
+    let payload = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("the exact media prefix");
+    assert_eq!(decode_base64(payload).len(), IMAGE_MAX_BYTES);
+
+    let (provider, _store) = mantle_image_provider(&config, &server.uri());
+    let mut broker = Broker::new(Box::new(provider));
+    raw.push(0);
+    let denial = broker
+        .prepare_vision(
+            "main",
+            &config,
+            "/world/image-over",
+            "goal: describe the image",
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes: raw,
+            },
+        )
+        .expect_err("one byte past the raw bound denies");
+    match denial {
+        ModelError::ImageTooLarge {
+            bytes,
+            raw_limit,
+            encoded,
+            wire_limit,
+            wire_remaining,
+            scope,
+        } => {
+            assert_eq!(bytes, IMAGE_MAX_BYTES + 1);
+            assert_eq!(raw_limit, IMAGE_MAX_BYTES);
+            assert_eq!(encoded, ImageMedia::Png.data_url_len(IMAGE_MAX_BYTES + 1));
+            assert_eq!(wire_limit, MODEL_WIRE_MAX_BYTES);
+            assert!(wire_remaining < MODEL_WIRE_MAX_BYTES);
+            assert_eq!(scope, "/world/image-over");
+        }
+        other => panic!("wrong denial: {other:?}"),
+    }
+    assert!(
+        broker.accounted_requests() == 0
+            && server
+                .received_requests()
+                .await
+                .expect("the mock answers")
+                .len()
+                == 1,
+        "the denial never posts"
+    );
+}
+
+/// The encoded data URL counts inside the 1 MiB wire cap beside the raw
+/// bound: a maximal image plus text that alone fits the cap denies typed
+/// naming the wire bound, and nothing is sent.
+#[tokio::test]
+async fn encoded_image_and_text_together_deny_past_the_wire_limit() {
+    let server = MockServer::start().await;
+    let config = Config::parse_validated(&mantle_image_config()).expect("valid");
+    let (provider, _store) = mantle_image_provider(&config, &server.uri());
+    let mut broker = Broker::new(Box::new(provider));
+    let mut raw = vec![0u8; IMAGE_MAX_BYTES];
+    raw[..8].copy_from_slice(&PNG[..8]);
+    let inputs = "x".repeat(400_000);
+    let denial = broker
+        .prepare_vision(
+            "main",
+            &config,
+            "/world/image-wire-bound",
+            &inputs,
+            InputOrigin::Human,
+            &RankingFacts::unknown(),
+            PendingImage {
+                declared: ImageMedia::Png,
+                bytes: raw,
+            },
+        )
+        .expect_err("the encoded image pushes the request past the wire cap");
+    match denial {
+        ModelError::ImageTooLarge {
+            bytes,
+            raw_limit,
+            wire_limit,
+            wire_remaining,
+            ..
+        } => {
+            assert_eq!(bytes, IMAGE_MAX_BYTES);
+            assert_eq!(raw_limit, IMAGE_MAX_BYTES);
+            assert_eq!(wire_limit, MODEL_WIRE_MAX_BYTES);
+            assert_eq!(wire_remaining, 0, "the accounted total leaves no wire room");
+        }
+        other => panic!("wrong denial: {other:?}"),
+    }
+    assert_eq!(broker.accounted_requests(), 0);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock answers")
+            .is_empty(),
+        "the wire-bound denial issues no request"
     );
 }

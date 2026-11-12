@@ -422,10 +422,11 @@ fn machine_vision_answer_is_denied_and_names_the_tui_recovery() {
 
 // ----- packaged TUI composer positive -----
 
-/// One lm-studio loopback peer: the served catalogue states a vision model so
-/// the recorded capability probe answers, and one Chat Completions POST
-/// carries the answer's read call. Only POSTs are counted as sends.
-struct LmStudioPeer {
+/// One local `ollama` loopback peer: the served catalogue and native
+/// descriptor state a vision model so the recorded capability probe
+/// answers, and one Responses POST carries the answer's read call. Only
+/// `/v1/responses` POSTs are counted as sends.
+struct OllamaPeer {
     endpoint: String,
     address: std::net::SocketAddr,
     posts: Arc<AtomicU64>,
@@ -433,7 +434,7 @@ struct LmStudioPeer {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl LmStudioPeer {
+impl OllamaPeer {
     fn start(read_path: &'static str) -> Self {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind peer");
         let address = listener.local_addr().expect("peer address");
@@ -452,14 +453,26 @@ impl LmStudioPeer {
                 let Some((method, target, _)) = read_http(&mut stream) else {
                     continue;
                 };
-                let (status, body) = if method == "POST" && target.ends_with("/chat/completions") {
+                // The Responses adapter's legs: the model send is the one
+                // counted POST, while the capability gate and the catalogue
+                // read state the served descriptor — `/api/tags` and
+                // `/api/show` are the native surface, never sends.
+                let (status, body) = if method == "POST" && target.ends_with("/v1/responses") {
                     thread_posts.fetch_add(1, Ordering::SeqCst);
-                    ("200 OK", chat_stream(read_path))
-                } else if target.ends_with("/api/v0/models") {
+                    ("200 OK", responses_stream(read_path))
+                } else if target.ends_with("/api/show") {
                     (
                         "200 OK",
-                        json!({"data": [{"id": "fixture-vision", "type": "vlm", "state": "loaded"}]})
-                            .to_string(),
+                        json!({
+                            "capabilities": ["thinking", "vision"],
+                            "model_info": {"fixture.context_length": 4096},
+                        })
+                        .to_string(),
+                    )
+                } else if target.ends_with("/api/tags") {
+                    (
+                        "200 OK",
+                        json!({"models": [{"name": "fixture-vision"}]}).to_string(),
                     )
                 } else if target.ends_with("/models") {
                     (
@@ -469,7 +482,7 @@ impl LmStudioPeer {
                 } else {
                     ("200 OK", json!({"object": "list", "data": []}).to_string())
                 };
-                let is_stream = method == "POST";
+                let is_stream = method == "POST" && target.ends_with("/v1/responses");
                 let content_type = if is_stream {
                     "text/event-stream"
                 } else {
@@ -500,7 +513,7 @@ impl LmStudioPeer {
     }
 }
 
-impl Drop for LmStudioPeer {
+impl Drop for OllamaPeer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(stream) = std::net::TcpStream::connect(self.address) {
@@ -539,40 +552,50 @@ fn read_http(stream: &mut std::net::TcpStream) -> Option<(String, String, Vec<u8
     Some((method, target, body))
 }
 
-fn chat_stream(read_path: &str) -> String {
+/// One completed Responses stream carrying a single `read_file` call:
+/// the answer step executes it once with no second model send.
+fn responses_stream(read_path: &str) -> String {
     let arguments = serde_json::to_string(&json!({"path": read_path})).expect("arguments");
     let call = json!({
-        "index": 0, "id": "call-vision", "type": "function",
-        "function": {"name": "read_file", "arguments": arguments},
+        "id": "fc_1", "type": "function_call", "status": "completed",
+        "call_id": "call-vision", "name": "read_file", "arguments": arguments,
     });
-    let delta = json!({
-        "id": "c1", "object": "chat.completion.chunk",
-        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [call]}, "finish_reason": null}],
-    });
-    let finish = json!({
-        "id": "c1", "object": "chat.completion.chunk",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-    });
-    let usage = json!({
-        "id": "c1", "choices": [],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
-    });
-    format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+    let added = support::sse_block(
+        "response.output_item.added",
+        &json!({
+            "item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": ""},
+            "output_index": 0,
+        }),
+    );
+    let done = support::sse_block(
+        "response.output_item.done",
+        &json!({"item": call, "output_index": 0}),
+    );
+    let completed = support::sse_block(
+        "response.completed",
+        &json!({"response": {
+            "id": "resp_1",
+            "status": "completed",
+            "output": [call],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+        }}),
+    );
+    format!("{added}{done}{completed}")
 }
 
 fn installed_vision_config(endpoint: &str) -> String {
     format!(
         "config_version = 1\n\
-         [connections.lm-studio]\nkind = \"local\"\nendpoint = \"{endpoint}\"\n\
+         [connections.ollama]\nkind = \"local\"\nendpoint = \"{endpoint}\"\n\
          [models.defaults]\n\
-         model = {{ mode = \"fixed\", connection = \"lm-studio\", model_id = \"fixture-vision\" }}\n\
+         model = {{ mode = \"fixed\", connection = \"ollama\", model_id = \"fixture-vision\" }}\n\
          effort = {{ mode = \"auto\" }}\nfallback = {{ mode = \"off\" }}\n"
     )
 }
 
 #[test]
 fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
-    let peer = LmStudioPeer::start("AGENTS.md");
+    let peer = OllamaPeer::start("AGENTS.md");
     let root = tempfile::TempDir::with_prefix("rivect-vision-tui-").expect("fixture root");
     let bundle = support::release::baseline_bundle();
     assert!(
