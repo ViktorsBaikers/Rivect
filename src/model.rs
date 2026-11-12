@@ -17,6 +17,206 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// One image media type the typed vision path admits (TD-20). The three
+/// variants are the only sniffed formats: a payload outside them is a
+/// typed refusal, never a guessed content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageMedia {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl ImageMedia {
+    /// The short name the public attachment params and the transcript use.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Webp => "webp",
+        }
+    }
+
+    /// The media type a `data:` URL names.
+    #[must_use]
+    pub fn wire_media(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    /// Parses the public `media_type` spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "png" => Some(Self::Png),
+            "jpeg" => Some(Self::Jpeg),
+            "webp" => Some(Self::Webp),
+            _ => None,
+        }
+    }
+
+    /// The encoded `data:` URL length one raw payload of `raw` bytes
+    /// occupies: the prefix plus base64's four bytes per three.
+    #[must_use]
+    pub fn data_url_len(self, raw: usize) -> usize {
+        let prefix = match self {
+            Self::Png => "data:image/png;base64,".len(),
+            Self::Jpeg => "data:image/jpeg;base64,".len(),
+            Self::Webp => "data:image/webp;base64,".len(),
+        };
+        prefix.saturating_add(raw.div_ceil(3).saturating_mul(4))
+    }
+
+    /// The format a payload's own leading bytes declare.
+    #[must_use]
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Some(Self::Png);
+        }
+        if bytes.starts_with(b"\xff\xd8\xff") {
+            return Some(Self::Jpeg);
+        }
+        // RIFF container: the fourcc at offset 8 names the form.
+        if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            return Some(Self::Webp);
+        }
+        None
+    }
+}
+
+/// One image read the public answer path carries to its request step
+/// (TD-20): the bytes the scoped executor returned and the media the
+/// caller declared. [`Broker::prepare_vision`] sniffs, bounds, digests and
+/// freezes it — the one image constructor — so an [`ImageInput`] never
+/// exists without having crossed that gate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingImage {
+    pub declared: ImageMedia,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for PendingImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingImage")
+            .field("declared", &self.declared)
+            .field("byte_len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One typed image frozen on a request manifest (TD-20): media type, the
+/// raw bytes, their length and sha256, and the dimensions the media header
+/// states when this build parses them. `Debug` redacts the bytes — a log or
+/// a status projection may name the digest, never the pixels. Equality is
+/// the digest's: two image inputs are the same input exactly when their
+/// bytes hash equal.
+#[derive(Clone)]
+pub struct ImageInput {
+    media: ImageMedia,
+    bytes: Arc<[u8]>,
+    byte_len: usize,
+    digest: String,
+    dimensions: Option<(u32, u32)>,
+}
+
+impl ImageInput {
+    #[must_use]
+    pub fn media(&self) -> ImageMedia {
+        self.media
+    }
+
+    /// The raw bytes the adapter encodes; never logged.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[must_use]
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        self.dimensions
+    }
+
+    /// The bytes this image occupies on the wire as its `data:` URL.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        self.media.data_url_len(self.byte_len)
+    }
+
+    /// Builds the typed input from one scoped read: the magic is sniffed
+    /// and a declared/detected mismatch denied here, before any manifest
+    /// accounting or admission.
+    fn from_pending(pending: PendingImage) -> Result<Self, ModelError> {
+        let Some(detected) = ImageMedia::sniff(&pending.bytes) else {
+            return Err(ModelError::ImageUnsupportedMedia {
+                detected: "unknown".to_string(),
+            });
+        };
+        if detected != pending.declared {
+            return Err(ModelError::ImageMediaMismatch {
+                declared: pending.declared.label().to_string(),
+                detected: detected.label().to_string(),
+            });
+        }
+        let byte_len = pending.bytes.len();
+        let digest = hex(&Sha256::digest(&pending.bytes));
+        let dimensions = png_dimensions(&pending.bytes);
+        Ok(Self {
+            media: detected,
+            bytes: Arc::from(pending.bytes),
+            byte_len,
+            digest,
+            dimensions,
+        })
+    }
+}
+
+impl std::fmt::Debug for ImageInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImageInput")
+            .field("media", &self.media)
+            .field("byte_len", &self.byte_len)
+            .field("digest", &self.digest)
+            .field("dimensions", &self.dimensions)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ImageInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
+
+impl Eq for ImageInput {}
+
+/// The pixel size a PNG IHDR states; another media or header shape keeps
+/// the optional field `None` rather than guessing.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestManifest {
@@ -37,6 +237,11 @@ pub struct RequestManifest {
     pub output_reserve: usize,
     pub inputs: String,
     pub inputs_digest: String,
+    /// The one typed image this request carries (TD-20), frozen by
+    /// [`Broker::prepare_vision`]. `None` is every text-only request: an
+    /// answer without an image leaves the wire bytes and the journal row
+    /// byte-identical to the pre-image path.
+    pub image: Option<ImageInput>,
     /// The context epoch of the model-visible prefix (AC-061
     /// contribution): an unchanged prefix replays the same epoch
     /// bytewise; a prefix mutation opens a new epoch carrying the
@@ -213,6 +418,32 @@ pub enum ModelError {
         "model request exceeds wire limit: accounted {actual} bytes with mandatory instructions, tools and output reserve exceeds {limit}"
     )]
     RequestTooLarge { limit: usize, actual: usize },
+    /// A payload whose leading bytes declare another media than the
+    /// caller did: the request never reaches an admission.
+    #[error("image media mismatch: declared {declared}, detected {detected}")]
+    ImageMediaMismatch { declared: String, detected: String },
+    /// A payload whose leading bytes name none of the three admitted
+    /// formats.
+    #[error("unsupported image media: detected {detected}; expected png, jpeg or webp")]
+    ImageUnsupportedMedia { detected: String },
+    /// The frozen purpose pinned a connection or model that does not
+    /// answer the image capability: a typed denial before any send.
+    #[error("image input is not supported by connection {connection} model {model}")]
+    ImageUnsupported { connection: String, model: String },
+    /// The image itself, or the request carrying it, exceeds its bound.
+    /// The line names both bounds and the scope root so the caller reads
+    /// exactly how much room remains.
+    #[error(
+        "image bytes={bytes} raw_limit={raw_limit} encoded={encoded} wire_limit={wire_limit} wire_remaining={wire_remaining} scope={scope}"
+    )]
+    ImageTooLarge {
+        bytes: usize,
+        raw_limit: usize,
+        encoded: usize,
+        wire_limit: usize,
+        wire_remaining: usize,
+        scope: String,
+    },
     #[error("dispatch world mismatch: manifest froze {frozen}, dispatch attempted from {current}")]
     WorldMismatch { frozen: String, current: String },
     #[error(
@@ -883,6 +1114,9 @@ struct FreezeRequest<'a> {
     origin: InputOrigin,
     instructions: &'a str,
     tools: &'a [String],
+    /// The one typed image this request carries; `None` keeps the text-only
+    /// path byte-identical.
+    image: Option<&'a PendingImage>,
 }
 
 pub struct Broker {
@@ -1237,6 +1471,57 @@ impl Broker {
                 origin,
                 instructions: &instructions,
                 tools: &tools,
+                image: None,
+            },
+            facts,
+        )
+    }
+
+    /// The one constructor of an image-bearing request (TD-20): the
+    /// pending image is sniffed, bounded and digested on the same freeze
+    /// the text-only entries run, so the accounted bytes include the
+    /// encoded `data:` URL it will occupy and the pinned connection must
+    /// answer both [`Provider::serves`] and
+    /// [`Provider::image_input`] before any admission exists.
+    ///
+    /// # Errors
+    ///
+    /// The [`Broker::prepare`] refusals, plus
+    /// [`ModelError::ImageMediaMismatch`]/[`ModelError::ImageUnsupportedMedia`]
+    /// for a payload outside the declared media,
+    /// [`ModelError::ImageUnsupported`] when the pinned connection or model
+    /// does not answer the image capability, and
+    /// [`ModelError::ImageTooLarge`] when the raw bound or the accounted
+    /// wire limit is exceeded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the same request fields prepare_with_facts takes plus the one typed image; a carrier struct would only rename them"
+    )]
+    pub fn prepare_vision(
+        &mut self,
+        purpose: &str,
+        config: &Config,
+        world: &str,
+        inputs: &str,
+        origin: InputOrigin,
+        facts: &RankingFacts,
+        image: PendingImage,
+    ) -> Result<RequestManifest, ModelError> {
+        let instructions = self.assemble_instructions(purpose, MANDATORY_INSTRUCTIONS)?;
+        let tools: Vec<String> = DECLARED_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect();
+        self.freeze_manifest(
+            config,
+            purpose,
+            &FreezeRequest {
+                world,
+                inputs,
+                origin,
+                instructions: &instructions,
+                tools: &tools,
+                image: Some(&image),
             },
             facts,
         )
@@ -1301,6 +1586,7 @@ impl Broker {
                 origin: InputOrigin::Tool,
                 instructions: &instructions,
                 tools: &tools,
+                image: None,
             },
             facts,
         )
@@ -1354,7 +1640,34 @@ impl Broker {
             }));
         };
         let credential = frozen_credential(&config.connections, &config.profiles, &connection);
-        let accounted = wire_composition(
+        let image = request
+            .image
+            .map(|pending| ImageInput::from_pending(pending.clone()))
+            .transpose()?;
+        if image.is_some() {
+            // The pinned model is whichever assignment the request will send:
+            // a recorded model froze as a fixed pin above; an assignment that
+            // still names no single model cannot answer the per-model
+            // capability, so it fails closed rather than guessing one.
+            let model_id = match &model {
+                ModelAssign::Fixed(fixed) => fixed.model_id.clone(),
+                ModelAssign::Auto { .. } | ModelAssign::Inherit => {
+                    return Err(ModelError::ImageUnsupported {
+                        connection,
+                        model: "unspecified".to_string(),
+                    });
+                }
+            };
+            if !self.provider.serves(&connection, &connection_entry)
+                || !self.provider.image_input(&connection, &model_id)
+            {
+                return Err(ModelError::ImageUnsupported {
+                    connection,
+                    model: model_id,
+                });
+            }
+        }
+        let text_accounted = wire_composition(
             request.instructions,
             &model,
             request.tools,
@@ -1363,6 +1676,24 @@ impl Broker {
         )
         .len()
             + OUTPUT_RESERVE_BYTES;
+        let mut accounted = text_accounted;
+        if let Some(image) = &image {
+            let encoded = image.encoded_len();
+            let total = text_accounted.saturating_add(encoded);
+            if image.byte_len() > crate::contracts::IMAGE_MAX_BYTES
+                || total > crate::contracts::MODEL_WIRE_MAX_BYTES
+            {
+                return Err(ModelError::ImageTooLarge {
+                    bytes: image.byte_len(),
+                    raw_limit: crate::contracts::IMAGE_MAX_BYTES,
+                    encoded,
+                    wire_limit: crate::contracts::MODEL_WIRE_MAX_BYTES,
+                    wire_remaining: crate::contracts::MODEL_WIRE_MAX_BYTES.saturating_sub(total),
+                    scope: request.world.to_string(),
+                });
+            }
+            accounted = total;
+        }
         if accounted > crate::contracts::MODEL_WIRE_MAX_BYTES {
             return Err(ModelError::RequestTooLarge {
                 limit: crate::contracts::MODEL_WIRE_MAX_BYTES,
@@ -1383,6 +1714,7 @@ impl Broker {
             output_reserve: OUTPUT_RESERVE_BYTES,
             inputs: request.inputs.to_string(),
             inputs_digest: hex(&Sha256::digest(request.inputs.as_bytes())),
+            image,
             epoch_id,
             mutation_reason: epoch_cost.map(|cost| cost.reason.to_string()),
             epoch_cost,

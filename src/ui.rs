@@ -114,8 +114,8 @@ use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Stdout, Write};
-use std::path::Path;
+use std::io::{self, Read as _, Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -495,6 +495,17 @@ struct TranscriptCache {
     wrapped: usize,
 }
 
+/// One image the operator attached with `/image <path>` (TD-20): the path
+/// and the media/size a bounded preview read stated. Display state only —
+/// the answer re-reads the bytes through the scoped executor, so this
+/// value neither grants access nor stands in for the request payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerImage {
+    pub path: PathBuf,
+    pub media: crate::model::ImageMedia,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocalView {
     pub status: String,
@@ -509,6 +520,10 @@ pub struct LocalView {
     pub dock_stale: Option<String>,
     pub transcript: Vec<String>,
     pub composer: String,
+    /// The one image `/image <path>` attached to the next answer (TD-20);
+    /// `None` until the operator attaches one, cleared by bare `/image`,
+    /// a new conversation or the answer it rides.
+    pub image: Option<ComposerImage>,
     /// Streaming external (worker) output with its typed settlement
     /// state. Hostile or not, everything shown passed sanitization at
     /// the stream boundary; the step driver produces the chunks.
@@ -1207,6 +1222,7 @@ pub fn initial_view() -> LocalView {
             TRANSCRIPT_NO_PROJECT.to_string(),
         ],
         composer: String::new(),
+        image: None,
         output: OutputStream::new(),
         output_scroll: Cell::new(0),
         transcript_scroll: Cell::new(0),
@@ -3222,7 +3238,8 @@ fn apply_decision_choice(view: &mut LocalView, rt: &mut Runtime, session_id: &Se
     match decision_commit(&card) {
         DecisionCommit::Send(selection) => {
             view.decision = None;
-            let result = commit_answer(rt, session_id, &card, selection);
+            let image = view.image.take();
+            let result = commit_answer(rt, session_id, &card, selection, image);
             paint_answer(view, result);
         }
         DecisionCommit::Refused(line) => view.push_transcript(line),
@@ -3289,8 +3306,19 @@ fn commit_answer(
     session_id: &SessionId,
     card: &DecisionPanel,
     selection: AnswerSelection,
+    image: Option<ComposerImage>,
 ) -> AnswerResult {
     let task = card.question.task_id.clone();
+    // The attachment is read through the scoped executor before the answer
+    // commits: a scope or magic refusal leaves the question pending instead
+    // of applying an answer whose image never crossed the boundary.
+    let pending = match image {
+        Some(image) => match rt.read_answer_image(&task, &image.path, image.media) {
+            Ok(pending) => Some(pending),
+            Err(error) => return AnswerResult::Denied(error.to_string()),
+        },
+        None => None,
+    };
     match rt.owner.store.answer_question(
         session_id,
         &task,
@@ -3299,7 +3327,7 @@ fn commit_answer(
         &selection,
         DECISION_ANSWER_AUTHOR,
     ) {
-        Ok(_) => match rt.resume_answered(session_id, &task, selection) {
+        Ok(_) => match rt.resume_answered_with_image(session_id, &task, selection, pending) {
             Ok(ResumeAdmission::Drained) => AnswerResult::Applied,
             // The committed answer grew nothing runnable — a cancelled or
             // settled subtree never dispatches again, so the note says
@@ -3689,6 +3717,7 @@ impl SendOwner {
         session_id: SessionId,
         card: DecisionPanel,
         selection: AnswerSelection,
+        image: Option<ComposerImage>,
     ) -> io::Result<Self> {
         let (tx, rx) =
             std::sync::mpsc::sync_channel::<(TuiDispatch, AnswerResult)>(SEND_COMPLETION_CAPACITY);
@@ -3703,7 +3732,7 @@ impl SendOwner {
                 if std::env::var_os(SEND_FAILURE_ENV).is_some() {
                     return;
                 }
-                let result = dispatch.commit_answer(&session_id, &card, selection);
+                let result = dispatch.commit_answer(&session_id, &card, selection, image);
                 // A closed receiver is teardown after a cancel: the send
                 // already settled through the ledger, so the failed
                 // hand-back only retires the runtime with this thread.
@@ -3766,8 +3795,9 @@ impl TuiDispatch {
         session_id: &SessionId,
         card: &DecisionPanel,
         selection: AnswerSelection,
+        image: Option<ComposerImage>,
     ) -> AnswerResult {
-        commit_answer(&mut self.runtime, session_id, card, selection)
+        commit_answer(&mut self.runtime, session_id, card, selection, image)
     }
 }
 
@@ -3827,6 +3857,45 @@ const COMPOSER_USAGE: &str = "Unknown command. /help lists the available command
 
 /// Painted for a `/tui` shape the surface command does not serve.
 const TUI_USAGE: &str = "tui: /tui [fullscreen|inline|mouse on|off]";
+
+/// Painted when `/image` carries more than the one path it serves.
+const IMAGE_USAGE: &str =
+    "image: /image <path> attaches one file to the next answer; bare /image clears it";
+
+/// Painted when bare `/image` drops the attachment.
+const IMAGE_DETACHED: &str = "image detached";
+
+/// The bounded preview `/image <path>` paints: the file's stated size and
+/// its leading magic, read with one 12-byte header. The answer re-reads the
+/// bytes through the scoped executor, so this preview neither grants access
+/// nor replaces that admission.
+fn composer_image(path: &Path, scope_root: &Path) -> Result<ComposerImage, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| format!("image denied: {error}"))?;
+    if !metadata.is_file() {
+        return Err("image denied: not a regular file".to_string());
+    }
+    let raw_limit = crate::contracts::IMAGE_MAX_BYTES;
+    if metadata.len() > u64::try_from(raw_limit).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "image denied: image bytes={} raw_limit={raw_limit} scope={}",
+            metadata.len(),
+            scope_root.display()
+        ));
+    }
+    let mut header = [0u8; 12];
+    let mut file = std::fs::File::open(path).map_err(|error| format!("image denied: {error}"))?;
+    let read = file
+        .read(&mut header)
+        .map_err(|error| format!("image denied: {error}"))?;
+    let Some(media) = crate::model::ImageMedia::sniff(&header[..read]) else {
+        return Err("image denied: unsupported media; expected png, jpeg or webp".to_string());
+    };
+    Ok(ComposerImage {
+        path: path.to_path_buf(),
+        media,
+        bytes: metadata.len(),
+    })
+}
 
 /// Serves `/tui`: the surface and mouse capture are process-owned, so this
 /// command needs the guard rather than the dispatcher. The transcript and
@@ -3926,6 +3995,9 @@ fn reset_view_rows(view: &mut LocalView) {
     view.transcript_follow = fresh.transcript_follow;
     view.transcript_follow_bottom = fresh.transcript_follow_bottom;
     view.transcript_page = fresh.transcript_page;
+    // A new conversation's next answer is not the previous one's: the
+    // attachment does not cross into a conversation the operator reset.
+    view.image = None;
 }
 
 /// The runtime's own refusal message, when a dispatch fault is a rejected
@@ -4143,6 +4215,36 @@ fn run_composer_command(
                 // cause is the only detail the transcript may keep.
                 Err(error) => refusal_or_fault(view, "/login", error),
             }
+        }
+        // `/image` is the shipped ordinary vision entry (TD-20): one file
+        // attached to the next answer, never a catalog row.
+        _ if input == "/image" || input.starts_with("/image ") => {
+            let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
+            let argument = input
+                .strip_prefix("/image")
+                .map(str::trim)
+                .unwrap_or_default();
+            if argument.is_empty() {
+                view.image = None;
+                view.push_transcript(IMAGE_DETACHED.to_string());
+                return Ok(());
+            }
+            if argument.split_whitespace().count() != 1 {
+                view.push_transcript(IMAGE_USAGE.to_string());
+                return Ok(());
+            }
+            match composer_image(Path::new(argument), &dispatch.runtime.scope_root) {
+                Ok(image) => {
+                    view.push_transcript(format!(
+                        "image {} {} bytes",
+                        image.media.label(),
+                        image.bytes
+                    ));
+                    view.image = Some(image);
+                }
+                Err(line) => view.push_transcript(line),
+            }
+            Ok(())
         }
         _ if input.starts_with('/') => {
             view.push_transcript(COMPOSER_USAGE.to_string());
@@ -4480,8 +4582,10 @@ where
                                 .take()
                                 .ok_or_else(|| io::Error::other("no open session to send on"))?;
                             let session_id = SessionId(dispatch.session_id.clone());
-                            send_owner =
-                                Some(SendOwner::start(dispatch, session_id, card, selection)?);
+                            let image = view.image.take();
+                            send_owner = Some(SendOwner::start(
+                                dispatch, session_id, card, selection, image,
+                            )?);
                             status_before_send = Some(view.status.clone());
                             view.status = TUI_SEND_PENDING.to_string();
                             continue;

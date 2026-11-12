@@ -1274,6 +1274,7 @@ mod tests {
             output_reserve: 0,
             inputs: "goal".to_string(),
             inputs_digest: "digest".to_string(),
+            image: None,
             epoch_id: "epoch-1".to_string(),
             mutation_reason: None,
             epoch_cost: None,

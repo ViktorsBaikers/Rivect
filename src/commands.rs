@@ -198,6 +198,12 @@ pub struct Runtime {
     /// answer — cancellation tombstones the attempt through this map,
     /// and the answered candidate dispatches from its frozen manifest.
     pub paused_attempts: BTreeMap<String, PausedAttempt>,
+    /// The image one task's next answer carries (TD-20), keyed by task: the
+    /// answer path reads it through the scoped executor and stores the raw
+    /// bytes here; the task's next model-carrying step consumes it through
+    /// [`crate::model::Broker::prepare_vision`]. A new answer, a consumed
+    /// step or a cancelled task clears it, so no image crosses answers.
+    pub(crate) pending_images: BTreeMap<String, crate::model::PendingImage>,
     /// The one single-flight registry the production executor shares
     /// (INV-023, AC-060): identical permitted reads merge here, and a
     /// second registry would charge the same physical read twice.
@@ -1548,6 +1554,7 @@ impl Runtime {
             boot_diagnostics,
             base_recovery,
             paused_attempts: BTreeMap::new(),
+            pending_images: BTreeMap::new(),
             flights: crate::resources::ReadFlights::new(),
             economy: EconomySnapshot::empty(data_root),
             cache_rate: CacheRate::default(),
@@ -1861,6 +1868,91 @@ impl Runtime {
             Err(err) => Err(crate::controller::ControllerError::Scheduler(err)),
         }
     }
+
+    /// One image the public answer path read through the scoped executor
+    /// (TD-20): the bytes and the media the caller declared, ready for the
+    /// task's next model-carrying step to freeze through
+    /// [`crate::model::Broker::prepare_vision`].
+    ///
+    /// # Errors
+    ///
+    /// The executor's typed admission denial (a canonicalized target outside
+    /// the grant, a symlink escape, an unavailable sandbox), or
+    /// [`AnswerImageError::Denied`] for a shell-level refusal.
+    pub(crate) fn read_answer_image(
+        &mut self,
+        task: &TaskId,
+        path: &Path,
+        declared: crate::model::ImageMedia,
+    ) -> Result<crate::model::PendingImage, AnswerImageError> {
+        let grant = self.scoped_grant.clone();
+        // The executor's read leg opens the path it is handed after its
+        // canonicalize-and-scope check; a caller-relative spelling makes
+        // that leg hang in the sandbox probe on this host, so the entry
+        // resolves it against the process cwd first. `absolute` does not
+        // touch the filesystem: the executor still canonicalizes the
+        // absolute path and a symlink escape or out-of-scope target stays
+        // its typed denial.
+        let target = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        match crate::tools::invoke_read(self, task, &grant, target)? {
+            crate::executor::EffectOutcome::Read { bytes, .. } => {
+                Ok(crate::model::PendingImage { declared, bytes })
+            }
+            crate::executor::EffectOutcome::Denied { reason } => {
+                Err(AnswerImageError::Denied(reason))
+            }
+            crate::executor::EffectOutcome::Executed { .. } => Err(AnswerImageError::NotRead),
+        }
+    }
+
+    /// [`Runtime::resume_answered`] carrying one image (TD-20): the image
+    /// belongs to this answer only, so a disarm rides every answer that
+    /// carries none and a resume that could not grow a runnable step drops
+    /// it instead of letting it ride a later one.
+    pub(crate) fn resume_answered_with_image(
+        &mut self,
+        session_id: &SessionId,
+        task: &TaskId,
+        selection: AnswerSelection,
+        image: Option<crate::model::PendingImage>,
+    ) -> Result<ResumeAdmission, crate::controller::ControllerError> {
+        match image {
+            Some(image) => {
+                self.pending_images.insert(task.0.clone(), image);
+            }
+            None => {
+                self.pending_images.remove(&task.0);
+            }
+        }
+        let resumed = self.resume_answered(session_id, task, selection);
+        if resumed.is_err() || matches!(resumed, Ok(ResumeAdmission::Tombstoned)) {
+            self.pending_images.remove(&task.0);
+        }
+        resumed
+    }
+
+    /// Takes the image the task's next model-carrying step freezes: exactly
+    /// one step consumes it, and a step that never prepares leaves it for
+    /// the task's next answer to replace or clear.
+    pub(crate) fn take_pending_image(
+        &mut self,
+        task: &TaskId,
+    ) -> Option<crate::model::PendingImage> {
+        self.pending_images.remove(&task.0)
+    }
+}
+
+/// The typed refusal of an answer image that never reached the request
+/// path: the executor's own admission error, a shell-level denial, or an
+/// effect that was not the read the caller asked for.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AnswerImageError {
+    #[error(transparent)]
+    Read(#[from] crate::executor::ExecutorError),
+    #[error("image read denied: {0}")]
+    Denied(String),
+    #[error("image read returned a non-read outcome")]
+    NotRead,
 }
 
 /// What the post-answer resume did with the answered task — surfaces
@@ -2407,6 +2499,12 @@ enum RequestError {
     )]
     MachineAnswerDenied,
     #[error(
+        "machine vision answer is denied; attach the image with the TUI composer: /image <path>"
+    )]
+    MachineImageAnswerDenied,
+    #[error("image must be an object with a non-empty path and media_type png, jpeg or webp")]
+    InvalidImage,
+    #[error(
         "machine steer without a trusted human ingress is denied; the intent revision is preserved"
     )]
     MachineSteerDenied,
@@ -2448,6 +2546,7 @@ impl RequestError {
             | Self::ArtifactReadUnavailable
             | Self::MethodUnavailable { .. } => ErrorCode::CapabilityUnavailable,
             Self::MachineAnswerDenied
+            | Self::MachineImageAnswerDenied
             | Self::MachineSteerDenied
             | Self::MachineHookDenied { .. }
             | Self::ObserverDenied { .. }
@@ -2477,6 +2576,7 @@ impl RequestError {
             | Self::SessionInFlight { .. }
             | Self::ArtifactReadUnavailable
             | Self::MachineAnswerDenied
+            | Self::MachineImageAnswerDenied
             | Self::MachineSteerDenied
             | Self::MachineHookDenied { .. }
             | Self::ObserverDenied { .. }
@@ -6987,6 +7087,15 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                 // attempt itself is journaled denied. An observer is refused
                 // earlier by the dispatcher's allowlist gate, which is the
                 // boundary and runs before this handler.
+                let machine_image = params.get("image").is_some();
+                let (denial, class) = if machine_image {
+                    (
+                        RequestError::MachineImageAnswerDenied,
+                        "machine_image_ingress",
+                    )
+                } else {
+                    (RequestError::MachineAnswerDenied, "machine_ingress")
+                };
                 if let Err(err) = journal_denied_answer(
                     &mut rt.owner.store,
                     &task,
@@ -6994,15 +7103,11 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     question_revision,
                     selection_value,
                     principal,
-                    "machine_ingress",
+                    class,
                 ) {
-                    return request_denial_journal_error(
-                        id,
-                        &RequestError::MachineAnswerDenied,
-                        &err,
-                    );
+                    return request_denial_journal_error(id, &denial, &err);
                 }
-                return request_error(id, RequestError::MachineAnswerDenied);
+                return request_error(id, denial);
             }
             let (Some(expected_intent), Some(question_revision)) =
                 (expected_intent, question_revision)
@@ -7059,6 +7164,63 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                         return request_denial_journal_error(id, &denial, &journal);
                     }
                     return request_error(id, denial);
+                }
+            };
+            // The image belongs to this answer (TD-20): it is read through
+            // the scoped executor before the answer commits, so a scope,
+            // symlink or read refusal journals a denied attempt with zero
+            // model calls, and the bytes then wait on the runtime for this
+            // task's next model-carrying step.
+            let pending_image = match params.get("image") {
+                None => None,
+                Some(value) => {
+                    let (path, declared) = match parse_answer_image(value) {
+                        Ok(parsed) => parsed,
+                        Err(denial) => {
+                            if let Err(journal) = journal_denied_answer(
+                                &mut rt.owner.store,
+                                &task,
+                                &question_id,
+                                Some(question_revision),
+                                Some(selection_value),
+                                "human",
+                                "invalid_image",
+                            ) {
+                                return request_denial_journal_error(id, &denial, &journal);
+                            }
+                            return request_error(id, denial);
+                        }
+                    };
+                    match rt.read_answer_image(&task, &path, declared) {
+                        Ok(pending) => Some(pending),
+                        Err(error) => {
+                            let code = match &error {
+                                AnswerImageError::Read(source) => source.error_code(),
+                                AnswerImageError::Denied(_) => ErrorCode::Denied,
+                                AnswerImageError::NotRead => ErrorCode::InternalError,
+                            };
+                            let message = error.to_string();
+                            if let Err(journal) = journal_denied_answer(
+                                &mut rt.owner.store,
+                                &task,
+                                &question_id,
+                                Some(question_revision),
+                                Some(selection_value),
+                                "human",
+                                "image_read_denied",
+                            ) {
+                                return envelope_error(
+                                    id,
+                                    ErrorCode::StorageUnavailable,
+                                    -32000,
+                                    &format!(
+                                        "image answer denied: {message}; the denial journal write failed: {journal}"
+                                    ),
+                                );
+                            }
+                            return envelope_error(id, code, -32000, &message);
+                        }
+                    }
                 }
             };
             let snapshot = match rt.owner.store.snapshot(&task) {
@@ -7124,7 +7286,12 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     // scheduler node through the production path; a
                     // settled tree grows nothing runnable — the answer
                     // itself stays durable (INV-021).
-                    match rt.resume_answered(&session, &task, selection.clone()) {
+                    match rt.resume_answered_with_image(
+                        &session,
+                        &task,
+                        selection.clone(),
+                        pending_image,
+                    ) {
                         // `result` is the answer-commit snapshot — read
                         // before the resume ran, and either arm can move
                         // the task past it inside this same request: a
@@ -7242,6 +7409,7 @@ fn submit_task(rt: &mut Runtime, ingress: Ingress, params: Value, id: Value) -> 
                     // waiting surface.
                     match rt.scheduler.cancel_task_tree(&task) {
                         Ok(_) => {
+                            rt.pending_images.remove(&task.0);
                             rt.tombstone_paused(&task);
                             RpcResponse::ok(
                                 id,
@@ -8209,6 +8377,36 @@ enum SelectionError {
     MissingText,
     #[error("selection.kind must be option or custom")]
     UnsupportedKind,
+}
+
+/// Parses `params.image` on a task answer (TD-20): exactly the two fields
+/// the contract names, a non-empty path and one admitted media spelling.
+/// The path is kept as typed — canonicalization and the scope check belong
+/// to the executor admission, never to this parser.
+fn parse_answer_image(value: &Value) -> Result<(PathBuf, crate::model::ImageMedia), RequestError> {
+    let Some(object) = value.as_object() else {
+        return Err(RequestError::InvalidImage);
+    };
+    let mut path = None;
+    let mut media = None;
+    for (name, member) in object {
+        match name.as_str() {
+            "path" => {
+                path = member
+                    .as_str()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from);
+            }
+            "media_type" => {
+                media = member.as_str().and_then(crate::model::ImageMedia::parse);
+            }
+            _ => return Err(RequestError::InvalidImage),
+        }
+    }
+    match (path, media) {
+        (Some(path), Some(media)) => Ok((path, media)),
+        _ => Err(RequestError::InvalidImage),
+    }
 }
 
 fn parse_selection(value: &Value) -> Result<AnswerSelection, SelectionError> {

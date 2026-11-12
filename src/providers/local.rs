@@ -5785,6 +5785,28 @@ impl Provider for ChatCompletionsProvider {
         connection == self.connection
     }
 
+    /// The recorded image mark for one pinned model (TD-20): a class with a
+    /// recorded catalogue answers from it without a wire leg; an
+    /// open-proxy class states its capability only in the served catalogue,
+    /// so the same bounded discovery the catalogue leg reads answers here.
+    /// A failed or unreadable discovery is no capability — the request then
+    /// denies typed instead of sending an image the peer never admitted.
+    fn image_input(&self, connection: &str, model: &str) -> bool {
+        if connection != self.connection {
+            return false;
+        }
+        if let Some(row) = recorded_catalog(&self.connection)
+            .into_iter()
+            .find(|row| row.id == model)
+        {
+            return row.vision;
+        }
+        self.contract.binds_optional_credential()
+            && self
+                .catalog()
+                .is_ok_and(|rows| rows.iter().any(|row| row.id == model && row.vision))
+    }
+
     /// Sends the frozen manifest as one physical Chat Completions
     /// request.
     ///

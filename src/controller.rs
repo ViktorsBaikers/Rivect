@@ -227,6 +227,19 @@ impl ControllerError {
             Self::EnvironmentRetention { .. } => ErrorCode::StorageUnavailable,
             Self::Policy(_) => ErrorCode::Denied,
             Self::Model(ModelError::RequestTooLarge { .. }) => ErrorCode::ContextOverflow,
+            // The accounted image (raw plus its encoded data URL) crossing
+            // either bound is the same request-size class; the wire line
+            // names both numbers.
+            Self::Model(ModelError::ImageTooLarge { .. }) => ErrorCode::ContextOverflow,
+            // A declared/detected media disagreement is the caller's own
+            // input, never a denial of the connection.
+            Self::Model(
+                ModelError::ImageMediaMismatch { .. } | ModelError::ImageUnsupportedMedia { .. },
+            ) => ErrorCode::InvalidInput,
+            // A pinned connection or model that does not answer the image
+            // capability is unavailable for this request, not a policy
+            // denial of the operator's grant.
+            Self::Model(ModelError::ImageUnsupported { .. }) => ErrorCode::CapabilityUnavailable,
             Self::Model(
                 ModelError::Config(_)
                 | ModelError::NoEligibleCandidate { .. }
@@ -908,14 +921,18 @@ impl Runtime {
         // turn that could move consent.
         let origin = self.owner.store.answer_input_origin(task_id)?;
         let facts = self.ranking_facts(task_id, &inputs)?;
-        let manifest = match self.broker.prepare_with_facts(
-            &purpose,
-            &self.config_for_broker(),
-            &world,
-            &inputs,
-            origin,
-            &facts,
-        ) {
+        let config = self.config_for_broker();
+        let prepared = match self.take_pending_image(task_id) {
+            // The answer carried a typed image: the one image constructor
+            // sniffs, bounds, digests and admit it on this same request.
+            Some(image) => self
+                .broker
+                .prepare_vision(&purpose, &config, &world, &inputs, origin, &facts, image),
+            None => self
+                .broker
+                .prepare_with_facts(&purpose, &config, &world, &inputs, origin, &facts),
+        };
+        let manifest = match prepared {
             Ok(manifest) => manifest,
             // The scope chain cannot fund one more bound: the ranking refuses
             // before any attempt exists, and the task waits on the named

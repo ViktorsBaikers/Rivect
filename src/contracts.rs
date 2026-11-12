@@ -17,6 +17,10 @@ pub const REQUEST_MAX_BYTES: usize = 1 << 20;
 /// transmitted bytes plus the mandatory output reserve. Overflow is a
 /// typed rejection, never a silent drop of mandatory parts.
 pub const MODEL_WIRE_MAX_BYTES: usize = 1 << 20;
+/// Raw bytes one typed image may carry (TD-20): base64 grows them to
+/// roughly 683 KiB, leaving the rest of [`MODEL_WIRE_MAX_BYTES`] for the
+/// text, instructions and output reserve of the same request.
+pub const IMAGE_MAX_BYTES: usize = 512 * 1024;
 pub const PAGE_DEFAULT: u32 = 20;
 pub const PAGE_MAX: u32 = 200;
 pub const KNOWN_READY_OPTION: &str = "brief";

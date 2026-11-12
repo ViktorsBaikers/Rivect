@@ -2063,6 +2063,16 @@ pub trait Provider: Send {
     /// doubles included — declares the rule; a scripted double that
     /// answers anything returns `true`.
     fn serves(&self, connection: &str, entry: &Connection) -> bool;
+    /// Whether this adapter's recorded model surface answers image input
+    /// (TD-20): the typed vision path admits a request only when the pinned
+    /// connection serves it and this capability holds, so an adapter that
+    /// cannot honour an image denies it typed instead of dropping it. The
+    /// default is `false`; an adapter whose recorded catalogue states the
+    /// mark overrides it.
+    fn image_input(&self, connection: &str, model: &str) -> bool {
+        let _ = (connection, model);
+        false
+    }
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError>;
 }
 
@@ -2366,6 +2376,14 @@ impl Provider for ConfiguredProvider {
         self.adapters
             .get(connection)
             .is_some_and(|(built, _)| built == entry)
+    }
+
+    /// The installed adapter's own recorded capability — a connection the
+    /// set did not build answers `false` rather than borrowing a sibling's.
+    fn image_input(&self, connection: &str, model: &str) -> bool {
+        self.adapters
+            .get(connection)
+            .is_some_and(|(_, adapter)| adapter.image_input(connection, model))
     }
 
     fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {

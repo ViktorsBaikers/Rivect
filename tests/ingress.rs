@@ -952,13 +952,20 @@ fn vision_purpose_is_refused_before_any_send() {
         Box::new(PlatformWorker),
     );
     let config = world.runtime.config_for_broker();
-    // A vision request is a model-class effect: a purpose the document does
-    // not declare is refused by the broker before any wire attempt.
-    let prepared = world.runtime.broker.prepare(
+    // The offline positive lives in tests/vision; this is its unsupported
+    // control: an undeclared vision purpose is refused by the broker before
+    // any wire attempt even when the payload is a valid PNG.
+    let prepared = world.runtime.broker.prepare_vision(
         "vision",
         &config,
         "/world/ingress-vision",
         "describe the image",
+        rivect::model::InputOrigin::Human,
+        &rivect::model::RankingFacts::unknown(),
+        rivect::model::PendingImage {
+            declared: rivect::model::ImageMedia::Png,
+            bytes: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+        },
     );
     match prepared {
         Err(rivect::model::ModelError::NoEligibleCandidate { purpose, rejected }) => {
@@ -974,14 +981,8 @@ fn vision_purpose_is_refused_before_any_send() {
         !config.models.purposes.contains_key("vision"),
         "the shipped purpose set declares no vision entry"
     );
-    // No production entry carries an image/vision input today: the manifest
-    // carries text inputs only, and no shipped purpose names `vision`. The
-    // refusal above is therefore the only vision proof this build can run;
-    // the gap is retained instead of being reported as a native positive.
-    support::not_run::record(
-        "ingress.vision",
-        "no production vision entry: Broker::prepare/RequestManifest carry text inputs only and no shipped purpose declares `vision`",
-    );
+    // No live vision endpoint is claimed: the offline typed path is proved
+    // by tests/vision, and the external leg stays the deferred owner row.
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
 }
 

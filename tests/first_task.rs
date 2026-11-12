@@ -6803,3 +6803,46 @@ fn tui_composer_start_question_completes_with_one_settlement() {
     pty.finish().expect("pty teardown");
     println!("task-start: tui card opened; begin_sends=1 begin_settlements=1");
 }
+
+#[test]
+fn answer_without_image_keeps_manifest_and_journal_byte_identical() {
+    let (mut world, _scope, _file, _grant) =
+        scoped_world("vision-absent", Some(&support::config_distinct_pools()));
+    let session = world.open_session("vision-absent-session");
+    let created = world.dispatch(&corpus_create(&session, "vision-absent-create"));
+    let task = rivect::contracts::TaskId(
+        created["result"]["task_id"]
+            .as_str()
+            .expect("task id")
+            .to_string(),
+    );
+    let question = world.publish(&session, &task);
+    let answer = world.dispatch(&corpus_answer_custom(
+        &session,
+        "vision-absent-answer",
+        &task,
+        &question,
+        "steps",
+        json!(9),
+    ));
+    assert!(answer["error"].is_null(), "{answer}");
+    let manifest = world.last_manifest().expect("the answer dispatched");
+    assert!(
+        manifest.image.is_none(),
+        "an answer without the field carries no typed image"
+    );
+    assert!(
+        !manifest.wire_bytes().contains("data:image/"),
+        "the wire bytes stay the pre-image composition"
+    );
+    let attempts = world
+        .runtime
+        .store()
+        .answer_attempts(&task)
+        .expect("answer attempts");
+    let journal = serde_json::to_string(&attempts[0].selection).expect("journal selection");
+    assert_eq!(
+        journal, r#"{"kind":"custom","text":"steps"}"#,
+        "the journal row carries exactly the pre-image selection bytes"
+    );
+}
