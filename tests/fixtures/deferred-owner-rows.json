@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "carrier": {
+    "path": ".devrites/archive/rivect-native-cli-05-actions-workflow-sources/history/gates-dec058-macos-carried.md",
+    "sha256": "c3cfc6fc7dd11e0622787340fb0bd02c4ab8ce9694228970c2ab0161864fd234",
+    "rows": 40
+  },
+  "carrier_rows": [
+    "AC-023a.macos.custom-check-claim",
+    "AC-018.macos.provider-issuer",
+    "AC-018.macos.provider-claim",
+    "AC-018.macos.issuer-sites",
+    "AC-018.macos.issuer-owner-policy",
+    "AC-018.macos.issuer-owner-store",
+    "AC-018.macos.consumer-issuer",
+    "AC-018.macos.consumer-issuer-faults",
+    "AC-018.macos.consumer-store-routes",
+    "AC-018.macos.consumer-wire-mapping",
+    "AC-018.macos.provider-handoff",
+    "AC-018.macos.recovery",
+    "AC-018.macos.real-cargo-red-green",
+    "AC-018.macos.offline-dependency-project",
+    "AC-018.macos.wrong-or-revoked-grants",
+    "AC-018.macos.snapshot-aba",
+    "AC-018.macos.linker-vs-system-exec",
+    "AC-018.macos.deny-project-write",
+    "AC-018.macos.deny-network",
+    "AC-018.macos.deny-outside-read",
+    "AC-018.macos.unsafe-workspace",
+    "AC-018.macos.env-allowlist",
+    "AC-018.macos.capture-bounded",
+    "AC-018.macos.non-enforcing-mechanism",
+    "AC-018.macos.toolchain-layout",
+    "AC-018.macos.dependency-ancestor-swap",
+    "AC-018.macos.dependency-fd-anchor",
+    "AC-018.macos.dependency-pair-consumed",
+    "AC-018.macos.dependency-pair-first-byte",
+    "AC-018.macos.registry-invisible",
+    "AC-018.macos.dependency-escape",
+    "AC-018.macos.dependency-revocation",
+    "AC-018.macos.cleanup-seam",
+    "AC-018.macos.private-library-unit",
+    "AC-018.macos.stateful-comparator",
+    "AC-018.macos.concurrent-library-harness",
+    "AC-018.macos.should-panic-termination",
+    "AC-018.macos.setsid-survivor",
+    "AC-018.macos.vendor-phase-a-failure",
+    "AC-036b"
+  ],
+  "legs": [
+    {
+      "case_id": "live.provider_entitlement",
+      "owner": "operator + SLICE-005/006",
+      "prerequisite": "exact DEC-003 grant: class, case, candidate, account, data, destination, cost, attempt, scope, expiry"
+    },
+    {
+      "case_id": "live.search_endpoints",
+      "owner": "operator + SLICE-017",
+      "prerequisite": "real search endpoint and key grants plus a live network path"
+    },
+    {
+      "case_id": "live.vision_external",
+      "owner": "operator + SLICE-018/019",
+      "prerequisite": "external vision endpoint grant and an approved payload destination"
+    },
+    {
+      "case_id": "auth.keychain",
+      "owner": "platform host (SLICE-005)",
+      "prerequisite": "macOS keychain store available with an approved access grant"
+    },
+    {
+      "case_id": "auth.secret_service",
+      "owner": "platform host (SLICE-005)",
+      "prerequisite": "Linux Secret Service store available with an approved access grant"
+    },
+    {
+      "case_id": "platform.terminal_matrix",
+      "owner": "platform host (SLICE-012)",
+      "prerequisite": "real terminal platforms for every geometry and theme cell"
+    }
+  ]
+}

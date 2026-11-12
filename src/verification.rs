@@ -1714,7 +1714,27 @@ pub struct FinalAcceptance {
     pub installed_rows: usize,
     pub ui_cells: usize,
     pub blockers: FinalBlockers,
+    /// The offline 1764-row conjunction is a full pass. The release verdict
+    /// additionally requires an empty deferred owner ledger.
     pub full_pass: bool,
+    /// The offline pass, named separately from the release answer so a
+    /// reader cannot round the deferred owner rows into it.
+    pub offline_full_pass: bool,
+    /// True only when the offline set passed and no deferred owner row is
+    /// still open. [`evaluate_final`] cannot see that ledger, so it starts
+    /// false and [`FinalAcceptance::with_deferred_rows`] applies it.
+    pub release_ready: bool,
+}
+
+impl FinalAcceptance {
+    /// Apply the deferred owner ledger. A non-empty ledger keeps the release
+    /// not ready even when the offline conjunction is a full pass.
+    #[must_use]
+    pub fn with_deferred_rows(mut self, deferred_rows: usize) -> Self {
+        self.offline_full_pass = self.full_pass;
+        self.release_ready = self.full_pass && deferred_rows == 0;
+        self
+    }
 }
 
 /// The denominator the acceptance manifest declares. A declaration that
@@ -1898,5 +1918,7 @@ pub fn evaluate_final(
         ui_cells,
         blockers,
         full_pass,
+        offline_full_pass: full_pass,
+        release_ready: false,
     })
 }

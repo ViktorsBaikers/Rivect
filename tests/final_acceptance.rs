@@ -11,9 +11,11 @@
 //! packaged `--ui-review` entry: its report carries 285 state×theme
 //! observations with per-state status/dock/composer/modal SGR fingerprints,
 //! so the row is PASS evidence when the candidate, every cell and every
-//! renderer-only claim match. The run prints the stable verdict line; the
-//! full-pass claim stays SLICE-010/Seal, while real provider, publication
-//! and platform legs stay NOT_RUN.
+//! renderer-only claim match. The default run asserts the fail-closed pending
+//! path; `RIVECT_OFFLINE_EVIDENCE=release` asserts the offline full pass and
+//! the separate release answer, whose deferred owner ledger keeps
+//! `release_ready` false while real provider, publication and platform legs
+//! stay NOT_RUN.
 
 #![allow(
     clippy::expect_used,
@@ -60,6 +62,211 @@ const MONO_PROBES: usize = THEME_OBSERVATIONS;
 const DUMB_PROBES: usize = UI_STATES.len();
 /// The recorded matrix gate.
 const MATRIX_BUDGET_SECONDS: f64 = 900.0;
+
+/// The explicit release-mode selector `scripts/release-gate.sh` sets; the
+/// default `cargo test` run only asserts the fail-closed path.
+const OFFLINE_EVIDENCE_ENV: &str = "RIVECT_OFFLINE_EVIDENCE";
+/// The checked-in deferred owner ledger.
+const DEFERRED_OWNER_LEDGER: &str = "tests/fixtures/deferred-owner-rows.json";
+/// The six live/platform owner legs the ledger surfaces.
+const DEFERRED_LEGS: [&str; 6] = [
+    "live.provider_entitlement",
+    "live.search_endpoints",
+    "live.vision_external",
+    "auth.keychain",
+    "auth.secret_service",
+    "platform.terminal_matrix",
+];
+/// The two host-store legs that block the release, not the offline
+/// conjunction; they are counted in the deferred ledger instead.
+const DEFERRED_RETAINED_LEGS: [&str; 2] = ["auth.keychain", "auth.secret_service"];
+/// The position-20 macOS carrier's recorded row count.
+const DEFERRED_CARRIER_ROWS: usize = 40;
+
+fn release_mode() -> bool {
+    std::env::var(OFFLINE_EVIDENCE_ENV).as_deref() == Ok("release")
+}
+
+fn pending_family(family: &str, producer: &str, cause: &str) {
+    println!(
+        "OFFLINE_ACCEPTANCE pending family={family} producer=\"{producer}\" cause=\"{cause}\""
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredOwnerRow {
+    case_id: String,
+    kind: &'static str,
+    owner: String,
+    prerequisite: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredLedger {
+    rows: Vec<DeferredOwnerRow>,
+    carrier_verified: bool,
+}
+
+fn deferred_ledger_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFERRED_OWNER_LEDGER)
+}
+
+fn carrier_ids(bytes: &[u8]) -> BTreeSet<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.strip_prefix("- [ ] "))
+        .filter_map(|row| row.split_once(':'))
+        .map(|(case_id, _)| case_id.trim().to_string())
+        .filter(|case_id| !case_id.is_empty())
+        .collect()
+}
+
+/// Read the deferred owner ledger and verify its pinned carrier origin. The
+/// carrier file lives under the host-local `.devrites/archive`, so a clone
+/// without it keeps the pinned fixture rows and reports pending; release mode
+/// requires the exact digest and 40-row set.
+fn deferred_owner_rows_from(
+    ledger_path: &Path,
+    strict_carrier: bool,
+) -> Result<DeferredLedger, String> {
+    let bytes =
+        std::fs::read(ledger_path).map_err(|error| format!("missing deferred ledger: {error}"))?;
+    let ledger: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("malformed deferred ledger: {error}"))?;
+    if ledger["schema_version"] != json!(1) {
+        return Err("deferred ledger schema_version is not 1".to_string());
+    }
+    let carrier_path = ledger["carrier"]["path"]
+        .as_str()
+        .ok_or_else(|| "deferred ledger names no carrier path".to_string())?;
+    let carrier_sha256 = ledger["carrier"]["sha256"]
+        .as_str()
+        .ok_or_else(|| "deferred ledger names no carrier digest".to_string())?;
+    if carrier_sha256.len() != 64 || !carrier_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("deferred carrier digest is not 64 hex characters".to_string());
+    }
+    if ledger["carrier"]["rows"].as_u64() != Some(DEFERRED_CARRIER_ROWS as u64) {
+        return Err(format!(
+            "deferred carrier is not {DEFERRED_CARRIER_ROWS} rows"
+        ));
+    }
+    let carrier_rows = ledger["carrier_rows"]
+        .as_array()
+        .ok_or_else(|| "deferred ledger carries no carrier rows".to_string())?;
+    if carrier_rows.len() != DEFERRED_CARRIER_ROWS {
+        return Err(format!(
+            "deferred ledger carries {} carrier rows, not {DEFERRED_CARRIER_ROWS}",
+            carrier_rows.len()
+        ));
+    }
+    let legs = ledger["legs"]
+        .as_array()
+        .ok_or_else(|| "deferred ledger carries no owner legs".to_string())?;
+    if legs.len() != DEFERRED_LEGS.len() {
+        return Err(format!(
+            "deferred ledger carries {} owner legs, not {}",
+            legs.len(),
+            DEFERRED_LEGS.len()
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let required: BTreeSet<String> = final_required_cases().into_iter().collect();
+    let mut rows = Vec::with_capacity(DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len());
+    for row in carrier_rows {
+        let case_id = row
+            .as_str()
+            .ok_or_else(|| "deferred carrier row is not a case id".to_string())?;
+        if case_id.trim().is_empty() || !seen.insert(case_id.to_string()) {
+            return Err(format!(
+                "deferred carrier row {case_id} is empty or duplicated"
+            ));
+        }
+        if required.contains(case_id) {
+            return Err(format!("deferred row {case_id} is a required offline case"));
+        }
+        rows.push(DeferredOwnerRow {
+            case_id: case_id.to_string(),
+            kind: "macos_carrier",
+            owner: "macOS release milestone (position 20)".to_string(),
+            prerequisite: "macOS host; the recorded CHECK/EXPECT runs from the carrier origin"
+                .to_string(),
+        });
+    }
+    for leg in legs {
+        let case_id = leg["case_id"]
+            .as_str()
+            .ok_or_else(|| "deferred owner leg names no id".to_string())?;
+        let owner = leg["owner"].as_str().unwrap_or_default();
+        let prerequisite = leg["prerequisite"].as_str().unwrap_or_default();
+        if !DEFERRED_LEGS.contains(&case_id) {
+            return Err(format!("deferred owner leg {case_id} is not recorded"));
+        }
+        if owner.trim().is_empty() || prerequisite.trim().is_empty() {
+            return Err(format!(
+                "deferred owner leg {case_id} misses owner or prerequisite"
+            ));
+        }
+        if !seen.insert(case_id.to_string()) {
+            return Err(format!("deferred owner leg {case_id} is duplicated"));
+        }
+        if required.contains(case_id) {
+            return Err(format!("deferred row {case_id} is a required offline case"));
+        }
+        rows.push(DeferredOwnerRow {
+            case_id: case_id.to_string(),
+            kind: "owner_leg",
+            owner: owner.to_string(),
+            prerequisite: prerequisite.to_string(),
+        });
+    }
+    if seen.len() != DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len() {
+        return Err("deferred ledger does not cover its recorded set".to_string());
+    }
+
+    let carrier_file = Path::new(env!("CARGO_MANIFEST_DIR")).join(carrier_path);
+    let carrier_verified = match std::fs::read(&carrier_file) {
+        Ok(carrier_bytes) => {
+            let digest = rivect::config::hex(&Sha256::digest(&carrier_bytes));
+            if digest != carrier_sha256 {
+                return Err(format!(
+                    "deferred carrier digest {digest} is not {carrier_sha256}"
+                ));
+            }
+            let ids = carrier_ids(&carrier_bytes);
+            let pinned: BTreeSet<String> = rows
+                .iter()
+                .filter(|row| row.kind == "macos_carrier")
+                .map(|row| row.case_id.clone())
+                .collect();
+            if ids != pinned {
+                return Err("deferred carrier rows do not match the pinned ids".to_string());
+            }
+            true
+        }
+        Err(error) if strict_carrier => {
+            return Err(format!(
+                "deferred carrier {} is unreadable: {error}",
+                carrier_file.display()
+            ));
+        }
+        Err(error) => {
+            println!(
+                "DEFERRED_CARRIER pending path=\"{}\" sha256={carrier_sha256} rows={DEFERRED_CARRIER_ROWS} cause=\"{error}\"",
+                carrier_file.display()
+            );
+            false
+        }
+    };
+    Ok(DeferredLedger {
+        rows,
+        carrier_verified,
+    })
+}
+
+fn deferred_owner_rows() -> Result<DeferredLedger, String> {
+    deferred_owner_rows_from(&deferred_ledger_path(), release_mode())
+}
 
 /// The renderer-only claim each of these states' passing cells must carry,
 /// character for character. A missing or altered claim is a malformed report:
@@ -462,9 +669,7 @@ fn provider_trial_rows_from(
     let manifest_bytes = match std::fs::read(manifest_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            println!(
-                "OFFLINE_ACCEPTANCE pending family=provider producer=\"{PROVIDER_PRODUCER}\" cause=\"{error}\""
-            );
+            pending_family("provider", PROVIDER_PRODUCER, &error.to_string());
             return censored_provider_rows(
                 candidate,
                 format!("missing receipt: run {PROVIDER_PRODUCER}"),
@@ -480,9 +685,7 @@ fn provider_trial_rows_from(
     let receipt_bytes = match std::fs::read(receipt_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            println!(
-                "OFFLINE_ACCEPTANCE pending family=provider producer=\"{PROVIDER_PRODUCER}\" cause=\"{error}\""
-            );
+            pending_family("provider", PROVIDER_PRODUCER, &error.to_string());
             return censored_provider_rows(
                 candidate,
                 format!("missing receipt: run {PROVIDER_PRODUCER}"),
@@ -941,9 +1144,7 @@ fn search_rows_from(manifest_path: &Path, receipt_path: &Path, candidate: &str) 
     let manifest_bytes = match std::fs::read(manifest_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            println!(
-                "OFFLINE_ACCEPTANCE pending family=search producer=\"{SEARCH_PRODUCER}\" cause=\"{error}\""
-            );
+            pending_family("search", SEARCH_PRODUCER, &error.to_string());
             return censored_search_rows(
                 candidate,
                 format!("missing manifest: run {SEARCH_PRODUCER}"),
@@ -959,9 +1160,7 @@ fn search_rows_from(manifest_path: &Path, receipt_path: &Path, candidate: &str) 
     let receipt_bytes = match std::fs::read(receipt_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            println!(
-                "OFFLINE_ACCEPTANCE pending family=search producer=\"{SEARCH_PRODUCER}\" cause=\"{error}\""
-            );
+            pending_family("search", SEARCH_PRODUCER, &error.to_string());
             return censored_search_rows(
                 candidate,
                 format!("missing receipt: run {SEARCH_PRODUCER}"),
@@ -1123,6 +1322,9 @@ fn search_receipt_missing_stale_or_unmarked_is_never_pass() {
     );
 }
 
+const INSTALLED_ORDINARY_PRODUCER: &str = "cargo test --locked --test installed installed_ordinary_request_completes_with_one_settlement --exact --nocapture";
+const INSTALLED_UI_PRODUCER: &str = "cargo test --locked --test installed_tui installed_19_state_matrix_runs_on_the_packaged_artifact --exact --nocapture";
+
 fn installed_receipt_path() -> PathBuf {
     std::env::var_os("RIVECT_INSTALLED_ORDINARY_RECEIPT")
         .map(PathBuf::from)
@@ -1138,6 +1340,18 @@ fn read_receipt(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("malformed receipt: {error}"))
 }
 
+fn installed_receipt(path: &Path, family: &str, producer: &str) -> Result<Value, String> {
+    match read_receipt(path) {
+        Ok(receipt) => Ok(receipt),
+        Err(cause) => {
+            if cause.starts_with("missing") {
+                pending_family(family, producer, &cause);
+            }
+            Err(cause)
+        }
+    }
+}
+
 fn check_candidate(receipt: &Value, candidate: &str) -> Result<(), String> {
     let recorded = receipt["candidate_manifest_sha256"]
         .as_str()
@@ -1149,7 +1363,7 @@ fn check_candidate(receipt: &Value, candidate: &str) -> Result<(), String> {
 }
 
 fn installed_ordinary_evidence(path: &Path, candidate: &str) -> Result<String, String> {
-    let receipt = read_receipt(path)?;
+    let receipt = installed_receipt(path, "installed-ordinary", INSTALLED_ORDINARY_PRODUCER)?;
     check_candidate(&receipt, candidate)?;
     if receipt["schema_version"] != json!(1) {
         return Err("receipt schema_version is not 1".to_string());
@@ -1440,7 +1654,7 @@ fn theme_observations(report: &Value) -> Result<(), String> {
 }
 
 fn installed_ui_evidence(path: &Path, candidate: &str) -> Result<String, String> {
-    let report = read_receipt(path)?;
+    let report = installed_receipt(path, "installed-ui", INSTALLED_UI_PRODUCER)?;
     check_candidate(&report, candidate)?;
     if report["schema_version"] != json!(1) {
         return Err("matrix schema_version is not 1".to_string());
@@ -1582,6 +1796,7 @@ fn acceptance_group_rows(
     let receipt_bytes = match std::fs::read(receipt_path) {
         Ok(bytes) => bytes,
         Err(error) => {
+            pending_family("acceptance", &producer, &error.to_string());
             return censored_acceptance_group(
                 candidate,
                 group,
@@ -2066,12 +2281,15 @@ fn full_pass_with_retained(
     report.full_pass && retained == 0
 }
 
-/// Surfaces each retained leg row as a NOT_RUN line and returns the number
-/// of unique legs. Retained legs are their own blocker family: they never
-/// enter `blockers.not_run`, whose membership is the declared-vs-observed
-/// comparison, but a real retained row still forbids a full pass.
-fn surface_retained_not_run(retained_not_run: &[Value]) -> usize {
-    let mut retained_legs: BTreeSet<&str> = BTreeSet::new();
+/// Surfaces each retained leg row as a NOT_RUN line and splits the unique
+/// legs into offline blockers and deferred owner legs. The two host-store
+/// legs block the release, not the offline conjunction, so they are counted
+/// in the deferred ledger instead. Retained legs never enter
+/// `blockers.not_run`, whose membership is the declared-vs-observed
+/// comparison, but an offline retained row still forbids a full pass.
+fn surface_retained_not_run(retained_not_run: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut offline_legs: BTreeSet<String> = BTreeSet::new();
+    let mut deferred_legs: BTreeSet<String> = BTreeSet::new();
     for row in retained_not_run {
         assert_eq!(
             row["status"], "not_run",
@@ -2086,12 +2304,17 @@ fn surface_retained_not_run(retained_not_run: &[Value]) -> usize {
             !leg.chars().any(char::is_control) && !prerequisite.chars().any(char::is_control),
             "a retained row carries no control character: {row}"
         );
-        if retained_legs.insert(leg) {
+        if DEFERRED_RETAINED_LEGS.contains(&leg) {
+            if deferred_legs.insert(leg.to_string()) {
+                println!("DEFERRED_NOT_RUN {leg}: {prerequisite}");
+            }
+        } else if offline_legs.insert(leg.to_string()) {
             println!("LEG_NOT_RUN {leg}: {prerequisite}");
         }
     }
-    println!("LEGS_NOT_RUN retained={}", retained_legs.len());
-    retained_legs.len()
+    println!("LEGS_NOT_RUN retained={}", offline_legs.len());
+    println!("DEFERRED_RETAINED legs={}", deferred_legs.len());
+    (offline_legs, deferred_legs)
 }
 
 /// The retained leg files this run can read, walked independently of
@@ -2129,16 +2352,34 @@ fn a_retained_leg_not_run_is_surfaced_and_forbids_a_full_pass() {
     );
     let retained = vec![json!({
         "schema_version": 1,
-        "leg": "auth.keychain",
+        "leg": "ingress.exec",
         "status": "not_run",
         "prerequisite": "fixture prerequisite",
     })];
-    let retained_legs = surface_retained_not_run(&retained);
-    assert_eq!(retained_legs, 1, "the retained NOT_RUN leg is surfaced");
+    let (offline_legs, deferred_legs) = surface_retained_not_run(&retained);
+    assert_eq!(
+        offline_legs.len(),
+        1,
+        "the retained NOT_RUN leg is surfaced"
+    );
+    assert!(deferred_legs.is_empty());
     assert!(
-        !full_pass_with_retained(&report, retained_legs),
+        !full_pass_with_retained(&report, offline_legs.len()),
         "a complete report plus one retained row is not a full pass"
     );
+
+    // The two host-store legs are deferred owner rows: they block the
+    // release, not the offline conjunction.
+    let deferred = vec![json!({
+        "schema_version": 1,
+        "leg": "auth.keychain",
+        "status": "not_run",
+        "prerequisite": "no keychain",
+    })];
+    let (offline_legs, deferred_legs) = surface_retained_not_run(&deferred);
+    assert!(offline_legs.is_empty());
+    assert_eq!(deferred_legs.len(), 1);
+    assert!(!report.with_deferred_rows(deferred_legs.len()).release_ready);
 }
 
 #[test]
@@ -2156,11 +2397,13 @@ fn retained_rows_dedupe_by_leg_and_never_forge_a_verdict() {
         "prerequisite": "no pty",
     });
     let retained = vec![duplicate.clone(), duplicate, other];
+    let (offline_legs, deferred_legs) = surface_retained_not_run(&retained);
     assert_eq!(
-        surface_retained_not_run(&retained),
+        offline_legs.len(),
         2,
         "the counted total is the unique-leg count"
     );
+    assert!(deferred_legs.is_empty());
 }
 
 /// The retained reader's file walk: only a closed-set leg file that fits the
@@ -2242,6 +2485,182 @@ fn retained_reader_ignores_conflicting_and_control_bearing_rows() {
 }
 
 #[test]
+fn the_offline_pass_and_the_release_answer_are_separate() {
+    let candidate = "candidate";
+    let mut rows = complete_rows(candidate);
+    let unserved: BTreeSet<String> = rivect::verification::unserved_cases().into_iter().collect();
+    for row in &mut rows {
+        if unserved.contains(&row.case_id) {
+            row.outcome = TrialOutcome::Unserved;
+            row.evidence = Some(format!("receipt#{}", row.case_id));
+            row.cause = Some("unserved: no installed adapter".to_string());
+        }
+    }
+    let report = counted(candidate, &rows);
+    assert!(report.full_pass && report.offline_full_pass, "{report:?}");
+    assert!(!report.release_ready);
+
+    let report = counted(candidate, &rows).with_deferred_rows(46);
+    assert!(report.offline_full_pass);
+    assert!(
+        !report.release_ready,
+        "a deferred ledger blocks the release"
+    );
+
+    let flipped = counted(candidate, &rows).with_deferred_rows(0);
+    assert!(
+        flipped.release_ready,
+        "an empty deferred ledger flips the gate"
+    );
+
+    // A censored row is a blocker, never a passed row, and no empty ledger
+    // can round it up.
+    let mut censored = rows.clone();
+    let victim = censored
+        .iter_mut()
+        .find(|row| row.outcome == TrialOutcome::Pass)
+        .expect("one pass row");
+    victim.outcome = TrialOutcome::Censored;
+    victim.evidence = None;
+    victim.cause = Some("not run".to_string());
+    let blocked_case = victim.case_id.clone();
+    let blocked = counted(candidate, &censored).with_deferred_rows(0);
+    assert!(!blocked.offline_full_pass);
+    assert!(!blocked.release_ready);
+    assert_eq!(blocked.blockers.not_run, vec![blocked_case]);
+}
+
+fn write_deferred_fixture(root: &Path, ledger: &Value) -> PathBuf {
+    let path = root.join("deferred-owner-rows.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(ledger).expect("serialize the deferred fixture"),
+    )
+    .expect("write the deferred fixture");
+    path
+}
+
+#[test]
+fn deferred_owner_ledger_verifies_the_carrier_and_refuses_overlap() {
+    let source = std::fs::read(deferred_ledger_path()).expect("the deferred ledger reads");
+    let mut ledger: Value =
+        serde_json::from_slice(&source).expect("the deferred ledger is valid JSON");
+    let ids: Vec<String> = ledger["carrier_rows"]
+        .as_array()
+        .expect("carrier rows")
+        .iter()
+        .map(|id| id.as_str().expect("a carrier id").to_string())
+        .collect();
+    assert_eq!(ids.len(), DEFERRED_CARRIER_ROWS);
+    let root = tempfile::TempDir::with_prefix("rivect-deferred-ledger-").expect("temp");
+    let carrier = root.path().join("carrier.md");
+    let carrier_text = ids
+        .iter()
+        .map(|id| format!("- [ ] {id}: fixture obligation\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    std::fs::write(&carrier, &carrier_text).expect("write the carrier fixture");
+    ledger["carrier"]["path"] = json!(carrier.to_str().expect("utf-8 carrier path"));
+    ledger["carrier"]["sha256"] = json!(rivect::config::hex(&Sha256::digest(
+        carrier_text.as_bytes()
+    )));
+    let ledger_path = write_deferred_fixture(root.path(), &ledger);
+
+    let verified =
+        deferred_owner_rows_from(&ledger_path, true).expect("the fixture carrier verifies");
+    assert!(verified.carrier_verified);
+    assert_eq!(
+        verified.rows.len(),
+        DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len()
+    );
+    assert_eq!(
+        verified
+            .rows
+            .iter()
+            .filter(|row| row.kind == "macos_carrier")
+            .count(),
+        DEFERRED_CARRIER_ROWS
+    );
+    assert!(verified.rows.iter().all(|row| !row.owner.is_empty()));
+    assert!(verified.rows.iter().all(|row| !row.prerequisite.is_empty()));
+
+    // A drifted carrier file no longer matches the pinned digest.
+    let mut tampered = ledger.clone();
+    tampered["carrier"]["sha256"] = json!("0".repeat(64));
+    let tampered_path = write_deferred_fixture(root.path(), &tampered);
+    let refused = deferred_owner_rows_from(&tampered_path, true)
+        .expect_err("a drifted carrier digest is refused");
+    assert!(refused.contains("digest"), "{refused}");
+
+    // A deferred id in the offline roster would be counted as a PASS.
+    let mut overlap = ledger.clone();
+    overlap["carrier_rows"][0] = json!("A01");
+    let overlap_carrier = root.path().join("overlap.md");
+    let overlap_text = overlap["carrier_rows"]
+        .as_array()
+        .expect("carrier rows")
+        .iter()
+        .map(|id| format!("- [ ] {}: fixture obligation\n", id.as_str().expect("id")))
+        .collect::<Vec<_>>()
+        .join("");
+    std::fs::write(&overlap_carrier, &overlap_text).expect("write overlap carrier");
+    overlap["carrier"]["path"] = json!(overlap_carrier.to_str().expect("utf-8 path"));
+    overlap["carrier"]["sha256"] = json!(rivect::config::hex(&Sha256::digest(
+        overlap_text.as_bytes()
+    )));
+    let overlap_path = write_deferred_fixture(root.path(), &overlap);
+    let refused = deferred_owner_rows_from(&overlap_path, true)
+        .expect_err("a required case in the ledger is refused");
+    assert!(refused.contains("required offline case"), "{refused}");
+
+    // A duplicated owner leg is not two rows.
+    let mut duplicate = ledger.clone();
+    duplicate["legs"][1]["case_id"] = duplicate["legs"][0]["case_id"].clone();
+    let duplicate_path = write_deferred_fixture(root.path(), &duplicate);
+    let refused = deferred_owner_rows_from(&duplicate_path, true)
+        .expect_err("a duplicated owner leg is refused");
+    assert!(refused.contains("duplicated"), "{refused}");
+
+    // A leg without an owner or prerequisite is not a surfaced owner row.
+    let mut ownerless = ledger.clone();
+    ownerless["legs"][0]["owner"] = json!("");
+    let ownerless_path = write_deferred_fixture(root.path(), &ownerless);
+    let refused =
+        deferred_owner_rows_from(&ownerless_path, true).expect_err("an ownerless leg is refused");
+    assert!(refused.contains("owner"), "{refused}");
+
+    // A shrunken carrier set is not a smaller ledger.
+    let mut shrunken = ledger.clone();
+    shrunken["carrier_rows"].as_array_mut().expect("rows").pop();
+    let shrunken_path = write_deferred_fixture(root.path(), &shrunken);
+    let refused = deferred_owner_rows_from(&shrunken_path, true)
+        .expect_err("a shrunken carrier set is refused");
+    assert!(refused.contains("39"), "{refused}");
+
+    // Release mode has no pending carrier: an absent file is refused.
+    let mut absent = ledger.clone();
+    absent["carrier"]["path"] = json!(root.path().join("absent.md").to_str().expect("utf-8 path"));
+    let absent_path = write_deferred_fixture(root.path(), &absent);
+    let refused = deferred_owner_rows_from(&absent_path, true)
+        .expect_err("an absent carrier is refused in release mode");
+    assert!(refused.contains("unreadable"), "{refused}");
+
+    // The checked-in ledger verifies its pinned origin when this host has it.
+    let checked = deferred_owner_rows_from(&deferred_ledger_path(), false)
+        .expect("the checked-in ledger reads");
+    assert_eq!(
+        checked.rows.len(),
+        DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len()
+    );
+    if checked.carrier_verified {
+        println!(
+            "DEFERRED_CARRIER verified sha256={} rows={DEFERRED_CARRIER_ROWS}",
+            ledger["carrier"]["sha256"]
+        );
+    }
+}
+
+#[test]
 fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     let bundle = support::release::baseline_bundle();
     assert!(
@@ -2300,7 +2719,67 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     println!("UI-CELLS counted={ui_count} missing={ui_missing} stale={ui_stale}");
     rows.extend(ui);
 
-    let report = counted(&candidate, &rows);
+    let release = release_mode();
+    let deferred = match deferred_owner_rows() {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            println!("DEFERRED pending cause=\"{error}\"");
+            if release {
+                panic!("the deferred owner ledger is invalid: {error}");
+            }
+            DeferredLedger {
+                rows: Vec::new(),
+                carrier_verified: false,
+            }
+        }
+    };
+    let deferred_rows = deferred.rows.len();
+    let deferred_effective = if deferred.carrier_verified {
+        deferred_rows
+    } else {
+        usize::MAX
+    };
+
+    // Host-conditional legs retain a machine-readable NOT_RUN row instead of
+    // returning green. The two host-store legs are deferred owner rows; the
+    // rest are offline blockers.
+    let retained_not_run = support::not_run::records();
+    let (offline_retained_legs, deferred_retained_legs) =
+        surface_retained_not_run(&retained_not_run);
+    let surfaced: BTreeSet<String> = retained_not_run
+        .iter()
+        .map(|row| {
+            row["leg"]
+                .as_str()
+                .expect("a surfaced row names its leg")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        surfaced,
+        retained_legs_on_disk(),
+        "the retained reader surfaces every leg file on disk exactly once"
+    );
+    let deferred_ids: BTreeSet<&str> = deferred
+        .rows
+        .iter()
+        .map(|row| row.case_id.as_str())
+        .collect();
+    assert!(
+        deferred_retained_legs
+            .iter()
+            .all(|leg| deferred_ids.contains(leg.as_str())),
+        "a host-store leg is a deferred owner row: {deferred_retained_legs:?}"
+    );
+    let retained_legs_not_run = offline_retained_legs.len();
+
+    let report = counted(&candidate, &rows).with_deferred_rows(deferred_effective);
+    let row_blockers = report.blockers.missing.len()
+        + report.blockers.stale.len()
+        + report.blockers.failed.len()
+        + report.blockers.not_run.len()
+        + report.blockers.unattributed.len();
+    let offline_blockers = row_blockers + retained_legs_not_run;
     println!(
         "FINAL required={} present={} current={} passed={} provider_rows={} alias_rows={} installed_rows={} ui_cells={}",
         report.required,
@@ -2320,6 +2799,61 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
         report.blockers.not_run.len(),
         report.blockers.unattributed.len()
     );
+    println!(
+        "OFFLINE_ACCEPTANCE required={} passed={} unserved={} blockers={}",
+        report.required, report.passed, report.unserved, row_blockers
+    );
+    println!(
+        "FINAL_ACCEPTANCE verdict={} release_ready={} offline_blockers={} deferred={}",
+        if report.release_ready {
+            "full-pass"
+        } else {
+            "not-full-pass"
+        },
+        report.release_ready,
+        offline_blockers,
+        deferred_rows
+    );
+
+    let deferred_json: Vec<Value> = deferred
+        .rows
+        .iter()
+        .map(|row| {
+            json!({
+                "case_id": row.case_id,
+                "kind": row.kind,
+                "owner": row.owner,
+                "prerequisite": row.prerequisite,
+            })
+        })
+        .collect();
+    write_final_acceptance(&json!({
+        "schema_version": 1,
+        "candidate_manifest_sha256": candidate,
+        "required": report.required,
+        "present": report.present,
+        "current": report.current,
+        "passed": report.passed,
+        "unserved": report.unserved,
+        "provider_rows": report.provider_rows,
+        "alias_rows": report.alias_rows,
+        "installed_rows": report.installed_rows,
+        "ui_cells": report.ui_cells,
+        "blockers": {
+            "missing": report.blockers.missing.len(),
+            "stale": report.blockers.stale.len(),
+            "failed": report.blockers.failed.len(),
+            "not_run": report.blockers.not_run.len(),
+            "unattributed": report.blockers.unattributed.len(),
+            "retained_legs": retained_legs_not_run,
+            "offline_total": offline_blockers,
+        },
+        "offline_full_pass": report.offline_full_pass,
+        "release_ready": report.release_ready,
+        "deferred_count": deferred_rows,
+        "deferred": deferred_json,
+        "carrier_verified": deferred.carrier_verified,
+    }));
 
     assert_eq!(report.required, expected_required_rows());
     assert_eq!(
@@ -2374,6 +2908,30 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             report.ui_cells, FINAL_UI_CELLS,
             "every 19xGxI cell is counted in the report"
         );
+    }
+
+    if release {
+        assert!(
+            deferred.carrier_verified,
+            "release requires the carrier digest and 40-row set"
+        );
+        assert_eq!(
+            deferred_rows,
+            DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len(),
+            "the deferred ledger is 40 carrier rows plus 6 owner legs"
+        );
+        assert!(
+            report.full_pass && report.offline_full_pass,
+            "the offline conjunction is a full pass: {report:?}"
+        );
+        assert_eq!(report.required, 1764);
+        assert_eq!(report.present, 1764);
+        assert_eq!(report.current, 1764);
+        assert_eq!(report.passed, 1758);
+        assert_eq!(report.unserved, 6);
+        assert!(report.blockers.is_empty(), "{report:?}");
+        assert_eq!(retained_legs_not_run, 0, "no offline retained leg");
+        assert_eq!(ui_count, FINAL_UI_CELLS);
         assert_eq!(ui_missing, 0, "every 19xGxI cell is counted");
         assert_eq!(
             ui_stale, 0,
@@ -2384,100 +2942,81 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             expected_required_rows() - declared_not_run.len() - report.unserved,
             "every current row and cell passes; unserved stays outside passed"
         );
-    }
+        assert!(
+            !report.release_ready,
+            "the deferred ledger keeps the release not ready"
+        );
 
-    let ordinary = rows
-        .iter()
-        .find(|row| row.case_id == INSTALLED_ORDINARY_CASE)
-        .expect("release row");
-    assert_eq!(ordinary.outcome, TrialOutcome::Pass);
-    let evidence = ordinary
-        .evidence
-        .as_deref()
-        .expect("retained receipt pointer");
-    assert!(
-        evidence.ends_with(INSTALLED_ORDINARY_EVIDENCE_MARKER),
-        "the row points at its retained receipt: {evidence}"
-    );
-    assert!(
-        !report
-            .blockers
-            .not_run
-            .contains(&INSTALLED_ORDINARY_CASE.to_string())
-    );
-    println!("PASSED {INSTALLED_ORDINARY_CASE}: {evidence}");
+        let ordinary = rows
+            .iter()
+            .find(|row| row.case_id == INSTALLED_ORDINARY_CASE)
+            .expect("release row");
+        assert_eq!(ordinary.outcome, TrialOutcome::Pass);
+        let evidence = ordinary
+            .evidence
+            .as_deref()
+            .expect("retained receipt pointer");
+        assert!(
+            evidence.ends_with(INSTALLED_ORDINARY_EVIDENCE_MARKER),
+            "the row points at its retained receipt: {evidence}"
+        );
+        assert!(
+            !report
+                .blockers
+                .not_run
+                .contains(&INSTALLED_ORDINARY_CASE.to_string())
+        );
+        println!("PASSED {INSTALLED_ORDINARY_CASE}: {evidence}");
 
-    // The UI row passes on its candidate-bound matrix: every cell PASS, the
-    // 285 state×theme observations present, and every renderer-only claim
-    // intact.
-    let ui_row = rows
-        .iter()
-        .find(|row| row.case_id == INSTALLED_UI_CASE)
-        .expect("release row");
-    if let Some(cause) = ui_row.cause.as_deref() {
-        println!("UI-ROW cause: {cause}");
-    }
-    assert_eq!(ui_row.outcome, TrialOutcome::Pass);
-    let evidence = ui_row.evidence.as_deref().expect("retained matrix pointer");
-    assert!(
-        evidence.ends_with(INSTALLED_UI_EVIDENCE_MARKER),
-        "the row points at its retained matrix: {evidence}"
-    );
-    assert!(
-        !report
-            .blockers
-            .not_run
-            .contains(&INSTALLED_UI_CASE.to_string())
-    );
-    assert_eq!(
-        ui_count, FINAL_UI_CELLS,
-        "the matrix counts every one of the 1330 cells"
-    );
-    println!("PASSED {INSTALLED_UI_CASE}: {evidence}");
-
-    // Host-conditional legs retain a machine-readable NOT_RUN row instead of
-    // returning green. The conjunction surfaces every retained row as NOT_RUN
-    // and cannot claim a full pass while one exists.
-    let retained_not_run = support::not_run::records();
-    let retained_legs_not_run = surface_retained_not_run(&retained_not_run);
-    let surfaced: BTreeSet<String> = retained_not_run
-        .iter()
-        .map(|row| {
-            row["leg"]
-                .as_str()
-                .expect("a surfaced row names its leg")
-                .to_string()
-        })
-        .collect();
-    assert_eq!(
-        surfaced,
-        retained_legs_on_disk(),
-        "the retained reader surfaces every leg file on disk exactly once"
-    );
-    assert_eq!(
-        retained_legs_not_run,
-        surfaced.len(),
-        "the counted total is the deduped unique-leg count it prints"
-    );
-
-    let blocker_count = report.blockers.missing.len()
-        + report.blockers.stale.len()
-        + report.blockers.failed.len()
-        + report.blockers.not_run.len()
-        + report.blockers.unattributed.len()
-        + retained_legs_not_run;
-    let full_pass = full_pass_with_retained(&report, retained_legs_not_run);
-    println!(
-        "FINAL_ACCEPTANCE verdict={} blockers={blocker_count}",
-        if full_pass {
-            "full-pass"
-        } else {
-            "not-full-pass"
+        // The UI row passes on its candidate-bound matrix: every cell PASS,
+        // the 285 state×theme observations present, and every renderer-only
+        // claim intact.
+        let ui_row = rows
+            .iter()
+            .find(|row| row.case_id == INSTALLED_UI_CASE)
+            .expect("release row");
+        assert_eq!(ui_row.outcome, TrialOutcome::Pass);
+        let evidence = ui_row.evidence.as_deref().expect("retained matrix pointer");
+        assert!(
+            evidence.ends_with(INSTALLED_UI_EVIDENCE_MARKER),
+            "the row points at its retained matrix: {evidence}"
+        );
+        assert!(
+            !report
+                .blockers
+                .not_run
+                .contains(&INSTALLED_UI_CASE.to_string())
+        );
+        assert_eq!(
+            ui_count, FINAL_UI_CELLS,
+            "the matrix counts every one of the 1330 cells"
+        );
+        println!("PASSED {INSTALLED_UI_CASE}: {evidence}");
+    } else {
+        // The default run asserts the fail-closed path only: any absent,
+        // stale or censored offline row forbids a full pass, while a fully
+        // current receipt set is allowed to read as the offline pass.
+        let fail_closed = !report.blockers.is_empty()
+            || rows.iter().any(|row| row.outcome == TrialOutcome::Censored)
+            || retained_legs_not_run > 0;
+        if fail_closed {
+            assert!(
+                !full_pass_with_retained(&report, retained_legs_not_run),
+                "a partial offline set is never a full pass: {report:?}"
+            );
         }
-    );
+    }
+}
 
-    assert!(
-        !report.full_pass,
-        "the full-pass claim stays SLICE-010/Seal: {report:?}"
-    );
+fn write_final_acceptance(value: &Value) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("final-acceptance.json");
+    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(value).expect("serialize the final acceptance verdict"),
+    )
+    .expect("write the final acceptance verdict");
+    std::fs::rename(&temporary, &path).expect("publish the final acceptance verdict");
 }
