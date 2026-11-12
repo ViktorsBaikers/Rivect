@@ -68,6 +68,11 @@ const MATRIX_BUDGET_SECONDS: f64 = 900.0;
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
 
 const WAIT: Duration = Duration::from_secs(10);
+/// The live-resize lane is separate from the four-worker pool: at most two
+/// resized frames capture at once, and each waits for its own settled frame.
+const LIVE_WORKERS: usize = 2;
+/// A settled live-resize frame may take longer than an ordinary first paint.
+const LIVE_RESIZE_WAIT: Duration = Duration::from_secs(30);
 
 /// Env gate for the cursor-query trace: the harness prints when it sees
 /// `ESC [ 6 n`, when it answers, and what the child reported on timeout.
@@ -712,6 +717,23 @@ fn parallel_map<T: Copy + Send + Sync, R: Send>(
     })
 }
 
+/// Runs the live-resize jobs in their own small lane after the ordinary jobs
+/// have finished on the four-worker pool. Their resize settle never competes
+/// with sibling redraws, and each capture waits for a still frame.
+fn parallel_then_live<T: Copy + Send + Sync, R: Send>(
+    jobs: &[T],
+    workers: usize,
+    live_workers: usize,
+    live: impl Fn(T) -> bool + Sync,
+    work: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let (live_jobs, parallel_jobs): (Vec<T>, Vec<T>) =
+        jobs.iter().copied().partition(|job| live(*job));
+    let mut results = parallel_map(&parallel_jobs, workers, &work);
+    results.extend(parallel_map(&live_jobs, live_workers, work));
+    results
+}
+
 fn await_review_screen(
     tui: &mut TuiPty,
     fixture: &StateFixture,
@@ -721,10 +743,13 @@ fn await_review_screen(
         tui.wait(needle, WAIT)?;
     }
     if geometry == Geometry::LiveResize {
-        tui.resize(40, 120)?;
-        tui.wait(fixture.needles[0], WAIT)?;
-        tui.resize(20, 60)?;
-        tui.wait(fixture.needles[0], WAIT)?;
+        for (rows, cols) in [(40, 120), (20, 60)] {
+            let mark = tui.bytes()?.len();
+            tui.resize(rows, cols)?;
+            // The resize redraw starts a new byte stream; require a still
+            // screen after that point before the frame is captured.
+            tui.wait_settled_after(fixture.needles[0], mark, LIVE_RESIZE_WAIT)?;
+        }
     }
     Ok(())
 }
@@ -1426,6 +1451,50 @@ impl TuiPty {
         }
     }
 
+    /// Waits until bytes beyond `mark` arrived (the resize redraw started), the
+    /// needle is on screen, and the whole squashed screen has held identical
+    /// for three consecutive reads. A resize capture never records a partially
+    /// repainted or pre-resize frame.
+    fn wait_settled_after(
+        &mut self,
+        needle: &str,
+        mark: usize,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        let needle = support::squashed(needle);
+        let mut previous: Option<String> = None;
+        let mut stable = 0usize;
+        loop {
+            self.answer_cursor_query()?;
+            let bytes = self.bytes()?;
+            let screen = self.screen(&bytes);
+            let squashed = support::squashed(&screen);
+            if bytes.len() > mark && squashed.contains(&needle) {
+                if previous.as_deref() == Some(squashed.as_str()) {
+                    stable += 1;
+                    if stable >= 2 {
+                        return Ok(screen);
+                    }
+                } else {
+                    stable = 0;
+                }
+                previous = Some(squashed);
+            } else {
+                stable = 0;
+                previous = None;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timeout waiting for a settled {needle:?}; last screen:\n{screen}"
+                ));
+            }
+            self.pty
+                .pump_for(Duration::from_millis(25))
+                .map_err(|error| format!("pty pump: {error}"))?;
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         if trace_enabled() {
             eprintln!(
@@ -2108,27 +2177,38 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
     let state_geometries: Vec<(usize, Geometry)> = (0..STATES)
         .flat_map(|state| Geometry::ALL.iter().map(move |geometry| (state, *geometry)))
         .collect();
-    let controls: std::collections::HashMap<_, _> =
-        parallel_map(&state_geometries, MATRIX_WORKERS, |(state, geometry)| {
+    let controls: std::collections::HashMap<_, _> = parallel_then_live(
+        &state_geometries,
+        MATRIX_WORKERS,
+        LIVE_WORKERS,
+        |(_, geometry)| geometry == Geometry::LiveResize,
+        |(state, geometry)| {
             let fixture = state_fixture(state);
             ((state, geometry), render_state(&fixture, geometry))
-        })
-        .into_iter()
-        .collect();
+        },
+    )
+    .into_iter()
+    .collect();
 
     let theme_jobs: Vec<(usize, Geometry, &'static str)> = state_geometries
         .iter()
         .flat_map(|(state, geometry)| THEMES.map(|theme| (*state, *geometry, theme)))
         .collect();
-    let theme_results = parallel_map(&theme_jobs, MATRIX_WORKERS, |(state, geometry, theme)| {
-        let control = controls
-            .get(&(state, geometry))
-            .cloned()
-            .unwrap_or_else(|| Err("control probe missing".to_string()));
-        let verdict = observe_theme(state, geometry, theme, &control)
-            .map(|observation| observation.to_json());
-        ((state, geometry, theme), verdict)
-    });
+    let theme_results = parallel_then_live(
+        &theme_jobs,
+        MATRIX_WORKERS,
+        LIVE_WORKERS,
+        |(_, geometry, _)| geometry == Geometry::LiveResize,
+        |(state, geometry, theme)| {
+            let control = controls
+                .get(&(state, geometry))
+                .cloned()
+                .unwrap_or_else(|| Err("control probe missing".to_string()));
+            let verdict = observe_theme(state, geometry, theme, &control)
+                .map(|observation| observation.to_json());
+            ((state, geometry, theme), verdict)
+        },
+    );
     let mut observations = Vec::with_capacity(THEME_OBSERVATIONS);
     let mut theme_verdicts = std::collections::HashMap::new();
     let mut theme_pass = 0usize;
@@ -2142,13 +2222,19 @@ fn installed_19_state_matrix_runs_on_the_packaged_artifact() {
         }
     }
 
-    let mono_results = parallel_map(&theme_jobs, MATRIX_WORKERS, |(state, geometry, theme)| {
-        let fixture = state_fixture(state);
-        (
-            (state, geometry, theme),
-            mono_probe(&fixture, geometry, theme),
-        )
-    });
+    let mono_results = parallel_then_live(
+        &theme_jobs,
+        MATRIX_WORKERS,
+        LIVE_WORKERS,
+        |(_, geometry, _)| geometry == Geometry::LiveResize,
+        |(state, geometry, theme)| {
+            let fixture = state_fixture(state);
+            (
+                (state, geometry, theme),
+                mono_probe(&fixture, geometry, theme),
+            )
+        },
+    );
     let mut mono_verdicts = std::collections::HashMap::new();
     let mut mono_pass = 0usize;
     for (key, result) in mono_results {
