@@ -165,6 +165,7 @@ fn missing_executable_or_fixture_reports_setup_gap_not_product_defect() {
             rivect::verification::AssumptionClassification::ProductDefect
         );
     }
+    println!("ROW A06 ok");
 }
 
 mod assumptions {
@@ -1634,6 +1635,7 @@ fn material_fork_under_background_surfaces_one_versioned_question() {
         Some(1),
         "the served question is the versioned row the fork pinned"
     );
+    println!("ROW A09 ok");
 }
 
 #[test]
@@ -1826,6 +1828,7 @@ fn machine_answer_without_delegation_stays_denied() {
             .is_some(),
         "the denial preserved the pending fork"
     );
+    println!("ROW 17.1 ok");
 }
 
 #[test]
@@ -1958,6 +1961,7 @@ fn auto_never_gains_rights_payment_or_authority() {
         rivect::contracts::Lifecycle::Running,
         "the answered task resumes; it never completes or cancels itself"
     );
+    println!("ROW A10 ok");
 }
 
 #[test]
@@ -5344,6 +5348,7 @@ fn resolve_decision_shows_five_honest_slots_plus_always_multiline_custom() {
     ] {
         assert!(flat.contains(needle), "the card paints {needle:?}: {flat}");
     }
+    println!("ROW 17.1 ok");
 }
 
 #[test]
@@ -5993,6 +5998,7 @@ mod plan_selection {
         assert_eq!(readiness.handler.as_deref(), Some(ASSESS_READINESS));
         assert_eq!(readiness.blocker, None);
         assert_eq!(provider_calls(&world), 0, "no model call anywhere");
+        println!("ROW A12 ok");
     }
 
     #[test]
@@ -6065,6 +6071,7 @@ mod plan_selection {
                 .all(|capability| !PLAN_STAGES.contains(&capability.as_str())),
             "no stage row was recorded for the approved contract"
         );
+        println!("ROW A03 ok");
     }
 
     #[test]
@@ -6244,6 +6251,7 @@ mod plan_selection {
                 "assess_security follows its trigger classes on {surface:?}"
             );
         }
+        println!("ROW A04 ok");
     }
 
     #[test]
@@ -6505,6 +6513,7 @@ mod plan_selection {
                 .expect("a selection was recorded");
             assert_eq!(record.request_kind, kind);
         }
+        println!("ROW A05 ok");
     }
 
     #[test]
@@ -8862,6 +8871,7 @@ mod plan_selection {
             ],
             "every shortlisted action the facts decline is traced with its reason"
         );
+        println!("ROW A13 ok");
     }
 
     #[test]
@@ -9015,6 +9025,7 @@ mod plan_selection {
             blockers.is_empty(),
             "every required row is routed, so none carries an invented blocker: {blockers:?}"
         );
+        println!("ROW A01 ok");
     }
 
     #[test]
@@ -9084,6 +9095,7 @@ mod plan_selection {
             StoreError::Conflict(ConflictCause::PlanRowUnresolved { .. })
         ));
         assert!(matches!(gate(&world, &task), PlanGate::Paused { .. }));
+        println!("ROW A14 ok");
     }
 
     #[test]

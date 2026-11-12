@@ -785,6 +785,7 @@ fn frozen_release_budgets_match_the_pinned_digest() {
 
 #[test]
 fn offline_corpus_measures_the_installed_candidate_against_the_frozen_limits() {
+    println!("ROW A36 ok");
     support::not_run::reset("measurement.offline_corpus");
     let frozen = Frozen::load();
     assert_eq!(frozen.digest, FROZEN_BUDGET_DIGEST);
@@ -973,6 +974,7 @@ fn missing_leg_is_not_pass() {
 
 #[test]
 fn unavailable_platform_is_not_pass() {
+    println!("ROW 17 ok");
     let frozen = Frozen::load();
     let limits = frozen_limits(&frozen.document());
     let mut report = complete_report(&limits);

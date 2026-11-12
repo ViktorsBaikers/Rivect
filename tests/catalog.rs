@@ -1889,4 +1889,5 @@ fn the_32_row_conjunction_runs_last() {
         "every capability produced an asserted positive outcome"
     );
     assert_eq!(negatives, 32, "every capability has a negative control");
+    println!("ROW 17.2 ok");
 }

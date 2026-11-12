@@ -115,7 +115,18 @@ row_count=$(jq -r '.rows | length' "$manifest") || exit 2
 }
 case $family in
     provider) denominator=222 ;;
-    acceptance) denominator=40 ;;
+    acceptance)
+        # One checked group manifest: the three A-scenario groups carry 12
+        # rows and the sections+upgrade group 4. The consumer unions the four
+        # group receipts into the family's 40 rows.
+        case $row_count in
+            12 | 4) denominator=$row_count ;;
+            *)
+                printf 'acceptance group declares %s rows, not 12 or 4\n' "$row_count" >&2
+                exit 2
+                ;;
+        esac
+        ;;
     search) denominator=20 ;;
     *)
         printf 'unknown offline evidence family: %s\n' "$family" >&2
@@ -208,11 +219,14 @@ while IFS='	' read -r case_id provider marker expected oracles observation; do
         }
         if [ -z "$first_oracle" ]; then
             first_oracle=$oracle
+            printf '%s\t%s\t%s\t%s\t1\n' "$case_id" "$oracle" "$marker" "$expected" >>"$tmp/oracles.tsv"
+        else
+            printf '%s\t%s\t%s\t%s\t0\n' "$case_id" "$oracle" "$marker" "$expected" >>"$tmp/oracles.tsv"
         fi
         printf '%s\n' "$target" >>"$tmp/targets.raw"
     done
     IFS=$old_ifs
-    printf '%s\t%s\t%s\t%s\n' "$case_id" "$first_oracle" "$marker" "$expected" >>"$tmp/oracles.tsv"
+    printf '%s\t%s\t%s\t%s\n' "$case_id" "$first_oracle" "$marker" "$expected" >>"$tmp/receipt_rows.tsv"
 done <"$tmp/rows.tsv"
 
 sort -u "$tmp/targets.raw" >"$tmp/targets.txt"
@@ -244,8 +258,8 @@ while IFS= read -r target; do
         exit 1
     fi
 
-    cases=0
-    while IFS='	' read -r case_id oracle marker expected; do
+    : >"$tmp/cases.raw"
+    while IFS='	' read -r case_id oracle marker expected first; do
         case $oracle in
             "$target::"*) test_name=${oracle#*::} ;;
             *) continue ;;
@@ -259,14 +273,15 @@ while IFS= read -r target; do
             grep -F "$test_name" "$output" >&2 || true
             exit 1
         fi
-        if ! grep -Fqx -- "$marker" "$output"; then
+        # The row marker proves the row's own evidence target; an extra
+        # oracle must run and pass but is not required to print that marker.
+        if [ "$first" = 1 ] && ! grep -Fqx -- "$marker" "$output"; then
             printf 'marker is absent from target %s output: %s\n' "$target" "$marker" >&2
             exit 1
         fi
-        cases=$((cases + 1))
-        jq -cRn --arg case_id "$case_id" --arg evidence "$oracle" --arg marker "$marker" --arg outcome "$expected" \
-            '{case_id: $case_id, evidence: $evidence, marker: $marker, outcome: $outcome}' >>"$tmp/receipt_rows.jsonl"
+        printf '%s\n' "$case_id" >>"$tmp/cases.raw"
     done <"$tmp/oracles.tsv"
+    cases=$(sort -u "$tmp/cases.raw" | wc -l | tr -d ' ')
     [ "$cases" -gt 0 ] || {
         printf 'target %s served no manifest oracle\n' "$target" >&2
         exit 1
@@ -276,6 +291,11 @@ while IFS= read -r target; do
         '{target: $target, command: $command, exit: 0, output_sha256: $output_sha256, cases: $cases}' >>"$tmp/receipt_targets.jsonl"
     printf 'OFFLINE_EVIDENCE target=%s exit=0 cases=%s\n' "$target" "$cases"
 done <"$tmp/targets.txt"
+
+while IFS='	' read -r case_id oracle marker expected; do
+    jq -cRn --arg case_id "$case_id" --arg evidence "$oracle" --arg marker "$marker" --arg outcome "$expected" \
+        '{case_id: $case_id, evidence: $evidence, marker: $marker, outcome: $outcome}' >>"$tmp/receipt_rows.jsonl"
+done <"$tmp/receipt_rows.tsv"
 
 row_total=$(wc -l <"$tmp/receipt_rows.jsonl" | tr -d ' ')
 [ "$row_total" = "$denominator" ] || {

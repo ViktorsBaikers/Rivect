@@ -191,6 +191,7 @@ fn ran_task(world: &World, node: usize) -> TaskId {
 
 #[test]
 fn one_slot_parent_child_completes_via_ingress_driven_wait() {
+    println!("ROW A21 ok");
     let (mut world, file, _grant) = scoped_world("one-slot-parent");
     world.runtime.scheduler = Scheduler::new(1, 4);
     let session = world.open_session("bootstrap-one-slot-parent");
@@ -1391,6 +1392,7 @@ fn strict_policy(
 
 #[test]
 fn sterile_exact_repeat_fires_once_at_cap_then_cooldown_bounds_the_loop() {
+    println!("ROW A21 ok");
     let scheduler = Scheduler::new(2, 4);
     let mut supervisor = Supervisor::new(SupervisorPolicy::default()).expect("policy validates");
     let task = stub_task("denied-loop");
@@ -3260,6 +3262,7 @@ fn execute_flight_read(
 /// (INV-023, AC-060 contribution).
 #[test]
 fn identical_permitted_reads_merge_into_one_physical_charge() {
+    println!("ROW A18 ok");
     let (mut world, file, grant) = scoped_world("singleflight-merge");
     let session = world.open_session("bootstrap-singleflight-merge");
     let task_a = flight_task(&mut world, &session, "cmd-flight-a");
@@ -3336,6 +3339,7 @@ fn identical_permitted_reads_merge_into_one_physical_charge() {
 /// (INV-023: differing rights/snapshots never merge).
 #[test]
 fn differing_scope_snapshot_or_mode_never_merges_reads() {
+    println!("ROW A19 ok");
     let (mut world, file, grant) = scoped_world("singleflight-no-merge");
     let session = world.open_session("bootstrap-singleflight-no-merge");
     let task_a = flight_task(&mut world, &session, "cmd-no-merge-a");

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "family": "acceptance",
+  "rows": [
+    {"case_id":"A01","provider":"section-16.10","oracle":["docs::docs_status_question_serves_only_an_applicable_source","decisions::plan_selection::catalog_never_dumped_into_todo"],"marker":"ROW A01 ok","expected":"pass","observation":"Explain code and narrow doc search without a mandatory design/plan/build chain"},
+    {"case_id":"A02","provider":"section-16.10","oracle":["effect_boundary::managed_write_writes_exact_bytes_on_checked_fd","evaluator::defect_fake_pass_zero_selection_and_missing_cells_are_rejected"],"marker":"ROW A02 ok","expected":"pass","observation":"Docs typo gets the exact edit and a fitting check, no fake RED"},
+    {"case_id":"A03","provider":"section-16.10","oracle":["decisions::plan_selection::sufficient_contract_skips_decorative_stages"],"marker":"ROW A03 ok","expected":"pass","observation":"Full input contract and approved architecture reused, no extra polling/design"},
+    {"case_id":"A04","provider":"section-16.10","oracle":["decisions::plan_selection::short_request_with_auth_api_or_migration_risk_gets_required_depth"],"marker":"ROW A04 ok","expected":"pass","observation":"Short request with auth/API/migration risk gets the required depth"},
+    {"case_id":"A05","provider":"section-16.10","oracle":["decisions::plan_selection::plan_only_audit_or_diagnose_request_never_edits_or_ships"],"marker":"ROW A05 ok","expected":"pass","observation":"Plan-only, audit-only and diagnose-only requests never edit or ship"},
+    {"case_id":"A06","provider":"section-16.10","oracle":["decisions::missing_executable_or_fixture_reports_setup_gap_not_product_defect"],"marker":"ROW A06 ok","expected":"pass","observation":"Setup failure is separated from a product defect, no weakened test"},
+    {"case_id":"A07","provider":"section-16.10","oracle":["evaluator::setup_gap_red_is_not_credited_and_green_plus_regressions_are_checked"],"marker":"ROW A07 ok","expected":"pass","observation":"A syntax/setup RED is not credited as the symptom; GREEN and regressions checked"},
+    {"case_id":"A08","provider":"section-16.10","oracle":["docs::installed_version_never_accepts_an_incompatible_latest_api"],"marker":"ROW A08 ok","expected":"pass","observation":"One version-aware lookup or reuse, no provider fan-out"},
+    {"case_id":"A09","provider":"section-16.10","oracle":["decisions::material_fork_under_background_surfaces_one_versioned_question"],"marker":"ROW A09 ok","expected":"pass","observation":"A subagent-discovered material fork asks once through the parent control point"},
+    {"case_id":"A10","provider":"section-16.10","oracle":["decisions::auto_never_gains_rights_payment_or_authority"],"marker":"ROW A10 ok","expected":"pass","observation":"Auto takes an architecture choice without a dialog and without new rights, money or grants"},
+    {"case_id":"A11","provider":"section-16.10","oracle":["routing::every_purpose_carries_admission_and_single_accounting"],"marker":"ROW A11 ok","expected":"pass","observation":"Every fixed/auto model/effort call is admitted, configurable and accounted; fallback honoured"},
+    {"case_id":"A12","provider":"section-16.10","oracle":["decisions::plan_selection::purpose_row_without_a_broker_seam_yields_exact_blocker_never_a_template"],"marker":"ROW A12 ok","expected":"pass","observation":"A disabled required capability stays an obligation or an exact blocker"}
+  ]
+}

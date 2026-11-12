@@ -1543,6 +1543,8 @@ pub enum ActionError {
     RepairDropsCriterion { criterion: String },
     #[error("explanation claim {index} cites no recorded evidence")]
     UnsupportedClaim { index: usize },
+    #[error("candidate {digest} breaks the shared contract: {contract}")]
+    IntegrationIncompatible { digest: String, contract: String },
     #[error("delivery refused")]
     Delivery(#[from] crate::update::DeliveryError),
     #[error("procedure segment could not be derived")]
@@ -1583,7 +1585,9 @@ impl ActionError {
             | Self::MissingSecurityCheck { .. }
             | Self::AuditInsufficient
             | Self::Procedure(_) => ErrorCode::DependencyBlocked,
-            Self::RepairDropsCriterion { .. } => ErrorCode::Conflict,
+            Self::RepairDropsCriterion { .. } | Self::IntegrationIncompatible { .. } => {
+                ErrorCode::Conflict
+            }
             Self::EmptyInput { .. }
             | Self::InputOverLimit { .. }
             | Self::MeasurementWithoutSamples { .. }
@@ -3530,6 +3534,17 @@ fn validate_integration(
     ctx: &mut ActionContext<'_>,
 ) -> Result<ActionOutcome, ActionError> {
     non_empty(VALIDATE_INTEGRATION, &input.candidate.digest)?;
+    if let Some(contract) = input.candidate.compatibility.iter().find(|entry| {
+        entry
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("incompatible")
+    }) {
+        return Err(ActionError::IntegrationIncompatible {
+            digest: input.candidate.digest,
+            contract: contract.clone(),
+        });
+    }
     if input.candidate.consumers.is_empty() || input.candidate.compatibility.is_empty() {
         return Ok(skip(VALIDATE_INTEGRATION, SkipReason::NeedsInformation));
     }

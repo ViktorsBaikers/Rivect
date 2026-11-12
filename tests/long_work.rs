@@ -695,6 +695,7 @@ fn unit_bound_below_the_frozen_bound_stops_instead_of_waiting() {
 
 #[test]
 fn expired_worker_does_not_renew_itself() {
+    println!("ROW A22 ok");
     let mut fixture = fixture("long-work-expired");
     let task = fixture.task.clone();
     assert!(fixture.start(&task, 0, 5, 10).get("result").is_some());
@@ -719,6 +720,7 @@ fn expired_worker_does_not_renew_itself() {
 
 #[test]
 fn stopped_worker_creates_no_second_ledger_or_grant() {
+    println!("ROW A22 ok");
     let mut fixture = fixture("long-work-no-second");
     let task = fixture.task.clone();
     assert!(fixture.start(&task, 600, 5, 10).get("result").is_some());

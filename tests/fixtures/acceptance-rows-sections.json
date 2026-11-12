@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "family": "acceptance",
+  "rows": [
+    {"case_id":"17","provider":"section-17","oracle":["update::joint_run_observes_both_effects_p1","measurement::unavailable_platform_is_not_pass"],"marker":"ROW 17 ok","expected":"pass","observation":"Delivery proves ownership, migrations, preservation, new-behavior adoption, real commands, remaining obligations and platform honesty"},
+    {"case_id":"17.1","provider":"section-17.1","oracle":["decisions::resolve_decision_shows_five_honest_slots_plus_always_multiline_custom","decisions::machine_answer_without_delegation_stays_denied"],"marker":"ROW 17.1 ok","expected":"pass","observation":"Material unstated forks ask the native five options plus custom; auto never fakes approval; switches, scopes, pins and late answers hold"},
+    {"case_id":"17.2","provider":"section-17.2","oracle":["catalog::the_32_row_conjunction_runs_last","learning::verified_delta_changes_the_next_request_p1"],"marker":"ROW 17.2 ok","expected":"pass","observation":"The 32-handler obligation registry is implemented and tested, not documentation-only; personal learning changes the next task"},
+    {"case_id":"AC-082-N-N+1-N+2","provider":"ac-082","oracle":["update::upgrade_chain_keeps_basis_delta_deletion_and_revocation"],"marker":"ROW AC-082-N-N+1-N+2 ok","expected":"pass","observation":"N to N+1 to N+2 keeps the new basis and the personal delta, including interruption and downgrade"}
+  ]
+}

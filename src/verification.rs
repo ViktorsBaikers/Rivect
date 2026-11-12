@@ -1186,7 +1186,19 @@ pub const OFFLINE_EVIDENCE_PRODUCER_VERSION: &str = "1";
 /// before it is parsed.
 pub const OFFLINE_EVIDENCE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// The three offline evidence families and their fixed denominators.
+/// The four checked acceptance-row groups' exact member counts: the three
+/// A-scenario groups carry 12 rows each and the sections+upgrade group 4.
+pub const ACCEPTANCE_GROUP_SIZES: [usize; 4] = [12, 12, 12, 4];
+
+/// Whether `count` is one of the four checked acceptance group sizes.
+#[must_use]
+pub fn is_acceptance_group_size(count: usize) -> bool {
+    ACCEPTANCE_GROUP_SIZES.contains(&count)
+}
+
+/// The three offline evidence families and their union denominators. One
+/// acceptance family splits into the four checked groups above, so a group
+/// receipt carries 12 or 4 rows and the family union is 40.
 pub const OFFLINE_FAMILIES: [(&str, usize); 3] = [
     ("provider", OFFLINE_PROVIDER_ROWS),
     ("acceptance", 40),
@@ -1265,7 +1277,13 @@ impl OfflineEvidenceManifest {
                 family: self.family.clone(),
             });
         };
-        if self.rows.len() != denominator {
+        if self.family == "acceptance" {
+            if !is_acceptance_group_size(self.rows.len()) {
+                return Err(OfflineEvidenceError::GroupDenominator {
+                    declared: self.rows.len(),
+                });
+            }
+        } else if self.rows.len() != denominator {
             return Err(OfflineEvidenceError::Denominator {
                 declared: self.rows.len(),
                 expected: denominator,
@@ -1410,10 +1428,28 @@ impl OfflineEvidenceReceipt {
                 family: self.family.clone(),
             });
         }
-        let Some(denominator) = offline_family_denominator(&self.family) else {
+        let Some(family_denominator) = offline_family_denominator(&self.family) else {
             return Err(OfflineEvidenceError::UnknownFamily {
                 family: self.family.clone(),
             });
+        };
+        // One acceptance group receipt carries its group's 12 or 4 rows; the
+        // consumer unions the four checked groups into the family's 40.
+        let denominator = if self.family == "acceptance" {
+            if !is_acceptance_group_size(self.rows.len()) {
+                return Err(OfflineEvidenceError::GroupDenominator {
+                    declared: self.rows.len(),
+                });
+            }
+            if self.rows.len() != manifest.rows.len() {
+                return Err(OfflineEvidenceError::Denominator {
+                    declared: self.rows.len(),
+                    expected: manifest.rows.len(),
+                });
+            }
+            self.rows.len()
+        } else {
+            family_denominator
         };
         if manifest.rows.len() != denominator || self.rows.len() != denominator {
             return Err(OfflineEvidenceError::Denominator {
@@ -1569,6 +1605,8 @@ pub enum OfflineEvidenceError {
     UnknownFamily { family: String },
     #[error("the offline evidence declares {declared} rows, not {expected}")]
     Denominator { declared: usize, expected: usize },
+    #[error("the acceptance group declares {declared} rows, not one group's 12 or 4")]
+    GroupDenominator { declared: usize },
     #[error("the offline evidence repeats case {case_id}")]
     DuplicateCase { case_id: String },
     #[error("the offline evidence repeats target {target}")]
@@ -1610,6 +1648,7 @@ impl OfflineEvidenceError {
             Self::Schema { .. } | Self::ProducerVersion { .. } => ErrorCode::UnsupportedVersion,
             Self::UnknownFamily { .. }
             | Self::Denominator { .. }
+            | Self::GroupDenominator { .. }
             | Self::DuplicateCase { .. }
             | Self::DuplicateTarget { .. }
             | Self::Omission { .. }

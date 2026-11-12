@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "family": "acceptance",
+  "rows": [
+    {"case_id":"A25","provider":"section-16.10","oracle":["learning::verified_delta_changes_the_next_request_p1"],"marker":"ROW A25 ok","expected":"pass","observation":"Verified learning changes the next admissible definition, not just a stored file"},
+    {"case_id":"A26","provider":"section-16.10","oracle":["learning::sdk_docs_setup_and_repair_causes_are_distinguished"],"marker":"ROW A26 ok","expected":"pass","observation":"Feedback is attributed to the right cause, version and transport"},
+    {"case_id":"A27","provider":"section-16.10","oracle":["learning::failed_composition_keeps_the_delta_inactive_p5"],"marker":"ROW A27 ok","expected":"pass","observation":"Several learned rules active together are checked for conflicts and loops"},
+    {"case_id":"A28","provider":"section-16.10","oracle":["identity::rename_rebinds_pin_and_disable_p1"],"marker":"ROW A28 ok","expected":"pass","observation":"An update that renames an action/role preserves pins and disable intent"},
+    {"case_id":"A29","provider":"section-16.10","oracle":["identity::split_does_not_copy_the_delta_p2"],"marker":"ROW A29 ok","expected":"pass","observation":"Split/merged actions migrate by meaning without widening rights"},
+    {"case_id":"A30","provider":"section-16.10","oracle":["update::joint_run_observes_both_effects_p1","update::incompatible_delta_stays_inactive_with_its_diagnosis_p6"],"marker":"ROW A30 ok","expected":"pass","observation":"A new basis adds its mandatory check while compatible personalization still works"},
+    {"case_id":"A31","provider":"section-16.10","oracle":["update::defaults_merge_the_slots_the_user_defers_p15","update::user_row_keeps_its_slots_over_the_base_row_p16"],"marker":"ROW A31 ok","expected":"pass","observation":"Absent/inherit/auto/false/null/delete and reordered fallback keep their semantics"},
+    {"case_id":"A32","provider":"section-16.10","oracle":["identity::unknown_id_stays_unassigned_and_unknown_fields_survive_p6"],"marker":"ROW A32 ok","expected":"pass","observation":"Unknown fields and custom actions survive migration without activating executable content"},
+    {"case_id":"A33","provider":"section-16.10","oracle":["update::cutover_refuses_live_old_worker_and_incompatible_version","update::after_commit_crash_reopens_new_tuple_and_preserves_owner_ack"],"marker":"ROW A33 ok","expected":"pass","observation":"Upgrade with a live worker keeps a fence, late data and version attribution"},
+    {"case_id":"A34","provider":"section-16.10","oracle":["update::deterministic_update_and_rollback_make_zero_provider_calls"],"marker":"ROW A34 ok","expected":"pass","observation":"Update recovery does not require a paid model; only semantic conflicts wait"},
+    {"case_id":"A35","provider":"section-16.10","oracle":["update::off_survives_the_real_migration_p7","update::rollback_preserves_current_deletion_and_policy"],"marker":"ROW A35 ok","expected":"pass","observation":"Workflow off, explicit disables and tombstones survive profiles and update"},
+    {"case_id":"A36","provider":"section-16.10","oracle":["measurement::offline_corpus_measures_the_installed_candidate_against_the_frozen_limits","economy::cache_read_rate_uses_settled_bins_and_never_a_local_hash"],"marker":"ROW A36 ok","expected":"pass","observation":"Large catalog, cold start, warm run and learning/update meet counters, quota and resource limits"}
+  ]
+}

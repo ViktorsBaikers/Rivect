@@ -302,6 +302,8 @@ fn verified_delta_changes_the_next_request_p1() {
         2,
         "two physical requests, one per dispatch"
     );
+    println!("ROW A25 ok");
+    println!("ROW 17.2 ok");
 }
 
 // ----- p2: the next suitable task uses it automatically -----
@@ -484,6 +486,7 @@ fn overbroad_trigger_does_not_activate_p4() {
             .state,
         DeltaState::Inactive
     );
+    println!("ROW A15 ok");
 }
 
 // ----- p5: a failed composition keeps the delta inactive -----
@@ -544,6 +547,7 @@ fn failed_composition_keeps_the_delta_inactive_p5() {
             .state,
         DeltaState::Inactive
     );
+    println!("ROW A27 ok");
 }
 
 // ----- p6: one rollback leaves the rest of the experience active -----
@@ -1681,6 +1685,7 @@ fn sdk_docs_setup_and_repair_causes_are_distinguished() {
         "{refused}"
     );
     assert_eq!(refused.code(), ErrorCode::InvalidInput);
+    println!("ROW A26 ok");
 }
 
 #[test]

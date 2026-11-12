@@ -963,6 +963,7 @@ fn managed_write_rejects_occupant_swap_without_touching_new_file() {
 
 #[test]
 fn managed_write_writes_exact_bytes_on_checked_fd() {
+    println!("ROW A02 ok");
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-control");
     let admitted = {
         let mut executor = world.runtime.executor();
@@ -1502,6 +1503,7 @@ fn publish_intent_rejects_occupant_swap_after_staging() {
 
 #[test]
 fn managed_write_rechecks_revoked_grant_before_writing() {
+    println!("ROW A24 ok");
     let (mut world, _session, task, file, grant) = managed_write_fixture("managed-write-revoked");
     let admitted = {
         let mut executor = world.runtime.executor();
@@ -1560,6 +1562,7 @@ fn managed_write_rechecks_revoked_grant_before_writing() {
 
 #[test]
 fn managed_write_rechecks_cancel_before_writing() {
+    println!("ROW A24 ok");
     let (mut world, session, task, file, grant) = managed_write_fixture("managed-write-cancel");
     let admitted = {
         let mut executor = world.runtime.executor();

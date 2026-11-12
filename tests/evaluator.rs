@@ -298,6 +298,62 @@ fn defect_fake_pass_zero_selection_and_missing_cells_are_rejected() {
             case_id: "A02".to_string()
         })
     );
+    println!("ROW A02 ok");
+}
+
+/// A syntax/setup failure is censored evidence, never credited as the
+/// symptom's RED: the failing case stays NotRun until a real RED is observed,
+/// and the fixed GREEN run still carries its regression case.
+#[test]
+fn setup_gap_red_is_not_credited_and_green_plus_regressions_are_checked() {
+    let fixture = OracleFixture::write(&[
+        case("A01", "pass", "deterministic"),
+        case("A02", "fail", "deterministic"),
+        case("A03", "pass", "deterministic"),
+    ]);
+    let protected = ProtectedOracle::bind(&candidate_root(), &fixture.path).expect("binds");
+
+    let mut setup = censored("A01", TrialMode::Deterministic, "setup gap: syntax error");
+    setup.evidence = None;
+    let report = evaluate(
+        &protected,
+        &CandidateRun {
+            implementation: "setup-red".to_string(),
+            observations: vec![
+                setup,
+                observation("A02", TrialMode::Deterministic, TrialOutcome::Fail),
+                observation("A03", TrialMode::Deterministic, TrialOutcome::Pass),
+            ],
+        },
+    );
+    assert!(!report.accepted, "{report:?}");
+    assert_eq!(
+        report.rejection,
+        Some(Rejection::NotRun {
+            case_id: "A01".to_string()
+        }),
+        "a setup gap is not the symptom's RED"
+    );
+    assert_eq!(
+        report.counts.deterministic.passed, 1,
+        "the independent regression case still passed"
+    );
+
+    let report = evaluate(
+        &protected,
+        &CandidateRun {
+            implementation: "green".to_string(),
+            observations: vec![
+                observation("A01", TrialMode::Deterministic, TrialOutcome::Pass),
+                observation("A02", TrialMode::Deterministic, TrialOutcome::Fail),
+                observation("A03", TrialMode::Deterministic, TrialOutcome::Pass),
+            ],
+        },
+    );
+    assert!(report.accepted, "{report:?}");
+    assert_eq!(report.counts.deterministic.passed, 2);
+    assert_eq!(report.counts.deterministic.failed, 1);
+    println!("ROW A07 ok");
 }
 
 #[test]

@@ -3058,6 +3058,7 @@ fn measured(
 /// never becomes a provider hit.
 #[test]
 fn cache_read_rate_uses_settled_bins_and_never_a_local_hash() {
+    println!("ROW A36 ok");
     let mut world = support::open_world("economy-cache-bins", Some(config_text()));
     let session = world.open_session("bootstrap-economy-cache-bins");
     let reported = settle_through_runtime(

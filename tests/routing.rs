@@ -1169,6 +1169,7 @@ fn rights_loss_between_ranking_and_dispatch_re_blocks_the_send() {
 
 #[test]
 fn every_purpose_carries_admission_and_single_accounting() {
+    println!("ROW A11 ok");
     let config = Config::parse_validated(&pools_config()).expect("valid");
     let (mut broker, sent) = recording_broker();
     // (purpose, expected admission connection, expected model id):

@@ -92,6 +92,7 @@ fn status_question(
 
 #[test]
 fn installed_version_never_accepts_an_incompatible_latest_api() {
+    println!("ROW A08 ok");
     let directory = snapshot("version-trap");
     let source = DirectSource::new(directory.path());
 
@@ -598,6 +599,7 @@ fn malformed_and_oversized_documents_are_unknown_never_evidence() {
 
 #[test]
 fn docs_status_question_serves_only_an_applicable_source() {
+    println!("ROW A01 ok");
     // AC-037 at the declared product entry: the on-disk direct source is the
     // applicable one, and an incompatible latest/API answer is an explicit
     // unknown rather than evidence.

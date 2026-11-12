@@ -203,6 +203,8 @@ fn verified_delta(store: &mut TaskStore) -> rivect::learning::LearningDefinition
 /// store recorded the cutover — no restart and no second resolver.
 #[test]
 fn joint_run_observes_both_effects_p1() {
+    println!("ROW A30 ok");
+    println!("ROW 17 ok");
     let root = temp_root("p1");
     std::fs::create_dir_all(root.path().join("store")).expect("store dir");
     let mut store = open_store(&root.path().join("store"));
@@ -713,6 +715,7 @@ fn interrupted_update_stages_the_new_base_p5() {
 /// temporary state, never a deletion.
 #[test]
 fn incompatible_delta_stays_inactive_with_its_diagnosis_p6() {
+    println!("ROW A30 ok");
     let root = temp_root("p6");
     std::fs::create_dir_all(root.path().join("store")).expect("store dir");
     let mut store = open_store(&root.path().join("store"));
@@ -784,6 +787,7 @@ fn incompatible_delta_stays_inactive_with_its_diagnosis_p6() {
 /// value and never dropped from the effective view.
 #[test]
 fn off_survives_the_real_migration_p7() {
+    println!("ROW A35 ok");
     let off = user_config("[workflow]\nenabled = false\n");
     let mut world = support::open_world("update-p7", Some(&off));
 
@@ -1560,6 +1564,7 @@ fn composed_document_references_are_checked_p14() {
 /// store with no user document reads the base as its only layer.
 #[test]
 fn defaults_merge_the_slots_the_user_defers_p15() {
+    println!("ROW A31 ok");
     let base = base_document("").replace(
         "effort = { mode = \"auto\" }",
         "effort = { mode = \"fixed\", value = \"high\" }",
@@ -1638,6 +1643,7 @@ fn defaults_merge_the_slots_the_user_defers_p15() {
 /// under the user's key.
 #[test]
 fn user_row_keeps_its_slots_over_the_base_row_p16() {
+    println!("ROW A31 ok");
     let base = base_document(
         "[models.purposes.main]\n\
          model = { mode = \"fixed\", connection = \"local\", model_id = \"base-model\" }\n\
@@ -5144,6 +5150,7 @@ fn tree_state(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
 /// newer build wrote is refused before it is touched.
 #[test]
 fn cutover_refuses_live_old_worker_and_incompatible_version() {
+    println!("ROW A33 ok");
     let root = temp_root("live-owner");
     std::fs::create_dir_all(root.path().join("runtime")).expect("runtime dir");
     let marker = root.path().join("owner.pid");
@@ -5309,6 +5316,7 @@ fn after_commit_update_child() {
 /// snapshot is removed only after that readback.
 #[test]
 fn after_commit_crash_reopens_new_tuple_and_preserves_owner_ack() {
+    println!("ROW A33 ok");
     let root = temp_root("after-commit");
     std::fs::create_dir_all(root.path().join("runtime")).expect("runtime dir");
     let marker = rivect::update::hatch_marker(root.path(), "update-pause-after-commit");
@@ -5554,6 +5562,7 @@ fn owner_seam_refuses_a_held_root_before_any_effect() {
 /// grant lets a control principal read the retained bytes.
 #[test]
 fn rollback_preserves_current_deletion_and_policy() {
+    println!("ROW A35 ok");
     let root = temp_root("rollback-policy");
     std::fs::create_dir_all(root.path().join("runtime")).expect("runtime dir");
     let mut store = staged_cutover(root.path());
@@ -6449,6 +6458,7 @@ fn update_failure_evidence_survives_cleanup() {
 /// the end proves the same counter observes a real send.
 #[test]
 fn deterministic_update_and_rollback_make_zero_provider_calls() {
+    println!("ROW A34 ok");
     use std::sync::atomic::Ordering;
 
     let off = user_config(
@@ -8360,6 +8370,7 @@ fn base_v4() -> String {
 /// refusal rather than a silent replace.
 #[test]
 fn upgrade_chain_keeps_basis_delta_deletion_and_revocation() {
+    println!("ROW AC-082-N-N+1-N+2 ok");
     let root = temp_root("n-plus-two");
     std::fs::create_dir_all(root.path().join("store")).expect("store dir");
     let mut store = open_store(&root.path().join("store"));

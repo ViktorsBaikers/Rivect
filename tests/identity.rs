@@ -431,6 +431,7 @@ impl Grants {
 
 #[test]
 fn rename_rebinds_pin_and_disable_p1() {
+    println!("ROW A28 ok");
     let grants = Grants::new("rename");
     let policy_before = grants.read();
 
@@ -661,6 +662,7 @@ fn fallback_binding_follows_meaning_not_position() {
 
 #[test]
 fn split_does_not_copy_the_delta_p2() {
+    println!("ROW A29 ok");
     let grants = Grants::new("split");
     let policy_before = grants.read();
 
@@ -2191,6 +2193,7 @@ fn grants_are_not_widened_p5() {
 
 #[test]
 fn unknown_id_stays_unassigned_and_unknown_fields_survive_p6() {
+    println!("ROW A32 ok");
     let grants = Grants::new("unknown");
     let policy_before = grants.read();
 

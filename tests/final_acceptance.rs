@@ -690,6 +690,192 @@ fn provider_receipt_missing_stale_or_unmarked_is_never_pass() {
     );
 }
 
+fn acceptance_receipt(
+    manifest_bytes: &[u8],
+    manifest: &OfflineEvidenceManifest,
+    candidate: &str,
+) -> OfflineEvidenceReceipt {
+    let rows: Vec<EvidenceRow> = manifest
+        .rows
+        .iter()
+        .map(|row| EvidenceRow {
+            case_id: row.case_id.clone(),
+            evidence: row.oracle.first().expect("one oracle").clone(),
+            marker: row.marker.clone(),
+            outcome: TrialOutcome::Pass,
+        })
+        .collect();
+    let mut cases: BTreeMap<String, u32> = BTreeMap::new();
+    for row in &rows {
+        let target = row
+            .evidence
+            .split_once("::")
+            .expect("target::test")
+            .0
+            .to_string();
+        *cases.entry(target).or_default() += 1;
+    }
+    let targets = cases
+        .into_iter()
+        .map(|(target, cases)| OfflineEvidenceTarget {
+            command: format!("cargo test --locked --test {target} -- --nocapture"),
+            target,
+            exit: 0,
+            output_sha256: "a".repeat(64),
+            cases,
+        })
+        .collect();
+    OfflineEvidenceReceipt {
+        schema_version: 1,
+        producer_version: "1".to_string(),
+        family: "acceptance".to_string(),
+        candidate_manifest_sha256: candidate.to_string(),
+        manifest_sha256: rivect::config::hex(&Sha256::digest(manifest_bytes)),
+        targets,
+        counts: OfflineEvidenceCounts {
+            rows: rows.len(),
+            pass: rows.len(),
+            unserved: 0,
+        },
+        rows,
+    }
+}
+
+#[test]
+fn acceptance_group_receipts_missing_stale_unmarked_short_or_swapped_are_never_pass() {
+    let candidate = "d".repeat(64);
+    let root = tempfile::TempDir::with_prefix("rivect-acceptance-receipts-").expect("temp");
+    let mut groups: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
+    for group in ACCEPTANCE_GROUPS {
+        let manifest_path = acceptance_manifest_path(group);
+        let manifest_bytes = std::fs::read(&manifest_path).expect("checked manifest");
+        let manifest = OfflineEvidenceManifest::load(&manifest_bytes).expect("manifest validates");
+        let receipt_path = root.path().join(format!("{group}.json"));
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&acceptance_receipt(&manifest_bytes, &manifest, &candidate))
+                .expect("serialize"),
+        )
+        .expect("write receipt");
+        groups.push((group, manifest_path, receipt_path));
+    }
+
+    let rows = acceptance_rows_from(&groups, &candidate);
+    assert_eq!(rows.len(), 40);
+    assert!(
+        rows.iter().all(|row| row.outcome == TrialOutcome::Pass),
+        "every current marker-checked group row passes"
+    );
+    assert!(rows.iter().all(|row| row.evidence.is_some()));
+
+    // A missing receipt censors its whole group, never a smaller denominator.
+    let missing = groups.clone();
+    let missing_path = missing[0].2.clone();
+    std::fs::remove_file(&missing_path).expect("remove receipt");
+    let rows = acceptance_rows_from(&missing, &candidate);
+    assert_eq!(rows.len(), 40);
+    assert!(
+        group_is_censored(&rows, "a01-a12"),
+        "a missing group receipt is censored"
+    );
+    let manifest = OfflineEvidenceManifest::load(
+        &std::fs::read(acceptance_manifest_path("a01-a12")).expect("manifest"),
+    )
+    .expect("manifest");
+    let manifest_bytes = std::fs::read(acceptance_manifest_path("a01-a12")).expect("manifest");
+    std::fs::write(
+        &missing_path,
+        serde_json::to_vec(&acceptance_receipt(&manifest_bytes, &manifest, &candidate))
+            .expect("serialize"),
+    )
+    .expect("restore receipt");
+
+    // A stale receipt is censored.
+    let stale = groups.clone();
+    let stale_manifest_bytes =
+        std::fs::read(acceptance_manifest_path("a13-a24")).expect("manifest");
+    let stale_manifest = OfflineEvidenceManifest::load(&stale_manifest_bytes).expect("manifest");
+    std::fs::write(
+        &stale[1].2,
+        serde_json::to_vec(&acceptance_receipt(
+            &stale_manifest_bytes,
+            &stale_manifest,
+            &"e".repeat(64),
+        ))
+        .expect("serialize"),
+    )
+    .expect("write stale receipt");
+    let rows = acceptance_rows_from(&stale, &candidate);
+    assert!(
+        group_is_censored(&rows, "a13-a24"),
+        "a stale group receipt is censored"
+    );
+
+    // An unmarked receipt is censored.
+    let unmarked = groups.clone();
+    let unmarked_manifest_bytes =
+        std::fs::read(acceptance_manifest_path("a25-a36")).expect("manifest");
+    let unmarked_manifest =
+        OfflineEvidenceManifest::load(&unmarked_manifest_bytes).expect("manifest");
+    let mut unmarked_receipt =
+        acceptance_receipt(&unmarked_manifest_bytes, &unmarked_manifest, &candidate);
+    unmarked_receipt.rows[0].marker.clear();
+    std::fs::write(
+        &unmarked[2].2,
+        serde_json::to_vec(&unmarked_receipt).expect("serialize"),
+    )
+    .expect("write unmarked receipt");
+    let rows = acceptance_rows_from(&unmarked, &candidate);
+    assert!(
+        group_is_censored(&rows, "a25-a36"),
+        "an unmarked group receipt is censored"
+    );
+
+    // A short receipt is a group-denominator refusal, censored whole.
+    let short = groups.clone();
+    let short_manifest_bytes =
+        std::fs::read(acceptance_manifest_path("sections")).expect("manifest");
+    let short_manifest = OfflineEvidenceManifest::load(&short_manifest_bytes).expect("manifest");
+    let mut short_receipt = acceptance_receipt(&short_manifest_bytes, &short_manifest, &candidate);
+    short_receipt.rows.pop();
+    short_receipt.counts = OfflineEvidenceCounts {
+        rows: short_receipt.rows.len(),
+        pass: short_receipt.rows.len(),
+        unserved: 0,
+    };
+    std::fs::write(
+        &short[3].2,
+        serde_json::to_vec(&short_receipt).expect("serialize"),
+    )
+    .expect("write short receipt");
+    let rows = acceptance_rows_from(&short, &candidate);
+    assert!(
+        group_is_censored(&rows, "sections"),
+        "a short group receipt is censored"
+    );
+
+    // A manifest carrying another group's rows is refused before the receipt.
+    let mut swapped = groups.clone();
+    swapped[0].1 = acceptance_manifest_path("sections");
+    let rows = acceptance_rows_from(&swapped, &candidate);
+    assert!(
+        group_is_censored(&rows, "a01-a12"),
+        "a cross-group manifest is censored"
+    );
+}
+
+fn group_is_censored(rows: &[FinalRow], group: &str) -> bool {
+    let ids: BTreeSet<String> = acceptance_group_ids(group).into_iter().collect();
+    let mut count = 0;
+    for row in rows.iter().filter(|row| ids.contains(&row.case_id)) {
+        if row.outcome != TrialOutcome::Censored {
+            return false;
+        }
+        count += 1;
+    }
+    count == ids.len()
+}
+
 #[test]
 fn unserved_rows_are_terminal_and_never_passed() {
     let candidate = "candidate-current";
@@ -1092,22 +1278,206 @@ fn installed_ui_evidence(path: &Path, candidate: &str) -> Result<String, String>
     Ok(format!("{}#installed-ui", path.display()))
 }
 
-fn acceptance_rows(candidate: &str) -> Vec<FinalRow> {
-    let mut rows = Vec::with_capacity(SOURCE_SCENARIOS.len() + RELEASE_SECTIONS.len() + 3);
-    for id in SOURCE_SCENARIOS.iter().chain(RELEASE_SECTIONS.iter()) {
-        rows.push(censored(
-            (*id).to_string(),
+/// The four checked acceptance-row groups: the three A-scenario blocks and
+/// the sections+upgrade block. Each group carries its own receipt; the
+/// conjunction refuses to count a group short of its checked rows.
+const ACCEPTANCE_GROUPS: [&str; 4] = ["a01-a12", "a13-a24", "a25-a36", "sections"];
+
+fn acceptance_group_ids(group: &str) -> Vec<String> {
+    match group {
+        "a01-a12" => SOURCE_SCENARIOS[..12]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        "a13-a24" => SOURCE_SCENARIOS[12..24]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        "a25-a36" => SOURCE_SCENARIOS[24..]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect(),
+        "sections" => RELEASE_SECTIONS
+            .iter()
+            .map(|id| (*id).to_string())
+            .chain(std::iter::once(UPGRADE_CASE.to_string()))
+            .collect(),
+        other => panic!("unknown acceptance group {other}"),
+    }
+}
+
+fn acceptance_manifest_path(group: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(format!("acceptance-rows-{group}.json"))
+}
+
+fn acceptance_receipt_path(group: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("acceptance-rows-{group}.json"))
+}
+
+fn acceptance_producer(group: &str) -> String {
+    format!(
+        "sh scripts/offline-evidence.sh --manifest tests/fixtures/acceptance-rows-{group}.json --receipt target/acceptance-rows-{group}.json --bundle <dir>"
+    )
+}
+
+fn censored_acceptance_group(candidate: &str, group: &str, cause: String) -> Vec<FinalRow> {
+    acceptance_group_ids(group)
+        .into_iter()
+        .map(|case_id| censored(case_id, candidate, cause.clone()))
+        .collect()
+}
+
+/// Consume one checked acceptance group's candidate-current receipt. The
+/// manifest must carry exactly that group's checked ids; the receipt must
+/// validate against the checked-in bytes, name the acting candidate and carry
+/// every marker. Any shortfall censors the whole group, never a smaller
+/// denominator.
+fn acceptance_group_rows(
+    group: &str,
+    manifest_path: &Path,
+    receipt_path: &Path,
+    candidate: &str,
+) -> Vec<FinalRow> {
+    let producer = acceptance_producer(group);
+    let manifest_bytes = match std::fs::read(manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return censored_acceptance_group(
+                candidate,
+                group,
+                format!("missing manifest: {error}; run {producer}"),
+            );
+        }
+    };
+    let manifest = match OfflineEvidenceManifest::load(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return censored_acceptance_group(
+                candidate,
+                group,
+                format!("malformed manifest: {error}"),
+            );
+        }
+    };
+    let expected: BTreeSet<String> = acceptance_group_ids(group).into_iter().collect();
+    let observed: BTreeSet<String> = manifest
+        .rows
+        .iter()
+        .map(|row| row.case_id.clone())
+        .collect();
+    if observed != expected {
+        return censored_acceptance_group(
             candidate,
+            group,
+            "manifest rows are not the checked group".to_string(),
+        );
+    }
+    let receipt_bytes = match std::fs::read(receipt_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return censored_acceptance_group(
+                candidate,
+                group,
+                format!("missing receipt: {error}; run {producer}"),
+            );
+        }
+    };
+    let receipt = match OfflineEvidenceReceipt::load(&receipt_bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return censored_acceptance_group(
+                candidate,
+                group,
+                format!("malformed receipt: {error}"),
+            );
+        }
+    };
+    if let Err(error) = receipt.validate(&manifest_bytes, &manifest) {
+        return censored_acceptance_group(candidate, group, format!("invalid receipt: {error}"));
+    }
+    if receipt.candidate_manifest_sha256 != candidate {
+        return censored_acceptance_group(
+            candidate,
+            group,
             format!(
-                "not run: the owning target is recorded in docs/acceptance-manifest.md#{id} and is not consumed by this conjunction"
+                "stale receipt: {} is not {candidate}",
+                receipt.candidate_manifest_sha256
             ),
+        );
+    }
+    receipt
+        .rows
+        .into_iter()
+        .map(|row| {
+            let evidence = format!("{}#{}", receipt_path.display(), row.evidence);
+            match row.outcome {
+                TrialOutcome::Pass => passed(row.case_id, candidate, evidence),
+                TrialOutcome::Fail => failed(row.case_id, candidate, evidence),
+                TrialOutcome::Censored => censored(
+                    row.case_id,
+                    candidate,
+                    format!("receipt censored: {evidence}"),
+                ),
+                TrialOutcome::Unserved => censored(
+                    row.case_id,
+                    candidate,
+                    format!("acceptance rows are never unserved: {evidence}"),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn acceptance_rows_from(groups: &[(&str, PathBuf, PathBuf)], candidate: &str) -> Vec<FinalRow> {
+    let mut rows = Vec::with_capacity(40);
+    for (group, manifest_path, receipt_path) in groups {
+        rows.extend(acceptance_group_rows(
+            group,
+            manifest_path,
+            receipt_path,
+            candidate,
         ));
     }
-    rows.push(censored(
-        UPGRADE_CASE.to_string(),
-        candidate,
-        "not run: the N to N+1 to N+2 upgrade gates are owned by tests/update.rs and are not consumed by this conjunction".to_string(),
-    ));
+    let mut seen = BTreeSet::new();
+    assert_eq!(rows.len(), 40, "the four groups total 40 rows");
+    for row in &rows {
+        assert!(
+            seen.insert(row.case_id.as_str()),
+            "acceptance row {} appears in two groups",
+            row.case_id
+        );
+    }
+    let required: BTreeSet<String> = SOURCE_SCENARIOS
+        .iter()
+        .map(|id| (*id).to_string())
+        .chain(RELEASE_SECTIONS.iter().map(|id| (*id).to_string()))
+        .chain(std::iter::once(UPGRADE_CASE.to_string()))
+        .collect();
+    assert_eq!(
+        seen.into_iter().map(String::from).collect::<BTreeSet<_>>(),
+        required,
+        "the group union is exactly the checked acceptance roster"
+    );
+    rows
+}
+
+fn acceptance_rows(candidate: &str) -> Vec<FinalRow> {
+    let default_paths: Vec<(&str, PathBuf, PathBuf)> = ACCEPTANCE_GROUPS
+        .iter()
+        .map(|group| {
+            (
+                *group,
+                acceptance_manifest_path(group),
+                acceptance_receipt_path(group),
+            )
+        })
+        .collect();
+    let mut rows = acceptance_rows_from(&default_paths, candidate);
     rows.push(
         match installed_ordinary_evidence(&installed_receipt_path(), candidate) {
             Ok(evidence) => passed(INSTALLED_ORDINARY_CASE.to_string(), candidate, evidence),
@@ -1698,18 +2068,18 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     rows.extend(installed);
     rows.extend(search_rows(&candidate));
 
+    let acceptance_ids: BTreeSet<String> = SOURCE_SCENARIOS
+        .iter()
+        .map(|id| (*id).to_string())
+        .chain(RELEASE_SECTIONS.iter().map(|id| (*id).to_string()))
+        .chain(RELEASE_CASE_IDS.iter().map(|id| (*id).to_string()))
+        .collect();
     let mut expected_not_run = BTreeSet::new();
-    for id in SOURCE_SCENARIOS.iter().chain(RELEASE_SECTIONS.iter()) {
-        expected_not_run.insert((*id).to_string());
-    }
-    expected_not_run.extend(RELEASE_CASE_IDS.iter().map(|id| (*id).to_string()));
-    for case_id in [INSTALLED_ORDINARY_CASE, INSTALLED_UI_CASE] {
-        match rows.iter().find(|row| row.case_id == case_id) {
-            Some(row) if row.outcome == TrialOutcome::Pass => {
-                expected_not_run.remove(case_id);
-            }
+    for case_id in &acceptance_ids {
+        match rows.iter().find(|row| &row.case_id == case_id) {
+            Some(row) if row.outcome == TrialOutcome::Pass => {}
             _ => {
-                expected_not_run.insert(case_id.to_string());
+                expected_not_run.insert(case_id.clone());
             }
         }
     }

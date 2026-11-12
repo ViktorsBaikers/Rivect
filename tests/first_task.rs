@@ -2151,6 +2151,7 @@ fn crash_restart_no_repeat_effect() {
         2,
         "exactly two worker reads total: crash plus fresh re-request"
     );
+    println!("ROW A16 ok");
 }
 
 #[test]
@@ -2251,6 +2252,7 @@ fn post_confirmation_duplicate_identity_is_scoped_to_command() {
         2,
         "new command must dispatch own effect"
     );
+    println!("ROW A17 ok");
 }
 
 #[test]
@@ -2372,6 +2374,7 @@ fn unknown_without_safe_read_stays_blocked() {
         before_provider_calls,
         "blocked unknown task does not dispatch again"
     );
+    println!("ROW A17 ok");
 }
 
 /// A fixed-option answer names the one permitted read itself — no model
@@ -4966,6 +4969,7 @@ fn recorded_effects(c: &Continuation) -> usize {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p1() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p1");
     let open = c
         .world
@@ -5024,6 +5028,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p1() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p2() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p2");
     let question = c.question.clone();
     freeze_answered(
@@ -5083,6 +5088,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p2() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p3() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p3");
     let scope = model_spend_scope(&c.task, "alpha");
     let before = c
@@ -5114,6 +5120,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p3() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p4() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p4");
     let before = assembled(&c);
     let report = compact(&mut c);
@@ -5220,6 +5227,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p4() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p5() {
+    println!("ROW A23 ok");
     // E4: a model switch inside the continuation spends under its own scope
     // and never relabels the spend recorded before it.
     let mut c = continuation_task("compaction-p5");
@@ -5344,6 +5352,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p5() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p6() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p6");
     let question = c.question.clone();
     freeze_answered(
@@ -5395,6 +5404,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p6() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p7() {
+    println!("ROW A23 ok");
     // The effect runs before the compaction and the resume afterwards runs
     // the task's own step, so the count below is checked after a real
     // resume rather than after one that found nothing to do.
@@ -5451,6 +5461,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p7() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p8() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p8");
     let records = c
         .world
@@ -5605,6 +5616,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p8() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p9() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p9");
     let target = c
         .world
@@ -5647,6 +5659,7 @@ fn forced_compaction_preserves_intent_answer_remainder_and_spend_p9() {
 
 #[test]
 fn forced_compaction_preserves_intent_answer_remainder_and_spend_p10() {
+    println!("ROW A23 ok");
     let mut c = continuation_task("compaction-p10");
     let question = c.question.clone();
     freeze_answered(
