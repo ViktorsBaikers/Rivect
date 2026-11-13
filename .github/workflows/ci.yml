@@ -72,16 +72,20 @@ jobs:
         run: cargo fetch --locked
       - name: sandbox macos suite (all carrier oracles)
         run: cargo test --locked --test sandbox_macos -- --nocapture
-      - name: index worker memory bound
-        run: cargo test --locked --test index_worker -- --nocapture
-      - name: issuer owner checks
-        run: cargo test --locked --lib check_issuer -- --nocapture
       - name: workspace tests
+        # Doc-dependent gates need files the code-only checkout lacks; the
+        # index-worker's proc-table oracles are Linux-only (their carrier is
+        # gate-linux). Skips name the excluded rows exactly.
         run: >-
           cargo test --locked --workspace
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
+          --skip alive_observer_passes_only_the_allowlist
+          --skip answer_cap_stop_kills_and_reaps_the_worker
+          --skip cancel_stop_kills_and_reaps_the_worker
+          --skip cancellation_reaches_the_worker_and_ends_the_run
+          --skip footprint_stop_threshold_is_the_memory_budget
 
   # CD: tag pushes build the installed bundle via scripts/package-release.sh,
   # run the release gate (exit 0 = ready, 5 = not ready yet — recorded, never
