@@ -31,7 +31,10 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use support::{HELPER_IO_WITNESS, TempTree, ensure_helper, install_helper_io_shim, matrix_verdict};
+use support::{
+    HELPER_IO_WITNESS, TempTree, drop_sealed_attempt_root, ensure_helper, install_helper_io_shim,
+    matrix_verdict,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -3507,31 +3510,6 @@ fn check_error_site(result: &Result<CheckRun, ExecutorError>) -> &'static str {
         Err(ExecutorError::Check(error)) => error.site(),
         other => panic!("expected a typed check failure, got {other:?}"),
     }
-}
-
-/// Harness-side disposal of one retained attempt root: the product's
-/// strict cleanup (DEC-056) refuses the destructive emptying, so the
-/// test unseals and removes its own debris.
-fn drop_sealed_attempt_root(root: &Path) {
-    fn unseal_all(dir: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        drop(std::fs::set_permissions(
-            dir,
-            std::fs::Permissions::from_mode(0o700),
-        ));
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() && !path.is_symlink() {
-                    unseal_all(&path);
-                }
-            }
-        }
-    }
-    if root.is_dir() {
-        unseal_all(root);
-    }
-    drop(std::fs::remove_dir_all(root));
 }
 
 fn base_check(

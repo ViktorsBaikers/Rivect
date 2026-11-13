@@ -25,7 +25,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use support::{HELPER_IO_WITNESS, TempTree, ensure_helper, install_helper_io_shim, matrix_verdict};
+use support::{
+    HELPER_IO_WITNESS, TempTree, drop_sealed_attempt_root, ensure_helper, install_helper_io_shim,
+    matrix_verdict,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;

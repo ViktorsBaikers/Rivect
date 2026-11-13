@@ -1911,3 +1911,28 @@ pub fn symbol_corpus(name: &str) -> TempTree {
     std::fs::write(root.join("build/generated.rs"), "fn generated() {}\n").expect("ignored rust");
     tree
 }
+
+/// Harness-side disposal of one retained attempt root: the product's
+/// strict cleanup (DEC-056) refuses the destructive emptying, so the
+/// test unseals and removes its own debris. Shared by both sandbox suites.
+pub fn drop_sealed_attempt_root(root: &Path) {
+    fn unseal_all(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        drop(std::fs::set_permissions(
+            dir,
+            std::fs::Permissions::from_mode(0o700),
+        ));
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() && !path.is_symlink() {
+                    unseal_all(&path);
+                }
+            }
+        }
+    }
+    if root.is_dir() {
+        unseal_all(root);
+    }
+    drop(std::fs::remove_dir_all(root));
+}
