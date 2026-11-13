@@ -2137,12 +2137,27 @@ fn record_plan_selection(
 ) -> u64 {
     let config = rivect::config::Config::parse_validated(&support::base_config())
         .expect("harness config parses");
+    let criteria: Vec<_> = world
+        .runtime
+        .store()
+        .snapshot(task)
+        .expect("the task snapshot")
+        .criteria
+        .items
+        .into_iter()
+        .map(|criterion| criterion.id)
+        .collect();
     let request = rivect::actions::PlanRequest {
         task_id: task.clone(),
-        kind: rivect::actions::RequestKind::PlanOnly,
+        kind: rivect::actions::RequestKind::Change,
         surfaces: rivect::actions::SurfaceScan::Known([rivect::actions::Surface::Local].into()),
-        contract: rivect::actions::ContractBasis::Absent,
-        parts: Vec::new(),
+        contract: rivect::actions::ContractBasis::Approved,
+        parts: vec![rivect::actions::WorkPart {
+            id: "check".to_string(),
+            criteria,
+            depends_on: Vec::new(),
+            proof: "cargo test --test check".to_string(),
+        }],
         delegation: None,
         author: None,
     };
@@ -2153,6 +2168,15 @@ fn record_plan_selection(
             &mut world.runtime.action_context(session, &config),
         )
         .expect("the harness records the task selection");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .plan_gate(task)
+            .expect("the gate reads"),
+        rivect::state::PlanGate::Open,
+        "the harness selection opens the shared gate for real"
+    );
     selection.revision
 }
 
