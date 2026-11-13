@@ -311,13 +311,21 @@ fn published_generation() -> u64 {
 /// One real launch: a bounded child that exits at once, through the launch
 /// entry the product calls.
 fn started_launch() {
-    let mut launch = PreparedLaunch::direct("/bin/true");
+    // macOS ships `true` at /usr/bin/true, Linux at /bin/true (merged usr);
+    // the launch entry takes whichever the host actually has.
+    let true_bin = ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .expect("a system true binary exists");
+    let mut launch = PreparedLaunch::direct(true_bin);
     launch
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let output = launch.run(&[]).expect("a bounded launch of /bin/true");
+    let output = launch
+        .run(&[])
+        .expect("a bounded launch of the system true");
     assert!(
         output.status.success(),
         "the launched child ran to completion: {}",
