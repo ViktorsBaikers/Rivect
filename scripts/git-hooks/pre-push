@@ -1,0 +1,20 @@
+#!/bin/sh
+# Rivect engineering-standards push gate (docs/engineering-standards.md §14) —
+# the full suite. Tracked source; enable with:
+#   ln -sf ../../scripts/git-hooks/pre-push .git/hooks/pre-push
+# The distributed equivalent is CI.
+set -e
+echo "pre-push: fmt --check"
+cargo fmt --all -- --check
+echo "pre-push: clippy -D warnings"
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+echo "pre-push: workspace tests"
+cargo test --workspace
+echo "pre-push: doc tests"
+cargo test --workspace --doc
+echo "pre-push: doc build -Dwarnings"
+RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps --quiet
+echo "pre-push: cargo deny check"
+cargo deny check
+echo "pre-push: locked fetch"
+cargo fetch --locked

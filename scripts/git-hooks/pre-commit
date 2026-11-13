@@ -1,0 +1,50 @@
+#!/bin/sh
+# Rivect engineering-standards commit gate (docs/engineering-standards.md §14).
+# Tracked source; enable with:
+#   ln -sf ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
+# Fast checks at commit, NO tests (operator policy 2026-11-14): the
+# code_conventions ratchet and the full suite run at pre-push and in CI.
+set -e
+
+# Guard: .devrites is workspace state and must never enter the repository.
+# .git/info/exclude only covers UNTRACKED paths, so a path that was ever added
+# stays tracked and stages silently. This refuses such a commit outright.
+staged_devrites=$(git diff --cached --name-only --diff-filter=ACMR | grep '^\.devrites/' || true)
+if [ -n "$staged_devrites" ]; then
+  echo "pre-commit: refusing to commit .devrites workspace state:" >&2
+  echo "$staged_devrites" >&2
+  echo "run: git rm -r --cached .devrites" >&2
+  exit 1
+fi
+echo "pre-commit: fmt --check"
+cargo fmt --all -- --check
+echo "pre-commit: clippy -D warnings"
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+echo "pre-commit: cargo deny check"
+cargo deny check
+echo "pre-commit: doc build -Dwarnings"
+RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps --quiet
+if command -v typos >/dev/null 2>&1; then
+    echo "pre-commit: typos"
+    typos
+else
+    echo "pre-commit: typos not installed — skipped (install: cargo install typos-cli)"
+fi
+# >>> code-review-graph pre-commit hook >>>
+# Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
+if command -v code-review-graph >/dev/null 2>&1; then
+    crg_hook_git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || crg_hook_git_dir=""
+    crg_hook_root=$(git rev-parse --show-toplevel 2>/dev/null) || crg_hook_root=""
+    if [ -z "$crg_hook_git_dir" ] || [ -z "$crg_hook_root" ]; then
+        echo "code-review-graph: skipping automatic checks; cannot determine the Git worktree." >&2
+    elif [ -f "$crg_hook_git_dir/commondir" ] && [ "$CRG_HOOK_WORKTREES" != "1" ]; then
+        # Only a linked worktree's git dir carries a commondir file (Git 2.5+),
+        # so this needs no rev-parse options newer than --absolute-git-dir.
+        echo "code-review-graph: skipping automatic checks in a linked worktree;" \
+            "set CRG_HOOK_WORKTREES=1 to keep a graph for this worktree too." >&2
+    else
+        code-review-graph update --repo "$crg_hook_root" || true
+        code-review-graph detect-changes --brief --repo "$crg_hook_root" || true
+    fi
+fi
+# <<< code-review-graph pre-commit hook <<<
