@@ -1,0 +1,134 @@
+# Rivect CI/CD — local §14 gate on Linux+macOS, tag-triggered package.
+#
+# Standards §14: actions are pinned by version tag here; before relying on
+# this pipeline for a release, pin each `uses:` to its commit SHA
+# (supply-chain hardening — tracked as release follow-up).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The full §14 local gate: fmt, clippy, workspace test, doc test,
+  # rustdoc -Dwarnings, cargo deny, fetch --locked. Linux runner; the
+  # sandbox_linux suite executes here under Landlock.
+  gate-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: fetch locked
+        run: cargo fetch --locked
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: workspace tests
+        run: cargo test --locked --workspace
+      - name: doc tests
+        run: cargo test --locked --workspace --doc
+      - name: rustdoc
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # macOS leg: every carrier oracle lives in tests/sandbox_macos.rs under
+  # Seatbelt; this runner is the only place those rows can ever PASS.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: fetch locked
+        run: cargo fetch --locked
+      - name: sandbox macos suite (all carrier oracles)
+        run: cargo test --locked --test sandbox_macos -- --nocapture
+      - name: index worker memory bound
+        run: cargo test --locked --test index_worker -- --nocapture
+      - name: issuer owner checks
+        run: cargo test --locked --lib check_issuer -- --nocapture
+      - name: workspace tests
+        run: cargo test --locked --workspace
+
+  # CD: tag pushes build the installed bundle via scripts/package-release.sh,
+  # run the release gate (exit 0 = ready, 5 = not ready yet — recorded, never
+  # silently passed), then attach the bundle tarball to a GitHub Release.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate-linux, test-macos]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      - name: fetch locked
+        run: cargo fetch --locked
+      - name: jq (macos)
+        if: runner.os == 'macOS'
+        run: command -v jq >/dev/null || brew install jq
+      - name: package bundle
+        run: sh scripts/package-release.sh "$PWD/bundle"
+      - name: release gate (recorded, not forced)
+        id: gate
+        run: |
+          set +e
+          sh scripts/release-gate.sh --bundle "$PWD/bundle"
+          code=$?
+          set -e
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|5) exit 0 ;;
+            *) exit "$code" ;;
+          esac
+      - name: tarball
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          tar -C "$PWD/bundle" -czf "rivect-${tag}-${{ matrix.target }}.tar.gz" rivect rivect-sandbox-helper rivect.manifest.json
+          sha256sum "rivect-${tag}-${{ matrix.target }}.tar.gz" > "rivect-${tag}-${{ matrix.target }}.tar.gz.sha256" 2>/dev/null || \
+            shasum -a 256 "rivect-${tag}-${{ matrix.target }}.tar.gz" > "rivect-${tag}-${{ matrix.target }}.tar.gz.sha256"
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rivect-${{ github.ref_name }}-${{ matrix.target }}
+          path: |
+            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          retention-days: 30
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # release_ready=false (gate exit 5) publishes a prerelease draft;
+          # a real GO (exit 0) publishes the release for install.
+          draft: ${{ steps.gate.outputs.exit != '0' }}
+          prerelease: ${{ steps.gate.outputs.exit != '0' }}
+          files: |
+            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          body: |
+            Install: untar `rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz`
+            and place `rivect` + `rivect-sandbox-helper` on PATH together.
+            Verify `rivect.manifest.json` digests before use.
