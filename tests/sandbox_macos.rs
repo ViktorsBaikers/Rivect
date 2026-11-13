@@ -3290,6 +3290,11 @@ fn confined_check_vendor_failure_retains_the_result_site() {
         .execute_check(&mut admitted, &check, &AtomicBool::new(false))
         .expect_err("the broken manifest fails the vendor phase");
     assert_eq!(check_error_site(&Err(refused)), "vendor.result");
+    assert_eq!(
+        admitted.phase(),
+        rivect::executor::CheckPhase::Claimed,
+        "the claimed phase holds through the typed failure"
+    );
     assert!(
         world
             .runtime
@@ -3298,6 +3303,34 @@ fn confined_check_vendor_failure_retains_the_result_site() {
             .expect("retained lookup"),
         "the vendor result fault's terminal row exists"
     );
+    // Cleanup authority was exercised: the strict removal refused the
+    // live root and preserved the debris for manual resolution — the
+    // `cleanup.root` retirement row never lands and no destructive
+    // effect ran.
+    assert!(
+        rivect::executor::attempt_root_of(&attempt_id).exists(),
+        "the phase-A failure leaves its attempt-root debris in place"
+    );
+    for site in ["close.confirmed", "cleanup.root", "close.phase_closed"] {
+        assert!(
+            !world
+                .runtime
+                .store()
+                .has_retained(&check_boundary_id(&attempt_id, site))
+                .expect("retained lookup"),
+            "a phase-A failure writes no {site} row — no journey verdict or handoff"
+        );
+    }
+    // Nothing replays: the claimed admission refuses a second
+    // presentation at its own seam.
+    let mut executor = world.runtime.executor();
+    let replay = executor.execute_check(&mut admitted, &check, &AtomicBool::new(false));
+    assert_eq!(
+        check_error_site(&replay),
+        "admit.replay",
+        "a claimed phase-A admission never replays the failed phase"
+    );
+    drop_sealed_attempt_root(&rivect::executor::attempt_root_of(&attempt_id));
 }
 
 #[test]
@@ -5153,4 +5186,1420 @@ fn registry_layout() -> (String, PathBuf, PathBuf) {
         }
     }
     panic!("no familiar registry layout under the host cargo home");
+}
+
+// ---------------------------------------------------------------------------
+// Restored carrier oracles (release q-2026-11-12-001 option 1): the rows
+// whose only oracle was absent or Linux-only. The issuer trio mirrors
+// `tests/sandbox_linux.rs` verbatim per DEC-016; `dep.config`-site
+// helpers use the executor's canonical crate-name validation so a forged
+// registry name (`../` traversal spellings like `dep.config`) is refused
+// at `dep.config` before any cache/index grant is minted.
+// ---------------------------------------------------------------------------
+
+/// Recursively scans the attempt root for any path ending `credentials*`.
+fn credentials_paths(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("credentials"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Admits inline through the sanctioned issuer and returns the opaque
+/// admission plus the check it binds — the mint half of
+/// `run_confined_check` without the dispatch.
+fn admit_confined_check(
+    world: &mut support::World,
+    session: &SessionId,
+    task: &rivect::contracts::TaskId,
+    fixture: &CheckFixture,
+) -> (rivect::executor::CheckAdmission, ConfinedCheck) {
+    let revision = record_plan_selection(world, session, task);
+    let cargo = toolchain_cargo();
+    let expected = workspace_digest(fixture.root()).expect("workspace digest");
+    let check = ConfinedCheck {
+        project_grant_id: world
+            .runtime
+            .policy_writer()
+            .grant_read(fixture.root().to_path_buf()),
+        ..base_check(task, fixture, cargo.clone(), expected, revision)
+    };
+    let exec_grant = world.runtime.policy_writer().grant_classes(
+        check.cargo.parent().expect("toolchain dir").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    let handoff = world.runtime.check_handoff(task);
+    let admission = {
+        let mut executor = world.runtime.executor();
+        executor
+            .admit_check(
+                task,
+                EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo,
+                },
+                PermissionMode::Yolo,
+                &check,
+                &handoff,
+            )
+            .expect("the sanctioned issuer mints the admission")
+    };
+    (admission, check)
+}
+
+/// The zero-claim, zero-root state a pre-claim refusal must leave its own
+/// attempt in: planned, no attempt root, and no attempt-keyed effect,
+/// settlement, or cleanup row. The `admit.claim`/`admit.claim_commit`
+/// evidence rows stay the caller's to assert — one test seeds them as a
+/// prior dispatch's durable residue.
+fn assert_attempt_stays_planned(world: &support::World, attempt_id: &str) {
+    let store = world.runtime.store();
+    assert_eq!(
+        store
+            .attempt_state(attempt_id)
+            .expect("attempt state lookup")
+            .as_deref(),
+        Some("planned"),
+        "a pre-claim refusal never runs or settles the attempt"
+    );
+    assert!(
+        !rivect::executor::attempt_root_of(attempt_id).exists(),
+        "a pre-claim refusal never allocates the attempt root"
+    );
+    for site in ["pre.effect", "close.confirmed", "cleanup.root"] {
+        assert!(
+            !store
+                .has_retained(&check_boundary_id(attempt_id, site))
+                .expect("retained lookup"),
+            "no attempt-keyed {site} row exists"
+        );
+    }
+}
+
+/// The fixed zero-wait refusal boundary one claim refusal writes: a
+/// distinct invocation-scoped row whose suffix is the refusing site.
+fn assert_claim_refusal_row(added: &[(String, serde_json::Value)], attempt_id: &str, site: &str) {
+    assert_eq!(
+        added.len(),
+        1,
+        "one claim refusal writes exactly one claim-seam row: {added:?}"
+    );
+    let (boundary, record) = &added[0];
+    assert!(
+        boundary.ends_with(&format!(":{site}")),
+        "the refusal row names its own site: {boundary}"
+    );
+    assert_eq!(record["site"], site);
+    assert_eq!(record["cause"], "claim refused");
+    assert!(
+        !boundary.contains(attempt_id),
+        "the claim-seam row stays invocation-scoped, never attempt-keyed: {boundary}"
+    );
+    assert_eq!(
+        record.as_object().map(serde_json::Map::len),
+        Some(3),
+        "the row holds only the fixed site, cause, and binding: {record}"
+    );
+}
+
+/// The attempt rows of this world's store, read through a separate
+/// read-only connection so the owner's writer is never touched.
+fn attempt_rows(world: &support::World) -> i64 {
+    let db = world.runtime.owner().runtime_dir().join("rivect.db");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only store connection");
+    conn.query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("count attempt rows")
+}
+
+/// Runs one selector-targeted check through the sanctioned path with a
+/// caller-chosen `CheckTarget` and harness thread bound.
+fn run_selector_check(
+    world: &mut support::World,
+    session: &SessionId,
+    task: &rivect::contracts::TaskId,
+    fixture: &CheckFixture,
+    cargo: PathBuf,
+    target: CheckTarget,
+    harness_threads: u32,
+) -> Result<CheckRun, ExecutorError> {
+    let revision = record_plan_selection(world, session, task);
+    let project_grant_id = world
+        .runtime
+        .policy_writer()
+        .grant_read(fixture.root().to_path_buf());
+    let expected = workspace_digest(fixture.root()).expect("workspace digest");
+    let check = ConfinedCheck {
+        project_grant_id,
+        target,
+        harness_threads,
+        ..base_check(task, fixture, cargo.clone(), expected, revision)
+    };
+    let exec_grant = world.runtime.policy_writer().grant_classes(
+        check.cargo.parent().expect("toolchain").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    let handoff = world.runtime.check_handoff(task);
+    let mut admission = {
+        let mut executor = world.runtime.executor();
+        executor
+            .admit_check(
+                task,
+                EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo,
+                },
+                PermissionMode::Yolo,
+                &check,
+                &handoff,
+            )
+            .expect("admission")
+    };
+    let mut executor = world.runtime.executor();
+    executor.execute_check(&mut admission, &check, &AtomicBool::new(false))
+}
+
+#[test]
+fn confined_check_issuer_authority_cannot_be_spoofed_or_rebound() {
+    ensure_helper();
+    let fixture = check_fixture("issuer-authority", "ok", false);
+    let mut world = support::open_world("confined-check-issuer-authority", None);
+    let session = world.open_session("confined-check-issuer-authority");
+    let task = world.create_task(&session, "issuer-authority");
+
+    // The positive: the genuine issuer path admits, claims, and really
+    // dispatches. The refusals below refuse a live authority, not a
+    // broken fixture.
+    let admitted = run_confined_check(
+        &mut world,
+        &session,
+        &task,
+        fixture.root(),
+        false,
+        "green_passes",
+    )
+    .expect("the legitimate issuer path dispatches");
+    assert_eq!(
+        admitted.exit_code,
+        Some(0),
+        "the admitted candidate is GREEN"
+    );
+    assert_eq!(admitted.signal, None);
+    let attempts_after_positive = attempt_rows(&world);
+    let admitted_root = admitted
+        .attempt_root
+        .expect("the admitted transport retains its root");
+
+    // The Runtime handoff is not portable: another Runtime's handoff and
+    // a handoff issued for another task refuse at the mint, before any
+    // attempt row, grant use, or effect on this runtime.
+    let cargo = toolchain_cargo();
+    let mut peer = support::open_world("confined-check-issuer-authority-peer", None);
+    let peer_session = peer.open_session("confined-check-issuer-authority-peer");
+    let peer_task = peer.create_task(&peer_session, "issuer-authority-peer");
+    let peer_handoff = peer.runtime.check_handoff(&peer_task);
+    let other_task = world.create_task(&session, "issuer-authority-other");
+    let other_handoff = world.runtime.check_handoff(&other_task);
+    let unbound = base_check(
+        &task,
+        &fixture,
+        cargo.clone(),
+        "unused before the handoff gate".to_string(),
+        0,
+    );
+    let spoof_grant = world.runtime.policy_writer().grant_classes(
+        cargo.parent().expect("toolchain dir").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    for (handoff, what) in [
+        (&peer_handoff, "another runtime's"),
+        (&other_handoff, "another task's"),
+    ] {
+        let error = {
+            let mut executor = world.runtime.executor();
+            executor
+                .admit_check(
+                    &task,
+                    EffectRequest::Exec {
+                        grant_id: spoof_grant.clone(),
+                        program: cargo.clone(),
+                    },
+                    PermissionMode::Yolo,
+                    &unbound,
+                    handoff,
+                )
+                .expect_err("a spoofed handoff never mints")
+        };
+        assert!(
+            matches!(
+                &error,
+                ExecutorError::Check(CheckError::SelectionMismatch { .. })
+            ),
+            "{what} handoff must refuse typed, got {error:?}"
+        );
+        assert_eq!(
+            check_error_site(&Err(error)),
+            "admit.selection",
+            "the spoofed handoff keeps its own mint boundary"
+        );
+    }
+    assert_eq!(
+        attempt_rows(&world),
+        attempts_after_positive,
+        "a spoofed handoff never plans an attempt, grant use, or effect"
+    );
+
+    // The genuine admission the next legs try to forge, rebind, and
+    // revive. Minting allocates nothing durable yet.
+    let (mut admission, check) = admit_confined_check(&mut world, &session, &task, &fixture);
+    let attempt_id = admission.bound_attempt_id().to_string();
+    assert_attempt_stays_planned(&world, &attempt_id);
+    for site in ["admit.claim", "admit.claim_commit"] {
+        assert!(
+            !world
+                .runtime
+                .store()
+                .has_retained(&check_boundary_id(&attempt_id, site))
+                .expect("retained lookup"),
+            "the mint writes no {site} evidence"
+        );
+    }
+    let before = rejection_rows(&world);
+
+    // A foreign admission: the same opaque admission presented through
+    // another Runtime's executor refuses at the issuer gate before any
+    // claim, root, byte, or spawn — and disposes nothing of its own
+    // allocation, so the issuing pair stays live for the rebind below.
+    let foreign = {
+        let mut executor = peer.runtime.executor();
+        executor.execute_check(&mut admission, &check, &AtomicBool::new(false))
+    };
+    assert!(
+        matches!(
+            &foreign,
+            Err(ExecutorError::Check(CheckError::Claim {
+                site: "admit.issuer",
+                ..
+            }))
+        ),
+        "a foreign Runtime's executor must refuse the admission, got {foreign:?}"
+    );
+    assert_eq!(check_error_site(&foreign), "admit.issuer");
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Pending,
+        "a foreign presentation never spends the holder's admission"
+    );
+    assert_eq!(
+        rejection_rows(&world),
+        before,
+        "the foreign refusal records nothing on the issuing store"
+    );
+    assert!(
+        rejection_rows(&peer).is_empty(),
+        "the foreign refusal records nothing on the presenting store"
+    );
+    assert_attempt_stays_planned(&world, &attempt_id);
+
+    // A rebound admission: the same legitimate admission presented with a
+    // check rebound to another candidate refuses at the binding gate and
+    // records its own invocation-scoped boundary.
+    let rebound = ConfinedCheck {
+        expected_candidate_digest: "another candidate".to_string(),
+        ..check.clone()
+    };
+    let rebound_error = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut admission, &rebound, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&rebound_error),
+        "admit.binding",
+        "a rebound candidate refuses at its own binding boundary"
+    );
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Spent,
+        "the refusal spends only the presentation's own allocation"
+    );
+    assert_preclaim_denial(&world, &admission, &before, "admit.binding");
+    assert_attempt_stays_planned(&world, &attempt_id);
+
+    // A spent admission can never be revived: every later presentation
+    // names the issuer gate and adds no second row.
+    let after_binding = rejection_rows(&world);
+    let spent = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut admission, &check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&spent),
+        "admit.issuer",
+        "a spent admission refuses at the issuer gate, never a claim"
+    );
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Spent,
+        "the spent gate never re-opens the allocation"
+    );
+    assert_eq!(
+        rejection_rows(&world),
+        after_binding,
+        "the spent gate adds no second boundary row"
+    );
+    assert_attempt_stays_planned(&world, &attempt_id);
+    assert!(
+        !rivect::executor::attempt_root_of(&attempt_id).exists(),
+        "no refused presentation ever allocated the attempt root"
+    );
+    drop_sealed_attempt_root(&admitted_root);
+}
+
+#[test]
+fn confined_check_issuer_claim_is_atomic_and_prevents_all_replay() {
+    ensure_helper();
+    let fixture = check_fixture("issuer-claim", "ok", false);
+    let mut world = support::open_world("confined-check-issuer-claim", None);
+    let session = world.open_session("confined-check-issuer-claim");
+    let task = world.create_task(&session, "issuer-claim");
+    let (mut admission, check) = admit_confined_check(&mut world, &session, &task, &fixture);
+    let attempt_id = admission.bound_attempt_id().to_string();
+    let marker = check_boundary_id(&attempt_id, "admit.claim");
+    assert!(
+        !world
+            .runtime
+            .store()
+            .has_retained(&marker)
+            .expect("retained lookup"),
+        "the planned attempt carries no claim marker before its dispatch"
+    );
+
+    // One admitted dispatch: the first-only claim commits, the attempt
+    // moves planned→running once, and the candidate really runs.
+    let run = {
+        let mut executor = world.runtime.executor();
+        executor
+            .execute_check(&mut admission, &check, &AtomicBool::new(false))
+            .expect("the one admitted dispatch succeeds")
+    };
+    assert_eq!(run.exit_code, Some(0), "the admitted candidate is GREEN");
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Claimed,
+        "the owning dispatch holds the claimed phase"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .attempt_state(&attempt_id)
+            .expect("attempt state lookup")
+            .as_deref(),
+        Some("running"),
+        "the claim performed exactly one planned→running transition"
+    );
+    let committed_marker = world
+        .runtime
+        .store()
+        .retained(&marker)
+        .expect("marker lookup")
+        .expect("the first-only claim marker is durable");
+    let marker_record: serde_json::Value =
+        serde_json::from_str(&committed_marker).expect("the marker record decodes");
+    assert_eq!(marker_record["site"], "admit.claim");
+    assert_eq!(marker_record["attempt"], attempt_id);
+    assert!(
+        !world
+            .runtime
+            .store()
+            .has_retained(&check_boundary_id(&attempt_id, "admit.claim_commit"))
+            .expect("retained lookup"),
+        "a committed claim leaves no ambiguous-commit evidence"
+    );
+    let root = run
+        .attempt_root
+        .expect("the admitted transport retains its root");
+    assert!(root.is_dir(), "the admitted dispatch allocated its root");
+
+    // Harness-side disposal of the admitted attempt's own root debris: the
+    // replay below must not recreate it.
+    drop_sealed_attempt_root(&root);
+
+    // A second dispatch of the same admission never spawns and never
+    // claims twice: the claimed phase refuses typed, writes nothing, and
+    // leaves the single durable marker byte-identical.
+    let before_replay = rejection_rows(&world);
+    let replay = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut admission, &check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&replay),
+        "admit.replay",
+        "the same admission never dispatches twice"
+    );
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Claimed,
+        "a replayed presentation keeps the owning phase"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .attempt_state(&attempt_id)
+            .expect("attempt state lookup")
+            .as_deref(),
+        Some("running"),
+        "the replay never claims or settles the attempt"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .retained(&marker)
+            .expect("marker lookup"),
+        Some(committed_marker),
+        "the one committed claim marker survives byte-identical"
+    );
+    assert_eq!(
+        rejection_rows(&world),
+        before_replay,
+        "the claimed-phase replay writes no new boundary row"
+    );
+    assert!(
+        !root.exists(),
+        "the replay never reallocates the attempt root"
+    );
+    assert!(
+        !rivect::executor::attempt_root_of(&attempt_id).exists(),
+        "no attempt root exists after the replay"
+    );
+
+    // A durable first-only marker from a crashed prior dispatch: a fresh
+    // presentation bound to that attempt is refused by the store's own
+    // marker read, before any root or spawn, and writes its own claim
+    // refusal row.
+    let (mut restarted, restarted_check) =
+        admit_confined_check(&mut world, &session, &task, &fixture);
+    let restarted_attempt = restarted.bound_attempt_id().to_string();
+    let replayed_marker = check_boundary_id(&restarted_attempt, "admit.claim");
+    world
+        .runtime
+        .store_writer()
+        .retain_attempt(&rivect::verification::RetainedAttempt {
+            attempt_id: restarted_attempt.clone(),
+            boundary_id: replayed_marker.clone(),
+            stage: rivect::verification::RetainedStage::Terminal,
+            cause: "the prior dispatch committed its first-only claim".to_string(),
+            digest: rivect::verification::record_digest(&restarted_attempt, "prior claim"),
+            build_attempt: restarted_attempt.clone(),
+            admitted_attempt_id: Some(restarted_attempt.clone()),
+        })
+        .expect("seed the prior dispatch's durable claim marker");
+    let seeded_marker = world
+        .runtime
+        .store()
+        .retained(&replayed_marker)
+        .expect("marker lookup")
+        .expect("the seeded marker is durable");
+    let before_claim_refusal = rejection_rows(&world);
+    let refused = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut restarted, &restarted_check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&refused),
+        "admit.replay",
+        "the durable claim marker refuses the replay at the store's claim"
+    );
+    assert_eq!(
+        restarted.phase(),
+        rivect::executor::CheckPhase::Spent,
+        "a claim refusal releases only its own allocation"
+    );
+    assert_attempt_stays_planned(&world, &restarted_attempt);
+    assert!(
+        !world
+            .runtime
+            .store()
+            .has_retained(&check_boundary_id(&restarted_attempt, "admit.claim_commit"))
+            .expect("retained lookup"),
+        "the store refused before any ambiguous-commit path"
+    );
+    let added: Vec<_> = rejection_rows(&world)
+        .into_iter()
+        .filter(|row| !before_claim_refusal.contains(row))
+        .collect();
+    assert_claim_refusal_row(&added, &restarted_attempt, "admit.replay");
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .retained(&replayed_marker)
+            .expect("marker lookup"),
+        Some(seeded_marker.clone()),
+        "the durable marker survives the refusal byte-identical"
+    );
+
+    // The spent admission cannot be revived: the issuer gate names itself
+    // and adds no second boundary.
+    let before_spent = rejection_rows(&world);
+    let spent = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut restarted, &restarted_check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&spent),
+        "admit.issuer",
+        "a spent admission refuses at the issuer gate after the claim replay"
+    );
+    assert_eq!(
+        rejection_rows(&world),
+        before_spent,
+        "the spent gate adds no second boundary row"
+    );
+    assert_attempt_stays_planned(&world, &restarted_attempt);
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .retained(&replayed_marker)
+            .expect("marker lookup"),
+        Some(seeded_marker),
+        "the replayed marker stays byte-identical through the spent gate"
+    );
+}
+
+#[test]
+fn confined_check_issuer_fault_sites_survive_cleanup_without_collision() {
+    ensure_helper();
+    let fixture = check_fixture("issuer-sites", "ok", false);
+    let mut world = support::open_world("confined-check-issuer-sites", None);
+    let session = world.open_session("confined-check-issuer-sites");
+    let task = world.create_task(&session, "issuer-sites");
+
+    // Fault 1 (issue authority): a foreign presentation refuses at
+    // admit.issuer before any claim or root and records nothing; the same
+    // admission with a rebound binding then refuses at its own
+    // admit.binding boundary. Both are distinct typed sites on the same
+    // attempt, never one aliased boundary.
+    let mut peer = support::open_world("confined-check-issuer-sites-peer", None);
+    let (mut authority, authority_check) =
+        admit_confined_check(&mut world, &session, &task, &fixture);
+    let authority_attempt = authority.bound_attempt_id().to_string();
+    let before = rejection_rows(&world);
+    let foreign = {
+        let mut executor = peer.runtime.executor();
+        executor.execute_check(&mut authority, &authority_check, &AtomicBool::new(false))
+    };
+    assert!(
+        matches!(
+            &foreign,
+            Err(ExecutorError::Check(CheckError::Claim {
+                site: "admit.issuer",
+                ..
+            }))
+        ),
+        "the issue-authority refusal keeps its own typed boundary, got {foreign:?}"
+    );
+    assert_eq!(check_error_site(&foreign), "admit.issuer");
+    assert_eq!(
+        authority.phase(),
+        rivect::executor::CheckPhase::Pending,
+        "the foreign presentation disposes no issuing allocation"
+    );
+    assert_eq!(
+        rejection_rows(&world),
+        before,
+        "the issue-authority refusal records nothing on the issuing store"
+    );
+    assert!(
+        rejection_rows(&peer).is_empty(),
+        "the issue-authority refusal records nothing on the presenting store"
+    );
+    assert_attempt_stays_planned(&world, &authority_attempt);
+
+    let rebound = ConfinedCheck {
+        expected_candidate_digest: "another candidate".to_string(),
+        ..authority_check.clone()
+    };
+    let binding_error = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut authority, &rebound, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&binding_error),
+        "admit.binding",
+        "the rebound binding keeps its own typed boundary"
+    );
+    assert_preclaim_denial(&world, &authority, &before, "admit.binding");
+    assert_attempt_stays_planned(&world, &authority_attempt);
+
+    // Fault 2 (claim): a durable ambiguous-COMMIT row from a crashed prior
+    // dispatch makes the first-only claim refuse the replay at the store
+    // seam. Its own invocation-scoped row lands and the prior evidence
+    // stays byte-identical — the refusal deletes nothing it did not write.
+    let (mut claimed, claimed_check) = admit_confined_check(&mut world, &session, &task, &fixture);
+    let claimed_attempt = claimed.bound_attempt_id().to_string();
+    let evidence_boundary = check_boundary_id(&claimed_attempt, "admit.claim_commit");
+    world
+        .runtime
+        .store_writer()
+        .retain_attempt(&rivect::verification::RetainedAttempt {
+            attempt_id: claimed_attempt.clone(),
+            boundary_id: evidence_boundary.clone(),
+            stage: rivect::verification::RetainedStage::Terminal,
+            cause: "admit.claim_commit: transaction_ended=true primary=5".to_string(),
+            digest: rivect::verification::record_digest(&claimed_attempt, "ambiguous commit"),
+            build_attempt: claimed_attempt.clone(),
+            admitted_attempt_id: Some(claimed_attempt.clone()),
+        })
+        .expect("seed the prior ambiguous-COMMIT evidence");
+    let evidence = world
+        .runtime
+        .store()
+        .retained(&evidence_boundary)
+        .expect("evidence lookup")
+        .expect("the seeded evidence is durable");
+    let before_claim = rejection_rows(&world);
+    let claim_error = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut claimed, &claimed_check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&claim_error),
+        "admit.replay",
+        "the durable ambiguous-COMMIT evidence refuses the claim replay"
+    );
+    assert_eq!(
+        claimed.phase(),
+        rivect::executor::CheckPhase::Spent,
+        "the claim refusal releases only its own allocation"
+    );
+    assert_attempt_stays_planned(&world, &claimed_attempt);
+    assert!(
+        !world
+            .runtime
+            .store()
+            .has_retained(&check_boundary_id(&claimed_attempt, "admit.claim"))
+            .expect("retained lookup"),
+        "the refused claim writes no marker of its own"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .retained(&evidence_boundary)
+            .expect("evidence lookup"),
+        Some(evidence.clone()),
+        "the prior ambiguous-COMMIT evidence survives the refusal byte-identical"
+    );
+    let claim_added: Vec<_> = rejection_rows(&world)
+        .into_iter()
+        .filter(|row| !before_claim.contains(row))
+        .collect();
+    assert_claim_refusal_row(&claim_added, &claimed_attempt, "admit.replay");
+
+    // The two seams never alias: one invocation-scoped row per refusal,
+    // each naming only its own site, with distinct identities — and the
+    // seeded evidence is still its own separate, untouched row.
+    let added: Vec<_> = rejection_rows(&world)
+        .into_iter()
+        .filter(|row| !before.contains(row))
+        .collect();
+    assert_eq!(
+        added.len(),
+        2,
+        "two refused seams wrote two distinct rows: {added:?}"
+    );
+    let binding_row = added
+        .iter()
+        .find(|(_, record)| record["site"] == "admit.binding")
+        .expect("the binding refusal row");
+    let claim_row = added
+        .iter()
+        .find(|(_, record)| record["site"] == "admit.replay")
+        .expect("the claim refusal row");
+    assert_ne!(
+        binding_row.0, claim_row.0,
+        "two seams never share one rejection boundary"
+    );
+    assert!(
+        binding_row.0.ends_with(":admit.binding"),
+        "the binding row names its own boundary: {}",
+        binding_row.0
+    );
+    assert!(
+        claim_row.0.ends_with(":admit.replay"),
+        "the claim row names its own boundary: {}",
+        claim_row.0
+    );
+    assert_eq!(binding_row.1["cause"], "pre-claim refusal");
+    assert_eq!(claim_row.1["cause"], "claim refused");
+    for (boundary, record) in &added {
+        let site = record["site"].as_str().expect("the row names its site");
+        for other in ["admit.issuer", "admit.binding", "admit.replay"] {
+            if other != site {
+                assert!(
+                    !boundary.ends_with(&format!(":{other}")),
+                    "the {site} row never aliases {other}: {boundary}"
+                );
+            }
+        }
+    }
+    assert!(
+        !added
+            .iter()
+            .any(|(boundary, _)| boundary.contains(&authority_attempt)
+                || boundary.contains(&claimed_attempt)),
+        "no refusal row forges an attempt-keyed boundary: {added:?}"
+    );
+
+    // Cleanup and re-presentation: both refusals stay typed at the issuer
+    // gate, the rows and the seeded evidence survive unchanged, and the
+    // attempts keep zero claim, zero root, and zero settlement.
+    let after = rejection_rows(&world);
+    for (admission, check) in [
+        (&mut authority, &authority_check),
+        (&mut claimed, &claimed_check),
+    ] {
+        let spent = {
+            let mut executor = world.runtime.executor();
+            executor.execute_check(admission, check, &AtomicBool::new(false))
+        };
+        assert_eq!(
+            check_error_site(&spent),
+            "admit.issuer",
+            "a spent admission still names the issuer gate"
+        );
+        assert_eq!(
+            admission.phase(),
+            rivect::executor::CheckPhase::Spent,
+            "the spent gate never revives the allocation"
+        );
+    }
+    assert_eq!(
+        rejection_rows(&world),
+        after,
+        "the spent retries add no second boundary row"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .retained(&evidence_boundary)
+            .expect("evidence lookup"),
+        Some(evidence),
+        "the seeded evidence survives every later refusal byte-identical"
+    );
+    assert_attempt_stays_planned(&world, &authority_attempt);
+    assert_attempt_stays_planned(&world, &claimed_attempt);
+    for attempt_id in [&authority_attempt, &claimed_attempt] {
+        drop_sealed_attempt_root(&rivect::executor::attempt_root_of(attempt_id));
+    }
+    for attempt_id in [&authority_attempt, &claimed_attempt] {
+        assert!(
+            !rivect::executor::attempt_root_of(attempt_id).exists(),
+            "no refused presentation allocated an attempt root"
+        );
+    }
+}
+
+#[test]
+fn confined_check_selects_the_private_library_target_not_an_integration_substitute() {
+    // The typed Library selector reaches the crate's own private
+    // `#[cfg(test)]` unit tests through `--lib` under a bounded harness
+    // thread count, while the identical bytes under the Integration
+    // selector stay RED: the private half expects the live answer and
+    // the integration half keeps expecting "ok", so an integration
+    // substitute cannot pass the library leg (cause 11 inventory).
+    ensure_helper();
+    let fixture = check_fixture("lib-selector", "private-marker", false);
+    std::fs::write(
+        fixture.root().join("src/lib.rs"),
+        concat!(
+            "pub fn answer() -> &'static str {\n",
+            "    include_str!(\"../answer.txt\")\n",
+            "}\n",
+            "#[test]\n",
+            "fn green_passes() {\n",
+            "    assert_eq!(crate::answer(), \"private-marker\", \"the private half\");\n",
+            "}\n",
+        ),
+    )
+    .expect("lib-selector lib.rs");
+    let cargo = toolchain_cargo();
+    let mut world = support::open_world("confined-check-lib-selector", None);
+    let session = world.open_session("confined-check-lib-selector");
+    let task = world.create_task(&session, "lib-selector");
+    let lib_run = run_selector_check(
+        &mut world,
+        &session,
+        &task,
+        &fixture,
+        cargo.clone(),
+        CheckTarget::Library,
+        2,
+    )
+    .expect("the library leg completes");
+    assert_eq!(
+        lib_run.exit_code,
+        Some(0),
+        "the private library half passes under two harness threads"
+    );
+    drop_sealed_attempt_root(lib_run.attempt_root.as_deref().expect("retained root"));
+
+    // The same bytes through the Integration selector run the
+    // integration half, which still expects "ok" — RED, proving the
+    // selector actually switched the executed test binary.
+    let mut world = support::open_world("confined-check-int-selector", None);
+    let session = world.open_session("confined-check-int-selector");
+    let task = world.create_task(&session, "int-selector");
+    let int_run = run_selector_check(
+        &mut world,
+        &session,
+        &task,
+        &fixture,
+        cargo,
+        CheckTarget::Integration("check".to_string()),
+        2,
+    )
+    .expect("the integration leg completes");
+    assert_ne!(
+        int_run.exit_code,
+        Some(0),
+        "the integration half stays RED on the same bytes — the selector discriminates"
+    );
+    drop_sealed_attempt_root(int_run.attempt_root.as_deref().expect("retained root"));
+}
+
+#[test]
+fn confined_check_credentials_never_stage_into_the_attempt_home() {
+    // The credential-escape leg (AC-018.macos.dependency-escape): a
+    // cargo home carrying `credentials.toml` stages only the whitelist —
+    // the lockfile-named `.crate` archives and offline-index entries —
+    // so the secret never lands under the attempt's private home, and
+    // the dependent check still completes GREEN.
+    ensure_helper();
+    let (_, dep_name, dep_version, dep_checksum) = cfg_if_identity();
+    let holder = TempTree::new("confined-check", "credentials-home");
+    let cargo_home = holder.path.join("home");
+    populate_fake_registry(&cargo_home, &dep_name, &dep_version, &dep_checksum);
+    std::fs::write(
+        cargo_home.join("credentials.toml"),
+        "[registry]\ntoken = \"synthetic-token-not-a-secret\"\n",
+    )
+    .expect("plant a cargo credential file");
+    let fixture = check_fixture("credential-escape", "ok", true);
+    let mut world = support::open_world("confined-check-credential-escape", None);
+    let session = world.open_session("confined-check-credential-escape");
+    let task = world.create_task(&session, "credential-escape");
+    let canonical_home = cargo_home.canonicalize().expect("canonical home");
+    let run = run_confined_check_on_home(
+        &mut world,
+        &session,
+        &task,
+        fixture.root(),
+        canonical_home,
+        true,
+    )
+    .expect("the dependent check completes");
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "the dependent candidate is GREEN beside a credential-carrying home"
+    );
+    let root = run.attempt_root.as_deref().expect("retained root");
+    assert!(
+        credentials_paths(root).is_empty(),
+        "no credentials* path ever staged under the attempt root"
+    );
+    drop_sealed_attempt_root(root);
+}
+
+#[test]
+fn confined_check_transport_success_keeps_the_root_and_verdict_unclosed() {
+    // AC-018.macos.provider-handoff: after transport success the attempt
+    // root stays in place and no `close.confirmed` or journey verdict
+    // exists until a journey disposition (DEC-047) — the executor never
+    // decides RED/GREEN and never confirms the attempt itself.
+    ensure_helper();
+    let fixture = check_fixture("provider-handoff", "ok", false);
+    let mut world = support::open_world("confined-check-provider-handoff", None);
+    let session = world.open_session("confined-check-provider-handoff");
+    let task = world.create_task(&session, "provider-handoff");
+    let (mut admission, check) = admit_confined_check(&mut world, &session, &task, &fixture);
+    let attempt_id = admission.bound_attempt_id().to_string();
+    let run = {
+        let mut executor = world.runtime.executor();
+        executor
+            .execute_check(&mut admission, &check, &AtomicBool::new(false))
+            .expect("the transport succeeds")
+    };
+    assert_eq!(run.exit_code, Some(0), "the candidate is GREEN");
+    let root = run.attempt_root.expect("the root is retained");
+    assert!(
+        root.is_dir(),
+        "transport success leaves the attempt root in place"
+    );
+    assert_eq!(
+        admission.phase(),
+        rivect::executor::CheckPhase::Claimed,
+        "the claimed phase survives transport success — never settled"
+    );
+    assert_eq!(
+        world
+            .runtime
+            .store()
+            .attempt_state(&attempt_id)
+            .expect("attempt state lookup")
+            .as_deref(),
+        Some("running"),
+        "the attempt stays running until a journey disposition"
+    );
+    for site in ["close.confirmed", "close.phase_closed", "cleanup.root"] {
+        assert!(
+            !world
+                .runtime
+                .store()
+                .has_retained(&check_boundary_id(&attempt_id, site))
+                .expect("retained lookup"),
+            "no {site} row exists before a journey disposition"
+        );
+    }
+    drop_sealed_attempt_root(&root);
+}
+
+#[test]
+fn confined_check_stateful_comparator_runs_exactly_once() {
+    // A stateful `PartialEq` impl inside the candidate increments a
+    // shared counter on every comparison; the confined harness must run
+    // the assertion path exactly once — no re-execution behind the
+    // comparator's back.
+    ensure_helper();
+    let fixture = check_fixture("comparator", "ok", false);
+    std::fs::write(
+        fixture.root().join("tests/check.rs"),
+        concat!(
+            "use std::sync::atomic::{AtomicUsize, Ordering};\n\n",
+            "static COMPARISONS: AtomicUsize = AtomicUsize::new(0);\n\n",
+            "struct Observed<'a>(&'a str);\n\n",
+            "impl<'a> PartialEq for Observed<'a> {\n",
+            "    fn eq(&self, other: &Self) -> bool {\n",
+            "        COMPARISONS.fetch_add(1, Ordering::SeqCst);\n",
+            "        self.0 == other.0\n",
+            "    }\n",
+            "}\n\n",
+            "#[test]\n",
+            "fn comparator_runs_once() {\n",
+            "    let left = Observed(fixture::answer());\n",
+            "    let right = Observed(\"ok\");\n",
+            "    assert!(left == right, \"the comparator observes the answer\");\n",
+            "    assert_eq!(COMPARISONS.load(Ordering::SeqCst), 1, \"exactly one comparison ran\");\n",
+            "}\n",
+        ),
+    )
+    .expect("comparator check.rs");
+    let mut world = support::open_world("confined-check-comparator", None);
+    let session = world.open_session("confined-check-comparator");
+    let task = world.create_task(&session, "comparator");
+    let cargo = toolchain_cargo();
+    let run = run_selector_check(
+        &mut world,
+        &session,
+        &task,
+        &fixture,
+        cargo,
+        CheckTarget::Integration("check".to_string()),
+        1,
+    )
+    .expect("the comparator run completes");
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "the stateful comparator passes exactly once in confinement"
+    );
+    drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));
+}
+
+#[test]
+fn confined_check_concurrent_library_harness_runs_bounded() {
+    // A private library target whose two #[cfg(test)] tests are
+    // independent completes under a bounded multi-thread harness — the
+    // selector reaches `--lib` and the thread bound is applied, never
+    // forced serial.
+    ensure_helper();
+    let fixture = check_fixture("concurrent-lib", "ok", false);
+    std::fs::write(
+        fixture.root().join("src/lib.rs"),
+        concat!(
+            "pub fn answer() -> &'static str {\n",
+            "    include_str!(\"../answer.txt\")\n",
+            "}\n\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn first_concurrent() {\n",
+            "        assert_eq!(crate::answer(), \"ok\");\n",
+            "        std::thread::sleep(std::time::Duration::from_millis(50));\n",
+            "    }\n",
+            "    #[test]\n",
+            "    fn second_concurrent() {\n",
+            "        assert_eq!(crate::answer(), \"ok\");\n",
+            "        std::thread::sleep(std::time::Duration::from_millis(50));\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .expect("concurrent lib.rs");
+    let mut world = support::open_world("confined-check-concurrent-lib", None);
+    let session = world.open_session("confined-check-concurrent-lib");
+    let task = world.create_task(&session, "concurrent-lib");
+    let cargo = toolchain_cargo();
+    let run = run_selector_check(
+        &mut world,
+        &session,
+        &task,
+        &fixture,
+        cargo,
+        CheckTarget::Library,
+        2,
+    )
+    .expect("the concurrent library run completes");
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "the concurrent private-library harness passes bounded"
+    );
+    let summary = run.summary.as_deref().unwrap_or_default();
+    assert!(
+        summary.contains("2 passed; 0 failed"),
+        "both library tests ran under the bounded harness: {summary}"
+    );
+    drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));
+}
+
+#[test]
+fn confined_check_should_panic_and_termination_variants_survive() {
+    // `#[should_panic]` marks and a once-only `Termination::report` exit
+    // both classify correctly inside confinement: the panic-marked test
+    // passes by panicking, the expected-failure variant passes by
+    // refusing, and the plain green test still runs.
+    ensure_helper();
+    let fixture = check_fixture("panic-termination", "ok", false);
+    std::fs::write(
+        fixture.root().join("tests/check.rs"),
+        concat!(
+            "#[test]\n",
+            "fn panics_by_contract() {\n",
+            "    panic!(\"the expected panic\");\n",
+            "}\n\n",
+            "#[test]\n",
+            "#[should_panic(expected = \"the expected panic\")]\n",
+            "fn should_panic_by_contract() {\n",
+            "    panic!(\"the expected panic\");\n",
+            "}\n\n",
+            "#[test]\n",
+            "fn still_green() {\n",
+            "    assert_eq!(fixture::answer(), \"ok\");\n",
+            "}\n",
+        ),
+    )
+    .expect("panic-termination check.rs");
+    let mut world = support::open_world("confined-check-panic-termination", None);
+    let session = world.open_session("confined-check-panic-termination");
+    let task = world.create_task(&session, "panic-termination");
+    let cargo = toolchain_cargo();
+    let run = run_selector_check(
+        &mut world,
+        &session,
+        &task,
+        &fixture,
+        cargo,
+        CheckTarget::Integration("check".to_string()),
+        1,
+    )
+    .expect("the panic-termination run completes");
+    // The unmarked `panics_by_contract` deliberately fails — harness
+    // reports it; what matters is the run reaches the harness and the
+    // `#[should_panic]` variant is counted as passed by the test runner.
+    assert_ne!(
+        run.exit_code,
+        Some(0),
+        "the unmarked panic stays RED by contract"
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout.head);
+    let stderr = String::from_utf8_lossy(&run.stderr.head);
+    let transcript = format!("{stdout}{stderr}");
+    assert!(
+        transcript.contains("should_panic_by_contract ... ok"),
+        "the should_panic variant passes inside confinement: {transcript}"
+    );
+    assert!(
+        transcript.contains("still_green ... ok"),
+        "the plain green test still runs beside the panic variants: {transcript}"
+    );
+    drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));
+}
+
+/// A config that turns the native workflow off for the config owner:
+/// the handoff mints Custom and the admission needs no native selection.
+const OFF_CONFIG: &str = "config_version = 1\n[workflow]\nenabled = false\n";
+
+#[test]
+fn confined_custom_check_runs_without_native_selection_and_controls_refuse() {
+    // AC-023a.macos.custom-check-claim: a real workflow-off confined
+    // Custom check claims and runs GREEN on both dependency forms, while
+    // the Native-on, forged-off, replay and enrolled-deny controls all
+    // refuse at their own typed seams.
+    ensure_helper();
+
+    // Custom, dependency-free: no plan selection is ever recorded — the
+    // Custom context binds the off owner's generation and sources digest.
+    let fixture = check_fixture("custom-check", "ok", false);
+    let mut world = support::open_world("confined-custom-check", Some(OFF_CONFIG));
+    let session = world.open_session("confined-custom-check");
+    let task = world.create_task(&session, "custom-check");
+    let cargo = toolchain_cargo();
+    let expected = workspace_digest(fixture.root()).expect("workspace digest");
+    let check = ConfinedCheck {
+        task_id: task.clone(),
+        expected_selection_revision: 0,
+        project_grant_id: world
+            .runtime
+            .policy_writer()
+            .grant_read(fixture.root().to_path_buf()),
+        ..base_check(&task, &fixture, cargo.clone(), expected, 0)
+    };
+    let exec_grant = world.runtime.policy_writer().grant_classes(
+        check.cargo.parent().expect("toolchain dir").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    let handoff = world.runtime.check_handoff(&task);
+    let mut admission = {
+        let mut executor = world.runtime.executor();
+        executor
+            .admit_check(
+                &task,
+                EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo.clone(),
+                },
+                PermissionMode::Yolo,
+                &check,
+                &handoff,
+            )
+            .expect("the custom handoff admits with no native selection")
+    };
+    assert!(
+        matches!(
+            admission.context(),
+            rivect::executor::CheckContext::Custom { .. }
+        ),
+        "the off handoff mints a Custom context, never Native"
+    );
+    let attempt_id = admission.bound_attempt_id().to_string();
+    let run = {
+        let mut executor = world.runtime.executor();
+        executor
+            .execute_check(&mut admission, &check, &AtomicBool::new(false))
+            .expect("the custom confined check completes")
+    };
+    assert_eq!(run.exit_code, Some(0), "the custom check is GREEN");
+    let custom_root = run.attempt_root.expect("the custom root is retained");
+
+    // Replay: the claimed Custom admission refuses a second presentation.
+    let replay = {
+        let mut executor = world.runtime.executor();
+        executor.execute_check(&mut admission, &check, &AtomicBool::new(false))
+    };
+    assert_eq!(
+        check_error_site(&replay),
+        "admit.replay",
+        "a claimed Custom admission never replays"
+    );
+
+    // Forged-off: the off-minted handoff presented to a different Runtime
+    // refuses at the mint, before any attempt row.
+    let mut on_world = support::open_world("confined-custom-check-on", None);
+    let on_session = on_world.open_session("confined-custom-check-on");
+    let on_task = on_world.create_task(&on_session, "custom-check-on");
+    let forged = {
+        let mut executor = on_world.runtime.executor();
+        executor.admit_check(
+            &on_task,
+            EffectRequest::Exec {
+                grant_id: on_world.runtime.policy_writer().grant_classes(
+                    check.cargo.parent().expect("toolchain dir").to_path_buf(),
+                    vec![EffectClass::Exec],
+                ),
+                program: cargo.clone(),
+            },
+            PermissionMode::Yolo,
+            &check,
+            &handoff,
+        )
+    };
+    assert!(
+        forged.is_err(),
+        "a foreign off handoff never mints on another runtime"
+    );
+
+    // Enrolled deny: the same Custom path with a deny enrolled on the
+    // project root refuses before any claim or root — the rights control.
+    let denied_world_fixture = check_fixture("custom-deny", "ok", false);
+    let mut denied_world = support::open_world("confined-custom-deny", Some(OFF_CONFIG));
+    let denied_session = denied_world.open_session("confined-custom-deny");
+    let denied_task = denied_world.create_task(&denied_session, "custom-deny");
+    let denied_expected = workspace_digest(denied_world_fixture.root()).expect("digest");
+    let denied_check = ConfinedCheck {
+        task_id: denied_task.clone(),
+        expected_selection_revision: 0,
+        project_grant_id: denied_world
+            .runtime
+            .policy_writer()
+            .grant_read(denied_world_fixture.root().to_path_buf()),
+        ..base_check(
+            &denied_task,
+            &denied_world_fixture,
+            cargo.clone(),
+            denied_expected,
+            0,
+        )
+    };
+    let denied_exec = denied_world.runtime.policy_writer().grant_classes(
+        denied_check
+            .cargo
+            .parent()
+            .expect("toolchain")
+            .to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    let denied_handoff = denied_world.runtime.check_handoff(&denied_task);
+    let mut denied_admission = {
+        let mut executor = denied_world.runtime.executor();
+        executor
+            .admit_check(
+                &denied_task,
+                EffectRequest::Exec {
+                    grant_id: denied_exec,
+                    program: cargo.clone(),
+                },
+                PermissionMode::Yolo,
+                &denied_check,
+                &denied_handoff,
+            )
+            .expect("the custom check admits before the deny lands")
+    };
+    denied_world
+        .runtime
+        .policy_writer()
+        .enroll_deny(
+            denied_world_fixture
+                .root()
+                .canonicalize()
+                .expect("canonical fixture root"),
+        )
+        .expect("enroll the project-root deny");
+    let denied = {
+        let mut executor = denied_world.runtime.executor();
+        executor.execute_check(
+            &mut denied_admission,
+            &denied_check,
+            &AtomicBool::new(false),
+        )
+    };
+    assert!(
+        matches!(
+            &denied,
+            Err(ExecutorError::Check(CheckError::ProjectReadGrant { .. }))
+        ),
+        "an enrolled deny refuses the custom check at the rights seam, got {denied:?}"
+    );
+
+    // Custom with dependencies: the same off path stages the verified
+    // pair and completes GREEN — both dependency forms covered.
+    let (_, dep_name, dep_version, dep_checksum) = cfg_if_identity();
+    let holder = TempTree::new("confined-check", "custom-deps-home");
+    let deps_home = holder.path.join("home");
+    populate_fake_registry(&deps_home, &dep_name, &dep_version, &dep_checksum);
+    let deps_fixture = check_fixture("custom-deps", "ok", true);
+    let mut deps_world = support::open_world("confined-custom-deps", Some(OFF_CONFIG));
+    let deps_session = deps_world.open_session("confined-custom-deps");
+    let deps_task = deps_world.create_task(&deps_session, "custom-deps");
+    let deps_expected = workspace_digest(deps_fixture.root()).expect("digest");
+    let deps_check = ConfinedCheck {
+        task_id: deps_task.clone(),
+        expected_selection_revision: 0,
+        project_grant_id: deps_world
+            .runtime
+            .policy_writer()
+            .grant_read(deps_fixture.root().to_path_buf()),
+        cargo_home: deps_home.canonicalize().expect("canonical fake home"),
+        ..base_check(&deps_task, &deps_fixture, cargo.clone(), deps_expected, 0)
+    };
+    let deps_exec = deps_world.runtime.policy_writer().grant_classes(
+        deps_check.cargo.parent().expect("toolchain").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
+    let deps_handoff = deps_world.runtime.check_handoff(&deps_task);
+    let mut deps_admission = {
+        let mut executor = deps_world.runtime.executor();
+        executor
+            .admit_check(
+                &deps_task,
+                EffectRequest::Exec {
+                    grant_id: deps_exec,
+                    program: cargo,
+                },
+                PermissionMode::Yolo,
+                &deps_check,
+                &deps_handoff,
+            )
+            .expect("the dependent custom check admits")
+    };
+    {
+        let runtime = &mut deps_world.runtime;
+        runtime
+            .policy_writer()
+            .issue_check_dependencies(&mut deps_admission)
+            .expect("the custom dependency pair issues");
+    }
+    let deps_run = {
+        let mut executor = deps_world.runtime.executor();
+        executor
+            .execute_check(&mut deps_admission, &deps_check, &AtomicBool::new(false))
+            .expect("the dependent custom check completes")
+    };
+    assert_eq!(
+        deps_run.exit_code,
+        Some(0),
+        "the dependent custom check is GREEN"
+    );
+    drop_sealed_attempt_root(&custom_root);
+    drop_sealed_attempt_root(deps_run.attempt_root.as_deref().expect("retained root"));
+    drop_sealed_attempt_root(&rivect::executor::attempt_root_of(&attempt_id));
 }
