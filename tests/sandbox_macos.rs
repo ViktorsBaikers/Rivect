@@ -6241,7 +6241,7 @@ fn confined_check_stateful_comparator_runs_exactly_once() {
             "    }\n",
             "}\n\n",
             "#[test]\n",
-            "fn comparator_runs_once() {\n",
+            "fn green_passes() {\n",
             "    let left = Observed(fixture::answer());\n",
             "    let right = Observed(\"ok\");\n",
             "    assert!(left == right, \"the comparator observes the answer\");\n",
@@ -6286,15 +6286,12 @@ fn confined_check_concurrent_library_harness_runs_bounded() {
             "pub fn answer() -> &'static str {\n",
             "    include_str!(\"../answer.txt\")\n",
             "}\n\n",
-            "#[cfg(test)]\n",
-            "mod tests {\n",
-            "    #[test]\n",
-            "    fn green_passes() {\n",
-            "        let left = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
-            "        let right = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
-            "        left.join().expect(\"the first leg joins\");\n",
-            "        right.join().expect(\"the second leg joins\");\n",
-            "    }\n",
+            "#[test]\n",
+            "fn green_passes() {\n",
+            "    let left = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
+            "    let right = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
+            "    left.join().expect(\"the first leg joins\");\n",
+            "    right.join().expect(\"the second leg joins\");\n",
             "}\n",
         ),
     )
@@ -6376,6 +6373,7 @@ fn confined_check_should_panic_and_termination_variants_survive() {
 /// the handoff mints Custom and the admission needs no native selection.
 const OFF_CONFIG: &str = "config_version = 1\n\
      [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:primary\"\n\
+     [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n\
      [workflow]\nenabled = false\n";
 
 #[test]

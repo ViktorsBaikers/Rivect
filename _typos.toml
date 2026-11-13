@@ -38,3 +38,7 @@ empted = "empted"
 
 # "pendings", pluralised as a code term inside a comment.
 pendings = "pendings"
+
+# "Ratatui" is the crate name (ratatui on crates.io); the checker flags it
+# against "Ratatouille". The stack selection table cites it verbatim.
+Ratatui = "Ratatui"
