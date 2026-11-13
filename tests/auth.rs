@@ -2329,6 +2329,136 @@ fn config_rejects_inline_and_secret_looking_credential_values() {
     }
 }
 
+// ----- api-key class: baseten -------------------------------------------------
+
+/// The api-key class leg (AC-040f), exercised on a `baseten` fixture:
+/// both recorded credential bindings resolve through the scoped
+/// `SecretRef`/DEC-013 precedence — the connection's own
+/// `credential_ref`, and a bound profile's ref where the scope's
+/// trailing segment names that profile — while an absent scope denies
+/// the typed `CredentialAbsent` without writing an entry, a divergent
+/// profile scope is the mismatch, and no denial renders the material.
+/// The per-ID `baseten` credential/profile/region proof is the
+/// provider target's
+/// `baseten_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets`;
+/// this case exercises the class seam.
+#[test]
+fn baseten_api_key_binding_resolves_through_scoped_secret_ref() {
+    const BASETEN_KEY: &str = "fixture-baseten-key-never-a-real-credential";
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.baseten]\nkind = \"api_key\"\nendpoint = \"https://inference.baseten.co/v1\"\ncredential_ref = \"keyring:rivect-test/baseten-direct\"\n\
+         [connections.baseten-profiled]\nkind = \"api_key\"\nendpoint = \"https://inference.baseten.co/v1\"\ncredential_ref = \"keyring:rivect-test/baseten-scope\"\nprofile = \"baseten-team\"\n\
+         [profiles.baseten-team]\ncredential_ref = \"keyring:rivect-test/baseten-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "baseten")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/baseten-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let profiled = resolve_credential(&config, "baseten-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(profiled.scope(), "rivect-test/baseten-team");
+
+    // the recorded direct scope resolves the material at the seam, and
+    // resolution writes nothing of its own
+    let store = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/baseten-direct", BASETEN_KEY)],
+    );
+    assert_eq!(
+        store.resolve(&resolved).expect("the store answers"),
+        BASETEN_KEY.as_bytes(),
+        "the scoped ref is the only path to the material"
+    );
+    assert_eq!(
+        store
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/baseten-direct".to_string()],
+        "the recorded scope resolves without writing another entry"
+    );
+
+    // an absent scope denies typed and writes nothing: the sibling
+    // scope's material stays the only entry, and the denial names the
+    // missing scope alone
+    let absent = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/baseten-neighbor", BASETEN_KEY)],
+    );
+    let err = absent
+        .resolve(&resolved)
+        .expect_err("the absent scope is the typed denial");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/baseten-direct"),
+        "the absent scope names itself: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(BASETEN_KEY),
+        "the denial never renders the material: {rendered}"
+    );
+    assert_eq!(
+        absent
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/baseten-neighbor".to_string()],
+        "an absent scope denies without writing an entry"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "baseten",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "baseten-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/baseten-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    let err = resolve_credential(&mismatched, "baseten-profiled")
+        .expect_err("profile/scope disagreement is the typed mismatch");
+    assert!(
+        matches!(err, ProviderError::CredentialProfileMismatch { .. }),
+        "profile/scope disagreement is CredentialProfileMismatch: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(BASETEN_KEY),
+        "the mismatch never renders the material: {rendered}"
+    );
+}
+
 // ----- api-key class: coreweave -----------------------------------------------
 
 /// The `coreweave` api-key class leg (AC-040f): both recorded

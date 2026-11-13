@@ -7395,6 +7395,18 @@ fn azure_routes_to_the_responses_dialect() {
     );
 }
 
+/// `baseten` records the Chat Completions dialect on the fixed
+/// `inference.baseten.co/v1` base (DEC-002/DEC-025): the literal id
+/// routes to the shared codec, never a second adapter.
+#[test]
+fn baseten_routes_to_the_chat_completions_dialect() {
+    assert_eq!(
+        rivect::providers::dialect_for("baseten"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+}
+
 // ----- AC-040h Pro/Max profile is not an offline inference grant --------
 
 /// The login's scoped subscription credential is a live grant, not an

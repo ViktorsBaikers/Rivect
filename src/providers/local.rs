@@ -1,5 +1,5 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `baseten`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`, `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
@@ -14,7 +14,7 @@
 //! label, an endpoint shape or a catalogue answer: every compatible
 //! host a deployment wires under `custom-chat-completions` shares the
 //! one recorded generic contract, while `aiand`, `aimlapi`,
-//! `alibaba-coding-plan`, `alibaba-token-plan`, `coreweave`,
+//! `alibaba-coding-plan`, `alibaba-token-plan`, `baseten`, `coreweave`,
 //! `deepinfra`, `deepseek`, `firepass`, `fireworks`, `gmi-cloud`,
 //! `groq`, `huggingface` and `kilo` carry their own recorded predicates — the
 //! `/v1` base normalization and the org-scoped catalogue transform
@@ -25,7 +25,11 @@
 //! the region-bound authoritative `/models` catalogue with its
 //! chat-id prefix filter and the enrolled-base credential binding —
 //! the optional quota `cookie` member admitted for shape and dropped —
-//! on `alibaba-token-plan`, the configured-or-default host, the
+//! on `alibaba-token-plan`, the configured-or-default
+//! `inference.baseten.co/v1` host, the authoritative `/models` listing
+//! as the whole offer source with the unrecorded capability, price and
+//! effort metadata left unknown (DEC-012) and the plain bearer
+//! credential on `baseten`, the configured-or-default host, the
 //! authoritative `/models` listing and the scoped `key` with its
 //! `OpenAI-Project` member — the recorded login is `api-key`, whose
 //! `OpenAI-Project` header hook resolves from the environment, a
@@ -471,6 +475,14 @@ const ALIBABA_TOKEN_PLAN_EXCLUDED_PREFIXES: &[&str] = &[
     "text-embedding-",
     "wan2.7-",
 ];
+
+/// The recorded default API root of a `baseten` connection
+/// (`inference.baseten.co/v1`, HZN-008 DEC-025 row
+/// `Rivect/key → inference.baseten.co/v1`): the host the required
+/// `endpoint` field's empty string resolves under the recorded
+/// `config?.baseUrl ?? defaultBaseUrl` fallback — the same
+/// absent-override rule the api-key class binds.
+const BASETEN_DEFAULT_BASE_URL: &str = "https://inference.baseten.co/v1";
 
 /// The recorded default API root of a `coreweave` connection
 /// (`api.inference.wandb.ai/v1`): the host an absent or empty
@@ -1770,6 +1782,22 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             catalog: CatalogRule::Listing,
             credential: CredentialRule::AlibabaTokenPlan,
             entries: EntryRule::AlibabaTokenPlan,
+        }),
+        // `baseten` (HZN-008 class A — the api-key cell, DEC-025 row
+        // `Rivect/key → inference.baseten.co/v1`): the configured-or-
+        // recorded base, the authoritative `/models` listing as the
+        // whole offer source — the record states no roster, so the
+        // floor is empty (DEC-009) — the plain bearer credential, and
+        // ids only: the recorded capability/price/model transform has
+        // no reachable table, so every absent mark stays unknown and
+        // is never defaulted to zero or borrowed from a sibling
+        // (DEC-012).
+        "baseten" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(BASETEN_DEFAULT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
         }),
         // `coreweave` (HZN-008 class A): the configured-or-recorded
         // `api.inference.wandb.ai/v1` base, the authoritative

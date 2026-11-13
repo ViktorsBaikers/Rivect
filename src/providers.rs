@@ -1658,6 +1658,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "aimlapi" => Some(Dialect::ChatCompletions),
         "alibaba-coding-plan" => Some(Dialect::ChatCompletions),
         "alibaba-token-plan" => Some(Dialect::ChatCompletions),
+        "baseten" => Some(Dialect::ChatCompletions),
         "coreweave" => Some(Dialect::ChatCompletions),
         "deepinfra" => Some(Dialect::ChatCompletions),
         "deepseek" => Some(Dialect::ChatCompletions),
