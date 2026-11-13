@@ -1,5 +1,5 @@
 //! Offline evidence receipt validation (TD-16/TD-17): the checked-in
-//! manifest binds 222 rows, the current receipt projects 216 passes and six
+//! manifest binds 234 rows, the current receipt projects 228 passes and six
 //! terminal unserved rows, and every malformed/stale/duplicate/shrunken/
 //! unmarked target or receipt is refused. The producer's argument surface is
 //! exercised without running a target.
@@ -11,9 +11,9 @@
 )]
 
 use rivect::verification::{
-    EvidenceRow, OFFLINE_EVIDENCE_PRODUCER_VERSION, OFFLINE_EVIDENCE_SCHEMA, OfflineEvidenceCounts,
-    OfflineEvidenceManifest, OfflineEvidenceReceipt, OfflineEvidenceTarget, TrialExpectation,
-    TrialOutcome,
+    EvidenceRow, OFFLINE_EVIDENCE_PRODUCER_VERSION, OFFLINE_EVIDENCE_SCHEMA, OFFLINE_PROVIDER_ROWS,
+    OfflineEvidenceCounts, OfflineEvidenceManifest, OfflineEvidenceReceipt, OfflineEvidenceTarget,
+    TrialExpectation, TrialOutcome,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -79,23 +79,23 @@ fn current_receipt() -> OfflineEvidenceReceipt {
         targets,
         rows,
         counts: OfflineEvidenceCounts {
-            rows: 222,
-            pass: 216,
+            rows: 234,
+            pass: 228,
             unserved: 6,
         },
     }
 }
 
 #[test]
-fn current_receipt_projects_216_pass_and_6_unserved() {
+fn current_receipt_projects_228_pass_and_6_unserved() {
     let manifest_bytes = manifest_bytes();
     let manifest = OfflineEvidenceManifest::load(&manifest_bytes).expect("the manifest");
     let receipt = current_receipt();
     receipt
         .validate(&manifest_bytes, &manifest)
         .expect("the current receipt validates");
-    assert_eq!(receipt.rows.len(), 222);
-    assert_eq!(receipt.counts.pass, 216);
+    assert_eq!(receipt.rows.len(), 234);
+    assert_eq!(receipt.counts.pass, 228);
     assert_eq!(receipt.counts.unserved, 6);
     assert_eq!(
         receipt
@@ -103,7 +103,7 @@ fn current_receipt_projects_216_pass_and_6_unserved() {
             .iter()
             .filter(|row| row.outcome == TrialOutcome::Pass)
             .count(),
-        216
+        228
     );
     assert_eq!(
         receipt
@@ -327,4 +327,52 @@ fn producer_help_and_bad_arguments_exit_two() {
         .output()
         .expect("the producer script runs");
     assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+}
+
+#[test]
+fn producer_refuses_a_provider_manifest_with_the_wrong_row_count() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/offline-evidence.sh");
+    let root = tempfile::TempDir::with_prefix("rivect-offline-denominator-").expect("temp");
+    let manifest_path = root.path().join("provider-trials.json");
+    let receipt_path = root.path().join("receipt.json");
+    let bundle = root.path().join("bundle");
+    std::fs::create_dir_all(&bundle).expect("bundle dir");
+    std::fs::write(bundle.join("rivect.manifest.json"), b"{}").expect("bundle manifest");
+    let rows: Vec<serde_json::Value> = (0..=OFFLINE_PROVIDER_ROWS)
+        .map(|index| serde_json::json!({"case_id": format!("TP-PROVIDER-AUTH::synthetic-{index}")}))
+        .collect();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "family": "provider",
+            "rows": rows,
+        }))
+        .expect("serialize the synthetic manifest"),
+    )
+    .expect("write the synthetic manifest");
+
+    let wrong = Command::new("sh")
+        .arg(script)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--receipt")
+        .arg(&receipt_path)
+        .arg("--bundle")
+        .arg(&bundle)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("the producer script runs");
+    assert_eq!(wrong.status.code(), Some(2), "{wrong:?}");
+    let stderr = String::from_utf8_lossy(&wrong.stderr);
+    let declared = OFFLINE_PROVIDER_ROWS + 1;
+    assert!(
+        stderr.contains(&declared.to_string())
+            && stderr.contains(&format!("not {OFFLINE_PROVIDER_ROWS}")),
+        "the refusal names the declared and expected row counts: {stderr}"
+    );
+    assert!(
+        !receipt_path.exists(),
+        "a refused manifest writes no receipt"
+    );
 }

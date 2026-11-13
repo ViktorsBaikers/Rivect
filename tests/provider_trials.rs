@@ -1,4 +1,4 @@
-//! The checked-in 222-row provider trial manifest: every TP-PROVIDER-{AUTH,
+//! The checked-in 234-row provider trial manifest: every TP-PROVIDER-{AUTH,
 //! WIRE,RECOVERY} row names its exact integration oracles and the marker
 //! their output carries. The six cursor/devin rows are terminal `unserved`
 //! denials; every other row is an offline adapter-surface pass.
@@ -26,11 +26,11 @@ fn manifest() -> (Vec<u8>, OfflineEvidenceManifest) {
 }
 
 #[test]
-fn provider_manifest_carries_exactly_the_expected_222_case_rows() {
+fn provider_manifest_carries_exactly_the_expected_234_case_rows() {
     let (_bytes, manifest) = manifest();
     assert_eq!(manifest.family, "provider");
     assert_eq!(manifest.rows.len(), OFFLINE_PROVIDER_ROWS);
-    assert_eq!(manifest.rows.len(), 222, "74 providers x three trials");
+    assert_eq!(manifest.rows.len(), 234, "78 providers x three trials");
 
     let expected: BTreeSet<String> = PROVIDER_ROWS
         .iter()
@@ -134,7 +134,7 @@ fn provider_manifest_carries_exactly_the_expected_222_case_rows() {
             }
         }
     }
-    assert_eq!((pass, unserved), (216, 6), "216 pass + 6 unserved");
+    assert_eq!((pass, unserved), (228, 6), "228 pass + 6 unserved");
     let recorded: BTreeSet<String> = unserved_cases().into_iter().collect();
     let observed: BTreeSet<String> = manifest
         .rows

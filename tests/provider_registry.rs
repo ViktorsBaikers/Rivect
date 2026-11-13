@@ -27,8 +27,9 @@ fn bedrock_ids_map_to_their_recorded_dialects() {
     }
 }
 
-/// The exact current roster `dialect_for` answers, in source order.
-const RECORDED_ROSTER: [(&str, Dialect); 74] = [
+/// The exact current roster `dialect_for` answers, in canonical provider-table
+/// order.
+const RECORDED_ROSTER: [(&str, Dialect); 78] = [
     ("openai", Dialect::Responses),
     ("abliteration", Dialect::Responses),
     ("meta", Dialect::Responses),
@@ -107,6 +108,10 @@ const RECORDED_ROSTER: [(&str, Dialect); 74] = [
     ("yolo-auto", Dialect::ChatCompletions),
     ("zenmux", Dialect::ChatCompletions),
     ("zhipu-coding-plan", Dialect::ChatCompletions),
+    ("azure", Dialect::Responses),
+    ("baseten", Dialect::ChatCompletions),
+    ("cerebras", Dialect::ChatCompletions),
+    ("cline-pass", Dialect::ChatCompletions),
 ];
 
 #[test]
@@ -149,4 +154,29 @@ fn roster_matches_the_recorded_dialect_arms() {
         "the sign-in alias resolves the same two recorded transports"
     );
     assert_eq!(Dialect::CloudCode.to_string(), "cloudcode");
+}
+
+#[test]
+fn duplicate_roster_matches_the_canonical_provider_table() {
+    let canonical = rivect::verification::PROVIDER_ROWS;
+    assert_eq!(
+        RECORDED_ROSTER.len(),
+        canonical.len(),
+        "the duplicate roster holds every canonical provider row"
+    );
+    let recorded: Vec<&str> = RECORDED_ROSTER.iter().map(|(id, _)| *id).collect();
+    let expected: Vec<&str> = canonical.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        recorded, expected,
+        "the duplicate roster keeps the canonical id order"
+    );
+    let recorded_dialects: Vec<String> = RECORDED_ROSTER
+        .iter()
+        .map(|(_, dialect)| dialect.to_string())
+        .collect();
+    let canonical_dialects: Vec<&str> = canonical.iter().map(|(_, dialect)| *dialect).collect();
+    assert_eq!(
+        recorded_dialects, canonical_dialects,
+        "the duplicate roster keeps the canonical dialect order"
+    );
 }

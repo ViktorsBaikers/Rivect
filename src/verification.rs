@@ -954,8 +954,8 @@ pub const INSTALLED_UI_CASE: &str = "AC-001-INSTALLED-UI-RENDER";
 /// The three release-only cases outside A01–A36 and §17–§17.2.
 pub const RELEASE_CASE_IDS: [&str; 3] = [UPGRADE_CASE, INSTALLED_ORDINARY_CASE, INSTALLED_UI_CASE];
 
-/// The 74 provider rows with the dialect the registry must answer for each.
-pub const PROVIDER_ROWS: [(&str, &str); 74] = [
+/// The 78 provider rows with the dialect the registry must answer for each.
+pub const PROVIDER_ROWS: [(&str, &str); 78] = [
     ("openai", "responses"),
     ("abliteration", "responses"),
     ("meta", "responses"),
@@ -1030,6 +1030,10 @@ pub const PROVIDER_ROWS: [(&str, &str); 74] = [
     ("yolo-auto", "chat-completions"),
     ("zenmux", "chat-completions"),
     ("zhipu-coding-plan", "chat-completions"),
+    ("azure", "responses"),
+    ("baseten", "chat-completions"),
+    ("cerebras", "chat-completions"),
+    ("cline-pass", "chat-completions"),
 ];
 
 /// Both login alias rows and the canonical provider each stores.
@@ -1085,11 +1089,11 @@ pub const UI_INPUTS: [&str; 14] = [
     "tmux",
 ];
 
-/// 74 provider rows × five trial classes plus both alias rows.
+/// 78 provider rows × five trial classes plus both alias rows.
 pub const FINAL_PROVIDER_ROWS: usize =
     PROVIDER_ROWS.len() * PROVIDER_TRIALS.len() + ALIAS_ROWS.len();
 
-/// The installed TP's counted rows: 74 providers plus both aliases.
+/// The installed TP's counted rows: 78 providers plus both aliases.
 pub const FINAL_INSTALLED_ROWS: usize = PROVIDER_ROWS.len() + ALIAS_ROWS.len();
 
 /// 19 states × five geometries × fourteen input modes.
@@ -1103,7 +1107,7 @@ pub fn provider_case(trial: &str, provider: &str) -> String {
 /// The three trial classes the offline provider receipt carries.
 pub const OFFLINE_PROVIDER_TRIALS: [&str; 3] = ["AUTH", "WIRE", "RECOVERY"];
 
-/// The 74 providers × three offline trial classes the provider receipt binds.
+/// The 78 providers × three offline trial classes the provider receipt binds.
 pub const OFFLINE_PROVIDER_ROWS: usize = PROVIDER_ROWS.len() * OFFLINE_PROVIDER_TRIALS.len();
 
 /// The two recorded providers with no installed adapter. Their six
@@ -1714,7 +1718,7 @@ pub struct FinalAcceptance {
     pub installed_rows: usize,
     pub ui_cells: usize,
     pub blockers: FinalBlockers,
-    /// The offline 1764-row conjunction is a full pass. The release verdict
+    /// The offline 1784-row conjunction is a full pass. The release verdict
     /// additionally requires an empty deferred owner ledger.
     pub full_pass: bool,
     /// The offline pass, named separately from the release answer so a
@@ -1738,7 +1742,7 @@ impl FinalAcceptance {
 }
 
 /// The denominator the acceptance manifest declares. A declaration that
-/// differs from the fixed roster is rejected, so a 372 installed-row claim or
+/// differs from the fixed roster is rejected, so a 392 installed-row claim or
 /// any shrunken denominator is an invalid plan instead of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalDeclaration {
@@ -1748,7 +1752,7 @@ pub struct FinalDeclaration {
 }
 
 impl FinalDeclaration {
-    /// The release denominator: 372 provider+alias rows, 76 installed rows,
+    /// The release denominator: 392 provider+alias rows, 80 installed rows,
     /// 1330 UI cells.
     #[must_use]
     pub const fn release() -> Self {

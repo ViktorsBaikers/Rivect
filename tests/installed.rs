@@ -1,8 +1,8 @@
 //! AC-001/AC-040/AC-080 (TD-03): installed provider rows and support
 //! journeys run on the exact packaged artifact whose manifest digest the
-//! release activation identity binds. The 74 recorded provider rows plus both
-//! login aliases are exercised through the packaged binary as 76 installed
-//! rows — the other four TPs come from their own targets, so a 372
+//! release activation identity binds. The 78 recorded provider rows plus both
+//! login aliases are exercised through the packaged binary as 80 installed
+//! rows — the other four TPs come from their own targets, so a 392
 //! installed-row claim is rejected. Support preview/export and read-only
 //! replay publish nothing, repeat no effect, and replace provider-bound
 //! reasoning bytes and credential values with fixed reason codes. Unserved
@@ -29,16 +29,18 @@ mod support;
 
 use rivect::contracts::{RELEASE_MANIFEST_NAME, ReleaseManifest};
 use rivect::executor::verify_release_bundle;
-use rivect::verification::SEARCH_SERVICES;
+use rivect::verification::{
+    FINAL_PROVIDER_ROWS, PROVIDER_ROWS as CANONICAL_PROVIDER_ROWS, SEARCH_SERVICES,
+};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-/// The 74 recorded provider rows, in source order, with the dialect the
-/// installed build must answer for each.
-const PROVIDER_ROWS: [(&str, &str); 74] = [
+/// The 78 recorded provider rows, in canonical provider-table order, with the
+/// dialect the installed build must answer for each.
+const PROVIDER_ROWS: [(&str, &str); 78] = [
     ("openai", "responses"),
     ("abliteration", "responses"),
     ("meta", "responses"),
@@ -113,6 +115,10 @@ const PROVIDER_ROWS: [(&str, &str); 74] = [
     ("yolo-auto", "chat-completions"),
     ("zenmux", "chat-completions"),
     ("zhipu-coding-plan", "chat-completions"),
+    ("azure", "responses"),
+    ("baseten", "chat-completions"),
+    ("cerebras", "chat-completions"),
+    ("cline-pass", "chat-completions"),
 ];
 
 /// Both login alias rows and the canonical provider each stores.
@@ -124,9 +130,9 @@ const ALIAS_ROWS: [(&str, &str); 2] = [
 /// The two recorded dialects no installed adapter serves in this build.
 const UNSERVED_ROWS: [&str; 2] = ["cursor", "devin"];
 
-/// 74 provider rows plus 2 aliases are installed rows; 74×5+2 is the final
+/// 78 provider rows plus 2 aliases are installed rows; 78×5+2 is the final
 /// acceptance conjunction over all five TPs, never an installed-row count.
-const FIVE_TP_CONJUNCTION: usize = 74 * 5 + 2;
+const FIVE_TP_CONJUNCTION: usize = 78 * 5 + 2;
 
 fn installed_state(id: &str) -> &'static str {
     if UNSERVED_ROWS.contains(&id) {
@@ -134,6 +140,30 @@ fn installed_state(id: &str) -> &'static str {
     } else {
         "installed"
     }
+}
+
+#[test]
+fn duplicate_roster_matches_the_canonical_provider_table() {
+    assert_eq!(
+        PROVIDER_ROWS.len(),
+        CANONICAL_PROVIDER_ROWS.len(),
+        "the installed duplicate holds every canonical provider row"
+    );
+    let recorded: Vec<&str> = PROVIDER_ROWS.iter().map(|(id, _)| *id).collect();
+    let canonical: Vec<&str> = CANONICAL_PROVIDER_ROWS.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        recorded, canonical,
+        "the installed duplicate keeps the canonical id order"
+    );
+    let recorded_dialects: Vec<&str> = PROVIDER_ROWS.iter().map(|(_, dialect)| *dialect).collect();
+    let canonical_dialects: Vec<&str> = CANONICAL_PROVIDER_ROWS
+        .iter()
+        .map(|(_, dialect)| *dialect)
+        .collect();
+    assert_eq!(
+        recorded_dialects, canonical_dialects,
+        "the installed duplicate keeps the canonical dialect order"
+    );
 }
 
 /// One packaged process with the given frames on stdin, clean environment and
@@ -224,7 +254,7 @@ fn roster_complete(expected: &[(&str, &str, &str)], observed: &[(String, Value)]
 /// The installed build answers every recorded provider row and both aliases
 /// on the exact packaged artifact outside the checkout.
 #[test]
-fn installed_artifact_answers_76_provider_and_alias_rows() {
+fn installed_artifact_answers_80_provider_and_alias_rows() {
     let root = tempfile::TempDir::with_prefix("rivect-installed-rows-").expect("fixture root");
     let bundle = support::release::baseline_bundle();
     assert!(
@@ -251,10 +281,10 @@ fn installed_artifact_answers_76_provider_and_alias_rows() {
     std::fs::create_dir_all(&cwd).expect("nested cwd");
     let data_argument = data.to_str().expect("utf-8 data root");
 
-    // 74 provider rows, then the two alias rows: the alias ids are recorded
+    // 78 provider rows, then the two alias rows: the alias ids are recorded
     // provider rows too, and the alias form is exercised as its own row.
-    let mut frames = Vec::with_capacity(76);
-    let mut expected = Vec::with_capacity(74);
+    let mut frames = Vec::with_capacity(80);
+    let mut expected = Vec::with_capacity(78);
     for (index, (id, dialect)) in PROVIDER_ROWS.iter().enumerate() {
         frames.push(command_frame(
             index as u64 + 1,
@@ -286,7 +316,7 @@ fn installed_artifact_answers_76_provider_and_alias_rows() {
     let answers = responses(&output);
     assert_eq!(answers.len(), frames.len(), "one answer per frame");
 
-    let mut provider_rows = Vec::with_capacity(74);
+    let mut provider_rows = Vec::with_capacity(78);
     for index in 0..PROVIDER_ROWS.len() {
         let result = &answer(&answers, index as u64 + 1)["result"];
         assert_eq!(result["kind"], "provider.row", "{result}");
@@ -310,13 +340,16 @@ fn installed_artifact_answers_76_provider_and_alias_rows() {
     }
 
     let installed_rows = provider_rows.len() + alias_rows.len();
-    assert_eq!(provider_rows.len(), 74, "74 provider installed rows");
+    assert_eq!(provider_rows.len(), 78, "78 provider installed rows");
     assert_eq!(alias_rows.len(), 2, "2 alias installed rows");
-    assert_eq!(installed_rows, 76, "76 installed rows");
-    assert_eq!(FIVE_TP_CONJUNCTION, 372, "the five-TP conjunction is 372");
+    assert_eq!(installed_rows, 80, "80 installed rows");
+    assert_eq!(
+        FIVE_TP_CONJUNCTION, FINAL_PROVIDER_ROWS,
+        "the five-TP conjunction matches the canonical final row count"
+    );
     assert_ne!(
         installed_rows, FIVE_TP_CONJUNCTION,
-        "372 rows are the 74x5+2 five-TP conjunction, never an installed-row claim"
+        "392 rows are the 78x5+2 five-TP conjunction, never an installed-row claim"
     );
     assert!(
         roster_complete(&expected, &provider_rows),
@@ -386,7 +419,7 @@ fn installed_artifact_answers_76_provider_and_alias_rows() {
     );
     assert!(roster_complete(&expected, &provider_rows));
     println!(
-        "installed rows: {installed_rows} (74 provider + 2 alias); unserved rows stay explicit"
+        "installed rows: {installed_rows} (78 provider + 2 alias); unserved rows stay explicit"
     );
 }
 

@@ -114,7 +114,7 @@ row_count=$(jq -r '.rows | length' "$manifest") || exit 2
     exit 2
 }
 case $family in
-    provider) denominator=222 ;;
+    provider) denominator=234 ;;
     acceptance)
         # One checked group manifest: the three A-scenario groups carry 12
         # rows and the sections+upgrade group 4. The consumer unions the four

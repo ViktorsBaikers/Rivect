@@ -1,7 +1,7 @@
 //! AC-082 (REQ-068): the final release conjunction. One counted plan carries
 //! A01–A36, §17–§17.2, the upgrade confirmation and the two installed-release
-//! legs, the 74 provider rows under five trial classes plus both alias rows
-//! (74×5+2 = 372, of which the installed TP contributes 76), and the
+//! legs, the 78 provider rows under five trial classes plus both alias rows
+//! (78×5+2 = 392, of which the installed TP contributes 80), and the
 //! 19×G×I installed UI matrix. A row bound to another candidate is stale; a
 //! missing, stale, failed, censored or unattributed row prevents a full pass.
 //!
@@ -352,33 +352,33 @@ fn final_conjunction_fails_closed_on_missing_stale_and_shrunken_rows() {
     let candidate = "candidate-bytes";
 
     let complete = complete_rows(candidate);
-    assert_eq!(FINAL_PROVIDER_ROWS, 372, "74x5+2 = 372");
+    assert_eq!(FINAL_PROVIDER_ROWS, 392, "78x5+2 = 392");
     assert_eq!(
-        FINAL_INSTALLED_ROWS, 76,
-        "74 provider + 2 alias installed rows"
+        FINAL_INSTALLED_ROWS, 80,
+        "78 provider + 2 alias installed rows"
     );
     assert_eq!(FINAL_UI_CELLS, 1330, "19 x 5 x 14");
     assert_eq!(
         final_required_cases().len(),
-        1764,
-        "42 acceptance + 372 provider/alias + 20 search + 1330 ui"
+        1784,
+        "42 acceptance + 392 provider/alias + 20 search + 1330 ui"
     );
     let report = counted(candidate, &complete);
     assert!(
         report.full_pass,
         "a complete current set is a full pass: {report:?}"
     );
-    assert_eq!(report.required, 1764);
+    assert_eq!(report.required, 1784);
     assert_eq!(report.passed, expected_required_rows());
     assert_eq!(
         report.provider_rows,
         PROVIDER_ROWS.len() * PROVIDER_TRIALS.len(),
-        "74 x 5 provider trial rows"
+        "78 x 5 provider trial rows"
     );
     assert_eq!(
         report.provider_rows + report.alias_rows,
         FINAL_PROVIDER_ROWS,
-        "74x5+2 = 372"
+        "78x5+2 = 392"
     );
     assert_eq!(
         report.installed_rows, FINAL_INSTALLED_ROWS,
@@ -418,15 +418,15 @@ fn final_conjunction_fails_closed_on_missing_stale_and_shrunken_rows() {
     assert_eq!(report.ui_cells, 0);
     assert_eq!(report.blockers.missing.len(), FINAL_UI_CELLS);
 
-    // A 372 installed-row claim is a rejected declaration.
+    // A 392 installed-row claim is a rejected declaration.
     let claimed = FinalDeclaration {
-        installed_rows: 372,
+        installed_rows: 392,
         ..FinalDeclaration::release()
     };
     assert!(matches!(
         evaluate_final(candidate, claimed, &complete),
         Err(FinalAcceptanceError::InstalledDenominator {
-            declared: 372,
+            declared: 392,
             expected: FINAL_INSTALLED_ROWS,
         })
     ));
@@ -790,8 +790,8 @@ fn provider_receipt(
         targets,
         rows,
         counts: OfflineEvidenceCounts {
-            rows: 222,
-            pass: 216,
+            rows: 234,
+            pass: 228,
             unserved: 6,
         },
     }
@@ -813,12 +813,12 @@ fn provider_receipt_missing_stale_or_unmarked_is_never_pass() {
     )
     .expect("write the current receipt");
     let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
-    assert_eq!(rows.len(), 222);
+    assert_eq!(rows.len(), 234);
     assert_eq!(
         rows.iter()
             .filter(|row| row.outcome == TrialOutcome::Pass)
             .count(),
-        216
+        228
     );
     assert_eq!(
         rows.iter()
@@ -833,7 +833,7 @@ fn provider_receipt_missing_stale_or_unmarked_is_never_pass() {
 
     std::fs::remove_file(&receipt_path).expect("remove the receipt");
     let rows = provider_trial_rows_from(&manifest_path, &receipt_path, &candidate);
-    assert_eq!(rows.len(), 222);
+    assert_eq!(rows.len(), 234);
     assert!(
         rows.iter().all(|row| row.outcome == TrialOutcome::Censored),
         "a missing receipt is censored, never pass"
@@ -2684,7 +2684,7 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     assert_eq!(
         installed.len(),
         FINAL_INSTALLED_ROWS,
-        "74 provider rows plus both aliases"
+        "78 provider rows plus both aliases"
     );
     rows.extend(installed);
     rows.extend(search_rows(&candidate));
@@ -2863,16 +2863,16 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     assert_eq!(
         report.provider_rows,
         PROVIDER_ROWS.len() * PROVIDER_TRIALS.len(),
-        "74 x 5 provider trial rows"
+        "78 x 5 provider trial rows"
     );
     assert_eq!(
         report.provider_rows + report.alias_rows,
         FINAL_PROVIDER_ROWS,
-        "74x5+2 = 372"
+        "78x5+2 = 392"
     );
     assert_eq!(
         report.installed_rows, FINAL_INSTALLED_ROWS,
-        "74 provider INSTALLED rows plus 2 alias INSTALLED rows = 76"
+        "78 provider INSTALLED rows plus 2 alias INSTALLED rows = 80"
     );
     assert!(report.blockers.failed.is_empty(), "{report:?}");
     assert!(report.blockers.unattributed.is_empty(), "{report:?}");
@@ -2924,10 +2924,10 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             report.full_pass && report.offline_full_pass,
             "the offline conjunction is a full pass: {report:?}"
         );
-        assert_eq!(report.required, 1764);
-        assert_eq!(report.present, 1764);
-        assert_eq!(report.current, 1764);
-        assert_eq!(report.passed, 1758);
+        assert_eq!(report.required, 1784);
+        assert_eq!(report.present, 1784);
+        assert_eq!(report.current, 1784);
+        assert_eq!(report.passed, 1778);
         assert_eq!(report.unserved, 6);
         assert!(report.blockers.is_empty(), "{report:?}");
         assert_eq!(retained_legs_not_run, 0, "no offline retained leg");
