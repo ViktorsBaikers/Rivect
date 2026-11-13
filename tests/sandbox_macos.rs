@@ -6450,15 +6450,16 @@ fn confined_custom_check_runs_without_native_selection_and_controls_refuse() {
     let mut on_world = support::open_world("confined-custom-check-on", None);
     let on_session = on_world.open_session("confined-custom-check-on");
     let on_task = on_world.create_task(&on_session, "custom-check-on");
+    let forged_grant = on_world.runtime.policy_writer().grant_classes(
+        check.cargo.parent().expect("toolchain dir").to_path_buf(),
+        vec![EffectClass::Exec],
+    );
     let forged = {
         let mut executor = on_world.runtime.executor();
         executor.admit_check(
             &on_task,
             EffectRequest::Exec {
-                grant_id: on_world.runtime.policy_writer().grant_classes(
-                    check.cargo.parent().expect("toolchain dir").to_path_buf(),
-                    vec![EffectClass::Exec],
-                ),
+                grant_id: forged_grant,
                 program: cargo.clone(),
             },
             PermissionMode::Yolo,
