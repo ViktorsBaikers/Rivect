@@ -41,13 +41,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: workspace tests
         # Doc-dependent gates need files the code-only checkout lacks
-        # (origin carries no docs/pack trees): skip exactly those three and
-        # run everything else — never a blanket skip.
+        # (origin carries no docs/pack trees): the stack-admission trio and
+        # the measurement suite (frozen docs/release-budgets.md). Skip
+        # exactly those and run everything else — never a blanket skip.
         run: >-
           cargo test --locked --workspace
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
+          --skip local_cache_is_not_a_provider_cache
+          --skip missing_leg_is_not_pass
+          --skip ineligible_p99_is_not_pass
+          --skip frozen_release_budgets_match_the_pinned_digest
+          --skip offline_corpus_measures_the_installed_candidate_against_the_frozen_limits
+          --skip only_provider_rows_may_stay_not_run_with_their_prerequisite
+          --skip unavailable_platform_is_not_pass
+          --skip over_limit_fixture_is_blocked_not_pass
+          --skip unmeasured_kit_or_owned_rss_is_not_pass
       - name: doc tests
         run: cargo test --locked --workspace --doc
       - name: rustdoc
@@ -81,6 +91,15 @@ jobs:
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
+          --skip local_cache_is_not_a_provider_cache
+          --skip missing_leg_is_not_pass
+          --skip ineligible_p99_is_not_pass
+          --skip frozen_release_budgets_match_the_pinned_digest
+          --skip offline_corpus_measures_the_installed_candidate_against_the_frozen_limits
+          --skip only_provider_rows_may_stay_not_run_with_their_prerequisite
+          --skip unavailable_platform_is_not_pass
+          --skip over_limit_fixture_is_blocked_not_pass
+          --skip unmeasured_kit_or_owned_rss_is_not_pass
           --skip alive_observer_passes_only_the_allowlist
           --skip answer_cap_stop_kills_and_reaps_the_worker
           --skip cancel_stop_kills_and_reaps_the_worker
