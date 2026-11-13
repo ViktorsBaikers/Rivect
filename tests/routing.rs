@@ -6897,6 +6897,38 @@ fn nanogpt_offline_eligibility_is_binding_level_typed() {
         "only the resolvable binding is the api-key form"
     );
 
+    // the recorded class is the api_key binding: a subscription-kind
+    // declaration stays the live-grant class and is never offline
+    // usable (DEC-010)
+    let subscription = Config::parse_validated(
+        "config_version = 1\n\
+         [connections.nanogpt]\nkind = \"subscription\"\nendpoint = \"https://nano-gpt.com/api/v1\"\ncredential_ref = \"keyring:rivect/ng-plan\"\n\
+         [models.defaults]\nmodel = { mode = \"fixed\", connection = \"nanogpt\", model_id = \"openai/gpt-5.5\" }\n\
+         effort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n",
+    )
+    .expect("a subscription declaration parses");
+    assert!(
+        !rivect::providers::offline_usable(
+            &subscription.connections,
+            &subscription.profiles,
+            "nanogpt",
+        ),
+        "a subscription declaration never becomes this api-key binding"
+    );
+    assert!(
+        matches!(
+            rivect::providers::offline_eligible(
+                &pin,
+                &subscription.connections,
+                &subscription.profiles,
+            ),
+            Err(ProviderError::LiveGrantRequired {
+                kind: ConnKind::Subscription
+            })
+        ),
+        "a subscription declaration is the separate live-grant denial"
+    );
+
     // an api_key declaration that binds no credential is refused at
     // admission: the absent-binding predicate names the open proxy and
     // the local-endpoint class alone (DEC-009), so `nanogpt` can never
