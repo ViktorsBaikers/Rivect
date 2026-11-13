@@ -9664,14 +9664,17 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let data_root = tempfile::TempDir::with_prefix("rivect-recovery-locator-")?;
         let attempt = claimed_check_attempt(data_root.path(), "locator")?;
-        // TMPDIR A: a root whose name carries both locator delimiters and
-        // a non-UTF-8 byte, recorded the way the allocation records it.
-        let recorded = data_root
-            .path()
-            .canonicalize()?
-            .join(std::ffi::OsStr::from_bytes(
-                b"tmp-a \xff dev=7 ino=9 root-hex=",
-            ));
+        // TMPDIR A: a root whose name carries both locator delimiters and —
+        // where the filesystem admits it — a non-UTF-8 byte, recorded the way
+        // the allocation records it. APFS refuses a non-UTF-8 name at mkdir
+        // (EILSEQ), so the Darwin spelling proves the same delimiters without
+        // the byte; Linux keeps the byte because its VFS accepts it.
+        let name = if cfg!(target_os = "macos") {
+            std::ffi::OsStr::from_bytes(b"tmp-a  dev=7 ino=9 root-hex=")
+        } else {
+            std::ffi::OsStr::from_bytes(b"tmp-a \xff dev=7 ino=9 root-hex=")
+        };
+        let recorded = data_root.path().canonicalize()?.join(name);
         std::fs::create_dir(&recorded)?;
         std::fs::write(recorded.join("debris"), b"attempt bytes")?;
         let metadata = std::fs::metadata(&recorded)?;

@@ -10313,8 +10313,34 @@ impl TaskStore {
         // process replaced refuses instead of copying from the orphaned inode.
         self.unquarantined()?;
         self.verify_path_identity()?;
+        // VACUUM INTO opens the target with this connection's NOFOLLOW:
+        // a symlink anywhere in the spelling refuses (Darwin's /var -> /private/var
+        // makes every TMPDIR path one), so the parent is resolved first — the
+        // generated name itself cannot be a symlink without refusing to exist.
+        let canonical = target
+            .parent()
+            .ok_or_else(|| {
+                storage(ConnectionLifecycleError::FileCheck {
+                    file: "directory",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the checkpoint target has no parent directory",
+                    ),
+                })
+            })?
+            .canonicalize()
+            .map_err(|source| writer_file_check("directory", source))?
+            .join(target.file_name().ok_or_else(|| {
+                storage(ConnectionLifecycleError::FileCheck {
+                    file: "db",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the checkpoint target has no file name",
+                    ),
+                })
+            })?);
         let conn = self.conn()?;
-        conn.execute_batch(&sql::checkpoint_store(target))
+        conn.execute_batch(&sql::checkpoint_store(&canonical))
             .map_err(storage)
     }
 }
@@ -13364,13 +13390,27 @@ mod tests {
     }
 
     /// The parent-owned root of a child entry; the cleared environment
-    /// leaves exactly the marker.
+    /// leaves exactly the marker. Darwin's dyld re-injects
+    /// `__CF_USER_TEXT_ENCODING` after `env_clear`, so the count checks
+    /// for foreign variables, not a bare number — tolerated platform
+    /// noise beside the marker is still the cleared contract.
     fn child_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let root =
             std::env::var_os(CHILD_ROOT).ok_or("the child entry runs only under its parent")?;
-        let vars = std::env::vars_os().count();
-        if vars != 1 {
-            return Err(format!("the child environment holds {vars} variables, not 1").into());
+        #[cfg(target_os = "macos")]
+        const PLATFORM_NOISE: &[&str] = &["__CF_USER_TEXT_ENCODING"];
+        #[cfg(not(target_os = "macos"))]
+        const PLATFORM_NOISE: &[&str] = &[];
+        let foreign: Vec<String> = std::env::vars_os()
+            .filter_map(|(key, _)| {
+                let key = key.to_string_lossy().to_string();
+                (key != CHILD_ROOT && !PLATFORM_NOISE.contains(&key.as_str())).then_some(key)
+            })
+            .collect();
+        if !foreign.is_empty() {
+            return Err(
+                format!("the child environment holds foreign variables: {foreign:?}").into(),
+            );
         }
         Ok(root.into())
     }

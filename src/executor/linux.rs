@@ -1198,19 +1198,23 @@ pub fn probe_write_conformance(
 /// `AUDIT_ARCH_AARCH64` — the `seccomp_data` architecture word on 64-bit
 /// arm, verified against the proof container's kernel.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
 
 /// `AUDIT_ARCH_X86_64` for the same guard on amd64 hosts.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 
 /// `clone3` — same number on x86_64 and aarch64.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const SYS_CLONE3: u32 = 435;
 
 /// `clone` — architecture-specific; judged by flags, not denied by number,
 /// so glibc `fork` (SIGCHLD) still works after `clone3` returns ENOSYS.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 fn sys_clone() -> Option<u32> {
     match std::env::consts::ARCH {
         "aarch64" => Some(220),
@@ -1223,22 +1227,31 @@ fn sys_clone() -> Option<u32> {
 /// child leaves the host's process group and survives `killpg`. SIGCHLD
 /// and thread flags stay allowed so ordinary `fork` works.
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWTIME: u32 = 0x0000_0080;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWNS: u32 = 0x0002_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWCGROUP: u32 = 0x0200_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWUTS: u32 = 0x0400_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWIPC: u32 = 0x0800_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWUSER: u32 = 0x1000_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWPID: u32 = 0x2000_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEWNET: u32 = 0x4000_0000;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
     | CLONE_NEWNS
     | CLONE_NEWCGROUP
@@ -1249,6 +1262,7 @@ const CLONE_NEW_NAMESPACE_FLAGS: u32 = CLONE_NEWTIME
     | CLONE_NEWNET;
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
     match std::env::consts::ARCH {
         "aarch64" => {
@@ -1343,6 +1357,7 @@ fn native_net_syscalls() -> Option<(u32, &'static [u32])> {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::{
         CLONE_NEW_NAMESPACE_FLAGS, CLONE_NEWIPC, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
