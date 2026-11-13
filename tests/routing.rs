@@ -7419,6 +7419,18 @@ fn cerebras_routes_to_the_chat_completions_dialect() {
     );
 }
 
+/// `cline-pass` records the Chat Completions dialect on the plan base
+/// `api.cline.bot/api/v1` (DEC-002/DEC-005/DEC-011): the literal id
+/// routes to the shared codec, never a second adapter.
+#[test]
+fn cline_pass_routes_to_the_chat_completions_dialect() {
+    assert_eq!(
+        rivect::providers::dialect_for("cline-pass"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+}
+
 // ----- AC-040h Pro/Max profile is not an offline inference grant --------
 
 /// The login's scoped subscription credential is a live grant, not an

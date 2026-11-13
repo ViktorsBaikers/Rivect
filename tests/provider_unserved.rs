@@ -8,7 +8,9 @@
 //! The externally blocked `muse-code` id (AC-009) denies on its recorded
 //! class before any adapter's dialect claim and before the ledger
 //! reserves the send: the candidate walk and the manual pick prove the
-//! same class, zero requests, zero accounting and no dialect arm.
+//! same class, zero requests, zero accounting and no dialect arm. A
+//! recorded id with a dialect arm — `cline-pass` — is the contrast: the
+//! same send gate answers the build's absent adapter, never the block.
 
 #![allow(
     clippy::expect_used,
@@ -21,7 +23,7 @@ use rivect::config::{Config, Connection};
 use rivect::model::{Broker, ModelError, NullLedger, RejectionCause, RequestManifest};
 use rivect::providers::{
     CredentialStore, Dialect, Provider, ProviderError, ProviderReply, SecretRef, StoreKind,
-    dialect_for, muse_login,
+    dialect_for, externally_blocked, muse_login,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -627,5 +629,66 @@ fn muse_blocked_primary_walks_the_auto_chain() {
         ),
         "the blocked entry is never an unknown outcome: {:?}",
         muse.cause
+    );
+}
+
+// ----- cline-pass is not an externally blocked id ----------------------------
+
+/// AC-009's block class is not the plan class's fate: `cline-pass`
+/// records a Chat Completions dialect arm, so the send gate denies only
+/// the build's absent adapter (`DialectUnserved`), never
+/// `ExternalBlocked` — while the shipped `muse-code` block keeps its own
+/// recorded class.
+#[test]
+fn cline_pass_is_not_externally_blocked() {
+    const CLINE_PASS_CREDENTIAL_REF: &str = "keyring:rivect-test/cline-pass";
+    const CLINE_PASS_WORLD: &str = "/world/cline-pass";
+    const CLINE_PASS_MODEL: &str = "cline-pass-model";
+    assert_eq!(
+        dialect_for("cline-pass"),
+        Some(Dialect::ChatCompletions),
+        "the literal id records its dialect arm"
+    );
+    assert_eq!(
+        externally_blocked("cline-pass"),
+        None,
+        "the plan class is not the recorded external block"
+    );
+    let (error, requests, broker) = unserved_denial(
+        "cline-pass",
+        CLINE_PASS_CREDENTIAL_REF,
+        CLINE_PASS_WORLD,
+        CLINE_PASS_MODEL,
+    );
+    let ModelError::Provider(source) = &error else {
+        panic!("expected ModelError::Provider: {error}");
+    };
+    assert!(
+        matches!(
+            source,
+            ProviderError::DialectUnserved { connection, dialect }
+                if connection == "cline-pass" && *dialect == Dialect::ChatCompletions
+        ),
+        "the send gate denies the absent adapter, never the external block: {source}"
+    );
+    assert!(
+        !matches!(source, ProviderError::ExternalBlocked { .. }),
+        "an external block would mean the plan id was misclassified: {source}"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "no adapter leg ran for the denied pin"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a denied send is never accounted"
+    );
+    // the shipped block the contrast reads against stays unchanged
+    assert_eq!(
+        externally_blocked("muse-code"),
+        Some(muse_login::EXTERNAL_CLASS),
+        "muse-code keeps its recorded external class"
     );
 }

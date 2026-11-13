@@ -1,6 +1,7 @@
 //! The `custom-chat-completions`, `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `baseten`, `cerebras`,
-//! `coreweave`, `deepinfra`, `deepseek`, `firepass`, `fireworks`,
+//! `cline-pass`, `coreweave`, `deepinfra`, `deepseek`, `firepass`,
+//! `fireworks`,
 //! `gmi-cloud`, `groq`, `huggingface`, `kilo`, `litellm`, `llama.cpp`,
 //! `lm-studio`,
 //! `minimax-code`/`minimax-code-cn`, `mistral`, `moonshot`, `nanogpt`,
@@ -16,7 +17,8 @@
 //! host a deployment wires under `custom-chat-completions` shares the
 //! one recorded generic contract, while `aiand`, `aimlapi`,
 //! `alibaba-coding-plan`, `alibaba-token-plan`, `baseten`, `cerebras`,
-//! `coreweave`, `deepinfra`, `deepseek`, `firepass`, `fireworks`,
+//! `cline-pass`, `coreweave`, `deepinfra`, `deepseek`, `firepass`,
+//! `fireworks`,
 //! `gmi-cloud`, `groq`, `huggingface` and `kilo` carry their own
 //! recorded predicates — the `/v1` base normalization and the
 //! org-scoped catalogue transform on `aiand`, the default-host endpoint
@@ -35,7 +37,12 @@
 //! discovery — the recorded built-in roster is not in the reachable
 //! record, so the floor is empty (DEC-009), and a listing answer never
 //! reads as entitlement (EDGE-006) — the plain bearer credential on
-//! `cerebras`, the configured-or-default host, the
+//! `cerebras`, the configured-or-default `api.cline.bot/api/v1` plan
+//! base — the plan class's own recorded endpoint, never a PAYG base
+//! or a copied Cline client header, and offline a plan-scoped
+//! `api_key` rather than `ConnKind::Subscription` (DEC-005/DEC-011) —
+//! the `/models` listing with an empty floor (DEC-009) and the plain
+//! bearer credential on `cline-pass`, the configured-or-default host, the
 //! authoritative `/models` listing and the scoped `key` with its
 //! `OpenAI-Project` member — the recorded login is `api-key`, whose
 //! `OpenAI-Project` header hook resolves from the environment, a
@@ -497,6 +504,16 @@ const BASETEN_DEFAULT_BASE_URL: &str = "https://inference.baseten.co/v1";
 /// `config?.baseUrl ?? defaultBaseUrl` fallback — the same
 /// absent-override rule the api-key class binds.
 const CEREBRAS_DEFAULT_BASE_URL: &str = "https://api.cerebras.ai/v1";
+
+/// The recorded default API root of a `cline-pass` connection
+/// (`api.cline.bot/api/v1`, HZN-008 DEC-025 row
+/// `Rivect/key → api.cline.bot/api/v1`): the plan class's own base the
+/// required `endpoint` field's empty string resolves under. The record
+/// names a subscription plan rather than PAYG, so no PAYG base, second
+/// client identity or copied Cline header is a fallback from here
+/// (DEC-005), and offline the class declares a plan-scoped `api_key`
+/// (DEC-011) — the base is selected by the configured endpoint alone.
+const CLINE_PASS_DEFAULT_BASE_URL: &str = "https://api.cline.bot/api/v1";
 
 /// The recorded default API root of a `coreweave` connection
 /// (`api.inference.wandb.ai/v1`): the host an absent or empty
@@ -1824,6 +1841,23 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
         "cerebras" => Some(SourceContract {
             seed: &[],
             endpoint: EndpointRule::PlanBaseOrDefault(CEREBRAS_DEFAULT_BASE_URL),
+            catalog: CatalogRule::Listing,
+            credential: CredentialRule::Bearer,
+            entries: EntryRule::IdsOnly,
+        }),
+        // `cline-pass` (HZN-008 DEC-025 row
+        // `Rivect/key → api.cline.bot/api/v1`): the configured-or-
+        // recorded plan base, the `/models` listing with an empty floor
+        // — the recorded recommended-models list is not in the
+        // reachable record (DEC-009) — the plain bearer credential, and
+        // ids only. The record names a subscription plan, not PAYG
+        // (DEC-005), so nothing here substitutes a PAYG base or copies
+        // a Cline client header; offline the class is declared a
+        // plan-scoped `api_key` (DEC-011), which is what admits these
+        // legs.
+        "cline-pass" => Some(SourceContract {
+            seed: &[],
+            endpoint: EndpointRule::PlanBaseOrDefault(CLINE_PASS_DEFAULT_BASE_URL),
             catalog: CatalogRule::Listing,
             credential: CredentialRule::Bearer,
             entries: EntryRule::IdsOnly,

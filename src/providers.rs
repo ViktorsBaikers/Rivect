@@ -1660,6 +1660,7 @@ pub fn dialect_for(connection: &str) -> Option<Dialect> {
         "alibaba-token-plan" => Some(Dialect::ChatCompletions),
         "baseten" => Some(Dialect::ChatCompletions),
         "cerebras" => Some(Dialect::ChatCompletions),
+        "cline-pass" => Some(Dialect::ChatCompletions),
         "coreweave" => Some(Dialect::ChatCompletions),
         "deepinfra" => Some(Dialect::ChatCompletions),
         "deepseek" => Some(Dialect::ChatCompletions),

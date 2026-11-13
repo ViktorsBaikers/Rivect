@@ -1,8 +1,8 @@
 //! Provider proof legs for the ten recorded connection ids of this band
 //! — `coreweave`, `deepinfra`, `deepseek`, `firepass`, `fireworks`,
 //! `gmi-cloud`, `groq`, `huggingface`, `kilo` and `litellm` (section
-//! owned by SLICE-108) — the completion band's `baseten` and `cerebras`
-//! arms, plus the
+//! owned by SLICE-108) — the completion band's `baseten`, `cerebras` and
+//! `cline-pass` arms, plus the
 //! four position-4 ids whose source classes resolve through this
 //! offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
@@ -11308,6 +11308,619 @@ async fn cerebras_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::cerebras = NOT_RUN"]
 fn provider_installed_cerebras() {}
+
+// ----- cline-pass ------------------------------------------------------------
+
+// The `cline-pass` connection's proof legs (HZN-008 DEC-025 row
+// `Rivect/key → api.cline.bot/api/v1`, Chat Completions): the shared
+// adapter serves the literal id — no copied codec — under its own
+// recorded predicates. The configured `endpoint` carries the API base
+// verbatim — an empty one resolves the recorded `api.cline.bot/api/v1`
+// plan base — and a configured `region` is denied: the contract names
+// none. The record names a subscription plan, never PAYG (DEC-005), so
+// the arm substitutes no PAYG base, copies no Cline client header and
+// borrows no other scope's material; offline the class is declared a
+// plan-scoped `api_key` (DEC-011) and the credential is the plain
+// bearer. The catalogue is the configured base's own `/models` listing
+// with an empty floor: the recorded recommended-models list is not in
+// the reachable record (DEC-009).
+
+/// The scoped credential ref the `cline-pass` connection binds.
+const CLINE_PASS_REF: &str = "keyring:rivect-test/cline-pass";
+
+/// Fixture plan-key material — never a real credential, only ever sent
+/// to localhost.
+const CLINE_PASS_KEY: &str = "fixture-cline-pass-key";
+
+/// A PAYG-shaped fixture key: the seam records no key-class marker
+/// (DEC-011), so material outside the bound scope is never substituted
+/// for the plan key — the absent bound scope denies typed instead.
+const CLINE_PASS_PAYG_KEY: &str = "payg-shaped-neighbour-key";
+
+/// The pinned model id the fixed-pin legs carry.
+const CLINE_PASS_MODEL: &str = "fixture-cline-pass-chat";
+
+/// One configured `cline-pass` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn cline_pass_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.cline-pass]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{CLINE_PASS_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"cline-pass\", model_id = \"{CLINE_PASS_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn cline_pass_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CLINE_PASS_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "cline-pass".to_string(), store.clone())
+        .expect("the shared adapter builds for the cline-pass id");
+    (provider, store)
+}
+
+/// The `cline-pass` provider over the recorded plan key.
+fn enrolled_cline_pass_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    cline_pass_provider(config, CLINE_PASS_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::cline-pass ------------------------------------------
+
+/// A configured `cline-pass` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the plan-scoped api_key
+/// pin under DEC-011, the plain bearer credential rides the
+/// `Authorization` header — no scope member, no body copy, no copied
+/// Cline client identity — and the shared adapter posts exactly the
+/// frozen manifest as a `chat/completions` request: the pinned bare id
+/// verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim. The SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn cline_pass_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified cline-pass outcome",
+            Some(json!({"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&cline_pass_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_cline_pass_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/cline-pass", "goal: prove the wire")
+        .expect("the plan-scoped api_key pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/cline-pass", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified cline-pass outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CLINE_PASS_KEY}"),
+        "the plan key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(CLINE_PASS_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    // The arm copies no Cline client identity: a store-bound credential
+    // forwards no header (WireAuth::Store), so the client's own
+    // identity headers have no path onto this request.
+    for copied in ["x-title", "http-referer"] {
+        assert!(
+            !requests[0].headers.contains_key(copied),
+            "a copied Cline client header never rides the plan class: {copied}"
+        );
+    }
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(CLINE_PASS_MODEL),
+        "the bare id rides the wire exactly as pinned"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "cline-pass");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 3,
+            total_tokens: 9,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch(
+                &mut rivect::model::NullLedger,
+                "/world/cline-pass",
+                &manifest,
+            );
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success: a stream ended mid
+/// `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are both the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn cline_pass_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&cline_pass_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_cline_pass_provider(&config),
+        &config,
+        "/world/cline-pass",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/cline-pass", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&cline_pass_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_cline_pass_provider(&config),
+        &config,
+        "/world/cline-pass",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/cline-pass", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-AUTH::cline-pass ------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `cline-pass`, through the same shared construction its siblings use:
+/// a configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused bearer lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn cline_pass_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &cline_pass_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "cline-pass".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, CLINE_PASS_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "cline-pass");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, CLINE_PASS_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.cline-pass]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"cline-pass\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "cline-pass".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, CLINE_PASS_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, CLINE_PASS_KEY.as_bytes());
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config =
+        Config::parse_validated(&cline_pass_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_cline_pass_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "cline-pass");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, CLINE_PASS_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CLINE_PASS_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+/// The recorded plan class is what the arm admits, and no substitution
+/// path exists: an empty endpoint resolves the plan base
+/// `api.cline.bot/api/v1`, the plan-scoped `api_key` declaration
+/// prepares offline while the same pin declared `subscription` is the
+/// live-grant class (DEC-011), the bound store material rides as this
+/// connection's own bearer, and a PAYG-shaped key in another scope is
+/// never borrowed — the absent bound scope denies `CredentialAbsent`
+/// with zero wire legs. The seam records no key-class marker, so the
+/// assertion is the recorded class equality, not a fabricated PAYG
+/// check.
+#[tokio::test]
+async fn cline_pass_plan_class_refuses_payg_substitution() {
+    // the recorded default: an empty endpoint is the plan base
+    let defaulted = Config::parse_validated(&cline_pass_config("")).expect("valid");
+    let (provider, _store) = enrolled_cline_pass_provider(&defaulted);
+    let debug = format!("{provider:?}");
+    drop_blocking(provider);
+    assert!(
+        debug.contains("endpoint: \"https://api.cline.bot/api/v1\""),
+        "an empty endpoint resolves the recorded plan base: {debug}"
+    );
+
+    let server = MockServer::start().await;
+    mount_chat(&server, completed_stream("plan class", None)).await;
+    let config =
+        Config::parse_validated(&cline_pass_config(&server_uri_v1(&server))).expect("valid");
+
+    // the offline class the arm admits is the plan-scoped api_key
+    let mut broker = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()));
+    broker
+        .prepare("main", &config, "/world/cline-pass", "goal: plan class")
+        .expect("the plan-scoped api_key pin is the offline class");
+
+    // the subscription claim the record names is a live grant, never
+    // this offline arm — no subscription-kind substitution
+    let subscription = Config::parse_validated(
+        &cline_pass_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"subscription\""),
+    )
+    .expect("valid");
+    let err = Broker::new(Box::new(rivect::providers::LoopbackProvider::new()))
+        .prepare(
+            "main",
+            &subscription,
+            "/world/cline-pass",
+            "goal: subscription claim",
+        )
+        .expect_err("the subscription kind never prepares offline");
+    assert!(
+        matches!(
+            err,
+            ModelError::Provider(ProviderError::LiveGrantRequired {
+                kind: rivect::config::ConnKind::Subscription
+            })
+        ),
+        "the plan arm declares an api_key, not the grant-gated subscription class: {err:?}"
+    );
+
+    // a PAYG-shaped key in a sibling scope is never substituted for the
+    // bound plan scope
+    let neighbour = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(NEIGHBOR_REF, CLINE_PASS_PAYG_KEY)],
+    ));
+    let provider = provider_result(config.clone(), "cline-pass".to_string(), neighbour)
+        .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "no other scope's PAYG-shaped key stands in for the plan key: {denied:?}"
+    );
+    drop_blocking(provider);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "the denied send opened no wire leg"
+    );
+
+    // the admitted class is the recorded one: the bound material rides
+    // this connection's own bearer on the recorded chat path
+    let (provider, _store) = enrolled_cline_pass_provider(&config);
+    let (provider, accepted) = send_on_thread(provider, prepared_manifest(&config));
+    assert!(
+        matches!(&accepted, Ok(reply) if reply.text == "plan class"),
+        "the plan key serves its own class: {accepted:?}"
+    );
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the accepted send is the only leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CLINE_PASS_KEY}"),
+        "the bound plan material is the connection's own recorded bearer"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::cline-pass --------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `cline-pass`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting. The catalogue leg pins the recorded
+/// plan base on an empty endpoint and the ids-only offer; the recovery
+/// leg recovers a typed denial through the same credential seam.
+#[tokio::test]
+async fn cline_pass_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("cline-pass");
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": CLINE_PASS_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config =
+        Config::parse_validated(&cline_pass_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: an empty endpoint resolves the recorded
+    // `api.cline.bot/api/v1` plan base, and the listing's bare id is
+    // the whole offer.
+    let defaulted = Config::parse_validated(&cline_pass_config("")).expect("valid");
+    let (provider, _store) = enrolled_cline_pass_provider(&defaulted);
+    let debug = format!("{provider:?}");
+    let default_ok = debug.contains("endpoint: \"https://api.cline.bot/api/v1\"");
+    drop_blocking(provider);
+    let (provider, _store) = enrolled_cline_pass_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if default_ok
+            && model_ids(&listed) == [CLINE_PASS_MODEL]
+            && listed.iter().all(|model| {
+                model
+                    == &CatalogModel {
+                        id: model.id.clone(),
+                        ..CatalogModel::default()
+                    }
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "cline-pass".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_cline_pass_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/cline-pass", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/cline-pass", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "cline-pass".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(CLINE_PASS_REF, CLINE_PASS_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_cline_pass`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::cline-pass -------------------------------------
+
+/// TP-PROVIDER-INSTALLED::cline-pass = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::cline-pass = NOT_RUN"]
+fn provider_installed_cline_pass() {}
 
 // ----- coreweave -------------------------------------------------------------
 //
