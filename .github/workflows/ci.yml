@@ -31,6 +31,8 @@ jobs:
           toolchain: "1.98.1"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
       - name: fetch locked
         run: cargo fetch --locked
       - name: fmt

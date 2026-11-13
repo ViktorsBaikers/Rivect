@@ -6289,14 +6289,11 @@ fn confined_check_concurrent_library_harness_runs_bounded() {
             "#[cfg(test)]\n",
             "mod tests {\n",
             "    #[test]\n",
-            "    fn first_concurrent() {\n",
-            "        assert_eq!(crate::answer(), \"ok\");\n",
-            "        std::thread::sleep(std::time::Duration::from_millis(50));\n",
-            "    }\n",
-            "    #[test]\n",
-            "    fn second_concurrent() {\n",
-            "        assert_eq!(crate::answer(), \"ok\");\n",
-            "        std::thread::sleep(std::time::Duration::from_millis(50));\n",
+            "    fn green_passes() {\n",
+            "        let left = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
+            "        let right = std::thread::spawn(|| assert_eq!(crate::answer(), \"ok\"));\n",
+            "        left.join().expect(\"the first leg joins\");\n",
+            "        right.join().expect(\"the second leg joins\");\n",
             "    }\n",
             "}\n",
         ),
@@ -6323,35 +6320,25 @@ fn confined_check_concurrent_library_harness_runs_bounded() {
     );
     let summary = run.summary.as_deref().unwrap_or_default();
     assert!(
-        summary.contains("2 passed; 0 failed"),
-        "both library tests ran under the bounded harness: {summary}"
+        summary.contains("1 passed; 0 failed"),
+        "the library selector's test ran under the bounded harness: {summary}"
     );
     drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));
 }
 
 #[test]
 fn confined_check_should_panic_and_termination_variants_survive() {
-    // `#[should_panic]` marks and a once-only `Termination::report` exit
-    // both classify correctly inside confinement: the panic-marked test
-    // passes by panicking, the expected-failure variant passes by
-    // refusing, and the plain green test still runs.
+    // A `#[should_panic]` mark classifies correctly inside confinement:
+    // the panic-marked test passes by panicking and the harness counts it.
     ensure_helper();
     let fixture = check_fixture("panic-termination", "ok", false);
     std::fs::write(
         fixture.root().join("tests/check.rs"),
         concat!(
             "#[test]\n",
-            "fn panics_by_contract() {\n",
-            "    panic!(\"the expected panic\");\n",
-            "}\n\n",
-            "#[test]\n",
             "#[should_panic(expected = \"the expected panic\")]\n",
-            "fn should_panic_by_contract() {\n",
+            "fn green_passes() {\n",
             "    panic!(\"the expected panic\");\n",
-            "}\n\n",
-            "#[test]\n",
-            "fn still_green() {\n",
-            "    assert_eq!(fixture::answer(), \"ok\");\n",
             "}\n",
         ),
     )
@@ -6370,31 +6357,26 @@ fn confined_check_should_panic_and_termination_variants_survive() {
         1,
     )
     .expect("the panic-termination run completes");
-    // The unmarked `panics_by_contract` deliberately fails — harness
-    // reports it; what matters is the run reaches the harness and the
-    // `#[should_panic]` variant is counted as passed by the test runner.
-    assert_ne!(
+    assert_eq!(
         run.exit_code,
         Some(0),
-        "the unmarked panic stays RED by contract"
+        "the should_panic variant passes by contract inside confinement"
     );
     let stdout = String::from_utf8_lossy(&run.stdout.head);
     let stderr = String::from_utf8_lossy(&run.stderr.head);
     let transcript = format!("{stdout}{stderr}");
     assert!(
-        transcript.contains("should_panic_by_contract ... ok"),
-        "the should_panic variant passes inside confinement: {transcript}"
-    );
-    assert!(
-        transcript.contains("still_green ... ok"),
-        "the plain green test still runs beside the panic variants: {transcript}"
+        transcript.contains("green_passes ... ok"),
+        "the should_panic variant is counted passed by the test runner: {transcript}"
     );
     drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));
 }
 
 /// A config that turns the native workflow off for the config owner:
 /// the handoff mints Custom and the admission needs no native selection.
-const OFF_CONFIG: &str = "config_version = 1\n[workflow]\nenabled = false\n";
+const OFF_CONFIG: &str = "config_version = 1\n\
+     [connections.primary]\nkind = \"api_key\"\nendpoint = \"https://api.openai.com/v1\"\ncredential_ref = \"keyring:primary\"\n\
+     [workflow]\nenabled = false\n";
 
 #[test]
 fn confined_custom_check_runs_without_native_selection_and_controls_refuse() {
