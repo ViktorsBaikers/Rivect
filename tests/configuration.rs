@@ -18,7 +18,9 @@ use rivect::config::{
     Config, ConfigEdit, ConfigError, ConfigIssue, ConfigValue, ConnKind, EffortAssign,
     FallbackAssign, FixedModel, ModelAssign, Stage,
 };
-use rivect::providers::{ProviderError, offline_usable, resolve_credential};
+use rivect::providers::local::ChatCompletionsProvider;
+use rivect::providers::{ProviderError, StoreKind, offline_usable, resolve_credential};
+use std::sync::Arc;
 
 fn resolve_or_panic(config: &Config, purpose: &str) -> rivect::config::ResolvedPurpose {
     config
@@ -600,6 +602,63 @@ fn connection_endpoint_enforces_the_trust_boundary() {
                 );
             }
         }
+    }
+}
+
+/// `cerebras` is selected through the same TOML ingress as every
+/// connection: a loopback row validates and the configured endpoint is
+/// the adapter's wire base — no recorded default host is invented over
+/// it — while the endpoint trust boundary still refuses a
+/// credential-carrying or host-less form for this id before any send.
+#[test]
+fn cerebras_connection_binds_the_configured_endpoint_to_the_wire() {
+    fn cerebras_row(endpoint: &str) -> String {
+        format!(
+            "config_version = 1\n\
+             [connections.cerebras]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"keyring:rivect-test/cerebras\"\n\
+             [models.defaults]\n\
+             model = {{ mode = \"fixed\", connection = \"cerebras\", model_id = \"fixture-cerebras-chat\" }}\n\
+             effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+             fallback = {{ mode = \"off\" }}\n"
+        )
+    }
+
+    let endpoint = "http://127.0.0.1:11434/v1";
+    let config = Config::parse_validated(&cerebras_row(endpoint))
+        .expect("a loopback cerebras row validates");
+    assert_eq!(
+        config.connections["cerebras"].endpoint, endpoint,
+        "the admitted endpoint is retained verbatim"
+    );
+    let store = Arc::new(support::MapStore::seeded(
+        StoreKind::Keychain,
+        &[("keyring:rivect-test/cerebras", "fixture-cerebras-key")],
+    ));
+    let provider = ChatCompletionsProvider::new(&config, "cerebras", store)
+        .expect("the cerebras id binds the shared adapter");
+    let debug = format!("{provider:?}");
+    assert!(
+        debug.contains(&format!("endpoint: \"{endpoint}\"")),
+        "the configured endpoint is the wire base: {debug}"
+    );
+    assert!(
+        !debug.contains("api.cerebras.ai"),
+        "no default host is substituted over a configured endpoint: {debug}"
+    );
+
+    for refused in [
+        "https://user:pw@api.cerebras.ai/v1",
+        "http://user@127.0.0.1:11434",
+        "https://",
+        "http://",
+    ] {
+        let err = Config::parse_validated(&cerebras_row(refused))
+            .expect_err("the trust boundary refuses the form");
+        expect_stage(&err, Stage::Schema);
+        assert!(
+            matches!(err.issue, ConfigIssue::EndpointNotAllowed),
+            "endpoint {refused:?} must fail EndpointNotAllowed: {err}"
+        );
     }
 }
 

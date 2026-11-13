@@ -1,7 +1,8 @@
 //! Provider proof legs for the ten recorded connection ids of this band
 //! — `coreweave`, `deepinfra`, `deepseek`, `firepass`, `fireworks`,
 //! `gmi-cloud`, `groq`, `huggingface`, `kilo` and `litellm` (section
-//! owned by SLICE-108) — the completion band's `baseten` arm, plus the
+//! owned by SLICE-108) — the completion band's `baseten` and `cerebras`
+//! arms, plus the
 //! four position-4 ids whose source classes resolve through this
 //! offline target
 //! (TP-PROVIDER-{CATALOG,AUTH,WIRE,RECOVERY,INSTALLED}::
@@ -10718,6 +10719,595 @@ async fn baseten_provider_legs_matrix_executes_all_expected_legs() {
 #[test]
 #[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::baseten = NOT_RUN"]
 fn provider_installed_baseten() {}
+
+// ----- cerebras --------------------------------------------------------------
+
+// The `cerebras` connection's proof legs (HZN-008 class A — the
+// api-key cell, the recorded row `Rivect/key → api.cerebras.ai/v1`):
+// the shared Chat Completions adapter serves the literal id — no
+// copied codec — under its own recorded predicates. The configured
+// `endpoint` carries the API base verbatim — an empty one resolves the
+// recorded `api.cerebras.ai/v1` default — and a configured `region` is
+// denied: the contract names none. The catalogue is the configured
+// base's own key-gated, non-authoritative `/models` discovery; the
+// recorded built-in roster is not in the reachable record, so the
+// floor is empty (DEC-009), and a listing answer never proves model
+// rights (EDGE-006). The credential is the recorded plain bearer.
+
+/// The scoped credential ref the `cerebras` connection binds.
+const CEREBRAS_REF: &str = "keyring:rivect-test/cerebras";
+
+/// Fixture cerebras key material — never a real credential, only ever
+/// sent to localhost.
+const CEREBRAS_KEY: &str = "fixture-cerebras-key";
+
+/// The pinned model id the fixed-pin legs carry.
+const CEREBRAS_MODEL: &str = "fixture-cerebras-chat";
+
+/// A model only the non-authoritative listing names — offered by
+/// discovery, never admitted by it.
+const CEREBRAS_LISTED_MODEL: &str = "listed-entitlement-claim";
+
+/// One configured `cerebras` connection pointing at the fixture peer:
+/// the api_key auth class resolves a scoped `SecretRef` (DEC-011), the
+/// dialect comes from the literal connection id (DEC-007), and the
+/// endpoint carries the API base verbatim.
+fn cerebras_config(endpoint: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.cerebras]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{CEREBRAS_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"cerebras\", model_id = \"{CEREBRAS_MODEL}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+fn cerebras_provider(
+    config: &Config,
+    material: &str,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(CEREBRAS_REF, material)],
+    ));
+    let provider = provider_result(config.clone(), "cerebras".to_string(), store.clone())
+        .expect("the shared adapter builds for the cerebras id");
+    (provider, store)
+}
+
+/// The `cerebras` provider over the recorded enrolled credential.
+fn enrolled_cerebras_provider(
+    config: &Config,
+) -> (ChatCompletionsProvider, Arc<support::MapStore>) {
+    cerebras_provider(config, CEREBRAS_KEY)
+}
+
+// ----- TP-PROVIDER-WIRE::cerebras --------------------------------------------
+
+/// A configured `cerebras` connection returns a verified model outcome
+/// through the standard Broker: prepare admits the api_key pin under
+/// DEC-011, the plain bearer credential rides the `Authorization`
+/// header — no scope member, no body copy — and the shared adapter
+/// posts exactly the frozen manifest as a `chat/completions` request —
+/// the pinned bare id verbatim, system+user messages, `stream` with
+/// `stream_options.include_usage` and the pinned effort as
+/// `reasoning_effort` verbatim — the SSE stream validates its
+/// finish_reason/`[DONE]` terminal, and the one physical send is
+/// charged once with the provider's reported usage.
+#[tokio::test]
+async fn cerebras_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "verified cerebras outcome",
+            Some(json!({"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9})),
+        ),
+    )
+    .await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&cerebras_config(&base)).expect("valid");
+    let (provider, _store) = enrolled_cerebras_provider(&config);
+    let mut broker = Broker::new(Box::new(provider));
+    let manifest = broker
+        .prepare("main", &config, "/world/cerebras", "goal: prove the wire")
+        .expect("the cerebras pin passes DEC-011 eligibility");
+
+    let (broker, outcome) = dispatch(broker, "/world/cerebras", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified cerebras outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    // The wire request is exactly the frozen manifest — and nothing
+    // the manifest does not carry; a fixed pin opens no catalogue leg.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the send");
+    assert_eq!(requests.len(), 1, "one physical request — no /models leg");
+    assert_eq!(requests[0].url.path(), "/v1/chat/completions");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CEREBRAS_KEY}"),
+        "the plain key material bears the wire verbatim"
+    );
+    assert!(
+        !String::from_utf8_lossy(&requests[0].body).contains(CEREBRAS_KEY),
+        "credential material rides the authorization header, never the body"
+    );
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(CEREBRAS_MODEL),
+        "the bare id rides the wire exactly as pinned"
+    );
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "system", "content": manifest.instructions},
+            {"role": "user", "content": manifest.inputs},
+        ]),
+        "the frozen instructions and inputs ride the messages verbatim"
+    );
+    assert_eq!(body["stream"], json!(true));
+    assert_eq!(
+        body["stream_options"],
+        json!({"include_usage": true}),
+        "the recorded usage request rides the stream options"
+    );
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("medium"),
+        "the pinned effort rides the recorded reasoning_effort surface"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "cerebras");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 6,
+            completion_tokens: 3,
+            total_tokens: 9,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay =
+                broker.dispatch(&mut rivect::model::NullLedger, "/world/cerebras", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+/// Hostile stream input is never a false success: a stream ended mid
+/// `tool_calls` fragment — a partial call that never executes — and a
+/// finish_reason the dialect cannot classify are both the unknown
+/// terminal, and a rejected send charges nothing.
+#[tokio::test]
+async fn cerebras_adverse_wire_input_never_reports_success() {
+    // a complete content delta plus an unterminated tool-call
+    // fragment, then EOF — no finish_reason and no [DONE]
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&delta_chunk(json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":"},
+                }],
+            }))),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&cerebras_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_cerebras_provider(&config),
+        &config,
+        "/world/cerebras",
+        "goal: partial tool",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/cerebras", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "EOF mid tool call is the unknown terminal — never a usable call: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+
+    // a finish_reason the dialect cannot classify is unknown, never
+    // success
+    let server = MockServer::start().await;
+    mount_chat(
+        &server,
+        format!(
+            "{}{}{}",
+            data_block(&delta_chunk(json!({"content": "hi"}))),
+            data_block(&finish_chunk("mystery")),
+            DONE_BLOCK,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&cerebras_config(&server_uri_v1(&server))).expect("valid");
+    let (broker, manifest) = prepared_with(
+        enrolled_cerebras_provider(&config),
+        &config,
+        "/world/cerebras",
+        "goal: odd terminal",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/cerebras", manifest);
+    assert!(
+        matches!(
+            outcome,
+            Err(ModelError::Provider(ProviderError::UnknownTerminal { .. }))
+        ),
+        "an unclassifiable terminal is the unknown terminal: {outcome:?}"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "a rejected send charges nothing"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-CATALOG::cerebras -----------------------------------------
+
+/// The recorded discovery is non-authoritative (EDGE-006): the
+/// `/models` listing contributes its id as an offer, yet the offer
+/// releases no entitlement. With no material the listed id's send
+/// still denies `CredentialAbsent` — no keyless substitution — and
+/// with the bearer enrolled the peer's refusal of that same listed id
+/// is the typed transport denial with nothing accounted: "listed"
+/// never reads as "allowed".
+#[tokio::test]
+async fn cerebras_catalog_listing_is_not_entitlement() {
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": CEREBRAS_LISTED_MODEL})]).await;
+    let base = server_uri_v1(&server);
+    let config = Config::parse_validated(&cerebras_config(&base)).expect("valid");
+    let listed = Config::parse_validated(
+        &cerebras_config(&base).replace(CEREBRAS_MODEL, CEREBRAS_LISTED_MODEL),
+    )
+    .expect("valid");
+
+    // the non-authoritative listing answers its own id as the offer
+    let (provider, _store) = enrolled_cerebras_provider(&config);
+    let (provider, catalogue) = catalog_on_thread(provider);
+    let models = catalogue.expect("the non-authoritative listing answers");
+    drop_blocking(provider);
+    assert_eq!(
+        model_ids(&models),
+        [CEREBRAS_LISTED_MODEL],
+        "the listing's id is the whole offer"
+    );
+
+    // the listed id without material is still denied: an offer never
+    // stands in for the credential
+    let keyless = provider_result(
+        listed.clone(),
+        "cerebras".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (keyless, denied) = send_on_thread(keyless, prepared_manifest(&listed));
+    assert!(
+        matches!(denied, Err(ProviderError::CredentialAbsent { .. })),
+        "a listed id never stands in for the credential: {denied:?}"
+    );
+    drop_blocking(keyless);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the discovery leg ran — the denied send opened none"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/models");
+
+    // the peer refuses the listed id the discovery offered: the
+    // listed-but-denied send stays a typed denial, never success
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"model not enabled {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let (provider, _store) = enrolled_cerebras_provider(&listed);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&listed));
+    let err = outcome.expect_err("a listed id the peer refuses is never success");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused listed id is transport: {err}")
+    };
+    assert_eq!(connection, "cerebras");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 403 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, CEREBRAS_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the discovery leg then the refused request — no retry leg"
+    );
+    assert_eq!(requests[1].url.path(), "/v1/chat/completions");
+    let body: Value = serde_json::from_slice(&requests[1].body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!(CEREBRAS_LISTED_MODEL),
+        "the listed id rides its own request as pinned"
+    );
+    assert_eq!(
+        received_auth(&requests[1]),
+        format!("Bearer {CEREBRAS_KEY}"),
+        "the listing never stood in for the credential"
+    );
+}
+
+// ----- TP-PROVIDER-AUTH::cerebras --------------------------------------------
+
+/// Wrong credential/profile/region never produce a false success for
+/// `cerebras`, through the same shared construction its siblings use:
+/// a configured `region` — the recorded contract names none — denies
+/// `RegionMismatch` with the connection context, a profile-bound ref
+/// whose scope disagrees with the binding denies
+/// `CredentialProfileMismatch`, and a refused bearer lands the typed
+/// transport denial carrying the peer's status alone — no error, nor
+/// the offered credential material or the peer's body, reaches Display
+/// or Debug.
+#[tokio::test]
+async fn cerebras_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied — never ignored — while a sibling
+    // scope holds real material so the no-secret assertion proves no
+    // cross-scope leak instead of passing vacuously
+    let regioned = Config::parse_validated(
+        &cerebras_config(&server_uri_v1(&server))
+            .replace("kind = \"api_key\"", "kind = \"api_key\"\nregion = \"eu\""),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "cerebras".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, CEREBRAS_KEY)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    let ProviderError::RegionMismatch { connection, region } = &err else {
+        panic!("a configured region is the typed mismatch: {err}")
+    };
+    assert_eq!(connection, "cerebras");
+    assert_eq!(region, "eu");
+    assert_no_secret_or_body(&err, CEREBRAS_KEY.as_bytes());
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.cerebras]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"cerebras\", model_id = \"x\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        server_uri_v1(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "cerebras".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, CEREBRAS_KEY)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_no_secret_or_body(&err, CEREBRAS_KEY.as_bytes());
+
+    // a refused bearer is a typed transport denial — the wire never
+    // coerces a wrong credential into success, the peer's body never
+    // enters the error, and the request carried the bearer
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let config = Config::parse_validated(&cerebras_config(&server_uri_v1(&server))).expect("valid");
+    let (provider, _store) = enrolled_cerebras_provider(&config);
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused bearer is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused bearer is transport: {err}")
+    };
+    assert_eq!(connection, "cerebras");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_no_secret_or_body(&err, CEREBRAS_KEY.as_bytes());
+    drop_blocking(provider);
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(requests.len(), 1, "the refusal is the one request leg");
+    assert_eq!(
+        received_auth(&requests[0]),
+        format!("Bearer {CEREBRAS_KEY}"),
+        "the admitted bearer reached the wire — the denial is the peer's status"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::cerebras ----------------------------------------
+
+/// The legs matrix enforces the recorded expected set for `cerebras`:
+/// CATALOG, AUTH, WIRE and RECOVERY each execute and report inside this
+/// run, and INSTALLED reports NOT_RUN — an omitted leg fails the suite
+/// rather than silently absenting. The catalogue leg pins the recorded
+/// default base on an empty endpoint and the ids-only offer; the
+/// recovery leg recovers a typed denial through the same credential
+/// seam.
+#[tokio::test]
+async fn cerebras_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("cerebras");
+    use std::collections::BTreeMap;
+    let server = MockServer::start().await;
+    mount_models(&server, vec![json!({"id": CEREBRAS_MODEL})]).await;
+    mount_chat(
+        &server,
+        completed_stream(
+            "matrix",
+            Some(json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&cerebras_config(&server_uri_v1(&server))).expect("valid");
+    let mut reported = BTreeMap::new();
+
+    // CATALOG: an empty endpoint resolves the recorded
+    // `api.cerebras.ai/v1` base, and the listing's bare id is the
+    // whole offer.
+    let defaulted = Config::parse_validated(&cerebras_config("")).expect("valid");
+    let (provider, _store) = enrolled_cerebras_provider(&defaulted);
+    let debug = format!("{provider:?}");
+    let default_ok = debug.contains("endpoint: \"https://api.cerebras.ai/v1\"");
+    drop_blocking(provider);
+    let (provider, _store) = enrolled_cerebras_provider(&config);
+    let (provider, listed) = catalog_on_thread(provider);
+    let listed = listed.expect("catalog answers");
+    reported.insert(
+        "CATALOG",
+        if default_ok
+            && model_ids(&listed) == [CEREBRAS_MODEL]
+            && listed.iter().all(|model| {
+                model
+                    == &CatalogModel {
+                        id: model.id.clone(),
+                        ..CatalogModel::default()
+                    }
+            })
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // AUTH: an absent credential denies typed before any leg.
+    let provider = provider_result(
+        config.clone(),
+        "cerebras".to_string(),
+        Arc::new(support::MapStore::seeded(STORE_KIND, &[])),
+    )
+    .expect("binding resolves");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = {
+        let (provider, _store) = enrolled_cerebras_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare("main", &config, "/world/cerebras", "goal: matrix wire")
+            .expect("the pin prepares");
+        (broker, manifest)
+    };
+    let (broker, outcome) = dispatch(broker, "/world/cerebras", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: a typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "cerebras".to_string(), empty.clone())
+        .expect("binding resolves");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(CEREBRAS_REF, CEREBRAS_KEY.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(&retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // The row restates the `#[ignore]`d `provider_installed_cerebras`
+    // case's status, as its sibling matrices do.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
+    );
+}
+
+// ----- TP-PROVIDER-INSTALLED::cerebras ---------------------------------------
+
+/// TP-PROVIDER-INSTALLED::cerebras = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::cerebras = NOT_RUN"]
+fn provider_installed_cerebras() {}
 
 // ----- coreweave -------------------------------------------------------------
 //

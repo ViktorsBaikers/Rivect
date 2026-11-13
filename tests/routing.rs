@@ -7407,6 +7407,18 @@ fn baseten_routes_to_the_chat_completions_dialect() {
     );
 }
 
+/// `cerebras` records the Chat Completions dialect on the fixed
+/// `api.cerebras.ai/v1` base (DEC-002): the literal id routes to the
+/// shared codec, never a second adapter.
+#[test]
+fn cerebras_routes_to_the_chat_completions_dialect() {
+    assert_eq!(
+        rivect::providers::dialect_for("cerebras"),
+        Some(Dialect::ChatCompletions),
+        "the literal id routes to the shared Chat Completions dialect"
+    );
+}
+
 // ----- AC-040h Pro/Max profile is not an offline inference grant --------
 
 /// The login's scoped subscription credential is a live grant, not an
