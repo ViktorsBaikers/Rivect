@@ -7383,6 +7383,18 @@ fn custom_responses_eligibility_does_not_widen_other_ids() {
     ));
 }
 
+/// `azure` records the Responses dialect on the fixed azure resource path
+/// (DEC-003/DEC-004): the literal id routes to the shared codec, never a
+/// second adapter.
+#[test]
+fn azure_routes_to_the_responses_dialect() {
+    assert_eq!(
+        rivect::providers::dialect_for("azure"),
+        Some(Dialect::Responses),
+        "the literal id routes to the shared Responses dialect"
+    );
+}
+
 // ----- AC-040h Pro/Max profile is not an offline inference grant --------
 
 /// The login's scoped subscription credential is a live grant, not an

@@ -1,6 +1,6 @@
 //! OpenAI Responses-dialect provider proof legs (TP-PROVIDER-{CATALOG,
 //! AUTH,WIRE,RECOVERY,INSTALLED}::{openai,abliteration,meta,ollama,openrouter,
-//! sakana,custom-responses,openai-codex,openai-codex-device}):
+//! sakana,custom-responses,azure,openai-codex,openai-codex-device}):
 //! the configured literal Responses connections each return a verified
 //! model outcome through the standard Broker — the real synchronous
 //! adapter against the source-derived protocol peer as localhost
@@ -9,10 +9,12 @@
 //! bounded native discovery overlay; `openrouter` is the catalogue-only
 //! keyless class behind the recorded paste-key form; `custom-responses`
 //! records the operator-configured custom origin with an absent-binding
-//! headerless form. The SSE legs pin
+//! headerless form; `azure` records the fixed azure resource path with
+//! its required `api-version` query and the `api-key` header class. The
+//! SSE legs pin
 //! the shared parser's WHATWG §9.2.5–9.2.6 conformance.
 //! TP-PROVIDER-INSTALLED::{openai,meta,ollama,openrouter,sakana,custom-responses,
-//! openai-codex} stays NOT_RUN — the ignored named cases carry that status
+//! azure,openai-codex} stays NOT_RUN — the ignored named cases carry that status
 //! explicitly, and `openai-codex::class-002` WebSocket stays NOT_RUN (DEC-017).
 
 #![allow(
@@ -11481,5 +11483,618 @@ async fn encoded_image_and_text_together_deny_past_the_wire_limit() {
             .expect("the mock answers")
             .is_empty(),
         "the wire-bound denial issues no request"
+    );
+}
+
+// ----- azure ---------------------------------------------------------
+//
+// `azure` records the Responses dialect on the fixed resource path with a
+// required `api-version` query, authenticates by an `api-key` header and
+// claims no Entra flow (DEC-004/DEC-010). The listing is the only offer
+// source, the resolved deployment name rides the request `model` field,
+// and the query-aware composition plus the send-site deployment rule deny
+// before any byte (EDGE-001, DEC-015).
+
+/// The scoped credential ref the `azure` connection binds.
+const AZURE_REF: &str = "keyring:rivect-test/azure";
+
+/// The resolved deployment name the send maps into the request `model`.
+const AZURE_DEPLOYMENT: &str = "fixture-deployment";
+
+/// The fixed query the recorded endpoint carries: the resource segment
+/// lands before it, never after.
+const AZURE_QUERY: &str = "api-version=2024-10-21";
+
+/// Fixture key material — never a real credential, only ever sent to
+/// localhost.
+const AZURE_SECRET: &str = "fixture-azure-key-not-a-real-credential";
+
+/// One configured `azure` connection pointing at the fixture peer under
+/// the recorded api-key class and its required query.
+fn azure_config(endpoint: &str, model_id: &str) -> String {
+    format!(
+        "config_version = 1\n\
+         [connections.azure]\nkind = \"api_key\"\nendpoint = \"{endpoint}\"\ncredential_ref = \"{AZURE_REF}\"\n\
+         [models.defaults]\n\
+         model = {{ mode = \"fixed\", connection = \"azure\", model_id = \"{model_id}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n"
+    )
+}
+
+/// The recorded resource base: the API base carrying the required
+/// `api-version` query.
+fn azure_endpoint(server: &MockServer) -> String {
+    format!("{}/v1?{AZURE_QUERY}", server.uri())
+}
+
+fn azure_provider(config: &Config) -> (OpenAiProvider, Arc<support::MapStore>) {
+    let store = Arc::new(support::MapStore::seeded(
+        STORE_KIND,
+        &[(AZURE_REF, AZURE_SECRET)],
+    ));
+    let provider = provider_result(config.clone(), "azure".to_string(), store.clone())
+        .expect("the azure adapter builds for the literal id");
+    (provider, store)
+}
+
+/// The catalogue on a plain OS thread: the blocking client cannot be
+/// dropped inside a tokio context.
+fn azure_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
+    let (provider, outcome) = std::thread::spawn(move || {
+        let outcome = provider.catalog_models();
+        (provider, outcome)
+    })
+    .join()
+    .expect("the catalog thread joins");
+    drop_blocking(provider);
+    outcome.expect("the azure catalogue answers")
+}
+
+/// Every denial renders Display and Debug with typed context only — the
+/// fixture material and the peer's response body never appear on either.
+fn assert_azure_denial_clean(err: &ProviderError) {
+    for rendered in [format!("{err}"), format!("{err:?}")] {
+        assert!(
+            !rendered.contains(AZURE_SECRET),
+            "the credential material never renders: {rendered}"
+        );
+        assert!(
+            !rendered.contains(BODY_MARKER),
+            "the peer's response body never renders: {rendered}"
+        );
+    }
+}
+
+/// The `api-key` header a wire request carried.
+fn received_api_key(request: &Request) -> &str {
+    request
+        .headers
+        .get("api-key")
+        .and_then(|value| value.to_str().ok())
+        .expect("the request carried an api-key header")
+}
+
+// ----- TP-PROVIDER-WIRE::azure --------------------------------------
+
+/// A configured `azure` connection returns a verified model outcome
+/// through the standard Broker: the CATALOG phase answers on a connection
+/// whose resolved deployment is empty — the listing never carries a model,
+/// so a deployment rule bound to the shared composition helper would deny
+/// it — and the send legs on a non-empty deployment post the deployment as
+/// `model`, authenticate by `api-key` alone, and compose the resource path
+/// before the configured query.
+#[tokio::test]
+async fn azure_valid_control_yields_one_outcome_and_one_physical_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": AZURE_DEPLOYMENT}, {"id": "fixture-deployment-b"}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "verified azure outcome",
+            Vec::new(),
+            Some(json!({"input_tokens": 13, "output_tokens": 4, "total_tokens": 17})),
+        ),
+    )
+    .await;
+
+    // CATALOG: the deployment is empty, so a helper-bound deployment check
+    // reddens this leg; the listing alone offers its ids in sorted order.
+    let catalog_config =
+        Config::parse_validated(&azure_config(&azure_endpoint(&server), "")).expect("valid");
+    let models = azure_catalog(azure_provider(&catalog_config).0);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![AZURE_DEPLOYMENT, "fixture-deployment-b"],
+        "the authoritative listing offers every id"
+    );
+
+    let listings = server
+        .received_requests()
+        .await
+        .expect("the mock recorded the listing");
+    assert_eq!(listings.len(), 1, "the catalogue makes one listing call");
+    assert_eq!(listings[0].url.path(), "/v1/models");
+    assert_eq!(
+        listings[0].url.query(),
+        Some(AZURE_QUERY),
+        "the resource segment lands before the configured query"
+    );
+    assert_eq!(
+        received_api_key(&listings[0]),
+        AZURE_SECRET,
+        "the api-key header rides the listing leg"
+    );
+    assert!(
+        listings[0].headers.get("authorization").is_none(),
+        "the api-key class sends no Authorization header"
+    );
+
+    // The send legs ride a non-empty resolved deployment.
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        azure_provider(&config),
+        &config,
+        "/world/azure",
+        "goal: prove the azure wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/azure", manifest.clone());
+    let reply = outcome.expect("the verified outcome dispatches");
+    assert_eq!(reply.text, "verified azure outcome");
+    assert!(reply.tool_calls.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock recorded both legs");
+    let sends = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/responses")
+        .collect::<Vec<_>>();
+    assert_eq!(sends.len(), 1, "one physical request");
+    assert_eq!(
+        sends[0].url.query(),
+        Some(AZURE_QUERY),
+        "the composed path and query are exact"
+    );
+    assert_eq!(
+        received_api_key(sends[0]),
+        AZURE_SECRET,
+        "the recorded api-key header carries the credential"
+    );
+    assert!(
+        sends[0].headers.get("authorization").is_none(),
+        "the header-only path claims no Entra flow"
+    );
+    let body: Value = serde_json::from_slice(&sends[0].body).expect("json body");
+    assert_eq!(
+        body["model"], AZURE_DEPLOYMENT,
+        "the resolved deployment name rides the request model"
+    );
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert!(
+        body.get("include").is_none(),
+        "the record states no replay artifact for the id: {body}"
+    );
+
+    assert_eq!(broker.accounted_requests(), 1);
+    let record = broker
+        .accounting_record(&manifest.attempt_id)
+        .expect("the send is accounted");
+    assert_eq!(record.connection, "azure");
+    assert_eq!(
+        record.usage,
+        UsageDelta::Exact {
+            prompt_tokens: 13,
+            completion_tokens: 4,
+            total_tokens: 17,
+        }
+    );
+    let (broker, replay) = {
+        let manifest = manifest.clone();
+        std::thread::spawn(move || {
+            let mut broker = broker;
+            let replay = broker.dispatch(&mut rivect::model::NullLedger, "/world/azure", &manifest);
+            (broker, replay)
+        })
+        .join()
+        .expect("the replay thread joins")
+    };
+    assert!(
+        matches!(replay, Err(ModelError::AttemptAlreadyAccounted { .. })),
+        "the spent attempt never re-sends: {replay:?}"
+    );
+    drop_blocking(broker);
+}
+
+// ----- TP-PROVIDER-WIRE::azure (adverse input) ----------------------
+
+/// Partial and unclassifiable wire input never reports success: a stream
+/// ended mid tool call, a terminal whose payload is not JSON, and a
+/// completed envelope whose status the dialect cannot classify each deny
+/// typed (EDGE-004, PROH-008).
+#[tokio::test]
+async fn azure_adverse_wire_input_never_reports_success() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "fc_1", "type": "function_call", "status": "in_progress", "name": "read_file", "arguments": "", "call_id": "call_1"}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.function_call_arguments.delta",
+            &json!({"delta": "{\"path\":", "item_id": "fc_1", "output_index": 0}),
+        ),
+    );
+    mount_responses(&server, body).await;
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (provider, outcome) = send_on_thread(azure_provider(&config).0, prepared_manifest(&config));
+    let error = outcome.expect_err("a truncated tool block is never success");
+    assert!(
+        matches!(error, ProviderError::StreamViolation { .. }),
+        "a stream ended mid output item is the wire violation: {error}"
+    );
+    assert_azure_denial_clean(&error);
+    drop_blocking(provider);
+
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        "event: response.completed\ndata: {\"response\": \n\n".to_string(),
+    )
+    .await;
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (provider, outcome) = send_on_thread(azure_provider(&config).0, prepared_manifest(&config));
+    let error = outcome.expect_err("an unparseable terminal is never success");
+    assert!(
+        matches!(error, ProviderError::StreamViolation { .. }),
+        "a terminal payload that is not json is the wire violation: {error}"
+    );
+    assert_azure_denial_clean(&error);
+    drop_blocking(provider);
+
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        sse_block(
+            "response.completed",
+            &json!({"response": {"id": "resp_1", "status": "concluded", "output": []}}),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (provider, outcome) = send_on_thread(azure_provider(&config).0, prepared_manifest(&config));
+    let error = outcome.expect_err("an unclassifiable terminal is never success");
+    assert!(
+        matches!(error, ProviderError::UnknownTerminal { .. }),
+        "an unclassifiable terminal is the unknown terminal: {error}"
+    );
+    assert_azure_denial_clean(&error);
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-AUTH::azure --------------------------------------
+
+/// Wrong credential, profile or region denies with typed context and
+/// never renders material: a configured region is denied, a divergent
+/// profile scope is the mismatch, absent material is the seam's denial,
+/// and a refused key is the typed transport status with no second request
+/// and no Authorization header.
+#[tokio::test]
+async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_without_secrets() {
+    let server = MockServer::start().await;
+
+    // a configured region is denied, never ignored
+    let regioned = Config::parse_validated(
+        &azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT).replace(
+            "kind = \"api_key\"",
+            "kind = \"api_key\"\nregion = \"eu-1\"",
+        ),
+    )
+    .expect("valid");
+    let err = provider_result(
+        regioned,
+        "azure".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a configured region is denied, never ignored");
+    assert!(
+        matches!(&err, ProviderError::RegionMismatch { connection, region }
+            if connection == "azure" && region == "eu-1"),
+        "a configured region is the typed mismatch: {err}"
+    );
+    assert_azure_denial_clean(&err);
+
+    // a profile binding whose ref scope names another profile
+    let mismatched = Config::parse_validated(&format!(
+        "config_version = 1\n\
+         [connections.azure]\nkind = \"api_key\"\nendpoint = \"{}\"\ncredential_ref = \"keyring:rivect-test/work\"\nprofile = \"work\"\n\
+         [profiles.work]\ncredential_ref = \"keyring:rivect-test/personal\"\n\
+         [models.defaults]\nmodel = {{ mode = \"fixed\", connection = \"azure\", model_id = \"{AZURE_DEPLOYMENT}\" }}\n\
+         effort = {{ mode = \"fixed\", value = \"medium\" }}\n\
+         fallback = {{ mode = \"off\" }}\n",
+        azure_endpoint(&server)
+    ))
+    .expect("valid");
+    let err = provider_result(
+        mismatched,
+        "azure".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect_err("a divergent scope is a profile mismatch");
+    assert!(matches!(
+        err,
+        ProviderError::CredentialProfileMismatch { .. }
+    ));
+    assert_azure_denial_clean(&err);
+
+    // a bound ref with no material at its own scope
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let provider = provider_result(
+        config.clone(),
+        "azure".to_string(),
+        Arc::new(support::MapStore::seeded(
+            STORE_KIND,
+            &[(NEIGHBOR_REF, SECRET)],
+        )),
+    )
+    .expect("binding resolves; the store is read at send");
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("no material at the scope is the typed denial");
+    assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
+    assert_azure_denial_clean(&err);
+    drop_blocking(provider);
+
+    // a refused key is a typed transport denial, never success or a
+    // credential switch
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "{{\"error\": {{\"message\": \"denied {BODY_MARKER}\"}}}}"
+        )))
+        .mount(&server)
+        .await;
+    let provider = azure_provider(&config).0;
+    let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
+    let err = outcome.expect_err("a refused key is a typed transport denial");
+    let ProviderError::Transport { connection, cause } = &err else {
+        panic!("a refused key is transport: {err}")
+    };
+    assert_eq!(connection, "azure");
+    assert!(
+        cause.class() == TransportClass::HttpStatus { code: 401 },
+        "the status code is the context: {cause}"
+    );
+    assert_azure_denial_clean(&err);
+    drop_blocking(provider);
+
+    let requests = server.received_requests().await.expect("the mock recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a denial never retries another credential"
+    );
+    assert_eq!(received_api_key(&requests[0]), AZURE_SECRET);
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "no Entra token path is ever attempted"
+    );
+}
+
+// ----- TP-PROVIDER-RECOVERY::azure (pre-wire denials) ---------------
+
+/// Each recorded pre-wire variant denies typed with no accounted request:
+/// an endpoint without the query, an empty `api-version`, a duplicated
+/// `api-version`, and an empty or whitespace-only resolved deployment
+/// (EDGE-001, DEC-014/DEC-015). Every variant is fed singly, so an
+/// implementation that misses one cannot pass on another's denial.
+#[tokio::test]
+async fn azure_empty_deployment_or_malformed_api_version_denies_before_the_wire() {
+    let server = MockServer::start().await;
+    let base = format!("{}/v1", server.uri());
+    let variants = [
+        (
+            base.clone(),
+            AZURE_DEPLOYMENT,
+            "the configured endpoint carries no api-version query",
+        ),
+        (
+            format!("{base}?api-version="),
+            AZURE_DEPLOYMENT,
+            "the configured api-version query is empty",
+        ),
+        (
+            format!("{base}?api-version=a&api-version=b"),
+            AZURE_DEPLOYMENT,
+            "the configured api-version query is duplicated",
+        ),
+        (
+            azure_endpoint(&server),
+            "",
+            "the resolved deployment name is empty",
+        ),
+        (
+            azure_endpoint(&server),
+            "   ",
+            "the resolved deployment name is empty",
+        ),
+    ];
+    for (endpoint, model_id, expected) in variants {
+        let config = Config::parse_validated(&azure_config(&endpoint, model_id)).expect("valid");
+        let (broker, manifest) = prepared_with(
+            azure_provider(&config),
+            &config,
+            "/world/azure",
+            "goal: pre-wire denial",
+        );
+        let (broker, outcome) = dispatch(broker, "/world/azure", manifest);
+        let err = outcome.expect_err("the variant denies before the wire");
+        let ModelError::Provider(error) = &err else {
+            panic!("the pre-wire denial is the provider's: {err:?}")
+        };
+        assert_azure_denial_clean(error);
+        match error {
+            ProviderError::UnsendableRequest { connection, reason } => {
+                assert_eq!(connection, "azure");
+                assert_eq!(reason, expected, "each variant denies for its own reason");
+            }
+            other => panic!("{endpoint} is the unsendable denial: {other:?}"),
+        }
+        assert_eq!(
+            broker.accounted_requests(),
+            0,
+            "{endpoint} accounts no physical request"
+        );
+        drop_blocking(broker);
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no variant puts a byte on the wire"
+    );
+}
+
+// ----- TP-PROVIDER-WIRE::azure (legs matrix) ------------------------
+
+#[tokio::test]
+async fn azure_provider_legs_matrix_executes_all_expected_legs() {
+    emit_provider_rows("azure");
+    use std::collections::BTreeMap;
+    let mut reported: BTreeMap<&str, &str> = BTreeMap::new();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": AZURE_DEPLOYMENT}],
+        })))
+        .mount(&server)
+        .await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "matrix",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+
+    // CATALOG: the authoritative listing answers on a connection whose
+    // resolved deployment is empty — a deployment rule bound to the shared
+    // composition helper would deny the leg that never sends a model.
+    let catalog_config =
+        Config::parse_validated(&azure_config(&azure_endpoint(&server), "")).expect("valid");
+    let models = azure_catalog(azure_provider(&catalog_config).0);
+    reported.insert(
+        "CATALOG",
+        if models
+            .iter()
+            .map(|model| model.id.as_str())
+            .eq(std::iter::once(AZURE_DEPLOYMENT))
+        {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+
+    // The send legs ride a non-empty resolved deployment.
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+
+    // AUTH: a bound ref with no store material denies typed.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "azure".to_string(), empty)
+        .expect("the binding resolves; the store is read at send");
+    let (provider, denied) = send_on_thread(provider, prepared_manifest(&config));
+    reported.insert(
+        "AUTH",
+        if matches!(denied, Err(ProviderError::CredentialAbsent { .. })) {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // WIRE: the full broker dispatch returns the verified outcome.
+    let (broker, manifest) = prepared_with(
+        azure_provider(&config),
+        &config,
+        "/world/azure",
+        "goal: matrix wire",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/azure", manifest);
+    reported.insert(
+        "WIRE",
+        if matches!(&outcome, Ok(reply) if reply.text == "matrix") {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(broker);
+
+    // RECOVERY: the typed denial is followed by a successful retry
+    // through the same credential seam.
+    let empty = Arc::new(support::MapStore::seeded(STORE_KIND, &[]));
+    let provider = provider_result(config.clone(), "azure".to_string(), empty.clone())
+        .expect("the binding resolves; the store is read at send");
+    let manifest = prepared_manifest(&config);
+    let (provider, denied) = send_on_thread(provider, manifest.clone());
+    let denied_ok = matches!(denied, Err(ProviderError::CredentialAbsent { .. }));
+    empty.enroll(AZURE_REF, AZURE_SECRET.as_bytes());
+    let (provider, retried) = send_on_thread(provider, manifest);
+    let recovered = matches!(retried, Ok(reply) if reply.text == "matrix");
+    reported.insert(
+        "RECOVERY",
+        if denied_ok && recovered {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+    );
+    drop_blocking(provider);
+
+    // TP-PROVIDER-INSTALLED::azure = NOT_RUN: the installed-provider
+    // proof is a live leg this offline gate never runs.
+    reported.insert("INSTALLED", "NOT_RUN");
+
+    assert_eq!(
+        reported,
+        BTreeMap::from([
+            ("CATALOG", "PASS"),
+            ("AUTH", "PASS"),
+            ("WIRE", "PASS"),
+            ("RECOVERY", "PASS"),
+            ("INSTALLED", "NOT_RUN"),
+        ]),
+        "every expected leg executed and reported: {reported:?}"
     );
 }

@@ -1618,6 +1618,7 @@ pub fn externally_blocked(connection: &str) -> Option<&'static str> {
 pub fn dialect_for(connection: &str) -> Option<Dialect> {
     match connection {
         "openai" => Some(Dialect::Responses),
+        "azure" => Some(Dialect::Responses),
         "abliteration" => Some(Dialect::Responses),
         "meta" => Some(Dialect::Responses),
         "ollama" => Some(Dialect::Responses),

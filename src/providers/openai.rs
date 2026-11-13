@@ -1,8 +1,11 @@
 //! The OpenAI Responses dialect adapter (DEC-007/DEC-025, HZN-008) —
-//! the literal connection ids `openai`, `abliteration`, `meta`,
+//! the literal connection ids `openai`, `azure`, `abliteration`, `meta`,
 //! `ollama`, `custom-responses`, `openrouter`, `sakana`, `xai`,
 //! `xai-oauth`, `openai-codex` and `openai-codex-device` record this
-//! dialect. `ollama`
+//! dialect. `azure` rides the fixed azure resource path with its
+//! required `api-version` query, sends its deployment name as the
+//! request `model`, and authenticates by an `api-key` header alone
+//! (DEC-004/DEC-010). `ollama`
 //! is the local endpoint whose credential is optional (DEC-009) and
 //! whose catalogue carries a bounded native discovery overlay
 //! (DEC-012); `openrouter` rides the recorded paste-key form behind a
@@ -36,8 +39,8 @@
 //! the replay contract needs (SRC-019/D-006) — a connection whose
 //! recorded compat says the peer never returns them never asks.
 //! Secret material crosses only from [`CredentialStore`] into the
-//! `Authorization` header per send — never into config, manifests,
-//! diagnostics or this type's `Debug` (INV-001/INV-006).
+//! contract's recorded credential header per send — never into config,
+//! manifests, diagnostics or this type's `Debug` (INV-001/INV-006).
 
 use crate::config::{
     Config, ConnKind, Connection, EffortAssign, EffortLevel, FixedModel, ModelAssign,
@@ -122,6 +125,16 @@ const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5.2-codex"];
 /// to (HZN-16-03): the workspace recorded on the scoped credential,
 /// sent only when the credential carries one.
 const CODEX_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+
+/// The header the recorded `azure` row authenticates by (DEC-004/
+/// DEC-010): the scoped key rides `api-key` and never `Authorization`,
+/// because the fixed resource path claims no Entra identity flow.
+const AZURE_API_KEY_HEADER: &str = "api-key";
+
+/// The query parameter the recorded `azure` endpoint must carry
+/// (EDGE-001): the composition helper denies its absence, an empty
+/// value and a duplicate before any byte.
+const AZURE_API_VERSION_QUERY: &str = "api-version";
 
 /// Whether a literal id records the Codex credential contract: the
 /// canonical connection and its device alias share one backend and one
@@ -277,6 +290,11 @@ struct SourceContract {
     /// retry (PROH-020) — and `Allowed` elsewhere. The routing owner
     /// consults this before minting a fallback substitute.
     blind_retry: BlindRetry,
+    /// The wire header the contract authenticates by: the shipped
+    /// `Bearer` default, and `ApiKey` on the recorded `azure` row,
+    /// whose fixed resource path takes the scoped key in an `api-key`
+    /// header and claims no Entra flow (DEC-004/DEC-010).
+    auth_header: AuthHeader,
 }
 
 /// Whether a failed entered send may be re-dispatched onto a sibling
@@ -286,6 +304,16 @@ struct SourceContract {
 enum BlindRetry {
     Allowed,
     Refused,
+}
+
+/// The wire header one contract authenticates by. `Bearer` is the
+/// shipped `Authorization: Bearer` form every arm records; `ApiKey`
+/// sends the same scoped secret as `api-key: <token>` and no
+/// `Authorization` header, the one form the recorded `azure` row names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthHeader {
+    Bearer,
+    ApiKey,
 }
 
 /// The recorded per-connection contract for a Responses id
@@ -303,6 +331,20 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: true,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
+        }),
+        // The recorded `azure` row (DEC-004/DEC-010): the fixed resource
+        // path authenticates by the `api-key` header, the listing is the
+        // only offer source, and the record states no replay artifact
+        // for the id.
+        "azure" => Some(SourceContract {
+            seed: &[],
+            authoritative_models: true,
+            entry: EntryRule::IdsOnly,
+            reasoning_artifact: false,
+            requires_configured_endpoint: true,
+            blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::ApiKey,
         }),
         // DEC-012: the recorded 5-id seed is kept when a listing fails
         // or is unparseable, and replaced by an authoritative listing;
@@ -315,6 +357,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: true,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         "abliteration" => Some(SourceContract {
             seed: ABLITERATION_MODELS,
@@ -323,6 +366,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         "meta" => Some(SourceContract {
             seed: META_MUSE_MODELS,
@@ -331,6 +375,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         "ollama" => Some(SourceContract {
             seed: &[],
@@ -339,6 +384,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-010): the keyless `/models` answer offers only what the
@@ -351,6 +397,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // The listing is authoritative and carries its own entry rule
         // (DEC-004): the recorded in-source Fugu entries are mapping
@@ -363,6 +410,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // The xAI listing is authoritative and carries no vendored
         // floor; its recorded negative effort residue bounds a pinned
@@ -374,6 +422,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // The xAI OAuth listing is authoritative and no vendored
         // selected list is retained, so the listing alone offers — minus
@@ -387,6 +436,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: true,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-013: the routed owner translates the alias and passes the
         // fixed proxy base as the configured endpoint; the listing is
@@ -398,6 +448,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-014/DEC-020: the routed owner passes `{base}/v1` as the
         // configured endpoint for the Muse Spark and deepseek-v4-flash
@@ -410,6 +461,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-014: the routed owner passes `{base}/v1` as the
         // configured endpoint for the Muse Spark overrides; the
@@ -422,6 +474,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: false,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-020/HZN-16-03: the ChatGPT account-scoped listing is the
         // discovery source, and the closed Codex route table is the
@@ -436,6 +489,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: true,
             requires_configured_endpoint: true,
             blind_retry: BlindRetry::Refused,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-004: the routed owner derives the CAPI base from the
         // stored credential and passes it as the configured endpoint, so
@@ -449,6 +503,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: true,
             requires_configured_endpoint: true,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         // DEC-015: the origin is operator-configured, so no default base
         // is invented and an empty endpoint denies before the wire. The
@@ -462,6 +517,7 @@ fn contract_for(connection: &str) -> Option<SourceContract> {
             reasoning_artifact: false,
             requires_configured_endpoint: true,
             blind_retry: BlindRetry::Allowed,
+            auth_header: AuthHeader::Bearer,
         }),
         _ => None,
     }
@@ -510,6 +566,43 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
     }
 }
 
+/// One resource URL on the configured base (EDGE-001): the resource
+/// segment lands before any query the operator configured, because the
+/// recorded `azure` endpoint is `{origin}/openai/v1?api-version=…` and
+/// appending the segment after the query would fold it into its value.
+/// On `azure` the recorded `api-version` must be present, non-empty and
+/// single — absence, an empty value and a duplicate each deny before any
+/// byte — while every other arm composes verbatim.
+fn resource_url(connection: &str, base: &str, resource: &str) -> Result<String, ProviderError> {
+    let (path, query) = match base.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (base, None),
+    };
+    let composed = match query {
+        Some(query) => format!("{path}/{resource}?{query}"),
+        None => format!("{path}/{resource}"),
+    };
+    if connection != "azure" {
+        return Ok(composed);
+    }
+    let deny = |reason: &str| ProviderError::UnsendableRequest {
+        connection: connection.to_string(),
+        reason: reason.to_string(),
+    };
+    let mut versions = query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(name, _value)| *name == AZURE_API_VERSION_QUERY)
+        .map(|(_name, value)| value);
+    match (versions.next(), versions.next()) {
+        (None, _) => Err(deny("the configured endpoint carries no api-version query")),
+        (Some(""), _) => Err(deny("the configured api-version query is empty")),
+        (Some(_), Some(_)) => Err(deny("the configured api-version query is duplicated")),
+        (Some(_), None) => Ok(composed),
+    }
+}
+
 /// The mantle base under one resolved region (DEC-012): the admitted
 /// loopback override when present, else the recorded regional template.
 /// Assembly and send share it so a pin's region and the seed id's
@@ -552,8 +645,9 @@ struct StreamState {
     terminal: Option<Terminal>,
 }
 
-/// The material one send authenticates with: the bearer token plus the
-/// ChatGPT workspace the credential is bound to. Only the codex ids
+/// The material one send authenticates with: the scoped token — sent as
+/// the contract's recorded credential header — plus the ChatGPT
+/// workspace the credential is bound to. Only the codex ids
 /// record an account scope; every other arm carries `None` and sends no
 /// account header.
 struct WireMaterial {
@@ -561,19 +655,24 @@ struct WireMaterial {
     account: Option<String>,
 }
 
-/// Applies the scoped material to one outgoing request: the bearer and,
-/// where the credential recorded a workspace, the account-scope header.
-/// Both the catalogue and the inference leg use this one seam, so an
-/// absent binding stays headerless on either leg and a recorded account
-/// rides both.
+/// Applies the scoped material to one outgoing request under the
+/// contract's recorded header rule — the bearer by default, the
+/// `api-key` form on `azure` — and, where the credential recorded a
+/// workspace, the account-scope header. Both the catalogue and the
+/// inference leg use this one seam, so an absent binding stays
+/// headerless on either leg and a recorded account rides both.
 fn authenticate(
     request: reqwest::blocking::RequestBuilder,
     material: Option<&WireMaterial>,
+    header: AuthHeader,
 ) -> reqwest::blocking::RequestBuilder {
     let Some(material) = material else {
         return request;
     };
-    let request = request.bearer_auth(&material.token);
+    let request = match header {
+        AuthHeader::Bearer => request.bearer_auth(&material.token),
+        AuthHeader::ApiKey => request.header(AZURE_API_KEY_HEADER, &material.token),
+    };
     match &material.account {
         Some(account) => request.header(CODEX_ACCOUNT_HEADER, account),
         None => request,
@@ -991,7 +1090,8 @@ impl OpenAiProvider {
     /// offers only the listing's tool-capable
     /// entries with their recorded surfaces mapped (DEC-010), `sakana`
     /// offers the authoritative listing's entries with the recorded Fugu
-    /// mapping (DEC-004), `custom-responses` offers the authoritative listing
+    /// mapping (DEC-004), `azure` offers the authoritative listing alone
+    /// (DEC-010), `custom-responses` offers the authoritative listing
     /// alone (DEC-015), and `xai` offers the authoritative xAI listing as
     /// id-only entries with no vendored selected-list floor while
     /// `xai-oauth` offers the same listing minus its recorded non-chat
@@ -1003,7 +1103,9 @@ impl OpenAiProvider {
     /// # Errors
     /// The credential seam's typed denials, [`ProviderError::Transport`]
     /// on a failed call or non-success status or an expired whole-call
-    /// budget, and [`ProviderError::StreamViolation`] when the payload
+    /// budget, [`ProviderError::UnsendableRequest`] when the configured
+    /// endpoint carries no single, non-empty `api-version` query
+    /// (`azure`), and [`ProviderError::StreamViolation`] when the payload
     /// does not carry the `data` array the contract requires. A
     /// `bedrock-mantle` discovery failure is the recorded exception: it
     /// answers the retained seed instead of an error.
@@ -1050,8 +1152,10 @@ impl OpenAiProvider {
             return Ok(self.mantle_catalog(token, started));
         }
         check_deadline(&self.connection, self.deadline, started)?;
-        let mut request = self.client.get(format!("{}/models", self.endpoint));
-        request = authenticate(request, token);
+        let mut request =
+            self.client
+                .get(resource_url(&self.connection, &self.endpoint, "models")?);
+        request = authenticate(request, token, self.contract.auth_header);
         request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let mut response = request
             .send()
@@ -1154,7 +1258,7 @@ impl OpenAiProvider {
             return None;
         }
         let mut request = self.client.get(self.mantle_discovery_url());
-        request = authenticate(request, token);
+        request = authenticate(request, token, self.contract.auth_header);
         request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let Ok(mut response) = request.send() else {
             return None;
@@ -2276,7 +2380,10 @@ impl Provider for OpenAiProvider {
     /// [`ProviderError::ProviderFailed`],
     /// [`ProviderError::UnknownTerminal`],
     /// [`ProviderError::UnsendableRequest`] for a serialized request
-    /// body over the wire bound, [`ProviderError::StreamViolation`],
+    /// body over the wire bound, for a composed resource path the
+    /// configured endpoint cannot carry (absent, empty or duplicated
+    /// `api-version`) and for an empty resolved deployment name,
+    /// [`ProviderError::StreamViolation`],
     /// [`ProviderError::IncompatibleOutput`] and
     /// [`ProviderError::ReasoningProvenance`] as the stream legs
     /// document.
@@ -2363,9 +2470,20 @@ impl Provider for OpenAiProvider {
         } else {
             None
         };
+        // The resolved deployment name rides the request `model` field
+        // verbatim (EDGE-001): a pin that resolves empty or
+        // whitespace-only names nothing to deploy, so it denies here —
+        // at the send site, before composition, because the catalogue
+        // request carries no model and must keep answering.
+        if self.connection == "azure" && fixed.model_id.trim().is_empty() {
+            return Err(ProviderError::UnsendableRequest {
+                connection: self.connection.clone(),
+                reason: "the resolved deployment name is empty".to_string(),
+            });
+        }
         let url = match &mantle_base {
             Some(base) => format!("{base}/responses"),
-            None => format!("{}/responses", self.endpoint),
+            None => resource_url(&self.connection, &self.endpoint, "responses")?,
         };
         // The closed Codex route (AC-040i): the account-scoped listing
         // may name ids this contract does not serve, so a pin outside
@@ -2407,7 +2525,7 @@ impl Provider for OpenAiProvider {
             .body(body_bytes);
         // The absent binding sends no header; a bound one sends the
         // same material the catalogue leg carried (DEC-009).
-        let request = authenticate(request, token.as_ref());
+        let request = authenticate(request, token.as_ref(), self.contract.auth_header);
         let request = request.headers(forwarded_header_map(self.auth.forwarded()));
         let response = request
             .send()
