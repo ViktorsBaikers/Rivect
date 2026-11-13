@@ -2041,8 +2041,12 @@ fn exec_confinement_denies_unix_socket_connect() {
         !denied.exit_ok,
         "a scoped program must not connect to a unix service outside the scope: {denied:?}"
     );
+    // curl's prose varies by version and errno path ("Failed to connect"
+    // vs "failed to open socket: Operation not permitted"); either dialect
+    // names the connect denial, and the exit-code leg above pins the rest.
+    let stderr = denied.stderr.to_lowercase();
     assert!(
-        denied.stderr.contains("Failed to connect"),
+        stderr.contains("failed to connect") || stderr.contains("operation not permitted"),
         "the boundary names the connect denial: {denied:?}"
     );
 }
@@ -2761,13 +2765,16 @@ fn confined_exec_glibc_fork_works_because_clone3_returns_enosys() {
     ensure_helper();
     let bash = Path::new("/usr/bin/bash");
     assert!(bash.is_file(), "need /usr/bin/bash");
+    // Ubuntu 26's uutils makes /usr/bin/cat a symlink to a multicall binary
+    // outside /usr/bin; bash stays a real scoped ELF on every layout, and
+    // the pipeline child still proves fork+execve under clone3 ENOSYS.
     let confinement = linux::exec_confinement(Path::new("/usr/bin")).expect("exec confinement");
     let outcome = confined(
         &confinement,
         bash,
         &[
             std::ffi::OsStr::new("-c"),
-            std::ffi::OsStr::new("echo ok | /usr/bin/cat"),
+            std::ffi::OsStr::new("echo ok | /usr/bin/bash -c 'echo piped'"),
         ],
     )
     .expect("confined bash pipeline");

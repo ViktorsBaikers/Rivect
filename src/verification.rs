@@ -558,7 +558,8 @@ fn read_bounded_oracle(path: &Path) -> Result<Vec<u8>, ConformanceError> {
 /// evaluator reads.
 #[derive(Debug)]
 pub struct ProtectedOracle {
-    directory: tempfile::TempDir,
+    _directory: tempfile::TempDir,
+    directory_path: PathBuf,
     path: PathBuf,
     digest: String,
     oracle: Oracle,
@@ -608,7 +609,8 @@ impl ProtectedOracle {
         })?;
         let digest = crate::config::hex(&Sha256::digest(&bytes));
         Ok(Self {
-            directory,
+            _directory: directory,
+            directory_path: materialized,
             path,
             digest,
             oracle,
@@ -630,9 +632,11 @@ impl ProtectedOracle {
         &self.oracle
     }
 
-    /// The temp directory's own path; dropping the binding removes it.
+    /// The temp directory's own canonical path; dropping the binding removes
+    /// it. Canonical so `path()` and `directory()` compare equal-spelled on
+    /// hosts whose temp root is a symlink (Darwin /var -> /private/var).
     pub fn directory(&self) -> &Path {
-        self.directory.path()
+        &self.directory_path
     }
 }
 
