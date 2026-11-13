@@ -566,40 +566,47 @@ fn endpoint_for(connection: &str, configured: &str) -> String {
     }
 }
 
-/// One resource URL on the configured base (EDGE-001): the resource
-/// segment lands before any query the operator configured, because the
-/// recorded `azure` endpoint is `{origin}/openai/v1?api-version=…` and
-/// appending the segment after the query would fold it into its value.
-/// On `azure` the recorded `api-version` must be present, non-empty and
-/// single — absence, an empty value and a duplicate each deny before any
-/// byte — while every other arm composes verbatim.
+/// One resource URL on the configured base (EDGE-001): on `azure` the
+/// resource segment lands before any query the operator configured,
+/// because the recorded endpoint is `{origin}/openai/v1?api-version=…`
+/// and appending the segment after the query would fold it into its
+/// value. The recorded `api-version` must be present, non-empty and
+/// single — absence, an empty or valueless pair and a duplicate each
+/// deny before any byte — a `#` anywhere folds the query into a
+/// fragment and denies for the same reason, and the base's trailing
+/// slashes never double the separator. Every other arm keeps its
+/// shipped `{base}/{resource}` composition verbatim.
 fn resource_url(connection: &str, base: &str, resource: &str) -> Result<String, ProviderError> {
-    let (path, query) = match base.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (base, None),
-    };
-    let composed = match query {
-        Some(query) => format!("{path}/{resource}?{query}"),
-        None => format!("{path}/{resource}"),
-    };
     if connection != "azure" {
-        return Ok(composed);
+        return Ok(format!("{base}/{resource}"));
     }
     let deny = |reason: &str| ProviderError::UnsendableRequest {
         connection: connection.to_string(),
         reason: reason.to_string(),
     };
-    let mut versions = query
-        .unwrap_or_default()
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .filter(|(name, _value)| *name == AZURE_API_VERSION_QUERY)
-        .map(|(_name, value)| value);
+    // A fragment swallows the query: the gate would count a valid
+    // `api-version` the wire never carries.
+    if base.contains('#') {
+        return Err(deny("the configured endpoint carries a fragment"));
+    }
+    let (path, query) = match base.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (base, ""),
+    };
+    // Counting by name before splitting keeps a valueless pair visible:
+    // it is one more occurrence, so it denies as empty or as duplicated
+    // instead of vanishing from the count.
+    let mut versions = query.split('&').filter_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (name == AZURE_API_VERSION_QUERY).then_some(value)
+    });
     match (versions.next(), versions.next()) {
         (None, _) => Err(deny("the configured endpoint carries no api-version query")),
         (Some(""), _) => Err(deny("the configured api-version query is empty")),
         (Some(_), Some(_)) => Err(deny("the configured api-version query is duplicated")),
-        (Some(_), None) => Ok(composed),
+        // The path half loses its trailing slashes before the separator
+        // joins it: `{base}/?api-version=…` composes one slash, never two.
+        (Some(_), None) => Ok(format!("{}/{resource}?{query}", path.trim_end_matches('/'))),
     }
 }
 

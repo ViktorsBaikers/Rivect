@@ -2329,6 +2329,132 @@ fn config_rejects_inline_and_secret_looking_credential_values() {
     }
 }
 
+// ----- api-key class: azure -----------------------------------------------
+
+/// The `azure` api-key class leg (AC-040f): both recorded credential
+/// bindings resolve through the scoped `SecretRef`/DEC-013 precedence —
+/// the connection's own `credential_ref`, and a bound profile's ref
+/// where the scope's trailing segment names that profile — while an
+/// absent scope denies the typed `CredentialAbsent` without writing an
+/// entry, a divergent profile scope is the mismatch, and no denial
+/// renders the material.
+#[test]
+fn azure_api_key_binding_resolves_through_scoped_secret_ref() {
+    const AZURE_KEY: &str = "fixture-azure-key-never-a-real-credential";
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.azure]\nkind = \"api_key\"\nendpoint = \"https://resource.example.invalid/openai/v1?api-version=2024-10-21\"\ncredential_ref = \"keyring:rivect-test/azure-direct\"\n\
+         [connections.azure-profiled]\nkind = \"api_key\"\nendpoint = \"https://resource.example.invalid/openai/v1?api-version=2024-10-21\"\ncredential_ref = \"keyring:rivect-test/azure-scope\"\nprofile = \"azure-team\"\n\
+         [profiles.azure-team]\ncredential_ref = \"keyring:rivect-test/azure-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "azure")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/azure-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let profiled = resolve_credential(&config, "azure-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(profiled.scope(), "rivect-test/azure-team");
+
+    // the recorded direct scope resolves the material at the seam, and
+    // resolution writes nothing of its own
+    let store = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/azure-direct", AZURE_KEY)],
+    );
+    assert_eq!(
+        store.resolve(&resolved).expect("the store answers"),
+        AZURE_KEY.as_bytes(),
+        "the scoped ref is the only path to the material"
+    );
+    assert_eq!(
+        store
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/azure-direct".to_string()],
+        "the recorded scope resolves without writing another entry"
+    );
+
+    // an absent scope denies typed and writes nothing: the sibling
+    // scope's material stays the only entry, and the denial names the
+    // missing scope alone
+    let absent = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/azure-neighbor", AZURE_KEY)],
+    );
+    let err = absent
+        .resolve(&resolved)
+        .expect_err("the absent scope is the typed denial");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/azure-direct"),
+        "the absent scope names itself: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_KEY),
+        "the denial never renders the material: {rendered}"
+    );
+    assert_eq!(
+        absent
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/azure-neighbor".to_string()],
+        "an absent scope denies without writing an entry"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "azure",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "azure-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/azure-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    let err = resolve_credential(&mismatched, "azure-profiled")
+        .expect_err("profile/scope disagreement is the typed mismatch");
+    assert!(
+        matches!(err, ProviderError::CredentialProfileMismatch { .. }),
+        "profile/scope disagreement is CredentialProfileMismatch: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_KEY),
+        "the mismatch never renders the material: {rendered}"
+    );
+}
+
 // ----- api-key class: baseten -------------------------------------------------
 
 /// The api-key class leg (AC-040f), exercised on a `baseten` fixture:
@@ -2455,6 +2581,258 @@ fn baseten_api_key_binding_resolves_through_scoped_secret_ref() {
     let rendered = format!("{err} {err:?}");
     assert!(
         !rendered.contains(BASETEN_KEY),
+        "the mismatch never renders the material: {rendered}"
+    );
+}
+
+// ----- api-key class: cerebras --------------------------------------------
+
+/// The `cerebras` api-key class leg (AC-040f): both recorded credential
+/// bindings resolve through the scoped `SecretRef`/DEC-013 precedence —
+/// the connection's own `credential_ref`, and a bound profile's ref
+/// where the scope's trailing segment names that profile — while an
+/// absent scope denies the typed `CredentialAbsent` without writing an
+/// entry, a divergent profile scope is the mismatch, and no denial
+/// renders the material.
+#[test]
+fn cerebras_api_key_binding_resolves_through_scoped_secret_ref() {
+    const CEREBRAS_KEY: &str = "fixture-cerebras-key-never-a-real-credential";
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.cerebras]\nkind = \"api_key\"\nendpoint = \"https://api.cerebras.ai/v1\"\ncredential_ref = \"keyring:rivect-test/cerebras-direct\"\n\
+         [connections.cerebras-profiled]\nkind = \"api_key\"\nendpoint = \"https://api.cerebras.ai/v1\"\ncredential_ref = \"keyring:rivect-test/cerebras-scope\"\nprofile = \"cerebras-team\"\n\
+         [profiles.cerebras-team]\ncredential_ref = \"keyring:rivect-test/cerebras-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "cerebras")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/cerebras-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let profiled = resolve_credential(&config, "cerebras-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(profiled.scope(), "rivect-test/cerebras-team");
+
+    // the recorded direct scope resolves the material at the seam, and
+    // resolution writes nothing of its own
+    let store = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/cerebras-direct", CEREBRAS_KEY)],
+    );
+    assert_eq!(
+        store.resolve(&resolved).expect("the store answers"),
+        CEREBRAS_KEY.as_bytes(),
+        "the scoped ref is the only path to the material"
+    );
+    assert_eq!(
+        store
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/cerebras-direct".to_string()],
+        "the recorded scope resolves without writing another entry"
+    );
+
+    // an absent scope denies typed and writes nothing: the sibling
+    // scope's material stays the only entry, and the denial names the
+    // missing scope alone
+    let absent = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/cerebras-neighbor", CEREBRAS_KEY)],
+    );
+    let err = absent
+        .resolve(&resolved)
+        .expect_err("the absent scope is the typed denial");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/cerebras-direct"),
+        "the absent scope names itself: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(CEREBRAS_KEY),
+        "the denial never renders the material: {rendered}"
+    );
+    assert_eq!(
+        absent
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/cerebras-neighbor".to_string()],
+        "an absent scope denies without writing an entry"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "cerebras",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "cerebras-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/cerebras-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    let err = resolve_credential(&mismatched, "cerebras-profiled")
+        .expect_err("profile/scope disagreement is the typed mismatch");
+    assert!(
+        matches!(err, ProviderError::CredentialProfileMismatch { .. }),
+        "profile/scope disagreement is CredentialProfileMismatch: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(CEREBRAS_KEY),
+        "the mismatch never renders the material: {rendered}"
+    );
+}
+
+// ----- api-key class: cline-pass -------------------------------------------
+
+/// The `cline-pass` api-key class leg (AC-040f): both recorded
+/// credential bindings resolve through the scoped `SecretRef`/DEC-013
+/// precedence — the connection's own `credential_ref`, and a bound
+/// profile's ref where the scope's trailing segment names that profile —
+/// while an absent scope denies the typed `CredentialAbsent` without
+/// writing an entry, a divergent profile scope is the mismatch, and no
+/// denial renders the material.
+#[test]
+fn cline_pass_api_key_binding_resolves_through_scoped_secret_ref() {
+    const CLINE_PASS_KEY: &str = "fixture-cline-pass-key-never-a-real-credential";
+    let toml = "config_version = 1\n\
+         [workflow]\nenabled = false\n\
+         [connections.cline-pass]\nkind = \"api_key\"\nendpoint = \"https://api.cline.bot/api/v1\"\ncredential_ref = \"keyring:rivect-test/cline-pass-direct\"\n\
+         [connections.cline-pass-profiled]\nkind = \"api_key\"\nendpoint = \"https://api.cline.bot/api/v1\"\ncredential_ref = \"keyring:rivect-test/cline-pass-scope\"\nprofile = \"cline-pass-team\"\n\
+         [profiles.cline-pass-team]\ncredential_ref = \"keyring:rivect-test/cline-pass-team\"\n\
+         [models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n";
+    let config = Config::parse_validated(toml).expect("config parses");
+
+    let resolved = resolve_credential(&config, "cline-pass")
+        .unwrap_or_else(|e| panic!("the connection ref resolves: {}", error_variant(&e)));
+    assert_eq!(resolved.scope(), "rivect-test/cline-pass-direct");
+    assert_eq!(resolved.store(), NATIVE_KIND);
+
+    // the profile binding wins over the connection's own ref, and the
+    // scope's profile leg is the binding itself
+    let profiled = resolve_credential(&config, "cline-pass-profiled")
+        .unwrap_or_else(|e| panic!("the profile-bound ref resolves: {}", error_variant(&e)));
+    assert_eq!(profiled.scope(), "rivect-test/cline-pass-team");
+
+    // the recorded direct scope resolves the material at the seam, and
+    // resolution writes nothing of its own
+    let store = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/cline-pass-direct", CLINE_PASS_KEY)],
+    );
+    assert_eq!(
+        store.resolve(&resolved).expect("the store answers"),
+        CLINE_PASS_KEY.as_bytes(),
+        "the scoped ref is the only path to the material"
+    );
+    assert_eq!(
+        store
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/cline-pass-direct".to_string()],
+        "the recorded scope resolves without writing another entry"
+    );
+
+    // an absent scope denies typed and writes nothing: the sibling
+    // scope's material stays the only entry, and the denial names the
+    // missing scope alone
+    let absent = support::MapStore::seeded(
+        NATIVE_KIND,
+        &[("keyring:rivect-test/cline-pass-neighbor", CLINE_PASS_KEY)],
+    );
+    let err = absent
+        .resolve(&resolved)
+        .expect_err("the absent scope is the typed denial");
+    assert!(
+        matches!(&err, ProviderError::CredentialAbsent { scope } if scope == "rivect-test/cline-pass-direct"),
+        "the absent scope names itself: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(CLINE_PASS_KEY),
+        "the denial never renders the material: {rendered}"
+    );
+    assert_eq!(
+        absent
+            .entry_accounts(TEST_NAMESPACE)
+            .expect("the store lists its entries"),
+        vec!["rivect-test/cline-pass-neighbor".to_string()],
+        "an absent scope denies without writing an entry"
+    );
+
+    // eligibility is binding-level — resolution is enough, no store
+    // read happens until send (DEC-011)
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "cline-pass",
+    ));
+    assert!(rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "cline-pass-profiled",
+    ));
+    assert!(!rivect::providers::offline_usable(
+        &config.connections,
+        &config.profiles,
+        "undeclared",
+    ));
+
+    // an undeclared id is the typed denial — never a plaintext path
+    assert!(
+        matches!(
+            resolve_credential(&config, "undeclared"),
+            Err(ProviderError::UnknownConnection { .. })
+        ),
+        "an undeclared id is the typed denial"
+    );
+
+    // a profile whose ref scope names a different profile is the
+    // mismatch the seam refuses
+    let mismatched = Config::parse_validated(&toml.replace(
+        "keyring:rivect-test/cline-pass-team\"",
+        "keyring:rivect-test/other\"",
+    ))
+    .expect("config parses");
+    let err = resolve_credential(&mismatched, "cline-pass-profiled")
+        .expect_err("profile/scope disagreement is the typed mismatch");
+    assert!(
+        matches!(err, ProviderError::CredentialProfileMismatch { .. }),
+        "profile/scope disagreement is CredentialProfileMismatch: {}",
+        error_variant(&err)
+    );
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(CLINE_PASS_KEY),
         "the mismatch never renders the material: {rendered}"
     );
 }

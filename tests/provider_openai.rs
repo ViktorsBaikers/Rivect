@@ -11551,21 +11551,6 @@ fn azure_catalog(provider: OpenAiProvider) -> Vec<CatalogModel> {
     outcome.expect("the azure catalogue answers")
 }
 
-/// Every denial renders Display and Debug with typed context only — the
-/// fixture material and the peer's response body never appear on either.
-fn assert_azure_denial_clean(err: &ProviderError) {
-    for rendered in [format!("{err}"), format!("{err:?}")] {
-        assert!(
-            !rendered.contains(AZURE_SECRET),
-            "the credential material never renders: {rendered}"
-        );
-        assert!(
-            !rendered.contains(BODY_MARKER),
-            "the peer's response body never renders: {rendered}"
-        );
-    }
-}
-
 /// The `api-key` header a wire request carried.
 fn received_api_key(request: &Request) -> &str {
     request
@@ -11721,9 +11706,10 @@ async fn azure_valid_control_yields_one_outcome_and_one_physical_usage() {
 // ----- TP-PROVIDER-WIRE::azure (adverse input) ----------------------
 
 /// Partial and unclassifiable wire input never reports success: a stream
-/// ended mid tool call, a terminal whose payload is not JSON, and a
-/// completed envelope whose status the dialect cannot classify each deny
-/// typed (EDGE-004, PROH-008).
+/// ended mid tool call, a terminal whose payload is not JSON, a
+/// completed envelope whose status the dialect cannot classify, and a
+/// well-formed item kind the dialect cannot honour each deny typed
+/// (EDGE-004, PROH-008).
 #[tokio::test]
 async fn azure_adverse_wire_input_never_reports_success() {
     let server = MockServer::start().await;
@@ -11747,7 +11733,12 @@ async fn azure_adverse_wire_input_never_reports_success() {
         matches!(error, ProviderError::StreamViolation { .. }),
         "a stream ended mid output item is the wire violation: {error}"
     );
-    assert_azure_denial_clean(&error);
+    assert_no_secret_or_body(&error);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
     drop_blocking(provider);
 
     let server = MockServer::start().await;
@@ -11764,7 +11755,12 @@ async fn azure_adverse_wire_input_never_reports_success() {
         matches!(error, ProviderError::StreamViolation { .. }),
         "a terminal payload that is not json is the wire violation: {error}"
     );
-    assert_azure_denial_clean(&error);
+    assert_no_secret_or_body(&error);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
     drop_blocking(provider);
 
     let server = MockServer::start().await;
@@ -11784,8 +11780,166 @@ async fn azure_adverse_wire_input_never_reports_success() {
         matches!(error, ProviderError::UnknownTerminal { .. }),
         "an unclassifiable terminal is the unknown terminal: {error}"
     );
-    assert_azure_denial_clean(&error);
+    assert_no_secret_or_body(&error);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
     drop_blocking(provider);
+
+    // a well-formed item kind the request never declared: the dialect
+    // cannot honour a server-side tool call it never asked for
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "ignored",
+            vec![json!({
+                "id": "mcp_1",
+                "type": "mcp_call",
+                "status": "completed",
+                "name": "web_search",
+                "server_label": "web",
+                "arguments": "{}",
+            })],
+            None,
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (provider, outcome) = send_on_thread(azure_provider(&config).0, prepared_manifest(&config));
+    let error = outcome.expect_err("an item the dialect cannot honour is never success");
+    assert!(
+        matches!(error, ProviderError::IncompatibleOutput { .. }),
+        "an mcp_call item is the incompatible-output denial: {error}"
+    );
+    assert_no_secret_or_body(&error);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
+    drop_blocking(provider);
+}
+
+// ----- TP-PROVIDER-RECOVERY::azure (cancellation) --------------------
+
+/// A peer that cancels after the stream started ends the attempt with
+/// its own verdict, and the one physical send it entered stays exactly
+/// one: the ledger opens and closes a single settlement, the attempt
+/// books no usage, and no second request follows the cancelled verdict
+/// (EDGE-007).
+#[tokio::test]
+async fn azure_cancelled_mid_stream_settles_one_typed_verdict_once() {
+    let server = MockServer::start().await;
+    let cancelled = format!(
+        "{}{}{}",
+        sse_block(
+            "response.output_item.added",
+            &json!({"item": {"id": "msg_1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.output_item.done",
+            &json!({"item": {"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "cut"}]}, "output_index": 0}),
+        ),
+        sse_block(
+            "response.completed",
+            &json!({"response": {"id": "resp_1", "status": "cancelled", "output": [], "error": {"code": "cancelled", "message": "the peer cancelled the response"}}}),
+        ),
+    );
+    mount_responses(&server, cancelled).await;
+    let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
+        .expect("valid");
+    let (broker, manifest) = prepared_with(
+        azure_provider(&config),
+        &config,
+        "/world/azure",
+        "goal: cancelled mid-stream",
+    );
+    let (broker, ledger, outcome) = std::thread::spawn(move || {
+        let mut broker = broker;
+        let mut ledger = support::CountingLedger::new();
+        let outcome = broker.dispatch(&mut ledger, "/world/azure", &manifest);
+        (broker, ledger, outcome)
+    })
+    .join()
+    .expect("the dispatch thread joins");
+
+    let error = outcome.expect_err("a cancelled stream is never success");
+    let ModelError::Provider(provider_error) = &error else {
+        panic!("the cancelled stream is the peer's typed verdict: {error:?}")
+    };
+    let ProviderError::ProviderFailed { connection, reason } = provider_error else {
+        panic!("the cancelled stream is the provider verdict: {error:?}")
+    };
+    assert_eq!(connection, "azure");
+    assert_eq!(reason, "cancelled", "the peer's own verdict is the reason");
+    assert_no_secret_or_body(provider_error);
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
+    assert_eq!(
+        (ledger.begun, ledger.finished, ledger.failed),
+        (1, 1, 1),
+        "the entered send settles exactly once, as the one failed leg"
+    );
+    assert_eq!(
+        broker.accounted_requests(),
+        0,
+        "the cancelled attempt books no usage"
+    );
+    drop_blocking(broker);
+
+    let requests = server.received_requests().await.expect("the mock recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the cancelled attempt never re-sends its body"
+    );
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+}
+
+/// A base whose path half ends in a slash composes one separator, never
+/// two: the recorded resource path answers and the configured query
+/// stays exact.
+#[tokio::test]
+async fn azure_trailing_slash_base_composes_one_separator() {
+    let server = MockServer::start().await;
+    mount_responses(
+        &server,
+        responses_completed_stream(
+            "slashed",
+            Vec::new(),
+            Some(json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+        ),
+    )
+    .await;
+    let config = Config::parse_validated(&azure_config(
+        &format!("{}/v1/?{AZURE_QUERY}", server.uri()),
+        AZURE_DEPLOYMENT,
+    ))
+    .expect("valid");
+    let (broker, manifest) = prepared_with(
+        azure_provider(&config),
+        &config,
+        "/world/azure",
+        "goal: slashed base",
+    );
+    let (broker, outcome) = dispatch(broker, "/world/azure", manifest);
+    outcome.expect("the slashed base still reaches the recorded path");
+    let requests = server.received_requests().await.expect("the mock recorded");
+    assert_eq!(requests.len(), 1, "one physical send");
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(
+        requests[0].url.query(),
+        Some(AZURE_QUERY),
+        "the composed path and query are exact"
+    );
+    drop_blocking(broker);
 }
 
 // ----- TP-PROVIDER-AUTH::azure --------------------------------------
@@ -11821,7 +11975,12 @@ async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_with
             if connection == "azure" && region == "eu-1"),
         "a configured region is the typed mismatch: {err}"
     );
-    assert_azure_denial_clean(&err);
+    assert_no_secret_or_body(&err);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
 
     // a profile binding whose ref scope names another profile
     let mismatched = Config::parse_validated(&format!(
@@ -11847,7 +12006,12 @@ async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_with
         err,
         ProviderError::CredentialProfileMismatch { .. }
     ));
-    assert_azure_denial_clean(&err);
+    assert_no_secret_or_body(&err);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
 
     // a bound ref with no material at its own scope
     let config = Config::parse_validated(&azure_config(&azure_endpoint(&server), AZURE_DEPLOYMENT))
@@ -11864,7 +12028,12 @@ async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_with
     let (provider, outcome) = send_on_thread(provider, prepared_manifest(&config));
     let err = outcome.expect_err("no material at the scope is the typed denial");
     assert!(matches!(err, ProviderError::CredentialAbsent { .. }));
-    assert_azure_denial_clean(&err);
+    assert_no_secret_or_body(&err);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
     drop_blocking(provider);
 
     // a refused key is a typed transport denial, never success or a
@@ -11887,7 +12056,12 @@ async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_with
         cause.class() == TransportClass::HttpStatus { code: 401 },
         "the status code is the context: {cause}"
     );
-    assert_azure_denial_clean(&err);
+    assert_no_secret_or_body(&err);
+    let rendered = format!("{err} {err:?}");
+    assert!(
+        !rendered.contains(AZURE_SECRET),
+        "the denial renders no credential material: {rendered}"
+    );
     drop_blocking(provider);
 
     let requests = server.received_requests().await.expect("the mock recorded");
@@ -11907,9 +12081,11 @@ async fn azure_wrong_credential_profile_or_region_denies_with_typed_context_with
 
 /// Each recorded pre-wire variant denies typed with no accounted request:
 /// an endpoint without the query, an empty `api-version`, a duplicated
-/// `api-version`, and an empty or whitespace-only resolved deployment
-/// (EDGE-001, DEC-014/DEC-015). Every variant is fed singly, so an
-/// implementation that misses one cannot pass on another's denial.
+/// `api-version`, a valueless pair alone and beside a valued one, a
+/// fragment that folds the query out of the wire, and an empty or
+/// whitespace-only resolved deployment (EDGE-001, DEC-014/DEC-015).
+/// Every variant is fed singly, so an implementation that misses one
+/// cannot pass on another's denial.
 #[tokio::test]
 async fn azure_empty_deployment_or_malformed_api_version_denies_before_the_wire() {
     let server = MockServer::start().await;
@@ -11929,6 +12105,21 @@ async fn azure_empty_deployment_or_malformed_api_version_denies_before_the_wire(
             format!("{base}?api-version=a&api-version=b"),
             AZURE_DEPLOYMENT,
             "the configured api-version query is duplicated",
+        ),
+        (
+            format!("{base}?api-version"),
+            AZURE_DEPLOYMENT,
+            "the configured api-version query is empty",
+        ),
+        (
+            format!("{base}?api-version=1&api-version"),
+            AZURE_DEPLOYMENT,
+            "the configured api-version query is duplicated",
+        ),
+        (
+            format!("{base}#v1?api-version=1"),
+            AZURE_DEPLOYMENT,
+            "the configured endpoint carries a fragment",
         ),
         (
             azure_endpoint(&server),
@@ -11954,7 +12145,12 @@ async fn azure_empty_deployment_or_malformed_api_version_denies_before_the_wire(
         let ModelError::Provider(error) = &err else {
             panic!("the pre-wire denial is the provider's: {err:?}")
         };
-        assert_azure_denial_clean(error);
+        assert_no_secret_or_body(error);
+        let rendered = format!("{error} {error:?}");
+        assert!(
+            !rendered.contains(AZURE_SECRET),
+            "the denial renders no credential material: {rendered}"
+        );
         match error {
             ProviderError::UnsendableRequest { connection, reason } => {
                 assert_eq!(connection, "azure");
@@ -12082,8 +12278,8 @@ async fn azure_provider_legs_matrix_executes_all_expected_legs() {
     );
     drop_blocking(provider);
 
-    // TP-PROVIDER-INSTALLED::azure = NOT_RUN: the installed-provider
-    // proof is a live leg this offline gate never runs.
+    // The row restates the `#[ignore]`d `provider_installed_azure`
+    // case's status, as its sibling matrices do.
     reported.insert("INSTALLED", "NOT_RUN");
 
     assert_eq!(
@@ -12098,3 +12294,11 @@ async fn azure_provider_legs_matrix_executes_all_expected_legs() {
         "every expected leg executed and reported: {reported:?}"
     );
 }
+
+// ----- TP-PROVIDER-INSTALLED::azure ---------------------------------
+
+/// TP-PROVIDER-INSTALLED::azure = NOT_RUN: the installed-provider
+/// proof is a live-environment leg this offline slice never runs.
+#[test]
+#[ignore = "installed-provider proof is out of scope for the offline gate — TP-PROVIDER-INSTALLED::azure = NOT_RUN"]
+fn provider_installed_azure() {}
