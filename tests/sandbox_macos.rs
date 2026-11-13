@@ -6363,7 +6363,7 @@ fn confined_check_should_panic_and_termination_variants_survive() {
     let stderr = String::from_utf8_lossy(&run.stderr.head);
     let transcript = format!("{stdout}{stderr}");
     assert!(
-        transcript.contains("green_passes ... ok"),
+        transcript.contains("green_passes - should panic ... ok"),
         "the should_panic variant is counted passed by the test runner: {transcript}"
     );
     drop_sealed_attempt_root(run.attempt_root.as_deref().expect("retained root"));

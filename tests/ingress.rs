@@ -481,7 +481,9 @@ fn exec_ingress_runs_a_confined_program() {
             .map(PathBuf::from)
             .find(|candidate| candidate.is_file())
             .expect("a host cat program");
-        let cat = world.root.join("cat-dev-null");
+        // argv[0] keeps `cat`: some hosts ship it as a coreutils multicall
+        // binary that dispatches on its invocation name.
+        let cat = world.root.join("cat");
         std::fs::copy(&cat_source, &cat).expect("copy cat into the scope");
         std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o755))
             .expect("make the scoped cat executable");
