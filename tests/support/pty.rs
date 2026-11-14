@@ -705,12 +705,38 @@ impl Read for FaultReader {
 
 /// Reconstructs the visible frame from collected PTY bytes: the ANSI
 /// subset the TUI emits — cursor addressing, erase-in-line/display,
+/// scroll regions and scroll/insert/delete line and character operations,
 /// CR/LF, printable cells — flattened to `rows` x `cols` text lines.
+/// OSC payloads and private modes carry no cells and are skipped.
 pub fn reconstruct_screen(bytes: &[u8], rows: usize, cols: usize) -> String {
     let mut cells = vec![vec![b' '; cols]; rows];
     let mut row = 0usize;
     let mut col = 0usize;
+    // DECSTBM scrolling region, inclusive; the whole screen by default.
+    let mut top = 0usize;
+    let mut bottom = rows - 1;
     let mut index = 0usize;
+
+    // Scroll the region up/down by n lines (CSI S / CSI T, and a newline at
+    // the bottom margin): lines move toward the top/bottom and the vacated
+    // rows blank. rotate moves the row vectors, not the cells.
+    fn scroll_up(cells: &mut [Vec<u8>], top: usize, bottom: usize, n: usize) {
+        let region = &mut cells[top..=bottom];
+        let len = region.len();
+        let n = n.min(len);
+        region.rotate_left(n);
+        for line in &mut region[len - n..] {
+            line.fill(b' ');
+        }
+    }
+    fn scroll_down(cells: &mut [Vec<u8>], top: usize, bottom: usize, n: usize) {
+        let region = &mut cells[top..=bottom];
+        let n = n.min(region.len());
+        region.rotate_right(n);
+        for line in &mut region[..n] {
+            line.fill(b' ');
+        }
+    }
 
     while index < bytes.len() {
         match bytes[index] {
@@ -719,96 +745,206 @@ pub fn reconstruct_screen(bytes: &[u8], rows: usize, cols: usize) -> String {
                 if index >= bytes.len() {
                     break;
                 }
-                if bytes[index] != b'[' {
-                    index += 1;
-                    continue;
-                }
-                index += 1;
-                let params_start = index;
-                while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
-                    index += 1;
-                }
-                if index == bytes.len() {
-                    break;
-                }
-                let final_byte = bytes[index];
-                let params = &bytes[params_start..index];
-                index += 1;
-                if params.first() == Some(&b'?') {
-                    continue;
-                }
-                let parameters = params
-                    .split(|byte| *byte == b';')
-                    .map(|parameter| {
-                        if parameter.is_empty() {
-                            None
+                match bytes[index] {
+                    b'[' => {
+                        index += 1;
+                        let params_start = index;
+                        while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+                            index += 1;
+                        }
+                        if index == bytes.len() {
+                            break;
+                        }
+                        let final_byte = bytes[index];
+                        let params = &bytes[params_start..index];
+                        index += 1;
+                        // Private/secondary-prefixed modes (DEC private modes,
+                        // > / =) carry no cell effect here.
+                        if matches!(params.first(), Some(b'?') | Some(b'>') | Some(b'=')) {
+                            continue;
+                        }
+                        let parameters = params
+                            .split(|byte| *byte == b';')
+                            .map(|parameter| {
+                                if parameter.is_empty() {
+                                    None
+                                } else {
+                                    std::str::from_utf8(parameter)
+                                        .ok()
+                                        .and_then(|value| value.parse::<usize>().ok())
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let parameter = |position: usize, default: usize| {
+                            parameters
+                                .get(position)
+                                .and_then(|value| *value)
+                                .unwrap_or(default)
+                        };
+                        match final_byte {
+                            b'H' | b'f' => {
+                                row = parameter(0, 1).max(1).saturating_sub(1).min(rows - 1);
+                                col = parameter(1, 1).max(1).saturating_sub(1).min(cols - 1);
+                            }
+                            b'A' => row = row.saturating_sub(parameter(0, 1).max(1)),
+                            b'B' => row = row.saturating_add(parameter(0, 1).max(1)).min(rows - 1),
+                            b'C' | b'a' => {
+                                col = col.saturating_add(parameter(0, 1).max(1)).min(cols - 1)
+                            }
+                            b'D' => col = col.saturating_sub(parameter(0, 1).max(1)),
+                            b'G' => col = parameter(0, 1).max(1).saturating_sub(1).min(cols - 1),
+                            b'd' => row = parameter(0, 1).max(1).saturating_sub(1).min(rows - 1),
+                            b'E' => {
+                                row = row.saturating_add(parameter(0, 1).max(1)).min(rows - 1);
+                                col = 0;
+                            }
+                            b'F' => {
+                                row = row.saturating_sub(parameter(0, 1).max(1));
+                                col = 0;
+                            }
+                            b'J' => match parameter(0, 0) {
+                                0 => {
+                                    for cell in &mut cells[row][col..] {
+                                        *cell = b' ';
+                                    }
+                                    for line in cells.iter_mut().skip(row + 1) {
+                                        line.fill(b' ');
+                                    }
+                                }
+                                1 => {
+                                    for line in cells.iter_mut().take(row) {
+                                        line.fill(b' ');
+                                    }
+                                    for cell in &mut cells[row][..=col] {
+                                        *cell = b' ';
+                                    }
+                                }
+                                2 | 3 => {
+                                    for line in &mut cells {
+                                        line.fill(b' ');
+                                    }
+                                }
+                                _ => {}
+                            },
+                            b'K' => match parameter(0, 0) {
+                                0 => cells[row][col..].fill(b' '),
+                                1 => cells[row][..=col].fill(b' '),
+                                2 => cells[row].fill(b' '),
+                                _ => {}
+                            },
+                            // ECH: erase n cells from the cursor, no move.
+                            b'X' => {
+                                let end = (col + parameter(0, 1).max(1)).min(cols);
+                                cells[row][col..end].fill(b' ');
+                            }
+                            // ICH: insert n blanks at the cursor, shifting the
+                            // rest of the row right (cells past the edge drop).
+                            b'@' => {
+                                let n = parameter(0, 1).max(1).min(cols - col);
+                                if n > 0 {
+                                    let line = &mut cells[row];
+                                    line.copy_within(col..cols - n, col + n);
+                                    line[col..col + n].fill(b' ');
+                                }
+                            }
+                            // DCH: delete n cells at the cursor, pulling the
+                            // rest of the row left.
+                            b'P' => {
+                                let n = parameter(0, 1).max(1).min(cols - col);
+                                if n > 0 {
+                                    let line = &mut cells[row];
+                                    line.copy_within(col + n..cols, col);
+                                    line[cols - n..].fill(b' ');
+                                }
+                            }
+                            // IL / DL: insert/delete n whole lines at the cursor
+                            // within the scrolling region.
+                            b'L' => {
+                                if row >= top && row <= bottom {
+                                    let region = &mut cells[row..=bottom];
+                                    let n = parameter(0, 1).max(1).min(region.len());
+                                    region.rotate_right(n);
+                                    for line in &mut region[..n] {
+                                        line.fill(b' ');
+                                    }
+                                }
+                            }
+                            b'M' => {
+                                if row >= top && row <= bottom {
+                                    let region = &mut cells[row..=bottom];
+                                    let len = region.len();
+                                    let n = parameter(0, 1).max(1).min(len);
+                                    region.rotate_left(n);
+                                    for line in &mut region[len - n..] {
+                                        line.fill(b' ');
+                                    }
+                                }
+                            }
+                            b'S' => scroll_up(&mut cells, top, bottom, parameter(0, 1).max(1)),
+                            b'T' => scroll_down(&mut cells, top, bottom, parameter(0, 1).max(1)),
+                            // DECSTBM: set the scrolling region and home the
+                            // cursor to its top-left.
+                            b'r' => {
+                                let t = parameter(0, 1).max(1).saturating_sub(1).min(rows - 1);
+                                let b = parameter(1, rows).max(1).saturating_sub(1).min(rows - 1);
+                                if t < b {
+                                    top = t;
+                                    bottom = b;
+                                }
+                                row = top;
+                                col = 0;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // OSC (title etc.): skip to BEL or ST so its payload never
+                    // paints cells.
+                    b']' => {
+                        index += 1;
+                        while index < bytes.len() {
+                            if bytes[index] == 0x07 {
+                                index += 1;
+                                break;
+                            }
+                            if bytes[index] == 0x1b
+                                && index + 1 < bytes.len()
+                                && bytes[index + 1] == b'\\'
+                            {
+                                index += 2;
+                                break;
+                            }
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    // RI: reverse index — scroll down at the top margin.
+                    b'M' => {
+                        if row == top {
+                            scroll_down(&mut cells, top, bottom, 1);
                         } else {
-                            std::str::from_utf8(parameter)
-                                .ok()
-                                .and_then(|value| value.parse::<usize>().ok())
+                            row = row.saturating_sub(1);
                         }
-                    })
-                    .collect::<Vec<_>>();
-                let parameter = |position: usize, default: usize| {
-                    parameters
-                        .get(position)
-                        .and_then(|value| *value)
-                        .unwrap_or(default)
-                };
-                match final_byte {
-                    b'H' | b'f' => {
-                        row = parameter(0, 1).max(1).saturating_sub(1).min(rows - 1);
-                        col = parameter(1, 1).max(1).saturating_sub(1).min(cols - 1);
+                        index += 1;
+                        continue;
                     }
-                    b'A' => row = row.saturating_sub(parameter(0, 1).max(1)),
-                    b'B' => row = row.saturating_add(parameter(0, 1).max(1)).min(rows - 1),
-                    b'C' | b'a' => col = col.saturating_add(parameter(0, 1).max(1)).min(cols - 1),
-                    b'D' => col = col.saturating_sub(parameter(0, 1).max(1)),
-                    b'G' => col = parameter(0, 1).max(1).saturating_sub(1).min(cols - 1),
-                    b'd' => row = parameter(0, 1).max(1).saturating_sub(1).min(rows - 1),
-                    b'E' => {
-                        row = row.saturating_add(parameter(0, 1).max(1)).min(rows - 1);
-                        col = 0;
+                    // Charset designation (ESC ( B etc.): skip the designator.
+                    b'(' | b')' | b'*' | b'+' => {
+                        index += 2;
+                        continue;
                     }
-                    b'F' => {
-                        row = row.saturating_sub(parameter(0, 1).max(1));
-                        col = 0;
+                    _ => {
+                        index += 1;
+                        continue;
                     }
-                    b'J' => match parameter(0, 0) {
-                        0 => {
-                            for cell in &mut cells[row][col..] {
-                                *cell = b' ';
-                            }
-                            for line in cells.iter_mut().skip(row + 1) {
-                                line.fill(b' ');
-                            }
-                        }
-                        1 => {
-                            for line in cells.iter_mut().take(row) {
-                                line.fill(b' ');
-                            }
-                            for cell in &mut cells[row][..=col] {
-                                *cell = b' ';
-                            }
-                        }
-                        2 | 3 => {
-                            for line in &mut cells {
-                                line.fill(b' ');
-                            }
-                        }
-                        _ => {}
-                    },
-                    b'K' => match parameter(0, 0) {
-                        0 => cells[row][col..].fill(b' '),
-                        1 => cells[row][..=col].fill(b' '),
-                        2 => cells[row].fill(b' '),
-                        _ => {}
-                    },
-                    _ => {}
                 }
-                continue;
             }
             b'\r' => col = 0,
+            // The harness models ratatui's absolute-positioned repaints, which
+            // never scroll by newline; a newline advances the row and clamps at
+            // the bottom so a stray LF cannot shift a painted status line.
+            // Explicit scrolls (CSI S/T) and insert/delete lines still model
+            // the scrolling region above.
             b'\n' => row = (row + 1).min(rows - 1),
             b'\x08' => col = col.saturating_sub(1),
             byte if (0x20..=0x7e).contains(&byte) => {
@@ -874,4 +1010,68 @@ pub fn wait_for_screen_text(
         visible = reconstruct_screen(&pty.collected()?, rows, cols);
     }
     Ok(visible)
+}
+
+#[cfg(test)]
+mod screen_recon_tests {
+    use super::reconstruct_screen;
+
+    fn screen(bytes: &[u8], rows: usize, cols: usize) -> Vec<String> {
+        reconstruct_screen(bytes, rows, cols)
+            .split('\n')
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn scroll_up_shifts_lines_and_blanks_the_bottom() {
+        let out = screen(b"AAA\r\nBBB\r\nCCC\x1b[1S", 3, 3);
+        assert_eq!(out, vec!["BBB", "CCC", ""]);
+    }
+
+    #[test]
+    fn scroll_down_shifts_lines_and_blanks_the_top() {
+        let out = screen(b"AAA\r\nBBB\r\nCCC\x1b[1T", 3, 3);
+        assert_eq!(out, vec!["", "AAA", "BBB"]);
+    }
+
+    #[test]
+    fn newline_clamps_at_the_bottom_row() {
+        // The painted-frame model clamps a stray newline at the bottom rather
+        // than scrolling, so a status line stays put; explicit CSI S/T scroll.
+        let out = screen(b"AAA\r\nBBB\r\nCCC\r\nDDD", 3, 3);
+        assert_eq!(out, vec!["AAA", "BBB", "DDD"]);
+    }
+
+    #[test]
+    fn insert_line_pushes_the_region_down() {
+        let out = screen(b"AAA\r\nBBB\r\nCCC\x1b[2;1H\x1b[1L", 3, 3);
+        assert_eq!(out, vec!["AAA", "", "BBB"]);
+    }
+
+    #[test]
+    fn delete_line_pulls_the_region_up() {
+        let out = screen(b"AAA\r\nBBB\r\nCCC\x1b[2;1H\x1b[1M", 3, 3);
+        assert_eq!(out, vec!["AAA", "CCC", ""]);
+    }
+
+    #[test]
+    fn scrolling_region_confines_the_scroll() {
+        let out = screen(b"AAA\r\nBBB\r\nCCC\x1b[2;3r\x1b[1S", 3, 3);
+        assert_eq!(out, vec!["AAA", "CCC", ""]);
+    }
+
+    #[test]
+    fn osc_payload_never_paints_cells() {
+        let out = screen(b"AB\x1b]0;title\x07CD", 1, 4);
+        assert_eq!(out, vec!["ABCD"]);
+    }
+
+    #[test]
+    fn insert_and_delete_characters_shift_the_row() {
+        let out = screen(b"ABCD\x1b[1;2H\x1b[2@", 1, 6);
+        assert_eq!(out, vec!["A  BCD"]);
+        let out = screen(b"ABCD\x1b[1;2H\x1b[2P", 1, 4);
+        assert_eq!(out, vec!["AD"]);
+    }
 }
