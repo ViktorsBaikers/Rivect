@@ -3827,17 +3827,9 @@ fn owned_launch_pre_fence_socketpair_tuple_is_exact() {
                 .expect("the kernel truncates native integer arguments"),
         );
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        unsafe extern "C" {
-            fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
-        }
-        assert_eq!(
-            // SAFETY: getpid has no pointer operands; this checks current x32 availability.
-            unsafe { syscall(0x40000027) },
-            i64::from(std::process::id())
-        );
-    }
+    // x32 availability is probed by `x32_available()`; the live x32 legs below
+    // run only when the kernel implements the ABI (Ubuntu 26 kernels drop it).
+    // The BPF verdict table above proves x32 refusal either way.
     install_owned_test_filter(SeccompStage::PreInjection);
     let pair = owned_test_socketpair([1, 524293, 0]).expect("exact native anonymous tuple");
     {
@@ -3873,7 +3865,7 @@ fn owned_launch_pre_fence_socketpair_tuple_is_exact() {
         );
     }
     #[cfg(target_arch = "x86_64")]
-    {
+    if x32_available() {
         unsafe extern "C" {
             fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
         }
@@ -3921,6 +3913,17 @@ fn install_owned_test_filter(stage: rivect_sandbox_helper::SeccompStage) {
     assert_eq!(unsafe { prctl(38, 1, 0, 0, 0) }, 0);
     // SAFETY: the kernel copies the live aligned program and its immutable filters.
     assert_eq!(unsafe { prctl(22, 2, &program, 0, 0) }, 0);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x32_available() -> bool {
+    unsafe extern "C" {
+        fn syscall(number: std::os::raw::c_long, ...) -> std::os::raw::c_long;
+    }
+    // SAFETY: getpid has no pointer operands; probes whether the kernel still
+    // implements the x32 ABI. The BPF verdict table proves x32 refusal
+    // regardless; the live x32 legs run only when the ABI is present.
+    unsafe { syscall(0x40000027) == std::os::raw::c_long::from(std::process::id()) }
 }
 
 #[cfg(target_os = "linux")]
@@ -4187,11 +4190,14 @@ fn owned_launch_export_fence_blocks_scm_rights() {
     let artifact_path = fixture.path().join("artifact");
     std::fs::write(&artifact_path, b"independent owned artifact").expect("write export artifact");
     let expected = std::fs::metadata(&artifact_path).expect("freeze artifact identity");
-    let abis: &[bool] = if cfg!(target_arch = "x86_64") {
+    #[cfg(target_arch = "x86_64")]
+    let abis: &[bool] = if x32_available() {
         &[false, true]
     } else {
         &[false]
     };
+    #[cfg(not(target_arch = "x86_64"))]
+    let abis: &[bool] = &[false];
     for &compat in abis {
         for multiple in [false, true] {
             for anonymous in [false, true] {
