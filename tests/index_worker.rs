@@ -283,7 +283,12 @@ fn assert_worker_gone_in(
     // bound, and the caller's own assertions run (once) before any of
     // this function's panics.
     let recorded = recorded_pid(pid_file);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The worker is SIGKILLed on stop, but a namespaced grandchild can linger
+    // as an unreaped zombie until host init reaps it; on a loaded CI runner
+    // that reap occasionally exceeds a tight window (observed on runs
+    // 43522168656 / 43539113262 / 43563508648, always green locally). 10s
+    // tolerates that load while still failing a worker that is never reaped.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut observation = None;
     let mut liveness = Ok(false);
     if let Some(inner) = recorded {
