@@ -743,6 +743,11 @@ fn await_review_screen(
             tui.wait_settled_after(fixture.needles[0], mark, LIVE_RESIZE_WAIT)?;
         }
     }
+    // The composer prompt paints only after the startup cursor-query answer,
+    // which can land after the settle window above; require a still frame
+    // that already carries the composer row so control and theme captures
+    // share one settled state.
+    tui.wait_settled_after(&fixture.composer_label, 0, WAIT)?;
     Ok(())
 }
 
