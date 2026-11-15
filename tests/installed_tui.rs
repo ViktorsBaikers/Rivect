@@ -67,28 +67,15 @@ const MATRIX_BUDGET_SECONDS: f64 = 900.0;
 /// The three inherited themes and the exact `RIVECT_THEME` value each names.
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
 
-const WAIT: Duration = Duration::from_secs(10);
+/// Packaged probes run four-wide against a busy host: a generous deadline
+/// keeps a load-slowed paint from reading as a defect, and still fails a hang.
+const WAIT: Duration = Duration::from_secs(30);
 /// The live-resize lane is separate from the four-worker pool: at most two
 /// resized frames capture at once, and each waits for its own settled frame.
 const LIVE_WORKERS: usize = 2;
-/// A settled live-resize frame may take longer than an ordinary first paint.
-const LIVE_RESIZE_WAIT: Duration = Duration::from_secs(30);
-
-/// Env gate for the cursor-query trace: the harness prints when it sees
-/// `ESC [ 6 n`, when it answers, and what the child reported on timeout.
-/// Diagnostic only — unset, the trace is silent and no behaviour changes.
-const CURSOR_TRACE_ENV: &str = "RIVECT_PTY_CURSOR_TRACE";
-
-fn trace_enabled() -> bool {
-    std::env::var_os(CURSOR_TRACE_ENV).is_some()
-}
-
-/// Microseconds since the harness's first traced call, so query, answer and
-/// timeout orderings are readable in one run.
-fn trace_at() -> Duration {
-    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-    START.elapsed()
-}
+/// A settled live-resize frame may take longer than an ordinary first paint,
+/// and load stretches both; the deadline still fails a resize that never lands.
+const LIVE_RESIZE_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Geometry {
@@ -739,6 +726,11 @@ fn await_review_screen(
     fixture: &StateFixture,
     geometry: Geometry,
 ) -> Result<(), String> {
+    // The first needle can match on the first PTY quantum while the last
+    // rows of the frame are still in flight (a high-contrast frame floods
+    // styled blanks across many quanta). Capture only a frame that held
+    // still; mark 0 settles the initial paint itself.
+    tui.wait_settled_after(fixture.needles[0], 0, WAIT)?;
     for needle in &fixture.needles {
         tui.wait(needle, WAIT)?;
     }
@@ -1093,8 +1085,7 @@ fn inline_theme_probe(theme: &'static str) -> Result<(), String> {
     // The card refuses a key inside its consent floor (the first paint starts
     // a short clock); wait it out before dismissing.
     tui.pump(Duration::from_millis(400))?;
-    tui.send(b"\x1b")?;
-    tui.wait("decision left unanswered", WAIT)?;
+    tui.send_card_key(b"\x1b", "decision left unanswered", WAIT)?;
     tui.send(b"\x1b")?;
     let (bytes, code) = tui.finish()?;
     if code != Some(0) {
@@ -1242,6 +1233,9 @@ struct TuiPty {
     rows: u16,
     cols: u16,
     cursor_at: usize,
+    /// A deaf terminal reads cursor queries and drops them; the live
+    /// waits keep pumping but never reply, like a real dumb emulator.
+    deaf: bool,
 }
 
 impl TuiPty {
@@ -1281,6 +1275,7 @@ impl TuiPty {
             rows,
             cols,
             cursor_at: 0,
+            deaf: false,
         })
     }
 
@@ -1304,6 +1299,7 @@ impl TuiPty {
             rows,
             cols,
             cursor_at: 0,
+            deaf: false,
         })
     }
 
@@ -1400,22 +1396,19 @@ impl TuiPty {
 
     fn answer_cursor_query(&mut self) -> Result<(), String> {
         let bytes = self.bytes()?;
-        if let Some(found) = support::find_subsequence(&bytes[self.cursor_at..], b"\x1b[6n") {
-            if trace_enabled() {
-                eprintln!(
-                    "[cursor-trace {:?}] saw ESC[6n at byte {} (cursor_at {})",
-                    trace_at(),
-                    found,
-                    self.cursor_at
-                );
-            }
+        if self.deaf {
+            // The query is read and dropped; the mark moves past it so no
+            // later path answers it out of time.
+            self.cursor_at = bytes.len();
+            return Ok(());
+        }
+        if let Some(reply) = support::cursor_query_reply(&mut self.cursor_at, &bytes) {
             self.pty
-                .send(b"\x1b[1;1R")
+                .send(reply)
                 .map_err(|error| format!("pty send: {error}"))?;
-            if trace_enabled() {
-                eprintln!("[cursor-trace {:?}] answered ESC[1;1R", trace_at());
+            if support::trace_enabled() {
+                eprintln!("[cursor-trace {:?}] answered ESC[1;1R", support::trace_at());
             }
-            self.cursor_at += found + 4;
         }
         Ok(())
     }
@@ -1430,11 +1423,11 @@ impl TuiPty {
                 return Ok(screen);
             }
             if Instant::now() >= deadline {
-                if trace_enabled() {
+                if support::trace_enabled() {
                     let text = String::from_utf8_lossy(&bytes);
                     eprintln!(
                         "[cursor-trace {:?}] timeout for {needle:?}; cleanup-report={} alt-in={} alt-out={} cursor_at={}",
-                        trace_at(),
+                        support::trace_at(),
                         text.contains("terminal cleanup failed"),
                         text.contains("\u{1b}[?1049h"),
                         text.contains("\u{1b}[?1049l"),
@@ -1495,11 +1488,39 @@ impl TuiPty {
         }
     }
 
+    /// A card key can be eaten by the first-paint drain when load delays the
+    /// drain past the visible paint: resend until the effect lands, while the
+    /// card is still open, inside one real deadline. The attempt window is
+    /// generous so a landed key's frame arrives before any resend — a stray
+    /// Esc outside the card would quit the TUI.
+    fn send_card_key(
+        &mut self,
+        key: &[u8],
+        effect: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send(key)?;
+            let window =
+                Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now()));
+            match self.wait(effect, window) {
+                Ok(screen) => return Ok(screen),
+                Err(error) => {
+                    let screen = support::squashed(&self.screen(&self.bytes()?));
+                    if Instant::now() >= deadline || !screen.contains("focus") {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if trace_enabled() {
+        if support::trace_enabled() {
             eprintln!(
                 "[cursor-trace {:?}] send {:?}",
-                trace_at(),
+                support::trace_at(),
                 String::from_utf8_lossy(bytes)
             );
         }
@@ -1517,12 +1538,19 @@ impl TuiPty {
         Ok(())
     }
 
+    /// The exit wait plays terminal too: a child that asks for the cursor
+    /// position while leaving gets the same answer the live waits give.
+    fn wait_exit_answering(&mut self) -> Result<Option<u32>, String> {
+        let cursor_at = &mut self.cursor_at;
+        self.pty
+            .wait_exit_answering(WAIT, move |bytes| {
+                support::cursor_query_reply(cursor_at, bytes)
+            })
+            .map_err(|error| format!("pty wait: {error}"))
+    }
+
     fn finish_review(mut self) -> Result<(Vec<u8>, Option<u32>, bool), String> {
-        drop(self.pty.pump_for(Duration::from_millis(200)));
-        let code = self
-            .pty
-            .wait_exit(Duration::from_secs(10))
-            .map_err(|error| format!("pty wait: {error}"))?;
+        let code = self.wait_exit_answering()?;
         let data_root_opened = self.pty.data_root().exists();
         let bytes = self.bytes()?;
         self.pty
@@ -1532,11 +1560,7 @@ impl TuiPty {
     }
 
     fn finish(mut self) -> Result<(Vec<u8>, Option<u32>), String> {
-        drop(self.pty.pump_for(Duration::from_millis(200)));
-        let code = self
-            .pty
-            .wait_exit(Duration::from_secs(10))
-            .map_err(|error| format!("pty wait: {error}"))?;
+        let code = self.wait_exit_answering()?;
         let bytes = self.bytes()?;
         self.pty
             .finish()
@@ -1550,9 +1574,9 @@ fn exercise_resize(tui: &mut TuiPty, geometry: Geometry) -> Result<(), String> {
         return Ok(());
     }
     tui.resize(40, 120)?;
-    tui.wait("Rivect · not connected", WAIT)?;
+    tui.wait("Rivect · not connected", LIVE_RESIZE_WAIT)?;
     tui.resize(20, 60)?;
-    tui.wait("Rivect · not connected", WAIT)?;
+    tui.wait("Rivect · not connected", LIVE_RESIZE_WAIT)?;
     Ok(())
 }
 
@@ -1749,11 +1773,9 @@ fn vim_probe(geometry: Geometry) -> Result<(), String> {
     tui.wait("awaiting decision", WAIT)?;
     tui.wait("focus 1/2", WAIT)?;
     std::thread::sleep(Duration::from_millis(300));
-    tui.send(b"j")?;
-    tui.wait("focus 2/2", WAIT)?;
+    tui.send_card_key(b"j", "focus 2/2", WAIT)?;
     std::thread::sleep(Duration::from_millis(300));
-    tui.send(b"\x1b")?;
-    tui.wait("decision left unanswered", WAIT)?;
+    tui.send_card_key(b"\x1b", "decision left unanswered", WAIT)?;
     tui.send(b"\x1b")?;
     let (bytes, code) = tui.finish()?;
     if code != Some(0) {
@@ -2477,7 +2499,11 @@ fn installed_ui_review_keys_stay_passive_and_ctrl_c_restores() {
         ("awaiting-permission", "awaiting permission"),
     ] {
         let mut tui = TuiPty::spawn_review(Geometry::W80H24, state, &[]).expect("review pty");
-        tui.wait(needle, WAIT).expect("review state");
+        // Settle the frame before the baseline capture: the needle can match
+        // on the first PTY quantum while the modal's last rows are still in
+        // flight, which would read as a key effect when no key changed anything.
+        tui.wait_settled_after(needle, 0, WAIT)
+            .expect("review state");
         let before = tui.screen(&tui.bytes().expect("review bytes"));
         for key in [b"\r".as_slice(), b"a", b"y", b"d"] {
             tui.send(key).expect("review key");
@@ -2526,6 +2552,34 @@ fn installed_inline_clear_after_long_transcript_keeps_later_rows() {
     tui.send(b"\x1b").expect("exit");
     let (bytes, code) = tui.finish().expect("teardown");
     assert_eq!(code, Some(0), "inline /clear exits 0");
+    require_inline_restore(&bytes).expect("inline restore");
+}
+
+/// A terminal that never answers the cursor-position query must not kill
+/// the inline surface: the transcript insert degrades to a query-free
+/// repaint instead of exiting 1. The harness answers the startup query,
+/// then goes deaf like a real dumb emulator before the first insert.
+#[test]
+fn installed_inline_survives_a_terminal_that_never_answers_cursor_queries() {
+    let mut tui = TuiPty::spawn(
+        Geometry::W120H40,
+        Some(RenderMode::Inline),
+        &[("TERM", "dumb")],
+    )
+    .expect("inline pty");
+    tui.wait("Rivect · not connected", WAIT)
+        .expect("inline screen");
+    tui.deaf = true;
+    tui.send(b"/help\r").expect("help");
+    tui.wait("Commands: Enter submits", WAIT)
+        .expect("the transcript lands without a cursor answer");
+    // The degraded insert repaints the pinned region in full: without the
+    // query-free repaint the scroll leaves the status row blank.
+    tui.wait("Rivect · not connected", WAIT)
+        .expect("the pinned region survives the unanswered query");
+    tui.send(b"\x1b").expect("exit");
+    let (bytes, code) = tui.finish().expect("teardown");
+    assert_eq!(code, Some(0), "the deaf-terminal session exits 0");
     require_inline_restore(&bytes).expect("inline restore");
 }
 

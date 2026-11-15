@@ -2634,8 +2634,11 @@ fn ac090_panel_default_focus_and_unsolicited_enter_never_grant() {
 
     // Panel visible at 60x20 with verdict, effect class, initiator,
     // expiry, the pinned footer hint, and wrapped scope.
+    // The footer can render a frame after the body; wait for the full panel.
     let panel_up = screen.wait_for(Duration::from_secs(10), |text| {
-        text.contains("awaiting permission") && text.contains("decision: ask")
+        text.contains("awaiting permission")
+            && text.contains("decision: ask")
+            && text.contains(PANEL_FOOTER_HINT)
     });
     assert!(panel_up.contains("effect: write"), "mandatory class line");
     assert!(panel_up.contains("initiator: task-170-fixture"));
@@ -2756,8 +2759,11 @@ fn ac090_panel_pins_actions_and_scrolls_an_overflowing_scope() {
         consumed: 0,
     };
 
+    // The footer can render a frame after the body; wait for the full panel.
     let panel_up = screen.wait_for(Duration::from_secs(10), |text| {
-        text.contains("awaiting permission") && text.contains("[deny]")
+        text.contains("awaiting permission")
+            && text.contains("[deny]")
+            && text.contains(PANEL_FOOTER_HINT)
     });
     // Header fields stay pinned in scarce rows.
     assert!(panel_up.contains("decision: ask"));

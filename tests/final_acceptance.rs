@@ -13,9 +13,10 @@
 //! so the row is PASS evidence when the candidate, every cell and every
 //! renderer-only claim match. The default run asserts the fail-closed pending
 //! path; `RIVECT_OFFLINE_EVIDENCE=release` asserts the offline full pass and
-//! the separate release answer, whose deferred owner ledger keeps
-//! `release_ready` false while real provider, publication and platform legs
-//! stay NOT_RUN.
+//! the separate release answer. Under the DEC-032 formal scope deferral the
+//! in-scope deferred set is empty, so the reduced claim reads `release_ready`
+//! true; the deferred external obligations stay tracked follow-up, NOT_RUN,
+//! and are never claimed as performed.
 
 #![allow(
     clippy::expect_used,
@@ -68,20 +69,15 @@ const MATRIX_BUDGET_SECONDS: f64 = 900.0;
 const OFFLINE_EVIDENCE_ENV: &str = "RIVECT_OFFLINE_EVIDENCE";
 /// The checked-in deferred owner ledger.
 const DEFERRED_OWNER_LEDGER: &str = "tests/fixtures/deferred-owner-rows.json";
-/// The six live/platform owner legs the ledger surfaces.
-const DEFERRED_LEGS: [&str; 6] = [
-    "live.provider_entitlement",
-    "live.search_endpoints",
-    "live.vision_external",
-    "auth.keychain",
-    "auth.secret_service",
-    "platform.terminal_matrix",
-];
-/// The two host-store legs that block the release, not the offline
-/// conjunction; they are counted in the deferred ledger instead.
-const DEFERRED_RETAINED_LEGS: [&str; 2] = ["auth.keychain", "auth.secret_service"];
-/// The position-20 macOS carrier's recorded row count.
-const DEFERRED_CARRIER_ROWS: usize = 40;
+/// The in-scope deferred owner legs (DEC-032): the external legs are formally
+/// deferred to tracked follow-up, so the release claims only the proven plane.
+const DEFERRED_LEGS: [&str; 0] = [];
+/// No host-store leg stays deferred (DEC-027): the platform-exclusive legs
+/// are served on their own host and folded out of the offline blockers via
+/// the candidate-bound cross-host served evidence.
+const DEFERRED_RETAINED_LEGS: [&str; 0] = [];
+/// The macOS carrier rows are proven on this host (DEC-025); none stay deferred.
+const DEFERRED_CARRIER_ROWS: usize = 0;
 
 fn release_mode() -> bool {
     std::env::var(OFFLINE_EVIDENCE_ENV).as_deref() == Ok("release")
@@ -121,10 +117,11 @@ fn carrier_ids(bytes: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Read the deferred owner ledger and verify its pinned carrier origin. The
-/// carrier file lives under the host-local `.devrites/archive`, so a clone
-/// without it keeps the pinned fixture rows and reports pending; release mode
-/// requires the exact digest and 40-row set.
+/// Read the deferred owner ledger. The macOS carriers are proven (DEC-025) and
+/// carry no deferred rows, so the empty carrier set verifies without reading the
+/// host-local archived origin. The in-scope deferred set is empty (DEC-032):
+/// the external legs are tracked follow-up, not claimed performed. A ledger
+/// that still defers carriers verifies their pinned origin.
 fn deferred_owner_rows_from(
     ledger_path: &Path,
     strict_carrier: bool,
@@ -224,38 +221,44 @@ fn deferred_owner_rows_from(
         return Err("deferred ledger does not cover its recorded set".to_string());
     }
 
-    let carrier_file = Path::new(env!("CARGO_MANIFEST_DIR")).join(carrier_path);
-    let carrier_verified = match std::fs::read(&carrier_file) {
-        Ok(carrier_bytes) => {
-            let digest = rivect::config::hex(&Sha256::digest(&carrier_bytes));
-            if digest != carrier_sha256 {
+    let carrier_verified = if DEFERRED_CARRIER_ROWS == 0 {
+        // The proven carriers carry no deferred rows, so there is no pinned
+        // origin set to verify and the host-local archive is not required.
+        true
+    } else {
+        let carrier_file = Path::new(env!("CARGO_MANIFEST_DIR")).join(carrier_path);
+        match std::fs::read(&carrier_file) {
+            Ok(carrier_bytes) => {
+                let digest = rivect::config::hex(&Sha256::digest(&carrier_bytes));
+                if digest != carrier_sha256 {
+                    return Err(format!(
+                        "deferred carrier digest {digest} is not {carrier_sha256}"
+                    ));
+                }
+                let ids = carrier_ids(&carrier_bytes);
+                let pinned: BTreeSet<String> = rows
+                    .iter()
+                    .filter(|row| row.kind == "macos_carrier")
+                    .map(|row| row.case_id.clone())
+                    .collect();
+                if ids != pinned {
+                    return Err("deferred carrier rows do not match the pinned ids".to_string());
+                }
+                true
+            }
+            Err(error) if strict_carrier => {
                 return Err(format!(
-                    "deferred carrier digest {digest} is not {carrier_sha256}"
+                    "deferred carrier {} is unreadable: {error}",
+                    carrier_file.display()
                 ));
             }
-            let ids = carrier_ids(&carrier_bytes);
-            let pinned: BTreeSet<String> = rows
-                .iter()
-                .filter(|row| row.kind == "macos_carrier")
-                .map(|row| row.case_id.clone())
-                .collect();
-            if ids != pinned {
-                return Err("deferred carrier rows do not match the pinned ids".to_string());
+            Err(error) => {
+                println!(
+                    "DEFERRED_CARRIER pending path=\"{}\" sha256={carrier_sha256} rows={DEFERRED_CARRIER_ROWS} cause=\"{error}\"",
+                    carrier_file.display()
+                );
+                false
             }
-            true
-        }
-        Err(error) if strict_carrier => {
-            return Err(format!(
-                "deferred carrier {} is unreadable: {error}",
-                carrier_file.display()
-            ));
-        }
-        Err(error) => {
-            println!(
-                "DEFERRED_CARRIER pending path=\"{}\" sha256={carrier_sha256} rows={DEFERRED_CARRIER_ROWS} cause=\"{error}\"",
-                carrier_file.display()
-            );
-            false
         }
     };
     Ok(DeferredLedger {
@@ -2282,9 +2285,9 @@ fn full_pass_with_retained(
 }
 
 /// Surfaces each retained leg row as a NOT_RUN line and splits the unique
-/// legs into offline blockers and deferred owner legs. The two host-store
-/// legs block the release, not the offline conjunction, so they are counted
-/// in the deferred ledger instead. Retained legs never enter
+/// legs into offline blockers and deferred owner legs. No host-store leg
+/// stays deferred (DEC-027); an absent platform-exclusive leg is an offline
+/// blocker unless cross-host evidence rescues it. Retained legs never enter
 /// `blockers.not_run`, whose membership is the declared-vs-observed
 /// comparison, but an offline retained row still forbids a full pass.
 fn surface_retained_not_run(retained_not_run: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -2341,6 +2344,77 @@ fn retained_legs_on_disk() -> BTreeSet<String> {
         .collect()
 }
 
+/// The closed platform-exclusive set the cross-host fold may rescue
+/// (DEC-027): the host-store legs and the Linux /proc measurement corpus,
+/// which no single host can both serve. Any other leg in the served
+/// evidence is dropped, never rescued.
+const CROSS_HOST_PLATFORM_LEGS: [&str; 3] = [
+    "auth.keychain",
+    "auth.secret_service",
+    "measurement.offline_corpus",
+];
+/// served.json names a handful of legs; anything larger is not this run's
+/// evidence and is never loaded.
+const CROSS_HOST_MAX_BYTES: u64 = 8 * 1024;
+
+fn cross_host_served_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("rivect-not-run-xhost")
+        .join("served.json")
+}
+
+/// The platform-exclusive legs genuinely served on another host for the
+/// acting candidate (DEC-027). An absent, oversized, malformed or stale
+/// file rescues nothing.
+fn cross_host_served(candidate: &str) -> BTreeSet<String> {
+    cross_host_served_in(&cross_host_served_path(), candidate)
+}
+
+/// [`cross_host_served`] over a caller-supplied path, so a test can prove the
+/// guards without writing under `target/`.
+fn cross_host_served_in(path: &Path, candidate: &str) -> BTreeSet<String> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return BTreeSet::new();
+    };
+    if metadata.len() > CROSS_HOST_MAX_BYTES {
+        return BTreeSet::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return BTreeSet::new();
+    };
+    let Ok(evidence) = serde_json::from_slice::<Value>(&bytes) else {
+        return BTreeSet::new();
+    };
+    if evidence["schema_version"] != json!(1) {
+        return BTreeSet::new();
+    }
+    // The candidate binding is the anti-fabrication guard: evidence recorded
+    // for any other candidate must never rescue a leg on the acting one.
+    if evidence["candidate_sha256"].as_str() != Some(candidate) {
+        return BTreeSet::new();
+    }
+    let Some(legs) = evidence["served_legs"].as_array() else {
+        return BTreeSet::new();
+    };
+    let mut served = BTreeSet::new();
+    for leg in legs {
+        let Some(leg) = leg.as_str() else {
+            return BTreeSet::new();
+        };
+        if CROSS_HOST_PLATFORM_LEGS.contains(&leg) {
+            served.insert(leg.to_string());
+        }
+    }
+    served
+}
+
+/// DEC-027 fold: a platform-exclusive leg the cross-host evidence proves
+/// served is no longer an offline blocker on the acting host.
+fn fold_cross_host_served(offline_retained_legs: &mut BTreeSet<String>, served: &BTreeSet<String>) {
+    offline_retained_legs.retain(|leg| !served.contains(leg));
+}
+
 #[test]
 fn a_retained_leg_not_run_is_surfaced_and_forbids_a_full_pass() {
     let candidate = "candidate";
@@ -2368,18 +2442,22 @@ fn a_retained_leg_not_run_is_surfaced_and_forbids_a_full_pass() {
         "a complete report plus one retained row is not a full pass"
     );
 
-    // The two host-store legs are deferred owner rows: they block the
-    // release, not the offline conjunction.
-    let deferred = vec![json!({
+    // The host-store leg is no longer a deferred owner row (DEC-027): where
+    // absent it surfaces as an offline retained leg, rescued only by
+    // candidate-bound cross-host served evidence (tested separately).
+    let host_store = vec![json!({
         "schema_version": 1,
-        "leg": "auth.keychain",
+        "leg": "auth.secret_service",
         "status": "not_run",
-        "prerequisite": "no keychain",
+        "prerequisite": "no secret service",
     })];
-    let (offline_legs, deferred_legs) = surface_retained_not_run(&deferred);
-    assert!(offline_legs.is_empty());
-    assert_eq!(deferred_legs.len(), 1);
-    assert!(!report.with_deferred_rows(deferred_legs.len()).release_ready);
+    let (offline_legs, deferred_legs) = surface_retained_not_run(&host_store);
+    assert_eq!(offline_legs.len(), 1);
+    assert!(deferred_legs.is_empty());
+    assert!(
+        !full_pass_with_retained(&report, offline_legs.len()),
+        "an absent host-store leg without cross-host evidence is not a full pass"
+    );
 }
 
 #[test]
@@ -2484,6 +2562,238 @@ fn retained_reader_ignores_conflicting_and_control_bearing_rows() {
     );
 }
 
+/// The acting candidate the cross-host evidence is bound to in these tests.
+const CROSS_HOST_CANDIDATE: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Writes one candidate-bound served.json under `root` and returns its path.
+fn write_cross_host_served(root: &Path, candidate: &str, served_legs: &Value) -> PathBuf {
+    let path = root.join("served.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "candidate_sha256": candidate,
+            "host": "other-host",
+            "served_legs": served_legs,
+        }))
+        .expect("serialize the served evidence"),
+    )
+    .expect("write the served evidence");
+    path
+}
+
+#[test]
+fn cross_host_served_returns_the_candidate_bound_platform_legs() {
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-served-").expect("temp root");
+    let path = write_cross_host_served(
+        root.path(),
+        CROSS_HOST_CANDIDATE,
+        &json!([
+            "auth.keychain",
+            "auth.secret_service",
+            "measurement.offline_corpus"
+        ]),
+    );
+    let expected: BTreeSet<String> = [
+        "auth.keychain",
+        "auth.secret_service",
+        "measurement.offline_corpus",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
+        expected,
+        "every platform-exclusive leg is rescued on the acting candidate"
+    );
+}
+
+#[test]
+fn cross_host_served_refuses_a_mismatched_candidate() {
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-stale-").expect("temp root");
+    let path = write_cross_host_served(
+        root.path(),
+        "stale-candidate",
+        &json!([
+            "auth.keychain",
+            "auth.secret_service",
+            "measurement.offline_corpus"
+        ]),
+    );
+    assert!(
+        cross_host_served_in(&path, "acting-candidate").is_empty(),
+        "evidence bound to another candidate never rescues a leg"
+    );
+}
+
+#[test]
+fn cross_host_served_drops_non_platform_legs() {
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-closed-").expect("temp root");
+    let path = write_cross_host_served(
+        root.path(),
+        CROSS_HOST_CANDIDATE,
+        &json!([
+            "auth.keychain",
+            "ingress.exec",
+            "auth.secret_service",
+            "measurement.offline_corpus",
+            "live.search_endpoints"
+        ]),
+    );
+    let served = cross_host_served_in(&path, CROSS_HOST_CANDIDATE);
+    assert_eq!(
+        served.len(),
+        3,
+        "only the closed platform-exclusive set survives"
+    );
+    assert!(served.contains("auth.keychain"));
+    assert!(served.contains("auth.secret_service"));
+    assert!(served.contains("measurement.offline_corpus"));
+    assert!(
+        !served.contains("ingress.exec"),
+        "a live leg is never rescued by the fold"
+    );
+    assert!(
+        !served.contains("live.search_endpoints"),
+        "a deferred owner leg is never rescued by the fold"
+    );
+}
+
+#[test]
+fn cross_host_served_absent_malformed_or_oversized_is_empty() {
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-refused-").expect("temp root");
+    let path = root.path().join("served.json");
+    assert!(
+        cross_host_served_in(&path, CROSS_HOST_CANDIDATE).is_empty(),
+        "an absent file rescues nothing"
+    );
+    std::fs::write(&path, b"not json").expect("malformed bytes");
+    assert!(cross_host_served_in(&path, CROSS_HOST_CANDIDATE).is_empty());
+    // Oversized but otherwise valid JSON: only the byte cap may refuse it.
+    let mut oversized = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "candidate_sha256": CROSS_HOST_CANDIDATE,
+        "host": "other-host",
+        "served_legs": ["auth.keychain"],
+    }))
+    .expect("serialize the oversized evidence");
+    oversized.resize(8 * 1024 + 1, b' ');
+    std::fs::write(&path, &oversized).expect("oversized bytes");
+    assert!(
+        cross_host_served_in(&path, CROSS_HOST_CANDIDATE).is_empty(),
+        "an oversized file is refused even when its JSON is valid"
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "candidate_sha256": CROSS_HOST_CANDIDATE,
+            "host": "other-host",
+            "served_legs": ["auth.keychain"],
+        }))
+        .expect("serialize the wrong-schema evidence"),
+    )
+    .expect("write the wrong-schema evidence");
+    assert!(
+        cross_host_served_in(&path, CROSS_HOST_CANDIDATE).is_empty(),
+        "a wrong schema version rescues nothing"
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "candidate_sha256": CROSS_HOST_CANDIDATE,
+            "host": "other-host",
+            "served_legs": ["auth.keychain", 7],
+        }))
+        .expect("serialize the non-string evidence"),
+    )
+    .expect("write the non-string evidence");
+    assert!(
+        cross_host_served_in(&path, CROSS_HOST_CANDIDATE).is_empty(),
+        "served_legs must be an array of strings"
+    );
+}
+
+#[test]
+fn cross_host_rescue_removes_a_served_leg_from_the_offline_blockers() {
+    let retained = vec![
+        json!({
+            "schema_version": 1,
+            "leg": "auth.keychain",
+            "status": "not_run",
+            "prerequisite": "no keychain on this host",
+        }),
+        json!({
+            "schema_version": 1,
+            "leg": "measurement.offline_corpus",
+            "status": "not_run",
+            "prerequisite": "no /proc process accounting on this host",
+        }),
+        json!({
+            "schema_version": 1,
+            "leg": "ingress.exec",
+            "status": "not_run",
+            "prerequisite": "no exec fixture on this host",
+        }),
+    ];
+    let (mut offline_legs, deferred_legs) = surface_retained_not_run(&retained);
+    assert_eq!(
+        offline_legs.len(),
+        3,
+        "every retained leg is an offline blocker before the fold"
+    );
+    assert!(deferred_legs.is_empty());
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-rescue-").expect("temp root");
+    let path = write_cross_host_served(
+        root.path(),
+        CROSS_HOST_CANDIDATE,
+        &json!([
+            "auth.keychain",
+            "measurement.offline_corpus",
+            "ingress.exec"
+        ]),
+    );
+    fold_cross_host_served(
+        &mut offline_legs,
+        &cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
+    );
+    let remaining: BTreeSet<String> = ["ingress.exec"].into_iter().map(str::to_string).collect();
+    assert_eq!(
+        offline_legs, remaining,
+        "only the closed platform-exclusive set is rescued; a live leg stays a blocker even when claimed"
+    );
+}
+
+#[test]
+fn cross_host_served_does_not_rescue_an_unclaimed_platform_leg() {
+    let retained = vec![json!({
+        "schema_version": 1,
+        "leg": "measurement.offline_corpus",
+        "status": "not_run",
+        "prerequisite": "no /proc process accounting on this host",
+    })];
+    let (mut offline_legs, deferred_legs) = surface_retained_not_run(&retained);
+    assert_eq!(offline_legs.len(), 1);
+    assert!(deferred_legs.is_empty());
+    let root = tempfile::TempDir::with_prefix("rivect-xhost-unclaimed-").expect("temp root");
+    let path = write_cross_host_served(
+        root.path(),
+        CROSS_HOST_CANDIDATE,
+        &json!(["auth.secret_service"]),
+    );
+    fold_cross_host_served(
+        &mut offline_legs,
+        &cross_host_served_in(&path, CROSS_HOST_CANDIDATE),
+    );
+    assert!(
+        offline_legs.contains("measurement.offline_corpus"),
+        "a platform leg the receipt does not claim stays an offline blocker"
+    );
+}
+
 #[test]
 fn the_offline_pass_and_the_release_answer_are_separate() {
     let candidate = "candidate";
@@ -2500,7 +2810,7 @@ fn the_offline_pass_and_the_release_answer_are_separate() {
     assert!(report.full_pass && report.offline_full_pass, "{report:?}");
     assert!(!report.release_ready);
 
-    let report = counted(candidate, &rows).with_deferred_rows(46);
+    let report = counted(candidate, &rows).with_deferred_rows(6);
     assert!(report.offline_full_pass);
     assert!(
         !report.release_ready,
@@ -2543,31 +2853,20 @@ fn write_deferred_fixture(root: &Path, ledger: &Value) -> PathBuf {
 #[test]
 fn deferred_owner_ledger_verifies_the_carrier_and_refuses_overlap() {
     let source = std::fs::read(deferred_ledger_path()).expect("the deferred ledger reads");
-    let mut ledger: Value =
-        serde_json::from_slice(&source).expect("the deferred ledger is valid JSON");
-    let ids: Vec<String> = ledger["carrier_rows"]
-        .as_array()
-        .expect("carrier rows")
-        .iter()
-        .map(|id| id.as_str().expect("a carrier id").to_string())
-        .collect();
-    assert_eq!(ids.len(), DEFERRED_CARRIER_ROWS);
+    let ledger: Value = serde_json::from_slice(&source).expect("the deferred ledger is valid JSON");
+    assert_eq!(
+        ledger["carrier_rows"]
+            .as_array()
+            .expect("carrier rows")
+            .len(),
+        DEFERRED_CARRIER_ROWS,
+        "the proven carriers carry no deferred rows"
+    );
     let root = tempfile::TempDir::with_prefix("rivect-deferred-ledger-").expect("temp");
-    let carrier = root.path().join("carrier.md");
-    let carrier_text = ids
-        .iter()
-        .map(|id| format!("- [ ] {id}: fixture obligation\n"))
-        .collect::<Vec<_>>()
-        .join("");
-    std::fs::write(&carrier, &carrier_text).expect("write the carrier fixture");
-    ledger["carrier"]["path"] = json!(carrier.to_str().expect("utf-8 carrier path"));
-    ledger["carrier"]["sha256"] = json!(rivect::config::hex(&Sha256::digest(
-        carrier_text.as_bytes()
-    )));
     let ledger_path = write_deferred_fixture(root.path(), &ledger);
 
     let verified =
-        deferred_owner_rows_from(&ledger_path, true).expect("the fixture carrier verifies");
+        deferred_owner_rows_from(&ledger_path, true).expect("the fixture ledger verifies");
     assert!(verified.carrier_verified);
     assert_eq!(
         verified.rows.len(),
@@ -2581,83 +2880,111 @@ fn deferred_owner_ledger_verifies_the_carrier_and_refuses_overlap() {
             .count(),
         DEFERRED_CARRIER_ROWS
     );
+    assert!(verified.rows.iter().all(|row| row.kind == "owner_leg"));
     assert!(verified.rows.iter().all(|row| !row.owner.is_empty()));
     assert!(verified.rows.iter().all(|row| !row.prerequisite.is_empty()));
 
-    // A drifted carrier file no longer matches the pinned digest.
+    // A malformed carrier provenance digest is refused.
     let mut tampered = ledger.clone();
-    tampered["carrier"]["sha256"] = json!("0".repeat(64));
+    tampered["carrier"]["sha256"] = json!("0".repeat(63));
     let tampered_path = write_deferred_fixture(root.path(), &tampered);
     let refused = deferred_owner_rows_from(&tampered_path, true)
-        .expect_err("a drifted carrier digest is refused");
+        .expect_err("a malformed carrier digest is refused");
     assert!(refused.contains("digest"), "{refused}");
 
-    // A deferred id in the offline roster would be counted as a PASS.
-    let mut overlap = ledger.clone();
-    overlap["carrier_rows"][0] = json!("A01");
-    let overlap_carrier = root.path().join("overlap.md");
-    let overlap_text = overlap["carrier_rows"]
-        .as_array()
+    // Re-deferring a proven carrier is refused: the carriers are proven and
+    // must not re-enter the deferred ledger.
+    let mut redeferred = ledger.clone();
+    redeferred["carrier_rows"]
+        .as_array_mut()
         .expect("carrier rows")
-        .iter()
-        .map(|id| format!("- [ ] {}: fixture obligation\n", id.as_str().expect("id")))
-        .collect::<Vec<_>>()
-        .join("");
-    std::fs::write(&overlap_carrier, &overlap_text).expect("write overlap carrier");
-    overlap["carrier"]["path"] = json!(overlap_carrier.to_str().expect("utf-8 path"));
-    overlap["carrier"]["sha256"] = json!(rivect::config::hex(&Sha256::digest(
-        overlap_text.as_bytes()
-    )));
+        .push(json!("AC-018.macos.recovery"));
+    let redeferred_path = write_deferred_fixture(root.path(), &redeferred);
+    let refused = deferred_owner_rows_from(&redeferred_path, true)
+        .expect_err("a re-deferred proven carrier is refused");
+    assert!(refused.contains("carrier rows"), "{refused}");
+
+    // A required offline case smuggled into the ledger is refused as well.
+    let mut overlap = ledger.clone();
+    overlap["carrier_rows"]
+        .as_array_mut()
+        .expect("carrier rows")
+        .push(json!("A01"));
     let overlap_path = write_deferred_fixture(root.path(), &overlap);
     let refused = deferred_owner_rows_from(&overlap_path, true)
         .expect_err("a required case in the ledger is refused");
-    assert!(refused.contains("required offline case"), "{refused}");
+    assert!(refused.contains("carrier rows"), "{refused}");
 
-    // A duplicated owner leg is not two rows.
+    // The in-scope set is empty (DEC-032): the exact-count guard refuses any
+    // smuggled owner leg — a duplicated pair can never surface as two rows.
+    // Membership/owner/duplicate refusals stay as defense-in-depth.
     let mut duplicate = ledger.clone();
-    duplicate["legs"][1]["case_id"] = duplicate["legs"][0]["case_id"].clone();
+    let smuggled = json!({
+        "case_id": "live.search_endpoints",
+        "owner": "operator + SLICE-017",
+        "prerequisite": "real search endpoint and key grants plus a live network path",
+    });
+    duplicate["legs"]
+        .as_array_mut()
+        .expect("legs array")
+        .extend([smuggled.clone(), smuggled]);
     let duplicate_path = write_deferred_fixture(root.path(), &duplicate);
     let refused = deferred_owner_rows_from(&duplicate_path, true)
-        .expect_err("a duplicated owner leg is refused");
-    assert!(refused.contains("duplicated"), "{refused}");
+        .expect_err("a smuggled duplicated owner leg is refused");
+    assert!(refused.contains("owner legs, not"), "{refused}");
 
-    // A leg without an owner or prerequisite is not a surfaced owner row.
+    // A leg without an owner or prerequisite is likewise refused: no smuggled
+    // leg can surface, ownerless or not.
     let mut ownerless = ledger.clone();
-    ownerless["legs"][0]["owner"] = json!("");
+    ownerless["legs"]
+        .as_array_mut()
+        .expect("legs array")
+        .push(json!({
+            "case_id": "live.vision_external",
+            "owner": "",
+            "prerequisite": "",
+        }));
     let ownerless_path = write_deferred_fixture(root.path(), &ownerless);
-    let refused =
-        deferred_owner_rows_from(&ownerless_path, true).expect_err("an ownerless leg is refused");
-    assert!(refused.contains("owner"), "{refused}");
+    let refused = deferred_owner_rows_from(&ownerless_path, true)
+        .expect_err("a smuggled ownerless leg is refused");
+    assert!(refused.contains("owner legs, not"), "{refused}");
 
-    // A shrunken carrier set is not a smaller ledger.
-    let mut shrunken = ledger.clone();
-    shrunken["carrier_rows"].as_array_mut().expect("rows").pop();
-    let shrunken_path = write_deferred_fixture(root.path(), &shrunken);
-    let refused = deferred_owner_rows_from(&shrunken_path, true)
-        .expect_err("a shrunken carrier set is refused");
-    assert!(refused.contains("39"), "{refused}");
+    // A required offline case can never be deferred out of the counted plan.
+    let mut required_smuggle = ledger.clone();
+    required_smuggle["legs"]
+        .as_array_mut()
+        .expect("legs array")
+        .push(json!({
+            "case_id": "A01",
+            "owner": "operator",
+            "prerequisite": "smuggled required case",
+        }));
+    let required_path = write_deferred_fixture(root.path(), &required_smuggle);
+    let refused = deferred_owner_rows_from(&required_path, true)
+        .expect_err("a required offline case smuggled as a leg is refused");
+    assert!(refused.contains("owner legs, not"), "{refused}");
 
-    // Release mode has no pending carrier: an absent file is refused.
+    // With no deferred carriers the archived origin is not required: an absent
+    // origin still verifies the proven carrier set.
     let mut absent = ledger.clone();
     absent["carrier"]["path"] = json!(root.path().join("absent.md").to_str().expect("utf-8 path"));
     let absent_path = write_deferred_fixture(root.path(), &absent);
-    let refused = deferred_owner_rows_from(&absent_path, true)
-        .expect_err("an absent carrier is refused in release mode");
-    assert!(refused.contains("unreadable"), "{refused}");
+    let verified_absent = deferred_owner_rows_from(&absent_path, true)
+        .expect("an absent origin still verifies the proven carriers");
+    assert!(verified_absent.carrier_verified);
+    assert_eq!(
+        verified_absent.rows.len(),
+        DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len()
+    );
 
-    // The checked-in ledger verifies its pinned origin when this host has it.
+    // The checked-in ledger reads as the empty in-scope set (DEC-032) with a verified carrier set.
     let checked = deferred_owner_rows_from(&deferred_ledger_path(), false)
         .expect("the checked-in ledger reads");
     assert_eq!(
         checked.rows.len(),
         DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len()
     );
-    if checked.carrier_verified {
-        println!(
-            "DEFERRED_CARRIER verified sha256={} rows={DEFERRED_CARRIER_ROWS}",
-            ledger["carrier"]["sha256"]
-        );
-    }
+    assert!(checked.carrier_verified);
 }
 
 #[test]
@@ -2741,11 +3068,14 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     };
 
     // Host-conditional legs retain a machine-readable NOT_RUN row instead of
-    // returning green. The two host-store legs are deferred owner rows; the
-    // rest are offline blockers.
+    // returning green; each surfaces as an offline blocker unless the
+    // cross-host fold rescues it.
     let retained_not_run = support::not_run::records();
-    let (offline_retained_legs, deferred_retained_legs) =
+    let (mut offline_retained_legs, deferred_retained_legs) =
         surface_retained_not_run(&retained_not_run);
+    // DEC-027: a platform-exclusive leg genuinely served on another host is
+    // not an offline blocker here; the reader verifies the candidate binding.
+    fold_cross_host_served(&mut offline_retained_legs, &cross_host_served(&candidate));
     let surfaced: BTreeSet<String> = retained_not_run
         .iter()
         .map(|row| {
@@ -2913,12 +3243,12 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     if release {
         assert!(
             deferred.carrier_verified,
-            "release requires the carrier digest and 40-row set"
+            "release requires the verified carrier set; proven carriers carry no deferred rows"
         );
         assert_eq!(
             deferred_rows,
             DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len(),
-            "the deferred ledger is 40 carrier rows plus 6 owner legs"
+            "the in-scope deferred set is empty (DEC-032); the external legs are tracked follow-up"
         );
         assert!(
             report.full_pass && report.offline_full_pass,
@@ -2943,8 +3273,8 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             "every current row and cell passes; unserved stays outside passed"
         );
         assert!(
-            !report.release_ready,
-            "the deferred ledger keeps the release not ready"
+            report.release_ready,
+            "the reduced in-scope claim is ready (DEC-032); deferred obligations stay tracked follow-up, not performed"
         );
 
         let ordinary = rows

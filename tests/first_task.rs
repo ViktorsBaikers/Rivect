@@ -3050,7 +3050,12 @@ fn wait_for_visible_tui_text(
 /// submits work dismisses it before asserting the transcript or exiting.
 fn dismiss_start_card(pty: &mut support::PtySession) {
     if wait_for_visible_tui_text(pty, "awaiting decision", Duration::from_secs(5)).is_ok() {
-        std::thread::sleep(Duration::from_millis(300));
+        // The card's first frame flushes only while the harness drains the
+        // PTY; the consent floor runs from that completed paint. A bare
+        // sleep stalls the flush and lands the Esc inside the floor, so
+        // pump well past it: parallel fixtures can starve the child's paint.
+        pty.pump_for(Duration::from_secs(2))
+            .expect("pump past the decision consent floor");
         pty.send(b"\x1b").expect("pty send dismiss");
         let _left =
             wait_for_visible_tui_text(pty, "decision left unanswered", Duration::from_secs(5));
@@ -3093,6 +3098,10 @@ fn tui_enter_dispatches_tasks_and_help() {
         visible.contains("Submitted task: task from q (accepted: "),
         "non-empty Enter must show the accepted task receipt: {visible:?}"
     );
+    // The dock projection is its own state change and can paint a frame
+    // after the receipt: wait for it instead of reading the receipt frame.
+    let visible =
+        wait_for_visible_tui_text(&pty, ": waiting", Duration::from_secs(10)).expect("pty screen");
     assert!(
         visible.contains(": waiting"),
         "task dock must show the work waiting on its start question: {visible:?}"
@@ -6279,6 +6288,9 @@ fn task_start_scope_binding_falls_back_to_the_granted_root() {
     let granted = world.root.join("granted");
     let parent = world.root.join("parent");
     std::fs::create_dir_all(&granted).expect("granted root");
+    // Production binds the getcwd-resolved cwd; grant the canonical root so
+    // the joined evidence target matches it (macOS tempdirs hide behind /var).
+    let granted = granted.canonicalize().expect("granted root canonical");
     std::fs::create_dir_all(&parent).expect("parent root");
     std::fs::write(granted.join("allowed.txt"), "under-scope bytes\n").expect("target file");
     std::fs::write(parent.join("AGENTS.md"), "above the grant\n").expect("parent instruction");
@@ -6783,7 +6795,12 @@ fn tui_composer_start_question_completes_with_one_settlement() {
     let card = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
         .expect("start card");
     assert!(card.contains("Begin"), "the start card names begin: {card}");
-    std::thread::sleep(Duration::from_millis(300));
+    // The card's first frame flushes only while the harness drains the PTY;
+    // the consent floor runs from that completed paint. A bare sleep stalls
+    // the flush and lands the Enter inside the floor, so pump well past it:
+    // parallel fixtures can starve the child's paint.
+    pty.pump_for(Duration::from_secs(2))
+        .expect("pump past the decision consent floor");
     pty.send(b"\r").expect("pty send enter");
     let answered = wait_for_visible_tui_text(
         &pty,

@@ -8404,8 +8404,8 @@ mod anchored_exec {
     use super::*;
 
     /// Every descriptor of the anchored walk closes on exec. The child
-    /// probes the actual descriptor numbers the parent holds (`-ef`
-    /// compares inodes through `/dev/fd/<n>`), and a duplicate whose
+    /// probes the actual descriptor numbers the parent holds (file
+    /// identity through `/dev/fd/<n>`), and a duplicate whose
     /// `FD_CLOEXEC` this test clears is the positive control: the same
     /// probe must observe exactly that one descriptor.
     #[test]
@@ -8447,12 +8447,13 @@ mod anchored_exec {
         // The probe script is constant: every label, descriptor number and
         // path reaches it as a positional argument, never interpolated, and
         // the child sees only the PATH its shell may need.
+        // macOS 27.0 fdesc nodes report a different st_dev than the target file, so -ef alone misses live fds; inode identity still matches.
         let output = std::process::Command::new("/bin/sh")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .args([
                 "-c",
-                "while [ \"$#\" -gt 0 ]; do [ \"/dev/fd/$2\" -ef \"$3\" ] && echo \"$1:$2\"; shift 3; done; true",
+                "while [ \"$#\" -gt 0 ]; do if [ \"/dev/fd/$2\" -ef \"$3\" ] || { [ \"$(uname)\" = Darwin ] && [ \"$(stat -f '%i' \"/dev/fd/$2\" 2>/dev/null)\" = \"$(stat -f '%i' \"$3\")\" ]; }; then echo \"$1:$2\"; fi; shift 3; done; true",
                 "sh",
             ])
             .args(probes.iter().flat_map(|(label, fd, target)| {

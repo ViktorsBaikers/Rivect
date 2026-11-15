@@ -1637,6 +1637,7 @@ mod owned {
     use std::fs::File;
     use std::io::{self, Read};
     use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::raw::c_char;
     use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, Instant};
 
@@ -1651,7 +1652,11 @@ mod owned {
         fn read(fd: i32, bytes: *mut u8, length: usize) -> isize;
         fn poll(fds: *mut PollFd, length: usize, timeout: i32) -> i32;
         fn kill(pid: i32, signal: i32) -> i32;
-        fn execve(path: *const i8, argv: *const *const i8, env: *const *const i8) -> i32;
+        fn execve(
+            path: *const c_char,
+            argv: *const *const c_char,
+            env: *const *const c_char,
+        ) -> i32;
     }
 
     #[repr(C)]

@@ -136,9 +136,10 @@ const BASH: &str = "/usr/bin/bash";
 /// # Errors
 /// Returns [`WorkerError::SandboxUnavailable`] when the boundary admits
 /// the denied control (it does not enforce) or the confinement cannot be
-/// built, [`WorkerError::SandboxSpawnFailed`] when a launcher leg cannot
-/// start, and [`WorkerError::SandboxDenied`] when the boundary rejects
-/// the program.
+/// built, [`WorkerError::TargetMissing`] when the program cannot be
+/// canonicalized, [`WorkerError::SandboxSpawnFailed`] when a launcher leg
+/// cannot start, and [`WorkerError::SandboxDenied`] when the boundary
+/// rejects the program.
 pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
     let launcher = SandboxLauncher::default();
     let confinement = exec_confinement(scope_root)?;
@@ -172,7 +173,15 @@ pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
             ),
         });
     }
-    let outcome = run_confined(&launcher, &confinement, program, &[])?;
+    // Every canonicalize failure — missing, permission, symlink loop —
+    // denies the effect the same way: the target is unavailable.
+    let canonical_program =
+        program
+            .canonicalize()
+            .map_err(|_source| WorkerError::TargetMissing {
+                target: program.to_path_buf(),
+            })?;
+    let outcome = run_confined(&launcher, &confinement, &canonical_program, &[])?;
     expect_admitted(outcome.exit_ok, program)
 }
 

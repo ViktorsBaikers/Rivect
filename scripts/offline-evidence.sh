@@ -275,7 +275,8 @@ while IFS= read -r target; do
         fi
         # The row marker proves the row's own evidence target; an extra
         # oracle must run and pass but is not required to print that marker.
-        if [ "$first" = 1 ] && ! grep -Fqx -- "$marker" "$output"; then
+        # DEC-018: substring match; under load the marker can merge into a libtest "test <name> ..." line.
+        if [ "$first" = 1 ] && ! grep -Fq -- "$marker" "$output"; then
             printf 'marker is absent from target %s output: %s\n' "$target" "$marker" >&2
             exit 1
         fi

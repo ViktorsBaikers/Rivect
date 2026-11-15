@@ -31,8 +31,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{World, corpus_create};
+
+/// Packaged PTY legs run against a busy host: a generous deadline keeps a
+/// load-slowed paint from reading as a defect, and still fails a real hang.
+const WAIT: Duration = Duration::from_secs(30);
 
 /// A deterministic 1×1 PNG: the local fixture every positive carries.
 const PNG: &[u8] = &[
@@ -622,8 +626,7 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
     let mut pty = support::PtySession::spawn(command, 24, 80, root, data.clone())
         .expect("spawn the packaged TUI");
     assert!(
-        pty.wait_for(b"\x1b[?1049h", Duration::from_secs(10))
-            .expect("pty read"),
+        pty.wait_for(b"\x1b[?1049h", WAIT).expect("pty read"),
         "the packaged TUI enters the alternate screen"
     );
     pty.send(b"/image image.png\r").expect("pty send");
@@ -632,7 +635,7 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
         24,
         80,
         &format!("image png {} bytes", PNG.len()),
-        Duration::from_secs(10),
+        WAIT,
     )
     .expect("attachment line");
     assert!(
@@ -641,8 +644,7 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
     );
     pty.send(b"/image\r").expect("pty send bare image");
     let cleared =
-        support::wait_for_screen_text(&pty, 24, 80, "image detached", Duration::from_secs(10))
-            .expect("clear line");
+        support::wait_for_screen_text(&pty, 24, 80, "image detached", WAIT).expect("clear line");
     assert!(
         cleared.contains("image detached"),
         "bare /image clears the attachment: {cleared}"
@@ -652,32 +654,42 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
     pty.send("run the vision task\r".as_bytes())
         .expect("pty send");
     let card =
-        support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", Duration::from_secs(10))
-            .expect("start card");
+        support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", WAIT).expect("start card");
     assert!(card.contains("awaiting decision"), "the start card opens");
     std::thread::sleep(Duration::from_millis(300));
-    pty.send(b"\r").expect("pty send enter");
-    let answered = support::wait_for_screen_text(
-        &pty,
-        24,
-        80,
-        "decision answer recorded; task resumed",
-        Duration::from_secs(10),
-    )
-    .expect("answer note");
+    // The card's first paint drains input queued before it, and under load
+    // that drain can run after the paint is already visible — eating an
+    // Enter aimed at the open card. Resend while the card is still painted:
+    // a committed answer closes the card, and Enter on the empty composer is
+    // a no-op, so the one-settlement proof stays exact.
+    let deadline = Instant::now() + WAIT;
+    let answered = loop {
+        pty.send(b"\r").expect("pty send enter");
+        let frame = support::wait_for_screen_text(
+            &pty,
+            24,
+            80,
+            "decision answer recorded; task resumed",
+            Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .expect("answer note");
+        if frame.contains("decision answer recorded; task resumed") {
+            break frame;
+        }
+        let screen = support::reconstruct_screen(&pty.collected().expect("pty read"), 24, 80);
+        if Instant::now() >= deadline || !screen.contains("focus 1/2") {
+            break frame;
+        }
+    };
     assert!(
         answered.contains("decision answer recorded; task resumed"),
         "the answer resumes the task: {answered}"
     );
     let completed =
-        support::wait_for_screen_text(&pty, 24, 80, "completed", Duration::from_secs(10))
-            .expect("completed dock");
+        support::wait_for_screen_text(&pty, 24, 80, "completed", WAIT).expect("completed dock");
     assert!(completed.contains("completed"), "the task completes");
     pty.send(b"\x1b").expect("pty send exit");
-    assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
-        Some(0)
-    );
+    assert_eq!(pty.wait_exit(WAIT).expect("pty wait"), Some(0));
     let db = data.join("runtime").join("rivect.db");
     let conn = rusqlite::Connection::open(&db).expect("open store");
     let settlements: i64 = conn

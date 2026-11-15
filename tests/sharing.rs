@@ -30,7 +30,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::World;
 
 const OPEN: u64 = 1_000;
@@ -228,13 +228,17 @@ fn attach_over_socket(fixture: &mut Fixture, opened: &Value) -> Observer {
 /// One serving turn on the runtime's own thread. A frame written before the
 /// turn is already in the socket buffer, so one turn answers it.
 fn pump(world: &mut World) {
-    for _ in 0..100 {
+    // Yield counts starve under machine load; a wall-clock deadline still fails on an absent frame.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         if world.runtime.serve_sharing() > 0 {
             return;
         }
-        std::thread::yield_now();
+        if Instant::now() >= deadline {
+            panic!("the share surface answered no frame");
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("the share surface answered no frame");
 }
 
 fn token_of(opened: &Value) -> String {
@@ -874,6 +878,28 @@ fn bounded_turn_lets_a_queued_revoke_land_behind_buffered_frames() {
     for _ in 0..4 {
         observer.write(&status_request(&fixture.session));
     }
+
+    // Drain while the revoke dispatches: a peer that reads nothing fills the
+    // socket buffer with these economy-sized answers, and the bounded turn
+    // drops it mid-write, losing the queued frame this test proves refused.
+    let drain_stream = observer.writer.try_clone().expect("observer client clone");
+    // Match the pump's 10s deadline: the observer's 2s timeout false-reds under host stalls.
+    drain_stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("drain read timeout");
+    let drain = std::thread::spawn(move || {
+        let mut reader = BufReader::new(drain_stream);
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+        lines
+    });
     let revoked = fixture.revoke(&grant_id);
     assert_eq!(revoked["state"], "revoked");
     assert_eq!(grant_state(&fixture.world.root, &grant_id), "revoked");
@@ -883,8 +909,13 @@ fn bounded_turn_lets_a_queued_revoke_land_behind_buffered_frames() {
     // is refused. Read until the first denial instead of pinning the frame
     // budget the turn happened to spend.
     pump(&mut fixture.world);
-    for _ in 0..6 {
-        let response = observer.read();
+    let lines = drain.join().expect("the drain thread joins");
+    assert!(
+        !lines.is_empty(),
+        "the share surface closed without an answer"
+    );
+    for line in lines.iter().take(6) {
+        let response: Value = serde_json::from_str(line).expect("observer answer is JSON");
         if response.get("error").is_some() {
             assert_eq!(error_code(&response), "denied");
             observer.expect_closed();

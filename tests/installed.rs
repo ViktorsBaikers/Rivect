@@ -1046,7 +1046,11 @@ fn installed_ordinary_request_completes_with_one_settlement() {
     let _card =
         support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", Duration::from_secs(10))
             .expect("start card");
-    std::thread::sleep(Duration::from_millis(300));
+    // The card's first frame flushes only while the harness drains the PTY;
+    // the consent floor runs from that completed paint. A bare sleep stalls
+    // the flush and lands the Enter inside the floor, so pump past it.
+    pty.pump_for(Duration::from_millis(500))
+        .expect("pump past the decision consent floor");
     pty.send(b"\r").expect("pty send enter");
     let _answered = support::wait_for_screen_text(
         &pty,
@@ -1060,8 +1064,14 @@ fn installed_ordinary_request_completes_with_one_settlement() {
         support::wait_for_screen_text(&pty, 24, 80, "completed", Duration::from_secs(10))
             .expect("completed dock");
     pty.send(b"\x1b").expect("pty send exit");
+    // The packaged TUI queries the cursor position while restoring; the
+    // deaf live waits never answered, so the exit wait plays terminal.
+    let mut cursor_at = 0usize;
     assert_eq!(
-        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        pty.wait_exit_answering(Duration::from_secs(10), |bytes| {
+            support::cursor_query_reply(&mut cursor_at, bytes)
+        })
+        .expect("pty wait"),
         Some(0)
     );
     let db = data.join("runtime").join("rivect.db");

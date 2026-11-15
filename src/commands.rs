@@ -10502,6 +10502,877 @@ mod tests {
             );
         }
     }
+
+    /// The consented consumer journey at the Runtime seam (DEC-024):
+    /// one Runtime-issued handoff mints one admission, the issuer mints
+    /// exactly one dependency pair, the claim is first-only, the owning
+    /// dispatch consumes the pair on its failure arm, and every later
+    /// presentation refuses as a replay. A spoofed handoff or a peer
+    /// store holds no authority before any spawn.
+    #[test]
+    fn change_journey_uses_provider_authority_and_never_replays() -> TestResult {
+        crate::executor::test_helper::ensure_helper();
+        let data_root = tempfile::TempDir::with_prefix("rivect-consumer-issuer-")?;
+        let mut runtime = super::Runtime::open_with_worker(
+            data_root.path(),
+            Box::new(crate::providers::LoopbackProvider::new()),
+            Box::new(RecoveryNoWorker),
+        )?;
+        let (session, _, _, _) =
+            runtime
+                .owner
+                .store
+                .open_session("consumer-issuer", "conn", None)?;
+        let task = runtime
+            .owner
+            .store
+            .create_task(
+                &session,
+                "consumer-issuer-command",
+                "unit",
+                "consented check goal",
+                (&[], &[]),
+            )?
+            .task_id;
+        runtime.owner.store.record_plan_selection(
+            &session,
+            &task,
+            &crate::state::PlanSelectionWrite {
+                facts_digest: "journey-facts",
+                request_kind: crate::state::RequestKind::PlanOnly,
+                rows: &[],
+            },
+        )?;
+        let handoff = runtime.check_handoff(&task);
+        assert!(
+            !handoff.explicit_off(),
+            "the default owner boots the Native journey"
+        );
+        let cargo = std::env::current_exe()?.canonicalize()?;
+        std::fs::create_dir_all(data_root.path().join("home/registry/cache"))?;
+        std::fs::create_dir_all(data_root.path().join("home/registry/index"))?;
+        let exec_grant = runtime.policy.grant_classes(
+            cargo
+                .parent()
+                .ok_or("the toolchain dir is unnamed")?
+                .to_path_buf(),
+            vec![crate::contracts::EffectClass::Exec],
+        );
+        let project_grant_id = runtime.policy.grant_read(data_root.path().to_path_buf());
+        let check = crate::executor::ConfinedCheck {
+            task_id: task.clone(),
+            expected_selection_revision: 1,
+            project_grant_id,
+            project_root: data_root.path().to_path_buf(),
+            manifest_rel: std::path::PathBuf::from("Cargo.toml"),
+            cargo: cargo.clone(),
+            cargo_home: data_root.path().join("home"),
+            target: crate::executor::CheckTarget::Integration("check".to_string()),
+            harness_threads: 1,
+            exact_test: "green_passes".to_string(),
+            expected_phase: "candidate-review".to_string(),
+            expected_assertion_identity: "green_passes".to_string(),
+            expected_candidate_digest: "digest".to_string(),
+        };
+        let mut admission = {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            executor.admit_check(
+                &task,
+                crate::executor::EffectRequest::Exec {
+                    grant_id: exec_grant.clone(),
+                    program: cargo.clone(),
+                },
+                crate::policy::PermissionMode::Yolo,
+                &check,
+                &handoff,
+            )?
+        };
+        let attempt = admission.attempt_id().to_string();
+
+        // One issued pair per admission; the re-issue refuses.
+        runtime
+            .policy
+            .issue_check_dependencies(&runtime.owner.store, &mut admission)?;
+        assert!(matches!(
+            runtime
+                .policy
+                .issue_check_dependencies(&runtime.owner.store, &mut admission),
+            Err(crate::policy::CheckIssuerError::AlreadyIssued)
+        ));
+        assert!(
+            runtime
+                .policy
+                .reconsult_check_pair(admission.receipt().ok_or("the issued receipt")?)
+                .is_ok(),
+            "the issued pair reconsults while the dispatch owns it"
+        );
+
+        // A spoofed handoff — another runtime's policy/store identities —
+        // refuses before any planning, and a peer-store presentation holds
+        // no issuer authority over the real holder's pair.
+        let peer_root = tempfile::TempDir::with_prefix("rivect-consumer-peer-")?;
+        let peer_store = TaskStore::open(&peer_root.path().join("state.db"))?;
+        let peer_policy = crate::policy::Policy::default();
+        let foreign_state = std::sync::Arc::new(crate::executor::WorkflowOffState::new(
+            &config::resolve_effective(None)?,
+        ));
+        let spoofed = crate::executor::CheckHandoff::from_owner(
+            &foreign_state,
+            &task,
+            std::sync::Arc::clone(peer_policy.identity()),
+            std::sync::Arc::clone(peer_store.identity()),
+        );
+        let attempts_before = runtime.owner.store.snapshot(&task)?.attempts.items.len();
+        {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            match executor.admit_check(
+                &task,
+                crate::executor::EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo,
+                },
+                crate::policy::PermissionMode::Yolo,
+                &check,
+                &spoofed,
+            ) {
+                Err(crate::executor::ExecutorError::Check(
+                    crate::executor::CheckError::SelectionMismatch { detail },
+                )) => assert!(
+                    detail.contains("another runtime"),
+                    "the spoof refusal names the foreign issuer: {detail}"
+                ),
+                other => {
+                    unreachable!("the spoofed handoff must refuse before planning, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            runtime.owner.store.snapshot(&task)?.attempts.items.len(),
+            attempts_before,
+            "the spoofed handoff plans no attempt"
+        );
+        assert!(matches!(
+            runtime
+                .policy
+                .issue_check_dependencies(&peer_store, &mut admission),
+            Err(crate::policy::CheckIssuerError::ForeignAdmission)
+        ));
+        assert!(
+            runtime
+                .policy
+                .reconsult_check_pair(admission.receipt().ok_or("the holder's receipt")?)
+                .is_ok(),
+            "the foreign-store presentation never touches the holder's pair"
+        );
+
+        // The consented dispatch: the claim lands first-only, and the
+        // confined run settles as a failure (the bound cargo is the test
+        // executable, not a toolchain) — the owning dispatch consumes its
+        // pair on the failure arm too.
+        let run = {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            executor.execute_check(
+                &mut admission,
+                &check,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        };
+        assert!(
+            run.is_err(),
+            "the confined run settles as a failure: {run:?}"
+        );
+        let marker = crate::state::check_boundary(&attempt, "admit.claim");
+        assert!(
+            runtime.owner.store.has_retained(&marker)?,
+            "the first-only claim marker is durable: {run:?}"
+        );
+        assert_eq!(admission.phase(), crate::executor::CheckPhase::Claimed);
+        assert!(
+            runtime
+                .policy
+                .reconsult_check_pair(admission.receipt().ok_or("the consumed receipt")?)
+                .is_err(),
+            "the consumed pair no longer reconsults"
+        );
+
+        // Re-presentation refuses as a replay at both seams and writes no
+        // second marker or check row.
+        let rows_before = runtime.owner.store.retained_check_rows(&attempt)?.len();
+        let replay = runtime.owner.store.claim_check(
+            &admission.claim_binding(),
+            &std::sync::atomic::AtomicBool::new(false),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )?;
+        match replay {
+            crate::state::ClaimOutcome::Refused(refusal) => {
+                assert_eq!(refusal.site, crate::state::ClaimSite::Replay);
+            }
+            crate::state::ClaimOutcome::Claimed => {
+                unreachable!("a spent claim must refuse as a replay")
+            }
+        }
+        {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            match executor.execute_check(
+                &mut admission,
+                &check,
+                &std::sync::atomic::AtomicBool::new(false),
+            ) {
+                Err(crate::executor::ExecutorError::Check(
+                    crate::executor::CheckError::Claim { site, .. },
+                )) => assert_eq!(site, crate::state::ClaimSite::Replay.suffix()),
+                other => {
+                    unreachable!("the re-presented dispatch must refuse as a replay, got {other:?}")
+                }
+            }
+        }
+        assert!(
+            runtime.owner.store.has_retained(&marker)?,
+            "the replay never moves the first-only marker"
+        );
+        assert_eq!(
+            runtime.owner.store.retained_check_rows(&attempt)?.len(),
+            rows_before,
+            "the replay writes no second check row"
+        );
+        Ok(())
+    }
+
+    /// The store routes serve the provider's own durable stream: the
+    /// seeded retained rows ride the runtime's recovery read as the exact
+    /// dual-key statement, and events.read / task.snapshot / task.collection
+    /// carry the attempt and session identity with their cursor and
+    /// generation semantics intact (DEC-024 retained-stream reading).
+    #[test]
+    fn runtime_store_routes_emit_the_provider_stream_and_identity() -> TestResult {
+        fn route(
+            rt: &mut super::Runtime,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": "store-route", "method": method, "params": params,
+            });
+            let wire = super::dispatch_runtime_request(
+                rt,
+                super::Ingress::Machine,
+                "store-routes",
+                &request.to_string(),
+            );
+            Ok(serde_json::from_str(&wire)?)
+        }
+
+        let data_root = tempfile::TempDir::with_prefix("rivect-store-routes-")?;
+        // The provider seeding: one claimed attempt and its durable journey
+        // disposition, exactly as a settled check leaves them.
+        let attempt = claimed_check_attempt(data_root.path(), "routes")?;
+        let mut owner = crate::owner::Owner::elect(data_root.path())?;
+        // The bootstrap receipt replays the fixture's own session identity.
+        let (session, _, _, _) = owner.store.open_session("session-routes", "conn", None)?;
+        let row = retained_check_row(
+            &attempt,
+            "close.phase_closed",
+            "expected phase observed: red failed",
+        );
+        owner.store.retain_attempt(&row)?;
+        let task = owner
+            .store
+            .events_after(&session, None, 0, 100)?
+            .iter()
+            .find_map(|event| event.task_id.clone())
+            .ok_or("the seeded task emitted no creation event")?;
+        let row_json = serde_json::to_string(&row)?;
+        drop(owner);
+
+        // Arm the trace before the runtime's connect so the serving
+        // connection carries the provider stream observable.
+        crate::state::proof::arm();
+        let mut runtime = super::Runtime::open_with_worker(
+            data_root.path(),
+            Box::new(crate::providers::LoopbackProvider::new()),
+            Box::new(RecoveryNoWorker),
+        )?;
+        let (open_events, open_overflow) =
+            crate::state::proof::take().ok_or("the runtime open was armed")?;
+        assert!(!open_overflow, "the runtime open fits the proof sink");
+        assert!(
+            open_events.iter().any(|event| matches!(
+                event,
+                crate::state::proof::ProofEvent::Stmt(sql)
+                    if sql == crate::state::sql::RETAINED_BY_BOTH_KEYS
+            )),
+            "the runtime's recovery reads the provider rows through the exact dual-key statement"
+        );
+        let boundary = crate::state::check_boundary(&attempt, "close.phase_closed");
+        assert_eq!(
+            runtime.owner.store.retained(&boundary)?,
+            Some(row_json),
+            "the provider row reads back verbatim"
+        );
+
+        // events.read carries the session/task identity and the cursor.
+        let events = route(
+            &mut runtime,
+            "events.read",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "after_cursor": 0,
+            }),
+        )?;
+        let items = events["result"]["items"]
+            .as_array()
+            .ok_or("the events page")?;
+        assert!(
+            !items.is_empty(),
+            "the provider's writes ride the event stream"
+        );
+        for item in items {
+            assert_eq!(
+                item["session_id"], session.0,
+                "every event carries the session identity"
+            );
+        }
+        let created = items
+            .iter()
+            .find(|item| item["type"] == "task.created")
+            .ok_or("the task creation event")?;
+        assert_eq!(created["task_id"], task.0);
+        assert_eq!(
+            created["aggregate_id"], task.0,
+            "the event aggregate names the task"
+        );
+        assert_eq!(
+            events["result"]["snapshot_generation"], 0,
+            "the events page echoes its after cursor"
+        );
+        let last_cursor = items.last().ok_or("the page is non-empty")?["cursor"]
+            .as_u64()
+            .ok_or("the event cursor")?;
+        let tail = route(
+            &mut runtime,
+            "events.read",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "after_cursor": last_cursor,
+            }),
+        )?;
+        assert!(
+            tail["result"]["items"]
+                .as_array()
+                .ok_or("the tail page")?
+                .is_empty(),
+            "the cursor excludes everything already read"
+        );
+        assert_eq!(tail["result"]["snapshot_generation"], last_cursor);
+
+        // task.snapshot names the task and its generation.
+        let snapshot = route(
+            &mut runtime,
+            "task.snapshot",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "task_id": task.0,
+            }),
+        )?;
+        assert_eq!(snapshot["result"]["task_id"], task.0);
+        let second = runtime.owner.store.plan_attempt(
+            &task,
+            crate::contracts::EffectClass::Exec,
+            "route pagination attempt",
+        )?;
+        let generation = runtime.owner.store.snapshot(&task)?.revision;
+
+        // task.collection pages the attempts with the provider identity;
+        // the generation cursor is bound to the snapshot revision.
+        let page_one = route(
+            &mut runtime,
+            "task.collection",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "task_id": task.0,
+                "collection": "attempts", "page": { "page_size": 1 },
+            }),
+        )?;
+        assert_eq!(page_one["result"]["snapshot_generation"], generation);
+        let first_items = page_one["result"]["items"]
+            .as_array()
+            .ok_or("the first page")?;
+        assert_eq!(first_items.len(), 1);
+        assert_eq!(
+            first_items[0]["attempt_id"], attempt,
+            "the provider's claimed attempt rides the collection"
+        );
+        assert_eq!(
+            page_one["result"]["next_cursor"],
+            format!("gen:{generation}:offset:1")
+        );
+        let page_two = route(
+            &mut runtime,
+            "task.collection",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "task_id": task.0,
+                "collection": "attempts",
+                "page": { "page_size": 1, "cursor": format!("gen:{generation}:offset:1") },
+            }),
+        )?;
+        let second_items = page_two["result"]["items"]
+            .as_array()
+            .ok_or("the second page")?;
+        assert_eq!(second_items.len(), 1);
+        assert_eq!(second_items[0]["attempt_id"], second);
+        assert!(
+            page_two["result"].get("next_cursor").is_none(),
+            "the last page carries no cursor"
+        );
+        let stale = route(
+            &mut runtime,
+            "task.collection",
+            serde_json::json!({
+                "schema_version": 1, "session_id": session.0, "task_id": task.0,
+                "collection": "attempts",
+                "page": { "cursor": format!("gen:{}:offset:0", generation + 1) },
+            }),
+        )?;
+        assert_eq!(
+            stale["error"]["data"]["code"], "conflict",
+            "a moved generation refuses the stale cursor"
+        );
+
+        // The retained-stream read on the serving connection is exactly
+        // one full-text RETAINED_BY_BOTH_KEYS statement — the same constant
+        // the held-proof stream leg asserts.
+        crate::state::proof::arm();
+        assert!(runtime.owner.store.has_retained_either_key(&boundary)?);
+        let (read_events, read_overflow) =
+            crate::state::proof::take().ok_or("the retained read was armed")?;
+        assert!(!read_overflow);
+        assert_eq!(
+            read_events,
+            [crate::state::proof::ProofEvent::Stmt(
+                crate::state::sql::RETAINED_BY_BOTH_KEYS.to_string()
+            )],
+            "the retained-stream statement is the exact dual-key constant"
+        );
+        Ok(())
+    }
+
+    /// The claim-fault consumer oracle (DEC-024 split): every injectable
+    /// claim site refuses with its own typed suffix and position-honest
+    /// rejection row, the attempt stays planned with no marker, and a
+    /// reopened store claims. The Runtime dispatch surfaces the same
+    /// suffix, and the recovery note the existing diagnostics surface
+    /// actually paints rides boot_diagnostics into the rendered transcript.
+    #[test]
+    fn change_journey_claim_fault_legs_map_rows_and_transcript() -> TestResult {
+        use crate::state::tests::{
+            claim_deadline, claim_fixture, denial_rows, marker_boundary, refusal,
+        };
+        use crate::state::{ClaimOutcome, ClaimSite, RetentionOutcome, proof};
+
+        // (row legs) Native and Custom-off claims over the current fault
+        // sites: the pre-BEGIN positions write no row, every later
+        // position writes exactly one.
+        let legs = [
+            (true, proof::Site::WaitRead, ClaimSite::WaitRead, false),
+            (true, proof::Site::WaitSet, ClaimSite::WaitSet, false),
+            (true, proof::Site::Busy, ClaimSite::Busy, true),
+            (true, proof::Site::Begin, ClaimSite::Begin, true),
+            (true, proof::Site::Read, ClaimSite::Read, true),
+            (
+                true,
+                proof::Site::TerminalRead,
+                ClaimSite::TerminalRead,
+                true,
+            ),
+            (
+                true,
+                proof::Site::SelectionRead,
+                ClaimSite::SelectionRead,
+                true,
+            ),
+            (true, proof::Site::GateRead, ClaimSite::GateRead, true),
+            (true, proof::Site::Update, ClaimSite::Update, true),
+            (true, proof::Site::Marker, ClaimSite::Marker, true),
+            (true, proof::Site::Cancel, ClaimSite::Cancel, true),
+            (true, proof::Site::Deadline, ClaimSite::Deadline, true),
+            (false, proof::Site::WaitRead, ClaimSite::WaitRead, false),
+            (false, proof::Site::WaitSet, ClaimSite::WaitSet, false),
+            (false, proof::Site::Busy, ClaimSite::Busy, true),
+            (false, proof::Site::Begin, ClaimSite::Begin, true),
+            (false, proof::Site::Read, ClaimSite::Read, true),
+            (
+                false,
+                proof::Site::TerminalRead,
+                ClaimSite::TerminalRead,
+                true,
+            ),
+            (false, proof::Site::Update, ClaimSite::Update, true),
+            (false, proof::Site::Marker, ClaimSite::Marker, true),
+            (false, proof::Site::Cancel, ClaimSite::Cancel, true),
+            (false, proof::Site::Deadline, ClaimSite::Deadline, true),
+        ];
+        for (native, fault, site, writes_row) in legs {
+            let (root, mut store, _session, _task, attempt, claim) =
+                claim_fixture("consumer-fault");
+            let claim = if native {
+                claim
+            } else {
+                crate::state::CheckClaim {
+                    native: false,
+                    selection_revision: 0,
+                    facts_digest: String::new(),
+                    ..claim
+                }
+            };
+            let db = root.path().join("state.db");
+            let label = format!("native={native} {fault:?}");
+            proof::arm_fault(fault);
+            let refused = refusal(store.claim_check(
+                &claim,
+                &std::sync::atomic::AtomicBool::new(false),
+                claim_deadline(),
+            ));
+            assert_eq!(refused.site, site, "{label}");
+            assert_eq!(
+                matches!(refused.retention, RetentionOutcome::Retained),
+                writes_row,
+                "{label}"
+            );
+            assert!(!refused.restore_failed, "{label}");
+            assert_eq!(
+                store.attempt_state(&attempt)?.as_deref(),
+                Some("planned"),
+                "{label}"
+            );
+            assert!(!store.has_retained(&marker_boundary(&attempt))?, "{label}");
+            let rows = denial_rows(&db).map_err(|error| error.to_string())?;
+            if writes_row {
+                assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+                let (boundary, record) = &rows[0];
+                assert!(
+                    boundary.ends_with(&format!(":{}", site.suffix())),
+                    "{label}"
+                );
+                assert_eq!(record["site"], site.suffix(), "{label}");
+                assert_eq!(record["cause"], "claim refused", "{label}");
+                assert_eq!(record["binding"], claim.binding_digest, "{label}");
+            } else {
+                assert!(
+                    rows.is_empty(),
+                    "{label}: a pre-BEGIN position writes no row"
+                );
+            }
+            // Restart: the fault was consumed, the very same attempt
+            // claims, and the denial row is neither lost nor duplicated.
+            drop(store);
+            let mut reopened = TaskStore::open(&db)?;
+            assert!(
+                matches!(
+                    reopened.claim_check(
+                        &claim,
+                        &std::sync::atomic::AtomicBool::new(false),
+                        claim_deadline()
+                    )?,
+                    ClaimOutcome::Claimed
+                ),
+                "{label}: the restarted store claims"
+            );
+            assert_eq!(
+                denial_rows(&db).map_err(|error| error.to_string())?.len(),
+                usize::from(writes_row),
+                "{label}"
+            );
+            drop(reopened);
+        }
+
+        // (dispatch leg) the Runtime seam surfaces the same typed suffix:
+        // a consented admission's execute_check refuses at the injected
+        // site, and a fresh admission claims once the fault is consumed.
+        fn mint(
+            runtime: &mut super::Runtime,
+            task: &crate::contracts::TaskId,
+            check: &crate::executor::ConfinedCheck,
+            exec_grant: String,
+            cargo: std::path::PathBuf,
+            handoff: &crate::executor::CheckHandoff,
+        ) -> Result<crate::executor::CheckAdmission, crate::executor::ExecutorError> {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            executor.admit_check(
+                task,
+                crate::executor::EffectRequest::Exec {
+                    grant_id: exec_grant,
+                    program: cargo,
+                },
+                crate::policy::PermissionMode::Yolo,
+                check,
+                handoff,
+            )
+        }
+        crate::executor::test_helper::ensure_helper();
+        let data_root = tempfile::TempDir::with_prefix("rivect-consumer-faults-")?;
+        let mut runtime = super::Runtime::open_with_worker(
+            data_root.path(),
+            Box::new(crate::providers::LoopbackProvider::new()),
+            Box::new(RecoveryNoWorker),
+        )?;
+        let (session, _, _, _) =
+            runtime
+                .owner
+                .store
+                .open_session("consumer-faults", "conn", None)?;
+        let task = runtime
+            .owner
+            .store
+            .create_task(
+                &session,
+                "consumer-faults-command",
+                "unit",
+                "faulted check goal",
+                (&[], &[]),
+            )?
+            .task_id;
+        runtime.owner.store.record_plan_selection(
+            &session,
+            &task,
+            &crate::state::PlanSelectionWrite {
+                facts_digest: "fault-facts",
+                request_kind: crate::state::RequestKind::PlanOnly,
+                rows: &[],
+            },
+        )?;
+        let cargo = std::env::current_exe()?.canonicalize()?;
+        std::fs::create_dir_all(data_root.path().join("home/registry/cache"))?;
+        std::fs::create_dir_all(data_root.path().join("home/registry/index"))?;
+        let exec_grant = runtime.policy.grant_classes(
+            cargo
+                .parent()
+                .ok_or("the toolchain dir is unnamed")?
+                .to_path_buf(),
+            vec![crate::contracts::EffectClass::Exec],
+        );
+        let project_grant_id = runtime.policy.grant_read(data_root.path().to_path_buf());
+        let check = crate::executor::ConfinedCheck {
+            task_id: task.clone(),
+            expected_selection_revision: 1,
+            project_grant_id,
+            project_root: data_root.path().to_path_buf(),
+            manifest_rel: std::path::PathBuf::from("Cargo.toml"),
+            cargo: cargo.clone(),
+            cargo_home: data_root.path().join("home"),
+            target: crate::executor::CheckTarget::Integration("check".to_string()),
+            harness_threads: 1,
+            exact_test: "green_passes".to_string(),
+            expected_phase: "candidate-review".to_string(),
+            expected_assertion_identity: "green_passes".to_string(),
+            expected_candidate_digest: "digest".to_string(),
+        };
+        let handoff = runtime.check_handoff(&task);
+        let mut faulted = mint(
+            &mut runtime,
+            &task,
+            &check,
+            exec_grant.clone(),
+            cargo.clone(),
+            &handoff,
+        )?;
+        runtime
+            .policy
+            .issue_check_dependencies(&runtime.owner.store, &mut faulted)?;
+        let faulted_attempt = faulted.attempt_id().to_string();
+        proof::arm_fault(proof::Site::Read);
+        let dispatch_refusal = {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            executor.execute_check(
+                &mut faulted,
+                &check,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        };
+        match dispatch_refusal {
+            Err(crate::executor::ExecutorError::Check(crate::executor::CheckError::Claim {
+                site,
+                ..
+            })) => assert_eq!(site, ClaimSite::Read.suffix()),
+            other => {
+                unreachable!("the injected claim fault must refuse the dispatch, got {other:?}")
+            }
+        }
+        assert_eq!(
+            runtime
+                .owner
+                .store
+                .attempt_state(&faulted_attempt)?
+                .as_deref(),
+            Some("planned"),
+            "the refused dispatch never claimed its attempt"
+        );
+        assert!(
+            !runtime
+                .owner
+                .store
+                .has_retained(&marker_boundary(&faulted_attempt))?
+        );
+        let db = data_root.path().join("runtime/rivect.db");
+        let rows = denial_rows(&db).map_err(|error| error.to_string())?;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the claim's own row is the whole record: {rows:?}"
+        );
+        assert!(
+            rows[0]
+                .0
+                .ends_with(&format!(":{}", ClaimSite::Read.suffix()))
+        );
+        drop(faulted);
+        let mut recovered = mint(
+            &mut runtime,
+            &task,
+            &check,
+            exec_grant.clone(),
+            cargo,
+            &handoff,
+        )?;
+        runtime
+            .policy
+            .issue_check_dependencies(&runtime.owner.store, &mut recovered)?;
+        let recovered_attempt = recovered.attempt_id().to_string();
+        let run = {
+            let mut worker = RecoveryNoWorker;
+            let mut executor = crate::executor::Executor::new(
+                &mut runtime.policy,
+                &mut runtime.owner.store,
+                &mut worker,
+            );
+            executor.execute_check(
+                &mut recovered,
+                &check,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        };
+        assert!(
+            run.is_err(),
+            "the confined run settles as a failure: {run:?}"
+        );
+        assert!(
+            runtime
+                .owner
+                .store
+                .has_retained(&marker_boundary(&recovered_attempt))?,
+            "the consumed fault leaves the next claim first-only"
+        );
+        drop(recovered);
+
+        // (transcript leg) a durably-committed claim refusal leaves the
+        // attempt claimed but unsettled; the existing recovery surface
+        // reports its refused cleanup through boot_diagnostics, and the
+        // production render paints that note into the transcript. No
+        // ClaimRefusal-to-transcript mapping exists in this tree, so the
+        // note asserted here is the one the current code actually paints.
+        proof::arm_fault(proof::Site::CommitAfterDurable);
+        let durable = mint(
+            &mut runtime,
+            &task,
+            &check,
+            exec_grant,
+            check.cargo.clone(),
+            &handoff,
+        )?;
+        let durable_attempt = durable.attempt_id().to_string();
+        let commit_refusal = refusal(runtime.owner.store.claim_check(
+            &durable.claim_binding(),
+            &std::sync::atomic::AtomicBool::new(false),
+            claim_deadline(),
+        ));
+        assert_eq!(commit_refusal.site, ClaimSite::Commit);
+        assert!(matches!(
+            commit_refusal.retention,
+            RetentionOutcome::Retained
+        ));
+        assert!(
+            runtime
+                .owner
+                .store
+                .has_retained(&marker_boundary(&durable_attempt))?
+        );
+        let allocated = crate::executor::create_recorded_attempt_root(
+            &mut runtime.owner.store,
+            &durable_attempt,
+        )?;
+        populate_sealed(&allocated.canonical_root)?;
+        drop(durable);
+        drop(runtime);
+
+        let runtime = super::Runtime::open_with_worker(
+            data_root.path(),
+            Box::new(crate::providers::LoopbackProvider::new()),
+            Box::new(RecoveryNoWorker),
+        )?;
+        let note = runtime
+            .boot_diagnostics
+            .iter()
+            .find(|line| {
+                line.starts_with("check recovery: cleanup refused")
+                    && line.contains(&durable_attempt)
+            })
+            .ok_or("the recovery surface reports the faulted attempt's refused cleanup")?;
+        assert!(
+            note.contains("resolution:"),
+            "the note names the manual resolution: {note}"
+        );
+        let mut view = crate::ui::LocalView::default();
+        view.extend_transcript(&runtime.boot_diagnostics);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+        crate::ui::render(&mut terminal, &view)?;
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let painted: String = buffer
+            .content
+            .chunks(width)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(painted.as_bytes());
+        let screen = parser.screen().contents();
+        assert!(
+            screen.contains("check recovery: cleanup refused"),
+            "the rendered transcript paints the recovery note: {screen}"
+        );
+        drop(runtime);
+        drop_sealed_root(&allocated.canonical_root);
+        Ok(())
+    }
 }
 
 /// The in-crate twins of the closed-surface doctests: the same

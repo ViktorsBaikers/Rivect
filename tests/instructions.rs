@@ -48,6 +48,17 @@ fn identity(path: &Path) -> FileIdentity {
     FileIdentity::from_metadata(&std::fs::metadata(path).expect("fixture metadata"))
 }
 
+/// Whether the fixture volume keeps case-only spellings apart: a
+/// case-insensitive filesystem (the APFS default) folds `claude.md` onto
+/// `CLAUDE.md`, so a fixture picks names the host can actually hold distinct.
+fn fs_is_case_sensitive(dir: &Path) -> bool {
+    let probe = dir.join("case-probe.md");
+    std::fs::write(&probe, "probe").expect("write the case probe");
+    let distinct = !dir.join("CASE-PROBE.md").exists();
+    std::fs::remove_file(&probe).expect("remove the case probe");
+    distinct
+}
+
 fn load_counts(set: &InstructionSet, path: &Path) -> usize {
     set.entries
         .iter()
@@ -59,8 +70,11 @@ fn load_counts(set: &InstructionSet, path: &Path) -> usize {
 
 #[test]
 fn each_instruction_file_loads_once_p1() {
-    // Four fixtures, nested scopes: every candidate name appears once spread
-    // over the scope chain, so each file has exactly one way to be reached.
+    // Four fixtures, nested scopes: the candidate names spread over the scope
+    // chain, so each file has exactly one way to be reached. A case-insensitive
+    // volume folds `claude.md` onto `CLAUDE.md`, so the inner Claude fixture
+    // takes the canonical spelling there — discovery reports it anyway, and
+    // the alias probe still reaches the same file identity.
     let tree = temporary("rivect-instructions-p1-");
     let root = tree.path();
     let outer = write_file(
@@ -69,7 +83,15 @@ fn each_instruction_file_loads_once_p1() {
     );
     let middle = write_file(&root.join("b/CLAUDE.md"), "middle rules\n");
     let inner_agent = write_file(&root.join("b/c/agent.md"), "inner agent rules\n");
-    let inner_claude = write_file(&root.join("b/c/claude.md"), "inner claude rules\n");
+    let inner_claude_name = if fs_is_case_sensitive(root) {
+        "claude.md"
+    } else {
+        "CLAUDE.md"
+    };
+    let inner_claude = write_file(
+        &root.join("b/c").join(inner_claude_name),
+        "inner claude rules\n",
+    );
     let scopes = vec![root.to_path_buf(), root.join("b"), root.join("b/c")];
 
     let set = InstructionSet::discover(&scopes).expect("discovery reads every fixture");
@@ -89,14 +111,21 @@ fn each_instruction_file_loads_once_p1() {
     assert_eq!(set.entries.len(), 4, "four fixtures, four entries");
     assert!(set.conflicts.is_empty(), "no two fixtures share a scope");
 
-    // Deterministic precedence: the innermost scope first, the canonical name
-    // order inside one scope.
+    // Deterministic precedence: the innermost scope first, the name table's
+    // own order inside one scope.
+    let mut inner = [inner_agent.clone(), inner_claude.clone()];
+    inner.sort_by_key(|path| {
+        INSTRUCTION_FILES
+            .iter()
+            .position(|(name, _)| path.ends_with(*name))
+            .expect("a fixture name is a candidate")
+    });
     assert_eq!(
         set.entries
             .iter()
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>(),
-        vec![inner_agent.clone(), inner_claude.clone(), middle, outer],
+        inner.into_iter().chain([middle, outer]).collect::<Vec<_>>(),
         "precedence is a pure function of the scope chain and the name table"
     );
     assert_eq!(set.entries[3].scope, root, "each entry names its scope");
@@ -159,8 +188,16 @@ fn conflicting_sources_are_visible_p3() {
     // with both sources and the scope, instead of one silently winning.
     let tree = temporary("rivect-instructions-p3-");
     let root = tree.path();
-    let canonical = write_file(&root.join("CLAUDE.md"), "canonical claude\n");
-    let alias = write_file(&root.join("claude.md"), "alias claude\n");
+    // The two sources must stay distinct names on the host's volume: a
+    // case-insensitive filesystem folds `claude.md` onto `CLAUDE.md`, so the
+    // conflict uses the agent pair there — the same fold, two real files.
+    let (canonical_name, alias_name, slot) = if fs_is_case_sensitive(root) {
+        ("CLAUDE.md", "claude.md", InstructionSlot::Claude)
+    } else {
+        ("AGENTS.md", "agent.md", InstructionSlot::Agent)
+    };
+    let canonical = write_file(&root.join(canonical_name), "canonical rules\n");
+    let alias = write_file(&root.join(alias_name), "alias rules\n");
 
     let set = InstructionSet::discover(&[root.to_path_buf()]).expect("discovery");
 
@@ -171,7 +208,7 @@ fn conflicting_sources_are_visible_p3() {
         set.conflicts
     );
     let conflict = &set.conflicts[0];
-    assert_eq!(conflict.slot, InstructionSlot::Claude);
+    assert_eq!(conflict.slot, slot);
     assert_eq!(conflict.scope, root);
     assert_eq!(conflict.sources, vec![canonical.clone(), alias.clone()]);
 
@@ -307,7 +344,12 @@ fn configured_root_loads_each_file_once_p1() {
     let root = tree.path();
     write_file(&root.join("AGENTS.md"), "outer rules\n");
     let middle = write_file(&root.join("b/CLAUDE.md"), "middle rules\n");
-    std::os::unix::fs::symlink(&middle, root.join("b/claude.md")).expect("alias link");
+    // The alias link needs two names the volume keeps apart; on a
+    // case-insensitive filesystem discovery's `claude.md` probe already
+    // reaches `CLAUDE.md`'s identity, so the dedup runs without a link.
+    if fs_is_case_sensitive(root) {
+        std::os::unix::fs::symlink(&middle, root.join("b/claude.md")).expect("alias link");
+    }
     write_file(&root.join("b/c/agent.md"), "inner rules\n");
     let config = assembly_config();
     let mut broker = Broker::new(Box::new(LoopbackProvider::new()));
@@ -615,6 +657,33 @@ fn admit_read(
     executor.execute(&admitted)
 }
 
+/// How many runs one load-sensitive hook consult gets: under the parallel
+/// gate's load the scheduler can starve a hook child of its production
+/// [`HOOK_TIMEOUT_MS`] deadline without the hook itself being slow.
+const HOOK_LOAD_ATTEMPTS: usize = 4;
+
+/// Re-runs a hook consult only while it ends in the load-induced timeout:
+/// the first other outcome — success or refusal — returns untouched, and a
+/// timeout that outlives the bound is returned for the test to fail on.
+fn hook_eventually<T, E>(
+    mut run: impl FnMut() -> Result<T, E>,
+    timed_out: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let mut outcome = run();
+    for _ in 1..HOOK_LOAD_ATTEMPTS {
+        match &outcome {
+            Err(error) if timed_out(error) => outcome = run(),
+            _ => break,
+        }
+    }
+    outcome
+}
+
+/// The one refusal the retry absorbs: the hook's deadline, never its verdict.
+fn hook_timed_out(error: &ExecutorError) -> bool {
+    matches!(error, ExecutorError::Hook(HookError::TimedOut { .. }))
+}
+
 #[test]
 fn hook_transforming_arguments_is_refused_p4() {
     support::ensure_helper();
@@ -638,8 +707,11 @@ fn hook_transforming_arguments_is_refused_p4() {
         .runtime
         .set_read_scope(fixture.scope.clone(), permitted.clone());
 
-    let error = admit_read(&mut fixture, &permitted, &grant)
-        .expect_err("a permitted path rewritten into a denied one is refused");
+    let error = hook_eventually(
+        || admit_read(&mut fixture, &permitted, &grant),
+        hook_timed_out,
+    )
+    .expect_err("a permitted path rewritten into a denied one is refused");
 
     match &error {
         ExecutorError::HookTransform {
@@ -698,7 +770,7 @@ fn hook_with_unchanged_arguments_still_runs_p5() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target.clone());
 
-    let outcome = admit_read(&mut fixture, &target, &grant)
+    let outcome = hook_eventually(|| admit_read(&mut fixture, &target, &grant), hook_timed_out)
         .expect("an unchanged request is admitted and runs");
 
     assert!(
@@ -778,8 +850,8 @@ fn hook_stop_answer_is_refused_p4() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target.clone());
 
-    let error =
-        admit_read(&mut fixture, &target, &grant).expect_err("a stop answer refuses the request");
+    let error = hook_eventually(|| admit_read(&mut fixture, &target, &grant), hook_timed_out)
+        .expect_err("a stop answer refuses the request");
     match &error {
         ExecutorError::HookDenied { hook, decision } => {
             assert_eq!(hook, HOOK_ID, "the refusal names the hook that answered");
@@ -811,8 +883,8 @@ fn hook_oversized_answer_is_refused_p5() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target.clone());
 
-    let error =
-        admit_read(&mut fixture, &target, &grant).expect_err("an answer past the cap is refused");
+    let error = hook_eventually(|| admit_read(&mut fixture, &target, &grant), hook_timed_out)
+        .expect_err("an answer past the cap is refused");
     match &error {
         ExecutorError::Hook(HookError::OutputTooLarge { hook, limit }) => {
             assert_eq!(hook, HOOK_ID);
@@ -900,7 +972,7 @@ fn hook_child_tree_is_reaped_p6() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target.clone());
 
-    let outcome = admit_read(&mut fixture, &target, &grant)
+    let outcome = hook_eventually(|| admit_read(&mut fixture, &target, &grant), hook_timed_out)
         .expect("the descendant holds no answer pipe, so the run ends on its answer");
     assert!(
         matches!(&outcome, EffectOutcome::Read { bytes, .. } if bytes == b"permitted"),
@@ -934,7 +1006,7 @@ fn hook_malformed_answer_is_refused_p7() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target.clone());
 
-    let error = admit_read(&mut fixture, &target, &grant)
+    let error = hook_eventually(|| admit_read(&mut fixture, &target, &grant), hook_timed_out)
         .expect_err("an answer outside the contract is refused");
     match &error {
         ExecutorError::Hook(HookError::Malformed { hook, detail }) => {
@@ -971,8 +1043,11 @@ fn transformed_arguments_are_rechecked_at_the_named_site_p8() {
 
     // Permitted → permitted: the effect lands on the rewritten path, so the
     // admission and the effect both consumed the transformed arguments.
-    let outcome = admit_read(&mut fixture, &admitted_path, &grant)
-        .expect("a rewrite to a permitted path is admitted");
+    let outcome = hook_eventually(
+        || admit_read(&mut fixture, &admitted_path, &grant),
+        hook_timed_out,
+    )
+    .expect("a rewrite to a permitted path is admitted");
     let digest = match &outcome {
         EffectOutcome::Read { bytes, digest } => {
             assert_eq!(
@@ -997,8 +1072,11 @@ fn transformed_arguments_are_rechecked_at_the_named_site_p8() {
         .policy_writer()
         .enroll_deny(&chosen)
         .expect("deny the rewritten target");
-    let error = admit_read(&mut fixture, &admitted_path, &grant)
-        .expect_err("the denied rewrite is refused");
+    let error = hook_eventually(
+        || admit_read(&mut fixture, &admitted_path, &grant),
+        hook_timed_out,
+    )
+    .expect_err("the denied rewrite is refused");
     assert!(
         matches!(&error, ExecutorError::HookTransform { transformed, .. } if transformed == &chosen.display().to_string()),
         "the refusal names the transformed target: {error:?}"
@@ -1095,19 +1173,21 @@ fn scheduler_step_consults_the_declared_hook_p11() {
         .runtime
         .set_read_scope(fixture.scope.clone(), target);
 
-    let error = fixture
-        .world
-        .runtime
-        .run_decision_step(
-            &fixture.session,
-            &fixture.task,
-            &AnswerSelection::Option {
-                option_id: OptionId("brief".to_string()),
-            },
-            &grant,
-            false,
-        )
-        .expect_err("the declared hook's deny refuses the step's own admission");
+    let error = hook_eventually(
+        || {
+            fixture.world.runtime.run_decision_step(
+                &fixture.session,
+                &fixture.task,
+                &AnswerSelection::Option {
+                    option_id: OptionId("brief".to_string()),
+                },
+                &grant,
+                false,
+            )
+        },
+        |error| matches!(error, ControllerError::Executor(inner) if hook_timed_out(inner)),
+    )
+    .expect_err("the declared hook's deny refuses the step's own admission");
 
     match &error {
         ControllerError::Executor(ExecutorError::HookDenied { hook, decision }) => {

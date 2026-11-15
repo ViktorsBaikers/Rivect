@@ -4324,6 +4324,19 @@ fn macos_check_records_setsid_survivor_without_false_cleanup() {
     // pid-prefixed; the survivor witness file inside rw/tmp identifies
     // OUR root.
     let root_prefix = "rivect-check-".to_string();
+    // Stale retained roots from earlier runs carry dead or leaked
+    // witnesses: only a NEW root (names are server-owned uuids) holding
+    // a live pid can be this run's survivor. Snapshot before the
+    // confined run creates its attempt root.
+    let preexisting_roots: std::collections::HashSet<String> =
+        std::fs::read_dir(std::env::temp_dir())
+            .expect("list the temp dir for the pre-run root snapshot")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(&root_prefix).then_some(name)
+            })
+            .collect();
     let seen_pid = Arc::new(std::sync::Mutex::new(None));
     let watcher = {
         let seen_pid = seen_pid.clone();
@@ -4336,15 +4349,15 @@ fn macos_check_records_setsid_survivor_without_false_cleanup() {
                     .ok()
                     .and_then(|entries| {
                         entries.filter_map(|entry| entry.ok()).find_map(|entry| {
-                            if !entry
-                                .file_name()
-                                .to_string_lossy()
-                                .starts_with(&root_prefix)
+                            let name = entry.file_name().to_string_lossy().into_owned();
+                            if !name.starts_with(&root_prefix) || preexisting_roots.contains(&name)
                             {
                                 return None;
                             }
                             let pid = entry.path().join("rw/tmp/survivor.pid");
-                            std::fs::read_to_string(&pid).ok()
+                            let witness = std::fs::read_to_string(&pid).ok()?;
+                            let number = witness.trim().parse::<i32>().ok()?;
+                            (number > 0 && pid_alive(number)).then_some(witness)
                         })
                     });
                 if let Some(pid) = from_file {
@@ -5229,15 +5242,13 @@ fn credentials_paths(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
+            let Ok(file_type) = entry.file_type() else {
+                continue;
             };
             if file_type.is_dir() {
                 stack.push(path);

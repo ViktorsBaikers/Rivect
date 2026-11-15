@@ -102,7 +102,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::buffer::CellWidth as _;
 use ratatui::layout::Constraint;
 use ratatui::style::Style;
@@ -1671,18 +1671,44 @@ fn render_inline(
     if !pending.is_empty() {
         let text = transcript_text(pending);
         let rows = wrapped_row_count(&text, width);
-        terminal.insert_before(u16::try_from(rows).unwrap_or(u16::MAX), |buf| {
+        let inserted = terminal.insert_before(u16::try_from(rows).unwrap_or(u16::MAX), |buf| {
             Paragraph::new(text.as_str())
                 .style(palette.transcript())
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .render(buf.area, buf);
-        })?;
+        });
+        if let Err(error) = inserted {
+            if !is_unanswered_cursor_query(&error) {
+                return Err(error);
+            }
+            // The rows were drawn before the cursor snapshot query, so
+            // they landed; only the viewport erase and the buffer reset
+            // are missing. Erase from the viewport origin down and swap
+            // in the reset buffer so the draw below repaints the pinned
+            // region in full — both without another cursor query.
+            let origin = terminal.get_frame().area().as_position();
+            let backend = terminal.backend_mut();
+            backend.set_cursor_position(origin)?;
+            backend.clear_region(ClearType::AfterCursor)?;
+            terminal.swap_buffers();
+        }
         *flushed = view.transcript.len();
     }
     let mut card_inner = None;
     terminal.draw(|frame| card_inner = render_pinned(frame, view, palette))?;
     note_card_paint(view, card_inner);
     Ok(())
+}
+
+/// Whether an inline insert failed only because the terminal never
+/// answered the cursor-position query. crossterm 0.29 reports that
+/// timeout as this message behind `io::Error::other` wrappers (kind
+/// `Other` alone is not specific); Cargo.lock pins the wording's source,
+/// so re-check it on a crossterm upgrade.
+fn is_unanswered_cursor_query(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains("The cursor position could not be read within a normal duration")
 }
 
 /// The inline surface's pinned bottom region: status, status band, output

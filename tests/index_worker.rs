@@ -37,7 +37,9 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 use support::{
     TempTree, ast_corpus, ensure_helper, project_corpus, rivect_binary, search_corpus,
     search_query, symbol_corpus, symbol_query, tree_of,
@@ -126,6 +128,7 @@ fn recorded_pid(pid_file: &Path) -> Option<u32> {
 }
 
 /// Clock ticks per second from the process auxiliary vector (`AT_CLKTCK`).
+#[cfg(target_os = "linux")]
 fn clock_ticks() -> u64 {
     let Ok(bytes) = std::fs::read("/proc/self/auxv") else {
         return 100;
@@ -140,6 +143,7 @@ fn clock_ticks() -> u64 {
     100
 }
 
+#[cfg(target_os = "linux")]
 fn boot_unix() -> Option<u64> {
     std::fs::read_to_string("/proc/stat").ok().and_then(|stat| {
         stat.lines().find_map(|line| {
@@ -150,6 +154,7 @@ fn boot_unix() -> Option<u64> {
 }
 
 /// `starttime` from `/proc/<pid>/stat`, in clock ticks since boot.
+#[cfg(target_os = "linux")]
 fn start_ticks(stat: &str) -> Option<u64> {
     let rest = stat.rsplit_once(')')?.1;
     // Field 3 is the first token after `comm`; field 22 is starttime.
@@ -158,11 +163,13 @@ fn start_ticks(stat: &str) -> Option<u64> {
 
 /// `ESRCH`: the kernel's answer to a `/proc/<pid>` read once the process
 /// has exited after the file was opened. Std maps it to no `ErrorKind`.
+#[cfg(target_os = "linux")]
 const ESRCH: i32 = 3;
 
 /// A `/proc/<pid>` file's text, or `None` when that process is gone.
 /// A process that exits mid-scan is absence; any other read failure leaves
 /// the table scan incomplete and is the caller's error.
+#[cfg(target_os = "linux")]
 fn read_proc_file(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -184,6 +191,7 @@ fn read_proc_file(path: &Path) -> std::io::Result<Option<String>> {
 /// match needs a nested `NSpid` whose last id is `inner` and a start time
 /// at the pid file's mtime. An unreaped zombie still has both, so it counts
 /// as present.
+#[cfg(target_os = "linux")]
 fn host_worker_pids(proc_root: &Path, pid_file: &Path, inner: u32) -> std::io::Result<Vec<u32>> {
     let file_mtime = std::fs::metadata(pid_file)?
         .modified()?
@@ -225,6 +233,23 @@ fn host_worker_pids(proc_root: &Path, pid_file: &Path, inner: u32) -> std::io::R
         }
     }
     Ok(found)
+}
+
+/// Host pids of the worker that wrote `inner` into `pid_file`.
+///
+/// Darwin has no pid namespaces and no `/proc`: the pid the shim
+/// records (`echo $$`) IS the host pid, so `kill -0` alone resolves
+/// it. That probe succeeds for an unreaped zombie on Darwin exactly
+/// as on Linux, so a zombie counts as present until it is reaped.
+/// An observation error propagates: the observer retains the roots
+/// and fails, never counting the worker as gone.
+#[cfg(target_os = "macos")]
+fn host_worker_pids(_proc_root: &Path, _pid_file: &Path, inner: u32) -> std::io::Result<Vec<u32>> {
+    if alive(&inner.to_string())? {
+        Ok(vec![inner])
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// `/bin/sh -c` with a cleared environment and `PATH=/usr/bin:/bin`.

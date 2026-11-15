@@ -272,6 +272,54 @@ fn system_true() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The first shared library of the host git that lies outside the exec
+/// profile's admitted system trees (`EXEC_SYSTEM_READ_RULES`), read from the
+/// binary's own `otool -L` listing before the git positive's confined run. A git linking
+/// out-of-profile dylibs (Homebrew's `/opt/homebrew`) cannot execute under
+/// confinement: that proven host gap, never an exec denial, is the DEC-038
+/// NOT_RUN. `None` keeps the positive live — an unavailable inspection
+/// classifies nothing, so a removed `/dev/null` rule still fails the leg.
+#[cfg(target_os = "macos")]
+fn git_library_outside_exec_profile(git: &Path) -> Option<String> {
+    let output = std::process::Command::new("otool")
+        .arg("-L")
+        .arg(git)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8(output.stdout).ok()?;
+    // Header lines name the inspected binary (one per architecture) and end
+    // in ':'; each dependency line starts with its install path.
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.ends_with(':'))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|path| path.starts_with('/'))
+        .find(|path| {
+            ![
+                "/bin/",
+                "/usr/bin/",
+                "/usr/lib/",
+                "/usr/libexec/",
+                "/usr/share/",
+                "/System/",
+            ]
+            .iter()
+            .any(|tree| path.starts_with(tree))
+        })
+        .map(str::to_string)
+}
+
+/// The Seatbelt system-tree profile is macOS-only; elsewhere no library gap
+/// classifies and the git positive stays live.
+#[cfg(not(target_os = "macos"))]
+fn git_library_outside_exec_profile(_git: &Path) -> Option<String> {
+    None
+}
+
 #[test]
 fn read_file_ingress_through_the_real_entry_reads_in_scope_and_bounds_its_preview() {
     let scope_root = tempfile::TempDir::with_prefix("rivect-ingress-read-scope-").expect("scope");
@@ -543,28 +591,258 @@ fn exec_ingress_runs_a_confined_program() {
         other => panic!("a cancelled exec is refused: {other:?}"),
     }
 
-    // The positive: the real git program executes inside the declared scope.
-    match run(&mut world, &task, &program) {
+    // DEC-038: prove the host gap from git's own library listing before the
+    // positive, never from an exec denial — a removed /dev/null rule must
+    // still fail a host whose git links only system libraries. Only this
+    // proven gap skips the leg; the control and regressions still run.
+    if let Some(library) = git_library_outside_exec_profile(&git) {
+        support::not_run::record(
+            "ingress.exec",
+            &format!("host git links {library} outside the exec profile's system trees"),
+        );
+        eprintln!(
+            "NOT_RUN: host git links {library} outside the exec profile's system trees; only the git positive leg is skipped"
+        );
+    } else {
+        // The positive: the real git program executes inside the declared scope.
+        match run(&mut world, &task, &program) {
+            Ok(EffectOutcome::Executed { detail }) => {
+                assert_eq!(detail, "exec-performed exit=ok", "{detail}");
+                assert!(
+                    detail.len() <= 64,
+                    "the captured detail is bounded: {detail}"
+                );
+            }
+            Err(rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::SandboxDenied { .. },
+            )) => {
+                // The boundary executed the harmless control but denied git: the
+                // git positive is not proven, and a retained NOT_RUN would let a
+                // removed /dev/null rule read green. Fail instead.
+                panic!("the exec boundary denied the real git program after the control executed");
+            }
+            // The control program already executed, so this host's sandbox is
+            // available: every later failure is the git leg's own and a hard
+            // failure, never a retained NOT_RUN. Only the control match above
+            // may classify an unavailable sandbox.
+            other => panic!("the git positive must execute once the control did: {other:?}"),
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
+}
+
+#[test]
+fn exec_ingress_runs_a_program_granted_through_a_symlinked_scope() {
+    let Some(true_source) = system_true() else {
+        support::not_run::record(
+            "ingress.exec",
+            "no host true program for the symlinked-scope exec leg",
+        );
+        eprintln!("NOT_RUN: no host true program; the symlinked-scope exec leg is skipped");
+        return;
+    };
+    let (provider, calls, _manifest) = support::CountingProvider::new();
+    let mut world = support::open_world_with(
+        "ingress-exec-symlink",
+        None,
+        Box::new(provider),
+        Box::new(PlatformWorker),
+    );
+    let session = world.open_session("ingress-exec-symlink");
+    let task = world.create_task(&session, "ingress-exec-symlink-task");
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&task)
+        .expect("obligations");
+
+    // A private symlink alias to a canonical scope keeps the regression
+    // independent of the session TMPDIR's own spelling: the grant and the
+    // program both carry the alias, and the kernel must still admit the
+    // canonical target inside the canonical scope.
+    let scope =
+        tempfile::TempDir::with_prefix("rivect-ingress-exec-symlink-scope-").expect("scope");
+    let canonical_root = scope.path().canonicalize().expect("canonical scope root");
+    let canonical_program = canonical_root.join("scoped-true");
+    std::fs::copy(&true_source, &canonical_program).expect("copy true into scope");
+    std::fs::set_permissions(&canonical_program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the scoped program executable");
+    let alias_parent =
+        tempfile::TempDir::with_prefix("rivect-ingress-exec-symlink-alias-").expect("alias parent");
+    let alias_root = alias_parent.path().join("scope-alias");
+    std::os::unix::fs::symlink(&canonical_root, &alias_root)
+        .expect("symlink alias to the canonical scope");
+    let alias_program = alias_root.join("scoped-true");
+
+    let grant = world
+        .runtime
+        .policy_writer()
+        .grant_classes(alias_root.clone(), vec![EffectClass::Exec]);
+    let run = |world: &mut support::World,
+               task: &rivect::contracts::TaskId,
+               program: &Path|
+     -> Result<EffectOutcome, rivect::executor::ExecutorError> {
+        let admitted = {
+            let mut executor = world.runtime.executor();
+            executor.admit(
+                task,
+                EffectRequest::Exec {
+                    grant_id: grant.clone(),
+                    program: program.to_path_buf(),
+                },
+                PermissionMode::Yolo,
+            )?
+        };
+        let mut executor = world.runtime.executor();
+        executor.execute(&admitted)
+    };
+    let host_unavailable = |error: &rivect::executor::ExecutorError| {
+        matches!(
+            error,
+            rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::SandboxUnavailable { .. }
+                    | rivect::executor::WorkerError::SandboxSpawnFailed { .. }
+                    | rivect::executor::WorkerError::ExecUnavailable,
+            ) | rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::OwnedLaunch { .. }
+                    | rivect::executor::WorkerError::OwnedPreparation { .. },
+            )
+        )
+    };
+    // The control runs through the canonical spelling, so a host gap is
+    // classified before the alias leg discriminates the boundary defect.
+    match run(&mut world, &task, &canonical_program) {
+        Ok(EffectOutcome::Executed { .. }) => {}
+        Err(error) if host_unavailable(&error) => {
+            support::not_run::record(
+                "ingress.exec",
+                "confined exec unavailable on this host (sandbox namespaces/landlock)",
+            );
+            eprintln!(
+                "NOT_RUN: confined exec is unavailable on this host; the symlinked-scope exec leg is skipped"
+            );
+            return;
+        }
+        other => panic!("the canonical control program must execute: {other:?}"),
+    }
+    match run(&mut world, &task, &alias_program) {
         Ok(EffectOutcome::Executed { detail }) => {
             assert_eq!(detail, "exec-performed exit=ok", "{detail}");
-            assert!(
-                detail.len() <= 64,
-                "the captured detail is bounded: {detail}"
+        }
+        other => {
+            panic!("the program admitted through the symlinked scope must execute: {other:?}")
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
+}
+
+#[test]
+fn exec_ingress_denies_a_program_that_vanished_after_admission() {
+    let Some(true_source) = system_true() else {
+        support::not_run::record(
+            "ingress.exec",
+            "no host true program for the vanished-program exec leg",
+        );
+        eprintln!("NOT_RUN: no host true program; the vanished-program exec leg is skipped");
+        return;
+    };
+    let (provider, calls, _manifest) = support::CountingProvider::new();
+    let mut world = support::open_world_with(
+        "ingress-exec-vanished",
+        None,
+        Box::new(provider),
+        Box::new(PlatformWorker),
+    );
+    let session = world.open_session("ingress-exec-vanished");
+    let task = world.create_task(&session, "ingress-exec-vanished-task");
+    world
+        .runtime
+        .store_writer()
+        .materialize_obligations(&task)
+        .expect("obligations");
+
+    let scope =
+        tempfile::TempDir::with_prefix("rivect-ingress-exec-vanished-scope-").expect("scope");
+    let canonical_root = scope.path().canonicalize().expect("canonical scope root");
+    let program = canonical_root.join("scoped-true");
+    std::fs::copy(&true_source, &program).expect("copy true into scope");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the scoped program executable");
+    let grant = world
+        .runtime
+        .policy_writer()
+        .grant_classes(canonical_root.clone(), vec![EffectClass::Exec]);
+    let run = |world: &mut support::World,
+               task: &rivect::contracts::TaskId,
+               program: &Path|
+     -> Result<EffectOutcome, rivect::executor::ExecutorError> {
+        let admitted = {
+            let mut executor = world.runtime.executor();
+            executor.admit(
+                task,
+                EffectRequest::Exec {
+                    grant_id: grant.clone(),
+                    program: program.to_path_buf(),
+                },
+                PermissionMode::Yolo,
+            )?
+        };
+        let mut executor = world.runtime.executor();
+        executor.execute(&admitted)
+    };
+    let host_unavailable = |error: &rivect::executor::ExecutorError| {
+        matches!(
+            error,
+            rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::SandboxUnavailable { .. }
+                    | rivect::executor::WorkerError::SandboxSpawnFailed { .. }
+                    | rivect::executor::WorkerError::ExecUnavailable,
+            ) | rivect::executor::ExecutorError::Worker(
+                rivect::executor::WorkerError::OwnedLaunch { .. }
+                    | rivect::executor::WorkerError::OwnedPreparation { .. },
+            )
+        )
+    };
+    // The first execute is the host control: the sandbox must admit the
+    // canonical program before the vanished-target leg discriminates.
+    match run(&mut world, &task, &program) {
+        Ok(EffectOutcome::Executed { .. }) => {}
+        Err(error) if host_unavailable(&error) => {
+            support::not_run::record(
+                "ingress.exec",
+                "confined exec unavailable on this host (sandbox namespaces/landlock)",
             );
+            eprintln!(
+                "NOT_RUN: confined exec is unavailable on this host; the vanished-program exec leg is skipped"
+            );
+            return;
         }
+        other => panic!("the canonical control program must execute: {other:?}"),
+    }
+
+    // Yolo admission accepts the program without resolving it; the worker's
+    // canonicalize is the fail-closed point, so the reachable typed denial is
+    // a program removed between admit and execute.
+    let admitted = {
+        let mut executor = world.runtime.executor();
+        executor
+            .admit(
+                &task,
+                EffectRequest::Exec {
+                    grant_id: grant.clone(),
+                    program: program.clone(),
+                },
+                PermissionMode::Yolo,
+            )
+            .expect("admit the present program")
+    };
+    std::fs::remove_file(&program).expect("remove the admitted program");
+    let mut executor = world.runtime.executor();
+    match executor.execute(&admitted) {
         Err(rivect::executor::ExecutorError::Worker(
-            rivect::executor::WorkerError::SandboxDenied { .. },
-        )) => {
-            // The boundary executed the harmless control but denied git: the
-            // git positive is not proven, and a retained NOT_RUN would let a
-            // removed /dev/null rule read green. Fail instead.
-            panic!("the exec boundary denied the real git program after the control executed");
-        }
-        // The control program already executed, so this host's sandbox is
-        // available: every later failure is the git leg's own and a hard
-        // failure, never a retained NOT_RUN. Only the control match above
-        // may classify an unavailable sandbox.
-        other => panic!("the git positive must execute once the control did: {other:?}"),
+            rivect::executor::WorkerError::TargetMissing { target },
+        )) => assert_eq!(target, program, "the denial names the admitted program"),
+        other => panic!("a vanished program is a typed target denial, never a run: {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no wire");
 }

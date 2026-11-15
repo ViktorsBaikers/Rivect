@@ -850,9 +850,10 @@ fn fresh_write_artifact(scope_root: &Path) -> Result<PathBuf, WorkerError> {
 ///
 /// # Errors
 /// Returns [`WorkerError::ScopeRootUnavailable`] when the scope root
-/// cannot be canonicalized, [`WorkerError::SandboxSpawnFailed`] when
-/// the sandbox mechanism cannot start, and [`WorkerError::SandboxDenied`]
-/// when the boundary rejects the program.
+/// cannot be canonicalized, [`WorkerError::TargetMissing`] when the
+/// program cannot be canonicalized, [`WorkerError::SandboxSpawnFailed`]
+/// when the sandbox mechanism cannot start, and
+/// [`WorkerError::SandboxDenied`] when the boundary rejects the program.
 pub fn exec_once(scope_root: &Path, program: &Path) -> Result<(), WorkerError> {
     exec_once_with(Path::new(SANDBOX_EXEC), scope_root, program)
 }
@@ -870,7 +871,17 @@ pub fn exec_once_with(
         denied.exit_ok,
         "seatbelt exec boundary admitted the denied control /usr/bin/true",
     )?;
-    let outcome = run_confined(sandbox_exec, &profile, program, &[])?;
+    // Seatbelt matches canonical spellings; the scope subpath never matches a
+    // symlinked program spelling.
+    // Every canonicalize failure — missing, permission, symlink loop —
+    // denies the effect the same way: the target is unavailable.
+    let canonical_program =
+        program
+            .canonicalize()
+            .map_err(|_source| WorkerError::TargetMissing {
+                target: program.to_path_buf(),
+            })?;
+    let outcome = run_confined(sandbox_exec, &profile, &canonical_program, &[])?;
     expect_admitted(outcome.exit_ok, program)
 }
 

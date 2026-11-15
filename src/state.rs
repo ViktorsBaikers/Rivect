@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 mod learning;
-mod sql;
+pub(crate) mod sql;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Missing {
@@ -10346,7 +10346,7 @@ impl TaskStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::TaskStore;
     use super::proof::{CHILD_ROOT, ChildEntry, custody_failure, run_probe_child, spawn_child};
     use crate::contracts::TaskId;
@@ -11049,7 +11049,7 @@ mod tests {
         Ok(())
     }
 
-    fn claim_fixture(
+    pub fn claim_fixture(
         tag: &str,
     ) -> (
         tempfile::TempDir,
@@ -11107,14 +11107,14 @@ mod tests {
         (root, store, session, task, attempt, claim)
     }
 
-    fn refusal(outcome: super::Result<super::ClaimOutcome>) -> super::ClaimRefusal {
+    pub fn refusal(outcome: super::Result<super::ClaimOutcome>) -> super::ClaimRefusal {
         match outcome.expect("claim call reaches its typed outcome") {
             super::ClaimOutcome::Refused(refusal) => refusal,
             super::ClaimOutcome::Claimed => unreachable!("expected a typed refusal"),
         }
     }
 
-    fn marker_boundary(attempt: &str) -> String {
+    pub fn marker_boundary(attempt: &str) -> String {
         format!("ret:check:{attempt}:admit.claim")
     }
 
@@ -12913,7 +12913,7 @@ mod tests {
             Ok(())
         }
     }
-    fn claim_deadline() -> std::time::Instant {
+    pub fn claim_deadline() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(30)
     }
 
@@ -15059,7 +15059,7 @@ mod tests {
 
     /// Every non-authoritative denial row of one database, decoded, in
     /// boundary order, read through a separate connection.
-    fn denial_rows(
+    pub fn denial_rows(
         db: &std::path::Path,
     ) -> Result<Vec<(String, serde_json::Value)>, Box<dyn std::error::Error>> {
         let conn = rusqlite::Connection::open(db)?;

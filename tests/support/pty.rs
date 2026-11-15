@@ -439,10 +439,24 @@ impl PtySession {
         }
     }
 
-    /// Pumps and polls `try_wait`; never signals.
-    fn reap_within(&mut self, deadline: Instant) -> Result<Option<u32>, PtyWaitError> {
+    /// Pumps and polls `try_wait`; never signals. After every pump pass
+    /// `answer` sees the stream and may return reply bytes for the child.
+    fn reap_within(
+        &mut self,
+        deadline: Instant,
+        answer: &mut impl FnMut(&[u8]) -> Option<&'static [u8]>,
+    ) -> Result<Option<u32>, PtyWaitError> {
         loop {
-            pump(self.output.get_mut());
+            let reply = {
+                let output = self.output.get_mut();
+                pump(output);
+                answer(&output.stream)
+            };
+            if let Some(reply) = reply {
+                self.send(reply).map_err(|source| PtyWaitError::Wait {
+                    source: io::Error::other(source),
+                })?;
+            }
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     let code = status.exit_code();
@@ -470,12 +484,27 @@ impl PtySession {
     /// # Errors
     /// An observed wait or kill failure.
     pub fn wait_exit(&mut self, timeout: Duration) -> Result<Option<u32>, PtyWaitError> {
+        self.wait_exit_answering(timeout, |_| None)
+    }
+
+    /// `wait_exit` that plays terminal while it waits: after every pump
+    /// pass `answer` sees the whole stream and may return reply bytes
+    /// written to the child. A real terminal always answers a cursor
+    /// query; an exit wait that stays deaf can starve a child mid-restore.
+    ///
+    /// # Errors
+    /// An observed wait or kill failure, or a failed reply write.
+    pub fn wait_exit_answering(
+        &mut self,
+        timeout: Duration,
+        mut answer: impl FnMut(&[u8]) -> Option<&'static [u8]>,
+    ) -> Result<Option<u32>, PtyWaitError> {
         let deadline = Instant::now() + timeout;
         match self.state {
             ReapState::Reaped(code) => Ok(Some(code)),
-            ReapState::Terminated | ReapState::Unknown => self.reap_within(deadline),
+            ReapState::Terminated | ReapState::Unknown => self.reap_within(deadline, &mut answer),
             ReapState::Live => {
-                if let Some(code) = self.reap_within(deadline)? {
+                if let Some(code) = self.reap_within(deadline, &mut answer)? {
                     return Ok(Some(code));
                 }
                 match self.child.kill() {
@@ -505,10 +534,14 @@ impl PtySession {
                 errors.push(PtyTeardownError::ChildStateUnknown { root: root.keep() });
                 return self.finish_output(errors);
             }
-            ReapState::Terminated => self.reap_within(Instant::now() + Duration::from_secs(10)),
+            ReapState::Terminated => {
+                self.reap_within(Instant::now() + Duration::from_secs(10), &mut |_| None)
+            }
             ReapState::Live => match self.wait_exit(Duration::from_secs(1)) {
                 Ok(Some(code)) => Ok(Some(code)),
-                Ok(None) => self.reap_within(Instant::now() + Duration::from_secs(10)),
+                Ok(None) => {
+                    self.reap_within(Instant::now() + Duration::from_secs(10), &mut |_| None)
+                }
                 Err(source) => Err(source),
             },
         };
@@ -561,6 +594,45 @@ pub fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+/// Env gate for the cursor-query trace: the harness prints when it sees
+/// `ESC [ 6 n`, when it answers, and what the child reported on timeout.
+/// Diagnostic only — unset, the trace is silent and no behaviour changes.
+pub const CURSOR_TRACE_ENV: &str = "RIVECT_PTY_CURSOR_TRACE";
+
+pub fn trace_enabled() -> bool {
+    std::env::var_os(CURSOR_TRACE_ENV).is_some()
+}
+
+/// Microseconds since the harness's first traced call, so query, answer and
+/// timeout orderings are readable in one run.
+pub fn trace_at() -> Duration {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed()
+}
+
+/// The terminal's DSR reply: one unanswered ESC[6n past the scan mark
+/// earns one ESC[1;1R and advances the mark. Shared by the live waits
+/// and the exit wait so every harness path answers cursor queries.
+pub fn cursor_query_reply(cursor_at: &mut usize, bytes: &[u8]) -> Option<&'static [u8]> {
+    let found = find_subsequence(&bytes[*cursor_at..], b"\x1b[6n")?;
+    if trace_enabled() {
+        // Same locked write as report(): print macros are lint-denied in
+        // this shared file, which is never the test root.
+        let mut stderr = io::stderr().lock();
+        let line = format!(
+            "[cursor-trace {:?}] saw ESC[6n at byte {} (cursor_at {})\n",
+            trace_at(),
+            found,
+            *cursor_at
+        );
+        if let Err(write_error) = stderr.write_all(line.as_bytes()) {
+            std::hint::black_box(write_error);
+        }
+    }
+    *cursor_at += found + 4;
+    Some(b"\x1b[1;1R")
 }
 
 /// Cell-boundary artifacts can widen a rendered space; assertions match
@@ -1073,5 +1145,47 @@ mod screen_recon_tests {
         assert_eq!(out, vec!["A  BCD"]);
         let out = screen(b"ABCD\x1b[1;2H\x1b[2P", 1, 4);
         assert_eq!(out, vec!["AD"]);
+    }
+}
+
+#[cfg(test)]
+mod cursor_reply_tests {
+    use super::cursor_query_reply;
+
+    #[test]
+    fn each_query_earns_one_reply_and_advances_the_mark() {
+        let bytes = b"ab\x1b[6ncd\x1b[6n";
+        let mut mark = 0;
+        assert_eq!(
+            cursor_query_reply(&mut mark, bytes),
+            Some(b"\x1b[1;1R".as_slice())
+        );
+        assert_eq!(mark, 6);
+        assert_eq!(
+            cursor_query_reply(&mut mark, bytes),
+            Some(b"\x1b[1;1R".as_slice())
+        );
+        assert_eq!(mark, 12);
+        assert_eq!(cursor_query_reply(&mut mark, bytes), None);
+        assert_eq!(mark, 12);
+    }
+
+    #[test]
+    fn a_stream_without_a_query_keeps_the_mark() {
+        let mut mark = 3;
+        assert_eq!(cursor_query_reply(&mut mark, b"plain text"), None);
+        assert_eq!(mark, 3);
+    }
+
+    #[test]
+    fn a_partial_query_waits_for_the_rest_of_the_sequence() {
+        let mut mark = 0;
+        assert_eq!(cursor_query_reply(&mut mark, b"\x1b[6"), None);
+        assert_eq!(mark, 0);
+        assert_eq!(
+            cursor_query_reply(&mut mark, b"\x1b[6n"),
+            Some(b"\x1b[1;1R".as_slice())
+        );
+        assert_eq!(mark, 4);
     }
 }
