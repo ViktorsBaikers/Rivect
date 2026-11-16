@@ -86,8 +86,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fetch locked
         run: cargo fetch --locked
-      - name: raise process limit (parallel tests fork EAGAIN)
-        run: sudo sysctl -w kern.maxprocperuid=10000 kern.maxproc=20000
       - name: sandbox macos suite (all carrier oracles)
         run: |
           ulimit -u 10000 || true
