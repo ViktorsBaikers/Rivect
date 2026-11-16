@@ -1,17 +1,13 @@
 #!/bin/sh
-# Rivect engineering-standards push gate (docs/engineering-standards.md §14) —
-# the full suite. Tracked source; enable with:
+# Rivect push gate - fast lint/build checks only. The test suite runs in CI,
+# not here (gate-owner decision DEC-049). Tracked source; enable with:
 #   ln -sf ../../scripts/git-hooks/pre-push .git/hooks/pre-push
-# The distributed equivalent is CI.
+# CI (gate-linux + test-macos) is the authoritative full-suite gate.
 set -e
 echo "pre-push: fmt --check"
 cargo fmt --all -- --check
 echo "pre-push: clippy -D warnings"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-echo "pre-push: workspace tests"
-cargo test --workspace
-echo "pre-push: doc tests"
-cargo test --workspace --doc
 echo "pre-push: doc build -Dwarnings"
 RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps --quiet
 echo "pre-push: cargo deny check"

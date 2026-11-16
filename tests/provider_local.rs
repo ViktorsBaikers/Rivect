@@ -5231,8 +5231,9 @@ async fn abliteration_stream_gaps_inside_the_deadline_still_complete() {
         &[(ABLITERATION_REF, SECRET)],
     ));
     let built = config.clone();
+    // slow CI runners need headroom over the spaced-fragment total (~12 chunks x 60ms plus scheduling)
     let provider = std::thread::spawn(move || {
-        OpenAiProvider::with_deadline(&built, "abliteration", store, Duration::from_millis(1500))
+        OpenAiProvider::with_deadline(&built, "abliteration", store, Duration::from_secs(5))
     })
     .join()
     .expect("the provider thread joins")
