@@ -44,8 +44,10 @@ jobs:
         # (origin carries no docs/pack trees): the stack-admission trio and
         # the measurement suite (frozen docs/release-budgets.md). Skip
         # exactly those and run everything else — never a blanket skip.
+        # 2 threads: default parallelism tripped load-sensitive tests
+        # (workflow_off helper spawn) on the shared runner, same as macOS.
         run: >-
-          cargo test --locked --workspace
+          RUST_TEST_THREADS=2 cargo test --locked --workspace
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
@@ -107,7 +109,8 @@ jobs:
         # 4-way load tripped deadline/transport-sensitive tests (search_index
         # narrowed-cut widening, activation LocalPeer http) across tag runs.
         run: >-
-          RUST_TEST_THREADS=2 cargo test --locked --workspace --exclude rivect-sandbox-helper
+          RUST_TEST_THREADS=2 cargo test --locked --workspace
+          --exclude rivect-sandbox-helper
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
