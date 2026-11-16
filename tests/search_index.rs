@@ -163,13 +163,13 @@ fn init_cut(
 /// The assertion every answered cut of `narrowed_cut` faces: a widening
 /// is the product's verdict about the project, so it is asserted once and
 /// never retried.
-fn assert_kept_its_narrowing(result: &ProjectInitResult, changed: &[&str]) {
+fn assert_kept_its_narrowing(result: &ProjectInitResult, changed: &[&str], refusals: &[String]) {
     assert!(
         !result.graph.narrowed_to.is_empty(),
         "the cut kept the narrowing {changed:?} on its first answered \
          attempt: the file set outside it held still, so widening it would \
          be a verdict nothing in the project supports — coverage {:?}, \
-         narrowed_to {:?}",
+         narrowed_to {:?}, preceding RPC errors {refusals:?}",
         result.graph.completeness,
         result.graph.narrowed_to
     );
@@ -198,7 +198,7 @@ fn narrowed_cut(
             .unwrap_or_else(|refused| {
                 panic!("the cut carrying the manufactured verdict was refused: {refused}")
             });
-        assert_kept_its_narrowing(&result, changed);
+        assert_kept_its_narrowing(&result, changed, &[]);
         return result;
     }
     let extra = json!({ "changed": changed.iter().collect::<Vec<_>>() });
@@ -206,7 +206,7 @@ fn narrowed_cut(
     for _ in 0..3 {
         match init_cut(world, session, extra.clone()) {
             Ok(result) => {
-                assert_kept_its_narrowing(&result, changed);
+                assert_kept_its_narrowing(&result, changed, &refusals);
                 return result;
             }
             Err(refusal) => refusals.push(refusal),
@@ -3871,7 +3871,8 @@ fn a_watch_batch_is_repaired_without_a_caller_asking() {
     // the backend reports starts its own repair, so a project edited and
     // never re-initialised is repaired rather than left reading `Fresh`
     // over bytes that are gone.
-    let (mut world, session, tree) = project_world("off-path-watch", "watch-repair");
+    let tree = advisory_project("watch-repair");
+    let (mut world, session, _) = project_world_at("off-path-watch", &tree);
     let initial = init_result(&init(&mut world, &session, json!({})));
     let initial_generation = generation_of(&initial);
     assert!(initial.state.is_fresh(), "{initial:?}");
@@ -3879,44 +3880,105 @@ fn a_watch_batch_is_repaired_without_a_caller_asking() {
         world.runtime.index_watcher.is_some(),
         "a cut generation starts the project's own watch"
     );
+    assert!(
+        initial
+            .graph
+            .documents
+            .iter()
+            .any(|path| path == Path::new("node_modules/dep.rs")),
+        "the fixture's dependency directory is not ignored: {:?}",
+        initial.graph.documents
+    );
 
-    write_file(
-        &tree.path,
-        "src/added.rs",
-        "use crate::helper::helper_fn;\npub fn added() { crate::helper::helper_fn(); }\n",
-    );
-    // The backend pings the loop's channel; the loop turns and asks the
-    // runtime what is owed. No `project.init` is issued here — that is
-    // the property.
-    let mut repaired = None;
-    for _ in 0..400 {
-        if let Some(generation) = wait_for_repair(&mut world, initial_generation) {
-            repaired = Some(generation);
-            break;
+    let mut previous_generation = initial_generation;
+    for relative in ["src/added.rs", "node_modules/added.rs"] {
+        for present in [true, false] {
+            if present {
+                write_file(
+                    &tree.path,
+                    relative,
+                    "use crate::helper::helper_fn;\npub fn added() { crate::helper::helper_fn(); }\n",
+                );
+            } else {
+                std::fs::remove_file(tree.path.join(relative)).expect("remove source");
+            }
+            // Only the loop's watcher consumer starts this runtime's repair.
+            let mut repaired = None;
+            for _ in 0..400 {
+                if let Some(generation) = wait_for_repair(&mut world, previous_generation) {
+                    repaired = Some(generation);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let repaired = repaired.unwrap_or_else(|| {
+                panic!("the watcher's own batch repairs {relative}, present={present}")
+            });
+            let stored = world
+                .runtime
+                .store()
+                .index_graph(repaired)
+                .expect("reads")
+                .expect("retained");
+            assert!(stored.state.is_fresh(), "{relative}: {stored:?}");
+            assert_eq!(
+                stored
+                    .graph
+                    .documents
+                    .iter()
+                    .any(|path| path == Path::new(relative)),
+                present,
+                "the repaired snapshot matches membership of {relative}"
+            );
+            if present {
+                assert!(
+                    stored.graph.edges.iter().any(|edge| {
+                        edge.from.path == Path::new(relative)
+                            && edge.to.path == Path::new("src/helper.rs")
+                            && edge.kind == EdgeKind::Import
+                    }),
+                    "the new document is in the repaired generation: {:?}",
+                    stored.graph.edges
+                );
+            } else {
+                assert!(
+                    !stored.graph.edges.iter().any(|edge| {
+                        edge.from.path == Path::new(relative) || edge.to.path == Path::new(relative)
+                    }),
+                    "no relation survives the deleted document: {:?}",
+                    stored.graph.edges
+                );
+            }
+
+            let (mut oracle, oracle_session, _) =
+                project_world_at(&format!("off-path-watch-oracle-{repaired}"), &tree);
+            let full = init_result(&init(&mut oracle, &oracle_session, json!({})));
+            assert!(full.state.is_fresh(), "{full:?}");
+            assert_eq!(
+                stored.graph.documents, full.graph.documents,
+                "{relative}, present={present}"
+            );
+            assert_eq!(
+                stored.graph.edges,
+                stored_edges(&oracle, generation_of(&full)),
+                "automatic repair equals a full build for {relative}, present={present}"
+            );
+
+            // A handle held before this mutation must no longer claim freshness.
+            let old = world
+                .runtime
+                .store()
+                .index_graph(previous_generation)
+                .expect("reads")
+                .expect("retained");
+            assert!(
+                !old.state.is_fresh(),
+                "the generation the change replaced is not current: {:?}",
+                old.state
+            );
+            previous_generation = repaired;
         }
-        std::thread::sleep(Duration::from_millis(25));
     }
-    let repaired = repaired.expect("the watcher's own batch starts a repair");
-    let rows = stored_edges(&world, repaired);
-    assert!(
-        rows.iter()
-            .any(|edge| edge.from.path.as_path() == Path::new("src/added.rs")
-                && edge.to.path.as_path() == Path::new("src/helper.rs")),
-        "the new document is in the repaired generation: {rows:?}"
-    );
-    // And the handle a caller already held stopped being current, so the
-    // repair-or-stale invariant is visible either way.
-    let old = world
-        .runtime
-        .store()
-        .index_graph(initial_generation)
-        .expect("reads")
-        .expect("retained");
-    assert!(
-        !old.state.is_fresh(),
-        "the generation the change replaced is not current: {:?}",
-        old.state
-    );
 }
 
 /// One turn of the loop until a generation newer than `before` is sealed.

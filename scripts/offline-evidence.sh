@@ -186,10 +186,10 @@ rm -f -- "$receipt"
 : >"$tmp/targets.raw"
 unit_separator=$(printf '\037')
 while IFS='	' read -r case_id provider marker expected oracles observation; do
-    [ -n "$case_id" ] && [ -n "$provider" ] && [ -n "$marker" ] && [ -n "$observation" ] || {
+    if [ -z "$case_id" ] || [ -z "$provider" ] || [ -z "$marker" ] || [ -z "$observation" ]; then
         printf 'manifest row is missing a required field\n' >&2
         exit 2
-    }
+    fi
     case $expected in
         pass) ;;
         unserved)
@@ -212,14 +212,14 @@ while IFS='	' read -r case_id provider marker expected oracles observation; do
     for oracle in $oracles; do
         target=${oracle%%::*}
         test_name=${oracle#*::}
-        [ -n "$target" ] && [ -n "$test_name" ] || {
+        if [ -z "$target" ] || [ -z "$test_name" ]; then
             printf 'malformed oracle for %s: %s\n' "$case_id" "$oracle" >&2
             exit 2
-        }
-        [ "$target" != "lib" ] && [ "$target" != "bin" ] || {
+        fi
+        if [ "$target" = "lib" ] || [ "$target" = "bin" ]; then
             printf 'oracle target must be an integration target: %s\n' "$oracle" >&2
             exit 2
-        }
+        fi
         [ -f "$(dirname -- "$0")/../tests/$target.rs" ] || {
             printf 'oracle target is not an integration target: %s\n' "$target" >&2
             exit 2
@@ -255,10 +255,10 @@ while IFS= read -r target; do
     if [ -n "$logs_dir" ]; then
         output=$logs_dir/$target.log
         execution=$logs_dir/$target.json
-        [ -f "$output" ] && [ -f "$execution" ] || {
+        if [ ! -f "$output" ] || [ ! -f "$execution" ]; then
             printf 'missing execution for target %s\n' "$target" >&2
             exit 1
-        }
+        fi
         output_digest=$(sha256_of "$output")
         jq -e --arg candidate "$bundle_digest" --arg output "$output_digest" \
             --arg command "$command" '

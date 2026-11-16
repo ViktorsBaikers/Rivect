@@ -5,7 +5,8 @@
 2026-11-16. Исходный кандидат: `c02f551b64ca061b78eac02184bc8d4d731e9c8c`.
 Область: GitHub Actions, скрипты evidence и test-only потребление готового bundle.
 Продуктовые требования и denominator release conjunction не меняются.
-Основания и границы чтения: [исследование 22 первоисточников](../research/ci-cd-design.md).
+Исследование 22 первоисточников хранится локально в `research/ci-cd-design.md`,
+в Git не включается. Принятое решение: [ADR-0005](adr/0005-ci-artifact-promotion.md).
 
 Критерий: каждый Cargo target исполняется одним владельцем на платформу в одном
 workflow run; package/publisher не повторяют suite. Все release-проверки относятся
@@ -24,6 +25,14 @@ flowchart LR
 Tag должен совпадать с Cargo version. Поддерживаемые native targets:
 `x86_64-unknown-linux-gnu` на Ubuntu 24.04 и `aarch64-apple-darwin` на macOS 15.
 Runner labels закреплены; конкретный образ VM продолжает обновляться GitHub.
+
+Ubuntu 24.04 сохраняется как build/runtime baseline: переход на новый runner ради
+`setpriv` поднял бы glibc baseline архивов. `ci-linux-prerequisites.sh` собирает
+только `setpriv` util-linux 2.41.5 из upstream tarball с закреплённым SHA-256 и
+устанавливает его в `/usr/bin/setpriv` disposable VM; системные библиотеки и
+production bundle не меняются. Источник и checksum проверены 2026-11-16:
+[upstream checksums](https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/sha256sums.asc).
+Лицензия utility — GPL-2.0-or-later; utility не включается в поставку Rivect.
 
 ## Владельцы проверок
 
@@ -154,4 +163,36 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
   Ubuntu x86_64/macOS-15. Итоговые команды, manifests и логи: EVID-20-95.
 - Независимое correctness review: подтверждённых дефектов нет. Два security findings
   закрыты кодом и regression proof: повторная tag check; abnormal-exit rejection.
-- Новый remote pipeline и GitHub publication — NOT_RUN. Push/tag не выполнялись.
+- Push `9b2ce35` выполнен. Первый hosted run
+  [43930457186](https://github.com/ViktorsBaikers/Rivect/actions/runs/43930457186)
+  завершился FAIL: ShellCheck SC2015, Linux `setpriv` без Landlock options,
+  macOS `index_worker` и `search_index`. Package artifacts не созданы; сохранены
+  diagnostics обеих платформ. Tag/publication не запускались.
+- Исправления среды после hosted FAIL: ShellCheck clauses переписаны как `if`;
+  util-linux 2.41.5 собран на настоящем Ubuntu 24.04 container, Landlock
+  in-scope write прошёл, outside write получил Permission denied. 11 Python
+  contracts, actionlint и Ubuntu 24.04 ShellCheck прошли. Это не hosted GREEN.
+- macOS memory cause пока не установлена: локальный bounded probe на Darwin 27
+  не воспроизвёл поведение macOS 15; hosted stderr и peak footprint отсутствуют.
+  Классификация ошибок и memory limits не ослаблялись.
+- Watcher repair подавляет membership invalidation только для собственного runtime.
+  Для name-only exclusions `target`, `node_modules`, `.git` membership flag сохранён:
+  эти имена не доказывают исключение файла из настоящего enumeration policy.
+  Regression проверяет automatic create/delete repair в `src` и unignored
+  `node_modules`, полный snapshot oracle и stale предыдущего generation.
+  Предшествующие RPC errors входят в narrowing failure diagnostics; исходная
+  причина hosted narrowing FAIL ещё не доказана.
+- Diagnostic follow-up: raw native peak accessor сохраняет ABI296/offset240;
+  отдельное synthetic воспроизведение запускается только после исходного memory
+  failure. Custody сохраняется до final sample, stderr bounded/sanitized,
+  сомнительные наблюдения остаются inconclusive. Контрольный настоящий child
+  проверяет exit23, zombie sample, reap и stderr cap; исходные assertions не менялись.
+- Полный локальный §14 после коррекций PASS: 3778 tests, 68 suites, 85 ignored;
+  43 doctests; fmt/clippy/rustdoc/deny/locked fetch прошли. Fresh bundle и
+  настоящий CLI smoke прошли. Логи: `/tmp/rivect-diag-final.vr0Kf7/`,
+  `/tmp/rivect-ci-diagnostic-final-clippy.log`. `index_worker`: 49 passed,
+  2 ignored. PID marker fixture публикуется атомарно после полной записи.
+- Независимые scoped spec/code reviews: actionable membership-loss finding
+  исправлен с реальным create/delete proof; owning recheck — no-findings.
+  Следующий hosted diagnostic run и package upload пока NOT_RUN; local PASS
+  не заменяет macOS15 evidence и не закрывает исходную CI/package цель.

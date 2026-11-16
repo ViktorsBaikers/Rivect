@@ -4133,8 +4133,11 @@ struct RusageInfoV4 {
     _leading: [u64; 6],
     resident_size: u64,
     phys_footprint: u64,
-    /// `ri_proc_start_abstime` through `ri_runnable_time`.
-    _trailing: [u64; 27],
+    /// `ri_proc_start_abstime` through `ri_logical_writes`.
+    _middle: [u64; 20],
+    lifetime_max_phys_footprint: u64,
+    /// `ri_instructions` through `ri_runnable_time`.
+    _trailing: [u64; 6],
 }
 
 #[cfg(target_os = "macos")]
@@ -4143,6 +4146,8 @@ const _: () = assert!(size_of::<RusageInfoV4>() == 296);
 const _: () = assert!(std::mem::offset_of!(RusageInfoV4, resident_size) == 64);
 #[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::offset_of!(RusageInfoV4, phys_footprint) == 72);
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::offset_of!(RusageInfoV4, lifetime_max_phys_footprint) == 240);
 
 #[cfg(target_os = "macos")]
 const RUSAGE_INFO_V4: i32 = 4;
@@ -4151,8 +4156,8 @@ const RUSAGE_INFO_V4: i32 = 4;
 ///
 /// # Errors
 /// Returns `InvalidInput` when `pid` does not fit `pid_t`, and the OS
-/// error (`ESRCH`, `EPERM`) when `proc_pid_rusage` fails — a reaped pid
-/// fails, since it may already name another process.
+/// error (`ESRCH`, `EPERM`) when `proc_pid_rusage` refuses the read.
+/// After reaping, the pid may identify a different process.
 #[cfg(target_os = "macos")]
 fn proc_rusage_v4(pid: u32) -> io::Result<RusageInfoV4> {
     let pid = i32::try_from(pid).map_err(|_overflow| {
@@ -4163,7 +4168,9 @@ fn proc_rusage_v4(pid: u32) -> io::Result<RusageInfoV4> {
         _leading: [0; 6],
         resident_size: 0,
         phys_footprint: 0,
-        _trailing: [0; 27],
+        _middle: [0; 20],
+        lifetime_max_phys_footprint: 0,
+        _trailing: [0; 6],
     };
     // SAFETY: `info` is a live, writable 296-byte buffer with the SDK
     // `rusage_info_v4` layout (size and counter offsets asserted above).
@@ -4179,8 +4186,8 @@ fn proc_rusage_v4(pid: u32) -> io::Result<RusageInfoV4> {
 /// Process `pid`'s physical footprint in bytes (`proc_pid_rusage`
 /// `RUSAGE_INFO_V4` `ri_phys_footprint`) — it counts the small heap
 /// allocations a relative `RLIMIT_AS`/`RLIMIT_DATA` cap lets through. A
-/// live child reads its footprint and an exited, unreaped one reads zero;
-/// a reaped pid fails, since it may already name another process.
+/// live child reads its footprint and an exited, unreaped one reads zero.
+/// Keep the child unreaped: after reaping, its pid may be reused.
 ///
 /// # Errors
 /// Returns `InvalidInput` when `pid` does not fit `pid_t`, and the OS
@@ -4190,11 +4197,27 @@ pub fn phys_footprint(pid: u32) -> io::Result<u64> {
     Ok(proc_rusage_v4(pid)?.phys_footprint)
 }
 
+/// Returns the kernel's raw lifetime maximum physical footprint, in bytes.
+///
+/// Reads `RUSAGE_INFO_V4` `ri_lifetime_max_phys_footprint`; raw zero is
+/// not proof that the process never used memory. Keep an owned child
+/// unreaped during observation. After reaping, its identity is lost
+/// and the pid may already refer to another process.
+///
+/// # Errors
+/// Returns `InvalidInput` when `pid` does not fit `pid_t`, and the OS
+/// error (`ESRCH`, `EPERM`) when `proc_pid_rusage` refuses the read.
+#[cfg(target_os = "macos")]
+pub fn peak_phys_footprint(pid: u32) -> io::Result<u64> {
+    Ok(proc_rusage_v4(pid)?.lifetime_max_phys_footprint)
+}
+
 /// Process `pid`'s resident set in bytes (`ri_resident_size` on macOS,
 /// `/proc/<pid>/statm` resident pages on Linux) — the parent samples this
 /// across a confined group as an advisory aggregate, never a hard bound.
-/// A live child reads its residency, an exited unreaped one reads zero,
-/// and a reaped pid fails, since it may already name another process.
+/// On macOS an exited, unreaped child can retain cached residency even
+/// after its current physical footprint reaches zero. Keep the child
+/// unreaped: after reaping, the pid may identify another process.
 ///
 /// # Errors
 /// Returns [`ProcessReadError::ReadFailed`] naming `pid` when the read
@@ -4211,7 +4234,8 @@ pub fn resident_bytes(pid: u32) -> Result<u64, ProcessReadError> {
 
 /// Process `pid`'s resident set in bytes, from `/proc/<pid>/statm`'s
 /// resident field. Sampling this across a confined group is advisory,
-/// never a hard bound; a reaped pid has no `/proc` entry and fails.
+/// never a hard bound. Keep an owned child unreaped during observation;
+/// after reaping, its pid can be reused by another process.
 ///
 /// # Errors
 /// Returns [`ProcessReadError::ReadFailed`] when the statm read fails

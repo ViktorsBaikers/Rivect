@@ -5113,7 +5113,11 @@ fn owner_holder_child() {
     let marker = std::env::var_os("RIVECT_OWNER_PAUSE").expect("the marker names a file");
     let owner =
         rivect::owner::Owner::elect(Path::new(&data_root)).expect("the child holds the root");
-    std::fs::write(&marker, format!("{}\n", std::process::id())).expect("the marker lands");
+    // The parent treats any readable marker as ready.
+    let mut pending = tempfile::NamedTempFile::new_in(&data_root).expect("stage the owner marker");
+    std::io::Write::write_all(&mut pending, format!("{}\n", std::process::id()).as_bytes())
+        .expect("write the complete owner pid");
+    pending.persist(&marker).expect("the marker lands");
     drop(std::io::copy(
         &mut std::io::stdin().lock(),
         &mut std::io::sink(),

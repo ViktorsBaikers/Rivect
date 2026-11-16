@@ -1558,10 +1558,9 @@ pub struct IndexWatcher {
 /// early.
 pub const WATCH_PATH_CAPACITY: usize = 4_096;
 
-/// Directory names the project's own enumeration excludes under the
-/// standard filters, so the watch does not report the build output,
-/// the version-control metadata or a dependency tree as project
-/// changes. The list is the recorded one, not a per-caller guess.
+/// Directory names omitted from watcher path hints. Their membership
+/// changes still invalidate the generation because its enumeration uses
+/// project ignore rules, which need not exclude these directories.
 const WATCH_IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 #[derive(Debug, thiserror::Error)]
@@ -1576,13 +1575,11 @@ pub enum WatchError {
 impl IndexWatcher {
     /// Starts watching `root` recursively: a relation can cross any
     /// directory boundary, and a backend that cannot watch the root is a
-    /// typed refusal rather than a silently narrower index. The backend
-    /// has no ignore filter of its own, so the recorded exclusions are
-    /// applied where the events arrive — a `target/` build is not a
-    /// change to the project, and the same walker excludes it from the
-    /// enumeration a generation is cut from. Recorded paths are
-    /// project-relative to `root`, so a batch names the documents the
-    /// generation indexes.
+    /// typed refusal rather than a silently narrower index. Common build
+    /// and dependency directories are omitted from path hints, but their
+    /// membership changes still invalidate the generation: its ignore
+    /// rules may admit their contents. Recorded paths are project-relative
+    /// to `root`.
     ///
     /// `runtime_dir` is the runtime's own state directory, excluded when
     /// it sits inside `root` — see [`IndexWatcher::runtime_dir`].
@@ -1718,9 +1715,7 @@ fn record(
                     if kind != notify::event::AccessKind::Close(notify::event::AccessMode::Write)) =>
                 {}
             Ok(event) => {
-                if kind_moves_the_file_set(&event) {
-                    batch.file_set_moved = true;
-                }
+                let file_set_moved = kind_moves_the_file_set(&event);
                 for path in event.paths {
                     // The generation's file set is project-relative, so
                     // a path outside the watched root names no document
@@ -1730,15 +1725,6 @@ fn record(
                         batch.missed = true;
                         continue;
                     };
-                    // The same directories the enumeration's ignore
-                    // rules exclude carry no project document, so a
-                    // build or a fetch is not a change to re-derive
-                    // from. `need_rescan` already covers a rescan flag,
-                    // so an event that is nothing but excluded noise
-                    // leaves the batch as it stands.
-                    if excluded_by_rules(relative) {
-                        continue;
-                    }
                     // The runtime's own writes are not project changes,
                     // and a batch that reported them would ask the owner
                     // to rebuild what it just wrote.
@@ -1748,6 +1734,12 @@ fn record(
                             .canonicalize()
                             .is_ok_and(|path| path.starts_with(dir))
                     }) {
+                        continue;
+                    }
+                    batch.file_set_moved |= file_set_moved;
+                    // These names filter path hints, not indexed membership:
+                    // the project's ignore rules can still admit their files.
+                    if excluded_by_rules(relative) {
                         continue;
                     }
                     if batch.paths.len() < WATCH_PATH_CAPACITY {
@@ -1787,9 +1779,8 @@ fn kind_moves_the_file_set(event: &Event) -> bool {
     )
 }
 
-/// Whether a project-relative path sits under one of the recorded
-/// exclusions. Any component matching is enough: the path is inside
-/// that subtree, whatever its own name is.
+/// Whether a project-relative path is omitted from path hints by a
+/// directory-name exclusion.
 fn excluded_by_rules(relative: &Path) -> bool {
     relative.components().any(|component| {
         matches!(component, std::path::Component::Normal(name)
@@ -1803,7 +1794,7 @@ mod tests {
     use crate::commands::LoopEvent;
     use notify::event::CreateKind;
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -1831,23 +1822,49 @@ mod tests {
         };
         let empty = WatchBatch::default();
         let (wake, woken) = mpsc::sync_channel(1);
+        let tree = tempfile::tempdir().expect("fixture");
+        let root = tree.path().canonicalize().expect("canonical root");
+        let runtime_dir = root.join("runtime");
+        std::fs::create_dir(&runtime_dir).expect("runtime directory");
+        std::fs::write(runtime_dir.join("rivect.db-wal"), b"fixture").expect("runtime file");
         let watcher = IndexWatcher {
-            runtime_dir: None,
+            runtime_dir: Some(runtime_dir),
             pending: Arc::new(Mutex::new(WatchBatch::default())),
             consumer_live: Arc::new(AtomicBool::new(true)),
             _backend: notify::recommended_watcher(|_| {}).expect("create unregistered backend"),
         };
-        let root = Path::new("/watcher-snapshot-fixture");
+        let root = root.as_path();
         let emit = |event| {
             record(
                 &watcher.pending,
                 &watcher.consumer_live,
                 &wake,
                 root,
-                None,
+                watcher.runtime_dir(),
                 event,
             );
         };
+        for (path, moved) in [
+            (".git/index.lock", true),
+            ("target/probe.rs", true),
+            ("node_modules/dep.rs", true),
+            ("runtime/rivect.db-wal", false),
+        ] {
+            let create = Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join(path))
+                .add_path(root.join(path));
+            emit(Ok(create.clone()));
+            emit(Ok(create));
+            let expected = WatchBatch {
+                paths: BTreeSet::new(),
+                missed: false,
+                file_set_moved: moved,
+            };
+            assert_eq!(watcher.peek_batch(), expected, "{path}");
+            assert_eq!(watcher.pending_batch(), expected, "{path}");
+            assert_eq!(watcher.peek_batch(), empty, "{path}");
+            assert!(matches!(woken.try_recv(), Ok(LoopEvent::Index)));
+        }
         let create = Event::new(EventKind::Create(CreateKind::File))
             .add_path(root.join("src/a.rs"))
             .add_path(root.join("src/a.rs"));
@@ -1889,16 +1906,25 @@ mod tests {
         assert!(reset.needs_full_rebuild());
         assert!(matches!(woken.try_recv(), Ok(LoopEvent::Index)));
 
-        emit(Err(notify::Error::generic("backend failure")));
-        let failed = watcher.peek_batch();
-        assert_eq!(failed, missed);
-        assert!(failed.needs_full_rebuild());
-        let claimed = watcher.pending_batch();
-        assert_eq!(claimed, missed);
-        assert!(claimed.needs_full_rebuild());
-        let reset = watcher.pending_batch();
-        assert_eq!(reset, empty);
-        assert!(reset.needs_full_rebuild());
-        assert!(matches!(woken.try_recv(), Ok(LoopEvent::Index)));
+        for event in [
+            Err(notify::Error::generic("backend failure")),
+            Ok(Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.with_file_name("outside-watcher-fixture"))),
+            Ok(Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("target/probe.rs"))
+                .set_flag(notify::event::Flag::Rescan)),
+        ] {
+            emit(event);
+            let failed = watcher.peek_batch();
+            assert_eq!(failed, missed);
+            assert!(failed.needs_full_rebuild());
+            let claimed = watcher.pending_batch();
+            assert_eq!(claimed, missed);
+            assert!(claimed.needs_full_rebuild());
+            let reset = watcher.pending_batch();
+            assert_eq!(reset, empty);
+            assert!(reset.needs_full_rebuild());
+            assert!(matches!(woken.try_recv(), Ok(LoopEvent::Index)));
+        }
     }
 }

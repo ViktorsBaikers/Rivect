@@ -601,6 +601,552 @@ fn holder_shim(dir: &Path, name: &str, pid_file: &Path, bytes: u64) -> PathBuf {
     )
 }
 
+#[cfg(target_os = "macos")]
+mod memory_diagnostic {
+    use super::{Query, WORKER_KILL_GRACE, isolated, quoted};
+    use rivect::context::{ContextError, IsolatedCause};
+    use rivect::executor::INDEX_WORKER_FLAG;
+    use rivect_sandbox_helper::{
+        INDEX_WORKER_MEMORY_BUDGET, MEMORY_BUDGET_FLAG, peak_phys_footprint, phys_footprint,
+        resident_bytes, set_nonblocking, wait_ready,
+    };
+    use std::io::{self, Read as _, Write as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::path::Path;
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    const STDERR_CAP: usize = 4096;
+    const POLL: Duration = Duration::from_millis(2);
+    const OBSERVER_KILL_GRACE: Duration = Duration::from_secs(1);
+
+    #[derive(Debug)]
+    struct Sample {
+        elapsed: Duration,
+        current_bytes: u64,
+        resident_bytes: u64,
+        peak_bytes: u64,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct Report {
+        stop: &'static str,
+        samples: usize,
+        max_current_bytes: u64,
+        max_resident_bytes: u64,
+        max_peak_bytes: u64,
+        last: Option<Sample>,
+        final_after_zombie: Option<Result<Sample, io::ErrorKind>>,
+        status: Option<ExitStatus>,
+        unreaped_observers: usize,
+        artifacts_retained: bool,
+        stdout_bytes: usize,
+        stdout_eof: bool,
+        stderr_eof: bool,
+        stderr_retained_bytes: usize,
+        stderr: String,
+        faults: Vec<(&'static str, io::ErrorKind, Option<i32>)>,
+    }
+
+    impl Report {
+        fn fault(&mut self, stage: &'static str, error: &io::Error) {
+            self.faults
+                .push((stage, error.kind(), error.raw_os_error()));
+        }
+
+        fn sample(&mut self, pid: u32, start: Instant) -> io::Result<()> {
+            let sample = native_sample(pid, start)?;
+            self.samples += 1;
+            self.max_current_bytes = self.max_current_bytes.max(sample.current_bytes);
+            self.max_resident_bytes = self.max_resident_bytes.max(sample.resident_bytes);
+            self.max_peak_bytes = self.max_peak_bytes.max(sample.peak_bytes);
+            self.last = Some(sample);
+            Ok(())
+        }
+    }
+
+    fn native_sample(pid: u32, start: Instant) -> io::Result<Sample> {
+        Ok(Sample {
+            elapsed: start.elapsed(),
+            current_bytes: phys_footprint(pid)?,
+            resident_bytes: resident_bytes(pid).map_err(io::Error::other)?,
+            peak_bytes: peak_phys_footprint(pid)?,
+        })
+    }
+
+    fn nonblocking<T: std::os::fd::AsFd>(
+        pipe: &mut Option<T>,
+        stage: &'static str,
+        report: &mut Report,
+    ) -> bool {
+        let Some(fd) = pipe.as_ref() else {
+            report.fault(stage, &io::ErrorKind::NotConnected.into());
+            return false;
+        };
+        if let Err(error) = set_nonblocking(fd) {
+            report.fault(stage, &error);
+            *pipe = None;
+            return false;
+        }
+        true
+    }
+
+    fn drain<T: io::Read>(
+        pipe: &mut Option<T>,
+        bytes: &mut Vec<u8>,
+        cap: usize,
+    ) -> io::Result<usize> {
+        let Some(reader) = pipe.as_mut() else {
+            return Ok(0);
+        };
+        let mut block = [0_u8; 4096];
+        match reader.read(&mut block) {
+            Ok(0) => {
+                *pipe = None;
+                Ok(0)
+            }
+            Ok(count) => {
+                bytes.extend_from_slice(&block[..count.min(cap.saturating_sub(bytes.len()))]);
+                Ok(count)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(0)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn pause(deadline: Instant) -> io::Result<()> {
+        wait_ready(
+            &[],
+            &[],
+            POLL.min(deadline.saturating_duration_since(Instant::now())),
+        )
+    }
+
+    fn reap(child: &mut Child, deadline: Instant) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "diagnostic child reap timed out",
+                ));
+            }
+            pause(deadline)?;
+        }
+    }
+
+    fn zombie(pid: u32, deadline: Instant, report: &mut Report) -> io::Result<bool> {
+        let now = Instant::now();
+        let last_probe_cutoff = deadline
+            .checked_sub(OBSERVER_KILL_GRACE)
+            .filter(|cutoff| *cutoff > now)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "diagnostic ps has no cleanup grace",
+                )
+            })?;
+        let probe_deadline = (now + Duration::from_millis(100)).min(last_probe_cutoff);
+        let cleanup_deadline = probe_deadline + OBSERVER_KILL_GRACE;
+        let mut child = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ready = [
+            nonblocking(&mut stdout, "ps stdout setup", report),
+            nonblocking(&mut stderr, "ps stderr setup", report),
+        ]
+        .into_iter()
+        .all(|ready| ready);
+        let mut reaped = false;
+        let observed = (|| {
+            if !ready {
+                return Err(io::Error::other("diagnostic ps pipes are unavailable"));
+            }
+            loop {
+                drain(&mut stdout, &mut out, 64)?;
+                drain(&mut stderr, &mut err, STDERR_CAP)?;
+                if let Some(status) = child.try_wait()? {
+                    reaped = true;
+                    if !status.success() {
+                        return Err(io::Error::other("diagnostic ps did not succeed"));
+                    }
+                    drain(&mut stdout, &mut out, 64)?;
+                    return Ok(
+                        out.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'Z')
+                    );
+                }
+                if Instant::now() >= probe_deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "diagnostic ps timed out",
+                    ));
+                }
+                pause(probe_deadline)?;
+            }
+        })();
+        if !reaped {
+            if let Err(error) = child.kill() {
+                report.fault("ps kill", &error);
+            }
+            if let Err(error) = reap(&mut child, cleanup_deadline) {
+                report.unreaped_observers += 1;
+                report.fault("ps reap", &error);
+            }
+        }
+        while (stdout.is_some() || stderr.is_some()) && Instant::now() < cleanup_deadline {
+            if let Err(error) = drain(&mut stdout, &mut out, 64)
+                .and_then(|_| drain(&mut stderr, &mut err, STDERR_CAP))
+            {
+                report.fault("ps drain", &error);
+                break;
+            }
+            if let Err(error) = pause(cleanup_deadline) {
+                report.fault("ps drain wait", &error);
+                break;
+            }
+        }
+        observed
+    }
+
+    fn request_bytes(
+        request: &Query,
+        helper: &Path,
+        deadline: Instant,
+    ) -> io::Result<(tempfile::TempDir, Vec<u8>)> {
+        let dir = tempfile::TempDir::with_prefix("rivect-iw-memory-diagnostic-")?;
+        let file = dir.path().join("request.json");
+        let capture = dir.path().join("capture");
+        std::fs::write(
+            &capture,
+            format!("#!/bin/sh\nexec /bin/cat > {}\n", quoted(&file)),
+        )?;
+        std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755))?;
+        match isolated(request, &capture, helper, Some(deadline)) {
+            Err(ContextError::IsolatedRun {
+                cause: IsolatedCause::EmptyAnswer,
+                ..
+            }) => {}
+            Err(error) => return Err(io::Error::other(error)),
+            Ok(_) => return Err(io::Error::other("diagnostic capture answered a query")),
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(file)?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(io::Error::other("diagnostic request exceeded its cap"));
+        }
+        Ok((dir, bytes))
+    }
+
+    fn sanitized(bytes: &[u8], paths: &[&Path]) -> String {
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        for path in paths {
+            let path = path.to_string_lossy();
+            text = text.replace(path.as_ref(), "<fixture>");
+            if let Some(alias) = path.strip_prefix("/private") {
+                text = text.replace(alias, "<fixture>");
+            } else if path.starts_with("/var/") {
+                text = text.replace(&format!("/private{path}"), "<fixture>");
+            }
+        }
+        text.chars().flat_map(char::escape_default).collect()
+    }
+
+    pub fn run(
+        request: &Query,
+        program: &Path,
+        helper: &Path,
+        deadline: Instant,
+    ) -> (Report, String) {
+        let start = Instant::now();
+        let mut report = Report::default();
+        let (mut dir, payload) = match request_bytes(request, helper, deadline) {
+            Ok(captured) => captured,
+            Err(error) => {
+                report.fault("request capture", &error);
+                return (
+                    report,
+                    "separate synthetic reproduction, capture incomplete".into(),
+                );
+            }
+        };
+        if Instant::now() >= deadline {
+            return (
+                report,
+                "separate synthetic reproduction not started: original deadline elapsed".into(),
+            );
+        }
+        let mut command = Command::new(helper);
+        command
+            .args(["launch", MEMORY_BUDGET_FLAG])
+            .arg(INDEX_WORKER_MEMORY_BUDGET.to_string())
+            .arg("--")
+            .arg(program)
+            .arg(INDEX_WORKER_FLAG)
+            .env_clear()
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                report.fault("worker spawn", &error);
+                return (
+                    report,
+                    "separate synthetic reproduction, spawn incomplete".into(),
+                );
+            }
+        };
+        let pid = child.id();
+        let cleanup_deadline = deadline + WORKER_KILL_GRACE;
+        let mut stdin = child.stdin.take();
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ready = [
+            nonblocking(&mut stdin, "worker stdin setup", &mut report),
+            nonblocking(&mut stdout, "worker stdout setup", &mut report),
+            nonblocking(&mut stderr, "worker stderr setup", &mut report),
+        ]
+        .into_iter()
+        .all(|ready| ready);
+        let observed = (|| {
+            if !ready {
+                return Err(io::Error::other("diagnostic worker pipes are unavailable"));
+            }
+            let mut written = 0;
+            loop {
+                report.sample(pid, start)?;
+                report.stdout_bytes =
+                    report
+                        .stdout_bytes
+                        .saturating_add(drain(&mut stdout, &mut out, 0)?);
+                drain(&mut stderr, &mut err, STDERR_CAP)?;
+                if let Some(pipe) = stdin.as_mut() {
+                    match pipe.write(&payload[written..]) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(count) => written += count,
+                        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => stdin = None,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                    if written == payload.len() {
+                        stdin = None;
+                    }
+                }
+                if report.max_current_bytes > INDEX_WORKER_MEMORY_BUDGET
+                    || report.max_peak_bytes > INDEX_WORKER_MEMORY_BUDGET
+                {
+                    return Ok("memory budget stop");
+                }
+                if Instant::now() >= deadline {
+                    return Ok("original deadline stop");
+                }
+                if stdout.is_none()
+                    && stderr.is_none()
+                    && zombie(pid, cleanup_deadline, &mut report)?
+                {
+                    return Ok("exited before diagnostic stop");
+                }
+                pause(deadline)?;
+            }
+        })();
+        report.stop = match observed {
+            Ok(stop) => stop,
+            Err(error) => {
+                report.fault("worker observation", &error);
+                "observation incomplete"
+            }
+        };
+        drop(stdin);
+        if let Err(error) = rivect_sandbox_helper::kill_process_group(pid) {
+            report.fault("worker group kill", &error);
+        }
+        if let Err(error) = child.kill() {
+            report.fault("worker kill", &error);
+        }
+        while Instant::now() < cleanup_deadline {
+            match zombie(pid, cleanup_deadline, &mut report) {
+                Ok(true) => {
+                    match native_sample(pid, start) {
+                        Ok(sample) => report.final_after_zombie = Some(Ok(sample)),
+                        Err(error) => {
+                            report.final_after_zombie = Some(Err(error.kind()));
+                            report.fault("final unreaped sample", &error);
+                        }
+                    }
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    report.fault("zombie confirmation", &error);
+                    break;
+                }
+            }
+            if let Err(error) = pause(cleanup_deadline) {
+                report.fault("zombie confirmation wait", &error);
+                break;
+            }
+        }
+        // Native PID reads end here, before the first wait on this worker.
+        match reap(&mut child, cleanup_deadline) {
+            Ok(status) => report.status = Some(status),
+            Err(error) => report.fault("worker reap", &error),
+        }
+        while (stdout.is_some() || stderr.is_some()) && Instant::now() < cleanup_deadline {
+            match drain(&mut stdout, &mut out, 0).and_then(|count| {
+                report.stdout_bytes = report.stdout_bytes.saturating_add(count);
+                drain(&mut stderr, &mut err, STDERR_CAP)
+            }) {
+                Ok(_) => {}
+                Err(error) => {
+                    report.fault("worker drain", &error);
+                    break;
+                }
+            }
+            if let Err(error) = pause(cleanup_deadline) {
+                report.fault("worker drain wait", &error);
+                break;
+            }
+        }
+        report.stdout_eof = stdout.is_none();
+        report.stderr_eof = stderr.is_none();
+        report.stderr_retained_bytes = err.len();
+        report.stderr = sanitized(
+            &err,
+            &[
+                &request.root,
+                program,
+                dir.path(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            ],
+        );
+        if report.status.is_none()
+            || report.unreaped_observers != 0
+            || !report.stdout_eof
+            || !report.stderr_eof
+        {
+            super::support::retain_root(&mut dir);
+            report.artifacts_retained = true;
+        }
+        let text = format!(
+            "separate synthetic reproduction, not the original worker; budget_bytes={INDEX_WORKER_MEMORY_BUDGET} elapsed={:?} last_sample_elapsed={:?} exit_code={:?} signal={:?} child_virtual_size=unavailable child_as_limit=unavailable child_data_limit=unavailable stderr_prefix_cap_bytes={STDERR_CAP}; low peak or allocation-failure stderr alone is inconclusive",
+            start.elapsed(),
+            report.last.as_ref().map(|sample| sample.elapsed),
+            report.status.as_ref().and_then(|status| status.code()),
+            report.status.as_ref().and_then(|status| status.signal())
+        );
+        (report, text)
+    }
+
+    #[test]
+    fn controlled_failure_is_reaped_and_stderr_is_bounded_and_sanitized() {
+        let mut dir = tempfile::TempDir::with_prefix("rivect-iw-diagnostic-control-")
+            .expect("own the controlled child fixture");
+        let mut corpus = super::search_corpus("iw-diagnostic-control");
+        let request = super::search_query(super::QueryKind::Path, &corpus.path, "*.rs");
+        let program = super::program_shim(
+            dir.path(),
+            "controlled-exit",
+            &format!(
+                "printf 'diagnostic-controlled-exit %s\\n' {} >&2\nprintf '%5000s' x >&2\nexit 23",
+                quoted(&corpus.path)
+            ),
+        );
+        let helper = super::helper();
+        let (report, text) = run(
+            &request,
+            &program,
+            &helper,
+            Instant::now() + super::MAX_INDEX_PARSE_TIME,
+        );
+        if report.artifacts_retained || report.status.is_none() {
+            super::support::retain_root(&mut dir);
+            corpus.retain();
+        }
+        assert!(report.status.is_some(), "{report:?} {text}");
+        assert_eq!(
+            report.status.as_ref().and_then(|status| status.code()),
+            Some(23),
+            "{report:?} {text}"
+        );
+        assert_eq!(
+            report.status.as_ref().and_then(|status| status.signal()),
+            None,
+            "{report:?} {text}"
+        );
+        assert!(report.final_after_zombie.is_some(), "{report:?} {text}");
+        assert!(
+            matches!(&report.final_after_zombie, Some(Ok(_))),
+            "{report:?} {text}"
+        );
+        assert!(report.samples > 0, "{report:?} {text}");
+        assert!(report.stdout_eof && report.stderr_eof, "{report:?} {text}");
+        assert_eq!(report.unreaped_observers, 0, "{report:?} {text}");
+        assert!(!report.artifacts_retained, "{report:?} {text}");
+        assert_eq!(report.stderr_retained_bytes, 4096, "{report:?} {text}");
+        assert!(report.stderr.len() <= 4096, "{report:?} {text}");
+        let marker = "diagnostic-controlled-exit <fixture>";
+        assert!(report.stderr.contains(marker), "{report:?} {text}");
+        assert!(
+            !report
+                .stderr
+                .contains(corpus.path.to_string_lossy().as_ref()),
+            "{report:?} {text}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn peak_footprint_reads_a_live_process_and_rejects_an_invalid_pid() {
+    let current =
+        rivect_sandbox_helper::phys_footprint(std::process::id()).expect("read this live process");
+    assert!(current > 0, "the live fixture has a physical footprint");
+    let peak = rivect_sandbox_helper::peak_phys_footprint(std::process::id())
+        .expect("read the native lifetime peak");
+    assert!(
+        peak == 0 || peak >= current,
+        "raw zero is inconclusive; a recorded peak covers the earlier live sample"
+    );
+    let error = rivect_sandbox_helper::peak_phys_footprint(u32::MAX)
+        .expect_err("an invalid pid is refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
 /// A worker launched with `SENTINEL=1` beside the allowlisted env.
 fn env_sentinel(dir: &Path) -> PathBuf {
     script(
@@ -1024,8 +1570,22 @@ fn worker_memory_cap_stops_hostile_parse_before_the_deadline() {
     let request = search_query(QueryKind::Ast, &tree.path, "x < y");
     let real = helper();
     let start = Instant::now();
-    let cause = cause_of(isolated(&request, &worker(), &real, None));
+    let outcome = isolated(&request, &worker(), &real, None);
     let elapsed = start.elapsed();
+    #[cfg(target_os = "macos")]
+    if !matches!(
+        &outcome,
+        Err(ContextError::IsolatedRun {
+            cause: IsolatedCause::MemoryExceeded,
+            ..
+        })
+    ) {
+        println!(
+            "{:?}",
+            memory_diagnostic::run(&request, &worker(), &real, start + MAX_INDEX_PARSE_TIME)
+        );
+    }
+    let cause = cause_of(outcome);
     println!("EVID-474 memory cap: {elapsed:?} -> {cause:?}");
     // macOS: the relative RLIMIT misses GLR's small blocks, so the
     // parent's footprint poll is what stops the run (DEC-038).
@@ -1807,6 +2367,18 @@ fn worker_failure_classification_is_typed_per_seam() {
         let start = Instant::now();
         let outcome = isolated(&request, &hoarder, &real, None);
         let elapsed = start.elapsed();
+        if !matches!(
+            &outcome,
+            Err(ContextError::IsolatedRun {
+                cause: IsolatedCause::MemoryExceeded,
+                ..
+            })
+        ) {
+            println!(
+                "{:?}",
+                memory_diagnostic::run(&request, &hoarder, &real, start + MAX_INDEX_PARSE_TIME)
+            );
+        }
         expect(
             "perl pushing 1000-byte strings",
             outcome,
