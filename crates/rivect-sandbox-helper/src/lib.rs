@@ -6442,6 +6442,22 @@ mod tests {
         }
         parent_status_shape_controls();
 
+        // Joining observes clear_child_tid before procfs retires the task.
+        fn wait_for_native_task_retirement(tid: u32) {
+            let path = format!("/proc/self/task/{tid}");
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while Path::new(&path)
+                .try_exists()
+                .expect("observe native task retirement")
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "joined task {tid} must leave procfs before the next census"
+                );
+                std::thread::yield_now();
+            }
+        }
+
         fn finite_task_controls() {
             // Each held task is released while the cohort reread of its own
             // pinned identity follows the fresh count, so every retiree crosses
@@ -6488,15 +6504,17 @@ mod tests {
                         .recv_timeout(Duration::from_secs(5))
                         .expect("bounded task completion");
                     task.join().expect("retiring task joined");
+                    wait_for_native_task_retirement(tid);
                     waves += 1;
                 }
             });
-            for (_, (release, completed, task)) in retiring {
+            for (tid, (release, completed, task)) in retiring {
                 release.send(()).expect("release remaining task");
                 completed
                     .recv_timeout(Duration::from_secs(5))
                     .expect("bounded remaining completion");
                 task.join().expect("remaining held task joined");
+                wait_for_native_task_retirement(tid);
             }
             assert!(
                 result.is_ok(),
@@ -6544,9 +6562,10 @@ mod tests {
                 }
             });
             let born_count = births.len();
-            for (_, release, handle) in births {
+            for (tid, release, handle) in births {
                 release.send(()).expect("release each parked born thread");
                 handle.join().expect("reap each born thread");
+                wait_for_native_task_retirement(tid);
             }
             assert!(
                 birth_result.is_ok(),
@@ -6573,21 +6592,30 @@ mod tests {
             let mut late_pins = std::collections::BTreeSet::new();
             let mut late_cuts = Vec::new();
             let mut late_acquisitions = 0;
+            let mut late_count_cuts = 0;
+            let mut late_directory_open = false;
             let mut late_retirements = 0;
             let late_result = ensure_parent_observing(None, &mut |tid, _, phase| {
                 if phase == 5 {
                     late_acquisitions += 1;
+                    late_directory_open = true;
                 }
                 if phase == 0 {
                     late_pins.insert(tid);
                 }
+                if phase == 4 && tid == 0 {
+                    late_directory_open = false;
+                }
                 if phase == 4 && tid != 0 {
                     late_pins.remove(&tid);
-                    if late_cuts.len() < 64 {
+                    if late_directory_open {
                         late_retirements += 1;
                     }
                 }
                 if phase == 1 {
+                    late_count_cuts += 1;
+                }
+                if phase == 1 && late_cuts.len() < late_acquisitions {
                     let held = late_pins.len();
                     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
                     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -6624,16 +6652,21 @@ mod tests {
                         })
                         .expect("native Threads record");
                     late_cuts.push((held, count, born_tid));
-                    late_births.push((release_tx, handle));
+                    late_births.push((born_tid, release_tx, handle));
                 }
             });
-            for (release, handle) in late_births {
+            for (tid, release, handle) in late_births {
                 release
                     .send(())
                     .expect("release late born task after guard return");
                 handle.join().expect("join every late born task");
+                wait_for_native_task_retirement(tid);
             }
             assert_eq!(late_acquisitions, 64);
+            assert_eq!(
+                late_count_cuts, 64,
+                "a parked cohort must not recount: retirements={late_retirements}"
+            );
             assert_eq!(late_cuts.len(), 64);
             assert_eq!(late_retirements, 0);
             for (held, count, _) in &late_cuts {
@@ -6677,15 +6710,7 @@ mod tests {
                 .expect("pin old native identity");
             old_release.send(()).expect("release old native identity");
             old_task.join().expect("join old native identity");
-            // join() returns before the kernel task entry necessarily
-            // disappears; the held FD must observe retirement once it is
-            // gone, so give the entry a bounded settle before reading.
-            let settle = Instant::now() + Duration::from_millis(50);
-            while Path::new(&format!("/proc/self/task/{old_tid}")).exists()
-                && Instant::now() < settle
-            {
-                std::thread::yield_now();
-            }
+            wait_for_native_task_retirement(old_tid);
             let deadline = Instant::now() + Duration::from_millis(250);
             let death = parent_status(&mut old_status, old_tid, pid, deadline, None)
                 .err()
@@ -7240,6 +7265,16 @@ mod tests {
                                 traversal_reads.push(occurrence_reads.clone());
                                 before_count = false;
                             }
+                            if retire_after_count && count_cuts == 1 {
+                                assert_eq!(
+                                    directories, 1,
+                                    "post-count retirement must recut the held cohort before reopening"
+                                );
+                                assert!(
+                                    retired_tid.is_some_and(|tid| !live.contains_key(&tid)),
+                                    "the stale count must follow the old status consuming close"
+                                );
+                            }
                             count_cuts += 1;
                             if original.is_empty() {
                                 original = live
@@ -7283,22 +7318,25 @@ mod tests {
                         born = Some(tid);
                         parked.push((tid, release_tx, handle));
                         if retire_after_count {
-                            let (_, release, handle) = parked.remove(0);
+                            let (old_tid, release, handle) = parked.remove(0);
                             release
                                 .send(())
                                 .expect("retire the old pinned task after count");
                             handle.join().expect("old pinned task joined");
+                            wait_for_native_task_retirement(old_tid);
                         }
                     }
                 });
-                for (_, release, handle) in parked {
+                for (tid, release, handle) in parked {
                     release.send(()).expect("release each late parked task");
                     handle.join().expect("join each late parked task");
+                    wait_for_native_task_retirement(tid);
                 }
                 stable_release
                     .send(())
                     .expect("release the controlled survivor after terminal cleanup");
                 stable_task.join().expect("join the controlled survivor");
+                wait_for_native_task_retirement(stable_tid);
                 assert!(
                     late_result.is_ok(),
                     "finite late birth must reach a closed cut: {late_result:?}"

@@ -62,6 +62,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path, query_param};
@@ -318,6 +319,38 @@ fn antigravity_provider(config: &Config, profile: &str) -> (CloudCodeProvider, A
     let provider = provider_result(config.clone(), Arc::clone(&store))
         .expect("the antigravity adapter builds for the literal id");
     (provider, store)
+}
+
+/// The deadline covers the provider send, not SQLite setup or ledger writes.
+struct TimedCloudCode {
+    provider: CloudCodeProvider,
+    elapsed: SyncSender<Duration>,
+}
+
+impl TimedCloudCode {
+    fn new(provider: CloudCodeProvider) -> (Self, Receiver<Duration>) {
+        let (elapsed, receiver) = mpsc::sync_channel(1);
+        (Self { provider, elapsed }, receiver)
+    }
+}
+
+impl Provider for TimedCloudCode {
+    fn name(&self) -> &'static str {
+        self.provider.name()
+    }
+
+    fn serves(&self, connection: &str, entry: &rivect::config::Connection) -> bool {
+        self.provider.serves(connection, entry)
+    }
+
+    fn send(&mut self, manifest: &RequestManifest) -> Result<ProviderReply, ProviderError> {
+        let started = Instant::now();
+        let outcome = self.provider.send(manifest);
+        self.elapsed
+            .try_send(started.elapsed())
+            .expect("exactly one provider send is measured");
+        outcome
+    }
 }
 
 /// One configured `google-gemini-cli` connection pointing at the fixture
@@ -1627,12 +1660,12 @@ async fn a_read_stage_timeout_never_fails_over() {
     let provider = provider
         .with_fallback(&sandbox.uri())
         .expect("the proof fallback admits");
+    let (provider, elapsed) = TimedCloudCode::new(provider);
     let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
     let attempt_id = manifest.attempt_id.clone();
     let root =
         tempfile::TempDir::with_prefix("rivect-cloudcode-read-stall-").expect("fixture root");
     let db = root.path().join("state.db");
-    let started = Instant::now();
     let (store, outcome) = std::thread::spawn(move || {
         let mut store = TaskStore::open(&db).expect("store opens");
         let mut ledger = StoreLedger::new(&mut store, Vec::new());
@@ -1642,7 +1675,7 @@ async fn a_read_stage_timeout_never_fails_over() {
     })
     .join()
     .expect("the dispatch thread joins");
-    let elapsed = started.elapsed();
+    let elapsed = elapsed.try_recv().expect("the provider send was measured");
     match outcome {
         Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
             assert_eq!(
@@ -1670,6 +1703,12 @@ async fn a_read_stage_timeout_never_fails_over() {
         row.wire_retries, 0,
         "the stream crossed one leg and no retry followed"
     );
+    assert_eq!(row.exactness, Exactness::Unknown);
+    assert_eq!(row.unknown_reason.as_deref(), Some("send failed"));
+    assert_eq!(
+        row.bins.total_tokens, None,
+        "a timed-out send reports no usage, never zero"
+    );
     assert!(
         elapsed >= deadline / 2 && elapsed < deadline,
         "the half-share attempt bound cuts the stall: {elapsed:?}"
@@ -1696,11 +1735,11 @@ async fn a_stream_past_the_attempt_share_is_cut_inside_the_deadline() {
     let provider = provider
         .with_fallback(&sandbox.uri())
         .expect("the proof fallback admits");
+    let (provider, elapsed) = TimedCloudCode::new(provider);
     let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
     let attempt_id = manifest.attempt_id.clone();
     let root = tempfile::TempDir::with_prefix("rivect-cloudcode-share-cut-").expect("fixture root");
     let db = root.path().join("state.db");
-    let started = Instant::now();
     let (store, outcome) = std::thread::spawn(move || {
         let mut store = TaskStore::open(&db).expect("store opens");
         let mut ledger = StoreLedger::new(&mut store, Vec::new());
@@ -1710,7 +1749,7 @@ async fn a_stream_past_the_attempt_share_is_cut_inside_the_deadline() {
     })
     .join()
     .expect("the dispatch thread joins");
-    let elapsed = started.elapsed();
+    let elapsed = elapsed.try_recv().expect("the provider send was measured");
     match outcome {
         Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
             assert_eq!(
@@ -1763,11 +1802,11 @@ async fn a_live_drip_past_the_attempt_share_is_cut_by_the_total_timeout() {
     let provider = provider
         .with_fallback(&sandbox.uri())
         .expect("the proof fallback admits");
+    let (provider, elapsed) = TimedCloudCode::new(provider);
     let (broker, manifest) = prepared_with((provider, store), &config, WORLD, INPUTS);
     let attempt_id = manifest.attempt_id.clone();
     let root = tempfile::TempDir::with_prefix("rivect-cloudcode-live-drip-").expect("fixture root");
     let db = root.path().join("state.db");
-    let started = Instant::now();
     let (store, outcome) = std::thread::spawn(move || {
         let mut store = TaskStore::open(&db).expect("store opens");
         let mut ledger = StoreLedger::new(&mut store, Vec::new());
@@ -1777,7 +1816,7 @@ async fn a_live_drip_past_the_attempt_share_is_cut_by_the_total_timeout() {
     })
     .join()
     .expect("the dispatch thread joins");
-    let elapsed = started.elapsed();
+    let elapsed = elapsed.try_recv().expect("the provider send was measured");
     match outcome {
         Err(ModelError::Provider(ProviderError::Transport { cause, .. })) => {
             assert_eq!(

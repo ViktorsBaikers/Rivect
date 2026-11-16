@@ -1,8 +1,4 @@
-# Rivect CI/CD — local §14 gate on Linux+macOS, tag-triggered package.
-#
-# Standards §14: actions are pinned by version tag here; before relying on
-# this pipeline for a release, pin each `uses:` to its commit SHA
-# (supply-chain hardening — tracked as release follow-up).
+# Ownership and evidence contracts: docs/ci-cd.md.
 name: ci
 
 on:
@@ -10,237 +6,269 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer PR supersedes checks; a release must not be cancelled mid-publish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_TEST_THREADS: "2"
+
 jobs:
-  # The full §14 local gate: fmt, clippy, workspace test, doc test,
-  # rustdoc -Dwarnings, cargo deny, fetch --locked. Linux runner; the
-  # sandbox_linux suite executes here under Landlock.
-  gate-linux:
-    runs-on: ubuntu-latest
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.98.1"
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: allow unprivileged user namespaces
-        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-      - name: fetch locked
-        run: cargo fetch --locked
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: workspace tests
-        # Doc-dependent gates need files the code-only checkout lacks
-        # (origin carries no docs/pack trees): the stack-admission trio and
-        # the measurement suite (frozen docs/release-budgets.md). Skip
-        # exactly those and run everything else — never a blanket skip.
-        # 2 threads: default parallelism tripped load-sensitive tests
-        # (workflow_off helper spawn) on the shared runner, same as macOS.
-        run: >-
-          RUST_TEST_THREADS=2 cargo test --locked --workspace
-          -- --skip the_stack_admission_inputs_are_present_and_accepted
-          --skip always_on_instructions_keep_their_size_budget
-          --skip every_denied_lint_stays_visible_to_agents
-          --skip local_cache_is_not_a_provider_cache
-          --skip missing_leg_is_not_pass
-          --skip ineligible_p99_is_not_pass
-          --skip frozen_release_budgets_match_the_pinned_digest
-          --skip offline_corpus_measures_the_installed_candidate_against_the_frozen_limits
-          --skip only_provider_rows_may_stay_not_run_with_their_prerequisite
-          --skip unavailable_platform_is_not_pass
-          --skip over_limit_fixture_is_blocked_not_pass
-          --skip unmeasured_kit_or_owned_rss_is_not_pass
-      - name: doc tests
-        run: cargo test --locked --workspace --doc
-      - name: rustdoc
-        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          command: check
-
-  # macOS leg: every carrier oracle lives in tests/sandbox_macos.rs under
-  # Seatbelt; this runner is the only place those rows can ever PASS.
-  test-macos:
-    runs-on: macos-latest
-    # macos-latest is arm64 (Apple Silicon). Main-crate tests run at 4 threads;
-    # the process-heavy sandbox-helper launch suite (1100-member group) runs
-    # alone at 1 thread: the macOS per-uid process cap cannot be raised
-    # (sysctl/ulimit denied) -> fork EAGAIN under concurrency (DEC-052).
-    env:
-      RUST_TEST_THREADS: "4"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.98.1"
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: fetch locked
-        run: cargo fetch --locked
-      - name: macOS process limits (diagnostic)
+          key: quality
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - run: cargo fmt --all -- --check
+      - run: >-
+          cargo clippy --locked --workspace --all-targets --all-features
+          -- -D warnings
+      - run: RUSTDOCFLAGS="-Dwarnings" cargo doc --locked --workspace --no-deps
+      - name: dependency policy (pinned, registry-verified tool)
         run: |
-          sysctl kern.maxprocperuid kern.maxproc || true
-          echo "ulimit -u: $(ulimit -u)"
-          echo "uid process count: $(ps -u "$(id -u)" | wc -l | tr -d ' ')"
-      - name: sandbox-helper tests (process-heavy, serialized, runs first)
-        # The launch suite spawns a 1100-member process group near the macOS
-        # per-uid process cap. Run it FIRST on the cleanest process table and
-        # alone at 1 thread; later 4-thread steps would otherwise leave
-        # residual processes that push the spawn past the cap (fork EAGAIN).
-        run: RUST_TEST_THREADS=1 cargo test --locked -p rivect-sandbox-helper
-      - name: sandbox macos suite (all carrier oracles)
-        run: cargo test --locked --test sandbox_macos -- --nocapture
-      - name: workspace tests
-        # Doc-dependent gates need files the code-only checkout lacks; the
-        # index-worker's proc-table oracles are Linux-only (their carrier is
-        # gate-linux). Skips name the excluded rows exactly.
-        # 2 threads, not the job's 4: on the capacity-constrained arm64 runner
-        # 4-way load tripped deadline/transport-sensitive tests (search_index
-        # narrowed-cut widening, activation LocalPeer http) across tag runs.
-        run: >-
-          RUST_TEST_THREADS=2 cargo test --locked --workspace
-          --exclude rivect-sandbox-helper
-          -- --skip the_stack_admission_inputs_are_present_and_accepted
-          --skip always_on_instructions_keep_their_size_budget
-          --skip every_denied_lint_stays_visible_to_agents
-          --skip local_cache_is_not_a_provider_cache
-          --skip missing_leg_is_not_pass
-          --skip ineligible_p99_is_not_pass
-          --skip frozen_release_budgets_match_the_pinned_digest
-          --skip offline_corpus_measures_the_installed_candidate_against_the_frozen_limits
-          --skip only_provider_rows_may_stay_not_run_with_their_prerequisite
-          --skip unavailable_platform_is_not_pass
-          --skip over_limit_fixture_is_blocked_not_pass
-          --skip unmeasured_kit_or_owned_rss_is_not_pass
-          --skip alive_observer_passes_only_the_allowlist
-          --skip answer_cap_stop_kills_and_reaps_the_worker
-          --skip cancel_stop_kills_and_reaps_the_worker
-          --skip cancellation_reaches_the_worker_and_ends_the_run
-          --skip footprint_stop_threshold_is_the_memory_budget
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo deny check
+      - name: workflow and script contracts
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          shellcheck scripts/*.sh
+          python3 scripts/ci-contract-tests.py
 
-
-  # Cross-host serve (DEC-027): the conjunction's platform-exclusive legs
-  # (auth.keychain on macOS; auth.secret_service and the measurement corpus
-  # on Linux) cannot all run on one host. Each tag build serves its own
-  # host's legs and uploads a commit-bound receipt; package binds the union
-  # to the acting candidate so the fold rescues them. A leg that stays
-  # NOT_RUN refuses the receipt — never a fabricated serve.
-  xhost-serve:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [gate-linux, test-macos]
+  test:
+    name: test-${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             platform: linux
-          - os: macos-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
             platform: macos
+            target: aarch64-apple-darwin
+    env:
+      PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.98.1"
-      - uses: Swatinem/rust-cache@v2
-      - name: fetch locked
-        run: cargo fetch --locked
-      - name: allow unprivileged user namespaces (linux)
+          persist-credentials: false
+      - name: locate candidate outside the checkout
+        run: |
+          echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: test-${{ matrix.platform }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - name: Linux sandbox and local credential-store prerequisites
         if: matrix.platform == 'linux'
-        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-      - name: serve platform legs and record the receipt
-        run: sh scripts/xhost-serve.sh ${{ matrix.platform }} ${{ github.sha }}
-      - uses: actions/upload-artifact@v4
+        run: |
+          sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gnome-keyring dbus dbus-x11
+      - name: build candidate once and smoke
+        run: |
+          sh scripts/package-release.sh "$RIVECT_TEST_BUNDLE"
+          "$RIVECT_TEST_BUNDLE/rivect" --version
+          "$RIVECT_TEST_BUNDLE/rivect" --help
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version=$(cargo metadata --locked --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "rivect") | .version')
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+      - name: run platform targets once and attest their evidence
+        run: |
+          if [[ "$PLATFORM" == linux ]]; then
+            dbus-run-session -- sh scripts/ci-platform-test.sh
+          else
+            sh scripts/ci-platform-test.sh
+          fi
+      - name: doc tests (not included in explicit target selection)
+        run: cargo test --locked --workspace --doc
+      - name: assemble tested candidate and evidence
+        run: |
+          mkdir -p transfer/target
+          tar -C "$RIVECT_TEST_BUNDLE" -czf transfer/candidate.tar.gz \
+            rivect rivect-sandbox-helper rivect.manifest.json
+          cp xhost-receipt.json transfer/
+          cp target/provider-trials.json target/search-trials.json \
+            target/acceptance-rows-*.json target/installed-ordinary.json \
+            target/installed-tui-matrix.json transfer/target/
+          cp -R target/rivect-not-run transfer/target/
+      # upload-artifact v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: xhost-${{ matrix.platform }}
-          path: xhost-receipt.json
+          path: transfer/
+          if-no-files-found: error
           retention-days: 7
-  # CD: tag pushes build the installed bundle via scripts/package-release.sh,
-  # run the release gate (exit 0 = ready, 5 = not ready yet — recorded, never
-  # silently passed), then attach the bundle tarball to a GitHub Release.
-  package:
+      - name: retain diagnostics even on failure
+        if: ${{ always() }}
+        # upload-artifact v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: diagnostics-${{ matrix.platform }}
+          path: |
+            target/ci-logs/
+            target/rivect-not-run/
+          retention-days: 7
+
+  verify-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [gate-linux, test-macos, xhost-serve]
+    needs: [quality, test]
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
+            platform: linux
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
+          - os: macos-15
+            platform: macos
             target: aarch64-apple-darwin
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.98.1"
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: fetch locked
-        run: cargo fetch --locked
-      - name: jq (macos)
-        if: runner.os == 'macOS'
-        run: command -v jq >/dev/null || brew install jq
-      - name: package bundle
-        run: sh scripts/package-release.sh "$PWD/bundle"
-      - name: download cross-host receipts
-        uses: actions/download-artifact@v4
+          persist-credentials: false
+      - name: locate candidate outside the checkout
+        run: |
+          echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: test-${{ matrix.platform }}
+          save-if: false
+      - name: Linux sandbox prerequisite for the conjunction
+        if: matrix.platform == 'linux'
+        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+      # download-artifact v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: xhost-*
           path: xhost
-      - name: bind cross-host evidence to the acting candidate
-        run: sh scripts/xhost-bind.sh "$PWD/bundle" ${{ github.sha }}
-      - name: release gate (recorded, not forced)
-        id: gate
+          digest-mismatch: error
+      - name: verify receipts and restore the exact tested candidate
         run: |
-          set +e
-          sh scripts/release-gate.sh --bundle "$PWD/bundle"
-          code=$?
-          set -e
-          echo "exit=$code" >> "$GITHUB_OUTPUT"
-          case "$code" in
-            0|5) exit 0 ;;
-            *) exit "$code" ;;
-          esac
-      - name: tarball
+          test "$(find xhost -name xhost-receipt.json | wc -l | tr -d ' ')" = 2
+          mkdir "$RIVECT_TEST_BUNDLE"
+          tar -xOf "xhost/xhost-$PLATFORM/candidate.tar.gz" \
+            rivect.manifest.json > "$RIVECT_TEST_BUNDLE/rivect.manifest.json"
+          sh scripts/xhost-bind.sh "$RIVECT_TEST_BUNDLE" "$GITHUB_SHA"
+          tar -xf "xhost/xhost-$PLATFORM/candidate.tar.gz" \
+            -C "$RIVECT_TEST_BUNDLE"
+          cp -R "xhost/xhost-$PLATFORM/target/." target/
+      - name: release conjunction only (no producer reruns)
         run: |
-          tag="${GITHUB_REF_NAME}"
-          tar -C "$PWD/bundle" -czf "rivect-${tag}-${{ matrix.target }}.tar.gz" rivect rivect-sandbox-helper rivect.manifest.json
-          sha256sum "rivect-${tag}-${{ matrix.target }}.tar.gz" > "rivect-${tag}-${{ matrix.target }}.tar.gz.sha256" 2>/dev/null || \
-            shasum -a 256 "rivect-${tag}-${{ matrix.target }}.tar.gz" > "rivect-${tag}-${{ matrix.target }}.tar.gz.sha256"
-      - name: upload artifact
-        uses: actions/upload-artifact@v4
+          code=0
+          sh scripts/release-gate.sh --bundle "$RIVECT_TEST_BUNDLE" \
+            --receipts-only || code=$?
+          case "$code" in 0|5) ;; *) exit "$code" ;; esac
+          mkdir dist
+          jq --argjson exit "$code" --arg target "$TARGET" \
+            --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            '. + {gate_exit:$exit, target:$target,
+                  commit:$commit, run_id:$run}' \
+            target/final-acceptance.json > "dist/$TARGET.json"
+          cp "xhost/xhost-$PLATFORM/candidate.tar.gz" \
+            "dist/rivect-$GITHUB_REF_NAME-$TARGET.tar.gz"
+          (cd dist && shasum -a 256 ./*.tar.gz > "$TARGET.sha256")
+      # upload-artifact v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: rivect-${{ github.ref_name }}-${{ matrix.target }}
-          path: |
-            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
           retention-days: 30
-      - name: publish release
-        uses: softprops/action-gh-release@v2
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # No checkout, Cargo, build script or test runs with a write token.
+      # download-artifact v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          # release_ready=false (gate exit 5) publishes a prerelease draft;
-          # a real GO (exit 0) publishes the release for install.
-          draft: ${{ steps.gate.outputs.exit != '0' }}
-          prerelease: ${{ steps.gate.outputs.exit != '0' }}
-          files: |
-            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
-          body: |
-            Install: untar `rivect-${{ github.ref_name }}-${{ matrix.target }}.tar.gz`
-            and place `rivect` + `rivect-sandbox-helper` on PATH together.
-            Verify `rivect.manifest.json` digests before use.
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+          digest-mismatch: error
+      - name: publish both platforms in one transaction owner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          test "$(find . -name '*.json' | wc -l | tr -d ' ')" = 2
+          test "$(find . -name '*.tar.gz' | wc -l | tr -d ' ')" = 2
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            sha256sum -c "$target.sha256"
+            candidate=$(tar -xOf "rivect-$GITHUB_REF_NAME-$target.tar.gz" \
+              rivect.manifest.json | sha256sum | cut -d ' ' -f 1)
+            jq -e --arg target "$target" --arg commit "$GITHUB_SHA" \
+              --arg run "$GITHUB_RUN_ID" --arg candidate "$candidate" '
+              .schema_version == 1 and .target == $target and
+              .commit == $commit and .run_id == $run and
+              .candidate_manifest_sha256 == $candidate and
+              (.release_ready | type == "boolean") and
+              (.blockers.retained_legs |
+                type == "number" and . >= 0 and . == floor) and
+              ((.gate_exit == 0 and .release_ready == true and
+                .blockers.retained_legs == 0) or
+               (.gate_exit == 5 and (.release_ready == false or
+                .blockers.retained_legs > 0)))
+            ' "$target.json"
+          done
+          verify_tag() {
+            local tag_sha
+            tag_sha=$(gh api \
+              "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+            test "$tag_sha" = "$GITHUB_SHA"
+          }
+          verify_tag
+          args=(--draft)
+          ready=true
+          if ! jq -se 'all(.[]; .gate_exit == 0 and .release_ready == true
+            and .blockers.retained_legs == 0)' ./*.json; then
+            args+=(--prerelease)
+            ready=false
+          fi
+          # Draft first: failed uploads cannot expose a partial release.
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "Rivect $GITHUB_REF_NAME" \
+            --notes "Offline verdicts attached. Install both binaries." \
+            "${args[@]}" ./*.tar.gz ./*.sha256 ./*.json
+          if [[ "$ready" == true ]]; then
+            verify_tag
+            gh release edit "$GITHUB_REF_NAME" --draft=false
+          fi

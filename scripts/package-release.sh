@@ -25,7 +25,7 @@ if [ -e "$destination" ]; then
     exit 2
 fi
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 case $target_dir in
     /*) ;;

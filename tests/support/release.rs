@@ -1,8 +1,9 @@
-//! Installed-bundle fixture: one authentic package built outside the
-//! checkout by the shipped script, copied per case, and run from a nested
-//! Unicode/space working directory. The package is built once per test binary
-//! and never mutated in place.
+//! Installed-bundle fixture: one authentic supplied package, or one built by
+//! the shipped script, copied outside the checkout and run from a nested
+//! Unicode/space working directory. Each test binary owns its baseline copy;
+//! the supplied package is never mutated in place.
 
+use rivect::executor::verify_release_bundle;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::LazyLock;
@@ -33,16 +34,59 @@ struct Baseline {
 static BASELINE: LazyLock<Baseline> = LazyLock::new(|| {
     let root =
         tempfile::TempDir::with_prefix("rivect-release-baseline-").expect("baseline fixture root");
-    let bundle = root
-        .path()
+    let root_path = root.path().canonicalize().expect("canonical baseline root");
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .expect("canonical checkout root");
+    assert!(
+        !root_path.starts_with(&checkout),
+        "the baseline fixture must be outside the checkout"
+    );
+    let bundle = root_path
         .join("nested release space")
         .join("юникод package");
-    let output = package_into(&bundle);
-    assert!(
-        output.status.success(),
-        "the packaged baseline refused: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if let Some(source) = std::env::var_os("RIVECT_TEST_BUNDLE") {
+        let source = std::fs::canonicalize(source).expect("canonical supplied release bundle");
+        assert!(
+            !source.starts_with(&checkout),
+            "the supplied release bundle must be outside the checkout"
+        );
+        let activation =
+            verify_release_bundle(&source).expect("the supplied release bundle must be authentic");
+        let expected_build = format!(
+            "rivect {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            rivect::BUILD_ATTEMPT_ID
+        );
+        assert_eq!(
+            activation.build, expected_build,
+            "the supplied release bundle must match the test build"
+        );
+        copy_bundle(&source, &bundle);
+        assert_eq!(
+            verify_release_bundle(&bundle).expect("the copied release bundle must be authentic"),
+            activation,
+            "the copied release bundle must preserve the supplied activation identity"
+        );
+        let version = run_packaged(&bundle, &["--version"], &root_path);
+        assert!(
+            version.status.success(),
+            "the supplied executable must report its build: {}",
+            stderr_of(&version)
+        );
+        assert_eq!(
+            stdout_of(&version).trim(),
+            expected_build,
+            "the supplied executable must match the test build"
+        );
+    } else {
+        let output = package_into(&bundle);
+        assert!(
+            output.status.success(),
+            "the packaged baseline refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Baseline {
         _root: root,
         bundle,

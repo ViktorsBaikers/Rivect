@@ -16,6 +16,7 @@ usage: offline-evidence.sh --manifest PATH --receipt PATH --bundle DIR
   --manifest PATH   checked-in family manifest (schema_version 1)
   --receipt PATH    candidate-bound receipt to write atomically
   --bundle DIR      installed candidate bundle holding rivect.manifest.json
+  --logs-dir DIR    consume same-run candidate-bound target logs, without rerunning
   --help            print this usage
 
 exit: 0 receipt written, 1 manifest/oracle/producer failure, 2 bad arguments
@@ -25,6 +26,7 @@ EOF
 manifest=
 receipt=
 bundle=
+logs_dir=
 while [ "$#" -gt 0 ]; do
     case $1 in
         --help | -h)
@@ -44,6 +46,11 @@ while [ "$#" -gt 0 ]; do
         --bundle)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             bundle=$2
+            shift 2
+            ;;
+        --logs-dir)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            logs_dir=$2
             shift 2
             ;;
         *)
@@ -236,26 +243,42 @@ target_count=$(wc -l <"$tmp/targets.txt" | tr -d ' ')
     exit 2
 }
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cargo=${CARGO:-cargo}
 : >"$tmp/receipt_rows.jsonl"
 : >"$tmp/receipt_targets.jsonl"
 
 while IFS= read -r target; do
     [ -n "$target" ] || continue
-    command="cargo test --locked --test $target -- --nocapture"
+    command="cargo test --locked --test $target -- --show-output"
     output=$tmp/$target.log
-    set +e
-    (
-        cd "$repo_root" &&
-            "$cargo" test --locked --test "$target" -- --nocapture
-    ) >"$output" 2>&1
-    status=$?
-    set -e
-    if [ "$status" -ne 0 ]; then
-        printf 'target %s failed with exit %s; output: %s\n' "$target" "$status" "$output" >&2
-        tail -n 40 "$output" >&2 || true
-        exit 1
+    if [ -n "$logs_dir" ]; then
+        output=$logs_dir/$target.log
+        execution=$logs_dir/$target.json
+        [ -f "$output" ] && [ -f "$execution" ] || {
+            printf 'missing execution for target %s\n' "$target" >&2
+            exit 1
+        }
+        output_digest=$(sha256_of "$output")
+        jq -e --arg candidate "$bundle_digest" --arg output "$output_digest" \
+            --arg command "$command" '
+                .exit == 0 and .candidate_manifest_sha256 == $candidate and
+                .output_sha256 == $output and .command == $command
+            ' "$execution" >/dev/null || {
+            printf 'failed, stale or tampered execution: %s\n' "$target" >&2
+            exit 1
+        }
+    else
+        status=0
+        (
+            cd "$repo_root" &&
+                "$cargo" test --locked --test "$target" -- --show-output
+        ) >"$output" 2>&1 || status=$?
+        if [ "$status" -ne 0 ]; then
+            printf 'target %s failed with exit %s\n' "$target" "$status" >&2
+            cat "$output" >&2
+            exit 1
+        fi
     fi
 
     : >"$tmp/cases.raw"
