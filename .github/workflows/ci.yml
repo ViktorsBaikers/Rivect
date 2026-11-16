@@ -86,6 +86,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fetch locked
         run: cargo fetch --locked
+      - name: sandbox-helper tests (process-heavy, serialized, runs first)
+        # The launch suite spawns a 1100-member process group near the macOS
+        # per-uid process cap. Run it FIRST on the cleanest process table and
+        # alone at 1 thread; later 4-thread steps would otherwise leave
+        # residual processes that push the spawn past the cap (fork EAGAIN).
+        run: RUST_TEST_THREADS=1 cargo test --locked -p rivect-sandbox-helper
       - name: sandbox macos suite (all carrier oracles)
         run: cargo test --locked --test sandbox_macos -- --nocapture
       - name: workspace tests
@@ -111,10 +117,6 @@ jobs:
           --skip cancel_stop_kills_and_reaps_the_worker
           --skip cancellation_reaches_the_worker_and_ends_the_run
           --skip footprint_stop_threshold_is_the_memory_budget
-      - name: sandbox-helper tests (process-heavy, serialized)
-        # The launch suite spawns a 1100-member process group; run this crate
-        # alone at 1 thread so it does not compete for the macOS process cap.
-        run: RUST_TEST_THREADS=1 cargo test --locked -p rivect-sandbox-helper
 
   # CD: tag pushes build the installed bundle via scripts/package-release.sh,
   # run the release gate (exit 0 = ready, 5 = not ready yet — recorded, never
