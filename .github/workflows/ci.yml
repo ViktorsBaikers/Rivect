@@ -103,8 +103,11 @@ jobs:
         # Doc-dependent gates need files the code-only checkout lacks; the
         # index-worker's proc-table oracles are Linux-only (their carrier is
         # gate-linux). Skips name the excluded rows exactly.
+        # 2 threads, not the job's 4: on the capacity-constrained arm64 runner
+        # 4-way load tripped deadline/transport-sensitive tests (search_index
+        # narrowed-cut widening, activation LocalPeer http) across tag runs.
         run: >-
-          cargo test --locked --workspace --exclude rivect-sandbox-helper
+          RUST_TEST_THREADS=2 cargo test --locked --workspace --exclude rivect-sandbox-helper
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
           --skip every_denied_lint_stays_visible_to_agents
