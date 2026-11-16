@@ -23,7 +23,7 @@ jobs:
   # rustdoc -Dwarnings, cargo deny, fetch --locked. Linux runner; the
   # sandbox_linux suite executes here under Landlock.
   gate-linux:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -86,13 +86,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fetch locked
         run: cargo fetch --locked
+      - name: raise process limit (parallel tests fork EAGAIN)
+        run: sudo sysctl -w kern.maxprocperuid=10000 kern.maxproc=20000
       - name: sandbox macos suite (all carrier oracles)
-        run: cargo test --locked --test sandbox_macos -- --nocapture
+        run: |
+          ulimit -u 10000 || true
+          cargo test --locked --test sandbox_macos -- --nocapture
       - name: workspace tests
         # Doc-dependent gates need files the code-only checkout lacks; the
         # index-worker's proc-table oracles are Linux-only (their carrier is
         # gate-linux). Skips name the excluded rows exactly.
         run: >-
+          ulimit -u 10000 || true;
           cargo test --locked --workspace
           -- --skip the_stack_admission_inputs_are_present_and_accepted
           --skip always_on_instructions_keep_their_size_budget
