@@ -23,7 +23,7 @@ jobs:
   # rustdoc -Dwarnings, cargo deny, fetch --locked. Linux runner; the
   # sandbox_linux suite executes here under Landlock.
   gate-linux:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -71,9 +71,12 @@ jobs:
   # Seatbelt; this runner is the only place those rows can ever PASS.
   test-macos:
     runs-on: macos-latest
-    # macos-latest is arm64 (Apple Silicon); run at default test parallelism
-    # (DEC-049). Deadline headroom lives in the tests (DEC-046/048), not a
-    # 1-thread cap.
+    # macos-latest is arm64 (Apple Silicon). Moderate test parallelism (4):
+    # full default exhausts the runner's process limit (fork EAGAIN), while
+    # 1 thread is needlessly slow (DEC-050). Deadline headroom lives in the
+    # tests (DEC-046/048).
+    env:
+      RUST_TEST_THREADS: "4"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
