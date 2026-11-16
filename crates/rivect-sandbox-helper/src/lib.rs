@@ -4541,7 +4541,8 @@ fn list_all_pids(pids: &mut [i32]) -> i32 {
 /// live host always holds the caller's own pid, never an empty Ok.
 #[cfg(target_os = "macos")]
 fn enumerate_processes() -> Result<Vec<ProcessEntry>, ProcessReadError> {
-    let mut capacity = 4096_i32;
+    // Small start: the truncation-regression group must fit under the macOS per-uid process cap (busy hosts grow to the scan cap).
+    let mut capacity = 2048_i32;
     loop {
         let mut pids = vec![0_i32; capacity as usize];
         // A nonpositive return is the enumeration call itself failing:
