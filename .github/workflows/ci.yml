@@ -123,12 +123,49 @@ jobs:
           --skip cancellation_reaches_the_worker_and_ends_the_run
           --skip footprint_stop_threshold_is_the_memory_budget
 
+
+  # Cross-host serve (DEC-027): the conjunction's platform-exclusive legs
+  # (auth.keychain on macOS; auth.secret_service and the measurement corpus
+  # on Linux) cannot all run on one host. Each tag build serves its own
+  # host's legs and uploads a commit-bound receipt; package binds the union
+  # to the acting candidate so the fold rescues them. A leg that stays
+  # NOT_RUN refuses the receipt — never a fabricated serve.
+  xhost-serve:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate-linux, test-macos]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: fetch locked
+        run: cargo fetch --locked
+      - name: allow unprivileged user namespaces (linux)
+        if: matrix.platform == 'linux'
+        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+      - name: serve platform legs and record the receipt
+        run: sh scripts/xhost-serve.sh ${{ matrix.platform }} ${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xhost-${{ matrix.platform }}
+          path: xhost-receipt.json
+          retention-days: 7
   # CD: tag pushes build the installed bundle via scripts/package-release.sh,
   # run the release gate (exit 0 = ready, 5 = not ready yet — recorded, never
   # silently passed), then attach the bundle tarball to a GitHub Release.
   package:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [gate-linux, test-macos]
+    needs: [gate-linux, test-macos, xhost-serve]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -154,6 +191,13 @@ jobs:
         run: command -v jq >/dev/null || brew install jq
       - name: package bundle
         run: sh scripts/package-release.sh "$PWD/bundle"
+      - name: download cross-host receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: xhost-*
+          path: xhost
+      - name: bind cross-host evidence to the acting candidate
+        run: sh scripts/xhost-bind.sh "$PWD/bundle" ${{ github.sha }}
       - name: release gate (recorded, not forced)
         id: gate
         run: |

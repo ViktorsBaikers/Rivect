@@ -1325,8 +1325,8 @@ fn search_receipt_missing_stale_or_unmarked_is_never_pass() {
     );
 }
 
-const INSTALLED_ORDINARY_PRODUCER: &str = "cargo test --locked --test installed installed_ordinary_request_completes_with_one_settlement --exact --nocapture";
-const INSTALLED_UI_PRODUCER: &str = "cargo test --locked --test installed_tui installed_19_state_matrix_runs_on_the_packaged_artifact --exact --nocapture";
+const INSTALLED_ORDINARY_PRODUCER: &str = "cargo test --locked --test installed installed_ordinary_request_completes_with_one_settlement -- --exact --nocapture";
+const INSTALLED_UI_PRODUCER: &str = "cargo test --locked --test installed_tui installed_19_state_matrix_runs_on_the_packaged_artifact -- --exact --nocapture";
 
 fn installed_receipt_path() -> PathBuf {
     std::env::var_os("RIVECT_INSTALLED_ORDINARY_RECEIPT")
