@@ -86,6 +86,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fetch locked
         run: cargo fetch --locked
+      - name: macOS process limits (diagnostic)
+        run: |
+          sysctl kern.maxprocperuid kern.maxproc || true
+          echo "ulimit -u: $(ulimit -u)"
+          echo "uid process count: $(ps -u "$(id -u)" | wc -l | tr -d ' ')"
       - name: sandbox-helper tests (process-heavy, serialized, runs first)
         # The launch suite spawns a 1100-member process group near the macOS
         # per-uid process cap. Run it FIRST on the cleanest process table and

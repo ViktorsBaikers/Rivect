@@ -1775,14 +1775,16 @@ fn process_group_members_lists_a_forked_grandchild() {
 /// BYTE capacity while its return is a pid COUNT, so a call-site
 /// regression that passes the count shrinks the buffer fourfold — a
 /// 4096-slot listing then admits only 1024 pids and silently truncates.
-/// 1100 members of ONE process group (a leader plus joiners under
+/// 1025 members of ONE process group (a leader plus joiners under
 /// `setpgid`, all `/bin/sleep`, killed and reaped before any verdict)
 /// cannot fit a truncated listing, so the exact-count assert fails on
-/// the regression.
+/// the regression. 1025 is the smallest count above the 1024 truncation
+/// threshold: it keeps the discriminator while leaving the most headroom
+/// under the macOS per-uid process cap (which cannot be raised on CI).
 #[cfg(target_os = "macos")]
 #[test]
 fn process_group_members_surfaces_a_group_past_the_ffi_byte_boundary() {
-    const MEMBERS: usize = 1100;
+    const MEMBERS: usize = 1025;
     let _serialized = UID_COUNT_SENSITIVE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
