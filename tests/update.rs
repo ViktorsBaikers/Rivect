@@ -2276,8 +2276,8 @@ fn refused_guard_edit_serves_the_entry_that_landed_p23() {
 /// changed document is therefore a deliberate step: ship it under the next
 /// `SHIPPED_BASE_VERSION` and move this pair with it.
 const SHIPPED_BASE_IDENTITY: (u64, &str) = (
-    2,
-    "4c5534393b44d8221036dd94c23549136670d1448af9b6d04ddc5f7cbf5cadca",
+    3,
+    "9905df7dc66d5b8d8407f034c02539e77ff694b2759a41b128d8be4af86dfb2c",
 );
 
 /// AC-054/INV-010a: the base version and the shipped document are one identity,
@@ -4545,7 +4545,7 @@ fn checked_phase_projects_and_survives_kill_before_activation() {
             .staged_base()
             .expect("staged read")
             .map(|base| base.version),
-        Some(2),
+        Some(SHIPPED_BASE_VERSION),
         "the ledger still holds the base as staged"
     );
     assert_eq!(
@@ -4880,6 +4880,7 @@ fn blocker_page_traverses_and_refuses_by_domain() {
     let page = first.blockers.expect("the base holds a set");
     assert_eq!(page.items.len(), 20, "the default page size is 20");
     assert_eq!(page.snapshot_generation, SHIPPED_BASE_VERSION);
+    let set_epoch = page.snapshot_generation;
     let cursor = page.next_cursor.expect("a next page exists");
 
     let mut seen: Vec<String> = page.items.clone();
@@ -4985,7 +4986,10 @@ fn blocker_page_traverses_and_refuses_by_domain() {
     // every other collection, and the conflict names the requested base.
     let stale: Value = world.dispatch(&status_with_blockers(
         &session,
-        json!({ "base": SHIPPED_BASE_VERSION, "cursor": "blk:2:9999:offset:0" }),
+        json!({
+            "base": SHIPPED_BASE_VERSION,
+            "cursor": format!("blk:{SHIPPED_BASE_VERSION}:9999:offset:0"),
+        }),
     ));
     assert!(
         stale["error"].is_null(),
@@ -5023,7 +5027,10 @@ fn blocker_page_traverses_and_refuses_by_domain() {
     // caller still reads, and the ledger is not reported unavailable.
     let beyond: Value = world.dispatch(&status_with_blockers(
         &session,
-        json!({ "base": SHIPPED_BASE_VERSION, "cursor": "blk:2:1:offset:9000" }),
+        json!({
+            "base": SHIPPED_BASE_VERSION,
+            "cursor": format!("blk:{SHIPPED_BASE_VERSION}:{set_epoch}:offset:9000"),
+        }),
     ));
     assert!(
         beyond["error"].is_null(),
@@ -6560,7 +6567,7 @@ fn deterministic_update_and_rollback_make_zero_provider_calls() {
     );
     drop(world);
 
-    // 2. The actual rollback: a root that already serves base 1 takes a waiting
+    // 2. The actual rollback: a root serving the previous base takes a waiting
     // cutover, and that cutover's validation then fails, so the production open
     // reports `RolledBack` — the serving base stays, the checkpoint leaves and no
     // activation is claimed.
@@ -6568,13 +6575,17 @@ fn deterministic_update_and_rollback_make_zero_provider_calls() {
     std::fs::create_dir_all(stale_root.path().join("runtime")).expect("runtime dir");
     std::fs::write(stale_root.path().join("config.toml"), &off).expect("the user document lands");
     let stale_primary = stale_root.path().join("runtime").join("rivect.db");
+    let previous_base = SHIPPED_BASE_VERSION - 1;
     let rollback_task;
     let kept_rollback;
     {
         let mut store = TaskStore::open(&stale_primary).expect("the store opens");
         store
-            .serve_base(&install(stale_root.path(), BaseSource::new(1, &base_v1())))
-            .expect("base 1 serves");
+            .serve_base(&install(
+                stale_root.path(),
+                BaseSource::new(previous_base, &base_v1()),
+            ))
+            .expect("the previous base serves");
         store
             .stage_base(&install(stale_root.path(), BaseSource::SHIPPED))
             .expect("the successor stages");
@@ -6630,7 +6641,7 @@ fn deterministic_update_and_rollback_make_zero_provider_calls() {
             .active_base()
             .expect("base read")
             .map(|base| base.version),
-        Some(1),
+        Some(previous_base),
         "the rollback left the previous base serving"
     );
     assert_eq!(
@@ -6962,15 +6973,25 @@ fn semantic_conflicts_traverse_every_status_page() {
         let mut seen: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut set_epoch = None;
         loop {
             let request = match &cursor {
-                None => json!({ "page_size": 200, "base": 2 }),
-                Some(cursor) => json!({ "page_size": 200, "base": 2, "cursor": cursor }),
+                None => json!({ "page_size": 200, "base": SHIPPED_BASE_VERSION }),
+                Some(cursor) => {
+                    json!({ "page_size": 200, "base": SHIPPED_BASE_VERSION, "cursor": cursor })
+                }
             };
             let response: Value = world.dispatch(&status_with_blockers(&session, request));
             assert!(response["error"].is_null(), "{count}: {response}");
             let page = &response["result"]["update"]["blockers"];
-            assert_eq!(page["snapshot_generation"], 2, "{count}: {response}");
+            let epoch = page["snapshot_generation"]
+                .as_u64()
+                .expect("the page names its epoch");
+            assert_eq!(
+                epoch,
+                *set_epoch.get_or_insert(epoch),
+                "{count}: {response}"
+            );
             let items: Vec<String> = page["items"]
                 .as_array()
                 .expect("items")
@@ -7000,7 +7021,7 @@ fn semantic_conflicts_traverse_every_status_page() {
             world
                 .runtime
                 .store()
-                .base_blocker(2, beyond)
+                .base_blocker(SHIPPED_BASE_VERSION, beyond)
                 .expect("the lookup answers"),
             "{count}: {beyond} is not enforced"
         );
@@ -7297,7 +7318,7 @@ fn pre_column_staged_row_activates_into_readable_metadata() {
     std::fs::create_dir_all(root.path().join("runtime")).expect("runtime dir");
     let path = root.path().join("state.db");
     let document_text = base_v2();
-    let document = BaseSource::new(SHIPPED_BASE_VERSION, &document_text);
+    let document = BaseSource::new(2, &document_text);
     {
         let mut store = TaskStore::open(&path).expect("the store opens");
         store
@@ -7324,7 +7345,7 @@ fn pre_column_staged_row_activates_into_readable_metadata() {
             .staged_base()
             .expect("staged read")
             .map(|base| base.version),
-        Some(SHIPPED_BASE_VERSION),
+        Some(document.version()),
         "the pre-column row is still the waiting checkpoint"
     );
     let served = store
@@ -7343,7 +7364,7 @@ fn pre_column_staged_row_activates_into_readable_metadata() {
     );
     assert_eq!(
         receipt.blockers.map(|page| page.snapshot_generation),
-        Some(SHIPPED_BASE_VERSION),
+        Some(2),
         "the activated row carries its set: the epoch was written onto the surviving row"
     );
 }

@@ -6504,6 +6504,10 @@ struct ChatPeer {
 
 impl ChatPeer {
     fn start(read_path: &'static str) -> Self {
+        Self::scripted(move |_, _| chat_stream("read_file", json!({"path": read_path})))
+    }
+
+    fn scripted(reply: impl Fn(u64, &[u8]) -> String + Send + 'static) -> Self {
         use std::io::Write as _;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the chat peer");
         let address = listener.local_addr().expect("peer address");
@@ -6519,12 +6523,12 @@ impl ChatPeer {
                 if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
-                let Some((method, target, _body)) = read_chat_request(&mut stream) else {
+                let Some((method, target, body)) = read_chat_request(&mut stream) else {
                     continue;
                 };
                 if method == "POST" && target.starts_with("/v1/chat/completions") {
-                    thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let response = chat_stream(read_path);
+                    let turn = thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = reply(turn, &body);
                     let head = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         response.len()
@@ -6606,13 +6610,13 @@ fn read_chat_request(stream: &mut std::net::TcpStream) -> Option<(String, String
     Some((method, target, body))
 }
 
-fn chat_stream(read_path: &str) -> String {
-    let arguments = serde_json::to_string(&json!({"path": read_path})).expect("tool arguments");
+fn chat_stream(tool: &str, args: Value) -> String {
+    let arguments = serde_json::to_string(&args).expect("tool arguments");
     let call = json!({
         "index": 0,
         "id": "call-start",
         "type": "function",
-        "function": {"name": "read_file", "arguments": arguments},
+        "function": {"name": tool, "arguments": arguments},
     });
     let delta = json!({
         "id": "c1",
@@ -6762,6 +6766,116 @@ fn headless_entry_creates_the_start_question_and_denies_a_machine_answer() {
         "the denied machine answer preserves the pending question"
     );
     println!("task-start headless: create=1 question=1 machine_answer=denied");
+}
+
+#[test]
+fn fresh_tui_shows_project_and_login_without_idle_metrics() {
+    let root = tempfile::TempDir::with_prefix("rivect-first-use-").expect("fixture root");
+    let data = root.path().join("private-state");
+    let project = root.path().join("coding-project");
+    std::fs::create_dir(&project).expect("project directory");
+    let mut command = support::pty_command(rivect_binary());
+    command.arg("--data-root");
+    command.arg(&data);
+    command.cwd(&project);
+    let mut pty = support::PtySession::spawn(command, 24, 100, root, data).expect("spawn the TUI");
+    let screen = support::wait_for_screen_text(&pty, 24, 100, "Project:", Duration::from_secs(10))
+        .expect("project label");
+    assert!(
+        screen.contains(
+            project
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_str()
+                .expect("UTF-8 cwd")
+        ),
+        "{screen}"
+    );
+    assert!(screen.contains("Run /login"), "{screen}");
+    assert!(!screen.contains("settled unknown"), "{screen}");
+    assert!(!screen.contains("NOT_RUN"), "{screen}");
+    pty.send(b"/login\r").expect("start browser login");
+    let pending =
+        support::wait_for_screen_text(&pty, 24, 100, "Login pending:", Duration::from_secs(10))
+            .expect("pending login");
+    assert!(pending.contains("Login pending:"), "{pending}");
+    assert!(pending.contains("not connected"), "{pending}");
+    pty.send(b"/login cancel\r").expect("cancel browser login");
+    let cancelled =
+        support::wait_for_screen_text(&pty, 24, 100, "Login cancelled.", Duration::from_secs(10))
+            .expect("cancelled login");
+    assert!(cancelled.contains("Login cancelled."), "{cancelled}");
+    assert!(cancelled.contains("not connected"), "{cancelled}");
+    pty.send(b"\x1b").expect("pty send exit");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn ordinary_tui_task_continues_from_read_to_write_approval() {
+    let peer = ChatPeer::scripted(|turn, payload| {
+        if turn == 0 {
+            return chat_stream("read_file", json!({"path": "inventory.rs"}));
+        }
+        assert!(
+            String::from_utf8_lossy(payload).contains("const STOCK: u8 = 17;"),
+            "the next request carries the actual read result"
+        );
+        chat_stream(
+            "write_file",
+            json!({
+                "path": "inventory.rs",
+                "text": "const STOCK: u8 = 18;\n"
+            }),
+        )
+    });
+    let root = tempfile::TempDir::with_prefix("rivect-coding-").expect("fixture root");
+    let data = root.path().join("data");
+    let project = root.path().join("project");
+    std::fs::create_dir(&data).expect("data directory");
+    std::fs::create_dir(&project).expect("project directory");
+    let file = project.join("inventory.rs");
+    std::fs::write(&file, "const STOCK: u8 = 17;\n").expect("initial code");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("loopback config");
+    let mut command = support::pty_command(rivect_binary());
+    command.arg("--data-root");
+    command.arg(&data);
+    command.cwd(&project);
+    let mut pty = support::PtySession::spawn(command, 24, 80, root, data).expect("spawn the TUI");
+    let initial = wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10))
+        .expect("project label");
+    assert!(initial.contains("Project:"), "{initial}");
+    pty.send(b"Increase the stock count by one.\r")
+        .expect("submit task");
+    let start = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
+        .expect("task decision");
+    assert!(start.contains("awaiting decision"), "{start}");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("wait for consent");
+    pty.send(b"\r").expect("begin task");
+    let approval = wait_for_visible_tui_text(&pty, "awaiting permission", Duration::from_secs(10))
+        .expect("write decision");
+    assert!(approval.contains("awaiting permission"), "{approval}");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read project file"),
+        "const STOCK: u8 = 17;\n"
+    );
+    pty.send(b"\x1b").expect("deny write");
+    let denied = wait_for_visible_tui_text(&pty, "permission denied", Duration::from_secs(10))
+        .expect("denial");
+    assert!(denied.contains("permission denied"), "{denied}");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read project file"),
+        "const STOCK: u8 = 17;\n"
+    );
+    pty.finish().expect("pty teardown");
 }
 
 #[test]

@@ -4302,7 +4302,7 @@ fn new_connection_and_profile_keys_are_additive_and_strict_validated() {
     );
     // the shipped defaults document a complete commented connection —
     // kind, endpoint with the trust boundary, the scoped credential_ref,
-    // region and the profile binding with its table — nothing ships live
+    // region and the profile binding with its table.
     let shipped = rivect::config::SHIPPED_DEFAULTS_TOML;
     assert!(
         shipped.contains(
@@ -4317,16 +4317,20 @@ fn new_connection_and_profile_keys_are_additive_and_strict_validated() {
         ),
         "the complete commented connection block ships verbatim"
     );
-    for line in shipped.lines() {
-        let trimmed = line.trim_start();
-        let profile_key = ["region", "profile", "credential_ref"]
-            .iter()
-            .any(|key| trimmed.starts_with(key));
-        assert!(
-            !(profile_key && !trimmed.starts_with('#')),
-            "a profile key shipped live: {line}"
-        );
-    }
+    let fresh = rivect::config::resolve_effective(None)
+        .expect("fresh effective config")
+        .composed();
+    assert_eq!(
+        fresh.connections.keys().collect::<Vec<_>>(),
+        ["openai-codex"]
+    );
+    assert_eq!(fresh.profiles.keys().collect::<Vec<_>>(), ["openai-codex"]);
+    assert_eq!(
+        resolve_credential(&fresh, "openai-codex")
+            .expect("onboarding uses a scoped credential reference")
+            .profile(),
+        "openai-codex"
+    );
 }
 
 /// DEC-014: `config.read` serves the additive profile keys over the wire —

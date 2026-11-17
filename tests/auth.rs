@@ -6312,6 +6312,126 @@ async fn anthropic_pro_max_profile_legs_matrix_executes_all_expected_legs() {
 
 const CODEX_REFRESH_FIXTURE: &str = "fixture-codex-refresh-not-real";
 
+#[tokio::test]
+async fn fresh_effective_config_prepares_codex_login_offline() {
+    let peer = MockServer::start().await;
+    let config = rivect::config::resolve_effective(None)
+        .expect("shipped configuration resolves")
+        .composed();
+    let session = openai_login::begin_login(&config, "openai-codex", &codex_token_endpoint(&peer))
+        .expect("a fresh installation prepares the canonical login");
+    assert!(
+        session
+            .authorize_url()
+            .starts_with("https://auth.openai.com/")
+    );
+    assert!(
+        session
+            .authorize_url()
+            .contains("code_challenge_method=S256")
+    );
+    assert!(
+        peer.received_requests()
+            .await
+            .expect("request log")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn fresh_codex_login_enables_a_configured_provider_send() {
+    let peer = MockServer::start().await;
+    mount_codex_exchange(&peer, "good-code", CODEX_WORKSPACE, CODEX_EMAIL).await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-5.2-codex"}]
+        })))
+        .mount(&peer)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(support::responses_completed_stream(
+                    "login fixture answer",
+                    Vec::new(),
+                    Some(json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5})),
+                )),
+        )
+        .mount(&peer)
+        .await;
+
+    let resolved = || {
+        let mut config = rivect::config::resolve_effective(None)
+            .expect("shipped configuration resolves")
+            .composed();
+        config
+            .connections
+            .get_mut("openai-codex")
+            .expect("canonical connection")
+            .endpoint = format!("{}/backend-api/codex", peer.uri());
+        config
+    };
+    let config = resolved();
+    let reference = resolve_credential(&config, "openai-codex").expect("scoped reference");
+    let store: Arc<dyn CredentialStore> = Arc::new(support::MapStore::new(reference.store()));
+    let login = openai_login::begin_login(&config, "openai-codex", &codex_token_endpoint(&peer))
+        .expect("prepare login");
+    let cancelled = format!(
+        "http://localhost:1455/auth/callback?error=access_denied&state={}",
+        login.state()
+    );
+    assert!(matches!(
+        openai_login::complete_login(&config, "openai-codex", &login, &cancelled, store.as_ref()),
+        Err(CodexLoginError::Cancelled)
+    ));
+    assert!(!store.occupied(&reference).expect("check credential slot"));
+    let redirect = codex_callback(login.state(), "good-code");
+    on_login_thread(|| {
+        openai_login::complete_login(&config, "openai-codex", &login, &redirect, store.as_ref())
+    })
+    .expect("exchange fixture code into the credential store");
+
+    // Resolve the effective config again as a new runtime would.
+    let config = resolved();
+    let reply = on_login_thread(|| {
+        let configured = rivect::providers::configured_provider(&config, &store)
+            .expect("build configured adapter");
+        assert!(configured.refusals.is_empty());
+        let mut broker = Broker::new(configured.provider);
+        let manifest = broker
+            .prepare_with_facts(
+                "main",
+                &config,
+                "/project",
+                "hello",
+                InputOrigin::Human,
+                &rivect::model::RankingFacts::Recorded(rivect::model::RecordedFacts {
+                    surfaces: None,
+                    tools_required: false,
+                    context_tokens_estimate: 5,
+                    obligations: 0,
+                    criteria: 0,
+                    remaining_units: Default::default(),
+                    scope_chain: Vec::new(),
+                }),
+            )
+            .expect("select a model");
+        broker.dispatch(&mut rivect::model::NullLedger, "/project", &manifest)
+    })
+    .expect("the enrolled credential dispatches");
+    assert_eq!(reply.text, "login fixture answer");
+    let requests = peer.received_requests().await.expect("request log");
+    assert_eq!(requests.len(), 3, "one exchange, one listing and one send");
+    let sent = &requests[2];
+    assert_eq!(sent.url.path(), "/backend-api/codex/responses");
+    let body: Value = serde_json::from_slice(&sent.body).expect("model request");
+    assert_eq!(body["model"], "gpt-5.2-codex");
+    assert_eq!(sent.headers["chatgpt-account-id"], CODEX_WORKSPACE);
+}
+
 fn codex_callback(state: &str, code: &str) -> String {
     format!("http://localhost:1455/auth/callback?code={code}&state={state}")
 }

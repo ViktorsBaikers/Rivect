@@ -6151,6 +6151,7 @@ impl Runtime {
     /// the same typed cause a query would give.
     pub fn set_project_root(&mut self, root: PathBuf) {
         self.index.root = root.canonicalize().unwrap_or(root);
+        self.economy.project = self.index.root.display().to_string();
     }
 
     /// Cuts one project-index generation: the run happens on the

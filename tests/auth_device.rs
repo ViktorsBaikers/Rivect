@@ -1024,10 +1024,15 @@ fn tui_login_command_uses_the_same_methods() {
     let reference = resolve_credential(&parsed, "openai-codex").expect("canonical ref");
 
     // The `/login` command begins the browser leg and paints the recorded
-    // verification URL.
+    // verification URL and the next action.
     let pending = login_command(&mut world.runtime, None).expect("the TUI begins a login");
-    assert_eq!(pending.len(), 1);
     assert!(pending[0].contains("https://auth.openai.com/oauth/authorize?"));
+    assert!(
+        pending
+            .iter()
+            .any(|line| line.contains("/login <callback URL>")),
+        "{pending:?}"
+    );
 
     // The same pending leg is completed through `/login <callback>`; the
     // begin above uses the recorded endpoint, so the contract peer is chosen

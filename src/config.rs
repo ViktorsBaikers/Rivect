@@ -65,16 +65,11 @@ const MCP_CREDENTIAL_KEYS: &[&str] = &["reference", "origin", "variable"];
 /// base's own identity. It is neither the store's schema generation
 /// (`PRAGMA user_version`) nor `config_version`, and the base ledger records
 /// it beside the digest it belongs to.
-pub const SHIPPED_BASE_VERSION: u64 = 2;
+pub const SHIPPED_BASE_VERSION: u64 = 3;
 
-/// The shipped base document. A Codex login writes the canonical profile the
-/// operator's `[connections.openai-codex]` row (`kind = "api_key"`, a scoped
-/// `credential_ref`, `profile = "openai-codex"`) and its
-/// `[profiles.openai-codex]` row name; login resolves that existing
-/// declaration and names the missing connection id instead of auto-creating
-/// one. Inlining those rows here would change the base identity and demand a
-/// base-version + pin bump, so they stay documented beside the template.
-pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n# A hook is a user-declared program the executor runs at one\n# instrumented event. It answers allow, deny or stop and may rewrite the\n# request's path; the rewritten request is re-checked by the same\n# admission before any effect, and only the file installs one:\n# [hooks.\"effect.request@project\"]\n# command = \"/usr/local/bin/rivect-hook\"\n# args = []\n# A declared MCP server is operator-owned too: the program, its args, its\n# environment and the origin its egress is admitted against come from this\n# file only, so a request names a server but never supplies one:\n# [mcp.servers.fixture]\n# origin = \"mcp+stdio://fixture\"\n# program = \"/usr/local/bin/rivect-mcp-fixture\"\n# args = []\n# [mcp.servers.fixture.credential]\n# reference = \"keyring:rivect/mcp-fixture\"\n# origin = \"mcp+stdio://fixture\"\n# variable = \"RIVECT_MCP_TOKEN\"\n";
+/// The shipped base document includes an onboarding binding for new users.
+/// Authentication writes secret material through the platform store.
+pub const SHIPPED_DEFAULTS_TOML: &str = "config_version = 1\n[workflow]\nenabled = true\n[decisions]\nmode = \"ask\"\n[context]\n# auto_compact silences the near-full context warning; nothing compacts automatically in this build.\nauto_compact = false\n[models.defaults]\nmodel = { mode = \"auto\" }\neffort = { mode = \"auto\" }\nfallback = { mode = \"auto\" }\n[connections.openai-codex]\nkind = \"api_key\"\nendpoint = \"https://chatgpt.com/backend-api/codex\"\ncredential_ref = \"keyring:rivect/openai-codex\"\nprofile = \"openai-codex\"\n[profiles.openai-codex]\ncredential_ref = \"keyring:rivect/openai-codex\"\n# Declaring a connection takes the full row — kind, endpoint and a\n# scoped credential_ref (https on any host, or http on a loopback host):\n# [connections.openai]\n# kind = \"api_key\"\n# endpoint = \"https://api.openai.com/v1\"\n# credential_ref = \"keyring:rivect/openai\"\n# region = \"us-east-1\"\n# profile = \"default\"\n# [profiles.default]\n# credential_ref = \"keyring:rivect/default\"\n# A hook is a user-declared program the executor runs at one\n# instrumented event. It answers allow, deny or stop and may rewrite the\n# request's path; the rewritten request is re-checked by the same\n# admission before any effect, and only the file installs one:\n# [hooks.\"effect.request@project\"]\n# command = \"/usr/local/bin/rivect-hook\"\n# args = []\n# A declared MCP server is operator-owned too: the program, its args, its\n# environment and the origin its egress is admitted against come from this\n# file only, so a request names a server but never supplies one:\n# [mcp.servers.fixture]\n# origin = \"mcp+stdio://fixture\"\n# program = \"/usr/local/bin/rivect-mcp-fixture\"\n# args = []\n# [mcp.servers.fixture.credential]\n# reference = \"keyring:rivect/mcp-fixture\"\n# origin = \"mcp+stdio://fixture\"\n# variable = \"RIVECT_MCP_TOKEN\"\n";
 
 // ----- the versioned base and the update its ledger records -----
 
@@ -132,14 +127,16 @@ impl<'a> BaseSource<'a> {
     /// The typed layer, read through the shared section schema.
     fn layer(self) -> Result<BaseLayer, ConfigError> {
         let doc: DocumentMut = self.text.parse().map_err(ConfigError::parse)?;
-        let (workflow, decisions, context, models) = validated_base(&doc)?;
+        let base = validated_base(&doc)?;
         Ok(BaseLayer {
             version: self.version,
             digest: self.digest(),
-            workflow: workflow.enabled,
-            decisions: decisions.mode,
-            context,
-            models,
+            workflow: base.workflow.enabled,
+            decisions: base.decisions.mode,
+            context: base.context,
+            models: base.models,
+            connections: base.connections,
+            profiles: base.profiles,
         })
     }
 }
@@ -148,10 +145,9 @@ impl<'a> BaseSource<'a> {
 /// from the user document so the layer that answered a read is never derived
 /// from a comparison of values.
 ///
-/// A base owns no connection, profile or hook. Of the default-bearing sections
-/// it states, `[models.defaults]` merges slot by slot — a base default answers
-/// where the user's document defers the slot or has no document at all — while
-/// a purpose row the user writes stays the user's whole.
+/// Connections and profiles supply onboarding only in the absence of a user
+/// document. Model defaults merge slot by slot and a user purpose row stays
+/// whole.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaseLayer {
     /// The base version this layer was read from (INV-010a).
@@ -162,6 +158,8 @@ pub struct BaseLayer {
     pub decisions: Option<DecisionModeValue>,
     pub context: Context,
     pub models: Models,
+    connections: BTreeMap<String, Connection>,
+    profiles: BTreeMap<String, Profile>,
 }
 
 /// One base an update run offers the ledger: the version, the digest of the
@@ -2128,6 +2126,26 @@ struct ParsedDocument {
 }
 
 fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
+    let parsed = read_document(doc)?;
+    if parsed.connections.is_empty() {
+        return Err(ConfigError::schema(
+            "connections",
+            ConfigIssue::MissingConnections,
+        ));
+    }
+    if parsed.models.defaults.is_none() {
+        return Err(ConfigError::schema(
+            "models.defaults",
+            ConfigIssue::Required {
+                field: "models.defaults".to_string(),
+            },
+        ));
+    }
+    check_model_references(&parsed.connections, &parsed.models)?;
+    Ok(parsed)
+}
+
+fn read_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
     let mut version = None;
     let mut workflow = Workflow::default();
     let mut decisions = Decisions::default();
@@ -2194,13 +2212,25 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
         }
     }
     let version = document_config_version(version)?;
-    if connections.is_empty() {
-        return Err(ConfigError::schema(
-            "connections",
-            ConfigIssue::MissingConnections,
-        ));
-    }
-    for (name, connection) in &connections {
+    check_connection_bindings(&connections, &profiles)?;
+    Ok(ParsedDocument {
+        version,
+        workflow,
+        decisions,
+        context,
+        connections,
+        profiles,
+        models,
+        hooks,
+        mcp,
+    })
+}
+
+fn check_connection_bindings(
+    connections: &BTreeMap<String, Connection>,
+    profiles: &BTreeMap<String, Profile>,
+) -> Result<(), ConfigError> {
+    for (name, connection) in connections {
         let key = format!("connections.{name}");
         match connection.kind {
             ConnKind::ApiKey | ConnKind::Subscription => {
@@ -2251,26 +2281,7 @@ fn validated_document(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> 
             ));
         }
     }
-    if models.defaults.is_none() {
-        return Err(ConfigError::schema(
-            "models.defaults",
-            ConfigIssue::Required {
-                field: "models.defaults".to_string(),
-            },
-        ));
-    }
-    check_model_references(&connections, &models)?;
-    Ok(ParsedDocument {
-        version,
-        workflow,
-        decisions,
-        context,
-        connections,
-        profiles,
-        models,
-        hooks,
-        mcp,
-    })
+    Ok(())
 }
 
 /// The referential checks a document's `[models]` section must pass: every fixed
@@ -2426,54 +2437,25 @@ fn context_section(item: &Item) -> Result<Context, ConfigError> {
     Ok(context)
 }
 
-/// The base document's sections, read by the same schema as the user's
-/// document (AC-054): a base supplies defaults, so it may state the four
-/// default-bearing sections and owns nothing a user owns — connections,
-/// profiles and hooks stay the user's to declare, and a base that states one is
-/// refused rather than silently trusted with it.
-fn validated_base(
-    doc: &DocumentMut,
-) -> Result<(Workflow, Decisions, Context, Models), ConfigError> {
-    let mut version = None;
-    let mut workflow = Workflow::default();
-    let mut decisions = Decisions::default();
-    let mut context = Context::default();
-    let mut models = Models::default();
-    for (key, item) in doc.iter() {
-        match key {
-            "config_version" => {
-                let value = item
-                    .as_integer()
-                    .filter(|value| *value >= 0)
-                    .ok_or_else(|| {
-                        ConfigError::schema(
-                            "config_version",
-                            ConfigIssue::ConfigVersionNotNonNegativeInteger,
-                        )
-                    })?;
-                version = Some(value as u64);
-            }
-            "workflow" => workflow = workflow_section(item)?,
-            "decisions" => decisions = decisions_section(item)?,
-            "context" => context = context_section(item)?,
-            "models" => models = models_table(table_like(key, item)?)?,
-            other => {
-                return Err(ConfigError::schema(
-                    other,
-                    ConfigIssue::UnknownRootKey {
-                        key: other.to_string(),
-                    },
-                ));
-            }
+/// Base defaults use the file schema. Executable declarations stay user-owned.
+fn validated_base(doc: &DocumentMut) -> Result<ParsedDocument, ConfigError> {
+    for key in ["hooks", "mcp"] {
+        if doc.contains_key(key) {
+            return Err(ConfigError::schema(
+                key,
+                ConfigIssue::UnknownRootKey {
+                    key: key.to_string(),
+                },
+            ));
         }
     }
-    document_config_version(version)?;
+    let base = read_document(doc)?;
     // The reserved user namespace (AC-056, REQ-046): a base is the release's
     // own document, so it may not name an id inside the namespace the user's
     // identities live in — a mapping that could name it could rebind or
     // overwrite the user's own experience. The user's own document keeps the
     // namespace; only this layout is refused.
-    for name in models.purposes.keys() {
+    for name in base.models.purposes.keys() {
         if crate::identity::claims_personal_namespace(name) {
             return Err(ConfigError::schema(
                 format!("models.purposes.{name}"),
@@ -2481,7 +2463,7 @@ fn validated_base(
             ));
         }
     }
-    Ok((workflow, decisions, context, models))
+    Ok(base)
 }
 
 #[derive(Debug)]
@@ -4589,7 +4571,11 @@ impl EffectiveConfig {
     /// defers.
     #[must_use]
     pub fn composed(&self) -> Config {
-        let user = self.parsed.clone().unwrap_or_default();
+        let user = self.parsed.clone().unwrap_or_else(|| Config {
+            connections: self.base.connections.clone(),
+            profiles: self.base.profiles.clone(),
+            ..Config::default()
+        });
         Config {
             version: user.version,
             workflow: Workflow {

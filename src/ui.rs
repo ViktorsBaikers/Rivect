@@ -1496,13 +1496,14 @@ fn modal_frame(
     } else {
         area.height.saturating_sub(4).max(6)
     };
+    let top = if compact {
+        area.height.saturating_sub(height)
+    } else {
+        area.height.saturating_sub(height) / 2
+    };
     let rect = ratatui::layout::Rect {
-        x: area.width.saturating_sub(width) / 2,
-        y: if compact {
-            area.height.saturating_sub(height)
-        } else {
-            area.height.saturating_sub(height) / 2
-        },
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area.y.saturating_add(top),
         width,
         height,
     };
@@ -2061,6 +2062,18 @@ fn dispatch_tui_request(runtime: &mut Runtime, request: Value) -> io::Result<Val
 /// The dispatch's transport or refusal error; an omitted result field is a
 /// transport-class error.
 pub fn login_command(runtime: &mut Runtime, argument: Option<&str>) -> io::Result<Vec<String>> {
+    Ok(login_presentation(runtime, argument)?.lines)
+}
+
+struct LoginPresentation {
+    lines: Vec<String>,
+    authenticated_profile: Option<String>,
+}
+
+fn login_presentation(
+    runtime: &mut Runtime,
+    argument: Option<&str>,
+) -> io::Result<LoginPresentation> {
     let (method, params) = match argument {
         None => (
             "auth.login.begin",
@@ -2087,7 +2100,10 @@ pub fn login_command(runtime: &mut Runtime, argument: Option<&str>) -> io::Resul
             Some("none") => "No login is pending.".to_string(),
             _ => return Err(io::Error::other("login cancel answered no state")),
         };
-        return Ok(vec![line]);
+        return Ok(LoginPresentation {
+            lines: vec![line],
+            authenticated_profile: None,
+        });
     }
     if method == "auth.login.begin" {
         let url = result
@@ -2098,17 +2114,28 @@ pub fn login_command(runtime: &mut Runtime, argument: Option<&str>) -> io::Resul
         if let Some(code) = result.get("user_code").and_then(Value::as_str) {
             lines.push(format!("Enter code: {code}"));
             lines.push("Run /login complete to check authorization.".to_string());
+        } else {
+            lines.push("Open the link, then enter /login <callback URL>.".to_string());
         }
-        return Ok(lines);
+        return Ok(LoginPresentation {
+            lines,
+            authenticated_profile: None,
+        });
     }
     if let Some(profile) = result.get("profile").and_then(Value::as_str) {
-        return Ok(vec![format!("Login complete: {profile}")]);
+        return Ok(LoginPresentation {
+            lines: vec![format!("Login complete: {profile}")],
+            authenticated_profile: Some(profile.to_string()),
+        });
     }
     let state = result
         .get("state")
         .and_then(Value::as_str)
         .ok_or_else(|| io::Error::other("login complete omitted profile and state"))?;
-    Ok(vec![format!("Login pending: {state}")])
+    Ok(LoginPresentation {
+        lines: vec![format!("Login pending: {state}")],
+        authenticated_profile: None,
+    })
 }
 
 /// A failed open still owes the operator the boot verdicts the dropped
@@ -2312,6 +2339,7 @@ impl TuiDispatch {
         // started in.
         runtime.set_instructions_root(std::env::current_dir().ok());
         if let Ok(cwd) = std::env::current_dir() {
+            runtime.set_project_root(cwd.clone());
             runtime.set_instructions_root(Some(cwd.clone()));
             runtime.bind_read_scope(cwd.clone());
             runtime.bind_first_task_scope(cwd);
@@ -2999,6 +3027,19 @@ fn economy_row(economy: Option<&Value>) -> String {
         Some(Value::Null) | None => "unknown".to_string(),
         Some(_) => "malformed".to_string(),
     };
+    if economy["settled_tokens"].is_null()
+        && economy["charged_units"].is_null()
+        && economy["context_tokens"].is_null()
+        && economy["cache_rate"].is_null()
+        && economy["quota_remaining"].is_null()
+        && economy["reset_at"].is_null()
+        && economy["model"].is_null()
+        && economy["agents"].as_u64() == Some(0)
+        && economy["pending_sends"].as_u64() == Some(0)
+        && economy["settled_without_total"].as_u64() == Some(0)
+    {
+        return format!("economy: project {project}");
+    }
     format!(
         "economy: project {project} cwd {cwd} settled {} tok ({}) charged {} units ({}) agents {} slots ({}) reset {} ({}) quota {} ({}) context {} tok ({}) cache {cache} ({}) model {} ({}) effort {} ({}) purpose {} scope {}",
         economy_number(economy, "settled_tokens"),
@@ -4231,9 +4272,29 @@ fn run_composer_command(
                 .map(str::trim)
                 .filter(|argument| !argument.is_empty());
             let dispatch = ensure_dispatch(tui_dispatch, view, data_root)?;
-            match login_command(&mut dispatch.runtime, argument) {
-                Ok(lines) => {
-                    view.extend_transcript(&lines);
+            match login_presentation(&mut dispatch.runtime, argument) {
+                Ok(login) => {
+                    view.extend_transcript(&login.lines);
+                    if let Some(profile) = login.authenticated_profile {
+                        let config = dispatch.runtime.config_for_broker();
+                        match config.resolve_purpose("main") {
+                            Ok(purpose) => {
+                                let model = match purpose.model {
+                                    crate::config::ModelAssign::Fixed(pin) => pin.model_id,
+                                    crate::config::ModelAssign::Auto { .. } => "auto".to_string(),
+                                    crate::config::ModelAssign::Inherit => "inherit".to_string(),
+                                };
+                                view.status =
+                                    format!("Rivect · connected · {profile} · model {model}");
+                            }
+                            Err(error) => {
+                                view.status = format!("Rivect · connected · {profile}");
+                                view.push_transcript(format!(
+                                    "Model selection unavailable: {error}"
+                                ));
+                            }
+                        }
+                    }
                     Ok(())
                 }
                 // A login refusal never echoes the composer input: the
@@ -4342,6 +4403,16 @@ where
     // watches the degraded session that follows.
     let mut tui_dispatch = match open_dispatch(data_root) {
         Ok(dispatch) => {
+            let project = &dispatch.runtime.economy().project;
+            view.transcript[1] = format!("Project: {project}");
+            if dispatch
+                .runtime
+                .config_for_broker()
+                .connections
+                .contains_key(crate::providers::openai_login::CANONICAL_PROFILE)
+            {
+                view.push_transcript("Run /login to connect your ChatGPT account.".to_string());
+            }
             surface_boot_diagnostics(&mut view, &dispatch.runtime);
             Some(dispatch)
         }
@@ -5083,12 +5154,10 @@ mod tests {
             .last()
             .cloned()
             .expect("the economy slot paints last");
-        assert!(
-            economy.starts_with("economy: project ")
-                && economy.contains("settled unknown tok")
-                && economy.contains("quota unknown"),
-            "an unspent runtime names its workspace and unknowns: {economy}"
-        );
+        assert!(economy.starts_with("economy: project "), "{economy}");
+        assert!(!economy.contains("unknown"), "{economy}");
+        assert!(status["economy"]["settled_tokens"].is_null());
+        assert!(status["economy"]["quota_remaining"].is_null());
         Ok(())
     }
 
@@ -6636,6 +6705,7 @@ mod tests {
 
             // `/login` begins the browser leg and paints the recorded URL.
             run_login_composer("/login", &mut view, &mut dispatch, root.path());
+            assert!(view.status.contains("not connected"), "{}", view.status);
             assert!(
                 view.transcript
                     .iter()
@@ -6667,6 +6737,9 @@ mod tests {
                 &mut dispatch,
                 root.path(),
             );
+            assert!(view.status.contains("connected"), "{}", view.status);
+            assert!(!view.status.contains("not connected"), "{}", view.status);
+            assert!(view.status.contains("gpt-5.2-codex"), "{}", view.status);
             assert!(
                 view.transcript
                     .iter()
@@ -9825,13 +9898,7 @@ fallback = { mode = \"off\" }\n";
             seen(&mut exit.pty, b"\x1b[?1049h", secs(10)),
             "alternate screen must be entered on start"
         );
-        drop(screen(
-            &exit.pty,
-            40,
-            120,
-            "No project or index is selected",
-            secs(10),
-        ));
+        drop(screen(&exit.pty, 40, 120, "Run /login", secs(10)));
         press(&mut exit.pty, b"\x1b");
         expect_exit(&mut exit, secs(10));
         assert_eq!(outcome_of(&exit), json!({ "exit": 0 }));

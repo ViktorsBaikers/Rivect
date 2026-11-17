@@ -2689,8 +2689,7 @@ fn installed_linear_mode_is_append_only_plain_text() {
             "{label}: linear emitted cursor addressing: {}",
             String::from_utf8_lossy(&bytes)
         );
-        let start = b"Input is available. Enter a task or a clarification.\r\n\
-No project or index is selected; ordinary replies are not blocked.";
+        let start = b"Input is available. Enter a task or a clarification.\r\nProject:";
         assert!(
             support::find_subsequence(&bytes, start).is_some(),
             "{label}: consecutive transcript rows arrive intact: {}",
@@ -2701,6 +2700,52 @@ No project or index is selected; ordinary replies are not blocked.";
             "{label}: the help row arrives in the stream"
         );
     }
+}
+
+#[test]
+fn installed_fresh_project_prepares_and_cancels_login() {
+    let root = tempfile::TempDir::with_prefix("rivect-installed-onboarding-").expect("test root");
+    let home = root.path().join("home");
+    let project = root.path().join("project");
+    let data = root.path().join("private-state");
+    std::fs::create_dir(&home).expect("isolated HOME");
+    std::fs::create_dir(&project).expect("project directory");
+    let mut command = support::pty_command(support::release::baseline_bundle().join("rivect"));
+    command.cwd(&project);
+    command.env("HOME", &home);
+    command.arg("--data-root");
+    command.arg(&data);
+    let mut pty =
+        support::PtySession::spawn(command, 24, 120, root, data).expect("spawn packaged Rivect");
+    let screen = |pty: &support::PtySession, needle: &str| {
+        support::wait_for_screen_text(pty, 24, 120, needle, WAIT).expect("read terminal")
+    };
+    let fresh = screen(&pty, "Run /login");
+    assert!(
+        fresh.contains(
+            project
+                .canonicalize()
+                .expect("canonical cwd")
+                .to_str()
+                .expect("UTF-8 cwd")
+        ),
+        "{fresh}"
+    );
+    assert!(fresh.contains("not connected"), "{fresh}");
+    assert!(!fresh.contains("NOT_RUN"), "{fresh}");
+    pty.send(b"/login\r").expect("prepare login");
+    let pending = screen(&pty, "Login pending:");
+    assert!(pending.contains("Login pending:"), "{pending}");
+    assert!(pending.contains("not connected"), "{pending}");
+    pty.send(b"/login cancel\r").expect("cancel login");
+    let cancelled = screen(&pty, "Login cancelled.");
+    assert!(cancelled.contains("Login cancelled."), "{cancelled}");
+    assert!(cancelled.contains("not connected"), "{cancelled}");
+    pty.send(b"\x1b").expect("exit");
+    assert_eq!(pty.wait_exit(WAIT).expect("process exit"), Some(0));
+    let bytes = pty.collected().expect("terminal output");
+    require_fullscreen_restore(&bytes).expect("terminal restored");
+    pty.finish().expect("teardown");
 }
 
 #[test]
