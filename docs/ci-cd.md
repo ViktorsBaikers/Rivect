@@ -37,9 +37,9 @@ curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/ins
 Intel macOS, Linux ARM64 и musl этой поставкой не поддерживаются.
 Пользователю не нужны Cargo, `gh`, `jq` или Python. Архив содержит ровно
 `rivect`, `rivect-sandbox-helper`, `rivect.manifest.json`; helper устанавливается
-рядом с CLI. Архивы называются `rivect-v0.1.2-TARGET.tar.gz`, checksums —
-`TARGET.sha256`. Корневой пакет — 0.1.2, независимый helper остаётся 0.1.0;
-существующие теги `v0.1.0` и `v0.1.1` не переносятся.
+рядом с CLI. Архивы называются `rivect-v0.1.3-TARGET.tar.gz`, checksums —
+`TARGET.sha256`. Корневой пакет — 0.1.3, независимый helper остаётся 0.1.0;
+уже отправленные теги не переносятся.
 До переключения активного bundle установщик проверяет запуск CLI через
 `--version`; несовместимый бинарник не заменяет работающую установку.
 Установка без `sudo`: полные bundles хранятся в
@@ -58,6 +58,23 @@ Ubuntu 24.04 сохраняется как build/runtime baseline: перехо�
 production bundle не меняются. Источник и checksum проверены 2026-11-16:
 [upstream checksums](https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/sha256sums.asc).
 Лицензия utility — GPL-2.0-or-later; utility не включается в поставку Rivect.
+
+### macOS: настоящий Git и Exec-only scope
+
+macOS jobs `test` и `verify-release` находят настоящий Apple Git через
+`/usr/bin/xcrun --find git`. Приватный каталог `mktemp` под `$RUNNER_TEMP`
+содержит только symlink `git` на этот executable и добавляется в `GITHUB_PATH`.
+Это исключает зависимость confined carrier от Homebrew dylibs вне профиля;
+весь `/usr/bin` не поднимается в PATH, поэтому выбор Python не меняется.
+
+По §15.1 ТЗ право исполнения не даёт права читать постороннюю конфигурацию.
+Production macOS launcher после очистки окружения задаёт фиксированный
+`GIT_CONFIG_NOSYSTEM=1`, а не наследует значение вызывающего процесса:
+скопированный Apple Git не должен читать системный `gitconfig` из Xcode.
+Seatbelt profile, файловые разрешения и классификация ошибок не расширяются.
+AC-078 / DEC-022 по-прежнему проверяется настоящим Git, скопированным в scope;
+отдельный `true` control, `/dev/null`, отрицательные проверки и лимиты сохранены.
+Недоступная sandbox остаётся `NOT_RUN`; отказ после успешного control — failure.
 
 ## Владельцы проверок
 

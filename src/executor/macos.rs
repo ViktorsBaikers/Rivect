@@ -750,6 +750,8 @@ fn run_confined_inner(
     args: &[&OsStr],
 ) -> Result<ConfinedOutcome, WorkerError> {
     let mut command = helper_launch_command()?;
+    // An exec grant does not admit reads of ambient system Git configuration.
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
     command
         .arg(sandbox_exec)
         .arg("-p")

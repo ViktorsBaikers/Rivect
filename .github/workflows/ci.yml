@@ -78,6 +78,14 @@ jobs:
       - name: locate candidate outside the checkout
         run: |
           echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+      - name: select native Apple Git for confined execution
+        if: matrix.platform == 'macos'
+        run: |
+          git_bin=$(/usr/bin/xcrun --find git)
+          test -x "$git_bin"
+          shim_dir=$(mktemp -d "$RUNNER_TEMP/rivect-native-git.XXXXXX")
+          ln -s "$git_bin" "$shim_dir/git"
+          printf '%s\n' "$shim_dir" >> "$GITHUB_PATH"
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -161,6 +169,14 @@ jobs:
       - name: locate candidate outside the checkout
         run: |
           echo "RIVECT_TEST_BUNDLE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+      - name: select native Apple Git for confined execution
+        if: matrix.platform == 'macos'
+        run: |
+          git_bin=$(/usr/bin/xcrun --find git)
+          test -x "$git_bin"
+          shim_dir=$(mktemp -d "$RUNNER_TEMP/rivect-native-git.XXXXXX")
+          ln -s "$git_bin" "$shim_dir/git"
+          printf '%s\n' "$shim_dir" >> "$GITHUB_PATH"
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
