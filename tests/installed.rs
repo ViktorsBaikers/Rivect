@@ -812,7 +812,7 @@ fn packaged_docs_search_binds_five_profiles_and_keeps_docs_status_pure() {
 }
 
 /// One loopback Chat Completions peer for the installed ordinary request:
-/// every POST is counted and answered with one streamed `read_file` call.
+/// The first POST requests a read. The second must carry its shared contents.
 struct OrdinaryPeer {
     endpoint: String,
     address: std::net::SocketAddr,
@@ -822,7 +822,7 @@ struct OrdinaryPeer {
 }
 
 impl OrdinaryPeer {
-    fn start(read_path: &'static str) -> Self {
+    fn start(read_path: &'static str, sample: &'static str) -> Self {
         let listener =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the ordinary peer");
         let address = listener.local_addr().expect("peer address");
@@ -838,12 +838,34 @@ impl OrdinaryPeer {
                 if thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
                     return;
                 }
-                let Some((method, target, _body)) = read_http(&mut stream) else {
+                let Some((method, target, request)) = read_http(&mut stream) else {
                     continue;
                 };
                 if method == "POST" && target.starts_with("/v1/chat/completions") {
-                    thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body = chat_stream(read_path);
+                    let turn = thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let request = String::from_utf8_lossy(&request);
+                    let body = match turn {
+                        0 => {
+                            assert!(
+                                !request.contains(sample),
+                                "project bytes arrived before consent"
+                            );
+                            chat_stream(read_path)
+                        }
+                        1 => {
+                            assert!(
+                                request.contains(sample),
+                                "the next request must carry the read result"
+                            );
+                            let result = json!({
+                                "id": "c2", "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"role": "assistant",
+                                    "content": "I read the installed project sample."}, "finish_reason": "stop"}],
+                            });
+                            format!("data: {result}\n\ndata: [DONE]\n\n")
+                        }
+                        _ => panic!("unexpected request after the installed read report"),
+                    };
                     let head = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
@@ -987,8 +1009,8 @@ fn write_ordinary_receipt(candidate: &str) {
         "schema_version": 1,
         "status": "pass",
         "candidate_manifest_sha256": candidate,
-        "sends": 1,
-        "settlements": 1,
+        "sends": 2,
+        "settlements": 2,
     });
     std::fs::write(
         &path,
@@ -997,14 +1019,13 @@ fn write_ordinary_receipt(candidate: &str) {
     .expect("write the ordinary receipt");
 }
 
-/// The packaged artifact runs one ordinary first task from the TUI composer:
-/// the create publishes the start question, its card opens, and `begin`
-/// drains the configured local provider to one verified outcome and one
-/// settlement.
+/// The packaged composer reads a real file and retains the two distinct
+/// settlements around the user's decision to share its contents.
 #[test]
-fn installed_ordinary_request_completes_with_one_settlement() {
+fn installed_ordinary_request_reports_a_shared_read_with_two_settlements() {
     invalidate_ordinary_receipt();
-    let peer = OrdinaryPeer::start("AGENTS.md");
+    let sample = "installed inventory sample 851";
+    let peer = OrdinaryPeer::start("inventory.txt", sample);
     let root = tempfile::TempDir::with_prefix("rivect-installed-ordinary-").expect("fixture root");
     let bundle = support::release::baseline_bundle();
     assert!(
@@ -1023,7 +1044,7 @@ fn installed_ordinary_request_completes_with_one_settlement() {
     let cwd = root.path().join("nested working dir").join("юникод cwd");
     std::fs::create_dir_all(&data).expect("data root");
     std::fs::create_dir_all(&cwd).expect("nested cwd");
-    std::fs::write(cwd.join("AGENTS.md"), "installed instructions\n").expect("instruction");
+    std::fs::write(cwd.join("inventory.txt"), sample).expect("project sample");
     std::fs::write(
         data.join("config.toml"),
         installed_chat_config(&peer.endpoint),
@@ -1043,26 +1064,27 @@ fn installed_ordinary_request_completes_with_one_settlement() {
     );
     pty.send("run the installed task\r".as_bytes())
         .expect("pty send");
-    let _card =
+    let card =
         support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", Duration::from_secs(10))
             .expect("start card");
+    assert!(card.contains("awaiting decision"), "{card}");
     // The card's first frame flushes only while the harness drains the PTY;
     // the consent floor runs from that completed paint. A bare sleep stalls
     // the flush and lands the Enter inside the floor, so pump past it.
-    pty.pump_for(Duration::from_millis(500))
+    pty.pump_for(Duration::from_secs(2))
         .expect("pump past the decision consent floor");
     pty.send(b"\r").expect("pty send enter");
-    let _answered = support::wait_for_screen_text(
-        &pty,
-        24,
-        80,
-        "decision answer recorded; task resumed",
-        Duration::from_secs(10),
-    )
-    .expect("answer note");
-    let _completed =
-        support::wait_for_screen_text(&pty, 24, 80, "completed", Duration::from_secs(10))
-            .expect("completed dock");
+    let share =
+        support::wait_for_screen_text(&pty, 24, 80, "Share inventory.txt", Duration::from_secs(10))
+            .expect("sharing card");
+    assert!(share.contains("Share inventory.txt"), "{share}");
+    assert_eq!(peer.requests(), 1, "the content has not been sent yet");
+    pty.pump_for(Duration::from_secs(2)).expect("consent floor");
+    pty.send(b"\x1b[B\r").expect("share once");
+    let response = "I read the installed project sample.";
+    let screen = support::wait_for_screen_text(&pty, 24, 80, response, Duration::from_secs(10))
+        .expect("model report");
+    assert!(screen.contains(response), "{screen}");
     pty.send(b"\x1b").expect("pty send exit");
     // The packaged TUI queries the cursor position while restoring; the
     // deaf live waits never answered, so the exit wait plays terminal.
@@ -1081,8 +1103,12 @@ fn installed_ordinary_request_completes_with_one_settlement() {
             row.get(0)
         })
         .expect("count settlements");
-    assert_eq!(settlements, 1);
-    assert_eq!(peer.requests(), 1, "one configured-model send");
+    assert_eq!(settlements, 2);
+    assert_eq!(
+        peer.requests(),
+        2,
+        "one initial and one approved follow-up send"
+    );
 
     let data_argument = data.to_str().expect("utf-8 data root");
     let usage_run = run_packaged_frames(
@@ -1111,11 +1137,11 @@ fn installed_ordinary_request_completes_with_one_settlement() {
     let usage_answers = responses(&usage_run);
     assert_eq!(
         answer(&usage_answers, 2)["result"]["totals"]["settled_count"],
-        1,
-        "the packaged usage.view counts the one settlement"
+        2,
+        "the packaged usage.view counts both settlements"
     );
 
     pty.finish().expect("pty teardown");
     write_ordinary_receipt(&candidate);
-    println!("installed ordinary: completed; sends=1 settlements=1");
+    println!("installed ordinary: read reported; sends=2 settlements=2");
 }

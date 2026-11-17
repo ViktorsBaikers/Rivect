@@ -1222,7 +1222,7 @@ fn git_ingress_refuses_an_unscoped_program_before_any_spawn() {
 }
 
 #[test]
-fn vision_purpose_is_refused_before_any_send() {
+fn vision_without_a_capable_provider_is_refused_before_any_send() {
     support::not_run::reset("ingress.vision");
     let (provider, calls, _manifest) = support::CountingProvider::new();
     let mut world = support::open_world_with(
@@ -1233,8 +1233,7 @@ fn vision_purpose_is_refused_before_any_send() {
     );
     let config = world.runtime.config_for_broker();
     // The offline positive lives in tests/vision; this is its unsupported
-    // control: an undeclared vision purpose is refused by the broker before
-    // any wire attempt even when the payload is a valid PNG.
+    // control: the shipped text connection cannot serve a valid PNG.
     let prepared = world.runtime.broker.prepare_vision(
         "vision",
         &config,
@@ -1248,14 +1247,13 @@ fn vision_purpose_is_refused_before_any_send() {
         },
     );
     match prepared {
-        Err(rivect::model::ModelError::NoEligibleCandidate { purpose, rejected }) => {
-            assert_eq!(purpose, "vision", "the refusal names the requested purpose");
-            assert!(
-                rejected.is_empty(),
-                "an undeclared purpose enumerates no declared candidate: {rejected:?}"
+        Err(rivect::model::ModelError::ImageUnsupported { connection, .. }) => {
+            assert_eq!(
+                connection, "openai-codex",
+                "the refusal names the shipped connection"
             );
         }
-        other => panic!("an undeclared vision purpose is refused typed: {other:?}"),
+        other => panic!("an image without a capable provider is refused typed: {other:?}"),
     }
     assert!(
         !config.models.purposes.contains_key("vision"),

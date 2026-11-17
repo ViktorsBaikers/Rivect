@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use support::{World, corpus_create};
 
 /// Packaged PTY legs run against a busy host: a generous deadline keeps a
@@ -454,7 +454,7 @@ impl OllamaPeer {
                 if thread_stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let Some((method, target, _)) = read_http(&mut stream) else {
+                let Some((method, target, request)) = read_http(&mut stream) else {
                     continue;
                 };
                 // The Responses adapter's legs: the model send is the one
@@ -463,6 +463,15 @@ impl OllamaPeer {
                 // `/api/show` are the native surface, never sends.
                 let (status, body) = if method == "POST" && target.ends_with("/v1/responses") {
                     thread_posts.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        !String::from_utf8_lossy(&request)
+                            .contains("vision fixture local sample 642")
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&request)
+                            .contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABAAAAAElFTkSuQmCC"),
+                        "the actual PNG must reach the Responses endpoint"
+                    );
                     ("200 OK", responses_stream(read_path))
                 } else if target.ends_with("/api/show") {
                     (
@@ -556,8 +565,7 @@ fn read_http(stream: &mut std::net::TcpStream) -> Option<(String, String, Vec<u8
     Some((method, target, body))
 }
 
-/// One completed Responses stream carrying a single `read_file` call:
-/// the answer step executes it once with no second model send.
+/// One completed Responses stream carrying a single `read_file` call.
 fn responses_stream(read_path: &str) -> String {
     let arguments = serde_json::to_string(&json!({"path": read_path})).expect("arguments");
     let call = json!({
@@ -598,8 +606,8 @@ fn installed_vision_config(endpoint: &str) -> String {
 }
 
 #[test]
-fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
-    let peer = OllamaPeer::start("AGENTS.md");
+fn packaged_tui_slash_image_sends_the_png_and_keeps_the_requested_read_local() {
+    let peer = OllamaPeer::start("inventory.txt");
     let root = tempfile::TempDir::with_prefix("rivect-vision-tui-").expect("fixture root");
     let bundle = support::release::baseline_bundle();
     assert!(
@@ -611,7 +619,7 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
     let cwd = root.path().join("nested").join("юникод");
     std::fs::create_dir_all(&data).expect("data root");
     std::fs::create_dir_all(&cwd).expect("cwd");
-    std::fs::write(cwd.join("AGENTS.md"), "vision instructions\n").expect("instructions");
+    std::fs::write(cwd.join("inventory.txt"), "vision fixture local sample 642").expect("sample");
     std::fs::write(cwd.join("image.png"), PNG).expect("image fixture");
     std::fs::write(
         data.join("config.toml"),
@@ -656,42 +664,27 @@ fn packaged_tui_slash_image_attaches_a_png_and_completes_with_one_settlement() {
     let card =
         support::wait_for_screen_text(&pty, 24, 80, "awaiting decision", WAIT).expect("start card");
     assert!(card.contains("awaiting decision"), "the start card opens");
-    std::thread::sleep(Duration::from_millis(300));
-    // The card's first paint drains input queued before it, and under load
-    // that drain can run after the paint is already visible — eating an
-    // Enter aimed at the open card. Resend while the card is still painted:
-    // a committed answer closes the card, and Enter on the empty composer is
-    // a no-op, so the one-settlement proof stays exact.
-    let deadline = Instant::now() + WAIT;
-    let answered = loop {
-        pty.send(b"\r").expect("pty send enter");
-        let frame = support::wait_for_screen_text(
-            &pty,
-            24,
-            80,
-            "decision answer recorded; task resumed",
-            Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
-        )
-        .expect("answer note");
-        if frame.contains("decision answer recorded; task resumed") {
-            break frame;
-        }
-        let screen = support::reconstruct_screen(&pty.collected().expect("pty read"), 24, 80);
-        if Instant::now() >= deadline || !screen.contains("focus 1/2") {
-            break frame;
-        }
-    };
-    assert!(
-        answered.contains("decision answer recorded; task resumed"),
-        "the answer resumes the task: {answered}"
-    );
-    let completed =
-        support::wait_for_screen_text(&pty, 24, 80, "completed", WAIT).expect("completed dock");
-    assert!(completed.contains("completed"), "the task completes");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("start consent floor");
+    pty.send(b"\r").expect("begin");
+    let share = support::wait_for_screen_text(&pty, 24, 80, "Share inventory.txt", WAIT)
+        .expect("read disclosure card");
+    assert!(share.contains("Share inventory.txt"), "{share}");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("disclosure consent floor");
+    pty.send(b"\r").expect("keep the file local");
+    let local = support::wait_for_screen_text(&pty, 24, 80, "file contents kept local", WAIT)
+        .expect("read outcome");
+    assert!(local.contains("file contents kept local"), "{local}");
     pty.send(b"\x1b").expect("pty send exit");
     assert_eq!(pty.wait_exit(WAIT).expect("pty wait"), Some(0));
     let db = data.join("runtime").join("rivect.db");
     let conn = rusqlite::Connection::open(&db).expect("open store");
+    let reads: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE effect_class = 'read' AND state = 'confirmed' AND describe LIKE '%inventory.txt'",
+        [], |row| row.get(0),
+    ).expect("confirmed project read");
+    assert_eq!(reads, 1);
     let settlements: i64 = conn
         .query_row("SELECT COUNT(*) FROM usage_settlements", [], |row| {
             row.get(0)

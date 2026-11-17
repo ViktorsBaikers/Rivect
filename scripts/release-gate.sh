@@ -71,7 +71,7 @@ if [ "$receipts_only" = false ]; then
         run_producer "tests/fixtures/acceptance-rows-$group.json" "target/acceptance-rows-$group.json"
     done
     run_producer tests/fixtures/search-trials.json target/search-trials.json
-    "$cargo" test --locked --test installed installed_ordinary_request_completes_with_one_settlement -- --exact --show-output ||
+    "$cargo" test --locked --test installed installed_ordinary_request_reports_a_shared_read_with_two_settlements -- --exact --show-output ||
         exit 1
     "$cargo" test --locked --test installed_tui installed_19_state_matrix_runs_on_the_packaged_artifact -- --exact --show-output ||
         exit 1

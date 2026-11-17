@@ -1325,7 +1325,7 @@ fn search_receipt_missing_stale_or_unmarked_is_never_pass() {
     );
 }
 
-const INSTALLED_ORDINARY_PRODUCER: &str = "cargo test --locked --test installed installed_ordinary_request_completes_with_one_settlement -- --exact --nocapture";
+const INSTALLED_ORDINARY_PRODUCER: &str = "cargo test --locked --test installed installed_ordinary_request_reports_a_shared_read_with_two_settlements -- --exact --nocapture";
 const INSTALLED_UI_PRODUCER: &str = "cargo test --locked --test installed_tui installed_19_state_matrix_runs_on_the_packaged_artifact -- --exact --nocapture";
 
 fn installed_receipt_path() -> PathBuf {
@@ -1377,8 +1377,8 @@ fn installed_ordinary_evidence(path: &Path, candidate: &str) -> Result<String, S
             receipt["status"].as_str().unwrap_or("missing")
         ));
     }
-    if receipt["sends"] != json!(1) || receipt["settlements"] != json!(1) {
-        return Err("receipt does not record sends=1 settlements=1".to_string());
+    if receipt["sends"] != json!(2) || receipt["settlements"] != json!(2) {
+        return Err("receipt does not record sends=2 settlements=2".to_string());
     }
     Ok(format!("{}#installed-ordinary", path.display()))
 }
@@ -2073,8 +2073,8 @@ fn installed_receipts_absent_stale_or_failed_are_never_pass() {
             "schema_version": 1,
             "status": "pass",
             "candidate_manifest_sha256": candidate,
-            "sends": 1,
-            "settlements": 1,
+            "sends": 2,
+            "settlements": 2,
         })
         .to_string(),
     )
