@@ -37,9 +37,9 @@ curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/ins
 Intel macOS, Linux ARM64 и musl этой поставкой не поддерживаются.
 Пользователю не нужны Cargo, `gh`, `jq` или Python. Архив содержит ровно
 `rivect`, `rivect-sandbox-helper`, `rivect.manifest.json`; helper устанавливается
-рядом с CLI. Архивы называются `rivect-v0.1.1-TARGET.tar.gz`, checksums —
-`TARGET.sha256`. Корневой пакет — 0.1.1, независимый helper остаётся 0.1.0;
-существующий тег `v0.1.0` не переносится.
+рядом с CLI. Архивы называются `rivect-v0.1.2-TARGET.tar.gz`, checksums —
+`TARGET.sha256`. Корневой пакет — 0.1.2, независимый helper остаётся 0.1.0;
+существующие теги `v0.1.0` и `v0.1.1` не переносятся.
 До переключения активного bundle установщик проверяет запуск CLI через
 `--version`; несовместимый бинарник не заменяет работающую установку.
 Установка без `sudo`: полные bundles хранятся в

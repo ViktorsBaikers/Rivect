@@ -78,14 +78,18 @@ awk 'substr($0, 1, 1) != "-" {bad=1} END {exit (bad || NR != 3)}' "$work/types" 
 staging=$(mktemp -d "$root/releases/.staging.XXXXXX") || fail 'cannot stage installation'
 tar -xzf "$work/$archive" --no-same-owner --no-same-permissions -C "$staging" || fail 'archive extraction failed'
 for name in rivect rivect-sandbox-helper rivect.manifest.json; do
-    [ -f "$staging/$name" ] && [ ! -L "$staging/$name" ] || fail 'extracted bundle is not regular files'
+    if [ ! -f "$staging/$name" ] || [ -L "$staging/$name" ]; then
+        fail 'extracted bundle is not regular files'
+    fi
 done
 chmod 0755 "$staging" "$staging/rivect" "$staging/rivect-sandbox-helper" || fail 'cannot set executable permissions'
 chmod 0644 "$staging/rivect.manifest.json" || fail 'cannot set manifest permissions'
 env -i HOME="$HOME" PATH="$PATH" "$staging/rivect" --version >/dev/null || fail 'release binary cannot run on this system'
 release=$root/releases/$expected
 if [ -e "$release" ] || [ -L "$release" ]; then
-    [ -d "$release" ] && [ ! -L "$release" ] || fail 'existing bundle path is not a directory'
+    if [ ! -d "$release" ] || [ -L "$release" ]; then
+        fail 'existing bundle path is not a directory'
+    fi
     for name in rivect rivect-sandbox-helper rivect.manifest.json; do
         if [ ! -f "$release/$name" ] || [ -L "$release/$name" ] || ! cmp -s "$staging/$name" "$release/$name"; then
             fail 'existing bundle differs from verified archive'
