@@ -194,5 +194,42 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
   2 ignored. PID marker fixture публикуется атомарно после полной записи.
 - Независимые scoped spec/code reviews: actionable membership-loss finding
   исправлен с реальным create/delete proof; owning recheck — no-findings.
-  Следующий hosted diagnostic run и package upload пока NOT_RUN; local PASS
-  не заменяет macOS15 evidence и не закрывает исходную CI/package цель.
+- Push `800fa3f` выполнен. Hosted run
+  [43962787351](https://github.com/ViktorsBaikers/Rivect/actions/runs/43962787351):
+  quality и Linux PASS; macOS FAIL в `auth_band7` и `index_worker`.
+  `search_index` прошёл. Это не общий CI GREEN.
+- Linux package создан: artifact `xhost-linux` (14276901595). Скачанный archive
+  содержит только `rivect`, `rivect-sandbox-helper`, `rivect.manifest.json`;
+  hashes бинарников, executable modes и привязка receipt к commit/run проверены.
+  SHA-256 manifest:
+  `5a733d9281e206e470ccc4d56596e436a6e493b79645243b79b37f6a3d03e8c4`.
+  Linux ELF на macOS не запускался. macOS package пока не создан.
+- Hosted synthetic memory probes завершились ENOMEM/SIGABRT при peak ниже
+  512 MiB; пересечение physical limit не доказано. Parser может законно первым
+  получить process resource limit. Следующая коррекция сохраняет оба budget
+  guards: physical fixture использует уникальные paced blocks; parser принимает
+  объявленные memory/resource-limit outcomes с прежним deadline.
+  Промежуточный `index_worker`: 49 passed, 2 ignored; fmt/clippy PASS.
+  Review выявил недостаточный oracle: обычный SIGABRT тоже классифицируется
+  как resource limit. Принимаемому сигналу нужна атрибуция из исходного запуска;
+  отдельное synthetic воспроизведение её не заменяет. Исходный stderr теперь
+  захватывается bounded exec-wrapper без смены PID, stdin, arguments или memory
+  limits. Resource signal принимается только с каноническим Tree-sitter
+  allocation/reallocation refusal. Настоящий посторонний SIGABRT отвергается;
+  восемь positive calibrations проверяют classifier, не изображая OS observations.
+  Финальный локальный `index_worker`: 50 passed, 2 ignored; fmt/clippy PASS.
+  Логи: `/tmp/rivect-macos-attribution-native.log`,
+  `/tmp/rivect-macos-attribution-clippy.log`. Scoped recheck: no-findings.
+- Hosted polling guard наблюдал один poll при общей 400 ms квоте. Начальная
+  HTTP работа тоже расходует квоту; фиксированный минимум polls не является
+  переносимым oracle. Детерминированная замена прошла 8 unit и 28 integration
+  tests: shared budget включает 300 s setup из 400 s; интервалы 20/40 s дают
+  ровно 4/2 polls, истечение в 400 s и отсутствие публикации. Прежний отдельный
+  publication-admission guard сохранён внутри owner test. Новый hosted proof NOT_RUN.
+  Tag/Release не создавались; CI artifacts хранятся семь дней.
+- Финальный локальный §14 (2026-11-17 UTC) PASS: workspace tests, отдельные
+  doctests, fmt, clippy со всеми targets/features, rustdoc `-Dwarnings`,
+  dependency policy и locked fetch. Inputs и полные логи:
+  `/tmp/rivect-macos-final.dT1oyW/`; fmt/clippy и targeted memory log указаны выше.
+  Настоящий CLI `--version`/`--help` прошёл с очищенным окружением и отдельным HOME.
+  Это proof локального кандидата поверх `800fa3f`, не hosted GREEN нового commit.

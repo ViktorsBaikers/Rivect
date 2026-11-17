@@ -30,11 +30,11 @@ use rivect_sandbox_helper::{INDEX_WORKER_MEMORY_BUDGET, MEMORY_BUDGET_FLAG, Reus
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
@@ -49,6 +49,7 @@ const SIGABRT: i32 = 6;
 const SIGKILL: i32 = 9;
 const SIGSEGV: i32 = 11;
 const SIGXCPU: i32 = 24;
+const PARSER_STDERR_CAP: usize = 4096;
 
 /// The real helper, built beside the test harness.
 fn helper() -> PathBuf {
@@ -116,6 +117,20 @@ fn sh_quote(text: &str) -> String {
 
 fn quoted(path: &Path) -> String {
     sh_quote(&path.display().to_string())
+}
+
+fn sanitized_stderr(bytes: &[u8], paths: &[&Path]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    for path in paths {
+        let path = path.to_string_lossy();
+        text = text.replace(path.as_ref(), "<fixture>");
+        if let Some(alias) = path.strip_prefix("/private") {
+            text = text.replace(alias, "<fixture>");
+        } else if path.starts_with("/var/") {
+            text = text.replace(&format!("/private{path}"), "<fixture>");
+        }
+    }
+    text.chars().flat_map(char::escape_default).collect()
 }
 
 /// Where a worker shim records its pid: `echo` writes it with its newline
@@ -585,6 +600,45 @@ fn pid_shim(dir: &Path, name: &str, pid_file: &Path, tail: &str) -> PathBuf {
     )
 }
 
+/// Capture the original exec'd worker without a pipe reader or another child.
+fn captured_stderr_shim(
+    dir: &Path,
+    name: &str,
+    pid_file: &Path,
+    program: &Path,
+) -> (PathBuf, PathBuf) {
+    let stderr = dir.join(format!("{name}.stderr"));
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stderr)
+            .expect("create private stderr capture"),
+    );
+    // FSIZE bounds disk use; env removes only the shell's added keys,
+    // preserving the helper's other environment and inherited memory limits.
+    let shim = pid_shim(
+        dir,
+        name,
+        pid_file,
+        &format!(
+            "ulimit -f 4 || exit 9\nexec /usr/bin/env -u PWD -u SHLVL -u _ {} \"$@\" 2>{}",
+            quoted(program),
+            quoted(&stderr)
+        ),
+    );
+    (shim, stderr)
+}
+
+fn read_parser_stderr(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut stderr = Vec::with_capacity(PARSER_STDERR_CAP + 1);
+    std::fs::File::open(path)?
+        .take(u64::try_from(PARSER_STDERR_CAP + 1).expect("stderr cap fits u64"))
+        .read_to_end(&mut stderr)?;
+    Ok(stderr)
+}
+
 /// A perl program that records its pid, reads the request, holds
 /// `bytes` in 1000-byte strings — the small blocks only the macOS
 /// footprint poll bounds (DEC-038) — and then sleeps.
@@ -856,20 +910,6 @@ mod memory_diagnostic {
         Ok((dir, bytes))
     }
 
-    fn sanitized(bytes: &[u8], paths: &[&Path]) -> String {
-        let mut text = String::from_utf8_lossy(bytes).into_owned();
-        for path in paths {
-            let path = path.to_string_lossy();
-            text = text.replace(path.as_ref(), "<fixture>");
-            if let Some(alias) = path.strip_prefix("/private") {
-                text = text.replace(alias, "<fixture>");
-            } else if path.starts_with("/var/") {
-                text = text.replace(&format!("/private{path}"), "<fixture>");
-            }
-        }
-        text.chars().flat_map(char::escape_default).collect()
-    }
-
     pub fn run(
         request: &Query,
         program: &Path,
@@ -1045,7 +1085,7 @@ mod memory_diagnostic {
         report.stdout_eof = stdout.is_none();
         report.stderr_eof = stderr.is_none();
         report.stderr_retained_bytes = err.len();
-        report.stderr = sanitized(
+        report.stderr = super::sanitized_stderr(
             &err,
             &[
                 &request.root,
@@ -1504,9 +1544,7 @@ fn real_envelope(request: &Query, retain_request_root: impl FnOnce()) -> Vec<u8>
 }
 
 /// `x<y,` repeated past 64 KiB: tree-sitter-typescript's GLR recovery
-/// grows memory without bound on it (review4 F1). Measured on macOS
-/// under the worker, its physical footprint crosses the 512 MiB budget
-/// about 3 s in (AST) — well inside MAX_INDEX_PARSE_TIME.
+/// grows memory without bound on it (review4 F1).
 fn hostile_tree(name: &str) -> TempTree {
     tree_of(name, &[("src/hostile.ts", &"x<y,".repeat(16_400))])
 }
@@ -1564,50 +1602,202 @@ fn hostile_typescript_in_worker_ends_as_typed_bounded_failure() {
     }
 }
 
-#[test]
-fn worker_memory_cap_stops_hostile_parse_before_the_deadline() {
-    let tree = hostile_tree("iw-cap");
-    let request = search_query(QueryKind::Ast, &tree.path, "x < y");
-    let real = helper();
-    let start = Instant::now();
-    let outcome = isolated(&request, &worker(), &real, None);
-    let elapsed = start.elapsed();
-    #[cfg(target_os = "macos")]
-    if !matches!(
-        &outcome,
-        Err(ContextError::IsolatedRun {
+/// A resource signal alone cannot attribute a failure to the parser's memory guard.
+fn parser_memory_guard(outcome: &Result<QueryResult, ContextError>, stderr: &[u8]) -> bool {
+    if stderr.len() > PARSER_STDERR_CAP {
+        return false;
+    }
+    let Err(error) = outcome else {
+        return false;
+    };
+    if error.error_code() != ErrorCode::BudgetExhausted {
+        return false;
+    }
+    match error {
+        ContextError::IsolatedRun {
             cause: IsolatedCause::MemoryExceeded,
             ..
-        })
-    ) {
+        } => true,
+        ContextError::IsolatedRun {
+            cause:
+                IsolatedCause::ResourceLimit {
+                    signal: SIGABRT | SIGKILL,
+                },
+            ..
+        } => {
+            let Ok(line) = std::str::from_utf8(stderr) else {
+                return false;
+            };
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let Some(bytes) = line
+                .strip_prefix("tree-sitter failed to allocate ")
+                .or_else(|| line.strip_prefix("tree-sitter failed to reallocate "))
+                .and_then(|bytes| bytes.strip_suffix(" bytes"))
+            else {
+                return false;
+            };
+            !bytes.starts_with('0')
+                && bytes.bytes().all(|byte| byte.is_ascii_digit())
+                && bytes.parse::<usize>().is_ok_and(|bytes| bytes > 0)
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn worker_memory_cap_stops_hostile_parse_before_the_deadline() {
+    let mut dir = tempfile::TempDir::with_prefix("rivect-iw-parser-memory-").expect("fixture root");
+    let mut tree = hostile_tree("iw-cap");
+    let request = search_query(QueryKind::Ast, &tree.path, "x < y");
+    let real = helper();
+    let native = worker().canonicalize().expect("canonical worker binary");
+    let pid_file = dir.path().join("parser.pid");
+    let (program, stderr_file) = captured_stderr_shim(dir.path(), "parser", &pid_file, &native);
+    let start = Instant::now();
+    let outcome = isolated(&request, &program, &real, None);
+    let elapsed = start.elapsed();
+    let captured = read_parser_stderr(&stderr_file);
+    let accepted = captured
+        .as_ref()
+        .is_ok_and(|stderr| parser_memory_guard(&outcome, stderr));
+    if !accepted || elapsed >= MAX_INDEX_PARSE_TIME {
+        support::retain_root(&mut dir);
+        tree.retain();
+        #[cfg(target_os = "macos")]
         println!(
             "{:?}",
-            memory_diagnostic::run(&request, &worker(), &real, start + MAX_INDEX_PARSE_TIME)
+            memory_diagnostic::run(&request, &native, &real, start + MAX_INDEX_PARSE_TIME)
         );
     }
-    let cause = cause_of(outcome);
-    println!("EVID-474 memory cap: {elapsed:?} -> {cause:?}");
-    // macOS: the relative RLIMIT misses GLR's small blocks, so the
-    // parent's footprint poll is what stops the run (DEC-038).
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        cause,
-        IsolatedCause::MemoryExceeded,
-        "the footprint poll ends the hostile parse"
+    let stderr = match &captured {
+        Ok(bytes) => sanitized_stderr(
+            bytes,
+            &[
+                request.root.as_path(),
+                dir.path(),
+                native.as_path(),
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+            ],
+        ),
+        Err(error) => format!("capture failed: {:?}", error.kind()),
+    };
+    let cause = match &outcome {
+        Err(ContextError::IsolatedRun { cause, .. }) => Some(cause),
+        _ => None,
+    };
+    println!("EVID-474 memory cap: {elapsed:?} -> {cause:?}; original_stderr={stderr}");
+    assert_worker_gone(
+        &pid_file,
+        "hostile parser memory guard",
+        || {
+            support::retain_root(&mut dir);
+            tree.retain();
+        },
+        move || {
+            assert!(
+                accepted,
+                "the original parser must report a typed memory guard; stderr={stderr}"
+            );
+            let code = outcome
+                .expect_err("the memory guard rejects the parse")
+                .error_code();
+            assert_eq!(code, ErrorCode::BudgetExhausted);
+            assert!(
+                elapsed < MAX_INDEX_PARSE_TIME,
+                "the cap stops the parse before the clamped deadline: {elapsed:?}"
+            );
+        },
     );
-    #[cfg(target_os = "linux")]
-    {
-        let IsolatedCause::ResourceLimit { signal } = cause else {
-            panic!("the memory cap ends the hostile parse, got {cause:?}");
-        };
-        assert!(
-            signal == SIGABRT || signal == SIGKILL,
-            "a cap hit surfaces as SIGABRT or SIGKILL, got {signal}"
-        );
+}
+
+#[test]
+fn parser_memory_guard_rejects_an_unrelated_abort() {
+    let mut dir = tempfile::TempDir::with_prefix("rivect-iw-parser-abort-").expect("fixture root");
+    let mut corpus = search_corpus("iw-parser-abort");
+    let request = search_query(QueryKind::Path, &corpus.path, "*.rs");
+    let abort = program_shim(dir.path(), "unrelated-abort", "kill -ABRT $$");
+    let pid_file = dir.path().join("abort.pid");
+    let (program, stderr_file) =
+        captured_stderr_shim(dir.path(), "capture-abort", &pid_file, &abort);
+    let real = helper();
+    let start = Instant::now();
+    let outcome = isolated(&request, &program, &real, None);
+    let elapsed = start.elapsed();
+    let captured = read_parser_stderr(&stderr_file);
+    let rejected = captured.as_ref().is_ok_and(|stderr| {
+        stderr.len() <= PARSER_STDERR_CAP && !parser_memory_guard(&outcome, stderr)
+    });
+    let is_abort = matches!(
+        &outcome,
+        Err(ContextError::IsolatedRun {
+            cause: IsolatedCause::ResourceLimit { signal: SIGABRT },
+            ..
+        })
+    );
+    if !is_abort || !rejected || elapsed >= MAX_INDEX_PARSE_TIME {
+        support::retain_root(&mut dir);
+        corpus.retain();
     }
-    assert!(
-        elapsed < MAX_INDEX_PARSE_TIME,
-        "the cap stops the parse before the clamped deadline: {elapsed:?}"
+    let stderr = match &captured {
+        Ok(bytes) => sanitized_stderr(bytes, &[corpus.path.as_path(), dir.path()]),
+        Err(error) => format!("capture failed: {:?}", error.kind()),
+    };
+    assert_worker_gone(
+        &pid_file,
+        "unrelated below-budget abort",
+        || {
+            support::retain_root(&mut dir);
+            corpus.retain();
+        },
+        move || {
+            assert!(
+                is_abort,
+                "the negative control must reach SIGABRT; stderr={stderr}"
+            );
+            assert!(
+                rejected,
+                "an unrelated abort is not parser memory evidence; stderr={stderr}"
+            );
+            assert!(
+                elapsed < MAX_INDEX_PARSE_TIME,
+                "the abort control ends before the clamped deadline: {elapsed:?}"
+            );
+            for malformed in [
+                b"Out of memory!\n".as_slice(),
+                b"tree-sitter failed to allocate 0 bytes".as_slice(),
+                b"tree-sitter failed to allocate 01 bytes".as_slice(),
+                b"tree-sitter failed to allocate +1 bytes".as_slice(),
+                b"tree-sitter failed to allocate -1 bytes".as_slice(),
+                b"tree-sitter failed to allocate 18446744073709551616 bytes".as_slice(),
+                b"prefix tree-sitter failed to allocate 163840 bytes".as_slice(),
+                b"tree-sitter failed to allocate 163840 bytes\nx".as_slice(),
+                b"tree-sitter failed to reallocate 0 bytes".as_slice(),
+            ] {
+                assert!(
+                    !parser_memory_guard(&outcome, malformed),
+                    "invalid allocation evidence must not pass: {malformed:?}"
+                );
+            }
+
+            // These calibrate the validator, not the OS resource-limit mechanism.
+            for signal in [SIGABRT, SIGKILL] {
+                let resource_limit = Err(ContextError::IsolatedRun {
+                    cause: IsolatedCause::ResourceLimit { signal },
+                    source: None,
+                });
+                for refusal in [
+                    b"tree-sitter failed to allocate 163840 bytes".as_slice(),
+                    b"tree-sitter failed to allocate 163840 bytes\n".as_slice(),
+                    b"tree-sitter failed to reallocate 1 bytes".as_slice(),
+                    b"tree-sitter failed to reallocate 1 bytes\n".as_slice(),
+                ] {
+                    assert!(
+                        parser_memory_guard(&resource_limit, refusal),
+                        "validator calibration rejects signal {signal} with {refusal:?}"
+                    );
+                }
+            }
+        },
     );
 }
 
@@ -2355,14 +2545,14 @@ fn worker_failure_classification_is_typed_per_seam() {
         "worker_failed",
         ErrorCode::InternalError,
     );
-    // Small heap blocks the macOS relative RLIMIT lets through: only the
-    // parent's footprint poll stops them, well before the deadline.
+    // Runtime-sized MiB blocks avoid shared-string/arena overhead; pacing
+    // leaves the footprint observer time to stop the live process.
     #[cfg(target_os = "macos")]
     {
         let hoarder = script(
             dir.path(),
             "hoarder",
-            "#!/usr/bin/perl\nlocal $/; my $request = <STDIN>;\nmy @held;\npush @held, 'x' x 1000 while 1;\n",
+            "#!/usr/bin/perl\nlocal $/; my $request = <STDIN>;\nmy @held;\nmy $bytes = 1024 * 1024;\nwhile (1) {\n    push @held, 'x' x $bytes++;\n    select(undef, undef, undef, 0.005) == 0 or die \"select: $!\\n\";\n}\n",
         );
         let start = Instant::now();
         let outcome = isolated(&request, &hoarder, &real, None);
@@ -2380,7 +2570,7 @@ fn worker_failure_classification_is_typed_per_seam() {
             );
         }
         expect(
-            "perl pushing 1000-byte strings",
+            "perl holding unique MiB-sized blocks",
             outcome,
             "memory_exceeded",
             ErrorCode::BudgetExhausted,

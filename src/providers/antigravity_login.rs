@@ -148,11 +148,12 @@ pub struct LoginSession {
     endpoints: AntigravityEndpoints,
     budget: ProvisioningBudget,
     cancelled: AtomicBool,
-    /// The clock the shared deadline reads. Production reads the system
-    /// clock; the offline proof steps it so the publication admission is
-    /// reached already spent without racing the last leg.
+    /// The offline deadline clock and interval wait are stepped together so
+    /// polling and publication need no wall-clock timing assumptions.
     #[cfg(test)]
     clock: std::sync::Arc<dyn Fn() -> Instant + Send + Sync>,
+    #[cfg(test)]
+    wait: std::sync::Arc<dyn Fn(Duration) + Send + Sync>,
 }
 
 impl fmt::Debug for LoginSession {
@@ -245,6 +246,8 @@ pub fn begin_login_with(
         cancelled: AtomicBool::new(false),
         #[cfg(test)]
         clock: std::sync::Arc::new(Instant::now),
+        #[cfg(test)]
+        wait: std::sync::Arc::new(pause),
     })
 }
 
@@ -779,7 +782,11 @@ fn settle(
         let wait = session
             .remaining(deadline)?
             .min(session.budget.poll_interval);
-        pause(wait);
+        #[cfg(not(test))]
+        let wait_for_interval = pause;
+        #[cfg(test)]
+        let wait_for_interval = session.wait.as_ref();
+        wait_for_interval(wait);
         if session.is_cancelled() {
             return Err(LoginError::Cancelled);
         }
@@ -1296,12 +1303,108 @@ mod tests {
         }
     }
 
+    /// One shared budget bounds interval-driven polls and publication.
+    ///
     /// The reading sequence is the deadline, one per leg (initial load, final
     /// reload, discovery) and then the publication admission: the last
     /// reading is the first past the deadline. A removed admission would
     /// reach the create-only write instead of the typed expiry.
     #[test]
-    fn a_budget_spent_at_the_publication_admission_writes_nothing() {
+    fn a_shared_budget_bounds_polling_and_publication() {
+        use std::sync::Mutex;
+
+        // Virtual seconds keep the 400:20 budget/interval ratio while real HTTP
+        // requests retain at least 20 s; host scheduling cannot spend logical time.
+        for (interval, expected_polls) in [(20, &[320, 340, 360, 380][..]), (40, &[340, 380][..])] {
+            let elapsed = std::sync::Arc::new(Mutex::new(Duration::ZERO));
+            let poll_times = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let peer_clock = std::sync::Arc::clone(&elapsed);
+            let peer_polls = std::sync::Arc::clone(&poll_times);
+            let initial_load = AtomicBool::new(true);
+            let peer = TestPeer::start(move |line| {
+                if line.contains(":loadCodeAssist") {
+                    if initial_load.swap(false, Ordering::SeqCst) {
+                        *peer_clock.lock().expect("clock lock") += Duration::from_secs(200);
+                        return "{}".to_string();
+                    }
+                    return json!({
+                        "currentTier": { "id": "free-tier" },
+                        "paidTier": { "id": "paid-tier" },
+                        "cloudaicompanionProject": "fixture-project"
+                    })
+                    .to_string();
+                }
+                if line.contains(":onboardUser") {
+                    *peer_clock.lock().expect("clock lock") += Duration::from_secs(100);
+                    return json!({ "name": "operations/never", "done": false }).to_string();
+                }
+                if line.starts_with("GET ") {
+                    let done = {
+                        let mut polls = peer_polls.lock().expect("poll times lock");
+                        polls.push(*peer_clock.lock().expect("clock lock"));
+                        polls.len() >= 5
+                    };
+                    // A missing wait reaches success after five polls instead of hanging.
+                    return json!({
+                        "name": "operations/never",
+                        "done": done,
+                        "response": {}
+                    })
+                    .to_string();
+                }
+                json!({ "models": { "gemini-2.5-flash": {} } }).to_string()
+            });
+            let base = Instant::now();
+            let mut session = begin_login_with(
+                "fixture-token",
+                &AntigravityEndpoints {
+                    code_assist: peer.base.clone(),
+                },
+                ProvisioningBudget {
+                    deadline: Duration::from_secs(400),
+                    poll_interval: Duration::from_secs(interval),
+                },
+            )
+            .expect("the login begins");
+            let clock = std::sync::Arc::clone(&elapsed);
+            let wait_clock = std::sync::Arc::clone(&elapsed);
+            session.clock = std::sync::Arc::new(move || base + *clock.lock().expect("clock lock"));
+            session.wait = std::sync::Arc::new(move |interval| {
+                *wait_clock.lock().expect("clock lock") += interval;
+            });
+            let store = TestStore {
+                entries: Mutex::new(BTreeMap::new()),
+            };
+
+            let error = complete_login(&antigravity_config(), "antigravity", &session, &store)
+                .expect_err("the operation exhausts the shared deadline");
+
+            assert!(matches!(error, LoginError::ProvisioningTimedOut), "{error}");
+            assert_eq!(
+                store.bytes(ADMISSION_SCOPE),
+                None,
+                "no profile is published"
+            );
+            assert_eq!(
+                *elapsed.lock().expect("clock lock"),
+                Duration::from_secs(400),
+                "the final wait stops at the shared deadline"
+            );
+            let observed = std::mem::take(&mut *poll_times.lock().expect("poll times lock"));
+            assert!(
+                observed
+                    .iter()
+                    .copied()
+                    .eq(expected_polls.iter().copied().map(Duration::from_secs)),
+                "interval {interval} s: actual {observed:?}, expected seconds {expected_polls:?}"
+            );
+            assert_eq!(
+                peer.requests().len(),
+                expected_polls.len() + 2,
+                "only initial load, onboarding and the admitted polls run"
+            );
+        }
+
         let peer = TestPeer::start(|line| {
             if line.contains(":loadCodeAssist") {
                 return json!({
