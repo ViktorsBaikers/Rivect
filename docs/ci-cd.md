@@ -26,6 +26,31 @@ Tag должен совпадать с Cargo version. Поддерживаемы
 `x86_64-unknown-linux-gnu` на Ubuntu 24.04 и `aarch64-apple-darwin` на macOS 15.
 Runner labels закреплены; конкретный образ VM продолжает обновляться GitHub.
 
+## Установка опубликованного релиза
+
+```sh
+curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/install.sh | sh
+```
+
+Поддерживаются macOS Apple Silicon (`aarch64-apple-darwin`) и Linux x86_64
+с glibc (`x86_64-unknown-linux-gnu`, build/runtime baseline Ubuntu 24.04).
+Intel macOS, Linux ARM64 и musl этой поставкой не поддерживаются.
+Пользователю не нужны Cargo, `gh`, `jq` или Python. Архив содержит ровно
+`rivect`, `rivect-sandbox-helper`, `rivect.manifest.json`; helper устанавливается
+рядом с CLI. Архивы называются `rivect-v0.1.1-TARGET.tar.gz`, checksums —
+`TARGET.sha256`. Корневой пакет — 0.1.1, независимый helper остаётся 0.1.0;
+существующий тег `v0.1.0` не переносится.
+До переключения активного bundle установщик проверяет запуск CLI через
+`--version`; несовместимый бинарник не заменяет работающую установку.
+Установка без `sudo`: полные bundles хранятся в
+`~/.local/share/rivect/releases/ARCHIVE_SHA256/`, атомарный symlink
+`~/.local/share/rivect/bin` выбирает активный bundle. Установщик однократно
+добавляет этот bin в PATH через профиль shell: `${ZDOTDIR:-$HOME}/.zshrc`
+для zsh, `~/.bashrc` и login profile для bash, `~/.profile` для sh/неизвестного
+shell, `~/.config/fish/config.fish` для fish. Pipe не меняет PATH родительского
+shell: после установки нужно открыть новый терминал или перечитать профиль.
+
+
 Ubuntu 24.04 сохраняется как build/runtime baseline: переход на новый runner ради
 `setpriv` поднял бы glibc baseline архивов. `ci-linux-prerequisites.sh` собирает
 только `setpriv` util-linux 2.41.5 из upstream tarball с закреплённым SHA-256 и
@@ -38,7 +63,7 @@ production bundle не меняются. Источник и checksum прове
 
 | Проверка | Владелец | Исключение повтора |
 | --- | --- | --- |
-| fmt, clippy, rustdoc, cargo-deny, workflow/shell contracts | quality | Не выполняются в publisher |
+| fmt, clippy, rustdoc, cargo-deny, workflow/shell contracts, offline installer tests | quality | Не выполняются в publisher |
 | lib/bin/examples и все integration targets workspace | `scripts/ci-test.py` | Перечень из `cargo metadata`; один вызов на target |
 | process-heavy helper | тот же runner | Первый пакет, один test thread |
 | обычные targets | тот же runner | Два test threads; не автоматические retries |
@@ -76,10 +101,15 @@ production bundle не меняются. Источник и checksum прове
 6. Verify восстанавливает собственные receipts, применяет разрешённый cross-host
    fold, запускает только exact conjunction. Release archive копируется из test
    artifact побайтно: нет повторной production-сборки или перепаковки.
+   Корневой `install.sh` копируется в отдельный `install-TARGET.sh` для каждой
+   платформы; SHA-256 этих байтов включается в её verdict как `installer_sha256`.
 7. Publisher требует обе платформы, валидные verdicts, archive checksums и tag SHA,
-   совпадающий с проверенным source. Тег проверяется до создания draft и повторно
-   после загрузки assets, непосредственно перед публикацией. Только общий ready
-   публикует draft. Upload failure не выставляет частичный stable.
+   совпадающий с проверенным source. Он проверяет installer digest каждого verdict
+   и побайтное равенство двух копий, затем загружает ровно один `install.sh` и
+   `install.sh.sha256`, не исполняя скачанный код с write token.
+   Тег проверяется до создания draft и повторно после загрузки assets,
+   непосредственно перед публикацией. Только общий ready публикует draft.
+   Upload failure не выставляет частичный stable.
 
 Exit 0 — ready и ноль retained legs; exit 5 — честно вычисленный non-ready,
 остаётся общим draft/prerelease с verdict JSON. Допустимы только conjunction exits
@@ -128,9 +158,12 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
 ## Проверка изменения
 
 - `python3 scripts/ci-contract-tests.py`: реальные subprocess/fs проверки dedup,
-  failed/stale/tampered evidence, cross-host binding, gate exit semantics и девять
-  исполняемых сценариев publisher, включая движение тега во время загрузки.
-- `actionlint .github/workflows/ci.yml`; `shellcheck scripts/*.sh`.
+  failed/stale/tampered evidence, cross-host binding, gate exit semantics и 12
+  исполняемых сценариев publisher: исходные девять плюс подмена, отсутствие
+  и несовпадение installer; проверяется единственный uploaded installer asset.
+- `python3 scripts/install-contract-tests.py`: offline installer contracts.
+- `actionlint .github/workflows/ci.yml`; `sh -n install.sh`;
+  `shellcheck install.sh scripts/*.sh`.
 - Полный локальный §14-набор и authentic supplied-bundle regressions.
 - Remote CI/publication не считаются проверенными по локальным mocks. Конкретный
   результат запуска и оставшиеся ограничения записываются в отчёте исполнения.

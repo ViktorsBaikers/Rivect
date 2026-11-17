@@ -50,8 +50,10 @@ jobs:
       - name: workflow and script contracts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          shellcheck scripts/*.sh
+          sh -n install.sh
+          shellcheck install.sh scripts/*.sh
           python3 scripts/ci-contract-tests.py
+          python3 scripts/install-contract-tests.py
 
   test:
     name: test-${{ matrix.platform }}
@@ -190,10 +192,13 @@ jobs:
             --receipts-only || code=$?
           case "$code" in 0|5) ;; *) exit "$code" ;; esac
           mkdir dist
+          cp install.sh "dist/install-$TARGET.sh"
+          installer=$(shasum -a 256 "dist/install-$TARGET.sh" | cut -d ' ' -f 1)
           jq --argjson exit "$code" --arg target "$TARGET" \
             --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            --arg installer "$installer" \
             '. + {gate_exit:$exit, target:$target,
-                  commit:$commit, run_id:$run}' \
+                  commit:$commit, run_id:$run, installer_sha256:$installer}' \
             target/final-acceptance.json > "dist/$TARGET.json"
           cp "xhost/xhost-$PLATFORM/candidate.tar.gz" \
             "dist/rivect-$GITHUB_REF_NAME-$TARGET.tar.gz"
@@ -234,11 +239,16 @@ jobs:
             sha256sum -c "$target.sha256"
             candidate=$(tar -xOf "rivect-$GITHUB_REF_NAME-$target.tar.gz" \
               rivect.manifest.json | sha256sum | cut -d ' ' -f 1)
+            test -f "install-$target.sh"
+            test ! -L "install-$target.sh"
+            installer=$(sha256sum "install-$target.sh" | cut -d ' ' -f 1)
             jq -e --arg target "$target" --arg commit "$GITHUB_SHA" \
-              --arg run "$GITHUB_RUN_ID" --arg candidate "$candidate" '
+              --arg run "$GITHUB_RUN_ID" --arg candidate "$candidate" \
+              --arg installer "$installer" '
               .schema_version == 1 and .target == $target and
               .commit == $commit and .run_id == $run and
               .candidate_manifest_sha256 == $candidate and
+              .installer_sha256 == $installer and
               (.release_ready | type == "boolean") and
               (.blockers.retained_legs |
                 type == "number" and . >= 0 and . == floor) and
@@ -248,6 +258,9 @@ jobs:
                 .blockers.retained_legs > 0)))
             ' "$target.json"
           done
+          cmp install-x86_64-unknown-linux-gnu.sh install-aarch64-apple-darwin.sh
+          cp install-x86_64-unknown-linux-gnu.sh install.sh
+          sha256sum install.sh > install.sh.sha256
           verify_tag() {
             local tag_sha
             tag_sha=$(gh api \
@@ -265,8 +278,8 @@ jobs:
           # Draft first: failed uploads cannot expose a partial release.
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "Rivect $GITHUB_REF_NAME" \
-            --notes "Offline verdicts attached. Install both binaries." \
-            "${args[@]}" ./*.tar.gz ./*.sha256 ./*.json
+            --notes 'Install with: curl -fsSL https://github.com/ViktorsBaikers/Rivect/releases/latest/download/install.sh | sh' \
+            "${args[@]}" ./*.tar.gz ./*.sha256 ./*.json install.sh
           if [[ "$ready" == true ]]; then
             verify_tag
             gh release edit "$GITHUB_REF_NAME" --draft=false

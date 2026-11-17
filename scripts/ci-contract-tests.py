@@ -471,25 +471,32 @@ class ReleasePublisher(unittest.TestCase):
         sha = "c" * 40
         targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
         scenarios = ["ready", "not-ready", "missing", "tampered", "foreign",
-                     "moved-tag", "upload-fails", "malformed", "moved-during-upload"]
+                     "moved-tag", "upload-fails", "malformed", "moved-during-upload",
+                     "tampered-installer", "missing-installer", "mismatched-installer"]
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 dist = root / "dist"
                 dist.mkdir()
+                installer_bytes = (ROOT / "install.sh").read_bytes()
                 for target in targets:
                     manifest = json.dumps({"schema_version": 1, "build": target}).encode()
-                    archive = dist / f"rivect-v0.1.0-{target}.tar.gz"
+                    archive = dist / f"rivect-v0.1.1-{target}.tar.gz"
                     with tarfile.open(archive, "w:gz") as output:
                         info = tarfile.TarInfo("rivect.manifest.json")
                         info.size = len(manifest)
                         output.addfile(info, io.BytesIO(manifest))
                     (dist / f"{target}.sha256").write_text(
                         f"{digest(archive)}  ./{archive.name}\n")
+                    installer = dist / f"install-{target}.sh"
+                    installer.write_bytes(installer_bytes)
+                    if scenario == "mismatched-installer" and target == targets[0]:
+                        installer.write_bytes(installer_bytes + b"\n# different installer\n")
                     ready = not (scenario == "not-ready" and target == targets[0])
                     verdict = {
                         "schema_version": 1, "target": target, "commit": sha, "run_id": "7",
                         "candidate_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+                        "installer_sha256": digest(installer),
                         "gate_exit": 0 if ready else 5, "release_ready": ready,
                         "blockers": {"retained_legs": 0 if ready else 1},
                     }
@@ -498,11 +505,16 @@ class ReleasePublisher(unittest.TestCase):
                     if scenario == "malformed":
                         verdict["release_ready"] = "true"
                     (dist / f"{target}.json").write_text(json.dumps(verdict))
-                first = dist / f"rivect-v0.1.0-{targets[0]}.tar.gz"
+                first = dist / f"rivect-v0.1.1-{targets[0]}.tar.gz"
                 if scenario == "missing":
                     first.unlink()
                 if scenario == "tampered":
                     first.write_bytes(b"changed")
+                installer = dist / f"install-{targets[0]}.sh"
+                if scenario == "tampered-installer":
+                    installer.write_bytes(installer_bytes + b"\n# tampered\n")
+                if scenario == "missing-installer":
+                    installer.unlink()
                 gh = root / "gh"
                 gh.write_text(textwrap.dedent("""\
                     #!/usr/bin/env python3
@@ -522,7 +534,7 @@ class ReleasePublisher(unittest.TestCase):
                     **os.environ, "PATH": f'{root}:{os.environ["PATH"]}',
                     "CALLS": str(calls_path), "SCENARIO": scenario,
                     "TAG_SHA": "d" * 40 if scenario == "moved-tag" else sha,
-                    "GITHUB_REF_NAME": "v0.1.0", "GITHUB_SHA": sha, "GITHUB_RUN_ID": "7",
+                    "GITHUB_REF_NAME": "v0.1.1", "GITHUB_SHA": sha, "GITHUB_RUN_ID": "7",
                     "GITHUB_REPOSITORY": "offline/fixture",
                 }
                 result = subprocess.run(["bash", "-euo", "pipefail", "-c", script],
@@ -530,6 +542,14 @@ class ReleasePublisher(unittest.TestCase):
                 calls = ([json.loads(line) for line in calls_path.read_text().splitlines()]
                          if calls_path.exists() else [])
                 mutations = [call for call in calls if call[0] == "release"]
+                creates = [call for call in mutations if call[:2] == ["release", "create"]]
+                for create in creates:
+                    self.assertEqual(create.count("install.sh"), 1, create)
+                    self.assertEqual(create.count("./install.sh.sha256"), 1, create)
+                    self.assertFalse(any(arg.startswith("install-") for arg in create), create)
+                    self.assertEqual((dist / "install.sh").read_bytes(), installer_bytes)
+                    self.assertEqual((dist / "install.sh.sha256").read_text(),
+                                     f"{digest(dist / 'install.sh')}  install.sh\n")
                 if scenario == "ready":
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual([call[:2] for call in mutations],
