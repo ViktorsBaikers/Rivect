@@ -233,3 +233,30 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
   `/tmp/rivect-macos-final.dT1oyW/`; fmt/clippy и targeted memory log указаны выше.
   Настоящий CLI `--version`/`--help` прошёл с очищенным окружением и отдельным HOME.
   Это proof локального кандидата поверх `800fa3f`, не hosted GREEN нового commit.
+- Push `be0d5e1` выполнен. Hosted run
+  [43998350590](https://github.com/ViktorsBaikers/Rivect/actions/runs/43998350590)
+  завершился FAIL: quality PASS; Linux остановился до сборки на `curl` exit 35
+  (`Recv failure: Connection reset by peer`); macOS — только physical-memory
+  fixture в `worker_failure_classification_is_typed_per_seam`.
+  Auth и исправленный parser oracle прошли; исходный parser stderr:
+  `tree-sitter failed to allocate 81920 bytes`, `ResourceLimit { signal: 6 }`.
+  Это настоящий исходный запуск, не synthetic reproduction.
+- Тот же pinned util-linux archive скачан локально с ожидаемым SHA-256.
+  Это подтверждает содержимое источника, не исправность сети GitHub runner.
+  Network bootstrap code не менялся. Physical fixture требует отдельного
+  parent-observer proof без гонки с child address-space guard; коррекция в работе.
+- Physical fixture теперь изолирует настоящий parent RSS observer: test-only
+  pass-through launcher явно не применяет и не аттестует native AS/DATA caps.
+  Конечный writable load — budget + 64 MiB; ожидается строго
+  `MemoryExceeded`/`BudgetExhausted`. Budget − 128 MiB control доказывает полную
+  readiness и проходит настоящий footprint check перед контролируемой отменой.
+  Нет unbounded allocation, pacing, увеличения budget или deadline.
+  Genuine-helper parser proof и все остальные classifier seams сохранены.
+- Локальный target: 50 passed, 2 ignored; over — `MemoryExceeded`, under —
+  `Cancelled`, readiness true. Fmt/clippy PASS; independent frozen-source
+  recheck — no-findings. Логи `/tmp/rivect-parent-footprint-{native,clippy}.log`.
+  Полный повторный workspace gate выполняется; hosted proof этой коррекции NOT_RUN.
+- Повторный полный §14 поверх `be0d5e1` PASS (2026-11-17 UTC):
+  workspace tests, отдельные doctests, fmt, all-target/all-feature clippy,
+  rustdoc `-Dwarnings`, dependency policy, locked fetch. Source inputs и логи:
+  `/tmp/rivect-parent-final.mkRGF0/`. Код production не изменялся.

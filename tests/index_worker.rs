@@ -655,6 +655,19 @@ fn holder_shim(dir: &Path, name: &str, pid_file: &Path, bytes: u64) -> PathBuf {
     )
 }
 
+/// A finite, writable heap load; readiness is published only after every block is held.
+#[cfg(target_os = "macos")]
+fn footprint_hoarder(dir: &Path, name: &str, ready_file: &Path, bytes: u64) -> PathBuf {
+    script(
+        dir,
+        name,
+        &format!(
+            "#!/usr/bin/perl\nlocal $/; my $request = <STDIN>;\nmy @held;\nmy $total = 0;\nwhile ($total < {bytes}) {{\n    my $length = 1024 * 1024 + scalar(@held);\n    $length = {bytes} - $total if $length > {bytes} - $total;\n    my $block = 'x' x $length;\n    substr($block, 0, 1) = chr(1 + scalar(@held) % 254);\n    push @held, $block;\n    $total += $length;\n}}\nopen(my $ready, '>', {}) or die \"open readiness: $!\\n\";\nprint $ready \"$total\\n\" or die \"write readiness: $!\\n\";\nclose($ready) or die \"close readiness: $!\\n\";\nsleep 30;\n",
+            quoted(ready_file)
+        ),
+    )
+}
+
 #[cfg(target_os = "macos")]
 mod memory_diagnostic {
     use super::{Query, WORKER_KILL_GRACE, isolated, quoted};
@@ -2545,40 +2558,155 @@ fn worker_failure_classification_is_typed_per_seam() {
         "worker_failed",
         ErrorCode::InternalError,
     );
-    // Runtime-sized MiB blocks avoid shared-string/arena overhead; pacing
-    // leaves the footprint observer time to stop the live process.
+    // Isolate the real parent's footprint guard from competing native AS/DATA limits.
+    // This launch-only fixture neither applies nor attests a native memory cap.
     #[cfg(target_os = "macos")]
     {
-        let hoarder = script(
-            dir.path(),
-            "hoarder",
-            "#!/usr/bin/perl\nlocal $/; my $request = <STDIN>;\nmy @held;\nmy $bytes = 1024 * 1024;\nwhile (1) {\n    push @held, 'x' x $bytes++;\n    select(undef, undef, undef, 0.005) == 0 or die \"select: $!\\n\";\n}\n",
+        let mut footprint_dir =
+            tempfile::TempDir::with_prefix("rivect-iw-parent-footprint-").expect("fixture root");
+        let launcher = script(
+            footprint_dir.path(),
+            "parent-footprint-launch-only",
+            &format!(
+                "#!/bin/sh\n[ \"$#\" -eq 6 ] || exit 30\n[ \"$1\" = launch ] || exit 30\n[ \"$2\" = {MEMORY_BUDGET_FLAG} ] || exit 30\n[ \"$3\" = {INDEX_WORKER_MEMORY_BUDGET} ] || exit 30\n[ \"$4\" = -- ] || exit 30\n[ \"$6\" = {INDEX_WORKER_FLAG} ] || exit 30\nshift 4\nexec \"$@\"\n"
+            ),
         );
-        let start = Instant::now();
-        let outcome = isolated(&request, &hoarder, &real, None);
-        let elapsed = start.elapsed();
-        if !matches!(
-            &outcome,
-            Err(ContextError::IsolatedRun {
-                cause: IsolatedCause::MemoryExceeded,
-                ..
-            })
-        ) {
+        const MIB: u64 = 1024 * 1024;
+        for (name, bytes, tag, code) in [
+            (
+                "over",
+                INDEX_WORKER_MEMORY_BUDGET + 64 * MIB,
+                "memory_exceeded",
+                ErrorCode::BudgetExhausted,
+            ),
+            (
+                "under",
+                INDEX_WORKER_MEMORY_BUDGET - 128 * MIB,
+                "cancelled",
+                ErrorCode::Cancelled,
+            ),
+        ] {
+            let ready_file = footprint_dir.path().join(format!("{name}.ready"));
+            let pid_file = footprint_dir.path().join(format!("{name}.pid"));
+            let hoarder = footprint_hoarder(footprint_dir.path(), name, &ready_file, bytes);
+            let (program, stderr_file) = captured_stderr_shim(
+                footprint_dir.path(),
+                &format!("{name}-capture"),
+                &pid_file,
+                &hoarder,
+            );
+            let under_budget = bytes < INDEX_WORKER_MEMORY_BUDGET;
+            let ready_seen = std::cell::Cell::new(false);
+            let readiness_error = std::cell::RefCell::new(None);
+            let ready_marker = format!("{bytes}\n");
+            let cancel_after_ready = || {
+                if !under_budget {
+                    return false;
+                }
+                if ready_seen.get() {
+                    return true;
+                }
+                let ready = std::fs::File::open(&ready_file).and_then(|mut file| {
+                    let mut marker = [0_u8; 32];
+                    let count = file.read(&mut marker)?;
+                    Ok(&marker[..count] == ready_marker.as_bytes())
+                });
+                match ready {
+                    Ok(true) => {
+                        // Returning false lets the real footprint check run before cancellation.
+                        ready_seen.set(true);
+                        false
+                    }
+                    Ok(false) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        *readiness_error.borrow_mut() = Some(error);
+                        true
+                    }
+                }
+            };
+            let start = Instant::now();
+            let outcome = query_isolated(
+                &request,
+                &IsolatedRun {
+                    program: &program,
+                    helper: &launcher,
+                    deadline: None,
+                    cancel: &cancel_after_ready,
+                    answer_cap: WORKER_ANSWER_MAX,
+                },
+            );
+            let elapsed = start.elapsed();
+            let captured = read_parser_stderr(&stderr_file);
+            let ready_seen = ready_seen.get();
+            let readiness_error = readiness_error.into_inner();
+            let expected = match &outcome {
+                Err(ContextError::IsolatedRun {
+                    cause: IsolatedCause::MemoryExceeded,
+                    ..
+                }) => !under_budget,
+                Err(ContextError::IsolatedRun {
+                    cause: IsolatedCause::Cancelled,
+                    ..
+                }) => under_budget,
+                _ => false,
+            };
+            let capture_complete = captured
+                .as_ref()
+                .is_ok_and(|stderr| stderr.len() <= PARSER_STDERR_CAP);
+            if !expected
+                || !capture_complete
+                || (under_budget && !ready_seen)
+                || readiness_error.is_some()
+                || elapsed >= MAX_INDEX_PARSE_TIME
+            {
+                support::retain_root(&mut footprint_dir);
+                corpus.retain();
+            }
+            let stderr = match &captured {
+                Ok(bytes) => {
+                    sanitized_stderr(bytes, &[corpus.path.as_path(), footprint_dir.path()])
+                }
+                Err(error) => format!("capture failed: {error:?}"),
+            };
+            let cause = match &outcome {
+                Err(ContextError::IsolatedRun { cause, .. }) => Some(cause),
+                _ => None,
+            };
             println!(
-                "{:?}",
-                memory_diagnostic::run(&request, &hoarder, &real, start + MAX_INDEX_PARSE_TIME)
+                "EVID-474 isolated parent footprint {name}: held_target_bytes={bytes} elapsed={elapsed:?} cause={cause:?} ready={ready_seen} readiness_error={readiness_error:?} original_stderr={stderr}; no native AS/DATA proof"
+            );
+            assert_worker_gone(
+                &pid_file,
+                "isolated parent footprint guard",
+                || {
+                    support::retain_root(&mut footprint_dir);
+                    corpus.retain();
+                },
+                || {
+                    assert!(capture_complete, "bounded original stderr: {stderr}");
+                    assert!(readiness_error.is_none(), "{readiness_error:?}");
+                    assert!(
+                        !under_budget || ready_seen,
+                        "the under-budget control must hold its complete payload"
+                    );
+                    assert!(
+                        expected,
+                        "the parent must produce the exact physical-guard outcome"
+                    );
+                    expect(
+                        &format!("isolated parent footprint {name}; no native AS/DATA proof"),
+                        outcome,
+                        tag,
+                        code,
+                    );
+                    assert!(
+                        elapsed < MAX_INDEX_PARSE_TIME,
+                        "the physical-guard fixture ends before the original deadline: {elapsed:?}"
+                    );
+                },
             );
         }
-        expect(
-            "perl holding unique MiB-sized blocks",
-            outcome,
-            "memory_exceeded",
-            ErrorCode::BudgetExhausted,
-        );
-        assert!(
-            elapsed < MAX_INDEX_PARSE_TIME,
-            "the footprint poll stops the hoarder before the deadline: {elapsed:?}"
-        );
     }
     let sleeper = program_shim(dir.path(), "sleeper", "exec /bin/sleep 30");
     expect(
