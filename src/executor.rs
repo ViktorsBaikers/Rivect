@@ -8,6 +8,7 @@
 
 pub mod linux;
 pub mod macos;
+mod project_edit;
 
 use crate::config::hex;
 use crate::contracts::{
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant};
 pub use macos::{
     FileIdentity, ReadObservation, ReadWorker, Unattested, WorkerError, WriteIdentity,
 };
+pub(crate) use project_edit::ProjectEdit;
 
 /// A private native directory and one artifact borrowed from it.
 ///
@@ -5985,7 +5987,7 @@ impl CheckTarget {
 /// alphanumerics and `_`, plus `-` in a target name or `::` module
 /// separators in a test path, and never a leading `-`.
 #[must_use]
-fn plain_selector(token: &str, module_path: bool) -> bool {
+pub(crate) fn plain_selector(token: &str, module_path: bool) -> bool {
     !token.is_empty()
         && !token.starts_with('-')
         && token.chars().all(|c| {
@@ -8495,6 +8497,14 @@ pub fn workspace_digest(root: &Path) -> Result<String, CheckError> {
         .map(|tree| tree.digest)
         .map_err(|error| CheckError::InventoryRefused {
             detail: format!("{error}"),
+        })
+}
+
+pub(crate) fn scoped_workspace_digest(root: &Path, policy: &Policy) -> Result<String, CheckError> {
+    inventory_under(root, &|path| policy.covers(path))
+        .map(|tree| tree.digest)
+        .map_err(|error| CheckError::InventoryRefused {
+            detail: error.to_string(),
         })
 }
 

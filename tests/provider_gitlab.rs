@@ -1313,6 +1313,8 @@ fn an_action_hands_back_the_recorded_tool_call() {
         vec![ToolCall {
             tool: "read".to_string(),
             path: Some("src/main.rs".to_string()),
+            text: None,
+            test: None,
         }],
         "the MCP action maps to the bare tool name and its path argument"
     );

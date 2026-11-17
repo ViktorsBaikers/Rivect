@@ -229,7 +229,12 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -4118,6 +4123,67 @@ async fn completed_tool_call_reaches_the_reply_typed() {
     drop_blocking(broker);
 }
 
+#[tokio::test]
+async fn declared_write_preserves_text_and_refuses_invalid_arguments() {
+    let replacement = "pub fn answer() -> u8 { 42 }\n";
+    for (arguments, valid) in [
+        (json!({"path": "src/lib.rs", "text": false}), false),
+        (json!({"path": "src/lib.rs", "text": replacement}), true),
+    ] {
+        let server = MockServer::start().await;
+        let call = json!({
+            "id": "fc_1", "type": "function_call", "status": "completed",
+            "name": "write_file", "arguments": arguments.to_string(),
+            "call_id": "call_1",
+        });
+        mount_responses(
+            &server,
+            responses_completed_stream("proposed edit", vec![call], None),
+        )
+        .await;
+        let config =
+            Config::parse_validated(&openai_config(&server_uri_v1(&server))).expect("valid");
+        let (provider, _store) = openai_provider(&config);
+        let mut broker = Broker::new(Box::new(provider));
+        let manifest = broker
+            .prepare_call(
+                "main",
+                &config,
+                "/world/openai",
+                "Edit the library.",
+                &rivect::model::CallContract {
+                    instructions: "Use the declared tool.",
+                    tools: &["write_file"],
+                },
+            )
+            .expect("prepare the declared write tool");
+        let (broker, outcome) = dispatch(broker, "/world/openai", manifest);
+        let requests = server.received_requests().await.expect("requests recorded");
+        let request: Value = serde_json::from_slice(&requests[0].body).expect("model request");
+        assert_eq!(
+            request["tools"][0]["parameters"]["required"],
+            json!(["path", "text"]),
+            "the model sees both mandatory write arguments"
+        );
+        if valid {
+            let reply = outcome.expect("valid write request");
+            assert_eq!(reply.tool_calls.len(), 1);
+            let edit = &reply.tool_calls[0];
+            assert_eq!(edit.tool, "write_file");
+            assert_eq!(edit.path.as_deref(), Some("src/lib.rs"));
+            assert_eq!(edit.text.as_deref(), Some(replacement));
+            assert!(!format!("{edit:?}").contains(replacement.trim()));
+        } else {
+            let error = outcome.expect_err("non-text write content must be refused");
+            assert!(matches!(
+                error,
+                ModelError::Provider(ProviderError::StreamViolation { .. })
+            ));
+        }
+        drop_blocking(broker);
+    }
+}
+
 /// DEC-012: a blob minted under a retired epoch is a foreign replay
 /// under the new one — ownership claims outlive the replay set they
 /// retired with, and the retired set never rides the wire again.
@@ -4672,7 +4738,12 @@ async fn meta_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -5695,7 +5766,12 @@ async fn ollama_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -6971,7 +7047,12 @@ async fn openrouter_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -7962,7 +8043,12 @@ async fn sakana_valid_control_yields_one_outcome_and_one_physical_usage() {
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -8773,7 +8859,12 @@ async fn custom_responses_valid_control_yields_one_outcome_and_one_physical_usag
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -8977,7 +9068,12 @@ async fn custom_responses_sends_store_false_and_never_a_hosted_tool() {
     );
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }]),
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }]),
         "only the frozen manifest's function tools ride the request"
     );
     let tools = body["tools"].as_array().expect("the tools array");
@@ -10253,6 +10349,8 @@ async fn openai_codex_stream_fragmentation_and_repeated_usage_never_duplicates()
         vec![rivect::providers::ToolCall {
             tool: "read_file".to_string(),
             path: Some("/tmp/fixture".to_string()),
+            text: None,
+            test: None,
         }]
     );
     assert_eq!(

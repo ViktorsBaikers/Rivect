@@ -2634,6 +2634,61 @@ impl TaskStore {
 
     // ----- sessions -----
 
+    pub(crate) fn tui_project_session(
+        &self,
+        marker: &str,
+        session: Option<&SessionId>,
+    ) -> Result<Option<SessionId>> {
+        self.conn()?
+            .query_row(
+                sql::TUI_PROJECT_SESSION,
+                params![marker, session.map(|id| &id.0)],
+                |row| row.get::<_, String>(0).map(SessionId),
+            )
+            .optional()
+            .map_err(storage)
+    }
+
+    pub(crate) fn record_tui_turn(
+        &mut self,
+        task: &TaskId,
+        project: &str,
+        config_digest: &str,
+        connection: &str,
+    ) -> Result<()> {
+        self.conn_write()?
+            .execute(
+                sql::INSERT_TUI_TURN_ROUTE,
+                params![task.0, project, config_digest, connection],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    pub(crate) fn tui_previous_turns(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        project: &str,
+        config_digest: &str,
+        connection: &str,
+    ) -> Result<Vec<Value>> {
+        let mut statement = self
+            .conn()?
+            .prepare(sql::TUI_PREVIOUS_TURNS)
+            .map_err(storage)?;
+        let mut turns = statement.query_map(
+            params![session.0, task.0, project, config_digest, connection],
+            |row| {
+                let goal: Vec<u8> = row.get(0)?;
+                let observation: Option<String> = row.get(1)?;
+                Ok(json!({"goal": String::from_utf8_lossy(&goal), "observed_effect": observation}))
+            },
+        ).map_err(storage)?.collect::<std::result::Result<Vec<_>, _>>().map_err(storage)?;
+        turns.reverse();
+        Ok(turns)
+    }
+
     pub fn open_session(
         &mut self,
         bootstrap_id: &str,

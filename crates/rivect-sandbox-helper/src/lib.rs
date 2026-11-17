@@ -3609,14 +3609,23 @@ impl std::error::Error for FdOpenError {
     }
 }
 
-// `openat(2)` — present on macOS and Linux with the same ABI; the mode
-// argument is unused without O_CREAT and stays out of the declaration.
+// The mode argument is present only when openat uses O_CREAT.
 #[allow(
     unsafe_code,
     reason = "the crate's sanctioned syscall surface (DEC-009)"
 )]
 unsafe extern "C" {
-    unsafe fn openat(dirfd: i32, pathname: *const std::os::raw::c_char, oflag: i32) -> i32;
+    unsafe fn openat(dirfd: i32, pathname: *const std::os::raw::c_char, oflag: i32, ...) -> i32;
+    fn unlinkat(dirfd: i32, pathname: *const std::os::raw::c_char, flags: i32) -> i32;
+    #[cfg_attr(target_os = "macos", link_name = "renameatx_np")]
+    #[cfg_attr(target_os = "linux", link_name = "renameat2")]
+    fn exchange_at(
+        old_dir: i32,
+        old_path: *const std::os::raw::c_char,
+        new_dir: i32,
+        new_path: *const std::os::raw::c_char,
+        flags: u32,
+    ) -> i32;
     unsafe fn fstatat(
         dirfd: i32,
         pathname: *const std::os::raw::c_char,
@@ -3956,6 +3965,85 @@ pub fn openat_leaf(
         return Err(FdOpenError::Oversize);
     }
     Ok(AnchoredLeaf { file, identity })
+}
+
+fn leaf_c_string(name: &[u8]) -> io::Result<std::ffi::CString> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    Ok(std::ffi::CString::new(name)?)
+}
+
+/// Creates a private staging file relative to an already validated directory.
+///
+/// # Errors
+/// Invalid names, an occupied leaf, and OS refusals leave existing files untouched.
+#[allow(
+    unsafe_code,
+    reason = "the crate's sanctioned syscall surface (DEC-009)"
+)]
+pub fn create_edit_stage(dir: &AnchoredDir, name: &[u8]) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "macos")]
+    const CREATE_EXCLUSIVE: i32 = 0x0200 | 0x0800;
+    #[cfg(target_os = "linux")]
+    const CREATE_EXCLUSIVE: i32 = 0o100 | 0o200;
+    let name = leaf_c_string(name)?;
+    // SAFETY: a live directory fd and a validated single C name are held through the call.
+    let fd = unsafe {
+        openat(
+            dir.fd.as_raw_fd(),
+            name.as_ptr(),
+            2 | CREATE_EXCLUSIVE | ANCHOR_O_NOFOLLOW | O_CLOEXEC,
+            0o600_i32,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new, exclusively owned fd.
+    Ok(std::fs::File::from(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(fd)
+    }))
+}
+
+/// Atomically swaps two existing leaves in the same anchored directory.
+///
+/// # Errors
+/// Unsupported swaps, invalid names and OS refusals leave the names unchanged.
+#[allow(
+    unsafe_code,
+    reason = "the crate's sanctioned syscall surface (DEC-009)"
+)]
+pub fn exchange_edit_leaves(dir: &AnchoredDir, left: &[u8], right: &[u8]) -> io::Result<()> {
+    let left = leaf_c_string(left)?;
+    let right = leaf_c_string(right)?;
+    let fd = dir.fd.as_raw_fd();
+    // SAFETY: both single names and their live directory fd are held through the call.
+    let outcome = unsafe { exchange_at(fd, left.as_ptr(), fd, right.as_ptr(), 2) };
+    if outcome < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Removes one exact staging name from its pinned directory.
+///
+/// # Errors
+/// Invalid names and OS refusals propagate without a path-based retry.
+#[allow(
+    unsafe_code,
+    reason = "the crate's sanctioned syscall surface (DEC-009)"
+)]
+pub fn remove_edit_stage(dir: &AnchoredDir, name: &[u8]) -> io::Result<()> {
+    let name = leaf_c_string(name)?;
+    // SAFETY: the directory fd and single name remain live. No flags permit removing directories.
+    let outcome = unsafe { unlinkat(dir.fd.as_raw_fd(), name.as_ptr(), 0) };
+    if outcome < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// The only `launch` option accepted before `--`: caps the launched

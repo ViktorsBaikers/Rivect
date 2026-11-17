@@ -1328,7 +1328,12 @@ fn action_tool(connection: &str, action: &Value) -> Result<ToolCall, ProviderErr
         .get("path")
         .and_then(Value::as_str)
         .map(str::to_string);
-    Ok(ToolCall { tool, path })
+    Ok(ToolCall {
+        tool,
+        path,
+        text: None,
+        test: None,
+    })
 }
 
 /// The recorded MCP argument form: an object, or a JSON-string object;

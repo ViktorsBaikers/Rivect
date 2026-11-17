@@ -279,6 +279,8 @@ async fn ollama_cloud_valid_control_yields_one_outcome_and_one_physical_usage() 
         vec![ToolCall {
             tool: "read_file".to_string(),
             path: Some("/world/ollama-cloud/target.txt".to_string()),
+            text: None,
+            test: None,
         }],
         "the streamed tool call is the typed call"
     );

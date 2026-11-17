@@ -5074,6 +5074,8 @@ async fn vercel_ai_gateway_stream_fragmentation_and_repeated_usage_never_duplica
         vec![rivect::providers::ToolCall {
             tool: "read_file".to_string(),
             path: Some("/tmp/fixture".to_string()),
+            text: None,
+            test: None,
         }]
     );
     assert_eq!(
@@ -5707,6 +5709,8 @@ async fn custom_messages_stream_fragmentation_and_repeated_usage_never_duplicate
         vec![rivect::providers::ToolCall {
             tool: "read_file".to_string(),
             path: Some("/tmp/fixture".to_string()),
+            text: None,
+            test: None,
         }]
     );
     assert_eq!(

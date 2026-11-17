@@ -340,7 +340,12 @@ async fn valid_control_yields_one_outcome_and_one_physical_usage() {
         body["tools"],
         json!([{
             "type": "function",
-            "function": {"name": "read_file", "description": "", "parameters": {"type": "object"}},
+            "function": {"name": "read_file", "description": "", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        }},
         }]),
         "the declared tool surface maps to function tools verbatim"
     );
@@ -4807,7 +4812,12 @@ async fn abliteration_valid_control_yields_one_outcome_and_one_physical_usage() 
     assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     assert_eq!(
         body["tools"],
-        json!([{ "type": "function", "name": "read_file" }])
+        json!([{ "type": "function", "name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        } }])
     );
     assert_eq!(
         body["input"],
@@ -6907,7 +6917,12 @@ async fn aimlapi_valid_control_yields_one_outcome_and_one_physical_usage() {
         body["tools"],
         json!([{
             "type": "function",
-            "function": {"name": "read_file", "description": "", "parameters": {"type": "object"}},
+            "function": {"name": "read_file", "description": "", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Project-relative file path"}},
+            "required": ["path"],
+            "additionalProperties": false,
+        }},
         }]),
         "the declared tool surface maps to function tools verbatim"
     );
@@ -23616,6 +23631,8 @@ async fn zenmux_stream_fragmentation_and_repeated_usage_never_duplicates() {
         vec![ToolCall {
             tool: "read_file".to_string(),
             path: Some("/tmp/fixture".to_string()),
+            text: None,
+            test: None,
         }]
     );
     assert_eq!(

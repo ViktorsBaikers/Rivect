@@ -440,6 +440,94 @@ struct ConfirmedRead<'a> {
     effect_attempt: String,
 }
 
+pub(crate) const FILE_SHARE_QUESTION: &str = "share-file:";
+const SHARE_ONCE: &str = "share-once";
+pub(crate) const FILE_WRITE_QUESTION: &str = "write-file:";
+pub(crate) const PROJECT_CHECK_QUESTION: &str = "run-check:";
+const ALLOW_WRITE: &str = "allow-write-once";
+const ALLOW_CHECK: &str = "allow-check-once";
+
+pub(crate) struct PendingFileShare {
+    question: QuestionId,
+    pub(crate) task: TaskId,
+    path: PathBuf,
+    digest: String,
+    recipient: ApprovedRecipient,
+    inputs: String,
+}
+
+struct ApprovedRecipient {
+    connection: String,
+    endpoint: String,
+    config_revision: String,
+    identity: String,
+}
+
+pub(crate) struct PendingFileWrite {
+    question: QuestionId,
+    pub(crate) task: TaskId,
+    path: PathBuf,
+    edit: crate::executor::ProjectEdit,
+    bytes: Vec<u8>,
+    recipient: ApprovedRecipient,
+}
+
+pub(crate) struct PendingProjectCheck {
+    question: QuestionId,
+    pub(crate) task: TaskId,
+    cargo: PathBuf,
+    cargo_home: PathBuf,
+    selector: String,
+    candidate: String,
+    recipient: ApprovedRecipient,
+}
+
+fn local_check_toolchain() -> Option<(PathBuf, PathBuf)> {
+    use std::path::Path;
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map_or_else(|| home.join(".cargo"), PathBuf::from)
+        .canonicalize()
+        .ok()?;
+    let direct = std::env::var_os("CARGO").into_iter().map(PathBuf::from);
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let local = direct.chain(
+        std::env::split_paths(&search)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("cargo")),
+    );
+    let usable = |path: PathBuf| {
+        if !path.is_absolute() {
+            return None;
+        }
+        let canonical = path.canonicalize().ok()?;
+        (canonical.is_file() && canonical.parent()?.join("rustc").is_file()).then_some(canonical)
+    };
+    if let Some(cargo) = local.filter_map(usable).next() {
+        return Some((cargo, cargo_home));
+    }
+    let rustup_home =
+        std::env::var_os("RUSTUP_HOME").map_or_else(|| home.join(".rustup"), PathBuf::from);
+    let settings = std::fs::read_to_string(rustup_home.join("settings.toml"))
+        .ok()?
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    let name = std::env::var("RUSTUP_TOOLCHAIN").ok().or_else(|| {
+        settings
+            .get("default_toolchain")?
+            .as_str()
+            .map(str::to_owned)
+    })?;
+    if !matches!(
+        Path::new(&name).components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    ) {
+        return None;
+    }
+    let cargo = usable(rustup_home.join("toolchains").join(name).join("bin/cargo"))?;
+    Some((cargo, cargo_home))
+}
+
 impl Runtime {
     pub fn drain_scheduler(&mut self, session_id: &SessionId) -> Result<(), ControllerError> {
         for _ in 0..SCHEDULER_DRAIN_LIMIT {
@@ -466,6 +554,9 @@ impl Runtime {
         grant_id: &str,
         crash_after_dispatch: bool,
     ) -> Result<StepOutcome, ControllerError> {
+        if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
+            return Ok(cancelled);
+        }
         if let Some(gated) = self.gate_decision_dispatch(session_id, task_id, grant_id)? {
             return Ok(gated);
         }
@@ -483,14 +574,17 @@ impl Runtime {
         if let Some(segment) = self.saved_segment(task_id)? {
             return self.run_saved_segment(session_id, task_id, grant_id, &segment);
         }
-        let (target, retained_attempt_id) =
-            match self.resolve_read_target(session_id, task_id, answer)? {
-                Ok(pair) => pair,
-                Err(waiting) => return Ok(waiting),
-            };
+        let resolved = self.resolve_read_target(session_id, task_id, answer);
+        if let Some(cancelled) = self.foreground_cancellation(session_id, task_id)? {
+            return Ok(cancelled);
+        }
+        let (target, retained_attempt_id) = match resolved? {
+            Ok(pair) => pair,
+            Err(waiting) => return Ok(waiting),
+        };
         let request = EffectRequest::Read {
             grant_id: grant_id.to_string(),
-            path: target.clone(),
+            path: target,
         };
         let admitted = {
             let mut executor = self.executor();
@@ -516,6 +610,7 @@ impl Runtime {
         }
         match executor.execute(&admitted) {
             Ok(EffectOutcome::Read { bytes, digest }) => {
+                let target = admitted.request.target_path();
                 self.complete_read_with_evidence(ConfirmedRead {
                     session_id,
                     task_id,
@@ -538,6 +633,33 @@ impl Runtime {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn foreground_cancellation(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<Option<StepOutcome>, ControllerError> {
+        if !self.foreground.as_ref().is_some_and(|work| {
+            &work.task_id == task_id && work.cancel.load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            return Ok(None);
+        }
+        let snapshot = self.owner.store.snapshot(task_id)?;
+        if snapshot.lifecycle.is_terminal() {
+            return Ok(Some(StepOutcome::NoAction { snapshot }));
+        }
+        self.owner.store.cancel_task(
+            session_id,
+            task_id,
+            snapshot.intent_revision,
+            Some(crate::executor::TASK_CANCELLED),
+        )?;
+        self.tombstone_paused(task_id);
+        self.clear_budget_wait(session_id, task_id);
+        Ok(Some(StepOutcome::NoAction {
+            snapshot: self.owner.store.snapshot(task_id)?,
+        }))
     }
 
     /// Resumes one task's continuation after a forced compaction
@@ -821,6 +943,21 @@ impl Runtime {
         // option id colliding with a stale pause's candidate on a
         // different fork can never spend its frozen manifest.
         let answered = self.owner.store.latest_applied_answer_question(task_id)?;
+        if let Some(question) = &answered
+            && question.0.starts_with(FILE_SHARE_QUESTION)
+        {
+            return self.resume_file_share(session_id, task_id, question, answer);
+        }
+        if let Some(question) = &answered
+            && question.0.starts_with(FILE_WRITE_QUESTION)
+        {
+            return self.resume_file_write(session_id, task_id, question, answer);
+        }
+        if let Some(question) = &answered
+            && question.0.starts_with(PROJECT_CHECK_QUESTION)
+        {
+            return self.resume_project_check(session_id, task_id, question, answer);
+        }
         // The reserved `begin` position is the ordinary first step only when
         // the applied answer named this task's recorded start question. A
         // fallback candidate that happens to be named `begin` keeps its own
@@ -848,11 +985,12 @@ impl Runtime {
                         paused.manifest.attempt_id.clone(),
                         option_id.0.clone(),
                         paused.manifest.clone(),
+                        paused.share_reads,
                     )
                 }),
             AnswerSelection::Custom { .. } => None,
         };
-        if let Some((attempt_id, connection, paused_manifest)) = chosen {
+        if let Some((attempt_id, connection, paused_manifest, share_reads)) = chosen {
             let scopes = self.budget_scopes(task_id)?;
             let sent = {
                 let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
@@ -887,6 +1025,15 @@ impl Runtime {
             };
             self.provider_calls += 1;
             self.paused_attempts.remove(&task_id.0);
+            if share_reads
+                && let Some(work) = self
+                    .foreground
+                    .as_mut()
+                    .filter(|work| &work.task_id == task_id)
+            {
+                work.share_reads = true;
+                self.record_tui_context(session_id, task_id)?;
+            }
             return self.read_target_from_reply(task_id, reply, Some(attempt_id));
         }
         if matches!(answer, AnswerSelection::Option { .. }) && !start_answer {
@@ -909,7 +1056,7 @@ impl Runtime {
         } else {
             format!("scope {target_declared}")
         };
-        let inputs = format!(
+        let mut inputs = format!(
             "goal: {}\nanswer: {}\n{}",
             String::from_utf8_lossy(&self.owner.store.goal_bytes(task_id)?),
             answer_text(answer),
@@ -920,14 +1067,25 @@ impl Runtime {
         // as such, so the wire's user channel never reads as a human
         // turn that could move consent.
         let origin = self.owner.store.answer_input_origin(task_id)?;
+        let mut config = self.config_for_broker();
+        let ordinary = start_answer
+            && self
+                .foreground
+                .as_ref()
+                .is_some_and(|work| &work.task_id == task_id);
+        if ordinary {
+            self.add_tui_context(session_id, task_id, &mut config, &mut inputs)?;
+        }
         let facts = self.ranking_facts(task_id, &inputs)?;
-        let config = self.config_for_broker();
         let prepared = match self.take_pending_image(task_id) {
             // The answer carried a typed image: the one image constructor
             // sniffs, bounds, digests and admit it on this same request.
             Some(image) => self
                 .broker
                 .prepare_vision(&purpose, &config, &world, &inputs, origin, &facts, image),
+            None if ordinary => self
+                .broker
+                .prepare_project_start(&purpose, &config, &world, &inputs, origin, &facts),
             None => self
                 .broker
                 .prepare_with_facts(&purpose, &config, &world, &inputs, origin, &facts),
@@ -951,6 +1109,12 @@ impl Runtime {
             }
             Err(source) => return Err(source.into()),
         };
+        if start_answer
+            && let Some(work) = self.foreground.as_mut()
+            && &work.task_id == task_id
+        {
+            work.share_reads = true;
+        }
         self.retain_pre_effect(&manifest.attempt_id, "first useful offline dispatch")?;
         let scopes = self.budget_scopes(task_id)?;
         let sent = {
@@ -972,6 +1136,14 @@ impl Runtime {
         match sent {
             Ok(reply) => {
                 self.provider_calls += 1;
+                if ordinary
+                    && let Some(cancelled) = self.foreground_cancellation(session_id, task_id)?
+                {
+                    return Ok(Err(cancelled));
+                }
+                if ordinary {
+                    self.record_tui_context(session_id, task_id)?;
+                }
                 // The send landed: any attempt this task was paused on
                 // is superseded — tombstone it so a late retry of its
                 // frozen manifest is refused, not resurrected.
@@ -1103,6 +1275,10 @@ impl Runtime {
                 manifest,
                 choice,
                 served_question_id,
+                share_reads: self
+                    .foreground
+                    .as_ref()
+                    .is_some_and(|work| &work.task_id == task_id && work.share_reads),
             },
         ) {
             self.broker.cancel_attempt(&previous.manifest.attempt_id);
@@ -1197,9 +1373,31 @@ impl Runtime {
         reply: ProviderReply,
         retained_attempt_id: Option<String>,
     ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        if reply.tool_calls.len() > 1
+            && self
+                .foreground
+                .as_ref()
+                .is_some_and(|work| &work.task_id == task_id && work.share_reads)
+        {
+            return Ok(Err(
+                self.refuse_effect(task_id, "use one project tool per response")?
+            ));
+        }
         let Some(call) = reply.tool_calls.iter().find(|c| c.tool == "read_file") else {
             self.owner.store.mark_no_ready(task_id)?;
             let snapshot = self.owner.store.snapshot(task_id)?;
+            if reply.tool_calls.is_empty()
+                && !reply.text.trim().is_empty()
+                && let Some(work) = self.foreground.as_mut()
+                && &work.task_id == task_id
+            {
+                if let Some(previous) = &mut work.reply {
+                    previous.push('\n');
+                    previous.push_str(&reply.text);
+                } else {
+                    work.reply = Some(reply.text);
+                }
+            }
             return Ok(Err(StepOutcome::Waiting { snapshot }));
         };
         Ok(Ok((
@@ -1207,6 +1405,82 @@ impl Runtime {
                 .join(call.path.as_deref().unwrap_or_default()),
             retained_attempt_id,
         )))
+    }
+
+    fn add_tui_context(
+        &self,
+        session: &SessionId,
+        task: &TaskId,
+        config: &mut crate::config::Config,
+        inputs: &mut String,
+    ) -> Result<(), ControllerError> {
+        use crate::config::{FallbackAssign, ModelAssign};
+        let project = crate::commands::tui_project_marker(&self.scope_root);
+        if self
+            .owner
+            .store
+            .tui_project_session(&project, Some(session))?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let resolved = config
+            .resolve_purpose(&self.purpose)
+            .map_err(ModelError::from)?;
+        let connection = match &resolved.model {
+            ModelAssign::Fixed(pin) => &pin.connection,
+            ModelAssign::Auto { pool: Some(pool) } if pool.len() == 1 => &pool[0],
+            ModelAssign::Auto { pool: None } if config.connections.len() == 1 => {
+                let Some(connection) = config.connections.keys().next() else {
+                    return Ok(());
+                };
+                connection
+            }
+            ModelAssign::Auto { .. } | ModelAssign::Inherit => return Ok(()),
+        };
+        let Some(identity) = self.private_context_recipient(config, connection) else {
+            return Ok(());
+        };
+        let revision = format!("{}:{identity}", self.effective().sources_digest);
+        let history = self
+            .owner
+            .store
+            .tui_previous_turns(session, task, &project, &revision, connection)?;
+        if !history.is_empty() {
+            inputs.push_str("\nEarlier human goals and recorded effects for this conversation: ");
+            inputs.push_str(&serde_json::Value::Array(history).to_string());
+            config
+                .models
+                .purposes
+                .entry(self.purpose.clone())
+                .or_default()
+                .fallback = Some(FallbackAssign::Off);
+        }
+        Ok(())
+    }
+
+    fn record_tui_context(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+    ) -> Result<(), ControllerError> {
+        let project = crate::commands::tui_project_marker(&self.scope_root);
+        if self
+            .owner
+            .store
+            .tui_project_session(&project, Some(session))?
+            .is_some()
+            && let Some(connection) = self.economy().connection.clone()
+        {
+            let config = self.config_for_broker();
+            if let Some(identity) = self.private_context_recipient(&config, &connection) {
+                let revision = format!("{}:{identity}", self.effective().sources_digest);
+                self.owner
+                    .store
+                    .record_tui_turn(task, &project, &revision, &connection)?;
+            }
+        }
+        Ok(())
     }
 
     /// Evidence and the completion guard for a confirmed scoped read. The
@@ -1251,8 +1525,695 @@ impl Runtime {
             admitted_attempt_id: None,
         };
         self.owner.store.retain_attempt(&terminal)?;
+        if self
+            .foreground
+            .as_ref()
+            .is_some_and(|work| &work.task_id == task_id && work.share_reads)
+        {
+            return self.pause_for_file_share(session_id, task_id, target, bytes, digest);
+        }
         let snapshot = self.owner.store.complete_if_eligible(session_id, task_id)?;
         Ok(StepOutcome::Completed { snapshot })
+    }
+
+    fn pause_for_file_share(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        path: &std::path::Path,
+        bytes: &[u8],
+        digest: &str,
+    ) -> Result<StepOutcome, ControllerError> {
+        let config = self.config_for_broker();
+        let selected = self.economy().connection.as_deref();
+        let allowed = selected.and_then(|connection| {
+            let entry = config.connections.get(connection)?;
+            let canonical_codex = connection == crate::providers::openai_login::CANONICAL_PROFILE
+                && entry.endpoint == "https://chatgpt.com/backend-api/codex";
+            let loopback = entry.kind == crate::config::ConnKind::Local
+                && crate::providers::loopback_base(connection, &entry.endpoint).is_ok();
+            (canonical_codex || loopback).then_some((connection, entry.endpoint.as_str()))
+        });
+        let Some((connection, endpoint)) = allowed else {
+            return self.refuse_effect(task, "file disclosure is unavailable for this connection");
+        };
+        let Some(identity) = self.private_context_recipient(&config, connection) else {
+            return self.refuse_effect(
+                task,
+                "file disclosure requires a verified connection identity",
+            );
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return self.refuse_effect(task, "file disclosure requires utf-8");
+        };
+        let display_path = path
+            .strip_prefix(&self.scope_root)
+            .unwrap_or(path)
+            .display();
+        let inputs = serde_json::json!({
+            "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
+            "tool_result": { "tool": "read_file", "path": display_path.to_string(), "text": text },
+        })
+        .to_string();
+        let question = Question {
+            question_id: QuestionId(format!(
+                "{FILE_SHARE_QUESTION}{}",
+                crate::contracts::CommandId::generate().0
+            )),
+            question_revision: 1,
+            task_id: task.clone(),
+            intent_revision: self.owner.store.snapshot(task)?.intent_revision,
+            prompt: format!(
+                "Share {display_path} with {connection} at {endpoint}? {} bytes, SHA-256 {digest}",
+                bytes.len()
+            ),
+            options: vec![
+                QuestionOption {
+                    option_id: OptionId("keep-local".to_string()),
+                    label: "Keep local".to_string(),
+                    consequences: "The file contents stay in this process.".to_string(),
+                    availability: Availability::Enabled,
+                },
+                QuestionOption {
+                    option_id: OptionId(SHARE_ONCE.to_string()),
+                    label: "Share once".to_string(),
+                    consequences: "Send this read result to the named connection.".to_string(),
+                    availability: Availability::Enabled,
+                },
+            ],
+            recommended_option_id: OptionId("keep-local".to_string()),
+            recommendation_basis: "File read permission does not authorize disclosure.".to_string(),
+        };
+        let pending = PendingFileShare {
+            question: question.question_id.clone(),
+            task: task.clone(),
+            path: path.to_path_buf(),
+            digest: digest.to_string(),
+            recipient: ApprovedRecipient {
+                connection: connection.to_string(),
+                endpoint: endpoint.to_string(),
+                config_revision: self.effective().sources_digest.clone(),
+                identity,
+            },
+            inputs,
+        };
+        let snapshot = self.owner.store.publish_question(session, &question)?;
+        self.file_share = Some(pending);
+        Ok(StepOutcome::Waiting { snapshot })
+    }
+
+    fn resume_file_share(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        question: &QuestionId,
+        answer: &AnswerSelection,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        let Some(share) = self.file_share.take_if(|share| &share.question == question) else {
+            return Ok(Err(
+                self.refuse_effect(task, "file disclosure approval is stale")?
+            ));
+        };
+        if !matches!(answer, AnswerSelection::Option { option_id } if option_id.0 == SHARE_ONCE) {
+            return Ok(Err(self.refuse_effect(
+                task,
+                "permission denied; file contents kept local",
+            )?));
+        }
+        let Some(work) = self
+            .foreground
+            .as_mut()
+            .filter(|work| &work.task_id == task)
+        else {
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file disclosure requires the active terminal",
+            )?));
+        };
+        work.share_reads = true;
+        if self.policy.covers(&share.path) || !self.recipient_current(&share.recipient) {
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file disclosure recipient or policy changed",
+            )?));
+        }
+        let result = self.dispatch_tool_observation(
+            session,
+            task,
+            &share.recipient,
+            &share.inputs,
+            &["read_file", crate::providers::WRITE_FILE_TOOL],
+        )?;
+        let (reply, attempt_id) = match result {
+            Ok(result) => result,
+            Err(waiting) => return Ok(Err(waiting)),
+        };
+        if let [call] = reply.tool_calls.as_slice()
+            && call.tool == crate::providers::WRITE_FILE_TOOL
+        {
+            return Ok(Err(self.offer_file_write(session, task, share, call)?));
+        }
+        self.read_target_from_reply(task, reply, Some(attempt_id))
+    }
+
+    fn recipient_current(&self, recipient: &ApprovedRecipient) -> bool {
+        recipient.config_revision == self.effective().sources_digest
+            && self
+                .private_context_recipient(&self.config_for_broker(), &recipient.connection)
+                .is_some_and(|identity| identity == recipient.identity)
+            && self.policy.decide(
+                std::path::Path::new(&recipient.endpoint),
+                EffectClass::Egress,
+                &crate::policy::AdmissionContext {
+                    mode: crate::policy::PermissionMode::Manual,
+                    in_grant_scope: false,
+                    budget_remaining: false,
+                    in_trusted_scope: false,
+                    has_checkpoint: false,
+                    previously_approved: false,
+                    within_declared_bounds: false,
+                    dry_run: false,
+                },
+            ) != crate::policy::ModeDecision::Deny
+    }
+
+    fn dispatch_tool_observation(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        recipient: &ApprovedRecipient,
+        inputs: &str,
+        tools: &[&str],
+    ) -> Result<Result<(ProviderReply, String), StepOutcome>, ControllerError> {
+        use crate::config::{FallbackAssign, ModelAssign};
+        let purpose = self.purpose.clone();
+        let mut config = self.config_for_broker();
+        let mut model = config
+            .resolve_purpose(&purpose)
+            .map_err(ModelError::from)?
+            .model;
+        if !matches!(&model, ModelAssign::Fixed(pin) if pin.connection == recipient.connection) {
+            model = ModelAssign::Auto {
+                pool: Some(vec![recipient.connection.clone()]),
+            };
+        }
+        let row = config.models.purposes.entry(purpose.clone()).or_default();
+        row.model = Some(model);
+        row.pool = Some(vec![recipient.connection.clone()]);
+        row.fallback = Some(FallbackAssign::Off);
+        let world = self.scope_root.display().to_string();
+        let facts = self.ranking_facts(task, inputs)?;
+        let manifest = self.broker.prepare_call_with_facts(
+            &purpose,
+            &config,
+            &world,
+            inputs,
+            &crate::model::CallContract {
+                instructions: crate::model::PROJECT_RESULT_INSTRUCTIONS,
+                tools,
+            },
+            &facts,
+        )?;
+        if let Some(cancelled) = self.foreground_cancellation(session, task)? {
+            self.broker.cancel_attempt(&manifest.attempt_id);
+            return Ok(Err(cancelled));
+        }
+        self.retain_pre_effect(&manifest.attempt_id, "approved tool continuation")?;
+        let scopes = self.budget_scopes(task)?;
+        let sent = {
+            let mut ledger = crate::state::StoreLedger::new(&mut self.owner.store, scopes);
+            self.broker.dispatch(&mut ledger, &world, &manifest)
+        };
+        self.note_send_outcome(session, task, &sent, Some(&manifest));
+        let reply = sent?;
+        self.provider_calls += 1;
+        if let Some(cancelled) = self.foreground_cancellation(session, task)? {
+            return Ok(Err(cancelled));
+        }
+        Ok(Ok((reply, manifest.attempt_id)))
+    }
+
+    fn offer_file_write(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        share: PendingFileShare,
+        call: &crate::providers::ToolCall,
+    ) -> Result<StepOutcome, ControllerError> {
+        use sha2::Digest as _;
+        let (Some(path), Some(text)) = (&call.path, &call.text) else {
+            return self.refuse_effect(task, "invalid file replacement");
+        };
+        let target = self.scope_root.join(path);
+        if target != share.path || self.policy.covers(&target) {
+            return self.refuse_effect(
+                task,
+                "file replacement requires a scoped read of the same path",
+            );
+        }
+        let Ok(identity) = crate::executor::write_target_identity(&self.scope_root, &target) else {
+            return self.refuse_effect(task, "file replacement target is unavailable");
+        };
+        if identity.reuse().is_err() || text.len() > crate::executor::macos::WRITE_MAX_BYTES {
+            return self.refuse_effect(task, "file replacement cannot be verified on this target");
+        }
+        let digest = crate::config::hex(&sha2::Sha256::digest(text.as_bytes()));
+        let deny = OptionId("deny".to_string());
+        let question = Question {
+            question_id: QuestionId(format!(
+                "{FILE_WRITE_QUESTION}{}",
+                crate::contracts::CommandId::generate().0
+            )),
+            question_revision: 1,
+            task_id: task.clone(),
+            intent_revision: self.owner.store.snapshot(task)?.intent_revision,
+            prompt: format!(
+                "Write {path}? Replace with {} bytes, SHA-256 {digest}",
+                text.len()
+            ),
+            options: vec![
+                QuestionOption {
+                    option_id: deny.clone(),
+                    label: "Deny".to_string(),
+                    consequences: "Keep the existing project file.".to_string(),
+                    availability: Availability::Enabled,
+                },
+                QuestionOption {
+                    option_id: OptionId(ALLOW_WRITE.to_string()),
+                    label: "Allow once".to_string(),
+                    consequences: "Apply this exact replacement to the named file.".to_string(),
+                    availability: Availability::Enabled,
+                },
+            ],
+            recommended_option_id: deny,
+            recommendation_basis: "A replacement requires explicit authorization.".to_string(),
+        };
+        let snapshot = self.owner.store.publish_question(session, &question)?;
+        self.file_write = Some(PendingFileWrite {
+            question: question.question_id,
+            task: task.clone(),
+            edit: crate::executor::ProjectEdit {
+                identity,
+                original_digest: share.digest,
+            },
+            path: target,
+            bytes: text.as_bytes().to_vec(),
+            recipient: share.recipient,
+        });
+        Ok(StepOutcome::Waiting { snapshot })
+    }
+
+    fn resume_file_write(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        question: &QuestionId,
+        answer: &AnswerSelection,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        let pending = self
+            .file_write
+            .take_if(|write| &write.question == question && &write.task == task);
+        if !matches!(answer, AnswerSelection::Option { option_id } if option_id.0 == ALLOW_WRITE) {
+            return Ok(Err(
+                self.refuse_effect(task, "permission denied; file unchanged")?
+            ));
+        }
+        let Some(write) = pending else {
+            return Ok(Err(
+                self.refuse_effect(task, "file replacement approval is stale")?
+            ));
+        };
+        let Some(cancel) = self
+            .foreground
+            .as_ref()
+            .filter(|work| &work.task_id == task)
+            .map(|work| std::sync::Arc::clone(&work.cancel))
+        else {
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file replacement requires the active terminal",
+            )?));
+        };
+        if !self.recipient_current(&write.recipient) || self.policy.covers(&write.path) {
+            return Ok(Err(self.refuse_effect(
+                task,
+                "file replacement scope or policy changed",
+            )?));
+        }
+        let applied = self.apply_file_write(task, write.path, write.bytes, &write.edit, &cancel);
+        if let Some(cancelled) = self.foreground_cancellation(session, task)? {
+            return Ok(Err(cancelled));
+        }
+        let (detail, path) = applied?;
+        let projected = path
+            .strip_prefix(&self.scope_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if !self.recipient_current(&write.recipient) {
+            if let Some(work) = self.foreground.as_mut() {
+                work.reply = Some(format!(
+                    "Written {projected}. Provider continuation blocked by policy."
+                ));
+            }
+            self.owner.store.mark_no_ready(task)?;
+            return Ok(Err(StepOutcome::Waiting {
+                snapshot: self.owner.store.snapshot(task)?,
+            }));
+        }
+        if let Some(work) = self.foreground.as_mut() {
+            work.reply = Some(format!("Written {projected}."));
+        }
+        let inputs = serde_json::json!({
+            "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
+            "tool_result": { "tool": "write_file", "path": projected, "detail": detail },
+        })
+        .to_string();
+        match self.dispatch_tool_observation(
+            session,
+            task,
+            &write.recipient,
+            &inputs,
+            &[crate::providers::RUN_CHECK_TOOL],
+        )? {
+            Ok((reply, attempt)) => {
+                if let [call] = reply.tool_calls.as_slice()
+                    && call.tool == crate::providers::RUN_CHECK_TOOL
+                    && let Some(selector) = &call.test
+                {
+                    return Ok(Err(self.offer_project_check(
+                        session,
+                        task,
+                        write.recipient,
+                        selector,
+                    )?));
+                }
+                self.read_target_from_reply(task, reply, Some(attempt))
+            }
+            Err(waiting) => Ok(Err(waiting)),
+        }
+    }
+
+    fn apply_file_write(
+        &mut self,
+        task: &TaskId,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        edit: &crate::executor::ProjectEdit,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(String, PathBuf), ControllerError> {
+        let class = EffectClass::Write;
+        let grant = self.policy.grant_once(self.scope_root.clone(), class);
+        let result = (|| {
+            let scope = path
+                .to_str()
+                .and_then(|target| crate::policy::preapproval_scope(class, &grant, target))
+                .ok_or(ExecutorError::PolicyDenied)?;
+            self.owner
+                .store
+                .record_preapproval(&scope, "terminal", 120)?;
+            let request = EffectRequest::Write {
+                grant_id: grant.clone(),
+                path: path.clone(),
+                bytes,
+            };
+            let mut executor = self.executor();
+            let admitted = executor.admit(
+                task,
+                request,
+                crate::policy::PermissionMode::PreapprovedOnly,
+            )?;
+            if admitted.request.target_path() != path || admitted.request.grant_id() != grant {
+                drop(executor);
+                self.owner
+                    .store
+                    .attempt_rejected(&admitted.attempt_id, "write target changed")?;
+                return Err(ExecutorError::PolicyDenied.into());
+            }
+            Ok((
+                executor.execute_project_edit(&admitted, edit, cancel)?,
+                path,
+            ))
+        })();
+        self.policy.forget_once(&grant);
+        result
+    }
+
+    fn offer_project_check(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        recipient: ApprovedRecipient,
+        selector: &str,
+    ) -> Result<StepOutcome, ControllerError> {
+        let Some((cargo, cargo_home)) = local_check_toolchain() else {
+            return self.refuse_effect(task, "check requires a locally installed Cargo toolchain");
+        };
+        if !self.scope_root.join("Cargo.toml").is_file() || self.policy.covers(&cargo) {
+            return self.refuse_effect(
+                task,
+                "check requires a Cargo project and an allowed executable",
+            );
+        }
+        let candidate = crate::executor::scoped_workspace_digest(&self.scope_root, &self.policy)
+            .map_err(ExecutorError::Check)?;
+        let deny = OptionId("deny".to_string());
+        let question = Question {
+            question_id: QuestionId(format!(
+                "{PROJECT_CHECK_QUESTION}{}",
+                crate::contracts::CommandId::generate().0
+            )),
+            question_revision: 1,
+            task_id: task.clone(),
+            intent_revision: self.owner.store.snapshot(task)?.intent_revision,
+            prompt: format!(
+                "Run Cargo test {selector} --exact in {} using {}? Library test, locked and offline. Project SHA-256 {candidate}",
+                self.scope_root.display(),
+                cargo.display()
+            ),
+            options: vec![
+                QuestionOption {
+                    option_id: deny.clone(),
+                    label: "Deny".to_string(),
+                    consequences: "Keep the edit and skip this check.".to_string(),
+                    availability: Availability::Enabled,
+                },
+                QuestionOption {
+                    option_id: OptionId(ALLOW_CHECK.to_string()),
+                    label: "Allow once".to_string(),
+                    consequences: "Run this exact test in a confined project snapshot.".to_string(),
+                    availability: Availability::Enabled,
+                },
+            ],
+            recommended_option_id: deny,
+            recommendation_basis: "Process execution requires explicit authorization.".to_string(),
+        };
+        let snapshot = self.owner.store.publish_question(session, &question)?;
+        self.project_check = Some(PendingProjectCheck {
+            question: question.question_id,
+            task: task.clone(),
+            cargo,
+            cargo_home,
+            selector: selector.to_string(),
+            candidate,
+            recipient,
+        });
+        Ok(StepOutcome::Waiting { snapshot })
+    }
+
+    fn resume_project_check(
+        &mut self,
+        session: &SessionId,
+        task: &TaskId,
+        question: &QuestionId,
+        answer: &AnswerSelection,
+    ) -> Result<Result<(PathBuf, Option<String>), StepOutcome>, ControllerError> {
+        let pending = self
+            .project_check
+            .take_if(|check| &check.question == question && &check.task == task);
+        if !matches!(answer, AnswerSelection::Option { option_id } if option_id.0 == ALLOW_CHECK) {
+            return Ok(Err(
+                self.refuse_effect(task, "permission denied; check not run")?
+            ));
+        }
+        let Some(pending) = pending else {
+            return Ok(Err(self.refuse_effect(task, "check approval is stale")?));
+        };
+        let Some(cancel) = self
+            .foreground
+            .as_ref()
+            .filter(|work| &work.task_id == task)
+            .map(|work| std::sync::Arc::clone(&work.cancel))
+        else {
+            return Ok(Err(
+                self.refuse_effect(task, "check requires the active terminal")?
+            ));
+        };
+        if !self.recipient_current(&pending.recipient) {
+            return Ok(Err(self.refuse_effect(task, "check configuration changed")?));
+        }
+        let observed_run = self.run_approved_check(session, &pending, &cancel);
+        if let Some(cancelled) = self.foreground_cancellation(session, task)? {
+            return Ok(Err(cancelled));
+        }
+        let run = observed_run?;
+        let status = match (run.exit_code, run.signal) {
+            (Some(code), _) => format!("exit {code}"),
+            (_, Some(signal)) => format!("signal {signal}"),
+            (None, None) => "exit unknown".to_string(),
+        };
+        let observed = format!("Cargo test {}: {status}.", pending.selector);
+        let mut output = observed.clone();
+        if self.recipient_current(&pending.recipient) {
+            let inputs = serde_json::json!({
+                "goal": String::from_utf8_lossy(&self.owner.store.goal_bytes(task)?),
+                "tool_result": { "tool": "run_check", "test": pending.selector, "exit_code": run.exit_code,
+                    "signal": run.signal, "summary": run.summary, "project_digest": run.project_digest },
+            }).to_string();
+            match self.dispatch_tool_observation(session, task, &pending.recipient, &inputs, &[]) {
+                Ok(Ok((reply, _))) if !reply.text.trim().is_empty() => {
+                    output = format!("{observed}\n{}", reply.text);
+                }
+                Ok(Err(waiting)) => return Ok(Err(waiting)),
+                Err(error) => {
+                    output = format!(
+                        "{observed}\nProvider summary unavailable: {}.",
+                        error.error_code().as_str()
+                    );
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
+        if let Some(work) = self.foreground.as_mut() {
+            work.reply = Some(output);
+        }
+        self.owner.store.mark_no_ready(task)?;
+        Ok(Err(StepOutcome::Waiting {
+            snapshot: self.owner.store.snapshot(task)?,
+        }))
+    }
+
+    fn run_approved_check(
+        &mut self,
+        session: &SessionId,
+        pending: &PendingProjectCheck,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::executor::CheckRun, ControllerError> {
+        use crate::actions::{
+            ActionRegistry, ContractBasis, PlanRequest, RequestKind, Surface, SurfaceScan, WorkPart,
+        };
+        use crate::executor::{CheckTarget, ConfinedCheck};
+        let task = &pending.task;
+        let handoff = self.check_handoff(task);
+        let revision = if handoff.explicit_off() {
+            0
+        } else {
+            let config = self.config_for_broker();
+            let criteria = self
+                .owner
+                .store
+                .snapshot(task)?
+                .criteria
+                .items
+                .into_iter()
+                .map(|criterion| criterion.id)
+                .collect();
+            let selection = ActionRegistry::new().select(
+                &PlanRequest {
+                    task_id: task.clone(),
+                    kind: RequestKind::Change,
+                    surfaces: SurfaceScan::Known([Surface::Local].into()),
+                    contract: ContractBasis::Approved,
+                    parts: vec![WorkPart {
+                        id: "check".to_string(),
+                        criteria,
+                        depends_on: Vec::new(),
+                        proof: format!(
+                            "cargo test --lib --locked --offline -- --exact {}",
+                            pending.selector
+                        ),
+                    }],
+                    delegation: None,
+                    author: None,
+                },
+                &[],
+                &mut self.action_context(session, &config),
+            )?;
+            selection.revision
+        };
+        let read = self
+            .policy
+            .grant_once(self.scope_root.clone(), EffectClass::Read);
+        let exec = self
+            .policy
+            .grant_once(pending.cargo.clone(), EffectClass::Exec);
+        let result = (|| {
+            for (class, grant, path) in [
+                (EffectClass::Exec, &exec, &pending.cargo),
+                (EffectClass::Read, &read, &self.scope_root),
+            ] {
+                let scope = path
+                    .to_str()
+                    .and_then(|target| crate::policy::preapproval_scope(class, grant, target))
+                    .ok_or(ExecutorError::PolicyDenied)?;
+                self.owner
+                    .store
+                    .record_preapproval(&scope, "terminal", 120)?;
+            }
+            let check = ConfinedCheck {
+                task_id: task.clone(),
+                expected_selection_revision: revision,
+                project_grant_id: read.clone(),
+                project_root: self.scope_root.clone(),
+                manifest_rel: PathBuf::from("Cargo.toml"),
+                cargo: pending.cargo.clone(),
+                cargo_home: pending.cargo_home.clone(),
+                target: CheckTarget::Library,
+                harness_threads: 1,
+                exact_test: pending.selector.clone(),
+                expected_phase: "project-check".to_string(),
+                expected_assertion_identity: pending.selector.clone(),
+                expected_candidate_digest: pending.candidate.clone(),
+            };
+            let mut executor = self.executor();
+            let mut admission = executor.admit_check(
+                task,
+                EffectRequest::Exec {
+                    grant_id: exec.clone(),
+                    program: pending.cargo.clone(),
+                },
+                crate::policy::PermissionMode::PreapprovedOnly,
+                &check,
+                &handoff,
+            )?;
+            let run = executor.execute_check(&mut admission, &check, cancel)?;
+            self.owner
+                .store
+                .attempt_confirmed(&admission.admitted().attempt_id)?;
+            Ok(run)
+        })();
+        self.policy.forget_once(&read);
+        self.policy.forget_once(&exec);
+        result
+    }
+
+    fn refuse_effect(
+        &mut self,
+        task: &TaskId,
+        reason: &'static str,
+    ) -> Result<StepOutcome, ControllerError> {
+        self.owner.store.mark_no_ready(task)?;
+        if let Some(work) = self
+            .foreground
+            .as_mut()
+            .filter(|work| &work.task_id == task)
+        {
+            work.reply = Some(format!("{reason}."));
+        }
+        Ok(StepOutcome::EffectDenied {
+            reason: reason.to_string(),
+            snapshot: self.owner.store.snapshot(task)?,
+        })
     }
 
     /// DEC-068 sentinel tail: the frozen answer is the only applicability

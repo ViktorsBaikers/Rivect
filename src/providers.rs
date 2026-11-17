@@ -247,10 +247,104 @@ pub(crate) fn loopback_base(connection: &str, raw: &str) -> Result<String, Provi
     Ok(base.to_owned())
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolCall {
     pub tool: String,
     pub path: Option<String>,
+    /// The replacement text on a validated write request.
+    pub text: Option<String>,
+    /// The exact libtest selector on a validated check request.
+    pub test: Option<String>,
+}
+
+impl std::fmt::Debug for ToolCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolCall")
+            .field("tool", &self.tool)
+            .field("path", &self.path)
+            .field("text_bytes", &self.text.as_ref().map(String::len))
+            .field("test", &self.test)
+            .finish()
+    }
+}
+
+pub(crate) const WRITE_FILE_TOOL: &str = "write_file";
+pub(crate) const RUN_CHECK_TOOL: &str = "run_check";
+
+pub(crate) fn project_tool_parameters(tool: &str) -> Option<Value> {
+    match tool {
+        "read_file" => Some(serde_json::json!({
+            "type": "object",
+            "properties": { "path": {"type": "string", "description": "Project-relative file path"} },
+            "required": ["path"],
+            "additionalProperties": false
+        })),
+        WRITE_FILE_TOOL => Some(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Project-relative file path"},
+            "text": {"type": "string", "description": "Complete replacement text"}
+        },
+        "required": ["path", "text"],
+        "additionalProperties": false
+        })),
+        RUN_CHECK_TOOL => Some(serde_json::json!({
+            "type": "object",
+            "properties": { "test": {"type": "string", "description": "Exact Cargo library test name, including the module path"} },
+            "required": ["test"],
+            "additionalProperties": false
+        })),
+        _ => None,
+    }
+}
+
+pub(crate) fn decode_file_call(
+    connection: &str,
+    tool: String,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<ToolCall, ProviderError> {
+    let path = arguments.get("path").and_then(Value::as_str);
+    let text = if tool == WRITE_FILE_TOOL {
+        match (path, arguments.get("text").and_then(Value::as_str)) {
+            (Some(path), Some(text)) if !path.is_empty() && arguments.len() == 2 => {
+                Some(text.to_string())
+            }
+            _ => {
+                return Err(violation(
+                    connection,
+                    "write_file requires a nonempty path and replacement text",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let test = if tool == RUN_CHECK_TOOL {
+        let Some(test) = arguments
+            .get("test")
+            .and_then(Value::as_str)
+            .filter(|test| {
+                arguments.len() == 1
+                    && test.len() <= 200
+                    && crate::executor::plain_selector(test, true)
+            })
+        else {
+            return Err(violation(
+                connection,
+                "run_check requires one exact test selector",
+            ));
+        };
+        Some(test.to_string())
+    } else {
+        None
+    };
+    Ok(ToolCall {
+        tool,
+        path: path.map(str::to_string),
+        text,
+        test,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2131,6 +2225,8 @@ impl Provider for LoopbackProvider {
                 tool_calls: vec![ToolCall {
                     tool: "read_file".to_string(),
                     path: Some(path),
+                    text: None,
+                    test: None,
                 }],
                 usage: UsageDelta::Unknown,
                 wire_retries: 0,

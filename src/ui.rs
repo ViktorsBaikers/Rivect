@@ -985,7 +985,14 @@ impl DecisionPanel {
 
     /// Option rows plus the custom row.
     fn rows(&self) -> usize {
-        self.question.options.len() + 1
+        self.question.options.len() + usize::from(self.accepts_custom())
+    }
+
+    fn accepts_custom(&self) -> bool {
+        let id = &self.question.question_id.0;
+        !id.starts_with(crate::controller::FILE_SHARE_QUESTION)
+            && !id.starts_with(crate::controller::FILE_WRITE_QUESTION)
+            && !id.starts_with(crate::controller::PROJECT_CHECK_QUESTION)
     }
 
     /// Whether the custom row is in editing mode (draft input owns keys).
@@ -1059,8 +1066,16 @@ impl DecisionPanel {
     /// card's 58-cell floor a third value on this row clipped past the
     /// border, so the header carries only what must stay whole.
     fn header_text(&self) -> String {
+        let id = &self.question.question_id.0;
+        let title = if id.starts_with(crate::controller::FILE_WRITE_QUESTION)
+            || id.starts_with(crate::controller::PROJECT_CHECK_QUESTION)
+        {
+            "awaiting permission"
+        } else {
+            DECISION_TITLE
+        };
         format!(
-            "{DECISION_TITLE}\ntask: {}\nquestion: {} rev {}",
+            "{title}\ntask: {}\nquestion: {} rev {}",
             self.question.task_id.0, self.question.question_id.0, self.question.question_revision,
         )
     }
@@ -1100,7 +1115,9 @@ impl DecisionPanel {
                 row
             })
             .collect();
-        items.push(self.custom_row_text());
+        if self.accepts_custom() {
+            items.push(self.custom_row_text());
+        }
         let items = items
             .iter()
             .enumerate()
@@ -2344,18 +2361,22 @@ impl TuiDispatch {
             runtime.bind_read_scope(cwd.clone());
             runtime.bind_first_task_scope(cwd);
         }
-        let result = match dispatch_tui_request(
-            &mut runtime,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "session.open",
-                "params": {
-                    "schema_version": 1,
-                    "bootstrap_id": format!("tui-{}", CommandId::generate()),
-                }
-            }),
-        ) {
+        let marker = crate::commands::tui_project_marker(&runtime.scope_root);
+        let previous = match runtime.store().tui_project_session(&marker, None) {
+            Ok(session) => session,
+            Err(error) => return Err(discard_runtime(runtime, io::Error::other(error))),
+        };
+        let mut bootstrap = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session.open",
+            "params": {"schema_version": 1, "bootstrap_id": format!("{marker}{}", CommandId::generate())}
+        });
+        if let Some(session) = previous {
+            bootstrap["method"] = json!("session.attach");
+            bootstrap["params"]["session_id"] = json!(session.0);
+        }
+        let result = match dispatch_tui_request(&mut runtime, bootstrap) {
             Ok(result) => result,
             // The runtime is discarded on this path: its verdicts and
             // release lines are reported best-effort and carried on the
@@ -2485,6 +2506,16 @@ impl TuiDispatch {
             .get("session_id")
             .and_then(Value::as_str)
             .ok_or_else(|| io::Error::other("tui session.new omitted session_id"))?;
+        let marker = crate::commands::tui_project_marker(&self.runtime.scope_root);
+        self.runtime
+            .owner
+            .store
+            .open_session(
+                &format!("{marker}{}", CommandId::generate()),
+                TUI_CONNECTION,
+                Some(&SessionId(session_id.to_string())),
+            )
+            .map_err(io::Error::other)?;
         self.session_id = session_id.to_string();
         Ok(previous)
     }
@@ -2527,6 +2558,18 @@ impl TuiDispatch {
             }
             return Ok((lines, None));
         };
+        let marker = crate::commands::tui_project_marker(&self.runtime.scope_root);
+        let local_session = self
+            .runtime
+            .store()
+            .tui_project_session(&marker, Some(&SessionId(session.to_string())))
+            .map_err(io::Error::other)?
+            .is_some();
+        let prefix = if local_session {
+            marker.as_str()
+        } else {
+            "tui-"
+        };
         let result = dispatch_tui_request(
             &mut self.runtime,
             json!({
@@ -2535,7 +2578,7 @@ impl TuiDispatch {
                 "method": "session.attach",
                 "params": {
                     "schema_version": 1,
-                    "bootstrap_id": format!("tui-{}", CommandId::generate()),
+                    "bootstrap_id": format!("{prefix}{}", CommandId::generate()),
                     "session_id": session,
                 }
             }),
@@ -3768,6 +3811,7 @@ const SEND_COMPLETION_CAPACITY: usize = 1;
 struct SendOwner {
     rx: std::sync::mpsc::Receiver<(TuiDispatch, AnswerResult)>,
     handle: Option<std::thread::JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// One look at the send window. The finished payload is boxed: the runtime
@@ -3788,6 +3832,13 @@ impl SendOwner {
     ) -> io::Result<Self> {
         let (tx, rx) =
             std::sync::mpsc::sync_channel::<(TuiDispatch, AnswerResult)>(SEND_COMPLETION_CAPACITY);
+        let cancel = Arc::new(AtomicBool::new(false));
+        dispatch.runtime.foreground = Some(crate::commands::ForegroundWork {
+            task_id: card.question.task_id.clone(),
+            cancel: Arc::clone(&cancel),
+            reply: None,
+            share_reads: false,
+        });
         let handle = std::thread::Builder::new()
             .name("rivect-tui-send".to_string())
             .spawn(move || {
@@ -3811,6 +3862,7 @@ impl SendOwner {
         Ok(Self {
             rx,
             handle: Some(handle),
+            cancel,
         })
     }
 
@@ -4610,7 +4662,8 @@ where
                     ..
                 }) if modifiers.contains(KeyModifiers::CONTROL)
             );
-            if send_owner.is_some() && cancel_key {
+            if let Some(owner) = send_owner.as_ref().filter(|_| cancel_key) {
+                owner.cancel.store(true, Ordering::Release);
                 if matches!(
                     &event,
                     TermEvent::Key(KeyEvent {
@@ -4867,11 +4920,19 @@ where
             Some(WindowPoll::Running) | None => None,
         };
         match window {
-            Some(Ok((dispatch, result))) => {
+            Some(Ok((mut dispatch, result))) => {
                 send_owner = None;
+                let reply = dispatch
+                    .runtime
+                    .foreground
+                    .take()
+                    .and_then(|work| work.reply);
                 tui_dispatch = Some(dispatch);
                 view.decision = None;
                 paint_answer(&mut view, result);
+                if !cancel_requested && let Some(reply) = reply {
+                    view.push_transcript(reply);
+                }
                 // The in-flight label is a window fact, not a session one:
                 // the surface returns to what the runtime now projects — a
                 // connection the send bound, else the status it carried
@@ -4945,8 +5006,9 @@ where
 /// is left detached and no channel is dropped out from under a live send.
 fn close_window(send_owner: &mut Option<SendOwner>, tui_dispatch: &mut Option<TuiDispatch>) {
     if let Some(owner) = send_owner.take()
-        && let Some((dispatch, _result)) = owner.finish()
+        && let Some((mut dispatch, _result)) = owner.finish()
     {
+        dispatch.runtime.foreground = None;
         *tui_dispatch = Some(dispatch);
     }
 }
@@ -8411,6 +8473,7 @@ fallback = { mode = \"off\" }\n";
         // 250 ms loop beat, so CI cannot drain the send before cancel.
         let slow = [(SLOW_SEND_ENV, "5000")];
         let opened = open_card(DECISION_PTY_ROWS as u16, DECISION_PTY_COLS as u16, &slow);
+        let task_id = opened.question.task_id;
         let mut driver = opened.driver;
 
         // A free-text answer needs the model, so this commit really
@@ -8535,6 +8598,15 @@ fallback = { mode = \"off\" }\n";
             "the cancelled send settled exactly once"
         );
         assert_eq!(totals.dispatched_count, 0, "no settlement row is left open");
+        let task = store.snapshot(&task_id).expect("read the cancelled task");
+        assert_eq!(task.lifecycle, crate::contracts::Lifecycle::Cancelled);
+        assert!(
+            task.attempts
+                .items
+                .iter()
+                .all(|attempt| attempt.effect_class != crate::contracts::EffectClass::Read),
+            "a late reply must not start a file read"
+        );
         drop(store);
         must(driver.finish(), "pty teardown");
     }

@@ -1373,6 +1373,8 @@ fn bedrock_complete_tool_use_yields_a_tool_call() {
         vec![ToolCall {
             tool: "read_file".to_owned(),
             path: Some("src/main.rs".to_owned()),
+            text: None,
+            test: None,
         }]
     );
     assert_eq!(

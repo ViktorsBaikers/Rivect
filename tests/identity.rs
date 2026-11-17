@@ -2475,9 +2475,10 @@ fn identity_rule_of_another_base_is_refused() {
     let root = temp_root("base");
     let mut store = open_store(&root);
     let document = base_document();
+    let shipped = rivect::config::SHIPPED_BASE_VERSION;
     store
         .serve_base(&BaseInstall::new(
-            BaseSource::new(2, &document),
+            BaseSource::new(shipped, &document),
             root.path().join("config.toml"),
             root.path(),
         ))
@@ -2487,14 +2488,14 @@ fn identity_rule_of_another_base_is_refused() {
             .active_base()
             .expect("base read")
             .map(|base| base.version),
-        Some(2),
-        "fixture: the ledger serves base 2"
+        Some(shipped),
+        "fixture: the ledger serves the shipped base"
     );
 
     // A mapping released with the previous base names another layout than the
     // one this build serves: it is refused, and nothing is recorded.
     let stale = IdentityMigration {
-        base_version: rivect::config::SHIPPED_BASE_VERSION - 1,
+        base_version: shipped - 1,
         ..role_rule(ROLE, ASSESS_SECURITY, MigrationRule::Rename, None)
     };
     let refused = store
@@ -2504,8 +2505,7 @@ fn identity_rule_of_another_base_is_refused() {
         matches!(
             refused,
             IdentityError::UnknownBase { offered, recorded }
-                if offered == rivect::config::SHIPPED_BASE_VERSION - 1
-                    && recorded == rivect::config::SHIPPED_BASE_VERSION
+                if offered == shipped - 1 && recorded == shipped
         ),
         "{refused}"
     );
@@ -2520,14 +2520,14 @@ fn identity_rule_of_another_base_is_refused() {
 
     // The rule of the base that does serve records and answers under it.
     let current = IdentityMigration {
-        base_version: rivect::config::SHIPPED_BASE_VERSION,
+        base_version: shipped,
         ..role_rule(ROLE, ASSESS_SECURITY, MigrationRule::Rename, None)
     };
     store
         .record_identity_migration(&current)
         .expect("the rule of the serving base records");
     let rules = store.identity_rules().expect("rules");
-    assert_eq!(rules.base_version(), rivect::config::SHIPPED_BASE_VERSION);
+    assert_eq!(rules.base_version(), shipped);
     assert_eq!(rules.migrations().len(), 1);
 
     // The same rule offered again is the replay a restarted release records:

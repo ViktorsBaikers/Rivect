@@ -872,6 +872,8 @@ impl OllamaCloudProvider {
         Ok(ToolCall {
             tool: name.to_string(),
             path,
+            text: None,
+            test: None,
         })
     }
 

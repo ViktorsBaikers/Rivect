@@ -83,6 +83,19 @@ enum ProviderSource {
     Factory(ProviderFactory),
 }
 
+pub(crate) struct ForegroundWork {
+    pub task_id: TaskId,
+    pub cancel: Arc<AtomicBool>,
+    pub reply: Option<String>,
+    pub share_reads: bool,
+}
+
+pub(crate) fn tui_project_marker(root: &Path) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(root.as_os_str().as_encoded_bytes());
+    format!("tui-project-{}-", config::hex(&digest))
+}
+
 /// The runtime's closed binding: the owner and the policy are read through
 /// accessors and never rebound from outside the crate.
 ///
@@ -153,6 +166,10 @@ pub struct Runtime {
     /// Publication target of the journaled config carrier (AC-095).
     pub config_path: PathBuf,
     pub provider_calls: u64,
+    pub(crate) foreground: Option<ForegroundWork>,
+    pub(crate) file_share: Option<crate::controller::PendingFileShare>,
+    pub(crate) file_write: Option<crate::controller::PendingFileWrite>,
+    pub(crate) project_check: Option<crate::controller::PendingProjectCheck>,
     /// The one injected backend seam; defaults to the platform worker
     /// (Linux Landlock/seccomp/netns on Linux, Seatbelt elsewhere).
     pub read_worker: Box<dyn crate::executor::ReadWorker>,
@@ -1155,6 +1172,7 @@ impl std::fmt::Debug for Runtime {
 pub struct PausedAttempt {
     pub manifest: RequestManifest,
     pub choice: Option<PendingFallback>,
+    pub(crate) share_reads: bool,
     /// The question the choice was served through: only an applied
     /// answer to that very question may dispatch the frozen manifest —
     /// an option id colliding with a candidate on a different fork must
@@ -1548,6 +1566,10 @@ impl Runtime {
             scoped_grant: String::new(),
             config_path,
             provider_calls: 0,
+            foreground: None,
+            file_share: None,
+            file_write: None,
+            project_check: None,
             read_worker,
             provider_factory,
             provider_credentials,
@@ -1713,6 +1735,38 @@ impl Runtime {
         self.effective.composed()
     }
 
+    pub(crate) fn private_context_recipient(
+        &self,
+        config: &config::Config,
+        id: &str,
+    ) -> Option<String> {
+        use crate::providers::openai_login as codex;
+        use sha2::Digest as _;
+        let endpoint = config.connections.get(id)?;
+        if id == codex::CANONICAL_PROFILE
+            && endpoint.endpoint == "https://chatgpt.com/backend-api/codex"
+        {
+            let reference = codex::canonical_reference(config, id).ok()?;
+            let credential =
+                codex::read_credential(self.provider_credentials.as_ref(), &reference).ok()?;
+            let identity = (
+                credential.account_id()?,
+                credential.email()?,
+                credential.plan_type(),
+            );
+            let encoded = serde_json::to_vec(&identity).ok()?;
+            return Some(config::hex(&sha2::Sha256::digest(encoded)));
+        }
+        if endpoint.kind == config::ConnKind::Local
+            && endpoint.credential_ref.is_none()
+            && endpoint.profile.is_none()
+            && crate::providers::loopback_base(id, &endpoint.endpoint).is_ok()
+        {
+            return Some("loopback-keyless".to_string());
+        }
+        None
+    }
+
     /// The applied effective config snapshot: a borrowed read of what
     /// the config owner actually applied, never of an assumed publish.
     #[must_use]
@@ -1822,6 +1876,9 @@ impl Runtime {
     /// callback never resurrects it. No entry means no outstanding
     /// attempt — nothing to tombstone.
     pub(crate) fn tombstone_paused(&mut self, task: &TaskId) {
+        drop(self.file_share.take_if(|share| &share.task == task));
+        drop(self.file_write.take_if(|write| &write.task == task));
+        drop(self.project_check.take_if(|check| &check.task == task));
         if let Some(paused) = self.paused_attempts.remove(&task.0) {
             self.broker.cancel_attempt(&paused.manifest.attempt_id);
         }

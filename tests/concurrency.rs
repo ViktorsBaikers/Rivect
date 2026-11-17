@@ -2160,6 +2160,8 @@ impl Provider for OutsideScopeProvider {
             tool_calls: vec![ToolCall {
                 tool: "read_file".to_string(),
                 path: Some(self.target.clone()),
+                text: None,
+                test: None,
             }],
             usage: UsageDelta::Unknown,
             wire_retries: 0,

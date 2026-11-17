@@ -228,6 +228,26 @@ impl Policy {
     pub fn grant_classes(&mut self, scope_root: PathBuf, classes: Vec<EffectClass>) -> String {
         self.next += 1;
         let grant_id = format!("grant-{}", self.next);
+        self.insert_grant(grant_id, scope_root, classes)
+    }
+
+    pub(crate) fn grant_once(&mut self, scope_root: PathBuf, class: EffectClass) -> String {
+        let id = format!("once-{}", crate::contracts::CommandId::generate().0);
+        self.insert_grant(id, scope_root, vec![class])
+    }
+
+    pub(crate) fn forget_once(&mut self, grant: &str) {
+        if grant.starts_with("once-") {
+            self.grants.remove(grant);
+        }
+    }
+
+    fn insert_grant(
+        &mut self,
+        grant_id: String,
+        scope_root: PathBuf,
+        classes: Vec<EffectClass>,
+    ) -> String {
         self.grants.insert(
             grant_id.clone(),
             Grant {

@@ -1706,6 +1706,8 @@ impl MessagesCodec {
                 state.tool_calls.push(ToolCall {
                     tool: block.name,
                     path: args.get("path").and_then(Value::as_str).map(str::to_string),
+                    text: None,
+                    test: None,
                 });
             }
             BlockKind::Thinking => {

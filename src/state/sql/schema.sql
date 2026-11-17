@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     event_cursor INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks (session_id);
+-- Additive routing metadata for prior human turns. Task text stays owned by tasks.
+CREATE TABLE IF NOT EXISTS tui_turn_routes (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id),
+    project TEXT NOT NULL,
+    config_digest TEXT NOT NULL,
+    connection TEXT NOT NULL
+) STRICT;
 -- Covers SESSION_GENERATION's MAX(revision) per session as a covering index;
 -- the page statements keep idx_tasks_session for their rowid-ordered scans.
 CREATE INDEX IF NOT EXISTS idx_tasks_session_revision

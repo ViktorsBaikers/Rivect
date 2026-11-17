@@ -921,6 +921,8 @@ impl GeminiCodec {
             state.tool_calls.push(ToolCall {
                 tool: name.to_string(),
                 path,
+                text: None,
+                test: None,
             });
         }
         state.parts.push(part.clone());

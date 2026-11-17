@@ -23,6 +23,21 @@ pub const LEARNING_SCHEMA: &str = include_str!("learning.sql");
 pub const BOOTSTRAP_RECEIPT_BY_KEY: &str =
     "SELECT result_json FROM bootstrap_receipts WHERE key = ?1";
 pub const SESSION_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1)";
+pub const TUI_PROJECT_SESSION: &str =
+    "SELECT session_id FROM attachments WHERE connection_id = 'tui'
+     AND substr(bootstrap_id, 1, length(?1)) = ?1 AND (?2 IS NULL OR session_id = ?2)
+     ORDER BY rowid DESC LIMIT 1";
+pub const INSERT_TUI_TURN_ROUTE: &str =
+    "INSERT INTO tui_turn_routes(task_id, project, config_digest, connection)
+     VALUES (?1, ?2, ?3, ?4) ON CONFLICT(task_id) DO NOTHING";
+pub const TUI_PREVIOUS_TURNS: &str = "SELECT t.goal_bytes,
+            (SELECT a.detail FROM attempts a WHERE a.task_id = t.task_id
+             AND a.state = 'confirmed' AND a.effect_class IN ('exec', 'write')
+             ORDER BY a.rowid DESC LIMIT 1)
+     FROM tasks t JOIN tui_turn_routes route USING (task_id)
+     WHERE t.session_id = ?1 AND t.task_id <> ?2 AND route.project = ?3
+       AND route.config_digest = ?4 AND route.connection = ?5 AND length(t.goal_bytes) <= 4096
+     ORDER BY t.rowid DESC LIMIT 6";
 pub const INSERT_ATTACHMENT: &str = "INSERT INTO attachments (attachment_id, session_id, connection_id, bootstrap_id, params_digest, state)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'attached')";
 pub const NEXT_SESSION_REVISION: &str =

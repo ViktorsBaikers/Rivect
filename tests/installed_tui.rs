@@ -1578,10 +1578,11 @@ fn exercise_resize(tui: &mut TuiPty, geometry: Geometry) -> Result<(), String> {
     if geometry != Geometry::LiveResize {
         return Ok(());
     }
-    tui.resize(40, 120)?;
-    tui.wait("Rivect · not connected", LIVE_RESIZE_WAIT)?;
-    tui.resize(20, 60)?;
-    tui.wait("Rivect · not connected", LIVE_RESIZE_WAIT)?;
+    for (rows, cols) in [(40, 120), (20, 60)] {
+        let mark = tui.bytes()?.len();
+        tui.resize(rows, cols)?;
+        tui.wait_settled_after("Rivect · not connected", mark, LIVE_RESIZE_WAIT)?;
+    }
     Ok(())
 }
 

@@ -905,6 +905,8 @@ fn finish_tool(
             .get("path")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        text: None,
+        test: None,
     })
 }
 

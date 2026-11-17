@@ -625,7 +625,12 @@ impl ZaiProvider {
                 };
                 args.get("path").and_then(Value::as_str).map(str::to_string)
             };
-            tool_calls.push(ToolCall { tool: name, path });
+            tool_calls.push(ToolCall {
+                tool: name,
+                path,
+                text: None,
+                test: None,
+            });
         }
         self.commit_chat(manifest, model, &state);
         Ok(ProviderReply {

@@ -10241,6 +10241,8 @@ mod plan_selection {
                         tool_calls: vec![ToolCall {
                             tool: "read_file".to_string(),
                             path: Some("secrets.txt".to_string()),
+                            text: None,
+                            test: None,
                         }],
                         usage: UsageDelta::Unknown,
                         wire_retries: 0,

@@ -5732,6 +5732,8 @@ impl Provider for StartTargetProvider {
             tool_calls: vec![ToolCall {
                 tool: "read_file".to_string(),
                 path: Some(self.target.clone()),
+                text: None,
+                test: None,
             }],
             usage: UsageDelta::Unknown,
             wire_retries: 0,
@@ -6610,6 +6612,16 @@ fn read_chat_request(stream: &mut std::net::TcpStream) -> Option<(String, String
     Some((method, target, body))
 }
 
+fn chat_text_stream(text: &str) -> String {
+    let response = json!({
+        "id": "c1", "object": "chat.completion.chunk",
+        "choices": [{"index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": "stop"}],
+    });
+    format!("data: {response}\n\ndata: [DONE]\n\n")
+}
+
 fn chat_stream(tool: &str, args: Value) -> String {
     let arguments = serde_json::to_string(&args).expect("tool arguments");
     let call = json!({
@@ -6815,13 +6827,91 @@ fn fresh_tui_shows_project_and_login_without_idle_metrics() {
 }
 
 #[test]
+fn ordinary_tui_input_displays_the_provider_reply() {
+    let peer = ChatPeer::scripted(|_, _| {
+        let response = json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "Keep the existing stock constant."},
+                "finish_reason": "stop"
+            }]
+        });
+        format!("data: {response}\n\ndata: [DONE]\n\n")
+    });
+    let root = tempfile::TempDir::with_prefix("rivect-reply-").expect("fixture root");
+    let data = root.path().join("data");
+    let project = root.path().join("project");
+    std::fs::create_dir(&data).expect("data directory");
+    std::fs::create_dir(&project).expect("project directory");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("loopback config");
+    let mut command = support::pty_command(rivect_binary());
+    command.arg("--data-root");
+    command.arg(&data);
+    command.cwd(&project);
+    let mut pty = support::PtySession::spawn(command, 24, 80, root, data).expect("spawn the TUI");
+    let initial = wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10))
+        .expect("project label");
+    assert!(initial.contains("Project:"), "{initial}");
+    pty.send(b"Should we change the stock constant?\r")
+        .expect("submit task");
+    let start = wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
+        .expect("task decision");
+    assert!(start.contains("awaiting decision"), "{start}");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("wait for consent");
+    pty.send(b"\r").expect("begin task");
+    let answer = wait_for_visible_tui_text(
+        &pty,
+        "Keep the existing stock constant.",
+        Duration::from_secs(10),
+    )
+    .expect("model reply");
+    assert!(
+        answer.contains("Keep the existing stock constant."),
+        "{answer}"
+    );
+    assert!(!answer.contains(": completed"), "{answer}");
+    pty.send(b"\x1b").expect("exit");
+    assert_eq!(
+        pty.wait_exit(Duration::from_secs(10)).expect("pty exit"),
+        Some(0)
+    );
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
 fn ordinary_tui_task_continues_from_read_to_write_approval() {
+    ordinary_tui_file_edit(false, false);
+}
+
+#[test]
+fn ordinary_tui_task_applies_the_exact_authorized_edit() {
+    ordinary_tui_file_edit(true, false);
+}
+
+#[test]
+fn ordinary_tui_edit_preserves_an_intervening_user_change() {
+    ordinary_tui_file_edit(true, true);
+}
+
+fn ordinary_tui_file_edit(allow: bool, changed: bool) {
     let peer = ChatPeer::scripted(|turn, payload| {
         if turn == 0 {
             return chat_stream("read_file", json!({"path": "inventory.rs"}));
         }
+        let request = String::from_utf8_lossy(payload);
+        if turn == 2 {
+            assert!(request.contains("write-performed"), "{request}");
+            return chat_text_stream("I updated the inventory constant to 18.");
+        }
         assert!(
-            String::from_utf8_lossy(payload).contains("const STOCK: u8 = 17;"),
+            request.contains("const STOCK: u8 = 17;"),
             "the next request carries the actual read result"
         );
         chat_stream(
@@ -6860,6 +6950,12 @@ fn ordinary_tui_task_continues_from_read_to_write_approval() {
     pty.pump_for(Duration::from_secs(2))
         .expect("wait for consent");
     pty.send(b"\r").expect("begin task");
+    wait_for_visible_tui_text(&pty, "Share inventory.rs", Duration::from_secs(10))
+        .expect("read disclosure decision");
+    assert_eq!(peer.requests(), 1);
+    pty.pump_for(Duration::from_secs(2))
+        .expect("wait for consent");
+    pty.send(b"\x1b[B\r").expect("share the read result once");
     let approval = wait_for_visible_tui_text(&pty, "awaiting permission", Duration::from_secs(10))
         .expect("write decision");
     assert!(approval.contains("awaiting permission"), "{approval}");
@@ -6867,26 +6963,272 @@ fn ordinary_tui_task_continues_from_read_to_write_approval() {
         std::fs::read_to_string(&file).expect("read project file"),
         "const STOCK: u8 = 17;\n"
     );
-    pty.send(b"\x1b").expect("deny write");
-    let denied = wait_for_visible_tui_text(&pty, "permission denied", Duration::from_secs(10))
-        .expect("denial");
-    assert!(denied.contains("permission denied"), "{denied}");
+    wait_for_visible_tui_text(&pty, "Write inventory.rs", Duration::from_secs(10))
+        .expect("exact write target");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("wait for consent");
+    let (keys, response, expected) = if changed {
+        let user_text = "const STOCK: u8 = 22; // edited by user\n";
+        std::fs::write(&file, user_text).expect("intervening user change");
+        (b"\x1b[B\r".as_slice(), "target changed", user_text)
+    } else if allow {
+        (
+            b"\x1b[B\r".as_slice(),
+            "I updated the inventory constant to 18.",
+            "const STOCK: u8 = 18;\n",
+        )
+    } else {
+        (
+            b"\r".as_slice(),
+            "permission denied",
+            "const STOCK: u8 = 17;\n",
+        )
+    };
+    pty.send(keys).expect("answer the permission decision");
+    let screen =
+        wait_for_visible_tui_text(&pty, response, Duration::from_secs(10)).expect("write outcome");
+    assert!(screen.contains(response), "{screen}");
     assert_eq!(
         std::fs::read_to_string(&file).expect("read project file"),
-        "const STOCK: u8 = 17;\n"
+        expected
     );
+    assert_eq!(peer.requests(), if allow && !changed { 3 } else { 2 });
     pty.finish().expect("pty teardown");
 }
 
 #[test]
-fn tui_composer_start_question_completes_with_one_settlement() {
-    let peer = ChatPeer::start("AGENTS.md");
+fn ordinary_tui_task_runs_a_real_local_check_after_editing() {
+    ordinary_tui_file_check(Some(18));
+}
+
+#[test]
+fn ordinary_tui_task_denies_execution_without_running_the_check() {
+    ordinary_tui_file_check(None);
+}
+
+#[test]
+fn ordinary_tui_task_reports_a_failing_check_as_failed() {
+    ordinary_tui_file_check(Some(19));
+}
+
+fn ordinary_tui_file_check(replacement: Option<u8>) {
+    let peer = ChatPeer::scripted(move |turn, payload| {
+        let request = String::from_utf8_lossy(payload);
+        match turn {
+            0 => chat_stream("read_file", json!({"path": "src/inventory.rs"})),
+            1 => {
+                assert!(request.contains("STOCK: u8 = 17"), "{request}");
+                chat_stream(
+                    "write_file",
+                    json!({
+                        "path": "src/inventory.rs",
+                        "text": format!("pub const STOCK: u8 = {};\n", replacement.unwrap_or(18))
+                    }),
+                )
+            }
+            2 => {
+                assert!(request.contains("write-performed"), "{request}");
+                chat_stream("run_check", json!({"test": "stock_is_eighteen"}))
+            }
+            3 if replacement == Some(19) => {
+                assert!(
+                    request.contains(r#"\"exit_code\":101"#) && request.contains("1 failed"),
+                    "{request}"
+                );
+                chat_text_stream("The inventory check failed.")
+            }
+            3 => {
+                assert!(
+                    request.contains(r#"\"exit_code\":0"#) && request.contains("1 passed"),
+                    "{request}"
+                );
+                chat_text_stream("The inventory check passed.")
+            }
+            _ => panic!("unexpected provider request"),
+        }
+    });
+    let root = tempfile::TempDir::with_prefix("rivect-coding-check-").expect("fixture root");
+    let data = root.path().join("data");
+    let project = root.path().join("project");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(home.join(".cargo")).expect("cargo home");
+    std::fs::create_dir(&data).expect("data directory");
+    std::fs::create_dir_all(project.join("src")).expect("project directory");
+    let file = project.join("src/inventory.rs");
+    std::fs::write(&file, "pub const STOCK: u8 = 17;\n").expect("initial code");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"inventory\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        project.join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"inventory\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("lockfile");
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "mod inventory;\n#[test]\nfn stock_is_eighteen() { assert_eq!(inventory::STOCK, 18); }\n",
+    )
+    .expect("independent check");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("loopback config");
+    let executable = if std::env::var_os("RIVECT_TEST_BUNDLE").is_some() {
+        support::release::baseline_bundle().join("rivect")
+    } else {
+        PathBuf::from(rivect_binary())
+    };
+    let mut command = support::pty_command(executable);
+    command.arg("--data-root");
+    command.arg(&data);
+    command.cwd(&project);
+    command.env("HOME", home);
+    command.env("CARGO", env!("CARGO"));
+    let mut pty =
+        support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("spawn the TUI");
+    let see = |pty: &support::PtySession, text: &str| {
+        let screen =
+            wait_for_visible_tui_text(pty, text, Duration::from_secs(16)).expect("terminal read");
+        assert!(screen.contains(text), "expected {text:?} in {screen}");
+    };
+    see(&pty, "Project:");
+    pty.send(b"Increase STOCK from 17 to 18 and run the stock_is_eighteen unit test.\r")
+        .expect("submit task");
+    for (prompt, keys) in [
+        ("awaiting decision", b"\r".as_slice()),
+        ("Share src/inventory.rs", b"\x1b[B\r".as_slice()),
+        ("Write src/inventory.rs", b"\x1b[B\r".as_slice()),
+        (
+            "Run Cargo test stock_is_eighteen",
+            if replacement.is_some() {
+                b"\x1b[B\r".as_slice()
+            } else {
+                b"\r".as_slice()
+            },
+        ),
+    ] {
+        see(&pty, prompt);
+        pty.pump_for(Duration::from_secs(2)).expect("consent floor");
+        pty.send(keys).expect("select and submit");
+    }
+    match replacement {
+        Some(18) => {
+            see(&pty, "The inventory check passed.");
+            see(&pty, "exit 0");
+        }
+        Some(19) => {
+            see(&pty, "The inventory check failed.");
+            see(&pty, "exit 101");
+        }
+        _ => {
+            see(&pty, "permission denied; check not run");
+            let database =
+                rusqlite::Connection::open(data.join("runtime/rivect.db")).expect("task store");
+            let attempts: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM attempts WHERE effect_class = 'exec'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("attempt count");
+            assert_eq!(attempts, 0);
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the edited file"),
+        format!("pub const STOCK: u8 = {};\n", replacement.unwrap_or(18))
+    );
+    assert_eq!(peer.requests(), if replacement.is_some() { 4 } else { 3 });
+    pty.finish().expect("pty teardown");
+}
+
+#[test]
+fn ordinary_tui_context_survives_restart_in_the_same_project() {
+    let peer = ChatPeer::scripted(|turn, payload| {
+        let request = String::from_utf8_lossy(payload);
+        match turn {
+            0 => chat_text_stream("I will use that convention."),
+            1 if request.contains("Use batching interval 73 for this project.") => {
+                chat_text_stream("The batching interval is 73.")
+            }
+            _ => chat_text_stream("No prior convention was supplied."),
+        }
+    });
+    let persistent = tempfile::TempDir::with_prefix("rivect-context-").expect("project");
+    let project = persistent.path().join("project");
+    let data = persistent.path().join("data");
+    std::fs::create_dir(&project).expect("project");
+    std::fs::create_dir(&data).expect("data");
+    std::fs::write(
+        data.join("config.toml"),
+        local_chat_config(&peer.endpoint()),
+    )
+    .expect("config");
+    for (goal, reply) in [
+        (
+            "Use batching interval 73 for this project.",
+            "I will use that convention.",
+        ),
+        (
+            "Which interval did I give you?",
+            "The batching interval is 73.",
+        ),
+    ] {
+        let root = tempfile::TempDir::new().expect("terminal scratch");
+        let mut command = support::pty_command(rivect_binary());
+        command.arg("--data-root");
+        command.arg(&data);
+        command.cwd(&project);
+        let mut pty = support::PtySession::spawn(command, 24, 80, root, data.clone()).expect("TUI");
+        let ready =
+            wait_for_visible_tui_text(&pty, "Project:", Duration::from_secs(10)).expect("startup");
+        assert!(ready.contains("Project:"), "{ready}");
+        pty.send(format!("{goal}\r").as_bytes()).expect("submit");
+        let decision =
+            wait_for_visible_tui_text(&pty, "awaiting decision", Duration::from_secs(10))
+                .expect("decision");
+        assert!(decision.contains("awaiting decision"), "{decision}");
+        pty.pump_for(Duration::from_secs(2)).expect("consent floor");
+        pty.send(b"\r").expect("begin");
+        let screen =
+            wait_for_visible_tui_text(&pty, reply, Duration::from_secs(10)).expect("reply");
+        assert!(screen.contains(reply), "{screen}");
+        pty.send(b"\x1b").expect("exit");
+        assert_eq!(
+            pty.wait_exit(Duration::from_secs(10)).expect("child exit"),
+            Some(0)
+        );
+        pty.finish().expect("pty teardown");
+    }
+    assert_eq!(peer.requests(), 2);
+}
+
+#[test]
+fn tui_composer_shares_a_read_result_only_after_consent() {
+    let peer = ChatPeer::scripted(|turn, payload| {
+        let request = String::from_utf8_lossy(payload);
+        if turn == 0 {
+            assert!(!request.contains("inventory sample 734"));
+            return chat_stream("read_file", json!({"path": "inventory.txt"}));
+        }
+        assert!(request.contains("inventory sample 734"), "{request}");
+        let response = json!({
+            "id": "c1", "object": "chat.completion.chunk",
+            "choices": [{"index": 0,
+                "delta": {"role": "assistant", "content": "The inventory sample was read."},
+                "finish_reason": "stop"}],
+        });
+        format!("data: {response}\n\ndata: [DONE]\n\n")
+    });
     let root = tempfile::TempDir::with_prefix("rivect-tui-start-").expect("fixture root");
     let data = root.path().join("data");
     let cwd = root.path().join("tui project");
     std::fs::create_dir_all(&data).expect("data root");
     std::fs::create_dir_all(&cwd).expect("project cwd");
-    std::fs::write(cwd.join("AGENTS.md"), "tui instructions\n").expect("instruction");
+    std::fs::write(cwd.join("inventory.txt"), "inventory sample 734\n").expect("inventory");
     std::fs::write(
         data.join("config.toml"),
         local_chat_config(&peer.endpoint()),
@@ -6916,19 +7258,24 @@ fn tui_composer_start_question_completes_with_one_settlement() {
     pty.pump_for(Duration::from_secs(2))
         .expect("pump past the decision consent floor");
     pty.send(b"\r").expect("pty send enter");
-    let answered = wait_for_visible_tui_text(
+    let sharing = wait_for_visible_tui_text(&pty, "Share inventory.txt", Duration::from_secs(10))
+        .expect("file disclosure decision");
+    assert!(sharing.contains("Share inventory.txt"), "{sharing}");
+    assert_eq!(peer.requests(), 1, "file bytes have not been shared");
+    pty.pump_for(Duration::from_secs(2))
+        .expect("wait for consent");
+    pty.send(b"\x1b[B\r")
+        .expect("select allow once and confirm");
+    let answer = wait_for_visible_tui_text(
         &pty,
-        "decision answer recorded; task resumed",
+        "The inventory sample was read.",
         Duration::from_secs(10),
     )
-    .expect("answer note");
+    .expect("model reply after consent");
     assert!(
-        answered.contains("decision answer recorded; task resumed"),
-        "{answered}"
+        answer.contains("The inventory sample was read."),
+        "{answer}"
     );
-    let completed = wait_for_visible_tui_text(&pty, "completed", Duration::from_secs(10))
-        .expect("completed dock");
-    assert!(completed.contains("completed"), "{completed}");
     pty.send(b"\x1b").expect("pty send exit");
     assert_eq!(
         pty.wait_exit(Duration::from_secs(10)).expect("pty wait"),
@@ -6942,10 +7289,9 @@ fn tui_composer_start_question_completes_with_one_settlement() {
             row.get(0)
         })
         .expect("count settlements");
-    assert_eq!(settlements, 1);
-    assert_eq!(peer.requests(), 1, "the card's begin sends once");
+    assert_eq!(settlements, 2);
+    assert_eq!(peer.requests(), 2, "consent sends one follow-up request");
     pty.finish().expect("pty teardown");
-    println!("task-start: tui card opened; begin_sends=1 begin_settlements=1");
 }
 
 #[test]

@@ -360,7 +360,7 @@ use crate::model::RequestManifest;
 use crate::policy::canonical_egress_target;
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
-    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES, ToolCall,
+    CredentialStore, Dialect, Provider, ProviderError, ProviderReply, STREAM_CHUNK_BYTES,
     TransportCause, WireAuth, bounded_reason, check_deadline, dialect_for, forwarded_header_map,
     payload_reason, positive_count, read_catalog_body, read_chunk, resolve_credential,
     resolve_optional_credential_in, route_for, routes_for, sse, transport, transport_status,
@@ -4048,12 +4048,14 @@ impl ChatCompletionsProvider {
                     .tools
                     .iter()
                     .map(|name| {
+                        let parameters = super::project_tool_parameters(name)
+                            .unwrap_or_else(|| json!({ "type": "object" }));
                         json!({
                             "type": "function",
                             "function": {
                                 "name": name,
                                 "description": "",
-                                "parameters": { "type": "object" },
+                                "parameters": parameters,
                             },
                         })
                     })
@@ -4691,21 +4693,20 @@ impl ChatCompletionsProvider {
                     reason: bounded_reason(format!("tool_call names undeclared tool {name}")),
                 });
             }
-            let path = if block.args.is_empty() {
-                None
+            let args = if block.args.is_empty() {
+                Value::Object(serde_json::Map::new())
             } else {
-                let args: Value = serde_json::from_str(&block.args).map_err(|_parse| {
+                serde_json::from_str(&block.args).map_err(|_parse| {
                     violation(&self.connection, "a tool_call's arguments did not parse")
-                })?;
-                let Some(args) = args.as_object() else {
-                    return Err(violation(
-                        &self.connection,
-                        "a tool_call's arguments are not an object",
-                    ));
-                };
-                args.get("path").and_then(Value::as_str).map(str::to_string)
+                })?
             };
-            tool_calls.push(ToolCall { tool: name, path });
+            let Some(arguments) = args.as_object() else {
+                return Err(violation(
+                    &self.connection,
+                    "a tool_call's arguments are not an object",
+                ));
+            };
+            tool_calls.push(super::decode_file_call(&self.connection, name, arguments)?);
         }
         Ok(ProviderReply {
             text: state.text,

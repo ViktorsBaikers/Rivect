@@ -51,7 +51,7 @@ use crate::providers::openai_login::{CodexCredential, LoginError as CodexLoginEr
 use crate::providers::sse::{SseEvent, SseParser};
 use crate::providers::{
     CatalogModel, CredentialStore, Dialect, ModelPrice, Provider, ProviderError, ProviderReply,
-    STREAM_CHUNK_BYTES, ToolCall, WireAuth, bounded_reason, check_deadline, dialect_for,
+    STREAM_CHUNK_BYTES, WireAuth, bounded_reason, check_deadline, dialect_for,
     forwarded_header_map, loopback_base, open_proxy_connection, read_catalog_body, read_chunk,
     resolve_admitted_credential_in, route_for, routes_for, sse, transport, transport_status,
     violation, wire_body,
@@ -1697,7 +1697,13 @@ impl OpenAiProvider {
                 manifest
                     .tools
                     .iter()
-                    .map(|name| json!({ "type": "function", "name": name }))
+                    .map(|name| {
+                        let mut tool = json!({ "type": "function", "name": name });
+                        if let Some(parameters) = super::project_tool_parameters(name) {
+                            tool["parameters"] = parameters;
+                        }
+                        tool
+                    })
                     .collect(),
             );
         }
@@ -1953,10 +1959,11 @@ impl OpenAiProvider {
                             "function_call arguments are not an object",
                         )
                     })?;
-                    tool_calls.push(ToolCall {
-                        tool: name.to_string(),
-                        path: args.get("path").and_then(Value::as_str).map(str::to_string),
-                    });
+                    tool_calls.push(super::decode_file_call(
+                        &self.connection,
+                        name.to_string(),
+                        args,
+                    )?);
                 }
                 // DEC-012: where the recorded peer returns the replay
                 // artifact, a reasoning item must carry the opaque
