@@ -82,7 +82,8 @@ fn replace_project_file(
     };
     #[cfg(target_os = "linux")]
     let (platform, profile) = {
-        super::linux::probe_write_conformance(&super::SandboxLauncher::default(), root)?;
+        use super::linux::{SandboxLauncher, probe_write_conformance};
+        probe_write_conformance(&SandboxLauncher::default(), root)?;
         ("linux", String::new())
     };
     let name = format!(".rivect-edit-{}", crate::contracts::CommandId::generate().0);
