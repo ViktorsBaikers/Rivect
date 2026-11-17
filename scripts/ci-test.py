@@ -21,7 +21,10 @@ def main():
     bundle = Path(os.environ["RIVECT_TEST_BUNDLE"]).resolve(strict=True)
     logs = ROOT / "target/ci-logs"
     # Logs are proof for this invocation, never a restored build cache.
-    logs.mkdir(parents=True, exist_ok=False)
+    logs.mkdir(parents=True, exist_ok=True)
+    if logs.is_symlink() or any(logs.iterdir()):
+        raise FileExistsError(f"ci logs directory is not fresh: {logs}")
+    (logs / "invocation.log").touch(exist_ok=False)
     candidate = sha256(bundle / "rivect.manifest.json")
     env = {**os.environ, "CARGO_TERM_COLOR": "never", "RUST_TEST_THREADS": "2"}
     env.pop("RUST_TEST_NOCAPTURE", None)

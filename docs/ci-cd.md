@@ -260,3 +260,34 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
   workspace tests, отдельные doctests, fmt, all-target/all-feature clippy,
   rustdoc `-Dwarnings`, dependency policy, locked fetch. Source inputs и логи:
   `/tmp/rivect-parent-final.mkRGF0/`. Код production не изменялся.
+- Push `e065a6f` выполнен. Run
+  [44039494430](https://github.com/ViktorsBaikers/Rivect/actions/runs/44039494430):
+  quality и macOS PASS; macOS package `xhost-macos` создан (artifact 14309562457).
+  Это первый hosted PASS изолированного physical-observer proof.
+  Общий CI всё ещё FAIL: Linux дошёл до candidate build, затем runner отказал
+  на существующем пустом `target/ci-logs` (`FileExistsError`), до запуска targets.
+- Runner теперь допускает только пустую directory shell, но отвергает symlink
+  или любые прежние evidence entries. Exclusive `invocation.log` резервирует
+  единственного владельца до Cargo. Нет удаления старых данных или повторного
+  исполнения targets. Реальный runner CLI regression прошёл RED→GREEN:
+  13 Python contracts PASS, включая неизменность evidence при replay и
+  отсутствие записи через symlink. Логи `/tmp/rivect-ci-empty-logs-{red,green}.log`.
+- macOS artifact 14309562457 для `e065a6f` скачан и проверен: ZIP SHA-256
+  `29261cddec0a001d301fa6e5d055f57c600eb1088354fde4dd510f42f0c170b5`;
+  manifest SHA-256
+  `e46e100f399f32bc2e3a871f1058f3731673b86da201e3a4b4717f15f131468f`.
+  Receipt привязан к commit/run/platform и `auth.keychain`; archive содержит
+  ровно три regular files, binary digests и executable permissions совпали.
+  Это частичный package proof: Linux artifact этого run отсутствует,
+  общий CI не GREEN. Binaries локально не запускались.
+- Финальный набор содержит 15 contract tests: дополнительно проверены stale logs
+  без owner marker и два конкурентных runner до первого Cargo target.
+  Реальная CLI-проверка с ограниченным loopback-gate подтверждает единственного
+  владельца; исходный runner при этом не менялся. PASS: 15 tests, 23.882 s,
+  `/tmp/rivect-ci-freshness-final.log`. Rust inputs совпадают с §14 proof
+  `/tmp/rivect-parent-final.mkRGF0/`; нового Rust-прогона для Python-only diff нет.
+- `devrites-engine check dup --worktree`: exit 2, scan incomplete — просканирован
+  161 файл; один eligible file недоступен или превышает лимит. Единственный
+  показанный cluster — headers/imports и объявления SHA-256 helpers.
+  Общий helper не добавлялся: test oracle остаётся независимым. Это не PASS
+  проверки дубликатов; ограничение сохранено явно.

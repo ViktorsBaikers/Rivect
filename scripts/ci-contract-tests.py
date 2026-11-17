@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import tarfile
@@ -254,9 +256,17 @@ class TargetOwnership(unittest.TestCase):
         tools.mkdir()
         self.cargo = tools / "cargo"
         self.cargo.write_text("""#!/usr/bin/env python3
-import json, os, sys
+import json, os, socket, sys
 from pathlib import Path
 if sys.argv[1] == 'metadata':
+    with open('metadata-entries.jsonl','a') as stream:
+        stream.write(json.dumps(sys.argv[1:])+'\\n')
+    gate_port = os.environ.get('CI_CONTRACT_METADATA_GATE_PORT')
+    if gate_port:
+        with socket.create_connection(('127.0.0.1', int(gate_port)), timeout=60) as gate:
+            gate.sendall(b'R')
+            if gate.recv(1) != b'G':
+                raise RuntimeError('metadata gate closed without release')
     print(json.dumps({'workspace_members':['root','helper'], 'packages':[
         {'id':'root','name':'rivect','targets':[
             {'name':'rivect','kind':['lib'],'test':True},
@@ -303,6 +313,146 @@ print('test result: ok. 1 passed; 0 failed; 0 ignored')
         self.assertEqual(targets[0], "launch")
         self.assertEqual(len(list((self.root / "target").glob("*trials.json"))), 2)
         self.assertEqual(len(list((self.root / "target").glob("acceptance-rows-*.json"))), 4)
+
+    def test_empty_restored_logs_run_once_and_replay_preserves_evidence(self):
+        target = self.root / "target"
+        logs = target / "ci-logs"
+        logs.mkdir(parents=True)
+        self.assertEqual(list(logs.iterdir()), [])
+
+        result = self.run_targets()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands_path = self.root / "commands.jsonl"
+        original_commands = commands_path.read_bytes()
+        commands = [json.loads(line) for line in original_commands.splitlines()]
+        targets = [args[args.index("--test") + 1] for args in commands if "--test" in args]
+        self.assertEqual(len(commands), 7)
+        self.assertEqual(sorted(targets), ["final_acceptance", "launch", "new_target", "search_text"])
+        self.assertEqual(targets[0], "launch")
+        receipts = list(target.glob("*trials.json")) + list(target.glob("acceptance-rows-*.json"))
+        self.assertCountEqual([path.name for path in receipts], [
+            "provider-trials.json", "search-trials.json",
+            "acceptance-rows-a01-a12.json", "acceptance-rows-a13-a24.json",
+            "acceptance-rows-a25-a36.json", "acceptance-rows-sections.json",
+        ])
+        original_evidence = {
+            path.relative_to(target): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in target.rglob("*") if path.is_file()
+        }
+
+        result = self.run_targets()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(commands_path.read_bytes(), original_commands)
+        self.assertEqual({
+            path.relative_to(target): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in target.rglob("*") if path.is_file()
+        }, original_evidence)
+
+    def test_symlink_logs_are_refused_without_writing_through_link(self):
+        outside = self.root / "outside-logs"
+        outside.mkdir()
+        logs = self.root / "target/ci-logs"
+        logs.parent.mkdir()
+        logs.symlink_to(outside, target_is_directory=True)
+
+        result = self.run_targets()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(logs.is_symlink())
+        self.assertEqual(logs.readlink(), outside)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(logs.parent.iterdir()), [logs])
+        self.assertFalse((self.root / "commands.jsonl").exists())
+
+    def test_markerless_nonempty_logs_refuse_cargo_without_changing_evidence(self):
+        target = self.root / "target"
+        logs = target / "ci-logs"
+        logs.mkdir(parents=True)
+        (logs / "search_text.log").write_bytes(b"restored search output\n")
+        original_evidence = {
+            path.relative_to(target): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in target.rglob("*") if path.is_file()
+        }
+
+        result = self.run_targets()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "metadata-entries.jsonl").exists())
+        self.assertFalse((self.root / "commands.jsonl").exists())
+        self.assertEqual({
+            path.relative_to(target): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in target.rglob("*") if path.is_file()
+        }, original_evidence)
+
+    def test_concurrent_runner_refuses_second_invocation_before_cargo(self):
+        command = ["python3", str(self.root / "scripts/ci-test.py")]
+        env = {**self.env, "FAIL_TARGET": "", "GITHUB_REF": "refs/heads/ci-contract-tests"}
+        expected_metadata = [["metadata", "--locked", "--no-deps", "--format-version", "1"]]
+        processes = []
+        gate = None
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(30)
+            try:
+                first = subprocess.Popen(
+                    command, cwd=self.root,
+                    env={**env, "CI_CONTRACT_METADATA_GATE_PORT": str(listener.getsockname()[1])},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True)
+                processes.append(first)
+                gate, _ = listener.accept()
+                gate.settimeout(30)
+                self.assertEqual(gate.recv(1), b"R")
+                self.assertFalse((self.root / "commands.jsonl").exists())
+
+                second = subprocess.Popen(
+                    command, cwd=self.root, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True)
+                processes.append(second)
+                _, stderr = second.communicate(timeout=30)
+                self.assertNotEqual(second.returncode, 0, stderr)
+                self.assertEqual([
+                    json.loads(line) for line in
+                    (self.root / "metadata-entries.jsonl").read_text().splitlines()
+                ], expected_metadata)
+                self.assertFalse((self.root / "commands.jsonl").exists())
+                self.assertIsNone(first.poll())
+
+                gate.sendall(b"G")
+                _, stderr = first.communicate(timeout=60)
+                self.assertEqual(first.returncode, 0, stderr)
+                self.assertEqual([
+                    json.loads(line) for line in
+                    (self.root / "metadata-entries.jsonl").read_text().splitlines()
+                ], expected_metadata)
+                commands = [
+                    json.loads(line) for line in
+                    (self.root / "commands.jsonl").read_text().splitlines()
+                ]
+                self.assertEqual(commands, [
+                    ["build", "--locked", "-p", "rivect-sandbox-helper",
+                     "--bin", "rivect-sandbox-helper"],
+                    ["test", "--locked", "-p", "rivect-sandbox-helper",
+                     "--lib", "--bins", "--", "--show-output"],
+                    ["test", "--locked", "-p", "rivect-sandbox-helper",
+                     "--test", "launch", "--", "--show-output"],
+                    ["test", "--locked", "-p", "rivect", "--lib", "--", "--show-output"],
+                    ["test", "--locked", "--test", "final_acceptance", "--", "--show-output"],
+                    ["test", "--locked", "--test", "new_target", "--", "--show-output"],
+                    ["test", "--locked", "--test", "search_text", "--", "--show-output"],
+                ])
+            finally:
+                if gate is not None:
+                    gate.close()
+                for child in processes:
+                    try:
+                        child.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            child.wait(timeout=10)
+                        child.communicate(timeout=10)
 
     def test_failed_target_blocks_receipts_but_keeps_diagnostics(self):
         result = self.run_targets("search_text")
