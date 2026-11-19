@@ -2423,10 +2423,12 @@ fn grapheme_cluster_scroll_does_not_overrun_the_content() {
         writeln!(body, "e{i:02} {graphemes}").expect("format grapheme row");
     }
     run.chunk(&body);
-    run.tui.see("e11");
+    let first = format!("e00 {graphemes}");
+    let last = format!("e11 {graphemes}");
+    run.tui.see(&last);
     run.tui.send(UP);
     run.tui.until("earlier grapheme rows", |frame| {
-        frame.contains("e00") && !frame.contains("e11")
+        frame.contains(&first) && !frame.contains(&last)
     });
     overshoot(&mut run.tui);
     run.tui.send(b"bottom");
@@ -2436,7 +2438,7 @@ fn grapheme_cluster_scroll_does_not_overrun_the_content() {
         let line = lines.next().expect("consecutive single-cell grapheme rows");
         assert!(line.contains(&format!("{label} {graphemes}")), "{frame}");
     }
-    assert!(!frame.contains("e00"), "{frame}");
+    assert!(!frame.contains(&first), "{frame}");
 }
 
 #[test]
