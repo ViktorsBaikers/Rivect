@@ -21,9 +21,14 @@ apt_noble() {
 apt_noble update -q --error-on=any
 apt_noble install -y -q --no-install-recommends "$@"
 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-curl --fail --location --silent --show-error --connect-timeout 10 --max-time 60 \
-    https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.5.tar.xz \
-    -o "$tmp/util-linux.tar.xz"
+fetch_util_linux() {
+    curl --proto '=https' --proto-redir '=https' --fail --location --silent --show-error \
+        --connect-timeout 10 --max-time 60 \
+        "https://$1/pub/linux/utils/util-linux/v2.41/util-linux-2.41.5.tar.xz" \
+        -o "$tmp/util-linux.tar.xz"
+}
+# A stalled mirror must not fail the job when the same pinned source is available.
+fetch_util_linux mirrors.edge.kernel.org || fetch_util_linux cdn.kernel.org
 printf 'f586e35d320ff537aab3ffeca37e9ecd482ccbe013590db4429a414d8aa6a728  %s/util-linux.tar.xz\n' "$tmp" | sha256sum -c -
 tar -xJf "$tmp/util-linux.tar.xz" -C "$tmp"
 (

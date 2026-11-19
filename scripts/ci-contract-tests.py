@@ -42,6 +42,38 @@ class ReleaseTag(unittest.TestCase):
                 self.assertEqual(result.returncode, expected, result.stderr)
 
 
+class LinuxPrerequisites(unittest.TestCase):
+    def test_transport_failure_tries_secondary_but_rejects_its_corrupt_archive(self):
+        with tempfile.TemporaryDirectory(prefix="rivect-ci-download-") as directory:
+            root = Path(directory)
+            (root / "sudo").write_text("#!/bin/sh\nexit 0\n")
+            (root / "curl").write_text(textwrap.dedent('''\
+                #!/bin/sh
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        https://*) url=$1 ;;
+                        -o) output=$2; shift ;;
+                    esac
+                    shift
+                done
+                printf '%s\\n' "$url" >> "$TMPDIR/requests"
+                case "$url" in
+                    https://mirrors.edge.kernel.org/*) exit 28 ;;
+                    https://cdn.kernel.org/*) printf 'corrupt archive' > "$output" ;;
+                    *) exit 2 ;;
+                esac
+                '''))
+            for name in ("sudo", "curl"):
+                (root / name).chmod(0o700)
+            result = subprocess.run(["sh", ROOT / "scripts/ci-linux-prerequisites.sh"],
+                env={"PATH": f"{root}:{os.environ['PATH']}", "TMPDIR": directory, "LC_ALL": "C"},
+                capture_output=True, text=True, timeout=10)
+            hosts = [line.split("/")[2] for line in (root / "requests").read_text().splitlines()]
+            self.assertEqual(hosts, ["mirrors.edge.kernel.org", "cdn.kernel.org"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("FAILED", result.stdout)
+
+
 class EvidenceReuse(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="rivect-ci-contract-")

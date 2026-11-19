@@ -60,6 +60,9 @@ Ubuntu 24.04 сохраняется как build/runtime baseline: перехо�
 устанавливает его в `/usr/bin/setpriv` disposable VM; системные библиотеки и
 production bundle не меняются. Источник и checksum проверены 2026-11-16:
 [upstream checksums](https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/sha256sums.asc).
+При ошибке скачивания с зеркала CI один раз пробует официальный CDN kernel.org
+по HTTPS. Обе ветки проверяют тот же SHA-256 до распаковки; несовпадение
+останавливает CI и не запускает сборку `setpriv`.
 Лицензия utility — GPL-2.0-or-later; utility не включается в поставку Rivect.
 
 ### macOS: настоящий Git и Exec-only scope
