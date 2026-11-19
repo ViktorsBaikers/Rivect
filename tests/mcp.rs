@@ -2719,8 +2719,10 @@ fn hostile_returned_content_grants_no_effects_ac079() {
         120,
         &["--ui-review", "awaiting-permission"],
     );
-    let permission = review.see("awaiting permission");
-    assert!(permission.contains("grant-installed-tui"), "{permission}");
+    // The dock label can paint in an earlier PTY chunk than the card.
+    review.until("the passive permission review card", |screen| {
+        screen.contains("awaiting permission") && screen.contains("grant-installed-tui")
+    });
     for token in CLIPBOARD_TOKENS {
         let hits = scanned
             .iter()

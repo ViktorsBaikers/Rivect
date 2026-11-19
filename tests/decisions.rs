@@ -5170,19 +5170,33 @@ fn arriving_escape_is_ignored_but_a_deliberate_blind_escape_can_dismiss() {
     let mut card = CardPty::at_prompt(24, 80, false);
     card.resume();
     card.see("focus 1/6");
-    card.send(b"\x1b");
+    // A complete CSI-u Esc press avoids the parser timeout for a bare Esc prefix.
+    // The following navigation acknowledges that the card handled the input batch.
+    card.send(b"\x1b[27;1:1uj");
+    let frame = card.see("focus 2/6");
+    assert!(
+        frame.contains("Enter selects") && !frame.contains(DECISION_UNANSWERED),
+        "{frame}"
+    );
+    card.pending(&card.question);
     card.wait_consent_floor();
-    let frame = card.frame();
-    assert!(frame.contains("Enter selects"), "{frame}");
-    card.resize(1, 80);
-    card.wait_consent_floor();
-    let frame = card.frame();
-    assert!(!frame.contains("1. Brief answer"), "{frame}");
-    card.send(b"\x1b");
-    card.wait_consent_floor();
-    card.resize(24, 80);
-    card.until("dismissed without consent", |frame| {
+
+    // Leave room for the dismissal notice, but not for a readable option.
+    card.resize(4, 80);
+    card.until("blind decision card", |frame| {
+        frame.contains("Esc returns")
+            && !frame.contains("1. Brief answer")
+            && !frame.contains("2. Step-by-step")
+    });
+    card.send(b"\x1b[27;1:1u");
+    card.until("dismissed while still blind", |frame| {
         frame.contains(DECISION_UNANSWERED) && !frame.contains("Enter selects")
+    });
+    card.resize(24, 80);
+    card.until("restored composer after dismissal", |frame| {
+        frame.contains("Message")
+            && frame.contains(DECISION_UNANSWERED)
+            && !frame.contains("Enter selects")
     });
     card.pending(&card.question);
 }

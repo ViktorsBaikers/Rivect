@@ -1143,10 +1143,16 @@ fn installed_inline_text_uses_fullscreen_palette_roles() {
     for theme in THEMES {
         inline_theme_probe(theme).expect("five colored inline text roles");
     }
-    input_probe(InputMode::Plain, Geometry::W80H24).expect("plain inline text has no colors");
+    for geometry in Geometry::ALL {
+        input_probe(InputMode::Plain, geometry).expect("plain inline text has no colors");
+    }
 }
 
 fn has_color_sgr(bytes: &[u8]) -> bool {
+    first_color_sgr(bytes).is_some()
+}
+
+fn first_color_sgr(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
     let mut offset = 0usize;
     while let Some(found) = support::find_subsequence(&bytes[offset..], b"\x1b[") {
         let start = offset + found + 2;
@@ -1168,13 +1174,25 @@ fn has_color_sgr(bytes: &[u8]) -> bool {
                     value,
                     30..=37 | 40..=47 | 90..=97 | 100..=107 | 38 | 48 | 58
                 ) {
-                    return true;
+                    return Some(start - 2..end + 1);
                 }
             }
         }
         offset = start;
     }
-    false
+    None
+}
+
+#[test]
+fn color_sgr_reports_first_explicit_color_after_terminal_controls() {
+    let prefix = b"\x1b[0m\x1b[1m\x1b[39m\x1b[49m\x1b[>4;1m\x1b[40;1H";
+    assert_eq!(first_color_sgr(prefix), None);
+    let color = b"\x1b[1;38;5;13m";
+    let bytes = [prefix.as_slice(), color, b"\x1b[48:2::10:20:30m"].concat();
+    assert_eq!(
+        first_color_sgr(&bytes),
+        Some(prefix.len()..prefix.len() + color.len())
+    );
 }
 
 fn has_mouse_capture(bytes: &[u8]) -> bool {
@@ -2159,8 +2177,15 @@ fn input_probe(input: InputMode, geometry: Geometry) -> Result<(), String> {
             if code != Some(0) {
                 return Err(format!("plain exit {code:?}"));
             }
-            if has_color_sgr(&bytes) {
-                return Err("plain emitted color".to_string());
+            if let Some(sgr) = first_color_sgr(&bytes) {
+                let nearby = &bytes[sgr.start.saturating_sub(24)..(sgr.end + 24).min(bytes.len())];
+                return Err(format!(
+                    "plain emitted color {:?} at byte {} of {}; nearby {:?}",
+                    String::from_utf8_lossy(&bytes[sgr.start..sgr.end]),
+                    sgr.start,
+                    bytes.len(),
+                    String::from_utf8_lossy(nearby)
+                ));
             }
             require_inline_restore(&bytes)
         }
@@ -3075,6 +3100,10 @@ fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     let opened = tui
         .wait("focus 1/2", WAIT)
         .expect("the inline pinned region paints the card footer");
+    // A complete CSI-u Esc press avoids the parser timeout for a bare Esc prefix.
+    // The following navigation acknowledges that the card handled the input batch.
+    tui.send(b"\x1b[27;1:1uj")
+        .expect("pre-floor dismiss and navigation");
     let screen = support::squashed(&opened);
     assert!(
         screen.contains("Begin the first step"),
@@ -3084,21 +3113,21 @@ fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
         screen.contains("> 1."),
         "the inline card paints the focused row: {screen}"
     );
-    // The consent window runs from the first paint: a key sent inside it
-    // cannot have been aimed at the card. The absent-needle wait outlasts
-    // the floor, so a dismissal would have painted by the assertion.
-    tui.send(b"\x1b").expect("pre-floor dismiss");
+
+    tui.wait("focus 2/2", WAIT)
+        .expect("the card stays open and handles navigation after the early Esc");
+    // Observe through the floor to catch any delayed dismissal.
     tui.pump(Duration::from_millis(400))
         .expect("pump past the floor");
     let bytes = tui.bytes().expect("inline bytes");
     let refused = support::squashed(&tui.screen(&bytes));
     assert!(
-        refused.contains("focus 1/2") && !refused.contains(DECISION_UNANSWERED),
+        refused.contains("focus 2/2") && !refused.contains(DECISION_UNANSWERED),
         "an unaimed Esc inside the floor never dismisses the card: {refused}"
     );
     // The waits above already outlasted the floor, so this Esc is admitted
     // and the card leaves the question pending for the wire surface.
-    tui.send(b"\x1b").expect("dismiss card");
+    tui.send(b"\x1b[27;1:1u").expect("dismiss card");
     tui.wait(DECISION_UNANSWERED, WAIT)
         .expect("the admitted Esc dismisses the card");
     tui.send(b"\x1b").expect("exit");
