@@ -3165,15 +3165,23 @@ fn card_task_id(frame: &str) -> Option<&str> {
 }
 
 fn dismiss_start_card(pty: &mut support::PtySession) -> String {
-    // The heading can paint before the terminal receives the full task ID.
-    let card = see_frame(pty, TUI_COLS, "decision with the full task ID", |screen| {
-        let frame = screen.contents();
-        frame.contains("awaiting decision") && card_task_id(&frame).is_some()
-    });
+    // A partial paint can contain the task ID before the card frame commits.
+    let card = see_frame(
+        pty,
+        TUI_COLS,
+        "painted decision with the full task ID",
+        |screen| {
+            let frame = screen.contents();
+            frame.contains("awaiting decision")
+                && frame.contains("focus 1/2")
+                && card_task_id(&frame).is_some()
+        },
+    );
     let id = card_task_id(&card).expect("full task ID").to_owned();
     pty.pump_for(Duration::from_millis(250))
         .expect("consent floor");
-    pty.send(b"\x1b").expect("dismiss unanswered question");
+    pty.send(b"\x1b[27;1:1u")
+        .expect("dismiss unanswered question");
     see(pty, "Unanswered; question stays pending");
     id
 }

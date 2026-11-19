@@ -270,8 +270,9 @@ export function Thread(opened: Startup) {
       if (!disposed) {
         dismissedFork = pending;
         setQuestion(undefined);
-        setNotice('Check /decision before attempting another answer.');
+        const previousNotice = notice();
         await loadQuestion(owner, task, 'open', pending);
+        if (!disposed && notice() === previousNotice) setNotice('Check /decision before attempting another answer.');
       }
     } finally { sending = false; watch(); }
   }

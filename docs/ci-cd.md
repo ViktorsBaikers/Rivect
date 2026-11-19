@@ -180,6 +180,10 @@ Bun. Launcher передаёт `NO_COLOR=1` для `TERM=dumb` и явного `
 даже пустого; сообщение об ошибке при этом остаётся видимым.
 `decision_test.py` получает controlling TTY после `exec` Python, не через
 `preexec_fn`. При зависании остаётся стек фикстуры; критерии consent прежние.
+Тест сразу отправляет следующую команду после подсказки `Check /decision`:
+подсказка появляется после повторного чтения вопроса, когда ввод больше не
+заблокирован ожиданием ответа. Escape в проверках первого шага отправляется
+после полного кадра карточки с UUID и счётчиком вариантов.
 
 Первоисточники: [GitHub Actions — dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching), [README upload-artifact v7.0.2](https://github.com/actions/upload-artifact/blob/cf430e030ddbb5b0abf93d22962f4752f3646cd9/README.md), [Cargo Book — cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html), [Nextest — модель изоляции тестов по процессам](https://nexte.st/docs/design/how-it-works/). Проектные границы promotion: [ADR-0005](adr/0005-ci-artifact-promotion.md).
 
