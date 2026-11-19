@@ -122,6 +122,11 @@ AC-078 / DEC-022 по-прежнему проверяется настоящим
   D-Bus-сессии от platform wrapper. В обычном офлайн-прогоне не обращаются
   к пользовательскому bus. Нативная проверка Secret Service и пять
   отказов `docs.search` с нулём HTTP-соединений по-прежнему обязательны.
+  Для сессии нужны `gnome-keyring` и `dbus-daemon`, без `dbus-x11`
+  и рекомендованных desktop-пакетов. [Ubuntu Noble `dbus-run-session`](https://manpages.ubuntu.com/manpages/noble/man1/dbus-run-session.1.html)
+  запускает собственный `dbus-daemon`. На чистом Noble x86_64 APT выбирает
+  124 пакета вместо 213, а реальный Secret Service возвращает коллекцию
+  `login` без `dbus-launch`. Это сравнение dependency plan, не время hosted job.
 
 ### Критерий повторного замера
 
@@ -152,6 +157,9 @@ PTY-проверки сохранены после смены интерфейс
 PTY fixture сохраняет один VT100-экран при resize и проверяет видимый кадр,
 а не строку в последней ANSI-дельте. Loopback peer явно включает blocking
 после accept: иначе macOS наследует режим listener и не ждёт deadline чтения.
+Матрица `TERM=dumb` проверяет все записанные байты, включая диагностику
+Bun. Launcher передаёт `NO_COLOR=1` для `TERM=dumb` и явного `NO_COLOR`,
+даже пустого; сообщение об ошибке при этом остаётся видимым.
 
 Первоисточники: [GitHub Actions — dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching), [README upload-artifact v7.0.2](https://github.com/actions/upload-artifact/blob/cf430e030ddbb5b0abf93d22962f4752f3646cd9/README.md), [Cargo Book — cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html), [Nextest — модель изоляции тестов по процессам](https://nexte.st/docs/design/how-it-works/). Проектные границы promotion: [ADR-0005](adr/0005-ci-artifact-promotion.md).
 
@@ -168,7 +176,8 @@ PTY fixture сохраняет один VT100-экран при resize и про
    [свежий отчёт AC-003 для v2](release-budgets.md) по своему точному
    архиву и установленному комплекту. Числовых порогов нет. Отсутствующие,
    неполные или относящиеся к другому архиву/run измерения блокируют релиз.
-   Обычные push и PR не тратят время на эти замеры.
+   Обычные push и PR не тратят время на эти замеры. Ручной preflight
+   не блокирует очередь обычных push: concurrency group включает тип события.
 3. Runner сохраняет полный лог, exit code, фактическую команду, manifest SHA-256 и
    output SHA-256 на target. `--show-output` сохраняет per-test PASS строки и
    успешные markers без nocapture-interleaving. Failed targets сохраняют логи,

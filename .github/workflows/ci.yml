@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   # A newer PR supersedes checks; a release must not be cancelled mid-publish.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -107,7 +107,8 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sh scripts/ci-linux-prerequisites.sh
-          sudo apt-get install -y -qq gnome-keyring dbus dbus-x11
+          sudo apt-get install -y -q --no-install-recommends \
+            gnome-keyring dbus-daemon
       - name: verify release tag matches package version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then

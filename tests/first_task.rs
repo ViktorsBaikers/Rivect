@@ -3156,14 +3156,21 @@ fn exit_thread(mut pty: support::PtySession) {
     pty.finish().expect("pty teardown");
 }
 
-fn dismiss_start_card(pty: &mut support::PtySession) -> String {
-    let card = see(pty, "awaiting decision");
-    let id = card
+fn card_task_id(frame: &str) -> Option<&str> {
+    frame
         .lines()
-        .find_map(|row| row.split_once("task: "))
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .expect("task id on start card")
-        .to_owned();
+        .filter_map(|row| row.split_once("task: "))
+        .filter_map(|(_, rest)| rest.split_whitespace().next())
+        .find(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+}
+
+fn dismiss_start_card(pty: &mut support::PtySession) -> String {
+    // The heading can paint before the terminal receives the full task ID.
+    let card = see_frame(pty, TUI_COLS, "decision with the full task ID", |screen| {
+        let frame = screen.contents();
+        frame.contains("awaiting decision") && card_task_id(&frame).is_some()
+    });
+    let id = card_task_id(&card).expect("full task ID").to_owned();
     pty.pump_for(Duration::from_millis(250))
         .expect("consent floor");
     pty.send(b"\x1b").expect("dismiss unanswered question");

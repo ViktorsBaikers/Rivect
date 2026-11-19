@@ -7086,6 +7086,14 @@ fn terminal_command(image: PathBuf) -> Command {
             command.env(key, value);
         }
     }
+    // Bun's diagnostic formatter does not recognize TERM=dumb or empty NO_COLOR.
+    let monochrome = command.get_envs().any(|(key, value)| {
+        key == "NO_COLOR"
+            || (key == "TERM" && value.is_some_and(|term| term.eq_ignore_ascii_case("dumb")))
+    });
+    if monochrome {
+        command.env("NO_COLOR", "1");
+    }
     command
 }
 
