@@ -135,7 +135,7 @@ jobs:
         timeout-minutes: 10
         run: |
           ln -s "$RIVECT_TEST_BUNDLE" tui/build/core
-          (cd tui && bun test ./wire_test.ts ./actions_test.ts ./dock.test.ts)
+          (cd tui && bun test ./wire_test.ts ./actions_test.ts ./dock.test.ts && bun test --conditions=browser ./decision.test.tsx)
           cargo build --offline --locked --example pty-screen
       - name: test the OpenTUI candidate
         timeout-minutes: 5

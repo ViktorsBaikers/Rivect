@@ -2518,7 +2518,15 @@ fn stored_panel_body_scroll_clamps_back_to_the_rendered_bound() {
         "scroll-fixture",
         &path,
     );
+    tui.see("Enter confirms, Esc denies");
     tui.resize(12, 60);
+    // The pre-resize footer was on the last row of the 24-line frame.
+    tui.until_screen("permission footer after resize", |screen| {
+        screen
+            .rows(0, 60)
+            .last()
+            .is_some_and(|row| row.contains(PAGING))
+    });
     assert_reverse_moves(&mut tui, "row 00", "row 39");
 }
 
@@ -2774,13 +2782,13 @@ fn permission_panel_strips_cf_from_rendered_scope_and_initiator() {
         "init\u{206A}iator",
         "\u{202E}scope",
     );
-    let screen = tui.see(&format!("grant: {grant}"));
-    assert!(screen.contains("initiator: initiator"), "{screen}");
-    assert!(
-        screen.contains("scope:") && screen.contains("/scope"),
-        "{screen}"
-    );
-    assert!(screen.contains(&format!("grant: {grant}")), "{screen}");
+    let grant_line = format!("grant: {grant}");
+    let screen = tui.until("complete sanitized permission panel", |screen| {
+        screen.contains(&grant_line)
+            && screen.contains("initiator: initiator")
+            && screen.contains("scope:")
+            && screen.contains("/scope")
+    });
     assert!(!screen.contains('\u{206A}'));
     assert!(!screen.contains('\u{202E}'));
     let raw = tui.raw();

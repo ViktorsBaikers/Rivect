@@ -35,7 +35,7 @@ function Card(props: Props) {
       Math.max(0, v.screenY, node.screenY) < Math.min(height, v.screenY + v.height, node.screenY + node.height);
   }
   function painted() {
-    const now = performance.now();
+    const now = renderer.clock.now();
     if (firstFrame === Infinity) firstFrame = now;
     if (now - promptSince >= 200) promptRead = true;
     promptSince = visible(prompt) ? Math.min(promptSince, now) : Infinity;
@@ -109,9 +109,9 @@ function Card(props: Props) {
     }
     // Ignore arrival type-ahead. Esc is never a grant and remains available
     // after this floor even when geometry cannot display a complete option.
-    else if (key.name === 'escape' && performance.now() - firstFrame >= 200) props.dismiss();
+    else if (key.name === 'escape' && renderer.clock.now() - firstFrame >= 200) props.dismiss();
     else if (key.name === 'return' && !key.shift) {
-      const now = performance.now();
+      const now = renderer.clock.now();
       if ((!promptRead && now - promptSince < 200) || now - rowSince < 200 || !visible(rows[focus()])) return;
       const option = q.options[focus()];
       if (option?.disabled !== undefined) setNote('Unavailable: ' + option.disabled);

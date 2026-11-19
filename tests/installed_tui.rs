@@ -3081,11 +3081,9 @@ fn installed_inline_survives_a_terminal_that_never_answers_cursor_queries() {
     require_inline_restore(&bytes).expect("inline restore");
 }
 
-/// The inline surface paints the decision card in its reserved region with
-/// the question line and the focused row visible: the floor projection pins
-/// both instead of scrolling the question away for a distant option. The
-/// leg proves a key sent inside the consent floor is refused and the same
-/// key after the floor dismisses the card.
+/// The inline surface keeps the prompt and focused row visible and restores
+/// the terminal after dismissing without an answer. The 199/200 ms boundary
+/// is exercised with a manual renderer clock in tui/decision.test.tsx.
 #[test]
 fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     let mut tui =
@@ -3100,10 +3098,7 @@ fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     let opened = tui
         .wait("focus 1/2", WAIT)
         .expect("the inline pinned region paints the card footer");
-    // A complete CSI-u Esc press avoids the parser timeout for a bare Esc prefix.
-    // The following navigation acknowledges that the card handled the input batch.
-    tui.send(b"\x1b[27;1:1uj")
-        .expect("pre-floor dismiss and navigation");
+    tui.send(b"j").expect("navigate card");
     let screen = support::squashed(&opened);
     assert!(
         screen.contains("Begin the first step"),
@@ -3115,18 +3110,10 @@ fn installed_inline_decision_card_paints_and_admits_after_the_consent_floor() {
     );
 
     tui.wait("focus 2/2", WAIT)
-        .expect("the card stays open and handles navigation after the early Esc");
-    // Observe through the floor to catch any delayed dismissal.
+        .expect("the card handles navigation");
+    // A PTY reader can be descheduled, so it can only guarantee a lower bound.
     tui.pump(Duration::from_millis(400))
         .expect("pump past the floor");
-    let bytes = tui.bytes().expect("inline bytes");
-    let refused = support::squashed(&tui.screen(&bytes));
-    assert!(
-        refused.contains("focus 2/2") && !refused.contains(DECISION_UNANSWERED),
-        "an unaimed Esc inside the floor never dismisses the card: {refused}"
-    );
-    // The waits above already outlasted the floor, so this Esc is admitted
-    // and the card leaves the question pending for the wire surface.
     tui.send(b"\x1b[27;1:1u").expect("dismiss card");
     tui.wait(DECISION_UNANSWERED, WAIT)
         .expect("the admitted Esc dismisses the card");
