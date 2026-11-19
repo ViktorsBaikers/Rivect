@@ -127,6 +127,10 @@ AC-078 / DEC-022 по-прежнему проверяется настоящим
   запускает собственный `dbus-daemon`. На чистом Noble x86_64 APT выбирает
   124 пакета вместо 213, а реальный Secret Service возвращает коллекцию
   `login` без `dbus-launch`. Это сравнение dependency plan, не время hosted job.
+  Установка этих пакетов и build prerequisites выполняется одной транзакцией.
+  После HTTP 503 в hosted preflight CI использует подписанные Ubuntu Noble,
+  updates и security через HTTPS. Локальный список источников и ограниченные
+  таймауты не меняют настройки APT runner и не допускают устаревшие индексы.
 
 ### Критерий повторного замера
 
@@ -160,6 +164,8 @@ PTY fixture сохраняет один VT100-экран при resize и про
 Матрица `TERM=dumb` проверяет все записанные байты, включая диагностику
 Bun. Launcher передаёт `NO_COLOR=1` для `TERM=dumb` и явного `NO_COLOR`,
 даже пустого; сообщение об ошибке при этом остаётся видимым.
+`decision_test.py` получает controlling TTY после `exec` Python, не через
+`preexec_fn`. При зависании остаётся стек фикстуры; критерии consent прежние.
 
 Первоисточники: [GitHub Actions — dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching), [README upload-artifact v7.0.2](https://github.com/actions/upload-artifact/blob/cf430e030ddbb5b0abf93d22962f4752f3646cd9/README.md), [Cargo Book — cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html), [Nextest — модель изоляции тестов по процессам](https://nexte.st/docs/design/how-it-works/). Проектные границы promotion: [ADR-0005](adr/0005-ci-artifact-promotion.md).
 

@@ -1,4 +1,6 @@
 """Reviewing a real pending question, pasting or cancelling must never record an answer."""
+from contextlib import contextmanager
+import faulthandler
 import fcntl
 import hashlib
 import json
@@ -19,9 +21,23 @@ from installed_test import wait_terminal_exit
 from screen_reader import terminal_reader
 
 
-def controlling_terminal():
-    os.setsid()
-    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+# Do not run Python code in the forked Popen child before it execs.
+ATTACH_TTY = (
+    'import fcntl, os, sys, termios; '
+    'fcntl.ioctl(0, termios.TIOCSCTTY, 0); '
+    'os.execv(sys.argv[1], sys.argv[1:])'
+)
+
+
+@contextmanager
+def owner_pipe(argv, **options):
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True, **options) as child:
+        try:
+            yield child
+        finally:
+            if child.poll() is None:
+                child.kill()
 
 
 def rpc(child, method, **params):
@@ -31,14 +47,12 @@ def rpc(child, method, **params):
                              'params':{'schema_version':1, **params}}) + '\n')
     sender.flush()
     if not select.select([reader], [], [], 5)[0]:
-        child.kill()
         raise AssertionError(f'private owner timed out on {method}')
     return json.loads(reader.readline())
 
 
 def seed(core, home, env):
-    with subprocess.Popen([core, '--ui-wire-v1'], cwd=home, env=env, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, text=True) as child:
+    with owner_pipe([core, '--ui-wire-v1'], cwd=home, env=env) as child:
         session = rpc(child, 'session.open', bootstrap_id='decision-fixture')['result']['session_id']
         task = rpc(child, 'task.submit', session_id=session, command_id='start-decision', kind='create',
                    goal='inspect only', contract={'criteria':[], 'constraints':[]}, first_question=True)['result']['task_id']
@@ -49,8 +63,8 @@ def seed(core, home, env):
 
 
 def refuse_unowned_tty(core, home, env, session, task, slave):
-    with subprocess.Popen([core, '--ui-terminal-wire-v1'], cwd=home, env=env, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=slave, start_new_session=True, text=True) as child:
+    with owner_pipe([core, '--ui-terminal-wire-v1'], cwd=home, env=env,
+                    stderr=slave, start_new_session=True) as child:
         assert rpc(child, 'session.attach', session_id=session, bootstrap_id='unowned-tty')['result']['session_id'] == session
         question = rpc(child, 'operator.question', session_id=session, task_id=task)['result']['question']
         reply = rpc(child, 'operator.answer', session_id=session, task_id=task, question_id=question['question_id'],
@@ -63,6 +77,7 @@ def refuse_unowned_tty(core, home, env, session, task, slave):
 
 
 binary = Path(sys.argv[1]).resolve(strict=True)
+faulthandler.dump_traceback_later(60)
 with tempfile.TemporaryDirectory() as work:
     home = Path(work)
     root = home / '.rivect'
@@ -90,9 +105,10 @@ with tempfile.TemporaryDirectory() as work:
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
         refuse_unowned_tty(binary, home, env, session, task, slave)
         with (
-            subprocess.Popen([binary], env=env, cwd=home, stdin=slave, stdout=slave, stderr=slave,
-                             preexec_fn=controlling_terminal) as client,
             sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db,
+            subprocess.Popen([sys.executable, '-I', '-S', '-c', ATTACH_TTY, binary],
+                             env=env, cwd=home, stdin=slave, stdout=slave, stderr=slave,
+                             start_new_session=True) as client,
         ):
             wait_text = terminal_reader()
             def counts():
@@ -189,3 +205,4 @@ with tempfile.TemporaryDirectory() as work:
     finally:
         os.close(master)
         os.close(slave)
+faulthandler.cancel_dump_traceback_later()

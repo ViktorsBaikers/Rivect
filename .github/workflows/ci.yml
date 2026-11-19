@@ -105,10 +105,8 @@ jobs:
       - run: cargo fetch --locked
       - name: Linux sandbox and local credential-store prerequisites
         if: matrix.platform == 'linux'
-        run: |
-          sh scripts/ci-linux-prerequisites.sh
-          sudo apt-get install -y -q --no-install-recommends \
-            gnome-keyring dbus-daemon
+        timeout-minutes: 6
+        run: sh scripts/ci-linux-prerequisites.sh --keyring
       - name: verify release tag matches package version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
@@ -273,6 +271,7 @@ jobs:
           cp -R "xhost/xhost-$PLATFORM/target/." target/
       - name: Linux sandbox prerequisite for the conjunction
         if: matrix.platform == 'linux'
+        timeout-minutes: 6
         run: sh scripts/ci-linux-prerequisites.sh
       - name: release conjunction only (no producer reruns)
         run: |
