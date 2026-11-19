@@ -193,3 +193,8 @@ unicode-width = "0.2.2"
 rusqlite = { version = "0.41.1", features = ["bundled", "trace"] }
 wiremock = "0.6.5"
 tempfile = "3.27.0"
+
+# Native release tests rehash large bundles. Keep the workspace test profile
+# for Rivect itself; only optimize the existing SHA-256 implementation.
+[profile.test.package.sha2]
+opt-level = 3
