@@ -46,10 +46,10 @@ class InstallerContract(unittest.TestCase):
         self.tool("gh", f"#!{sys.executable}\n" + f"""import hashlib, pathlib, sys
 args = sys.argv[1:]
 if (len(args) != 9 or args[:2] != ['attestation', 'verify']
-        or args[3:8] != ['--repo', 'github.com/ViktorsBaikers/Rivect', '--signer-workflow',
+        or args[3:8] != ['--repo', 'ViktorsBaikers/Rivect', '--signer-workflow',
                           'github.com/ViktorsBaikers/Rivect/.github/workflows/ci.yml', '--source-ref']
         or not args[8].startswith('refs/tags/')):
-    sys.exit(2)
+    sys.exit('invalid GitHub CLI attestation scope: --repo requires owner/repo')
 tag, asset = args[8].removeprefix('refs/tags/'), pathlib.Path(args[2])
 if not asset.name.startswith('rivect-' + tag + '-'):
     sys.exit(2)

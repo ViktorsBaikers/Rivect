@@ -328,7 +328,7 @@ def probe_bundle():
 try:
     verifier_env = {k: os.environ[k] for k in ("HOME", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN") if k in os.environ}
     verifier_env.update(PATH="/usr/bin:/bin", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1")
-    subprocess.run([gh, "attestation", "verify", archive, "--repo", "github.com/ViktorsBaikers/Rivect",
+    subprocess.run([gh, "attestation", "verify", archive, "--repo", "ViktorsBaikers/Rivect",
                     "--signer-workflow", "github.com/ViktorsBaikers/Rivect/.github/workflows/ci.yml",
                     "--source-ref", f"refs/tags/{tag}"],
                    env=verifier_env, stdin=subprocess.DEVNULL, check=True, timeout=90)

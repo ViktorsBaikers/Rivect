@@ -479,5 +479,10 @@ repository rulesets. Не двигать существующий `v0.1.0`: из
   [Обычный CI](https://github.com/ViktorsBaikers/Rivect/actions/runs/44559824219)
   прошёл на Linux за 16:11, на macOS за 25:21 с точным попаданием Cargo cache.
   Состав проверок не сокращён.
-- Следующий кандидат — `v0.1.7`. Гейты установщика, аттестации и двух нативных
-  платформ прежние. Тег `v0.1.6` не перемещается.
+- [v0.1.7](https://github.com/ViktorsBaikers/Rivect/releases/tag/v0.1.7) опубликован
+  [из CI](https://github.com/ViktorsBaikers/Rivect/actions/runs/44598352580/attempts/2).
+  Оба отчёта — 1784/1784, оба архива и аттестации подтверждены.
+  Чистая установка опубликованным скриптом отказала: [ gh attestation verify ](https://cli.github.com/manual/gh_attestation_verify)
+  принимает  owner/repo , а не  github.com/owner/repo . Офлайн-fixture копировал
+  ошибочный формат. Исправленный скрипт активировал опубликованный пакет с реальной
+  аттестацией. Версия исправленного установщика —  v0.1.8 ; теги и предыдущий релиз не меняются.
