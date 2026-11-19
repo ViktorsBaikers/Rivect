@@ -72,12 +72,16 @@ with tempfile.TemporaryDirectory() as work:
     image = home / 'figure.png'
     original = bytes.fromhex('89504e470d0a1a0a') + b'example'
     image.write_bytes(original)
+    # Hooks receive their request on stdin before returning a verdict. A bare
+    # cat can exit before the owner writes, racing with EPIPE on fast runners.
+    hook_args = ['-c', 'IFS= read -r request || [ -n "$request" ] || exit 2; exec /bin/cat "$1"',
+                 'image-policy-fixture', str(verdict)]
     alternate = home / 'alternate.png'
     alternate.write_bytes(original)
     (root / 'config.toml').write_text('config_version = 1\n[connections.loopback]\nkind = "local"\nendpoint = ""\n'
         '[models.defaults]\nmodel = { mode = "fixed", connection = "loopback", model_id = "offline" }\n'
         'effort = { mode = "fixed", value = "medium" }\nfallback = { mode = "off" }\n'
-        f'[hooks."effect.request@project"]\ncommand = "/bin/cat"\nargs = [{json.dumps(str(verdict))}]\n')
+        f'[hooks."effect.request@project"]\ncommand = "/bin/sh"\nargs = {json.dumps(hook_args)}\n')
     env = {'TERM':'xterm-256color', 'PATH':'/usr/bin:/bin', 'HOME':work, 'TMPDIR':work}
     session, task = seed(binary, home, env)
     database = root / 'runtime/rivect.db'
