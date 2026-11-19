@@ -36,7 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: quality
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: >-
+            ${{ github.event_name == 'push' &&
+                github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
       - run: >-
@@ -96,7 +98,9 @@ jobs:
         with:
           shared-key: native-v2-${{ matrix.platform }}
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-if: >-
+            ${{ github.event_name == 'push' &&
+                github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - name: Linux sandbox and local credential-store prerequisites
         if: matrix.platform == 'linux'
@@ -127,11 +131,15 @@ jobs:
           python3 ../scripts/check-release-sbom.py "$RIVECT_TEST_BUNDLE"
           "$RIVECT_TEST_BUNDLE/rivect" --version
           "$RIVECT_TEST_BUNDLE/rivect" --help
-      - name: test the OpenTUI candidate
+      - name: test OpenTUI wire and build the PTY screen reader
+        timeout-minutes: 10
         run: |
           ln -s "$RIVECT_TEST_BUNDLE" tui/build/core
           (cd tui && bun test ./wire_test.ts ./actions_test.ts ./dock.test.ts)
           cargo build --offline --locked --example pty-screen
+      - name: test the OpenTUI candidate
+        timeout-minutes: 5
+        run: |
           python3 scripts/ci-tui-test.py "$RIVECT_V2_TEST_BUNDLE"
       - name: verify MCP against independent SDK
         run: |

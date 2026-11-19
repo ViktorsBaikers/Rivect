@@ -35,6 +35,7 @@ def main():
         log = logs / f"{suite.stem}.log"
         start = monotonic()
         with log.open("wb") as output:
+            print(f"starting OpenTUI suite: {suite.name}", flush=True)
             status = subprocess.run([sys.executable, str(suite), str(client)], cwd=tui,
                                     env=env, stdout=output, stderr=subprocess.STDOUT).returncode
         return suite.name, status, log, monotonic() - start
