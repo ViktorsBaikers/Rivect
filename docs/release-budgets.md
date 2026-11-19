@@ -1,10 +1,45 @@
-# Release budgets and the AC-003 corpus (frozen)
+# Ресурсная приёмка Rivect (AC-003)
 
-This declaration and its measured baseline apply to the historical three-file
-package v1. Package v2 has a different inventory. Neither this declaration nor
-the historical verdict supplies a v2 resource-budget PASS. AC-003 remains open
-for v2 until its measurement contract is approved before measurement and verified
-against the exact v2 candidate.
+## Действующий критерий для v2
+
+Решение владельца: числовых порогов для v2 нет. Для стабильного релиза
+обязателен свежий машиночитаемый отчёт каждого нативного кандидата
+(Linux x86_64 и macOS arm64). Отсутствие, неполнота или несовпадение
+отчёта с артефактом блокирует выпуск. Установка, откат, sandbox и остальные
+критерии приёмки не меняются.
+
+- Размер в байтах: точный архив, передаваемый издателю, и сумма размеров
+  файлов установленной версии с квитанцией.
+- PTY: 20 свежих процессов на 160×50 без очистки кэша ОС; запуск до
+  видимого первого ввода, эхо клавиши и восстановление терминала после
+  Ctrl+C в покое.
+- Под нагрузкой: по 20 свежих процессов с короткой (1 задача) и длинной
+  (100 задач) историей, старым diff и продолжающимся локальным SSE.
+  Замеряем эхо ввода, отмену до закрытия SSE и записи состояния, RSS
+  дерева процессов после эха. Отчёт хранит значения отдельных прогонов,
+  p50/p95 по задержкам и максимум наблюдённого RSS; не называет его
+  непрерывно измеренным пиком. Сеть провайдера не используется.
+- Привязка: версия схемы, OS/arch, commit/run, SHA-256 манифеста и архива.
+  Release gate проверяет структуру, выборку, размеры и привязку, а не
+  сравнивает наблюдения с числовыми лимитами.
+
+Локальное воспроизведение на родной платформе (`BUNDLE` — установленная
+версия с соседней квитанцией; `ARCHIVE` и `REPORT` — абсолютные пути):
+
+```sh
+python3 scripts/release-resources.py collect "$BUNDLE" "$ARCHIVE" "$REPORT"
+RIVECT_RELEASE_ARCHIVE="$ARCHIVE" RIVECT_RELEASE_RESOURCES="$REPORT" \
+  sh scripts/release-gate.sh --bundle "$BUNDLE"
+```
+
+Локальный отчёт с `null` в полях GitHub commit/run не подходит для CI.
+Для проверки только структуры и привязки без повторных замеров используйте
+`verify` вместо `collect`.
+
+## Исторический корпус v1 (заморожен)
+
+Ниже декларация и результаты трёхфайлового v1. Они не доказывают
+приёмку v2 и не требуют повторного прогона.
 
 Every number and workload below is declared **before** the candidate is
 measured. The fenced declaration is the frozen artifact: the release report

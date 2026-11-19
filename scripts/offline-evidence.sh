@@ -308,9 +308,17 @@ while IFS= read -r target; do
             [ "$expected" = unserved ] && [ "$oracle" = 'measurement::v2_installed_package_measurement' ] || exit 1
             sed -n 's/^PACKAGE_SIZE_MEASUREMENT //p' "$output" | jq -se --arg hash "$bundle_digest" '
                 length == 1 and .[0].schema_version == 1 and .[0].v2.manifest_sha256 == $hash and
+                (.[0].v2 | .payload_files == 5 and .receipt_bytes == 65 and
+                    (.payload_bytes | type == "number" and . > 0) and
+                    (.local_tar_gz_bytes | type == "number" and . > 0) and
+                    .installed_bytes == (.payload_bytes + .receipt_bytes)) and
+                (.[0].headless.elapsed_ns_one_sample_per_probe |
+                    keys == ["headless_cancel", "headless_index", "headless_search",
+                        "headless_status_polling", "version"] and
+                    all(.[]; type == "number" and . > 0)) and
                 .[0].ac003.status == "NOT_RUN" and
-                .[0].ac003.prerequisite == "v2 has no approved AC-003 budget"' >/dev/null || {
-                printf 'missing candidate-bound v2 budget prerequisite\n' >&2; exit 1
+                .[0].ac003.prerequisite == "missing exact candidate resource observations"' >/dev/null || {
+                printf 'missing candidate-bound partial A36 measurement\n' >&2; exit 1
             }
         fi
         printf '%s\n' "$case_id" >>"$tmp/cases.raw"

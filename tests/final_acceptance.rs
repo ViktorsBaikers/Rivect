@@ -11,9 +11,8 @@
 //! packaged `--ui-review` entry: its report carries 285 state×theme
 //! observations with per-state status/dock/composer/modal SGR fingerprints,
 //! so the row is PASS evidence when the candidate, every cell and every
-//! renderer-only claim match. V2 package and headless measurements do not
-//! establish an AC-003 budget. A36 stays NOT_RUN and the release verdict
-//! stays false even with complete host-store evidence.
+//! renderer-only claim match. A36 requires both the package/headless receipt
+//! and verified resource observations from the exact native release archive.
 
 #![allow(
     clippy::expect_used,
@@ -46,11 +45,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const INSTALLED_ORDINARY_EVIDENCE_MARKER: &str = "#installed-ordinary";
 const INSTALLED_UI_EVIDENCE_MARKER: &str = "#installed-ui";
 const V2_MEASUREMENT_ORACLE: &str = "measurement::v2_installed_package_measurement";
-const V2_BUDGET_PREREQUISITE: &str = "v2 has no approved AC-003 budget";
+const RESOURCE_PREREQUISITE: &str = "missing exact candidate resource observations";
+const RESOURCE_LEG: &str = "measurement.offline_corpus";
+const RELEASE_ARCHIVE_ENV: &str = "RIVECT_RELEASE_ARCHIVE";
+const RELEASE_RESOURCES_ENV: &str = "RIVECT_RELEASE_RESOURCES";
 
 /// The three rendered themes and the observation each state must carry.
 const THEMES: [&str; 3] = ["light", "dark", "high-contrast"];
@@ -976,7 +979,7 @@ fn acceptance_group_receipts_missing_stale_unmarked_short_or_swapped_are_never_p
     assert_eq!(rows.len(), 40);
     let measurement = rows.iter().find(|row| row.case_id == "A36").expect("A36");
     assert_eq!(measurement.outcome, TrialOutcome::Censored);
-    assert_eq!(measurement.cause.as_deref(), Some(V2_BUDGET_PREREQUISITE));
+    assert_eq!(measurement.cause.as_deref(), Some(RESOURCE_PREREQUISITE));
     assert!(
         measurement
             .evidence
@@ -994,9 +997,57 @@ fn acceptance_group_receipts_missing_stale_unmarked_short_or_swapped_are_never_p
         .iter_mut()
         .find(|row| row.case_id == "A36")
         .expect("declared A36") = measurement.clone();
+    let mut retained = BTreeSet::from([RESOURCE_LEG.to_string(), "ingress.exec".to_string()]);
+    assert!(!apply_verified_resources(
+        &mut complete,
+        &mut retained,
+        None
+    ));
+    assert!(retained.contains(RESOURCE_LEG));
     let blocked = counted(&candidate, &complete).with_deferred_rows(0);
     assert_eq!(blocked.blockers.not_run, ["A36"]);
     assert!(!blocked.full_pass && !blocked.offline_full_pass && !blocked.release_ready);
+
+    // Exercise the fold with verifier success and the validated partial receipt.
+    let mut resources = VerifiedResources {
+        candidate: "e".repeat(64),
+        sha256: "f".repeat(64),
+    };
+    assert!(!apply_verified_resources(
+        &mut complete,
+        &mut retained,
+        Some(&resources)
+    ));
+    let (group, manifest_path, receipt_path) = &groups[2];
+    let mut stale_receipt =
+        acceptance_group_rows(group, manifest_path, receipt_path, &resources.candidate);
+    assert!(!apply_verified_resources(
+        &mut stale_receipt,
+        &mut retained,
+        Some(&resources)
+    ));
+    resources.candidate.clone_from(&candidate);
+    let mut without_receipt = [censored(
+        "A36".to_string(),
+        &candidate,
+        "missing receipt".to_string(),
+    )];
+    assert!(!apply_verified_resources(
+        &mut without_receipt,
+        &mut retained,
+        Some(&resources)
+    ));
+    assert!(retained.contains(RESOURCE_LEG));
+    assert!(apply_verified_resources(
+        &mut complete,
+        &mut retained,
+        Some(&resources)
+    ));
+    let accepted = counted(&candidate, &complete).with_deferred_rows(0);
+    assert!(accepted.blockers.is_empty() && accepted.release_ready);
+    assert_eq!(accepted.passed, blocked.passed + 1);
+    assert_eq!(retained, BTreeSet::from(["ingress.exec".to_string()]));
+    assert!(!full_pass_with_retained(&accepted, retained.len()));
     assert!(rows.iter().all(|row| row.evidence.is_some()));
 
     // A missing receipt censors its whole group, never a smaller denominator.
@@ -1892,7 +1943,7 @@ fn acceptance_group_rows(
                         candidate: candidate.to_string(),
                         outcome: TrialOutcome::Censored,
                         evidence: Some(evidence),
-                        cause: Some(V2_BUDGET_PREREQUISITE.to_string()),
+                        cause: Some(RESOURCE_PREREQUISITE.to_string()),
                     }
                 }
                 TrialOutcome::Unserved => censored(
@@ -2771,7 +2822,7 @@ fn cross_host_rescue_removes_a_served_leg_from_the_offline_blockers() {
             "schema_version": 1,
             "leg": "measurement.offline_corpus",
             "status": "not_run",
-            "prerequisite": V2_BUDGET_PREREQUISITE,
+            "prerequisite": RESOURCE_PREREQUISITE,
         }),
         json!({
             "schema_version": 1,
@@ -3031,6 +3082,147 @@ fn deferred_owner_ledger_verifies_the_carrier_and_refuses_overlap() {
     assert!(checked.carrier_verified);
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ResourceEvidenceError {
+    #[error("missing {0}")]
+    MissingPath(&'static str),
+    #[error("{0} must be absolute")]
+    RelativePath(&'static str),
+    #[error("cannot resolve {0}")]
+    ResolvePath(&'static str, #[source] std::io::Error),
+    #[error("both github commit and run identity are required for hosted resource verification")]
+    MissingRunIdentity,
+    #[error("cannot run or reap the resource verifier")]
+    VerifierIo(#[source] std::io::Error),
+    #[error("resource verifier exceeded its deadline")]
+    VerifierTimeout,
+    #[error("resource verifier rejected the candidate observations ({0})")]
+    Rejected(std::process::ExitStatus),
+    #[error("resource verifier bundle is not the acting candidate")]
+    CandidateMismatch,
+}
+
+struct VerifiedResources {
+    candidate: String,
+    sha256: String,
+}
+
+fn resource_path(
+    key: &'static str,
+    value: Option<std::ffi::OsString>,
+) -> Result<PathBuf, ResourceEvidenceError> {
+    let path = PathBuf::from(value.ok_or(ResourceEvidenceError::MissingPath(key))?);
+    if !path.is_absolute() {
+        return Err(ResourceEvidenceError::RelativePath(key));
+    }
+    path.canonicalize()
+        .map_err(|error| ResourceEvidenceError::ResolvePath(key, error))
+}
+
+#[test]
+fn resource_inputs_require_both_absolute_paths() {
+    assert!(matches!(
+        resource_path(RELEASE_RESOURCES_ENV, None),
+        Err(ResourceEvidenceError::MissingPath(RELEASE_RESOURCES_ENV))
+    ));
+    assert!(matches!(
+        resource_path(RELEASE_ARCHIVE_ENV, Some("candidate.tar.gz".into())),
+        Err(ResourceEvidenceError::RelativePath(RELEASE_ARCHIVE_ENV))
+    ));
+}
+
+fn verify_resources(
+    bundle: &Path,
+    candidate: &str,
+) -> Result<VerifiedResources, ResourceEvidenceError> {
+    let archive = resource_path(RELEASE_ARCHIVE_ENV, std::env::var_os(RELEASE_ARCHIVE_ENV))?;
+    let report = resource_path(
+        RELEASE_RESOURCES_ENV,
+        std::env::var_os(RELEASE_RESOURCES_ENV),
+    )?;
+    let mut verifier = Command::new("python3");
+    verifier
+        .env_clear()
+        .arg("-I")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/release-resources.py"
+        ))
+        .arg("verify")
+        .arg(bundle)
+        .arg(archive)
+        .arg(&report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    if let Some(path) = std::env::var_os("PATH") {
+        verifier.env("PATH", path);
+    }
+    match (
+        std::env::var_os("GITHUB_SHA"),
+        std::env::var_os("GITHUB_RUN_ID"),
+    ) {
+        (Some(commit), Some(run)) if !commit.is_empty() && !run.is_empty() => {
+            verifier.env("GITHUB_SHA", commit).env("GITHUB_RUN_ID", run);
+        }
+        (None, None) if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true") => {}
+        _ => return Err(ResourceEvidenceError::MissingRunIdentity),
+    }
+    run_resource_verifier(&mut verifier)?;
+    if support::release::sha256_file(&bundle.join(RELEASE_MANIFEST_NAME)) != candidate {
+        return Err(ResourceEvidenceError::CandidateMismatch);
+    }
+    Ok(VerifiedResources {
+        candidate: candidate.to_string(),
+        sha256: support::release::sha256_file(&report),
+    })
+}
+
+fn run_resource_verifier(command: &mut Command) -> Result<(), ResourceEvidenceError> {
+    let mut child = command.spawn().map_err(ResourceEvidenceError::VerifierIo)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let error = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(ResourceEvidenceError::Rejected(status)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => break ResourceEvidenceError::VerifierTimeout,
+            Err(error) => break ResourceEvidenceError::VerifierIo(error),
+        }
+    };
+    let killed = child.kill();
+    child.wait().map_err(ResourceEvidenceError::VerifierIo)?;
+    killed.map_err(ResourceEvidenceError::VerifierIo)?;
+    Err(error)
+}
+
+fn apply_verified_resources(
+    rows: &mut [FinalRow],
+    retained: &mut BTreeSet<String>,
+    resources: Option<&VerifiedResources>,
+) -> bool {
+    let Some(resources) = resources else {
+        return false;
+    };
+    let Some(row) = rows.iter_mut().find(|row| {
+        row.case_id == "A36"
+            && row.candidate == resources.candidate
+            && row.outcome == TrialOutcome::Censored
+            && row.cause.as_deref() == Some(RESOURCE_PREREQUISITE)
+    }) else {
+        return false;
+    };
+    let Some(evidence) = &mut row.evidence else {
+        return false;
+    };
+    evidence.push_str("; resources sha256=");
+    evidence.push_str(&resources.sha256);
+    row.outcome = TrialOutcome::Pass;
+    row.cause = None;
+    retained.remove(RESOURCE_LEG);
+    true
+}
+
 #[test]
 fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     let bundle = support::release::baseline_bundle();
@@ -3120,6 +3312,23 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     // DEC-027: a platform-exclusive leg genuinely served on another host is
     // not an offline blocker here; the reader verifies the candidate binding.
     fold_cross_host_served(&mut offline_retained_legs, &cross_host_served(&candidate));
+    let resources = if release {
+        match verify_resources(bundle, &candidate) {
+            Ok(resources) => Some(resources),
+            Err(error) => {
+                println!("AC-003 pending: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let resources_applied =
+        apply_verified_resources(&mut rows, &mut offline_retained_legs, resources.as_ref());
+    let resources = resources.filter(|_| resources_applied);
+    if resources_applied {
+        expected_not_run.remove("A36");
+    }
     let surfaced: BTreeSet<String> = retained_not_run
         .iter()
         .map(|row| {
@@ -3206,6 +3415,7 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
     write_final_acceptance(&json!({
         "schema_version": 1,
         "candidate_manifest_sha256": candidate,
+        "resources_sha256": resources.as_ref().map(|resources| resources.sha256.as_str()),
         "required": report.required,
         "present": report.present,
         "current": report.current,
@@ -3297,33 +3507,45 @@ fn final_acceptance_passes_the_installed_rows_and_prints_the_verdict() {
             DEFERRED_CARRIER_ROWS + DEFERRED_LEGS.len(),
             "the in-scope deferred set is empty (DEC-032); the external legs are tracked follow-up"
         );
-        assert!(
-            !report.full_pass && !offline_full_pass && !release_ready,
-            "{report:?}"
-        );
-        let budget = rows.iter().find(|row| row.case_id == "A36").expect("A36");
-        assert_eq!(budget.outcome, TrialOutcome::Censored);
-        assert_eq!(budget.cause.as_deref(), Some(V2_BUDGET_PREREQUISITE));
-        assert!(
-            budget
-                .evidence
-                .as_deref()
-                .expect("measurement receipt")
-                .ends_with(V2_MEASUREMENT_ORACLE)
-        );
+        let measurement = rows.iter().find(|row| row.case_id == "A36").expect("A36");
+        let evidence = measurement
+            .evidence
+            .as_deref()
+            .expect("measurement receipt");
+        if resources_applied {
+            assert_eq!(measurement.outcome, TrialOutcome::Pass);
+            assert!(measurement.cause.is_none());
+            let sha256 = &resources.as_ref().expect("verified resources").sha256;
+            assert!(evidence.ends_with(&format!(
+                "#{V2_MEASUREMENT_ORACLE}; resources sha256={sha256}"
+            )));
+            assert!(report.blockers.not_run.is_empty());
+            assert!(offline_retained_legs.is_empty());
+            assert!(
+                report.full_pass && offline_full_pass && release_ready,
+                "{report:?}"
+            );
+        } else {
+            assert_eq!(measurement.outcome, TrialOutcome::Censored);
+            assert_eq!(measurement.cause.as_deref(), Some(RESOURCE_PREREQUISITE));
+            assert!(evidence.ends_with(V2_MEASUREMENT_ORACLE));
+            assert_eq!(report.blockers.not_run, ["A36"]);
+            assert_eq!(
+                offline_retained_legs,
+                BTreeSet::from([RESOURCE_LEG.to_string()])
+            );
+            assert!(
+                !report.full_pass && !offline_full_pass && !release_ready,
+                "{report:?}"
+            );
+        }
         assert_eq!(report.required, 1784);
         assert_eq!(report.present, 1784);
         assert_eq!(report.current, 1784);
-        assert_eq!(report.passed, 1777);
+        assert_eq!(report.passed, 1777 + usize::from(resources_applied));
         assert_eq!(report.unserved, 6);
-        assert_eq!(report.blockers.not_run, ["A36"]);
-        assert_eq!(
-            offline_retained_legs,
-            BTreeSet::from(["measurement.offline_corpus".to_string()])
-        );
         assert!(retained_not_run.iter().any(|row| {
-            row["leg"] == "measurement.offline_corpus"
-                && row["prerequisite"] == V2_BUDGET_PREREQUISITE
+            row["leg"] == RESOURCE_LEG && row["prerequisite"] == RESOURCE_PREREQUISITE
         }));
         assert_eq!(ui_count, FINAL_UI_CELLS);
         assert_eq!(ui_missing, 0, "every 19xGxI cell is counted");

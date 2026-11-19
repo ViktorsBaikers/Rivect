@@ -11,7 +11,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tui.installed_test import chat_terminal, wait_text
+from tui.installed_test import chat_terminal, painted_text, wait_text
 
 
 def tree_rss(pid):
@@ -68,7 +68,11 @@ def sample(binary, count):
                         if n == count - 1 else '') + marker
                 with accept_goal(listener, master, f'committed receipt {n}') as peer:
                     peer.sendall(chunk(text, 'stop') + b'data: [DONE]\n\n')
-                wait_text(master, marker.encode())
+                received = wait_text(master, marker.encode())
+                # The glyph can paint in a preview before the owner accepts another task.
+                complete = 'output · complete'.encode()
+                if complete not in received and complete not in painted_text(master, received):
+                    wait_text(master, complete, received)
             with accept_goal(listener, master, 'pending final message') as peer:
                 peer.sendall(chunk('early fragment'))
                 os.write(master, b'\x1b[5~')

@@ -110,24 +110,34 @@ class EvidenceReuse(unittest.TestCase):
         self.status.unlink()
         self.assertNotEqual(self.produce().returncode, 0)
 
-    def test_a36_requires_current_package_measurement_not_a_frozen_budget_pass(self):
+    def test_a36_partial_evidence_requires_current_complete_native_measurements(self):
         rows = json.loads(self.manifest.read_text())["rows"][:3]
         selector = "v2_installed_package_measurement"
         marker = "PACKAGE_SIZE_MEASUREMENT"
         rows.append({"case_id": "A36", "provider": "offline", "marker": marker,
-                     "expected": "unserved", "observation": "missing v2 budget",
+                     "expected": "unserved", "observation": "partial measurement",
                      "oracle": ["measurement::" + selector]})
         self.manifest.write_text(json.dumps({"schema_version": 1, "family": "acceptance", "rows": rows}))
         current = self.record["candidate_manifest_sha256"]
-        prerequisite = "v2 has no approved AC-003 budget"
-        for digest_value, status, reason, accepted in [
-            (current, "NOT_RUN", prerequisite, True),
-            ("f" * 64, "NOT_RUN", prerequisite, False),
-            (current, "PASS", prerequisite, False),
-            (current, "NOT_RUN", "", False),
+        prerequisite = "missing exact candidate resource observations"
+        for digest_value, status, reason, missing_probe, accepted in [
+            (current, "NOT_RUN", prerequisite, False, True),
+            ("f" * 64, "NOT_RUN", prerequisite, False, False),
+            (current, "PASS", prerequisite, False, False),
+            (current, "NOT_RUN", "", False, False),
+            (current, "NOT_RUN", prerequisite, True, False),
         ]:
-            with self.subTest(digest_value=digest_value, status=status, reason=reason):
-                sample = {"schema_version": 1, "v2": {"manifest_sha256": digest_value},
+            with self.subTest(digest_value=digest_value, status=status, reason=reason,
+                              missing_probe=missing_probe):
+                probes = dict.fromkeys(("version", "headless_cancel", "headless_search",
+                                        "headless_index", "headless_status_polling"), 123)
+                if missing_probe:
+                    del probes["headless_cancel"]
+                sample = {"schema_version": 1,
+                          "v2": {"manifest_sha256": digest_value, "payload_files": 5,
+                                 "receipt_bytes": 65, "payload_bytes": 1000,
+                                 "installed_bytes": 1065, "local_tar_gz_bytes": 500},
+                          "headless": {"elapsed_ns_one_sample_per_probe": probes},
                           "ac003": {"status": status, "prerequisite": reason}}
                 log = self.logs / "measurement.log"
                 log.write_text(f"test {selector} ... ok\n{marker} {json.dumps(sample)}\n"
@@ -668,6 +678,7 @@ class ReleasePublisher(unittest.TestCase):
         scenarios = ["ready", "not-ready", "missing", "tampered", "foreign",
                      "moved-tag", "upload-fails", "malformed", "moved-during-upload",
                      "tampered-installer", "missing-installer", "mismatched-installer", "tampered-sbom", "tampered-receipt"]
+        scenarios += ["missing-resources", "tampered-resources", "foreign-resource-archive"]
         for scenario in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -689,6 +700,8 @@ class ReleasePublisher(unittest.TestCase):
                     bom = dist / f'{base}.cdx.json'
                     bom.write_text(json.dumps({'components':[{'type':'file', 'name':'rivect.manifest.json',
                         'hashes':[{'alg':'SHA-256', 'content':candidate}]}]}))
+                    resources = dist / f"{base}.resources.json"
+                    resources.write_text(json.dumps({"archive_sha256": digest(archive)}))
                     installer = dist / f"install-{target}.sh"
                     installer.write_bytes(installer_bytes)
                     if scenario == "mismatched-installer" and target == targets[0]:
@@ -699,6 +712,8 @@ class ReleasePublisher(unittest.TestCase):
                         "candidate_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
                         "installer_sha256": digest(installer),
                         "sbom_sha256": digest(bom),
+                        "resources_sha256": digest(resources),
+                        "archive_sha256": digest(archive),
                         "gate_exit": 0 if ready else 5, "release_ready": ready,
                         "blockers": {"retained_legs": 0 if ready else 1},
                     }
@@ -706,11 +721,17 @@ class ReleasePublisher(unittest.TestCase):
                         verdict["commit"] = "d" * 40
                     if scenario == "malformed":
                         verdict["release_ready"] = "true"
+                    if scenario == "foreign-resource-archive" and target == targets[0]:
+                        verdict["archive_sha256"] = "e" * 64
                     (dist / f"report-{target}.json").write_text(json.dumps(verdict))
                     if target == targets[0] and scenario == 'tampered-sbom':
                         bom.write_bytes(bom.read_bytes() + b' ')
                     if target == targets[0] and scenario == 'tampered-receipt':
                         (dist / f'{base}.manifest.sha256').write_text('0'*64 + '\n')
+                    if target == targets[0] and scenario == "missing-resources":
+                        resources.unlink()
+                    if target == targets[0] and scenario == "tampered-resources":
+                        resources.write_bytes(resources.read_bytes() + b" ")
                 first = dist / f"rivect-v0.1.1-{targets[0]}.tar.gz"
                 if scenario == "missing":
                     first.unlink()
@@ -753,7 +774,7 @@ class ReleasePublisher(unittest.TestCase):
                 creates = [call for call in mutations if call[:2] == ["release", "create"]]
                 for create in creates:
                     for target in targets:
-                        for suffix in ['cdx.json', 'manifest.sha256', 'tar.gz']:
+                        for suffix in ['cdx.json', 'manifest.sha256', 'resources.json', 'tar.gz']:
                             self.assertIn(f'./rivect-v0.1.1-{target}.{suffix}', create)
                     self.assertEqual(create.count("install.sh"), 1, create)
                     self.assertEqual(create.count("./install.sh.sha256"), 1, create)

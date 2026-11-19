@@ -26,7 +26,7 @@ use std::path::Path;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BUDGET_PREREQUISITE: &str = "v2 has no approved AC-003 budget";
+const RESOURCE_PREREQUISITE: &str = "missing exact candidate resource observations";
 
 /// The only parent environment an installed child inherits: what a process
 /// needs to locate its roots and the toolchain, never a secret (standards §10).
@@ -426,7 +426,7 @@ fn measure_package_size(bundle: &Path, archive: &Path) -> PackageSize {
 #[test]
 fn v2_installed_package_measurement() {
     support::not_run::reset("measurement.offline_corpus");
-    support::not_run::record("measurement.offline_corpus", BUDGET_PREREQUISITE);
+    support::not_run::record("measurement.offline_corpus", RESOURCE_PREREQUISITE);
     let temporary = tempfile::tempdir().expect("measurement scratch root");
     let bundle = support::release::baseline_bundle();
     let v2 = measure_package_size(bundle, &temporary.path().join("v2.tar.gz"));
@@ -441,7 +441,7 @@ fn v2_installed_package_measurement() {
         "installed": "regular file lengths in version directory plus adjacent receipt",
         "v2": v2,
         "headless": headless,
-        "ac003": { "status": "NOT_RUN", "prerequisite": BUDGET_PREREQUISITE },
+        "ac003": { "status": "NOT_RUN", "prerequisite": RESOURCE_PREREQUISITE },
     });
     println!("PACKAGE_SIZE_MEASUREMENT {measurement}");
 }

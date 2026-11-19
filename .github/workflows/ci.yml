@@ -56,6 +56,7 @@ jobs:
           shellcheck install.sh scripts/*.sh
           python3 scripts/ci-contract-tests.py
           python3 scripts/ci-tui-contract-tests.py
+          python3 scripts/release-resources-test.py
           python3 scripts/eval-metrics-test.py
           python3 scripts/install-contract-tests.py
 
@@ -178,6 +179,15 @@ jobs:
             target/acceptance-rows-*.json target/installed-ordinary.json \
             target/installed-tui-matrix.json transfer/target/
           cp -R target/rivect-not-run transfer/target/
+      - name: measure resources of the exact v2 archive and installed kit
+        if: >-
+          (github.event_name == 'workflow_dispatch' &&
+           github.ref == 'refs/heads/main') ||
+          startsWith(github.ref, 'refs/tags/v')
+        timeout-minutes: 12
+        run: |
+          python3 scripts/release-resources.py collect "$RIVECT_TEST_BUNDLE" \
+            transfer/candidate.tar.gz transfer/resources.json
       # upload-artifact v7.0.2
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -199,7 +209,10 @@ jobs:
           retention-days: 7
 
   verify-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v')
     needs: [quality, test]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -262,24 +275,31 @@ jobs:
         run: sh scripts/ci-linux-prerequisites.sh
       - name: release conjunction only (no producer reruns)
         run: |
+          host="$PWD/xhost/xhost-$PLATFORM"
+          export RIVECT_RELEASE_ARCHIVE="$host/candidate.tar.gz"
+          export RIVECT_RELEASE_RESOURCES="$host/resources.json"
           code=0
           sh scripts/release-gate.sh --bundle "$RIVECT_TEST_BUNDLE" \
             --receipts-only || code=$?
           case "$code" in 0|5) ;; *) exit "$code" ;; esac
+          jq -e '.resources_sha256 | strings | test("^[0-9a-f]{64}$")' \
+            target/final-acceptance.json >/dev/null
           mkdir dist
           cp install.sh "dist/install-$TARGET.sh"
           installer=$(shasum -a 256 "dist/install-$TARGET.sh" | cut -d ' ' -f 1)
           sbom=$(shasum -a 256 "$RIVECT_TEST_BUNDLE.cdx.json" | cut -c1-64)
+          archive=$(jq -er '.archive_sha256' "$RIVECT_RELEASE_RESOURCES")
           jq --argjson exit "$code" --arg target "$TARGET" \
             --arg commit "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
             --arg installer "$installer" --arg sbom "$sbom" \
-            '. + {gate_exit:$exit, target:$target,
-                  commit:$commit, run_id:$run, sbom_sha256:$sbom,
+            --arg archive "$archive" \
+            '. + {gate_exit:$exit, target:$target, commit:$commit, run_id:$run,
+                  archive_sha256:$archive, sbom_sha256:$sbom,
                   installer_sha256:$installer}' \
             target/final-acceptance.json > "dist/report-$TARGET.json"
-          cp "xhost/xhost-$PLATFORM/candidate.tar.gz" \
-            "dist/rivect-$GITHUB_REF_NAME-$TARGET.tar.gz"
           base="dist/rivect-$GITHUB_REF_NAME-$TARGET"
+          cp "$RIVECT_RELEASE_ARCHIVE" "$base.tar.gz"
+          cp "$RIVECT_RELEASE_RESOURCES" "$base.resources.json"
           for suffix in cdx.json manifest.sha256; do
             cp "$RIVECT_TEST_BUNDLE.$suffix" "$base.$suffix"
           done
@@ -294,7 +314,7 @@ jobs:
           retention-days: 30
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [verify-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -325,32 +345,39 @@ jobs:
           test "$(find . -name 'report-*.json' | wc -l | tr -d ' ')" = 2
           test "$(find . -name '*.cdx.json' | wc -l | tr -d ' ')" = 2
           test "$(find . -name '*.manifest.sha256' | wc -l)" -eq 2
+          test "$(find . -name '*.resources.json' | wc -l)" -eq 2
           test "$(find . -name '*.tar.gz' | wc -l | tr -d ' ')" = 2
           assets=()
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
-            sha256sum -c "$target.sha256"
-            candidate=$(tar -xOf "rivect-$GITHUB_REF_NAME-$target.tar.gz" \
-              rivect.manifest.json | sha256sum | cut -d ' ' -f 1)
             base="rivect-$GITHUB_REF_NAME-$target"
+            archive=$(sha256sum "$base.tar.gz" | cut -c1-64)
+            test "$(cat "$target.sha256")" = "$archive  ./$base.tar.gz"
+            candidate=$(tar -xOf "$base.tar.gz" rivect.manifest.json \
+              | sha256sum | cut -d ' ' -f 1)
             test "$(cat "$base.manifest.sha256")" = "$candidate"
             jq -e --arg hash "$candidate" 'any(.components[];
               .type == "file" and .name == "rivect.manifest.json" and
               .hashes == [{alg:"SHA-256", content:$hash}])' \
               "$base.cdx.json" >/dev/null
             sbom=$(sha256sum "$base.cdx.json" | cut -c1-64)
+            resources=$(sha256sum "$base.resources.json" | cut -c1-64)
             assets+=("./$base.tar.gz" "./$base.cdx.json"
-                     "./$base.manifest.sha256" "./report-$target.json"
+                     "./$base.manifest.sha256" "./$base.resources.json"
+                     "./report-$target.json"
                      "./$target.sha256")
             test -f "install-$target.sh"
             test ! -L "install-$target.sh"
             installer=$(sha256sum "install-$target.sh" | cut -d ' ' -f 1)
             jq -e --arg target "$target" --arg commit "$GITHUB_SHA" \
               --arg run "$GITHUB_RUN_ID" --arg candidate "$candidate" \
-              --arg installer "$installer" --arg sbom "$sbom" '
+              --arg installer "$installer" --arg sbom "$sbom" \
+              --arg resources "$resources" --arg archive "$archive" '
               .schema_version == 1 and .target == $target and
               .commit == $commit and .run_id == $run and
               .candidate_manifest_sha256 == $candidate and
               .installer_sha256 == $installer and .sbom_sha256 == $sbom and
+              .resources_sha256 == $resources and
+              .archive_sha256 == $archive and
               (.release_ready | type == "boolean") and
               (.blockers.retained_legs |
                 type == "number" and . >= 0 and . == floor) and

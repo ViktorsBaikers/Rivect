@@ -67,12 +67,15 @@ def sample(binary, project):
         os.close(slave)
 
 
-if __name__ == '__main__':
-    binary = Path(sys.argv[1]).resolve(strict=True)
-    samples = []
+def samples(binary):
     for _ in range(20):
         with tempfile.TemporaryDirectory() as project:
-            samples.append(sample(binary, project))
-    for name, values in zip(('launch to accepted input', 'input to echo', 'idle Ctrl+C restore'), zip(*samples)):
+            yield sample(binary, project)
+
+
+if __name__ == '__main__':
+    binary = Path(sys.argv[1]).resolve(strict=True)
+    rows = list(samples(binary))
+    for name, values in zip(('launch to accepted input', 'input to echo', 'idle Ctrl+C restore'), zip(*rows)):
         print(f'{name} p95: {sorted(values)[18] / 1e6:.2f} ms')
-    print('process group RSS after echo, max KiB:', max(row[3] for row in samples))
+    print('process group RSS after echo, max KiB:', max(row[3] for row in rows))
