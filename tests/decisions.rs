@@ -5166,18 +5166,11 @@ fn installed_first_readable_paint_starts_consent_after_an_invisible_resume() {
 }
 
 #[test]
-fn arriving_escape_is_ignored_but_a_deliberate_blind_escape_can_dismiss() {
+fn deliberate_blind_escape_dismisses_without_answering() {
     let mut card = CardPty::at_prompt(24, 80, false);
     card.resume();
     card.see("focus 1/6");
-    // A complete CSI-u Esc press avoids the parser timeout for a bare Esc prefix.
-    // The following navigation acknowledges that the card handled the input batch.
-    card.send(b"\x1b[27;1:1uj");
-    let frame = card.see("focus 2/6");
-    assert!(
-        frame.contains("Enter selects") && !frame.contains(DECISION_UNANSWERED),
-        "{frame}"
-    );
+    // The exact early-Esc boundary is checked with ManualClock in decision.test.tsx.
     card.pending(&card.question);
     card.wait_consent_floor();
 

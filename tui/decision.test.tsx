@@ -10,14 +10,14 @@ const question: Question = {
   custom: true, canRevealDiff: false, options: [{id:'begin', label:'Begin', consequences:'Prepare a plan'}],
 };
 
-test('inline decision ignores Esc at 199 ms and handles it at 200 ms after paint', async () => {
+test.each(['split-footer', 'alternate-screen'] as const)('%s ignores Esc at 199 ms and handles it at 200 ms after paint', async screenMode => {
   const clock = new ManualClock();
   let dismissals = 0;
   await using terminal = await testRender(() => <DecisionView question={question}
     confirm={async () => { throw new Error('Esc must not confirm'); }}
     reveal={async () => { throw new Error('Esc must not reveal'); }}
     dismiss={() => { dismissals++; }} />,
-    {width:80, height:24, screenMode:'split-footer', kittyKeyboard:true, clock});
+    {width:80, height:24, screenMode, kittyKeyboard:true, clock});
   await terminal.renderOnce();
   expect(terminal.captureCharFrame()).toContain('Begin the first step?');
   clock.advance(199);
