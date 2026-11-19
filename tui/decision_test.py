@@ -175,7 +175,8 @@ with tempfile.TemporaryDirectory() as work:
                     if time.monotonic() >= deadline:
                         raise AssertionError('witnessed answer did not reach the owner')
                     time.sleep(.02)
-                wait_text(master, b'\x1b[?2026l')  # The next real question can cover the receipt.
+                # The answer commits before the renderer resumes and the fixture settles.
+                wait_text(master, b'blocked')
                 os.write(master, b'\x03')
                 assert wait_terminal_exit(master, client) in (0, 130)
             finally:
