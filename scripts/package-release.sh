@@ -42,11 +42,20 @@ mkdir -p "$(dirname -- "$destination")"
 work=$(mktemp -d "$destination.staging.XXXXXX")
 staging=$work/bundle
 cleanup() {
-    if [ -d "$staging" ] && [ "$work/receipt" -ef "$receipt" ]; then
-        rm -- "$receipt"
-    fi
-    if [ -d "$staging" ] && [ "$work/sbom" -ef "$sbom" ]; then
-        rm -- "$sbom"
+    if [ -d "$staging" ]; then
+        python3 -I - "$work" "$receipt" "$sbom" <<'PY'
+import os
+import sys
+
+work, receipt, sbom = sys.argv[1:]
+for name, destination in (("receipt", receipt), ("sbom", sbom)):
+    try:
+        source = os.lstat(os.path.join(work, name))
+        if os.path.samestat(source, os.lstat(destination)):
+            os.unlink(destination)
+    except FileNotFoundError:
+        pass  # This sidecar was not linked, or has already disappeared.
+PY
     fi
     rm -rf -- "$work"
 }

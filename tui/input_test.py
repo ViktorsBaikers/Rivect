@@ -12,9 +12,10 @@ class InputTest(unittest.TestCase):
     def test_mouse_paste_and_escape(self):
         with chat_terminal(binary, 'loopback', '') as (master, database, child):
             os.write(master, b'/tui mouse on\r')
-            wait_text(master, b'tui: mouse on')
+            mouse_on = wait_text(master, b'tui: mouse on')
             os.write(master, b'/tui mouse off\r')
-            wait_text(master, b'tui: mouse off')
+            # OpenTUI can repaint only the changed suffix of the notice.
+            wait_text(master, b'tui: mouse off', prior=mouse_on)
             os.write(master, b'\x1b[200~/new\x1b[31m\r\x1b[201~')
             wait_text(master, b'Paste contains terminal control characters.')
             os.write(master, b'\x1b[200~A\r\n' + '雪'.encode() + b'\x1b[201~')

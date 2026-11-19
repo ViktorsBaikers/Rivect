@@ -79,8 +79,13 @@ class Launch(unittest.TestCase):
         with self.terminal() as (ui, master):
             first = wait_text(master, b'Message')
             self.assertIn(b'\x1b[?1049h', first)
-            command = subprocess.check_output(['ps', '-p', str(ui.pid), '-o', 'comm='], text=True).strip()
-            self.assertEqual(Path(command).resolve(), binary.parent / 'libexec/rivect-tui')
+            if sys.platform == 'linux':
+                # Linux comm exposes the Bun executable's basename, not its path.
+                executable = Path(f'/proc/{ui.pid}/exe').readlink()
+            else:
+                command = subprocess.check_output(['ps', '-p', str(ui.pid), '-o', 'comm='], text=True).strip()
+                executable = Path(command).resolve(strict=True)
+            self.assertEqual(executable, binary.parent / 'libexec/rivect-tui')
             os.write(master, b'\x03')
             self.assertEqual(wait_terminal_exit(master, ui), 130)
         self.assertFalse((self.home / '.rivect').exists())
